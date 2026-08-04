@@ -1,6 +1,6 @@
 {
   "base": "http://127.0.0.1:5002",
-  "project": "parity-4378f9d0",
+  "project": "parity-aecae540",
   "steps": {
     "admin_list_all_projects": {
       "status": 200,
@@ -4006,57 +4006,28 @@
                 }
               }
             },
-            "InsertAtLineBody": {
+            "ReadManyBody": {
               "required": [
-                "path",
-                "line",
-                "content"
+                "paths"
               ],
               "type": "object",
               "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path within the volume."
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Absolute POSIX paths to read, one entry per file."
                 },
-                "line": {
+                "per_file_cap_lines": {
                   "type": "integer",
-                  "description": "1-based line number to insert content before.",
-                  "format": "int32"
-                },
-                "content": {
-                  "type": "string",
-                  "description": "Text content to insert."
+                  "description": "Maximum number of lines returned per file.",
+                  "format": "int32",
+                  "default": 500
                 }
               }
             },
-            "SearchReplaceBody": {
-              "required": [
-                "path",
-                "search_block",
-                "replace_block"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path within the volume."
-                },
-                "search_block": {
-                  "type": "string",
-                  "description": "Multi-line block of text to locate."
-                },
-                "replace_block": {
-                  "type": "string",
-                  "description": "Multi-line block that replaces search_block."
-                },
-                "fuzzy": {
-                  "type": "boolean",
-                  "description": "Allow whitespace tolerant (fuzzy) matching of search_block.",
-                  "default": false
-                }
-              }
-            },
-            "MkdirBody": {
+            "CreateEmptyBody": {
               "required": [
                 "path"
               ],
@@ -4064,7 +4035,58 @@
               "properties": {
                 "path": {
                   "type": "string",
-                  "description": "Absolute POSIX path of the directory to create."
+                  "description": "Absolute POSIX path of the file to create."
+                },
+                "exist_ok": {
+                  "type": "boolean",
+                  "description": "Succeed silently if the file already exists.",
+                  "default": false
+                }
+              }
+            },
+            "EditSpec": {
+              "type": "object",
+              "properties": {
+                "old_string": {
+                  "type": "string"
+                },
+                "new_string": {
+                  "type": "string"
+                },
+                "replace_all": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "EditBody": {
+              "required": [
+                "path",
+                "old_string",
+                "new_string"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "old_string": {
+                  "type": "string",
+                  "description": "Exact text to find; must be unique unless replace_all is set."
+                },
+                "new_string": {
+                  "type": "string",
+                  "description": "Replacement text substituted for old_string."
+                },
+                "replace_all": {
+                  "type": "boolean",
+                  "description": "Replace every occurrence instead of requiring a unique match.",
+                  "default": false
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Return the diff without writing changes.",
+                  "default": false
                 }
               }
             },
@@ -4108,72 +4130,29 @@
                 }
               }
             },
-            "DeleteBody": {
+            "SearchReplaceBody": {
               "required": [
-                "path"
+                "path",
+                "search_block",
+                "replace_block"
               ],
               "type": "object",
               "properties": {
                 "path": {
                   "type": "string",
-                  "description": "Absolute POSIX path to delete."
-                }
-              }
-            },
-            "MoveBody": {
-              "required": [
-                "source",
-                "destination"
-              ],
-              "type": "object",
-              "properties": {
-                "source": {
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "search_block": {
                   "type": "string",
-                  "description": "Absolute POSIX source path to move."
+                  "description": "Multi-line block of text to locate."
                 },
-                "destination": {
+                "replace_block": {
                   "type": "string",
-                  "description": "Absolute POSIX destination path."
-                }
-              }
-            },
-            "EditSpec": {
-              "type": "object",
-              "properties": {
-                "old_string": {
-                  "type": "string"
+                  "description": "Multi-line block that replaces search_block."
                 },
-                "new_string": {
-                  "type": "string"
-                },
-                "replace_all": {
-                  "type": "boolean"
-                }
-              }
-            },
-            "CopyBody": {
-              "required": [
-                "source",
-                "destination"
-              ],
-              "type": "object",
-              "properties": {
-                "source": {
-                  "type": "string",
-                  "description": "Absolute POSIX source path to copy."
-                },
-                "destination": {
-                  "type": "string",
-                  "description": "Absolute POSIX destination path."
-                },
-                "overwrite": {
+                "fuzzy": {
                   "type": "boolean",
-                  "description": "Allow overwriting an existing destination (default no-clobber).",
-                  "default": false
-                },
-                "recursive": {
-                  "type": "boolean",
-                  "description": "Required to copy a directory tree.",
+                  "description": "Allow whitespace tolerant (fuzzy) matching of search_block.",
                   "default": false
                 }
               }
@@ -4212,6 +4191,74 @@
                 }
               }
             },
+            "MoveBody": {
+              "required": [
+                "source",
+                "destination"
+              ],
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Absolute POSIX source path to move."
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Absolute POSIX destination path."
+                }
+              }
+            },
+            "DeleteBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path to delete."
+                }
+              }
+            },
+            "CopyBody": {
+              "required": [
+                "source",
+                "destination"
+              ],
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Absolute POSIX source path to copy."
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Absolute POSIX destination path."
+                },
+                "overwrite": {
+                  "type": "boolean",
+                  "description": "Allow overwriting an existing destination (default no-clobber).",
+                  "default": false
+                },
+                "recursive": {
+                  "type": "boolean",
+                  "description": "Required to copy a directory tree.",
+                  "default": false
+                }
+              }
+            },
+            "MkdirBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the directory to create."
+                }
+              }
+            },
             "WriteBody": {
               "required": [
                 "path",
@@ -4239,32 +4286,11 @@
                 }
               }
             },
-            "ReadManyBody": {
-              "required": [
-                "paths"
-              ],
-              "type": "object",
-              "properties": {
-                "paths": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "description": "Absolute POSIX paths to read, one entry per file."
-                },
-                "per_file_cap_lines": {
-                  "type": "integer",
-                  "description": "Maximum number of lines returned per file.",
-                  "format": "int32",
-                  "default": 500
-                }
-              }
-            },
-            "EditBody": {
+            "InsertAtLineBody": {
               "required": [
                 "path",
-                "old_string",
-                "new_string"
+                "line",
+                "content"
               ],
               "type": "object",
               "properties": {
@@ -4272,40 +4298,14 @@
                   "type": "string",
                   "description": "Absolute POSIX path within the volume."
                 },
-                "old_string": {
+                "line": {
+                  "type": "integer",
+                  "description": "1-based line number to insert content before.",
+                  "format": "int32"
+                },
+                "content": {
                   "type": "string",
-                  "description": "Exact text to find; must be unique unless replace_all is set."
-                },
-                "new_string": {
-                  "type": "string",
-                  "description": "Replacement text substituted for old_string."
-                },
-                "replace_all": {
-                  "type": "boolean",
-                  "description": "Replace every occurrence instead of requiring a unique match.",
-                  "default": false
-                },
-                "dry_run": {
-                  "type": "boolean",
-                  "description": "Return the diff without writing changes.",
-                  "default": false
-                }
-              }
-            },
-            "CreateEmptyBody": {
-              "required": [
-                "path"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path of the file to create."
-                },
-                "exist_ok": {
-                  "type": "boolean",
-                  "description": "Succeed silently if the file already exists.",
-                  "default": false
+                  "description": "Text content to insert."
                 }
               }
             }

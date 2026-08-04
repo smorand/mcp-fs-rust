@@ -51,7 +51,16 @@ use pktline::{PacketType, PktReader};
 use serde::Deserialize;
 use std::sync::Arc;
 
-const UPLOAD_PACK_CAPABILITIES: &str = "multi_ack side-band-64k ofs-delta agent=mcp-fs/0.1.0";
+/// Advertised upload-pack capabilities.
+///
+/// `multi_ack_detailed` is REQUIRED by git over smart HTTP: with `--stateless-rpc` the
+/// client refuses to negotiate without it ("the option '--stateless-rpc' requires
+/// 'multi_ack_detailed'"). The reference implementation advertises only `multi_ack`, so a
+/// real `git clone` fails against it; verified against both servers. Advertising the
+/// detailed variant is a deliberate divergence: parity that leaves the documented git
+/// protocol unusable is not useful parity.
+const UPLOAD_PACK_CAPABILITIES: &str =
+    "multi_ack multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0";
 const RECEIVE_PACK_CAPABILITIES: &str =
     "report-status delete-refs side-band-64k quiet atomic ofs-delta agent=mcp-fs/0.1.0";
 const ZERO_ID: &str = "0000000000000000000000000000000000000000";
@@ -438,18 +447,42 @@ pub async fn handle_upload_pack(entry: &GitRepoEntry, body: &[u8]) -> Result<Vec
     Ok(out)
 }
 
+/// Build the packfile for a set of wanted tips.
+///
+/// The pack must contain the wanted objects AND everything reachable from them,
+/// parents included. `insert_recursive` only adds an object plus what it directly
+/// references (for a commit: its tree, recursively), NOT its ancestry, so a repository
+/// with more than one commit produced a pack that made the client fail with
+/// "Failed to traverse parents" / "remote did not send all necessary objects". The
+/// reference implementation has the same defect. A revwalk over the tips, fed to
+/// `insert_walk`, is the API that yields a complete pack.
 fn build_pack(repo: &git2::Repository, wants: &[String]) -> Result<Vec<u8>> {
     let mut buf = git2::Buf::new();
     {
         let mut pb = repo
             .packbuilder()
             .map_err(|e| ToolError::internal(format!("packbuilder failed: {e}")))?;
+
+        let mut walk = repo
+            .revwalk()
+            .map_err(|e| ToolError::internal(format!("revwalk failed: {e}")))?;
+        let mut pushed_any = false;
         for want in wants {
-            // Unknown or unreachable wants are skipped, like the C# try/catch.
+            // Unknown or unreachable wants are skipped, like the reference does.
             if let Ok(oid) = Oid::from_str(want) {
-                let _ = pb.insert_recursive(oid, None);
+                if walk.push(oid).is_ok() {
+                    pushed_any = true;
+                } else {
+                    // Not a commit (a tag or a bare tree can be wanted directly).
+                    let _ = pb.insert_recursive(oid, None);
+                }
             }
         }
+        if pushed_any {
+            pb.insert_walk(&mut walk)
+                .map_err(|e| ToolError::internal(format!("pack walk failed: {e}")))?;
+        }
+
         pb.write_buf(&mut buf)
             .map_err(|e| ToolError::internal(format!("pack write failed: {e}")))?;
     }
@@ -484,9 +517,12 @@ pub struct RefUpdate {
     pub ref_name: String,
 }
 
-/// Parse the command section, returning the updates and the trailing packfile.
-pub fn parse_receive_pack_request(body: &[u8]) -> (Vec<RefUpdate>, &[u8]) {
+/// Parse the command section, returning the updates, the client capability line and the
+/// trailing packfile. The capabilities matter: when the client asked for `side-band-64k`
+/// the report MUST be wrapped in band 1, otherwise git rejects it with "bad band".
+pub fn parse_receive_pack_request(body: &[u8]) -> (Vec<RefUpdate>, String, &[u8]) {
     let mut updates = Vec::new();
+    let mut client_caps = String::new();
     let mut reader = PktReader::new(body);
     let mut first = true;
     loop {
@@ -500,7 +536,10 @@ pub fn parse_receive_pack_request(body: &[u8]) -> (Vec<RefUpdate>, &[u8]) {
         }
         // Only the first command carries NUL separated client capabilities.
         let actual = if first && line.contains('\0') {
-            line.split('\0').next().unwrap_or("").to_string()
+            let mut it = line.splitn(2, '\0');
+            let cmd = it.next().unwrap_or("").to_string();
+            client_caps = it.next().unwrap_or("").trim().to_string();
+            cmd
         } else {
             line.clone()
         };
@@ -516,7 +555,7 @@ pub fn parse_receive_pack_request(body: &[u8]) -> (Vec<RefUpdate>, &[u8]) {
             ref_name: parts[2].to_string(),
         });
     }
-    (updates, reader.remaining())
+    (updates, client_caps, reader.remaining())
 }
 
 /// Serve a push. The caller must already hold the project write lock.
@@ -524,6 +563,7 @@ async fn receive_pack_locked(
     entry: &GitRepoEntry,
     updates: &[RefUpdate],
     pack: &[u8],
+    side_band: bool,
 ) -> Result<Vec<u8>> {
     // 12 bytes is the minimal pack header (magic, version, object count).
     if pack.len() > 12 {
@@ -532,18 +572,32 @@ async fn receive_pack_locked(
         entry.objects.import_from_repo(&repo).await?;
     }
 
-    let mut out = Vec::new();
     // `report-status` requires an `unpack` status line before the per ref lines.
     // The C# omits it, which makes a real `git push` report a failure even though the
     // refs update correctly, so this is a deliberate, documented divergence: a client
     // that cannot push is worse than a byte identical response (see module docs).
-    out.extend_from_slice(&pktline::encode("unpack ok\n"));
+    let mut report = Vec::new();
+    report.extend_from_slice(&pktline::encode("unpack ok\n"));
     for u in updates {
         let line = match process_ref_update(entry, u).await {
             Ok(l) => l,
             Err(e) => format!("ng {} {}", u.ref_name, e.message),
         };
-        out.extend_from_slice(&pktline::encode(&format!("{line}\n")));
+        report.extend_from_slice(&pktline::encode(&format!("{line}\n")));
+    }
+    report.extend_from_slice(&pktline::flush());
+
+    if !side_band {
+        return Ok(report);
+    }
+    // The client asked for side-band-64k, so the whole report travels on band 1.
+    // Without this git aborts with "protocol error: bad band #117" ('u' of "unpack").
+    let mut out = Vec::new();
+    for chunk in report.chunks(SIDE_BAND_CHUNK) {
+        let mut framed = Vec::with_capacity(chunk.len() + 1);
+        framed.push(1);
+        framed.extend_from_slice(chunk);
+        out.extend_from_slice(&pktline::encode_raw(&framed));
     }
     out.extend_from_slice(&pktline::flush());
     Ok(out)
@@ -551,12 +605,13 @@ async fn receive_pack_locked(
 
 /// Full push handling: parse, take the write lock, index, update refs, report.
 pub async fn handle_receive_pack(entry: &GitRepoEntry, body: &[u8]) -> Result<Vec<u8>> {
-    let (updates, pack) = parse_receive_pack_request(body);
+    let (updates, client_caps, pack) = parse_receive_pack_request(body);
     if updates.is_empty() {
         return Ok(pktline::flush());
     }
+    let side_band = client_caps.split_whitespace().any(|c| c == "side-band-64k");
     let _guard = entry.write_lock.lock().await;
-    receive_pack_locked(entry, &updates, pack).await
+    receive_pack_locked(entry, &updates, pack, side_band).await
 }
 
 fn index_pack(repo: &git2::Repository, pack: &[u8]) -> Result<()> {
@@ -660,7 +715,7 @@ mod tests {
     fn capability_strings_match_the_csharp() {
         assert_eq!(
             UPLOAD_PACK_CAPABILITIES,
-            "multi_ack side-band-64k ofs-delta agent=mcp-fs/0.1.0"
+            "multi_ack multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0"
         );
         assert_eq!(
             RECEIVE_PACK_CAPABILITIES,
@@ -823,8 +878,12 @@ mod tests {
         body.extend_from_slice(&pktline::flush());
         body.extend_from_slice(b"PACKpayload");
 
-        let (updates, pack) = parse_receive_pack_request(&body);
+        let (updates, caps, pack) = parse_receive_pack_request(&body);
         assert_eq!(updates.len(), 2);
+        assert_eq!(
+            caps, "report-status side-band-64k",
+            "client capabilities are captured, not just discarded"
+        );
         assert_eq!(
             updates[0],
             RefUpdate {
@@ -844,6 +903,48 @@ mod tests {
         let (_s, e) = entry(d.path()).await;
         let out = handle_receive_pack(&e, &pktline::flush()).await.unwrap();
         assert_eq!(out, b"0000");
+    }
+
+    /// A client that asked for side-band-64k must get the report on band 1. Without the
+    /// wrapping, git aborts with "protocol error: bad band #117" (the 'u' of "unpack").
+    #[tokio::test]
+    async fn receive_pack_report_is_side_band_framed_when_requested() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        let (commit, _t, _b) = seed_commit(&e.objects, "a.txt", b"x", "c1").await.unwrap();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&pktline::encode_raw(
+            format!("{ZERO_ID} {commit} refs/heads/sb\0report-status side-band-64k\n").as_bytes(),
+        ));
+        body.extend_from_slice(&pktline::flush());
+        let out = handle_receive_pack(&e, &body).await.unwrap();
+
+        // Every data packet carries the band byte first.
+        let mut reader = pktline::PktReader::new(&out);
+        let (line, kind) = reader.read_line();
+        assert_eq!(kind, PacketType::Data, "expected a data packet");
+        let raw = line.expect("payload");
+        assert!(raw.starts_with('\u{1}'), "report must be on band 1, got {raw:?}");
+        assert!(raw.contains("unpack ok"), "band 1 carries the report: {raw:?}");
+    }
+
+    /// Without side-band-64k the report stays raw pkt-lines.
+    #[tokio::test]
+    async fn receive_pack_report_is_raw_without_side_band() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        let (commit, _t, _b) = seed_commit(&e.objects, "a.txt", b"x", "c1").await.unwrap();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&pktline::encode_raw(
+            format!("{ZERO_ID} {commit} refs/heads/raw\0report-status\n").as_bytes(),
+        ));
+        body.extend_from_slice(&pktline::flush());
+        let out = handle_receive_pack(&e, &body).await.unwrap();
+        let lines = read_pkt_lines(&out);
+        assert_eq!(lines[0].as_deref(), Some("unpack ok"));
+        assert_eq!(lines[1].as_deref(), Some("ok refs/heads/raw"));
     }
 
     #[tokio::test]

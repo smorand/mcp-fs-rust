@@ -77,6 +77,15 @@ copying the reference exactly would copy a defect.
 Divergences that the corpus does not reach, listed here for completeness (all in
 `README.md` too, and documented at their call site):
 
+- **The git protocol is actually usable.** Three reference defects, each verified against
+  both servers, made a real `git clone` or `git push` impossible:
+  `upload-pack` did not advertise `multi_ack_detailed`, which git requires over smart HTTP;
+  the pack was built with `insert_recursive`, which omits a commit's ancestry, so any
+  repository with more than one commit produced an incomplete pack; and the `receive-pack`
+  report was sent as raw pkt-lines even when the client negotiated `side-band-64k`, so git
+  aborted with `bad band #117` after the push had landed. Fixed with the detailed
+  capability, a revwalk fed to `insert_walk`, and band 1 framing. Verified end to end:
+  clone, commit, push, reclone, three commits and exact content.
 - `receive-pack` sends the `unpack ok` report line the protocol requires; the C# omits it,
   so a real `git push` reports a failure even though the refs update.
 - Git HTTP routes enforce project membership; the C# only checked that the repo existed,

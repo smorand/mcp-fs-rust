@@ -145,19 +145,31 @@ reduced to `tool + ERR_* code` so a reworded message passes while a wrong code f
 Everything below is a case where reproducing the reference exactly would reproduce a
 defect. Each is documented at its call site.
 
-1. **`receive-pack` sends `unpack ok`.** The protocol requires that report line; the C#
+1. **A real `git clone` and `git push` actually work.** Three defects in the reference
+   made the documented git protocol unusable, all verified against both servers:
+   * `upload-pack` advertised `multi_ack` but not `multi_ack_detailed`, which git
+     *requires* over smart HTTP (`the option '--stateless-rpc' requires
+     'multi_ack_detailed'`), so no clone ever completed.
+   * the pack was built with `insert_recursive`, which adds an object and what it
+     directly references but NOT a commit's ancestry, so any repository with more than
+     one commit produced an incomplete pack (`remote did not send all necessary
+     objects`). Fixed with a revwalk fed to `insert_walk`.
+   * `receive-pack` returned the report as raw pkt-lines even when the client asked for
+     `side-band-64k`, so git aborted with `protocol error: bad band #117` after the push
+     had already landed. The report is now framed on band 1.
+2. **`receive-pack` sends `unpack ok`.** The protocol requires that report line; the C#
    omits it, so a real `git push` reports a failure even though the refs update.
-2. **Git HTTP routes enforce project membership.** The C# only checked that the repo
+3. **Git HTTP routes enforce project membership.** The C# only checked that the repo
    existed, so any verified token could read or write any project.
-3. **`git.max_pack_size_mb` is enforced.** The C# parsed it and never used it.
-4. **Pushed objects are really indexed and imported.** The C# path was a stub, so
+4. **`git.max_pack_size_mb` is enforced.** The C# parsed it and never used it.
+5. **Pushed objects are really indexed and imported.** The C# path was a stub, so
    pushed objects were dropped unless already present.
-5. **No custom libgit2 ODB backend.** `git2` cannot express one from safe Rust, so the
+6. **No custom libgit2 ODB backend.** `git2` cannot express one from safe Rust, so the
    blob store stays the source of truth and is synced around libgit2 calls. The stored
    bytes are identical; the on-disk object directory becomes a rebuildable cache.
-6. **An unsupported extraction format returns `ERR_NOT_SUPPORTED`** rather than
+7. **An unsupported extraction format returns `ERR_NOT_SUPPORTED`** rather than
    `ERR_INVALID_ARGUMENT` (message text unchanged).
-7. **Generated `.docx` keeps numbered list markers** and renders fenced code as
+8. **Generated `.docx` keeps numbered list markers** and renders fenced code as
    monospaced paragraphs instead of leaking the backtick lines.
 
 ## Not supported
