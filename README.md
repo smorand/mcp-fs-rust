@@ -169,8 +169,12 @@ same operation: `delete` skipped the trash, ignored `allow_hard_delete` and remo
 tree without asking for `recursive`; `move` had no no clobber rule; `upload` charged
 nothing against the write quota, making the highest volume write path the only one with no
 accounting; and none of them wrote an audit entry, so a REST mutation left no trace. All
-four now go through the engine. Related engine bug found on the way: `fs.move` with
-`overwrite: true` always failed, because the flag was checked and then ignored.
+four now go through the engine. The git write paths had the same gap: `git.remote_clone`
+imported a whole working tree and `git.checkout_file` restored a file with nothing charged
+against the quota, so git was a way around it. The clone is now charged up front, before
+the first write, so an import that does not fit leaves the volume untouched instead of half
+populated. Related engine bug found on the way: `fs.move` with `overwrite: true` always
+failed, because the flag was checked and then ignored.
 
 **Correctness fixes.** `auth.jwt.algorithms` is honoured instead of parsed and ignored
 (with unsupported names logged at startup and the HMAC family refused on purpose).

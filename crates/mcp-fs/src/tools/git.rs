@@ -233,6 +233,8 @@ pub fn register_with(
                     })
                     .await?
                 };
+                // A restore is a write, so it is charged like any other.
+                ctx.state.safety.charge_write(&ctx.person, &mount_id, bytes.len() as i64)?;
                 client.write_bytes_atomic(&norm, &bytes).await?;
                 ctx.state.safety.record_audit(
                     &ctx.person,
@@ -706,6 +708,7 @@ async fn remote_clone(
     let tmp_path = tmp.path().to_path_buf();
     let (url_owned, branch_owned, mount_owned) =
         (url.to_string(), branch.clone(), mount_id.to_string());
+    let person_owned = ctx.person.clone();
     let state = ctx.state.clone();
 
     on_git_thread(move || async move {
@@ -757,6 +760,17 @@ async fn remote_clone(
         let mut files = Vec::new();
         collect_blobs(&cloned, &tree, "", &mut files)?;
 
+        // Charge the whole import against the session quota BEFORE writing anything.
+        // Writing first and charging per file would leave a half populated volume when
+        // the budget runs out; a clone either fits or is refused cleanly. Importing a
+        // large repository therefore needs safety.write_quota_bytes raised, which is
+        // the honest trade: a bulk write is still a write.
+        let total_bytes: i64 = files
+            .iter()
+            .filter_map(|(_, oid)| cloned.find_blob(*oid).ok().map(|b| b.size() as i64))
+            .sum();
+        state.safety.charge_write(&person_owned, &mount_owned, total_bytes)?;
+
         let mut imported = 0usize;
         let mut skipped: Vec<String> = Vec::new();
         for (rel, oid) in files {
@@ -766,6 +780,14 @@ async fn remote_clone(
                 Err(e) => skipped.push(format!("{path}: {}", e.message)),
             }
         }
+
+        state.safety.record_audit(
+            &person_owned,
+            &mount_owned,
+            "git.remote_clone",
+            "/",
+            &format!("{imported} files, {total_bytes} bytes from {url_owned}"),
+        );
 
         // Commit count for the summary: breadth first over the parent graph.
         let mut seen = std::collections::HashSet::new();
@@ -1072,7 +1094,20 @@ mod tests {
 
     impl Env {
         async fn new() -> Env {
-            let f = Fixture::with_config(|c| c.git.enabled = true).await;
+            Env::build(|c| c.git.enabled = true).await
+        }
+
+        /// An environment with a tight write quota, to prove the writes are charged.
+        async fn with_quota(bytes: i64) -> Env {
+            Env::build(move |c| {
+                c.git.enabled = true;
+                c.safety.write_quota_bytes = bytes;
+            })
+            .await
+        }
+
+        async fn build(tweak: impl FnOnce(&mut crate::config::ServerConfig)) -> Env {
+            let f = Fixture::with_config(tweak).await;
             f.seed_project(MOUNT, OWNER).await;
             let git = Arc::new(GitRepoStore::new(f.state.config.clone()));
             let tokens = Arc::new(OAuthTokenStore::new());
@@ -1671,6 +1706,76 @@ mod tests {
     }
 
     // ── remote_clone ────────────────────────────────────────────────────────
+
+    /// Build a real local repository to clone from, so no network is involved.
+    fn seed_origin(dir: &std::path::Path, payload: &str) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("README.md"), payload).unwrap();
+        let repo = git2::Repository::init(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial\n", &tree, &[]).unwrap();
+        format!("file://{}", dir.display())
+    }
+
+    /// A clone is a bulk write, so it is charged against the quota, and it is charged
+    /// up front: an import that does not fit must leave the volume untouched rather
+    /// than half populated.
+    #[tokio::test]
+    async fn remote_clone_is_charged_up_front_and_writes_nothing_when_over_quota() {
+        let e = Env::with_quota(8).await;
+        let url = seed_origin(&e.f.dir.path().join("origin"), "0123456789");
+
+        let err = e
+            .call("git.remote_clone", json!({"mount_id": MOUNT, "url": url}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        assert!(
+            !client.exists("/README.md").await.unwrap(),
+            "the import must be refused before any file is written"
+        );
+    }
+
+    /// The happy path charges the imported bytes and records one audit entry.
+    #[tokio::test]
+    async fn remote_clone_charges_and_audits_the_import() {
+        let e = Env::new().await;
+        let url = seed_origin(&e.f.dir.path().join("origin"), "0123456789");
+        e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap();
+
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 10);
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        let entry = log
+            .iter()
+            .find(|x| x.op == "git.remote_clone")
+            .expect("an audit entry for the clone");
+        assert!(entry.detail.contains("1 files, 10 bytes"), "got {}", entry.detail);
+    }
+
+    /// Restoring a file from history is a write, so it is charged too.
+    #[tokio::test]
+    async fn checkout_file_is_charged_against_the_quota() {
+        let e = Env::with_quota(6).await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "abc\n").await;
+        let sha = e.commit("one").await;
+
+        // The seed write goes straight through the client, so it costs nothing: the
+        // file is 4 bytes and 6 are allowed, so the first restore fits and the second
+        // pushes the total to 8 and is refused.
+        let args = json!({"mount_id": MOUNT, "path": "/a.txt", "commit_sha": sha});
+        let out = e.call("git.checkout_file", args.clone()).await.unwrap();
+        assert_eq!(out["path"], "/a.txt");
+        let err = e.call("git.checkout_file", args).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+    }
 
     #[tokio::test]
     async fn remote_clone_imports_files_history_and_refs() {

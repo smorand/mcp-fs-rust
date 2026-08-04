@@ -337,6 +337,11 @@ async fn roots(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
 }
 
 /// Directory listing for a browser: directories first, then names caselessly.
+/// A browse listing for a UI: directories first, then names case insensitively, with
+/// sizes and mtimes always present. Deliberately not `fs.list_dir`, whose shape is tuned
+/// for an agent (opt in sizes, hidden filter, sort choice). The directory check still
+/// comes from the volume client, so listing a file is a 400 rather than an empty list
+/// that invents a directory.
 async fn list(
     State(state): State<Arc<AppState>>,
     Path(mount): Path<String>,
