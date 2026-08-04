@@ -864,8 +864,18 @@ pub async fn move_path(
     if !client.exists(src).await? {
         return Err(ToolError::not_found(format!("'{src}' does not exist")));
     }
-    if client.exists(dst).await? && !overwrite {
-        return Err(ToolError::no_clobber(format!("'{dst}' exists (pass overwrite=true)")));
+    if client.exists(dst).await? {
+        if !overwrite {
+            return Err(ToolError::no_clobber(format!("'{dst}' exists (pass overwrite=true)")));
+        }
+        // The metadata store refuses to rename onto an existing path, so the flag was
+        // accepted and then ignored: `overwrite: true` always failed with NO_CLOBBER.
+        // Clear the destination first, GCing whatever it referenced.
+        if client.is_dir(dst).await? {
+            client.delete_tree(dst).await?;
+        } else {
+            client.delete_file(dst).await?;
+        }
     }
     client.rename(src, dst).await?;
     safety.record_audit(person, mount_id, "move", src, &format!("-> {dst}"));
@@ -2766,6 +2776,37 @@ mod tests {
         assert_eq!(count_occurrences("aaaa", "aa"), 2);
         assert_eq!(count_occurrences("abc", ""), 0);
         assert_eq!(count_occurrences("abc", "z"), 0);
+    }
+
+    /// `overwrite: true` used to be accepted and then ignored: the metadata store
+    /// refuses to rename onto an existing path, so the move always failed with
+    /// NO_CLOBBER and the flag was dead.
+    #[tokio::test]
+    async fn move_with_overwrite_replaces_the_destination() {
+        let f = fixture();
+        f.v.write_text_atomic("/from.txt", "new").await.unwrap();
+        f.v.write_text_atomic("/onto.txt", "old").await.unwrap();
+
+        let e = move_path(&f.v, &f.s, P, M, "/from.txt", "/onto.txt", false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NO_CLOBBER);
+
+        move_path(&f.v, &f.s, P, M, "/from.txt", "/onto.txt", true).await.unwrap();
+        assert_eq!(f.v.read_text("/onto.txt").await.unwrap(), "new");
+        assert!(!f.v.exists("/from.txt").await.unwrap());
+    }
+
+    /// Overwriting a directory destination clears the whole subtree first.
+    #[tokio::test]
+    async fn move_with_overwrite_replaces_a_directory_destination() {
+        let f = fixture();
+        f.v.write_text_atomic("/src/a.txt", "keep").await.unwrap();
+        f.v.write_text_atomic("/dst/stale.txt", "gone").await.unwrap();
+
+        move_path(&f.v, &f.s, P, M, "/src", "/dst", true).await.unwrap();
+        assert_eq!(f.v.read_text("/dst/a.txt").await.unwrap(), "keep");
+        assert!(!f.v.exists("/dst/stale.txt").await.unwrap(), "stale entry removed");
     }
 
     // ── V4A patch internals (moved here with the engine) ──────────────────

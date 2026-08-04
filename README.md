@@ -163,6 +163,12 @@ project membership is enforced on the git routes (the reference let any verified
 read or write any project), `max_pack_size_mb` is enforced, and pushed objects are really
 indexed.
 
+**Data safety on the REST plane.** `delete` and `move` used to call the storage layer
+directly, so the REST door skipped the trash, ignored `allow_hard_delete`, removed a whole
+tree without asking for `recursive`, had no no clobber rule on `move`, and wrote no audit
+entry. Both now go through the same engine as the tools. Related engine bug: `fs.move`
+with `overwrite: true` always failed, because the flag was checked and then ignored.
+
 **Correctness fixes.** `auth.jwt.algorithms` is honoured instead of parsed and ignored
 (with unsupported names logged at startup and the HMAC family refused on purpose).
 Listing a file is a 400 rather than a 200 with an invented empty listing. `fs.tree` at

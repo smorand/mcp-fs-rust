@@ -34,11 +34,14 @@ token as the password. A 401 body is `{"error": "ERR_UNAUTHENTICATED", "detail":
 | GET | `/api/fs/{mount_id}/download` | query `path` (required) | raw bytes as an attachment, MIME guessed |
 | GET | `/api/fs/{mount_id}/download-zip` | query `path` (default `/`) | subtree as a zip, entry names relative to that root |
 
-Two deliberate differences from the matching tools, both inherited from the
-reference: the REST `delete` never uses the trash (a UI owns its own undo story)
-and the REST `move` has no no clobber flag. Attachment responses send the
-filename twice (sanitized ASCII plus RFC 5987 `filename*`) so unicode names
-survive.
+`delete` and `move` behave exactly like their tools: `delete` accepts `recursive`
+(required for a non empty directory) and `trash` (default true, so a delete is
+recoverable and audited), `move` accepts `overwrite` (default false). They used to
+call the volume client directly, which skipped the trash, ignored
+`safety.allow_hard_delete`, dropped a whole tree without `recursive` and wrote no
+audit entry: the same operation through two doors behaved differently and the REST
+door was the destructive one. Attachment responses send the filename twice
+(sanitized ASCII plus RFC 5987 `filename*`) so unicode names survive.
 
 ## Tool parity, GET
 

@@ -23,10 +23,10 @@ while keeping one bucket per volume. `git/odb.rs` owns
 `serialize`/`deserialize`/`object_id` plus read, write, exists, prefix resolution
 (short sha) and listing.
 
-Known latent issue inherited from the reference: a colon is illegal in an NTFS
-filename, so the local blob backend cannot hold `git:{sha}` on a Windows host. Git
-on Windows needs the S3 backend until a key mapping lands in both implementations
-at once.
+Scope note: the key contains a colon, which is illegal in an NTFS filename, so the
+local blob backend cannot hold git objects on a Windows host. Windows is out of scope
+for this port (POSIX hosts only), so the key is left readable as is; a Windows target
+would need a key mapping in the local backend, and the S3 backend is unaffected.
 
 ## SQLite index and on disk paths
 

@@ -64,7 +64,7 @@ in `app.rs` encode it.
 
 ## Current result
 
-**134 steps compared, 12 differences, every one deliberate.** The instruction is now to
+**134 steps compared, 13 differences, every one deliberate.** The instruction is now to
 fix what can be fixed on the Rust side rather than mirror a defect, so this list is a
 changelog of intentional improvements, not a parity debt.
 
@@ -86,6 +86,8 @@ codes to 500. That was wrong, it defaults to 400. The harness caught it.
 | Step(s) | Reference | Here | Why |
 |---|---|---|---|
 | `rest_list_a_file` | HTTP 200 with `{"entries": []}` | HTTP 400 `ERR_INVALID_ARGUMENT` | Listing a file is a caller mistake. Answering 200 with an empty listing invents a directory that does not exist and hides the bug. |
+| `rest_delete` | `{"deleted": true}`, no trash, no audit, a whole tree removed without `recursive` | the tool payload `{path, trashed, trash_path}`, honouring `recursive` and `trash` | The REST route called the volume client directly, so the same delete through two doors behaved differently and the REST door was the destructive one: it skipped the trash, ignored `safety.allow_hard_delete`, needed no `recursive`, and left no audit entry. `move` had the same shape of bug (no no clobber). Both now go through the engine. |
+| (unit tested) `fs.move` with `overwrite: true` | always failed with `ERR_NO_CLOBBER` | replaces the destination | The flag was checked and then ignored: the metadata store refuses to rename onto an existing path, so `overwrite` was dead code on both surfaces. The destination is now cleared first, GCing what it referenced. |
 | `find_refs_py` | references ordered `[3, 2]` | `[2, 3]` | The reference order is a tree-sitter traversal artifact. Ascending by line is deterministic and useful. |
 | (unit tested) `fs.tree` at exactly the node cap | one node short, flagged `truncated` | complete, `truncated: false` | The cap was checked after incrementing, so the cap-th node was dropped and a tree that fitted was reported as incomplete. |
 | `swagger_json` | `/api/fs/roots` absent | documented | ASP.NET excludes terminal `RequestDelegate` handlers from its OpenAPI document, so the reference page hides a route it serves. |

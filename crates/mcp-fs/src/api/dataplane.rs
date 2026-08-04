@@ -383,18 +383,24 @@ async fn delete(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    guarded(state, headers, mount, |r| async move {
+    guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        if !r.client.exists(&norm).await? {
-            return Ok(not_found_detail(format!("not found: {norm}")));
-        }
-        if r.client.is_dir(&norm).await? {
-            r.client.delete_tree(&norm).await?;
-        } else {
-            r.client.delete_file(&norm).await?;
-        }
-        Ok(Json(json!({"path": norm, "deleted": true})).into_response())
+        // Route through the engine like every other operation. Calling the volume
+        // client directly (as this did) skipped the trash, ignored
+        // safety.allow_hard_delete, let a whole tree go without `recursive`, and
+        // wrote no audit entry: the same delete through two doors behaved
+        // differently, and the REST door was the destructive one.
+        fs_ops::delete_path(
+            &r.client,
+            r.safety(),
+            &r.person,
+            &r.mount,
+            &norm,
+            a.bool_or("recursive", false),
+            a.bool_or("trash", true),
+        )
+        .await
     })
     .await
 }
@@ -406,15 +412,22 @@ async fn move_path(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    guarded(state, headers, mount, |r| async move {
+    guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let src = r.norm(&a.str("source")?)?;
         let dst = r.norm(&a.str("destination")?)?;
-        if !r.client.exists(&src).await? {
-            return Ok(not_found_detail(format!("not found: {src}")));
-        }
-        r.client.rename(&src, &dst).await?;
-        Ok(Json(json!({"source": src, "destination": dst})).into_response())
+        // Same reasoning as delete: the engine owns the no clobber rule and the audit
+        // entry, so the REST and MCP doors cannot drift apart.
+        fs_ops::move_path(
+            &r.client,
+            r.safety(),
+            &r.person,
+            &r.mount,
+            &src,
+            &dst,
+            a.bool_or("overwrite", false),
+        )
+        .await
     })
     .await
 }
@@ -1692,27 +1705,69 @@ mod tests {
         assert_eq!(v["source"], "/log2.txt");
         assert_eq!(v["destination"], "/moved.txt");
 
+        // The engine payload: soft delete by default, so the file moves to the trash
+        // instead of vanishing. The REST door used to bypass this entirely.
         let (status, v) = h.post(&u("delete"), json!({"path": "/moved.txt"})).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(v["deleted"], true);
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        assert_eq!(v["path"], "/moved.txt");
+        assert_eq!(v["trashed"], true);
+        let trashed = v["trash_path"].as_str().expect("a trash path").to_string();
 
         let (_, v) = h.get(&u("exists?path=/moved.txt")).await;
-        assert_eq!(v["exists"], false);
+        assert_eq!(v["exists"], false, "gone from its original path");
+        let (_, v) = h.get(&format!("{}?path={}", u("exists"), trashed)).await;
+        assert_eq!(v["exists"], true, "recoverable from the trash");
     }
 
-    /// The bytes plane short circuits with the C# `{detail}` body, not `{error}`.
+    /// Delete and move go through the engine, so a missing path is the standard
+    /// `ERR_NOT_FOUND` body rather than a bespoke short circuit.
     #[tokio::test]
-    async fn deleting_or_moving_a_missing_path_is_404_with_a_detail_body() {
+    async fn deleting_or_moving_a_missing_path_is_404_with_the_error_code() {
         let h = Harness::new().await;
         let (status, v) = h.post(&u("delete"), json!({"path": "/nope.txt"})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(v["detail"], "not found: /nope.txt");
+        assert_eq!(v["error"], code::NOT_FOUND);
 
         let (status, v) = h
             .post(&u("move"), json!({"source": "/nope.txt", "destination": "/x.txt"}))
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(v["detail"], "not found: /nope.txt");
+        assert_eq!(v["error"], code::NOT_FOUND);
+    }
+
+    /// A directory needs `recursive`, exactly like the tool. The REST door used to
+    /// delete a whole tree without asking, and without an audit entry.
+    #[tokio::test]
+    async fn deleting_a_directory_requires_recursive() {
+        let h = Harness::new().await;
+        h.seed("/d/inner/f.txt", "x").await;
+        let (status, v) = h.post(&u("delete"), json!({"path": "/d"})).await;
+        assert!(
+            (400..500).contains(&status.as_u16()),
+            "a non empty directory must be refused without recursive, got {status} {v}"
+        );
+        let (_, v) = h.get(&u("exists?path=/d/inner/f.txt")).await;
+        assert_eq!(v["exists"], true, "nothing was deleted");
+    }
+
+    /// Move honours no clobber, like the tool.
+    #[tokio::test]
+    async fn moving_onto_an_existing_path_needs_overwrite() {
+        let h = Harness::new().await;
+        h.seed("/from.txt", "a").await;
+        h.seed("/onto.txt", "b").await;
+        let (status, _) = h
+            .post(&u("move"), json!({"source": "/from.txt", "destination": "/onto.txt"}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = h
+            .post(
+                &u("move"),
+                json!({"source": "/from.txt", "destination": "/onto.txt", "overwrite": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1732,9 +1787,10 @@ mod tests {
     async fn delete_removes_a_directory_recursively() {
         let h = Harness::new().await;
         h.seed("/d/inner/f.txt", "x").await;
-        let (status, v) = h.post(&u("delete"), json!({"path": "/d"})).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(v["deleted"], true);
+        let (status, v) =
+            h.post(&u("delete"), json!({"path": "/d", "recursive": true})).await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        assert_eq!(v["path"], "/d");
         let (_, v) = h.get(&u("exists?path=/d/inner/f.txt")).await;
         assert_eq!(v["exists"], false);
     }
