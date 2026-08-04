@@ -1,0 +1,22 @@
+# Rust build output
+/target
+**/target
+
+# Runtime state (SQLite metadata, local blobs, admin db, git, oauth, trash)
+state/
+
+# Dev signing keys (generate with `mcp-fs keys`)
+.keys/
+
+# Local secrets sourced by run.sh -- never commit real secrets
+.env
+
+# Local-only config (personal working copy; copy from a *.yaml.template)
+config/local.yaml
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/

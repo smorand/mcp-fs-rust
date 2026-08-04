@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = ["crates/mcp-fs", "crates/parity-harness"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/smorand/mcp-fs-rust"
+
+[workspace.dependencies]
+# ── async / http ───────────────────────────────────────────────────────────────
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "sync", "time"] }
+axum = { version = "0.8", features = ["multipart", "json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = "1"
+http = "1"
+bytes = "1"
+
+# ── serialization / config ─────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+schemars = "1"
+
+# ── storage ────────────────────────────────────────────────────────────────────
+rusqlite = { version = "0.37", features = ["bundled"] }
+aws-sdk-s3 = "1"
+aws-config = "1"
+aws-credential-types = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+# ── identity ───────────────────────────────────────────────────────────────────
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+
+# ── git ────────────────────────────────────────────────────────────────────────
+git2 = "0.20"
+
+# ── documents / search ─────────────────────────────────────────────────────────
+regex = "1"
+globset = "0.4"
+similar = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# ── crypto (oauth token at rest) ───────────────────────────────────────────────
+aes-gcm = "0.10"
+base64 = "0.22"
+
+# ── http client (device flow, ocr) ─────────────────────────────────────────────
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+
+# ── openapi ────────────────────────────────────────────────────────────────────
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# ── cli / logging / misc ───────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "2"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+futures = "0.3"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
