@@ -1,5 +1,13 @@
 //! Local filesystem blob backend: content-addressed files under a per-volume dir.
-//! Port of the C# `Storage/LocalBlobStore.cs`. Layout: `{dir}/{bucket}/{sha256}`.
+//! Port of the C# `Storage/LocalBlobStore.cs`.
+//!
+//! Layout: `{dir}/{bucket}/{sha[..2]}/{sha}`. The two character shard directory is
+//! part of the on-disk contract: a volume written by the C# implementation must be
+//! readable here and vice versa, so it is NOT an implementation detail.
+//!
+//! Known latent issue inherited from the C#: a git object key is `git:{sha}`, and a
+//! colon is illegal in an NTFS filename, so the git subsystem on a Windows host needs
+//! the S3 backend (or a key mapping landed in both implementations at once).
 
 use crate::errors::{Result, ToolError};
 use crate::storage::traits::BlobBackend;
@@ -16,22 +24,28 @@ impl LocalBlobStore {
         Self { root: dir.as_ref().join(bucket) }
     }
 
+    /// `{root}/{first two chars}/{key}`. Keys shorter than two characters are kept
+    /// flat rather than panicking; only fixed length hashes reach this in practice.
     fn path_for(&self, sha256: &str) -> PathBuf {
-        self.root.join(sha256)
+        if sha256.len() < 2 {
+            return self.root.join(sha256);
+        }
+        self.root.join(&sha256[..2]).join(sha256)
     }
 }
 
 #[async_trait]
 impl BlobBackend for LocalBlobStore {
     async fn put(&self, sha256: &str, data: &[u8]) -> Result<()> {
-        tokio::fs::create_dir_all(&self.root).await?;
         let final_path = self.path_for(sha256);
+        let dir = final_path.parent().unwrap_or(&self.root).to_path_buf();
+        tokio::fs::create_dir_all(&dir).await?;
         // Content-addressed: an existing blob with this sha has identical bytes.
         if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
             return Ok(());
         }
         // Write to a temp name then rename, so a reader never sees a partial blob.
-        let tmp = self.root.join(format!(".tmp-{}-{}", sha256, uuid::Uuid::new_v4()));
+        let tmp = dir.join(format!(".tmp-{}-{}", sha256, uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp, data).await?;
         match tokio::fs::rename(&tmp, &final_path).await {
             Ok(()) => Ok(()),
@@ -166,12 +180,45 @@ mod tests {
     #[tokio::test]
     async fn no_temp_files_left_behind() {
         let (d, s) = store();
-        s.put("a", b"1").await.unwrap();
-        let mut entries = tokio::fs::read_dir(d.path().join("mcpfs-test")).await.unwrap();
+        let sha = "abcdef0123";
+        s.put(sha, b"1").await.unwrap();
+        let shard = d.path().join("mcpfs-test").join("ab");
+        let mut entries = tokio::fs::read_dir(&shard).await.unwrap();
         let mut names = Vec::new();
         while let Some(e) = entries.next_entry().await.unwrap() {
             names.push(e.file_name().to_string_lossy().to_string());
         }
-        assert_eq!(names, vec!["a"], "only the final blob should remain");
+        assert_eq!(names, vec![sha], "only the final blob should remain");
+    }
+
+    /// The two character shard directory is part of the on-disk contract shared with
+    /// the C# implementation. A volume written by one must be readable by the other,
+    /// so this layout is asserted explicitly.
+    #[tokio::test]
+    async fn on_disk_layout_is_sharded_by_first_two_chars() {
+        let (d, s) = store();
+        let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        s.put(sha, b"hello").await.unwrap();
+
+        let expected = d.path().join("mcpfs-test").join("2c").join(sha);
+        assert!(expected.exists(), "expected sharded path {}", expected.display());
+        assert!(
+            !d.path().join("mcpfs-test").join(sha).exists(),
+            "a flat layout would break compatibility with existing C# volumes"
+        );
+        assert_eq!(s.get(sha, 0, None).await.unwrap(), b"hello");
+    }
+
+    /// Blobs whose shard prefix collides still coexist.
+    #[tokio::test]
+    async fn blobs_sharing_a_shard_coexist() {
+        let (_d, s) = store();
+        s.put("ab1111", b"one").await.unwrap();
+        s.put("ab2222", b"two").await.unwrap();
+        assert_eq!(s.get("ab1111", 0, None).await.unwrap(), b"one");
+        assert_eq!(s.get("ab2222", 0, None).await.unwrap(), b"two");
+        s.delete("ab1111").await.unwrap();
+        assert!(!s.exists("ab1111").await.unwrap());
+        assert!(s.exists("ab2222").await.unwrap(), "sibling in the same shard survives");
     }
 }

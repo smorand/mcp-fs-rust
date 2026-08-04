@@ -1,0 +1,6426 @@
+{
+  "base": "http://127.0.0.1:5002",
+  "project": "parity-probe",
+  "steps": {
+    "admin_list_all_projects": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "projects": [
+                  {
+                    "project_id": "docling-scripts",
+                    "owner": "seb.morand@gmail.com",
+                    "created_at": "<volatile>"
+                  },
+                  {
+                    "project_id": "mcp-fs",
+                    "owner": "user",
+                    "created_at": "<volatile>"
+                  },
+                  {
+                    "project_id": "parity-probe",
+                    "owner": "admin@example.com",
+                    "created_at": "<volatile>"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1006,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "admin_list_members": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "project_id": "parity-probe",
+                "members": [
+                  {
+                    "person": "admin@example.com",
+                    "role": "owner",
+                    "added_by": "admin@example.com"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1008,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "admin_list_projects": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "projects": [
+                  {
+                    "project_id": "parity-probe",
+                    "owner": "admin@example.com",
+                    "created_at": "<volatile>",
+                    "is_owner": true
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1005,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "admin_list_users": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "users": [
+                  {
+                    "person": "admin@example.com",
+                    "is_admin": true
+                  },
+                  {
+                    "person": "seb.morand@gmail.com",
+                    "is_admin": false
+                  },
+                  {
+                    "person": "user",
+                    "is_admin": false
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1007,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "append_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "bytes_appended": 5
+              }
+            }
+          ]
+        },
+        "id": 1041,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "audit_log": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "entries": [
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "edit",
+                    "path": "/a.txt",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/dup.txt",
+                    "detail": "11 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "edit",
+                    "path": "/dup.txt",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "append",
+                    "path": "/a.txt",
+                    "detail": "5 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "insert_at_line",
+                    "path": "/a.txt",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/guard.txt",
+                    "detail": "1 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "edit",
+                    "path": "/guard.txt",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "mkdir",
+                    "path": "/src",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "mkdir",
+                    "path": "/src",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/src/app.py",
+                    "detail": "48 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/src/lib.rs",
+                    "detail": "24 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/.hidden",
+                    "detail": "1 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "copy",
+                    "path": "/a.txt",
+                    "detail": "-> /copy.txt"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "copy",
+                    "path": "/src",
+                    "detail": "-> /src-copy"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "move",
+                    "path": "/copy.txt",
+                    "detail": "-> /moved.txt"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "delete",
+                    "path": "/moved.txt",
+                    "detail": "-> /.mcp_trash/1785863086054__moved.txt"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "delete",
+                    "path": "/src-copy",
+                    "detail": "-> /.mcp_trash/1785863086056__src-copy"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/multi.txt",
+                    "detail": "14 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "multi_edit",
+                    "path": "/multi.txt",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "search_replace",
+                    "path": "/multi.txt",
+                    "detail": ""
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1099,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "audit_log_limit": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "entries": [
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "write",
+                    "path": "/multi.txt",
+                    "detail": "14 bytes"
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "multi_edit",
+                    "path": "/multi.txt",
+                    "detail": ""
+                  },
+                  {
+                    "timestamp": "<volatile>",
+                    "op": "search_replace",
+                    "path": "/multi.txt",
+                    "detail": ""
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1100,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "copy_file": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "source": "/a.txt",
+                "destination": "/copy.txt"
+              }
+            }
+          ]
+        },
+        "id": 1073,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "copy_noclobber": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_NO_CLOBBER>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1074,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "copy_tree": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "source": "/src",
+                "destination": "/src-copy"
+              }
+            }
+          ]
+        },
+        "id": 1075,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "count_lines_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "total_lines": 2
+              }
+            }
+          ]
+        },
+        "id": 1024,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "create_bad_hyphen": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_INVALID_ARGUMENT>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1011,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "create_bad_long": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_INVALID_ARGUMENT>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1010,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "create_bad_short": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_INVALID_ARGUMENT>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1009,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "create_duplicate": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_PROJECT_EXISTS>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1012,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "create_empty": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/empty.txt",
+                "created": true
+              }
+            }
+          ]
+        },
+        "id": 1030,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "delete_dir_nonrecursive": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_INVALID_ARGUMENT>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1082,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "delete_dir_recursive": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/src-copy",
+                "trashed": true,
+                "trash_path": "/.mcp_trash/1785863086056__src-copy"
+              }
+            }
+          ]
+        },
+        "id": 1083,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "delete_missing": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_NOT_FOUND>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1081,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "delete_moved": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/moved.txt",
+                "trashed": true,
+                "trash_path": "/.mcp_trash/1785863086054__moved.txt"
+              }
+            }
+          ]
+        },
+        "id": 1079,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "edit_ambiguous": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_AMBIGUOUS_MATCH>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1039,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "edit_apply": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "applied": true,
+                "diff": "--- /a.txt\n+++ /a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n"
+              }
+            }
+          ]
+        },
+        "id": 1034,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "edit_dry_run": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "applied": false,
+                "diff": "--- /a.txt\n+++ /a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n"
+              }
+            }
+          ]
+        },
+        "id": 1033,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "edit_no_match": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_NO_MATCH>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1036,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "edit_replace_all": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/dup.txt",
+                "applied": true,
+                "diff": "--- /dup.txt\n+++ /dup.txt\n@@ -1 +1 @@\n-dup dup dup\n+x x x\n"
+              }
+            }
+          ]
+        },
+        "id": 1040,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "edit_without_read": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/guard.txt",
+                "applied": true,
+                "diff": "--- /guard.txt\n+++ /guard.txt\n@@ -1 +1 @@\n-g\n+h\n"
+              }
+            }
+          ]
+        },
+        "id": 1045,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "exists_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "exists": true,
+                "kind": "file"
+              }
+            }
+          ]
+        },
+        "id": 1028,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "exists_after_delete": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "exists": false,
+                "kind": null
+              }
+            }
+          ]
+        },
+        "id": 1080,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "exists_missing": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "exists": false,
+                "kind": null
+              }
+            }
+          ]
+        },
+        "id": 1029,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "find_def_py": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "definitions": [
+                  {
+                    "path": "/src/app.py",
+                    "name": "hello",
+                    "kind": "function_definition",
+                    "line": 1
+                  },
+                  {
+                    "path": "/src/lib.rs",
+                    "name": "hello",
+                    "kind": "function_item",
+                    "line": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1071,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "find_refs_py": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "references": [
+                  {
+                    "path": "/src/app.py",
+                    "line": 3,
+                    "kind": "identifier"
+                  },
+                  {
+                    "path": "/src/app.py",
+                    "line": 2,
+                    "kind": "identifier"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1072,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "glob_all": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  "/.hidden",
+                  "/src/lib.rs",
+                  "/src/app.py",
+                  "/guard.txt",
+                  "/a.txt",
+                  "/dup.txt",
+                  "/empty.txt"
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1060,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "glob_excl_string": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  "/.hidden",
+                  "/src/lib.rs",
+                  "/guard.txt",
+                  "/a.txt",
+                  "/dup.txt",
+                  "/empty.txt"
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1062,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "glob_py": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  "/src/app.py"
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1061,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "grep_content": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  {
+                    "path": "/src/app.py",
+                    "line": 2,
+                    "text": "    total = 1",
+                    "context": null
+                  },
+                  {
+                    "path": "/src/app.py",
+                    "line": 3,
+                    "text": "    return total",
+                    "context": null
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1063,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "grep_context": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  {
+                    "path": "/src/app.py",
+                    "line": 2,
+                    "text": "    total = 1",
+                    "context": [
+                      "def hello(name):",
+                      "    total = 1",
+                      "    return total"
+                    ]
+                  },
+                  {
+                    "path": "/src/app.py",
+                    "line": 3,
+                    "text": "    return total",
+                    "context": [
+                      "    total = 1",
+                      "    return total"
+                    ]
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1068,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "grep_count": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "count": 2,
+                "files": 1
+              }
+            }
+          ]
+        },
+        "id": 1065,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "grep_files": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "files": [
+                  "/src/app.py"
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1064,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "grep_icase": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  {
+                    "path": "/src/app.py",
+                    "line": 2,
+                    "text": "    total = 1",
+                    "context": null
+                  },
+                  {
+                    "path": "/src/app.py",
+                    "line": 3,
+                    "text": "    return total",
+                    "context": null
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1067,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "grep_literal": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "matches": [
+                  {
+                    "path": "/src/app.py",
+                    "line": 2,
+                    "text": "    total = 1",
+                    "context": null
+                  },
+                  {
+                    "path": "/src/app.py",
+                    "line": 3,
+                    "text": "    return total",
+                    "context": null
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1066,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "hash_a_md5": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "algo": "md5",
+                "hash": "0f723ae7f9bf07744445e93ac5595156",
+                "size": 12
+              }
+            }
+          ]
+        },
+        "id": 1026,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "hash_a_sha1": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "algo": "sha1",
+                "hash": "58853e8a5e8272b1012f9a52a80758b27bd0d3cb",
+                "size": 12
+              }
+            }
+          ]
+        },
+        "id": 1027,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "hash_a_sha256": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "algo": "sha256",
+                "hash": "4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92",
+                "size": 12
+              }
+            }
+          ]
+        },
+        "id": 1025,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "hash_unicode": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/uni.txt",
+                "algo": "sha256",
+                "hash": "b83499eee339776683bc0612d36cc6fde1d48c7ee18e70084f88cd78c8f1e361",
+                "size": 22
+              }
+            }
+          ]
+        },
+        "id": 1103,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "head_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\thello"
+              }
+            }
+          ]
+        },
+        "id": 1022,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "health": {
+      "status": 200,
+      "body": {
+        "status": "ok",
+        "version": "<volatile>"
+      },
+      "raw": null
+    },
+    "initialize": {
+      "status": 200,
+      "body": {
+        "result": {
+          "protocolVersion": "2024-11-05",
+          "capabilities": {
+            "logging": {},
+            "tools": {
+              "listChanged": true
+            }
+          },
+          "serverInfo": {
+            "name": "mcp-fs",
+            "version": "<volatile>"
+          }
+        },
+        "id": 1001,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "insert_at_line": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "applied": true,
+                "line": 1
+              }
+            }
+          ]
+        },
+        "id": 1042,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "list_allowed_roots": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "person": "admin@example.com",
+                "roots": [
+                  {
+                    "mount_id": "parity-probe",
+                    "root": "/",
+                    "owner": "admin@example.com"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1090,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "list_root": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "entries": [
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "src",
+                    "kind": "dir"
+                  }
+                ],
+                "total": 5
+              }
+            }
+          ]
+        },
+        "id": 1051,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "list_root_hidden": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "entries": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "src",
+                    "kind": "dir"
+                  }
+                ],
+                "total": 6
+              }
+            }
+          ]
+        },
+        "id": 1052,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "list_root_sizes": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "entries": [
+                  {
+                    "name": "a.txt",
+                    "kind": "file",
+                    "size": 22,
+                    "mtime": "<volatile>"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file",
+                    "size": 5,
+                    "mtime": "<volatile>"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file",
+                    "size": 0,
+                    "mtime": "<volatile>"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file",
+                    "size": 1,
+                    "mtime": "<volatile>"
+                  },
+                  {
+                    "name": "src",
+                    "kind": "dir",
+                    "size": 0,
+                    "mtime": "<volatile>"
+                  }
+                ],
+                "total": 5
+              }
+            }
+          ]
+        },
+        "id": 1053,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "missing_required_arg": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "An error occurred invoking 'fs.read'."
+            }
+          ],
+          "isError": true
+        },
+        "id": 1088,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "mkdir_existing": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/src",
+                "created": true
+              }
+            }
+          ]
+        },
+        "id": 1047,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "mkdir_src": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/src",
+                "created": true
+              }
+            }
+          ]
+        },
+        "id": 1046,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "move_file": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "source": "/copy.txt",
+                "destination": "/moved.txt"
+              }
+            }
+          ]
+        },
+        "id": 1076,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "move_missing": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_NOT_FOUND>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1077,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "multi_edit_apply": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/multi.txt",
+                "applied": true,
+                "edits": 2,
+                "diff": "--- /multi.txt\n+++ /multi.txt\n@@ -1,3 +1,3 @@\n-one\n-two\n+1\n+2\n three\n"
+              }
+            }
+          ]
+        },
+        "id": 1094,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "multi_edit_atomic_fail": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_NO_MATCH>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1096,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "multi_edit_dry": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/multi.txt",
+                "applied": false,
+                "edits": 2,
+                "diff": "--- /multi.txt\n+++ /multi.txt\n@@ -1,3 +1,3 @@\n-one\n-two\n+1\n+2\n three\n"
+              }
+            }
+          ]
+        },
+        "id": 1093,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\thello\n2\tworld",
+                "total_lines": 2,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1016,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_a_dir": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "An error occurred invoking 'fs.read'."
+            }
+          ],
+          "isError": true
+        },
+        "id": 1087,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_a_paged": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "2\tworld",
+                "total_lines": 2,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1018,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_a_plain": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "hello\nworld",
+                "total_lines": 2,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1017,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_after_atomic_fail": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\t1\n2\t2\n3\tthree",
+                "total_lines": 3,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1097,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_after_edit": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\thello\n2\trust",
+                "total_lines": 2,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1035,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_after_insert": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\tfirst\n2\thello\n3\trust\n4\ttail",
+                "total_lines": 4,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1043,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_after_multi": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\t1\n2\t2\n3\tthree",
+                "total_lines": 3,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1095,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_bytes_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "base64": "aGVsbG8Kd29ybGQK",
+                "mime_type": "text/plain",
+                "length": 12
+              }
+            }
+          ]
+        },
+        "id": 1019,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_bytes_range": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "base64": "bGxv",
+                "mime_type": "text/plain",
+                "length": 3
+              }
+            }
+          ]
+        },
+        "id": 1020,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_dup": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\tdup dup dup",
+                "total_lines": 1,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1038,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_empty": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "",
+                "total_lines": 0,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1031,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_lines_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\thello\n2\tworld",
+                "total_lines": 2
+              }
+            }
+          ]
+        },
+        "id": 1021,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_many": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "files": [
+                  {
+                    "path": "/a.txt",
+                    "content": "1\tfirst\n2\thello\n3\trust\n4\ttail",
+                    "truncated": false
+                  },
+                  {
+                    "path": "/src/app.py",
+                    "content": "1\tdef hello(name):\n2\t    total = 1\n3\t    return total",
+                    "truncated": false
+                  },
+                  {
+                    "path": "/does-not-exist",
+                    "error": "not found: /does-not-exist"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1069,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_missing": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "An error occurred invoking 'fs.read'."
+            }
+          ],
+          "isError": true
+        },
+        "id": 1084,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_multi": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\tone\n2\ttwo\n3\tthree",
+                "total_lines": 3,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1092,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_section": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\tdef hello(name):\n2\t    total = 1\n3\t    return total",
+                "start_line": 1,
+                "end_line": 3
+              }
+            }
+          ]
+        },
+        "id": 1070,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_special_name": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\tx",
+                "total_lines": 1,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1105,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "read_unicode": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "1\théllo 🌍 日本語",
+                "total_lines": 1,
+                "truncated": false,
+                "next_offset": null
+              }
+            }
+          ]
+        },
+        "id": 1102,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "rest_audit": {
+      "status": 200,
+      "body": {
+        "entries": [
+          {
+            "timestamp": "<volatile>",
+            "op": "edit",
+            "path": "/dup.txt",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "append",
+            "path": "/a.txt",
+            "detail": "5 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "insert_at_line",
+            "path": "/a.txt",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/guard.txt",
+            "detail": "1 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "edit",
+            "path": "/guard.txt",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "mkdir",
+            "path": "/src",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "mkdir",
+            "path": "/src",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/src/app.py",
+            "detail": "48 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/src/lib.rs",
+            "detail": "24 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/.hidden",
+            "detail": "1 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "copy",
+            "path": "/a.txt",
+            "detail": "-> /copy.txt"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "copy",
+            "path": "/src",
+            "detail": "-> /src-copy"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "move",
+            "path": "/copy.txt",
+            "detail": "-> /moved.txt"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "delete",
+            "path": "/moved.txt",
+            "detail": "-> /.mcp_trash/1785863086054__moved.txt"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "delete",
+            "path": "/src-copy",
+            "detail": "-> /.mcp_trash/1785863086056__src-copy"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/multi.txt",
+            "detail": "14 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "multi_edit",
+            "path": "/multi.txt",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "search_replace",
+            "path": "/multi.txt",
+            "detail": ""
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/uni.txt",
+            "detail": "22 bytes"
+          },
+          {
+            "timestamp": "<volatile>",
+            "op": "write",
+            "path": "/a b&c'd.txt",
+            "detail": "1 bytes"
+          }
+        ]
+      },
+      "raw": null
+    },
+    "rest_copy": {
+      "status": 200,
+      "body": {
+        "source": "/rest.txt",
+        "destination": "/rest2.txt"
+      },
+      "raw": null
+    },
+    "rest_count_lines": {
+      "status": 200,
+      "body": {
+        "total_lines": 4
+      },
+      "raw": null
+    },
+    "rest_delete": {
+      "status": 200,
+      "body": {
+        "path": "/rest2.txt",
+        "deleted": true
+      },
+      "raw": null
+    },
+    "rest_exists": {
+      "status": 200,
+      "body": {
+        "exists": true,
+        "kind": "file"
+      },
+      "raw": null
+    },
+    "rest_forbidden_project": {
+      "status": 404,
+      "body": {
+        "error": "<error code=ERR_PROJECT_NOT_FOUND>",
+        "detail": "<error tool=no-such-project code=ERR_PROJECT_NOT_FOUND>"
+      },
+      "raw": null
+    },
+    "rest_glob": {
+      "status": 200,
+      "body": {
+        "matches": [
+          "/src/app.py"
+        ],
+        "truncated": false
+      },
+      "raw": null
+    },
+    "rest_grep": {
+      "status": 200,
+      "body": {
+        "matches": [
+          {
+            "path": "/src/app.py",
+            "line": 2,
+            "text": "    total = 1",
+            "context": null
+          },
+          {
+            "path": "/src/app.py",
+            "line": 3,
+            "text": "    return total",
+            "context": null
+          }
+        ],
+        "truncated": false
+      },
+      "raw": null
+    },
+    "rest_hash": {
+      "status": 200,
+      "body": {
+        "path": "/a.txt",
+        "algo": "sha256",
+        "hash": "66e89cc8d9d8b62666fc04da4dc819fafcbcd5b9d36487eeb2f1279c77f476ae",
+        "size": 22
+      },
+      "raw": null
+    },
+    "rest_head": {
+      "status": 200,
+      "body": {
+        "content": "1\tfirst"
+      },
+      "raw": null
+    },
+    "rest_list": {
+      "status": 200,
+      "body": {
+        "path": "/",
+        "entries": [
+          {
+            "name": ".mcp_trash",
+            "kind": "dir",
+            "size": 0,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "src",
+            "kind": "dir",
+            "size": 0,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": ".hidden",
+            "kind": "file",
+            "size": 1,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "a b&c'd.txt",
+            "kind": "file",
+            "size": 1,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "a.txt",
+            "kind": "file",
+            "size": 22,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "dup.txt",
+            "kind": "file",
+            "size": 5,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "empty.txt",
+            "kind": "file",
+            "size": 0,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "guard.txt",
+            "kind": "file",
+            "size": 1,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "multi.txt",
+            "kind": "file",
+            "size": 6,
+            "mtime": "<volatile>"
+          },
+          {
+            "name": "uni.txt",
+            "kind": "file",
+            "size": 22,
+            "mtime": "<volatile>"
+          }
+        ]
+      },
+      "raw": null
+    },
+    "rest_missing": {
+      "status": 500,
+      "body": {
+        "error": "<error code=ERR_INTERNAL_ERROR>"
+      },
+      "raw": null
+    },
+    "rest_mkdir": {
+      "status": 200,
+      "body": {
+        "path": "/rest-dir",
+        "created": true
+      },
+      "raw": null
+    },
+    "rest_read": {
+      "status": 200,
+      "body": {
+        "content": "1\tfirst\n2\thello\n3\trust\n4\ttail",
+        "total_lines": 4,
+        "truncated": false,
+        "next_offset": null
+      },
+      "raw": null
+    },
+    "rest_read_bytes": {
+      "status": 200,
+      "body": {
+        "base64": "Zmlycw==",
+        "mime_type": "text/plain",
+        "length": 4
+      },
+      "raw": null
+    },
+    "rest_read_written": {
+      "status": 200,
+      "body": {
+        "content": "1\tvia rest",
+        "total_lines": 1,
+        "truncated": false,
+        "next_offset": null
+      },
+      "raw": null
+    },
+    "rest_roots": {
+      "status": 200,
+      "body": {
+        "person": "admin@example.com",
+        "roots": [
+          {
+            "mount_id": "parity-probe",
+            "owner": "admin@example.com"
+          }
+        ]
+      },
+      "raw": null
+    },
+    "rest_stat": {
+      "status": 200,
+      "body": {
+        "path": "/a.txt",
+        "size": 22,
+        "mode": "0o644",
+        "kind": "file",
+        "mtime": "<volatile>",
+        "ctime": "<volatile>",
+        "atime": "<volatile>",
+        "uid": 1000,
+        "gid": 1000
+      },
+      "raw": null
+    },
+    "rest_tail": {
+      "status": 200,
+      "body": {
+        "content": "4\ttail"
+      },
+      "raw": null
+    },
+    "rest_tree": {
+      "status": 200,
+      "body": {
+        "path": "/",
+        "tree": [
+          {
+            "name": ".hidden",
+            "kind": "file"
+          },
+          {
+            "name": ".mcp_trash",
+            "kind": "dir",
+            "children": [
+              {
+                "name": "1785863086054__moved.txt",
+                "kind": "file"
+              },
+              {
+                "name": "1785863086056__src-copy",
+                "kind": "dir",
+                "children": [
+                  {
+                    "name": "app.py",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "lib.rs",
+                    "kind": "file"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "a b&c'd.txt",
+            "kind": "file"
+          },
+          {
+            "name": "a.txt",
+            "kind": "file"
+          },
+          {
+            "name": "dup.txt",
+            "kind": "file"
+          },
+          {
+            "name": "empty.txt",
+            "kind": "file"
+          },
+          {
+            "name": "guard.txt",
+            "kind": "file"
+          },
+          {
+            "name": "multi.txt",
+            "kind": "file"
+          },
+          {
+            "name": "src",
+            "kind": "dir",
+            "children": [
+              {
+                "name": "app.py",
+                "kind": "file"
+              },
+              {
+                "name": "lib.rs",
+                "kind": "file"
+              }
+            ]
+          },
+          {
+            "name": "uni.txt",
+            "kind": "file"
+          }
+        ],
+        "truncated": false
+      },
+      "raw": null
+    },
+    "rest_write": {
+      "status": 200,
+      "body": {
+        "path": "/rest.txt",
+        "bytes_written": 8,
+        "overwritten": false,
+        "diff": ""
+      },
+      "raw": null
+    },
+    "search_replace": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/multi.txt",
+                "applied": true,
+                "diff": "--- /multi.txt\n+++ /multi.txt\n@@ -1,3 +1,3 @@\n 1\n 2\n-three\n+3\n"
+              }
+            }
+          ]
+        },
+        "id": 1098,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "stat_empty": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/empty.txt",
+                "size": 0,
+                "mode": "0o644",
+                "kind": "file",
+                "mtime": "<volatile>",
+                "ctime": "<volatile>",
+                "atime": "<volatile>",
+                "uid": 1000,
+                "gid": 1000
+              }
+            }
+          ]
+        },
+        "id": 1032,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "stat_missing": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "An error occurred invoking 'fs.stat'."
+            }
+          ],
+          "isError": true
+        },
+        "id": 1085,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "stat_moved": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/moved.txt",
+                "size": 22,
+                "mode": "0o644",
+                "kind": "file",
+                "mtime": "<volatile>",
+                "ctime": "<volatile>",
+                "atime": "<volatile>",
+                "uid": 1000,
+                "gid": 1000
+              }
+            }
+          ]
+        },
+        "id": 1078,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "swagger_json": {
+      "status": 200,
+      "body": {
+        "openapi": "3.0.1",
+        "info": {
+          "title": "mcp-fs REST API",
+          "description": "The /api/fs data plane: bytes plane (upload/download/zip) plus full parity with the fs.* MCP tools. Auth: Bearer JWT in the Authorization or X-Forwarded-Authorization header.",
+          "version": "<volatile>"
+        },
+        "paths": {
+          "/health": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/list": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Flat directory listing with kinds and optional sizes.",
+              "description": "MCP tool: fs.list_dir. Flat directory listing with kinds and optional sizes.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to list.",
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/mkdir": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Create a directory (parents by default).",
+              "description": "MCP tool: fs.mkdir. Create a directory (parents by default).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/MkdirBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/delete": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Delete a path (moves to trash by default).",
+              "description": "MCP tool: fs.delete. Delete a path (moves to trash by default).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/DeleteBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/move": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Rename or relocate a path (no-clobber by default).",
+              "description": "MCP tool: fs.move. Rename or relocate a path (no-clobber by default).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/MoveBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/upload": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Upload one or more files (multipart form) into a directory.",
+              "description": "Upload one or more files (multipart form) into a directory.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/download": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Download a single file's raw bytes as an attachment.",
+              "description": "Download a single file's raw bytes as an attachment.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path of the file to download.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/download-zip": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Download a directory subtree as a zip archive.",
+              "description": "Download a directory subtree as a zip archive.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to archive (defaults to the volume root).",
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/read": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Read a text file with line-numbered, paged output.",
+              "description": "MCP tool: fs.read. Read a text file with line-numbered, paged output.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume, e.g. /src/app.py.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "offset_lines",
+                  "in": "query",
+                  "description": "0-based line offset to start reading from.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 0
+                  }
+                },
+                {
+                  "name": "limit_lines",
+                  "in": "query",
+                  "description": "Maximum number of lines to return.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 2000
+                  }
+                },
+                {
+                  "name": "line_numbered",
+                  "in": "query",
+                  "description": "Prefix each line with its 1-based line number.",
+                  "schema": {
+                    "type": "boolean",
+                    "default": true
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/read-bytes": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Read raw bytes (base64) with MIME type.",
+              "description": "MCP tool: fs.read_bytes. Read raw bytes (base64) with MIME type.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "offset_bytes",
+                  "in": "query",
+                  "description": "0-based byte offset to start reading from.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int64",
+                    "default": 0
+                  }
+                },
+                {
+                  "name": "length_bytes",
+                  "in": "query",
+                  "description": "Maximum number of bytes to return.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int64",
+                    "default": 65536
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/stat": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "POSIX metadata for a path.",
+              "description": "MCP tool: fs.stat. POSIX metadata for a path.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/exists": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Probe whether a path exists and its kind.",
+              "description": "MCP tool: fs.exists. Probe whether a path exists and its kind.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path to probe.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/hash": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Content hash (md5|sha1|sha256|sha512).",
+              "description": "MCP tool: fs.hash. Content hash (md5|sha1|sha256|sha512).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "algo",
+                  "in": "query",
+                  "description": "Hash algorithm: md5, sha1, sha256, or sha512.",
+                  "schema": {
+                    "type": "string",
+                    "default": "sha256"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/count-lines": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Count lines without returning content.",
+              "description": "MCP tool: fs.count_lines. Count lines without returning content.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/glob": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Find files by glob pattern, newest first (cap 100).",
+              "description": "MCP tool: fs.glob. Find files by glob pattern, newest first (cap 100).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "pattern",
+                  "in": "query",
+                  "description": "Glob pattern to match file paths, e.g. **/*.cs.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "root",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to search under.",
+                  "schema": {
+                    "type": "string",
+                    "default": "/"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/grep": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Search file contents (files|content|count modes).",
+              "description": "MCP tool: fs.grep. Search file contents (files|content|count modes).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "pattern",
+                  "in": "query",
+                  "description": "Search pattern; regex or literal depending on regex.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "root",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to search under.",
+                  "schema": {
+                    "type": "string",
+                    "default": "/"
+                  }
+                },
+                {
+                  "name": "include_glob",
+                  "in": "query",
+                  "description": "Glob limiting which files are searched.",
+                  "schema": {
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                {
+                  "name": "exclude_glob",
+                  "in": "query",
+                  "description": "Glob excluding files from the search.",
+                  "schema": {
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                {
+                  "name": "regex",
+                  "in": "query",
+                  "description": "Treat pattern as a regex when true, else a literal string.",
+                  "schema": {
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                {
+                  "name": "case_sensitive",
+                  "in": "query",
+                  "description": "Match case sensitively.",
+                  "schema": {
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                {
+                  "name": "output_mode",
+                  "in": "query",
+                  "description": "Output mode: files, content, or count.",
+                  "schema": {
+                    "type": "string",
+                    "default": "content"
+                  }
+                },
+                {
+                  "name": "context_lines",
+                  "in": "query",
+                  "description": "Lines of context around each match (content mode).",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 0
+                  }
+                },
+                {
+                  "name": "max_matches",
+                  "in": "query",
+                  "description": "Maximum number of matches to return.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 100
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/tree": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Recursive JSON tree to a maximum depth.",
+              "description": "MCP tool: fs.tree. Recursive JSON tree to a maximum depth.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to walk from.",
+                  "schema": {
+                    "type": "string",
+                    "default": "/"
+                  }
+                },
+                {
+                  "name": "max_depth",
+                  "in": "query",
+                  "description": "Maximum recursion depth to descend.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 3
+                  }
+                },
+                {
+                  "name": "with_sizes",
+                  "in": "query",
+                  "description": "Include size for each file node.",
+                  "schema": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/read-lines": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Read an inclusive line range [start_line, end_line].",
+              "description": "MCP tool: fs.read_lines. Read an inclusive line range [start_line, end_line].",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "start_line",
+                  "in": "query",
+                  "description": "First 1-based line to return (inclusive).",
+                  "required": true,
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32"
+                  }
+                },
+                {
+                  "name": "end_line",
+                  "in": "query",
+                  "description": "Last 1-based line to return (inclusive).",
+                  "required": true,
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/read-section": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Read the indentation block around an anchor line.",
+              "description": "MCP tool: fs.read_section. Read the indentation block around an anchor line.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "anchor_line",
+                  "in": "query",
+                  "description": "1-based line whose indentation block is returned.",
+                  "required": true,
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32"
+                  }
+                },
+                {
+                  "name": "max_lines",
+                  "in": "query",
+                  "description": "Maximum number of lines to return for the block.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 200
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/head": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "First N lines of a file.",
+              "description": "MCP tool: fs.head. First N lines of a file.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "lines",
+                  "in": "query",
+                  "description": "Number of leading lines to return.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 20
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/tail": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Last N lines of a file.",
+              "description": "MCP tool: fs.tail. Last N lines of a file.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "path",
+                  "in": "query",
+                  "description": "Absolute POSIX path within the volume.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "lines",
+                  "in": "query",
+                  "description": "Number of trailing lines to return.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 20
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/read-many": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Batch read several files with per-file error isolation.",
+              "description": "MCP tool: fs.read_many. Batch read several files with per-file error isolation.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ReadManyBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/copy": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Copy a file or tree (no-clobber by default).",
+              "description": "MCP tool: fs.copy. Copy a file or tree (no-clobber by default).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/CopyBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/write": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Create or overwrite a file (no-clobber by default, atomic).",
+              "description": "MCP tool: fs.write. Create or overwrite a file (no-clobber by default, atomic).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/WriteBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/append": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Append content to a file (optionally create it).",
+              "description": "MCP tool: fs.append. Append content to a file (optionally create it).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/AppendBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/create-empty": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Create an empty file (touch).",
+              "description": "MCP tool: fs.create_empty. Create an empty file (touch).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/CreateEmptyBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/edit": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Replace a unique string; dry_run returns the diff.",
+              "description": "MCP tool: fs.edit. Replace a unique string; dry_run returns the diff.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/EditBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/multi-edit": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Apply several edits atomically (all or nothing).",
+              "description": "MCP tool: fs.multi_edit. Apply several edits atomically (all or nothing).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/MultiEditBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/search-replace": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Replace a multi-line block (optional fuzzy match).",
+              "description": "MCP tool: fs.search_replace. Replace a multi-line block (optional fuzzy match).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/SearchReplaceBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/insert-at-line": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Insert content before a 1-based line number.",
+              "description": "MCP tool: fs.insert_at_line. Insert content before a 1-based line number.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/InsertAtLineBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/apply-patch": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Apply a multi-file V4A patch within one volume.",
+              "description": "MCP tool: fs.apply_patch. Apply a multi-file V4A patch within one volume.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ApplyPatchBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/extract-text": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it if already up to date. Returns md_path + a preview; read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR via a configured multimodal provider) and text; audio/video unsupported.",
+              "description": "MCP tool: fs.extract_text. Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it if already up to date. Returns md_path + a preview; read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR via a configured multimodal provider) and text; audio/video unsupported.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ExtractBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/write-docx": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Render Markdown into a .docx Word document and write it to the volume.",
+              "description": "MCP tool: fs.write_docx. Render Markdown into a .docx Word document and write it to the volume.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/WriteDocxBody"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/find-definition": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Find a symbol definition (language-aware).",
+              "description": "MCP tool: fs.find_definition. Find a symbol definition (language-aware).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "name",
+                  "in": "query",
+                  "description": "Symbol name to locate the definition of.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "root",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to search under.",
+                  "schema": {
+                    "type": "string",
+                    "default": "/"
+                  }
+                },
+                {
+                  "name": "kind",
+                  "in": "query",
+                  "description": "Optional symbol kind filter, e.g. function, class, method.",
+                  "schema": {
+                    "type": "string",
+                    "default": null
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/find-references": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Find identifier references (language-aware).",
+              "description": "MCP tool: fs.find_references. Find identifier references (language-aware).",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "name",
+                  "in": "query",
+                  "description": "Identifier name to find references to.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "root",
+                  "in": "query",
+                  "description": "Absolute POSIX directory to search under.",
+                  "schema": {
+                    "type": "string",
+                    "default": "/"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/api/fs/{mount_id}/audit-log": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "summary": "Recent mutations performed in this session.",
+              "description": "MCP tool: fs.audit_log. Recent mutations performed in this session.",
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "description": "Project/volume id the operation targets.",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "since",
+                  "in": "query",
+                  "description": "Only return entries at or after this Unix timestamp (seconds).",
+                  "schema": {
+                    "type": "number",
+                    "format": "double"
+                  }
+                },
+                {
+                  "name": "limit",
+                  "in": "query",
+                  "description": "Maximum number of recent entries to return.",
+                  "schema": {
+                    "type": "integer",
+                    "format": "int32",
+                    "default": 20
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/git/{mount_id}/info/refs": {
+            "get": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "name": "service",
+                  "in": "query",
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/git/{mount_id}/git-upload-pack": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          },
+          "/git/{mount_id}/git-receive-pack": {
+            "post": {
+              "tags": [
+                "mcp-fs"
+              ],
+              "parameters": [
+                {
+                  "name": "mount_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "OK"
+                }
+              }
+            }
+          }
+        },
+        "components": {
+          "schemas": {
+            "AppendBody": {
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "content": {
+                  "type": "string",
+                  "description": "Text content to append at the end of the file."
+                },
+                "create": {
+                  "type": "boolean",
+                  "description": "Create the file if it does not exist.",
+                  "default": false
+                }
+              }
+            },
+            "ApplyPatchBody": {
+              "required": [
+                "patch_text"
+              ],
+              "type": "object",
+              "properties": {
+                "patch_text": {
+                  "type": "string",
+                  "description": "Multi-file V4A patch text to apply within the volume."
+                }
+              }
+            },
+            "CopyBody": {
+              "required": [
+                "source",
+                "destination"
+              ],
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Absolute POSIX source path to copy."
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Absolute POSIX destination path."
+                },
+                "overwrite": {
+                  "type": "boolean",
+                  "description": "Allow overwriting an existing destination (default no-clobber).",
+                  "default": false
+                },
+                "recursive": {
+                  "type": "boolean",
+                  "description": "Required to copy a directory tree.",
+                  "default": false
+                }
+              }
+            },
+            "CreateEmptyBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the file to create."
+                },
+                "exist_ok": {
+                  "type": "boolean",
+                  "description": "Succeed silently if the file already exists.",
+                  "default": false
+                }
+              }
+            },
+            "DeleteBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path to delete."
+                }
+              }
+            },
+            "EditBody": {
+              "required": [
+                "path",
+                "old_string",
+                "new_string"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "old_string": {
+                  "type": "string",
+                  "description": "Exact text to find; must be unique unless replace_all is set."
+                },
+                "new_string": {
+                  "type": "string",
+                  "description": "Replacement text substituted for old_string."
+                },
+                "replace_all": {
+                  "type": "boolean",
+                  "description": "Replace every occurrence instead of requiring a unique match.",
+                  "default": false
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Return the diff without writing changes.",
+                  "default": false
+                }
+              }
+            },
+            "EditSpec": {
+              "type": "object",
+              "properties": {
+                "old_string": {
+                  "type": "string"
+                },
+                "new_string": {
+                  "type": "string"
+                },
+                "replace_all": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "ExtractBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the source document."
+                },
+                "max_chars": {
+                  "type": "integer",
+                  "description": "Maximum characters of Markdown to store.",
+                  "format": "int32",
+                  "default": 200000
+                },
+                "preview_chars": {
+                  "type": "integer",
+                  "description": "Number of leading characters returned as a preview.",
+                  "format": "int32",
+                  "default": 4000
+                },
+                "ocr": {
+                  "type": "boolean",
+                  "description": "Enable OCR for images via a configured multimodal provider.",
+                  "default": true
+                },
+                "refresh": {
+                  "type": "boolean",
+                  "description": "Force re-extraction even if the companion .md is up to date.",
+                  "default": false
+                }
+              }
+            },
+            "InsertAtLineBody": {
+              "required": [
+                "path",
+                "line",
+                "content"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "line": {
+                  "type": "integer",
+                  "description": "1-based line number to insert content before.",
+                  "format": "int32"
+                },
+                "content": {
+                  "type": "string",
+                  "description": "Text content to insert."
+                }
+              }
+            },
+            "MkdirBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the directory to create."
+                }
+              }
+            },
+            "MoveBody": {
+              "required": [
+                "source",
+                "destination"
+              ],
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Absolute POSIX source path to move."
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Absolute POSIX destination path."
+                }
+              }
+            },
+            "MultiEditBody": {
+              "required": [
+                "path",
+                "edits"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "edits": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EditSpec"
+                  },
+                  "description": "Ordered edits (old_string, new_string, replace_all) applied atomically."
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Return the diff without writing changes.",
+                  "default": false
+                }
+              }
+            },
+            "ReadManyBody": {
+              "required": [
+                "paths"
+              ],
+              "type": "object",
+              "properties": {
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Absolute POSIX paths to read, one entry per file."
+                },
+                "per_file_cap_lines": {
+                  "type": "integer",
+                  "description": "Maximum number of lines returned per file.",
+                  "format": "int32",
+                  "default": 500
+                }
+              }
+            },
+            "SearchReplaceBody": {
+              "required": [
+                "path",
+                "search_block",
+                "replace_block"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "search_block": {
+                  "type": "string",
+                  "description": "Multi-line block of text to locate."
+                },
+                "replace_block": {
+                  "type": "string",
+                  "description": "Multi-line block that replaces search_block."
+                },
+                "fuzzy": {
+                  "type": "boolean",
+                  "description": "Allow whitespace tolerant (fuzzy) matching of search_block.",
+                  "default": false
+                }
+              }
+            },
+            "WriteBody": {
+              "required": [
+                "path",
+                "content"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume, e.g. /src/app.py."
+                },
+                "content": {
+                  "type": "string",
+                  "description": "Full text content to write to the file."
+                },
+                "overwrite": {
+                  "type": "boolean",
+                  "description": "Allow overwriting an existing file (default no-clobber).",
+                  "default": false
+                },
+                "create_parents": {
+                  "type": "boolean",
+                  "description": "Create missing parent directories.",
+                  "default": true
+                }
+              }
+            },
+            "WriteDocxBody": {
+              "required": [
+                "path",
+                "markdown"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the .docx file to write."
+                },
+                "markdown": {
+                  "type": "string",
+                  "description": "Markdown source rendered into the Word document."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Optional document title.",
+                  "default": null,
+                  "nullable": true
+                },
+                "overwrite": {
+                  "type": "boolean",
+                  "description": "Allow overwriting an existing file (default no-clobber).",
+                  "default": false
+                }
+              }
+            }
+          },
+          "securitySchemes": {
+            "Bearer": {
+              "type": "http",
+              "description": "RS256 JWT. Sent as 'Authorization: Bearer <token>' (or X-Forwarded-Authorization when behind a gateway).",
+              "scheme": "bearer",
+              "bearerFormat": "JWT"
+            }
+          }
+        },
+        "tags": [
+          {
+            "name": "mcp-fs"
+          }
+        ]
+      },
+      "raw": null
+    },
+    "tail_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "content": "2\tworld"
+              }
+            }
+          ]
+        },
+        "id": 1023,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tools_list": {
+      "status": 200,
+      "body": {
+        "result": {
+          "tools": [
+            {
+              "name": "fs.read",
+              "description": "Read a text file with line-numbered, paged output.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume, e.g. /src/app.py.",
+                    "type": "string"
+                  },
+                  "offset_lines": {
+                    "description": "0-based line offset to start reading from.",
+                    "type": "integer",
+                    "default": 0
+                  },
+                  "limit_lines": {
+                    "description": "Maximum number of lines to return.",
+                    "type": "integer",
+                    "default": 2000
+                  },
+                  "line_numbered": {
+                    "description": "Prefix each line with its 1-based line number.",
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.read_many",
+              "description": "Batch read several files with per-file error isolation.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "paths": {
+                    "description": "Absolute POSIX paths to read, one entry per file.",
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "per_file_cap_lines": {
+                    "description": "Maximum number of lines returned per file.",
+                    "type": "integer",
+                    "default": 500
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "paths"
+                ]
+              }
+            },
+            {
+              "name": "admin.list_projects",
+              "description": "List projects the caller can access.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {}
+              }
+            },
+            {
+              "name": "fs.head",
+              "description": "First N lines of a file.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "lines": {
+                    "description": "Number of leading lines to return.",
+                    "type": "integer",
+                    "default": 20
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.grep",
+              "description": "Search file contents (files|content|count modes).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "description": "Search pattern; regex or literal depending on regex.",
+                    "type": "string"
+                  },
+                  "root": {
+                    "description": "Absolute POSIX directory to search under.",
+                    "type": "string",
+                    "default": "/"
+                  },
+                  "include_glob": {
+                    "description": "Glob limiting which files are searched.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "exclude_glob": {
+                    "description": "Glob excluding files from the search.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "regex": {
+                    "description": "Treat pattern as a regex when true, else a literal string.",
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "case_sensitive": {
+                    "description": "Match case sensitively.",
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "output_mode": {
+                    "description": "Output mode: files, content, or count.",
+                    "type": "string",
+                    "default": "content"
+                  },
+                  "context_lines": {
+                    "description": "Lines of context around each match (content mode).",
+                    "type": "integer",
+                    "default": 0
+                  },
+                  "max_matches": {
+                    "description": "Maximum number of matches to return.",
+                    "type": "integer",
+                    "default": 100
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "pattern"
+                ]
+              }
+            },
+            {
+              "name": "fs.count_lines",
+              "description": "Count lines without returning content.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.delete",
+              "description": "Delete a path (moves to trash by default).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path to delete.",
+                    "type": "string"
+                  },
+                  "recursive": {
+                    "description": "Required to delete a non-empty directory.",
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "trash": {
+                    "description": "Move to trash instead of hard deleting.",
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "admin.add_member",
+              "description": "Add a person to a project (owner or platform admin).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "project_id": {
+                    "description": "Id of the project to add the member to.",
+                    "type": "string"
+                  },
+                  "person": {
+                    "description": "Person id to add as a member.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "person"
+                ]
+              }
+            },
+            {
+              "name": "fs.apply_patch",
+              "description": "Apply a multi-file V4A patch within one volume.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "patch_text": {
+                    "description": "Multi-file V4A patch text to apply within the volume.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "patch_text"
+                ]
+              }
+            },
+            {
+              "name": "git.status",
+              "description": "Show HEAD, current branch, and all refs.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.move",
+              "description": "Rename or relocate a path (no-clobber by default).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "source": {
+                    "description": "Absolute POSIX source path to move.",
+                    "type": "string"
+                  },
+                  "destination": {
+                    "description": "Absolute POSIX destination path.",
+                    "type": "string"
+                  },
+                  "overwrite": {
+                    "description": "Allow overwriting an existing destination (default no-clobber).",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "source",
+                  "destination"
+                ]
+              }
+            },
+            {
+              "name": "git.auth_status",
+              "description": "Check authentication status for a provider (or all providers).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "description": "Provider to check: github or gitlab; omit to report all providers.",
+                    "type": "string",
+                    "default": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "admin.create_project",
+              "description": "Create a project for a designated owner and provision its volume (platform admin only).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "project_id": {
+                    "description": "New project id: 3 to 32 chars, lowercase letters, digits, hyphens, alphanumeric bounds.",
+                    "type": "string"
+                  },
+                  "owner": {
+                    "description": "Person id who owns the new project.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "owner"
+                ]
+              }
+            },
+            {
+              "name": "admin.list_members",
+              "description": "List members of a project (member or platform admin).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "project_id": {
+                    "description": "Id of the project whose members are listed.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.search_replace",
+              "description": "Replace a multi-line block (optional fuzzy match).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "search_block": {
+                    "description": "Multi-line block of text to locate.",
+                    "type": "string"
+                  },
+                  "replace_block": {
+                    "description": "Multi-line block that replaces search_block.",
+                    "type": "string"
+                  },
+                  "fuzzy": {
+                    "description": "Allow whitespace tolerant (fuzzy) matching of search_block.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "search_block",
+                  "replace_block"
+                ]
+              }
+            },
+            {
+              "name": "fs.write",
+              "description": "Create or overwrite a file (no-clobber by default, atomic).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume, e.g. /src/app.py.",
+                    "type": "string"
+                  },
+                  "content": {
+                    "description": "Full text content to write to the file.",
+                    "type": "string"
+                  },
+                  "overwrite": {
+                    "description": "Allow overwriting an existing file (default no-clobber).",
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "create_parents": {
+                    "description": "Create missing parent directories.",
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "content"
+                ]
+              }
+            },
+            {
+              "name": "admin.list_users",
+              "description": "List every known person and platform admins (platform admin only).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {}
+              }
+            },
+            {
+              "name": "fs.stat",
+              "description": "POSIX metadata for a path.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "git.blame",
+              "description": "Show who last modified each line of a file.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path of the file to blame.",
+                    "type": "string"
+                  },
+                  "ref_name": {
+                    "description": "Ref or commit to blame from; defaults to HEAD.",
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "git.auth",
+              "description": "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "description": "OAuth provider: github or gitlab.",
+                    "type": "string"
+                  },
+                  "instance_url": {
+                    "description": "Optional self-hosted instance URL (e.g. GitLab Enterprise).",
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "provider"
+                ]
+              }
+            },
+            {
+              "name": "git.log",
+              "description": "List commits. ref_name defaults to HEAD.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "ref_name": {
+                    "description": "Ref, branch, tag, or commit to start from; defaults to HEAD.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "limit": {
+                    "description": "Maximum number of commits to return.",
+                    "type": "integer",
+                    "default": 20
+                  },
+                  "path": {
+                    "description": "Optional path filter; only commits touching it are returned.",
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "git.init",
+              "description": "Initialize the volume as a git repository.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.extract_text",
+              "description": "Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it if already up to date. Returns md_path + a preview; read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR via a configured multimodal provider) and text; audio/video unsupported.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path of the source document.",
+                    "type": "string"
+                  },
+                  "max_chars": {
+                    "description": "Maximum characters of Markdown to store.",
+                    "type": "integer",
+                    "default": 200000
+                  },
+                  "preview_chars": {
+                    "description": "Number of leading characters returned as a preview.",
+                    "type": "integer",
+                    "default": 4000
+                  },
+                  "ocr": {
+                    "description": "Enable OCR for images via a configured multimodal provider.",
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "refresh": {
+                    "description": "Force re-extraction even if the companion .md is up to date.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.list_dir",
+              "description": "Flat directory listing with kinds and optional sizes.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX directory to list.",
+                    "type": "string",
+                    "default": "/"
+                  },
+                  "include_hidden": {
+                    "description": "Include dotfiles (names starting with a period).",
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "sort_by": {
+                    "description": "Sort order: name or size.",
+                    "type": "string",
+                    "default": "name"
+                  },
+                  "with_sizes": {
+                    "description": "Include size and mtime for each entry.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.find_definition",
+              "description": "Find a symbol definition (language-aware).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Symbol name to locate the definition of.",
+                    "type": "string"
+                  },
+                  "root": {
+                    "description": "Absolute POSIX directory to search under.",
+                    "type": "string",
+                    "default": "/"
+                  },
+                  "kind": {
+                    "description": "Optional symbol kind filter, e.g. function, class, method.",
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "name"
+                ]
+              }
+            },
+            {
+              "name": "git.tags",
+              "description": "List all tags.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "admin.list_all_projects",
+              "description": "List every project (platform admin only).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {}
+              }
+            },
+            {
+              "name": "fs.edit",
+              "description": "Replace a unique string; dry_run returns the diff.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "old_string": {
+                    "description": "Exact text to find; must be unique unless replace_all is set.",
+                    "type": "string"
+                  },
+                  "new_string": {
+                    "description": "Replacement text substituted for old_string.",
+                    "type": "string"
+                  },
+                  "replace_all": {
+                    "description": "Replace every occurrence instead of requiring a unique match.",
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "dry_run": {
+                    "description": "Return the diff without writing changes.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "old_string",
+                  "new_string"
+                ]
+              }
+            },
+            {
+              "name": "fs.read_bytes",
+              "description": "Read raw bytes (base64) with MIME type.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "offset_bytes": {
+                    "description": "0-based byte offset to start reading from.",
+                    "type": "integer",
+                    "default": 0
+                  },
+                  "length_bytes": {
+                    "description": "Maximum number of bytes to return.",
+                    "type": "integer",
+                    "default": 65536
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "admin.delete_project",
+              "description": "Delete a project and recursively tear down its volume (owner or platform admin).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "project_id": {
+                    "description": "Id of the project to delete.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.exists",
+              "description": "Probe whether a path exists and its kind.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path to probe.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.read_section",
+              "description": "Read the indentation block around an anchor line.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "anchor_line": {
+                    "description": "1-based line whose indentation block is returned.",
+                    "type": "integer"
+                  },
+                  "max_lines": {
+                    "description": "Maximum number of lines to return for the block.",
+                    "type": "integer",
+                    "default": 200
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "anchor_line"
+                ]
+              }
+            },
+            {
+              "name": "admin.remove_member",
+              "description": "Remove a person from a project (owner or platform admin).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "project_id": {
+                    "description": "Id of the project to remove the member from.",
+                    "type": "string"
+                  },
+                  "person": {
+                    "description": "Person id to remove from the project.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "person"
+                ]
+              }
+            },
+            {
+              "name": "fs.mkdir",
+              "description": "Create a directory (parents by default).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path of the directory to create.",
+                    "type": "string"
+                  },
+                  "parents": {
+                    "description": "Create missing parent directories.",
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "exist_ok": {
+                    "description": "Succeed silently if the directory already exists.",
+                    "type": "boolean",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.insert_at_line",
+              "description": "Insert content before a 1-based line number.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "line": {
+                    "description": "1-based line number to insert content before.",
+                    "type": "integer"
+                  },
+                  "content": {
+                    "description": "Text content to insert.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "line",
+                  "content"
+                ]
+              }
+            },
+            {
+              "name": "git.show",
+              "description": "Show details and diff of a commit.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "commit_sha": {
+                    "description": "Commit SHA to show details and diff for.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "commit_sha"
+                ]
+              }
+            },
+            {
+              "name": "fs.append",
+              "description": "Append content to a file (optionally create it).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "content": {
+                    "description": "Text content to append at the end of the file.",
+                    "type": "string"
+                  },
+                  "create": {
+                    "description": "Create the file if it does not exist.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "content"
+                ]
+              }
+            },
+            {
+              "name": "fs.list_allowed_roots",
+              "description": "List the volume roots the caller can access.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.write_docx",
+              "description": "Render Markdown into a .docx Word document and write it to the volume.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path of the .docx file to write.",
+                    "type": "string"
+                  },
+                  "markdown": {
+                    "description": "Markdown source rendered into the Word document.",
+                    "type": "string"
+                  },
+                  "title": {
+                    "description": "Optional document title.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "overwrite": {
+                    "description": "Allow overwriting an existing file (default no-clobber).",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "markdown"
+                ]
+              }
+            },
+            {
+              "name": "fs.hash",
+              "description": "Content hash (md5|sha1|sha256|sha512).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "algo": {
+                    "description": "Hash algorithm: md5, sha1, sha256, or sha512.",
+                    "type": "string",
+                    "default": "sha256"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "git.auth_revoke",
+              "description": "Revoke the stored token for a provider.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "description": "Provider whose stored token is revoked: github or gitlab.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "provider"
+                ]
+              }
+            },
+            {
+              "name": "fs.audit_log",
+              "description": "Recent mutations performed in this session.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "since": {
+                    "description": "Only return entries at or after this Unix timestamp (seconds).",
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "default": null
+                  },
+                  "limit": {
+                    "description": "Maximum number of recent entries to return.",
+                    "type": "integer",
+                    "default": 20
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "git.checkout_file",
+              "description": "Restore a file from a commit into the volume.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "commit_sha": {
+                    "description": "Commit SHA to restore the file from.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path of the file to restore into the volume.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "commit_sha",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.glob",
+              "description": "Find files by glob pattern, newest first (cap 100).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "description": "Glob pattern to match file paths, e.g. **/*.cs.",
+                    "type": "string"
+                  },
+                  "root": {
+                    "description": "Absolute POSIX directory to search under.",
+                    "type": "string",
+                    "default": "/"
+                  },
+                  "exclude_patterns": {
+                    "description": "Glob patterns whose matches are excluded from results.",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "pattern"
+                ]
+              }
+            },
+            {
+              "name": "git.branches",
+              "description": "List all branches with their SHA.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "git.diff",
+              "description": "Show diff between two refs or a ref and working tree.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "from_ref": {
+                    "description": "Base ref or commit to diff from.",
+                    "type": "string"
+                  },
+                  "to_ref": {
+                    "description": "Target ref or commit to diff to; omit to diff against the working tree.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "path": {
+                    "description": "Optional path filter limiting the diff.",
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "from_ref"
+                ]
+              }
+            },
+            {
+              "name": "fs.tree",
+              "description": "Recursive JSON tree to a maximum depth.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX directory to walk from.",
+                    "type": "string",
+                    "default": "/"
+                  },
+                  "max_depth": {
+                    "description": "Maximum recursion depth to descend.",
+                    "type": "integer",
+                    "default": 3
+                  },
+                  "exclude_patterns": {
+                    "description": "Glob patterns whose matches are pruned from the tree.",
+                    "default": null
+                  },
+                  "with_sizes": {
+                    "description": "Include size for each file node.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id"
+                ]
+              }
+            },
+            {
+              "name": "fs.multi_edit",
+              "description": "Apply several edits atomically (all or nothing).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "edits": {
+                    "description": "Ordered edits (old_string, new_string, replace_all) applied atomically.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "old_string": {
+                          "type": "string"
+                        },
+                        "new_string": {
+                          "type": "string"
+                        },
+                        "replace_all": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "dry_run": {
+                    "description": "Return the diff without writing changes.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "edits"
+                ]
+              }
+            },
+            {
+              "name": "git.remote_clone",
+              "description": "Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. Uses the OAuth token stored by git.auth if available for the detected provider. Copies all files into the volume AND imports the full git history into the git backend. Use depth=1 for a shallow clone (faster on large repos).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the clone is imported into.",
+                    "type": "string"
+                  },
+                  "url": {
+                    "description": "Remote git repository URL (GitHub, GitLab, or any HTTPS URL).",
+                    "type": "string"
+                  },
+                  "branch": {
+                    "description": "Branch to clone; omit to use the remote default branch.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "depth": {
+                    "description": "Shallow clone depth; 0 clones the full history.",
+                    "type": "integer",
+                    "default": 0
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "url"
+                ]
+              }
+            },
+            {
+              "name": "git.commit",
+              "description": "Create a commit from the current state of the volume.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "message": {
+                    "description": "Commit message.",
+                    "type": "string"
+                  },
+                  "author_name": {
+                    "description": "Optional author name; defaults to the caller.",
+                    "type": "string",
+                    "default": null
+                  },
+                  "author_email": {
+                    "description": "Optional author email; defaults to the caller person id.",
+                    "type": "string",
+                    "default": null
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "message"
+                ]
+              }
+            },
+            {
+              "name": "fs.find_references",
+              "description": "Find identifier references (language-aware).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Identifier name to find references to.",
+                    "type": "string"
+                  },
+                  "root": {
+                    "description": "Absolute POSIX directory to search under.",
+                    "type": "string",
+                    "default": "/"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "name"
+                ]
+              }
+            },
+            {
+              "name": "fs.copy",
+              "description": "Copy a file or tree (no-clobber by default).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "source": {
+                    "description": "Absolute POSIX source path to copy.",
+                    "type": "string"
+                  },
+                  "destination": {
+                    "description": "Absolute POSIX destination path.",
+                    "type": "string"
+                  },
+                  "overwrite": {
+                    "description": "Allow overwriting an existing destination (default no-clobber).",
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "recursive": {
+                    "description": "Required to copy a directory tree.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "source",
+                  "destination"
+                ]
+              }
+            },
+            {
+              "name": "fs.read_lines",
+              "description": "Read an inclusive line range [start_line, end_line].",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "start_line": {
+                    "description": "First 1-based line to return (inclusive).",
+                    "type": "integer"
+                  },
+                  "end_line": {
+                    "description": "Last 1-based line to return (inclusive).",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path",
+                  "start_line",
+                  "end_line"
+                ]
+              }
+            },
+            {
+              "name": "fs.create_empty",
+              "description": "Create an empty file (touch).",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path of the file to create.",
+                    "type": "string"
+                  },
+                  "exist_ok": {
+                    "description": "Succeed silently if the file already exists.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            },
+            {
+              "name": "fs.tail",
+              "description": "Last N lines of a file.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "mount_id": {
+                    "description": "Project/volume id the operation targets.",
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Absolute POSIX path within the volume.",
+                    "type": "string"
+                  },
+                  "lines": {
+                    "description": "Number of trailing lines to return.",
+                    "type": "integer",
+                    "default": 20
+                  }
+                },
+                "required": [
+                  "mount_id",
+                  "path"
+                ]
+              }
+            }
+          ]
+        },
+        "id": 1002,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "traversal": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "An error occurred invoking 'fs.read'."
+            }
+          ],
+          "isError": true
+        },
+        "id": 1086,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tree_deep": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "tree": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file",
+                    "size": 1
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file",
+                    "size": 22
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file",
+                    "size": 5
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file",
+                    "size": 0
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file",
+                    "size": 1
+                  },
+                  {
+                    "name": "src",
+                    "kind": "dir",
+                    "children": [
+                      {
+                        "name": "app.py",
+                        "kind": "file",
+                        "size": 48
+                      },
+                      {
+                        "name": "lib.rs",
+                        "kind": "file",
+                        "size": 24
+                      }
+                    ]
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1055,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tree_default": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "tree": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "src",
+                    "kind": "dir",
+                    "children": [
+                      {
+                        "name": "app.py",
+                        "kind": "file"
+                      },
+                      {
+                        "name": "lib.rs",
+                        "kind": "file"
+                      }
+                    ]
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1054,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tree_excl_array": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "tree": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1056,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tree_excl_csv": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "tree": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1058,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tree_excl_null": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "tree": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "src",
+                    "kind": "dir",
+                    "children": [
+                      {
+                        "name": "app.py",
+                        "kind": "file"
+                      },
+                      {
+                        "name": "lib.rs",
+                        "kind": "file"
+                      }
+                    ]
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1059,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "tree_excl_string": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/",
+                "tree": [
+                  {
+                    "name": ".hidden",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "a.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "dup.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "empty.txt",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "guard.txt",
+                    "kind": "file"
+                  }
+                ],
+                "truncated": false
+              }
+            }
+          ]
+        },
+        "id": 1057,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "unknown_method": {
+      "status": 200,
+      "body": {
+        "error": {
+          "code": -32601,
+          "message": "Method 'does/not/exist' is not available."
+        },
+        "id": 1003,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "unknown_tool": {
+      "status": 200,
+      "body": {
+        "error": {
+          "code": -32602,
+          "message": "Unknown tool: 'fs.nope'"
+        },
+        "id": 1004,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_a": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "bytes_written": 12,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1013,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_a_noclobber": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_NO_CLOBBER>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1014,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_a_overwrite": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a.txt",
+                "bytes_written": 12,
+                "overwritten": true,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1015,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_dup": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/dup.txt",
+                "bytes_written": 11,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1037,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_guard": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/guard.txt",
+                "bytes_written": 1,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1044,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_hidden": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/.hidden",
+                "bytes_written": 1,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1050,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_multi": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/multi.txt",
+                "bytes_written": 14,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1091,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_py": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/src/app.py",
+                "bytes_written": 48,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1048,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_rs": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/src/lib.rs",
+                "bytes_written": 24,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1049,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_special_name": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/a b&c'd.txt",
+                "bytes_written": 1,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1104,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "write_unicode": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": {
+                "path": "/uni.txt",
+                "bytes_written": 22,
+                "overwritten": false,
+                "diff": ""
+              }
+            }
+          ]
+        },
+        "id": 1101,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    },
+    "wrong_project": {
+      "status": 200,
+      "body": {
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "<error code=ERR_PROJECT_NOT_FOUND>"
+            }
+          ],
+          "isError": true
+        },
+        "id": 1089,
+        "jsonrpc": "2.0"
+      },
+      "raw": null
+    }
+  }
+}
