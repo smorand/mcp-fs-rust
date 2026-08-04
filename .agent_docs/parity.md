@@ -64,44 +64,61 @@ in `app.rs` encode it.
 
 ## Current result
 
-**128 steps compared, 8 differences, every one of them deliberate.** Each is a case where
-copying the reference exactly would copy a defect.
+**134 steps compared, 12 differences, every one deliberate.** The instruction is now to
+fix what can be fixed on the Rust side rather than mirror a defect, so this list is a
+changelog of intentional improvements, not a parity debt.
 
-| Step(s) | Reference | Here | Why we diverge |
+### Errors carry a usable code and a usable status
+
+| Step(s) | Reference | Here | Why |
 |---|---|---|---|
-| `read_missing`, `stat_missing`, `read_a_dir`, `traversal`, `missing_required_arg` | `"An error occurred invoking 'fs.read'."` with **no code** | `ERR_NOT_FOUND` / `ERR_INVALID_ARGUMENT` | The C# storage layer raises a bare `IOException`, which is not an `McpException`, so the SDK emits a generic sentence. A client cannot tell a missing file from a bad argument from a crash. Verified live on a project the caller owns. |
-| `rest_missing` | HTTP 500 | HTTP 404 | Same leak on the REST plane. The spec (FR-061) maps `ERR_NOT_FOUND` to 404. |
-| `swagger_json` | `/api/fs/roots` absent | documented | ASP.NET excludes terminal `RequestDelegate` handlers from its OpenAPI document, so the reference page silently hides a route it serves. |
-| `find_refs_py` | references ordered `[3, 2]` | `[2, 3]` | The reference order is a tree-sitter traversal artifact (deterministic but descending). Ascending by line is deterministic and useful. |
+| `read_missing`, `stat_missing`, `read_a_dir`, `traversal`, `missing_required_arg` | `"An error occurred invoking 'fs.read'."` with **no code** | `ERR_NOT_FOUND` / `ERR_INVALID_ARGUMENT` | The reference storage layer raises a bare `IOException`, which is not an `McpException`, so the SDK emits a generic sentence. A client cannot tell a missing file from a bad argument from a crash. |
+| `rest_missing` | HTTP 500 | HTTP 404 | Same leak on the REST plane: an absent file was reported as a server failure. |
+| `rest_edit_no_match`, `rest_edit_ambiguous` | HTTP 400 | HTTP 422 | The reference maps six codes and defaults the rest to a generic 400 (`GetValueOrDefault(code, 400)`), so "the text is not there" looked like "your request is malformed". 422 says the request was fine and the content was not. |
+| `rest_extract_unsupported` | HTTP 400, `ERR_INVALID_ARGUMENT` | HTTP 501, `ERR_NOT_SUPPORTED` | Asking to extract an `.mp3` is not a malformed request, it is a capability this server does not have. |
+| (not in the corpus) quota, read guard, duplicate project | HTTP 400 for all three | 429, 428, 409 | The status is the first thing a caller branches on: a spent budget, a missing precondition and a name conflict are three different situations with three different remedies. |
 
-Divergences that the corpus does not reach, listed here for completeness (all in
-`README.md` too, and documented at their call site):
+Note for the record: an earlier draft of this document claimed the reference sent unmapped
+codes to 500. That was wrong, it defaults to 400. The harness caught it.
 
-- **The git protocol is actually usable.** Three reference defects, each verified against
-  both servers, made a real `git clone` or `git push` impossible:
-  `upload-pack` did not advertise `multi_ack_detailed`, which git requires over smart HTTP;
-  the pack was built with `insert_recursive`, which omits a commit's ancestry, so any
-  repository with more than one commit produced an incomplete pack; and the `receive-pack`
-  report was sent as raw pkt-lines even when the client negotiated `side-band-64k`, so git
-  aborted with `bad band #117` after the push had landed. Fixed with the detailed
-  capability, a revwalk fed to `insert_walk`, and band 1 framing. Verified end to end:
-  clone, commit, push, reclone, three commits and exact content.
-- `receive-pack` sends the `unpack ok` report line the protocol requires; the C# omits it,
-  so a real `git push` reports a failure even though the refs update.
-- Git HTTP routes enforce project membership; the C# only checked that the repo existed,
-  so any verified token could read or write any project.
-- `git.max_pack_size_mb` is enforced; the C# parsed it and never used it.
-- Pushed objects are really indexed and imported; the C# path was a stub.
+### Behaviour that was simply incorrect
+
+| Step(s) | Reference | Here | Why |
+|---|---|---|---|
+| `rest_list_a_file` | HTTP 200 with `{"entries": []}` | HTTP 400 `ERR_INVALID_ARGUMENT` | Listing a file is a caller mistake. Answering 200 with an empty listing invents a directory that does not exist and hides the bug. |
+| `find_refs_py` | references ordered `[3, 2]` | `[2, 3]` | The reference order is a tree-sitter traversal artifact. Ascending by line is deterministic and useful. |
+| (unit tested) `fs.tree` at exactly the node cap | one node short, flagged `truncated` | complete, `truncated: false` | The cap was checked after incrementing, so the cap-th node was dropped and a tree that fitted was reported as incomplete. |
+| `swagger_json` | `/api/fs/roots` absent | documented | ASP.NET excludes terminal `RequestDelegate` handlers from its OpenAPI document, so the reference page hides a route it serves. |
+
+### Not reachable by the corpus, listed for completeness
+
+- **The git protocol actually works.** Three reference defects, each verified against both
+  servers, made a real `git clone` or `git push` impossible: `upload-pack` did not
+  advertise `multi_ack_detailed` (required over smart HTTP); the pack was built with
+  `insert_recursive`, which omits a commit's ancestry, so any repository with more than one
+  commit produced an incomplete pack; and the `receive-pack` report was raw pkt-lines even
+  when the client negotiated `side-band-64k`, so git aborted with `bad band #117` after the
+  push had landed. Fixed with the detailed capability, a revwalk fed to `insert_walk`, and
+  band 1 framing. Verified end to end: clone, commit, push, reclone.
+- `receive-pack` sends the `unpack ok` report line the protocol requires.
+- Git HTTP routes enforce project membership; the reference only checked that the repo
+  existed, so any verified token could read or write any project.
+- `git.max_pack_size_mb` is enforced; the reference parsed it and never used it.
+- Pushed objects are really indexed and imported; the reference path was a stub.
+- `auth.jwt.algorithms` is honoured. The reference parsed the key and hardcoded RS256, so a
+  configured policy was silently ignored. Unsupported names are logged at startup, and the
+  HMAC family is refused on purpose (an `HS*` algorithm with a public key file would let
+  anyone holding that key mint tokens).
 - No custom libgit2 ODB backend (`git2` cannot express one from safe Rust): the blob store
-  is the source of truth and is synced around libgit2 calls. Stored bytes are identical;
-  the on-disk object directory becomes a rebuildable cache.
-- An unsupported extraction format returns `ERR_NOT_SUPPORTED` rather than
-  `ERR_INVALID_ARGUMENT` (message text unchanged).
+  is the source of truth and is synced around libgit2 calls. Stored bytes are identical.
 - Generated `.docx` keeps numbered list markers and renders fenced code as monospaced
   paragraphs instead of leaking the backtick lines.
-- `is_owner` and `is_admin` flags are computed caselessly, like the checks that actually
-  authorize; the C# used ordinal comparisons there and could report a value contradicting
-  its own gate.
+- `is_owner` and `is_admin` flags are computed caselessly, like the checks that authorize.
+- An invalid `fs.grep` regex is `ERR_INVALID_ARGUMENT`; the reference let the exception
+  escape into a generic internal error.
+- One implementation per operation, shared by the MCP surface and the REST plane
+  (`core::fs_ops`), including the V4A patch engine, which used to live in the tool layer and
+  force the REST route to dispatch back through the tool registry.
 
 ## Working on parity
 

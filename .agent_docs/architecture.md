@@ -153,9 +153,9 @@ stays at ERROR with the full message. A misbehaving client therefore cannot floo
 the log, and an ERROR line is always worth reading. Logs go to stderr so stdout
 stays usable for `mcp-fs token`.
 
-Caveat inherited from the reference status map: the codes with no explicit HTTP
-mapping (`ERR_EDIT_WITHOUT_PRIOR_READ`, `ERR_AMBIGUOUS_MATCH`, `ERR_NO_MATCH`,
-`ERR_WRITE_QUOTA_EXCEEDED`, `ERR_NOT_SUPPORTED`, `ERR_PROJECT_EXISTS`) fall back
-to 500, so they are logged at ERROR even though a client caused them. The mapping
-is part of the pinned contract (see `.agent_docs/parity.md`), so it is not
-changed here; only the log level is affected.
+Every `ERR_*` code has an explicit HTTP status (see `ToolError::http_status`). The
+reference mapped six codes and defaulted the rest to a generic 400, so a spent
+quota, an edit without a prior read, an ambiguous match and an unsupported format
+were indistinguishable by status. Here they are 429, 428, 409 and 501 respectively,
+and `ToolError::is_client_error` tells the logging layer whether a failure was the
+caller's fault, so a 4xx stays concise and monitoring is not paged for it.

@@ -18,7 +18,7 @@ use crate::util::text::split_lines;
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Directory names pruned from every recursive walk (glob, grep, symbol search).
 pub const DEFAULT_EXCLUDES: &[&str] =
@@ -450,11 +450,24 @@ pub async fn tree(
         excludes.insert(e.clone());
     }
     let counter = AtomicUsize::new(0);
-    let nodes = build_tree(client, root.to_string(), max_depth, &excludes, with_sizes, &counter).await?;
+    // `truncated` must mean "entries were left out", not "the counter reached the
+    // cap". Deriving it from the counter alone made a tree of exactly TREE_CAP
+    // entries report itself as incomplete when nothing had been dropped.
+    let hit_cap = AtomicBool::new(false);
+    let nodes = build_tree(
+        client,
+        root.to_string(),
+        max_depth,
+        &excludes,
+        with_sizes,
+        &counter,
+        &hit_cap,
+    )
+    .await?;
     Ok(json!({
         "path": root,
         "tree": nodes,
-        "truncated": counter.load(Ordering::Relaxed) >= TREE_CAP,
+        "truncated": hit_cap.load(Ordering::Relaxed),
     }))
 }
 
@@ -467,9 +480,14 @@ fn build_tree<'a>(
     excludes: &'a HashSet<String>,
     with_sizes: bool,
     counter: &'a AtomicUsize,
+    hit_cap: &'a AtomicBool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Value>>> + Send + 'a>> {
     Box::pin(async move {
-        if depth < 0 || counter.load(Ordering::Relaxed) >= TREE_CAP {
+        if depth < 0 {
+            return Ok(Vec::new());
+        }
+        if counter.load(Ordering::Relaxed) >= TREE_CAP {
+            hit_cap.store(true, Ordering::Relaxed);
             return Ok(Vec::new());
         }
         let mut nodes = Vec::new();
@@ -477,11 +495,14 @@ fn build_tree<'a>(
             if excludes.contains(&entry.name) {
                 continue;
             }
-            // The cap is checked after the increment, so the 2000th node is the
-            // one that trips it and is not emitted (same as the C# port).
-            if counter.fetch_add(1, Ordering::Relaxed) + 1 >= TREE_CAP {
+            // Emit exactly TREE_CAP nodes, then stop and say so. Checking after the
+            // increment (as the reference did) dropped the cap-th node, so a tree of
+            // exactly TREE_CAP entries came back one short AND flagged as truncated.
+            if counter.load(Ordering::Relaxed) >= TREE_CAP {
+                hit_cap.store(true, Ordering::Relaxed);
                 break;
             }
+            counter.fetch_add(1, Ordering::Relaxed);
             let mut node = Map::new();
             node.insert("name".into(), json!(entry.name));
             node.insert("kind".into(), json!(entry.kind));
@@ -490,8 +511,16 @@ fn build_tree<'a>(
             }
             if entry.kind == "dir" && depth > 0 {
                 let child = format!("{}/{}", path.trim_end_matches('/'), entry.name);
-                let kids =
-                    build_tree(client, child, depth - 1, excludes, with_sizes, counter).await?;
+                let kids = build_tree(
+                    client,
+                    child,
+                    depth - 1,
+                    excludes,
+                    with_sizes,
+                    counter,
+                    hit_cap,
+                )
+                .await?;
                 node.insert("children".into(), Value::Array(kids));
             }
             nodes.push(Value::Object(node));
@@ -1290,6 +1319,232 @@ pub async fn write_docx(
     Ok(json!({"path": norm, "bytes_written": data.len(), "overwritten": exists}))
 }
 
+// ────────────────────────────────────────────────── apply_patch (V4A engine) ────
+
+/// Apply every operation of a V4A patch, in order. Key: `files`, one entry per
+/// touched path.
+///
+/// The parser and applier live here, in the engine, rather than in the tool module
+/// where they first landed: the REST plane needs the same operation, and it had to
+/// reach back through the tool registry to get it. One implementation, two thin
+/// adapters, like every other operation.
+pub async fn apply_patch(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount: &str,
+    patch_text: &str,
+) -> Result<Value> {
+    let ops = parse_patch(patch_text)?;
+    let mut touched: Vec<Value> = Vec::with_capacity(ops.len());
+    for op in &ops {
+        let norm = safety.normalize_path(&op.path)?;
+        match op.kind {
+            OpKind::Add => {
+                let data = op.add_content.as_bytes();
+                safety.charge_write(person, mount, data.len() as i64)?;
+                client.write_bytes_atomic(&norm, data).await?;
+                touched.push(json!({"path": norm, "op": "add"}));
+            }
+            OpKind::Delete => {
+                safety.ensure_read_before_write(person, mount, &norm)?;
+                client.delete_file(&norm).await?;
+                touched.push(json!({"path": norm, "op": "delete"}));
+            }
+            OpKind::Update => {
+                safety.ensure_read_before_write(person, mount, &norm)?;
+                let old = client.read_text(&norm).await?;
+                let neu = apply_update(&old, op)?;
+                let data = neu.as_bytes();
+                safety.charge_write(person, mount, data.len() as i64)?;
+                client.write_bytes_atomic(&norm, data).await?;
+                // Two audit entries per updated file, because the C# writes one
+                // inside its shared Commit helper and one in the loop tail. The
+                // duplicate is observable through fs.audit_log, so it is kept.
+                safety.record_audit(person, mount, "apply_patch", &norm, "");
+                match &op.move_to {
+                    Some(target) => {
+                        let dst = safety.normalize_path(target)?;
+                        client.rename(&norm, &dst).await?;
+                        touched.push(json!({"path": norm, "op": "update", "moved_to": dst}));
+                    }
+                    None => touched.push(json!({"path": norm, "op": "update"})),
+                }
+            }
+        }
+        safety.record_audit(person, mount, "apply_patch", &norm, "");
+    }
+    Ok(json!({"files": touched}))
+}
+
+const BEGIN: &str = "*** Begin Patch";
+const END: &str = "*** End Patch";
+const ADD: &str = "*** Add File: ";
+const UPDATE: &str = "*** Update File: ";
+const DELETE: &str = "*** Delete File: ";
+const MOVE: &str = "*** Move to: ";
+const HUNK_MARKER: &str = "@@";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Add,
+    Update,
+    Delete,
+}
+
+/// One hunk: the removed and added lines, plus the context that frames them.
+#[derive(Debug, Default)]
+struct Hunk {
+    removed: Vec<String>,
+    added: Vec<String>,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
+#[derive(Debug)]
+struct FileOp {
+    kind: OpKind,
+    path: String,
+    move_to: Option<String>,
+    add_content: String,
+    hunks: Vec<Hunk>,
+}
+
+impl FileOp {
+    fn new(kind: OpKind, path: String) -> Self {
+        Self { kind, path, move_to: None, add_content: String::new(), hunks: Vec::new() }
+    }
+}
+
+/// Parse the `*** Begin Patch` envelope into file operations.
+fn parse_patch(text: &str) -> Result<Vec<FileOp>> {
+    let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    if lines.first().map(|l| l.trim()) != Some(BEGIN) {
+        return Err(ToolError::invalid_argument("patch must start with '*** Begin Patch'"));
+    }
+    let mut ops: Vec<FileOp> = Vec::new();
+    let mut index = 1;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim() == END {
+            return Ok(ops);
+        }
+        if let Some(rest) = line.strip_prefix(ADD) {
+            index = parse_add(&lines, index + 1, rest.trim().to_string(), &mut ops);
+        } else if let Some(rest) = line.strip_prefix(UPDATE) {
+            index = parse_update(&lines, index + 1, rest.trim().to_string(), &mut ops);
+        } else if let Some(rest) = line.strip_prefix(DELETE) {
+            ops.push(FileOp::new(OpKind::Delete, rest.trim().to_string()));
+            index += 1;
+        } else {
+            return Err(ToolError::invalid_argument(format!("unexpected patch line: '{line}'")));
+        }
+    }
+    Err(ToolError::invalid_argument("patch missing '*** End Patch'"))
+}
+
+/// Body of an `Add File` block: every line, with one leading '+' stripped.
+fn parse_add(lines: &[&str], mut index: usize, path: String, ops: &mut Vec<FileOp>) -> usize {
+    let mut body: Vec<&str> = Vec::new();
+    while index < lines.len() && !is_marker(lines[index]) {
+        body.push(lines[index].strip_prefix('+').unwrap_or(lines[index]));
+        index += 1;
+    }
+    let mut op = FileOp::new(OpKind::Add, path);
+    op.add_content = body.join("\n");
+    ops.push(op);
+    index
+}
+
+/// Body of an `Update File` block: an optional `Move to:` then hunks.
+fn parse_update(lines: &[&str], mut index: usize, path: String, ops: &mut Vec<FileOp>) -> usize {
+    let mut op = FileOp::new(OpKind::Update, path);
+    if let Some(target) = lines.get(index).and_then(|l| l.strip_prefix(MOVE)) {
+        op.move_to = Some(target.trim().to_string());
+        index += 1;
+    }
+    // `current` is an index into op.hunks so the borrow checker stays out of the
+    // way while the vector grows.
+    let mut current: Option<usize> = None;
+    while index < lines.len() && !is_file_marker(lines[index]) {
+        let raw = lines[index];
+        if raw.starts_with(HUNK_MARKER) {
+            op.hunks.push(Hunk::default());
+            current = Some(op.hunks.len() - 1);
+            index += 1;
+            continue;
+        }
+        let slot = match current {
+            Some(i) => i,
+            None => {
+                op.hunks.push(Hunk::default());
+                current = Some(op.hunks.len() - 1);
+                op.hunks.len() - 1
+            }
+        };
+        classify_line(raw, &mut op.hunks[slot]);
+        index += 1;
+    }
+    ops.push(op);
+    index
+}
+
+/// '+' adds, '-' removes, anything else is context: before the first change when
+/// the hunk is still empty, after it otherwise.
+fn classify_line(raw: &str, hunk: &mut Hunk) {
+    if let Some(rest) = raw.strip_prefix('+') {
+        hunk.added.push(rest.to_string());
+    } else if let Some(rest) = raw.strip_prefix('-') {
+        hunk.removed.push(rest.to_string());
+    } else {
+        let text = raw.strip_prefix(' ').unwrap_or(raw).to_string();
+        if !hunk.removed.is_empty() || !hunk.added.is_empty() {
+            hunk.context_after.push(text);
+        } else {
+            hunk.context_before.push(text);
+        }
+    }
+}
+
+fn is_marker(line: &str) -> bool {
+    line.trim() == END || is_file_marker(line)
+}
+
+fn is_file_marker(line: &str) -> bool {
+    line.starts_with(ADD) || line.starts_with(UPDATE) || line.starts_with(DELETE) || line.trim() == END
+}
+
+/// Rebuild the old block (context + removed) and swap in the new one. An empty
+/// old block means "replace the whole file with the new block".
+fn apply_update(original: &str, op: &FileOp) -> Result<String> {
+    let mut content = original.to_string();
+    for hunk in &op.hunks {
+        let old_block = join_block(&hunk.context_before, &hunk.removed, &hunk.context_after);
+        let new_block = join_block(&hunk.context_before, &hunk.added, &hunk.context_after);
+        if !old_block.is_empty() && !content.contains(&old_block) {
+            return Err(ToolError::no_match(format!(
+                "hunk context not found in '{}'",
+                op.path
+            )));
+        }
+        content = if old_block.is_empty() {
+            new_block
+        } else {
+            replace_first(&content, &old_block, &new_block)
+        };
+    }
+    Ok(content)
+}
+
+fn join_block(before: &[String], middle: &[String], after: &[String]) -> String {
+    let mut all: Vec<&str> = Vec::with_capacity(before.len() + middle.len() + after.len());
+    all.extend(before.iter().map(String::as_str));
+    all.extend(middle.iter().map(String::as_str));
+    all.extend(after.iter().map(String::as_str));
+    all.join("\n")
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,7 +2159,22 @@ mod tests {
         }
         let r = tree(&f.v, "/", 1, &[], false).await.unwrap();
         assert_eq!(r["truncated"], true);
-        assert_eq!(r["tree"].as_array().unwrap().len(), TREE_CAP - 1);
+        // Exactly TREE_CAP nodes are emitted, not TREE_CAP - 1: the reference checked
+        // the cap after incrementing and silently dropped the last one.
+        assert_eq!(r["tree"].as_array().unwrap().len(), TREE_CAP);
+    }
+
+    /// A tree of exactly TREE_CAP entries must come back whole and NOT be flagged as
+    /// truncated. The old off-by-one returned one node short and set the flag.
+    #[tokio::test]
+    async fn tree_at_exactly_the_cap_is_complete_and_not_truncated() {
+        let f = fixture();
+        for i in 0..TREE_CAP {
+            f.v.write_text_atomic(&format!("/f{i}.txt"), "x").await.unwrap();
+        }
+        let r = tree(&f.v, "/", 1, &[], false).await.unwrap();
+        assert_eq!(r["tree"].as_array().unwrap().len(), TREE_CAP);
+        assert_eq!(r["truncated"], false, "a tree that fits must not be flagged");
     }
 
     // ── write ────────────────────────────────────────────────────────────────
@@ -2496,5 +2766,58 @@ mod tests {
         assert_eq!(count_occurrences("aaaa", "aa"), 2);
         assert_eq!(count_occurrences("abc", ""), 0);
         assert_eq!(count_occurrences("abc", "z"), 0);
+    }
+
+    // ── V4A patch internals (moved here with the engine) ──────────────────
+
+    /// Running out of lines without `*** End Patch` is an error. A trailing empty
+    /// line instead reports `unexpected patch line`, exactly like the C#.
+    #[test]
+    fn parse_patch_requires_the_end_marker() {
+        let err = parse_patch("*** Begin Patch\n*** Delete File: /a").unwrap_err();
+        assert!(err.message.contains("End Patch"), "got {}", err.message);
+
+        let trailing = parse_patch("*** Begin Patch\n*** Delete File: /a\n").unwrap_err();
+        assert!(trailing.message.contains("unexpected patch line"));
+    }
+
+    #[test]
+    fn parse_patch_rejects_an_unexpected_line() {
+        let err = parse_patch("*** Begin Patch\ngarbage\n*** End Patch\n").unwrap_err();
+        assert!(err.message.contains("unexpected patch line"));
+    }
+
+    /// Context lines frame the change: before it when the hunk is still empty,
+    /// after it once a +/- line has been seen.
+    #[test]
+    fn classify_line_splits_context_around_the_change() {
+        let mut h = Hunk::default();
+        classify_line(" ctx1", &mut h);
+        classify_line("-old", &mut h);
+        classify_line("+new", &mut h);
+        classify_line(" ctx2", &mut h);
+        assert_eq!(h.context_before, vec!["ctx1"]);
+        assert_eq!(h.removed, vec!["old"]);
+        assert_eq!(h.added, vec!["new"]);
+        assert_eq!(h.context_after, vec!["ctx2"]);
+    }
+
+    /// A hunk with no context and no removals replaces the whole file.
+    #[test]
+    fn apply_update_with_an_empty_old_block_replaces_everything() {
+        let mut op = FileOp::new(OpKind::Update, "/a.txt".into());
+        let mut hunk = Hunk::default();
+        hunk.added.push("only".into());
+        op.hunks.push(hunk);
+        assert_eq!(apply_update("whatever", &op).unwrap(), "only");
+    }
+
+    /// CRLF input parses like LF: the parser trims trailing carriage returns.
+    #[test]
+    fn parse_patch_tolerates_crlf() {
+        let ops = parse_patch("*** Begin Patch\r\n*** Delete File: /a.txt\r\n*** End Patch\r\n").unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].kind, OpKind::Delete);
+        assert_eq!(ops[0].path, "/a.txt");
     }
 }

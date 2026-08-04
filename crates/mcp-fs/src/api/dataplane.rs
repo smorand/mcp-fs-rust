@@ -23,7 +23,6 @@ use crate::core::fs_ops;
 use crate::docs;
 use crate::errors::{Result, ToolError};
 use crate::mcp::Args;
-use crate::mcp::registry::ToolCtx;
 use crate::safety::SafetyManager;
 use crate::state::AppState;
 use crate::storage::VolumeClient;
@@ -1079,13 +1078,9 @@ async fn insert_at_line(
     .await
 }
 
-/// Multi file V4A patch.
-///
-/// TODO(core): `fs_ops` has no `apply_patch` yet (the V4A engine, C#
-/// `Core/PatchV4A.cs`, is not ported). Until it lands, the request is forwarded
-/// to the registered `fs.apply_patch` tool so this endpoint starts working the
-/// moment the tool family is wired, with zero duplicated logic. Replace the body
-/// with a direct `fs_ops::apply_patch` call once that function exists.
+/// Multi file V4A patch. Calls the engine directly, like every other route: this
+/// used to dispatch through the tool registry because the V4A parser lived in the
+/// tool module.
 async fn apply_patch(
     State(state): State<Arc<AppState>>,
     Path(mount): Path<String>,
@@ -1094,15 +1089,8 @@ async fn apply_patch(
 ) -> Response {
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
-        let patch_text = a.str("patch_text")?;
-        let args = Args::new(json!({"mount_id": r.mount, "patch_text": patch_text}));
-        let ctx = ToolCtx { person: r.person.clone(), state: r.state.clone() };
-        match r.state.registry.call("fs.apply_patch", ctx, args).await {
-            Some(result) => result,
-            None => Err(ToolError::not_supported(
-                "fs.apply_patch is not available on this server",
-            )),
-        }
+        fs_ops::apply_patch(&r.client, r.safety(), &r.person, &r.mount, &a.str("patch_text")?)
+            .await
     })
     .await
 }
@@ -1163,8 +1151,7 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::errors::code;
     use crate::keys;
-    use crate::mcp::ToolSchema;
-    use crate::mcp::registry::{ToolRegistry, handler};
+    use crate::mcp::registry::ToolRegistry;
     use axum::body::to_bytes;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -1812,7 +1799,9 @@ mod tests {
         let (status, v) = h
             .post(&u("edit"), json!({"path": "/guard.txt", "old_string": "x", "new_string": "y"}))
             .await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // A precondition on session state the caller can satisfy, so a 4xx: the
+        // reference reported 500 and looked like a server fault.
+        assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
         assert_eq!(v["error"], code::EDIT_WITHOUT_PRIOR_READ);
     }
 
@@ -1861,43 +1850,39 @@ mod tests {
         assert_eq!(v["error"], code::NOT_FOUND);
     }
 
-    /// Until the V4A engine lands in `core`, the endpoint forwards to the tool
-    /// and reports honestly when it is absent.
+    /// The route calls `fs_ops::apply_patch` directly. It used to dispatch through the
+    /// tool registry because the V4A parser lived in the tool module.
     #[tokio::test]
-    async fn apply_patch_reports_when_the_engine_is_absent() {
+    async fn apply_patch_applies_a_real_patch() {
         let h = Harness::new().await;
-        let (status, v) = h.post(&u("apply-patch"), json!({"patch_text": "*** Begin Patch\n"})).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(v["error"], code::NOT_SUPPORTED);
+        // Read it through the plane first so the guard is satisfied.
+        h.seed("/p.txt", "one\ntwo\n").await;
+        let (status, _) = h.get(&format!("{}?path=/p.txt", u("read"))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let patch = "*** Begin Patch\n\
+                     *** Update File: /p.txt\n\
+                     @@\n\
+                     -two\n\
+                     +TWO\n\
+                     *** End Patch\n";
+        let (status, v) = h.post(&u("apply-patch"), json!({"patch_text": patch})).await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        assert!(v["files"].is_array(), "one entry per touched path: {v}");
+
+        let (_, after) = h.get(&format!("{}?path=/p.txt&line_numbered=false", u("read"))).await;
+        assert_eq!(after["content"], "one\nTWO");
     }
 
-    /// The same route works the moment `fs.apply_patch` is registered.
+    /// A malformed patch is the caller's fault, so a 4xx with a stable code.
     #[tokio::test]
-    async fn apply_patch_forwards_to_the_registered_tool() {
-        let mut h = Harness::new().await;
-        let mut registry = ToolRegistry::new();
-        registry.add(
-            ToolSchema::new("fs.apply_patch", "Apply a multi-file V4A patch within one volume.")
-                .req_str("mount_id", "Project/volume id the operation targets.")
-                .req_str("patch_text", "Multi-file V4A patch text to apply within the volume."),
-            handler(|_ctx, a: Args| async move {
-                Ok(json!({"echo": a.str("patch_text")?, "mount": a.str("mount_id")?}))
-            }),
+    async fn apply_patch_rejects_a_malformed_envelope() {
+        let h = Harness::new().await;
+        let (status, v) = h.post(&u("apply-patch"), json!({"patch_text": "not a patch"})).await;
+        assert!(
+            (400..500).contains(&status.as_u16()),
+            "expected a 4xx, got {status} with {v}"
         );
-        let state = Arc::new(AppState {
-            config: h.state.config.clone(),
-            admin: h.state.admin.clone(),
-            stores: h.state.stores.clone(),
-            safety: h.state.safety.clone(),
-            identity: h.state.identity.clone(),
-            registry: Arc::new(registry),
-        });
-        h.state = state;
-
-        let (status, v) = h.post(&u("apply-patch"), json!({"patch_text": "PATCH"})).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(v["echo"], "PATCH");
-        assert_eq!(v["mount"], MOUNT);
     }
 
     // ── bytes plane ──────────────────────────────────────────────────────────

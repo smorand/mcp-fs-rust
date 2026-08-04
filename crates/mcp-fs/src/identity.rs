@@ -19,6 +19,30 @@ pub struct IdentityResolver {
     issuer: Option<String>,
     audience: Option<String>,
     username_claim: String,
+    /// Algorithms accepted for verification, from `auth.jwt.algorithms`. The
+    /// reference parsed this key and never read it, hardcoding RS256, so a
+    /// deployment that configured something else was silently ignored. An entry
+    /// we cannot support is dropped at construction and reported by
+    /// [`Self::unsupported_algorithms`] so startup can surface it.
+    algorithms: Vec<Algorithm>,
+    unsupported: Vec<String>,
+}
+
+/// Map a configured algorithm name to the verifier's enum. Only asymmetric
+/// signatures are accepted: an HMAC family algorithm with a public key file would
+/// let anyone holding that public key mint tokens, so `HS*` is refused on purpose.
+fn parse_algorithm(name: &str) -> Option<Algorithm> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "RS256" => Some(Algorithm::RS256),
+        "RS384" => Some(Algorithm::RS384),
+        "RS512" => Some(Algorithm::RS512),
+        "PS256" => Some(Algorithm::PS256),
+        "PS384" => Some(Algorithm::PS384),
+        "PS512" => Some(Algorithm::PS512),
+        "ES256" => Some(Algorithm::ES256),
+        "ES384" => Some(Algorithm::ES384),
+        _ => None,
+    }
 }
 
 impl IdentityResolver {
@@ -32,13 +56,41 @@ impl IdentityResolver {
                 .ok()
                 .and_then(|pem| DecodingKey::from_rsa_pem(&pem).ok())
         };
+        let mut algorithms = Vec::new();
+        let mut unsupported = Vec::new();
+        for name in &auth.jwt.algorithms {
+            match parse_algorithm(name) {
+                Some(a) if !algorithms.contains(&a) => algorithms.push(a),
+                Some(_) => {}
+                None => unsupported.push(name.clone()),
+            }
+        }
+        // An empty or fully unsupported list would accept nothing, which is a
+        // confusing way to fail; fall back to the documented default.
+        if algorithms.is_empty() {
+            algorithms.push(Algorithm::RS256);
+        }
         Self {
             key,
             header: auth.jwt.header.clone(),
             issuer: auth.jwt.issuer.clone(),
             audience: auth.jwt.audience.clone(),
             username_claim: auth.jwt.username_claim.clone(),
+            algorithms,
+            unsupported,
         }
+    }
+
+    /// Algorithm names from the config that this build cannot verify. Non empty
+    /// means the operator wrote something that is being ignored, so the caller
+    /// should log it loudly at startup rather than let it pass unnoticed.
+    pub fn unsupported_algorithms(&self) -> &[String] {
+        &self.unsupported
+    }
+
+    /// The algorithms actually accepted for verification.
+    pub fn accepted_algorithms(&self) -> &[Algorithm] {
+        &self.algorithms
     }
 
     /// Build directly from a PEM public key, for tests.
@@ -51,6 +103,8 @@ impl IdentityResolver {
             issuer: issuer.map(str::to_string),
             audience: None,
             username_claim: username_claim.to_string(),
+            algorithms: vec![Algorithm::RS256],
+            unsupported: Vec::new(),
         })
     }
 
@@ -102,7 +156,10 @@ impl IdentityResolver {
             .as_ref()
             .ok_or_else(|| ToolError::unauthenticated("no JWT public key configured"))?;
 
-        let mut v = Validation::new(Algorithm::RS256);
+        // Honour every configured algorithm, not just RS256.
+        let primary = self.algorithms.first().copied().unwrap_or(Algorithm::RS256);
+        let mut v = Validation::new(primary);
+        v.algorithms = self.algorithms.clone();
         v.validate_exp = true;
         v.validate_nbf = true;
         // Match the C# TokenValidationParameters.ClockSkew of 30 seconds.
@@ -267,6 +324,64 @@ mod tests {
         assert!(r.bearer_from_headers(|_| None).is_none());
         let e = r.resolve(|_| None).unwrap_err();
         assert_eq!(e.code, crate::errors::code::UNAUTHENTICATED);
+    }
+
+    /// `auth.jwt.algorithms` must actually be honoured: the reference parsed it and
+    /// hardcoded RS256, so a configured value was silently ignored.
+    #[test]
+    fn configured_algorithms_are_honoured() {
+        let mut auth = AuthConfig::default();
+        auth.jwt.algorithms = vec!["RS512".into(), "PS256".into()];
+        let r = IdentityResolver::new(&auth);
+        assert_eq!(r.accepted_algorithms(), &[Algorithm::RS512, Algorithm::PS256]);
+        assert!(r.unsupported_algorithms().is_empty());
+    }
+
+    #[test]
+    fn unsupported_algorithm_names_are_reported_not_swallowed() {
+        let mut auth = AuthConfig::default();
+        auth.jwt.algorithms = vec!["RS256".into(), "MAGIC512".into()];
+        let r = IdentityResolver::new(&auth);
+        assert_eq!(r.accepted_algorithms(), &[Algorithm::RS256]);
+        assert_eq!(r.unsupported_algorithms(), &["MAGIC512".to_string()]);
+    }
+
+    /// An HMAC algorithm with a public key file would let anyone holding that public
+    /// key mint tokens, so the whole HS family is refused rather than accepted.
+    #[test]
+    fn hmac_algorithms_are_refused() {
+        let mut auth = AuthConfig::default();
+        auth.jwt.algorithms = vec!["HS256".into()];
+        let r = IdentityResolver::new(&auth);
+        assert_eq!(r.unsupported_algorithms(), &["HS256".to_string()]);
+        // and it falls back to the documented default rather than accepting nothing
+        assert_eq!(r.accepted_algorithms(), &[Algorithm::RS256]);
+    }
+
+    #[test]
+    fn an_empty_algorithm_list_falls_back_to_rs256() {
+        let mut auth = AuthConfig::default();
+        auth.jwt.algorithms = vec![];
+        let r = IdentityResolver::new(&auth);
+        assert_eq!(r.accepted_algorithms(), &[Algorithm::RS256]);
+    }
+
+    /// A token signed with RS256 must be rejected when the config only accepts RS512,
+    /// which proves the list is enforced and not decorative.
+    #[test]
+    fn a_token_signed_with_an_unaccepted_algorithm_is_rejected() {
+        let (pk, pubk) = keypair();
+        let t = mint(
+            &pk,
+            json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() + 3600}),
+        );
+
+        let mut r = IdentityResolver::from_pem(&pubk, Some("web-a2a"), "email").unwrap();
+        assert_eq!(r.verify(&t).unwrap(), "a@b.c", "RS256 accepted by default");
+
+        // Now accept only RS512: the same RS256 token must fail.
+        r.algorithms = vec![Algorithm::RS512];
+        assert!(r.verify(&t).is_err(), "RS256 token must not pass an RS512 only policy");
     }
 
     #[test]

@@ -142,35 +142,38 @@ reduced to `tool + ERR_* code` so a reworded message passes while a wrong code f
 
 ## Deliberate divergences from the C#
 
-Everything below is a case where reproducing the reference exactly would reproduce a
-defect. Each is documented at its call site.
+Each is a case where mirroring the reference would mirror a defect. The full table, with
+the harness step that proves each one, is in [`.agent_docs/parity.md`](.agent_docs/parity.md).
 
-1. **A real `git clone` and `git push` actually work.** Three defects in the reference
-   made the documented git protocol unusable, all verified against both servers:
-   * `upload-pack` advertised `multi_ack` but not `multi_ack_detailed`, which git
-     *requires* over smart HTTP (`the option '--stateless-rpc' requires
-     'multi_ack_detailed'`), so no clone ever completed.
-   * the pack was built with `insert_recursive`, which adds an object and what it
-     directly references but NOT a commit's ancestry, so any repository with more than
-     one commit produced an incomplete pack (`remote did not send all necessary
-     objects`). Fixed with a revwalk fed to `insert_walk`.
-   * `receive-pack` returned the report as raw pkt-lines even when the client asked for
-     `side-band-64k`, so git aborted with `protocol error: bad band #117` after the push
-     had already landed. The report is now framed on band 1.
-2. **`receive-pack` sends `unpack ok`.** The protocol requires that report line; the C#
-   omits it, so a real `git push` reports a failure even though the refs update.
-3. **Git HTTP routes enforce project membership.** The C# only checked that the repo
-   existed, so any verified token could read or write any project.
-4. **`git.max_pack_size_mb` is enforced.** The C# parsed it and never used it.
-5. **Pushed objects are really indexed and imported.** The C# path was a stub, so
-   pushed objects were dropped unless already present.
-6. **No custom libgit2 ODB backend.** `git2` cannot express one from safe Rust, so the
-   blob store stays the source of truth and is synced around libgit2 calls. The stored
-   bytes are identical; the on-disk object directory becomes a rebuildable cache.
-7. **An unsupported extraction format returns `ERR_NOT_SUPPORTED`** rather than
-   `ERR_INVALID_ARGUMENT` (message text unchanged).
-8. **Generated `.docx` keeps numbered list markers** and renders fenced code as
-   monospaced paragraphs instead of leaking the backtick lines.
+**Errors are usable.** The reference answers a missing file or a missing argument with
+`"An error occurred invoking 'fs.read'."` carrying **no error code** (its storage layer
+raises a bare `IOException`, which is not an `McpException`), so a client cannot tell a
+missing file from a bad argument from a crash. Here every failure carries its `ERR_*`
+code. On the REST plane the reference maps six codes and defaults the rest to a generic
+400, so a spent quota, a missing read precondition, an ambiguous match and an unsupported
+format were indistinguishable by status; here they are 429, 428, 409 and 501, and a
+missing file is 404 rather than 500.
+
+**A real `git clone` and `git push` work.** Three reference defects made the documented
+git protocol unusable: `upload-pack` did not advertise `multi_ack_detailed` (which git
+requires over smart HTTP), the pack was built without a commit's ancestry so any
+repository with more than one commit was incomplete, and the `receive-pack` report was not
+side-band framed so git aborted after the push had landed. Also: `unpack ok` is sent,
+project membership is enforced on the git routes (the reference let any verified token
+read or write any project), `max_pack_size_mb` is enforced, and pushed objects are really
+indexed.
+
+**Correctness fixes.** `auth.jwt.algorithms` is honoured instead of parsed and ignored
+(with unsupported names logged at startup and the HMAC family refused on purpose).
+Listing a file is a 400 rather than a 200 with an invented empty listing. `fs.tree` at
+exactly the node cap returns every node instead of dropping the last one and claiming to
+be truncated. Symbol references come back ordered by line. An invalid `fs.grep` regex is
+a stable 400.
+
+**Structural.** One implementation per operation in `core::fs_ops`, shared by the MCP
+surface and the REST plane, including the V4A patch engine. No custom libgit2 ODB backend
+(`git2` cannot express one from safe Rust): the blob store is the source of truth and is
+synced around libgit2 calls, with identical stored bytes.
 
 ## Not supported
 

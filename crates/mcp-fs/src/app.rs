@@ -49,6 +49,15 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     let stores = Arc::new(StoreManager::new(config.clone()));
     let safety = Arc::new(SafetyManager::new(config.safety.clone()));
     let identity = Arc::new(IdentityResolver::new(&config.auth));
+    // A configured algorithm this build cannot verify would otherwise be ignored in
+    // silence, leaving the operator believing a policy is in force when it is not.
+    if !identity.unsupported_algorithms().is_empty() {
+        tracing::warn!(
+            unsupported = ?identity.unsupported_algorithms(),
+            accepted = ?identity.accepted_algorithms(),
+            "auth.jwt.algorithms lists entries this build cannot verify, they are ignored"
+        );
+    }
 
     // The git families are only registered when the subsystem is on, so a server
     // with git disabled advertises exactly the tools it can serve.

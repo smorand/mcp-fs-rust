@@ -227,6 +227,8 @@ pub fn build(project: &str) -> Vec<Step> {
     s.push(call("read_unicode", "fs.read", json!({"mount_id":p,"path":"/uni.txt"})));
     s.push(call("hash_unicode", "fs.hash", json!({"mount_id":p,"path":"/uni.txt"})));
     s.push(call("write_special_name", "fs.write", json!({"mount_id":p,"path":"/a b&c'd.txt","content":"x"})));
+    // Exists so the REST extract step below hits the unsupported format path, not a 404.
+    s.push(call("write_audio", "fs.write", json!({"mount_id":p,"path":"/track.mp3","content":"not really audio"})));
     s.push(call("read_special_name", "fs.read", json!({"mount_id":p,"path":"/a b&c'd.txt"})));
 
     // ── REST data plane ──────────────────────────────────────────────────────
@@ -250,6 +252,30 @@ pub fn build(project: &str) -> Vec<Step> {
     s.push(rest_post("rest_copy", &format!("/api/fs/{p}/copy"), json!({"source":"/rest.txt","destination":"/rest2.txt"})));
     s.push(rest_post("rest_delete", &format!("/api/fs/{p}/delete"), json!({"path":"/rest2.txt"})));
     s.push(rest_get("rest_missing", &format!("/api/fs/{p}/read?path=/nope.txt")));
+    // Client caused failures on the REST plane. The reference left these codes
+    // unmapped, so they all reached a caller as 500; each is exercised here so the
+    // harness reports the status difference instead of being blind to it.
+    s.push(rest_post(
+        "rest_write_noclobber",
+        &format!("/api/fs/{p}/write"),
+        json!({"path":"/a.txt","content":"x"}),
+    ));
+    s.push(rest_post(
+        "rest_edit_no_match",
+        &format!("/api/fs/{p}/edit"),
+        json!({"path":"/a.txt","old_string":"ABSENT-TEXT","new_string":"y"}),
+    ));
+    s.push(rest_post(
+        "rest_edit_ambiguous",
+        &format!("/api/fs/{p}/edit"),
+        json!({"path":"/dup.txt","old_string":"dup","new_string":"z"}),
+    ));
+    s.push(rest_post(
+        "rest_extract_unsupported",
+        &format!("/api/fs/{p}/extract-text"),
+        json!({"path":"/track.mp3"}),
+    ));
+    s.push(rest_get("rest_list_a_file", &format!("/api/fs/{p}/list?path=/a.txt")));
     s.push(rest_get("rest_forbidden_project", "/api/fs/no-such-project/list?path=/"));
 
     // ── OpenAPI surface (public) ─────────────────────────────────────────────

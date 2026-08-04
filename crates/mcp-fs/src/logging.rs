@@ -43,8 +43,10 @@ pub fn init() {
 /// the caller caused and can fix. `ERR_INTERNAL_ERROR` and anything that is not
 /// a `ToolError` stay unexpected, so they keep ERROR level and full context.
 pub fn is_expected(err: &(dyn Error + 'static)) -> bool {
-    err.downcast_ref::<ToolError>()
-        .is_some_and(|e| e.http_status() < 500)
+    // Reuse the single definition of "the caller's fault" rather than re-deriving it
+    // from a status threshold here: a code mapped to 501 is a server side gap, not an
+    // expected client mistake, and only `is_client_error` knows that.
+    err.downcast_ref::<ToolError>().is_some_and(ToolError::is_client_error)
 }
 
 /// Log a failed tool call at the right level: INFO and concise when expected,

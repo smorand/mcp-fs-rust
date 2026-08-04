@@ -2,8 +2,9 @@
 //! `fs.insert_at_line`, `fs.apply_patch` (V4A).
 //!
 //! Port of the C# `Tools/EditTools.cs`. The first four delegate straight to the
-//! engine; `fs.apply_patch` also carries the V4A parser/applier (port of the C#
-//! `Core/PatchV4A.cs`), because the patch envelope is a tool level concern: the
+//! engine. The V4A parser and applier live in `core::fs_ops` so the REST plane
+//! shares them; this module only unpacks arguments. Historically they sat here,
+//! which forced the dataplane to reach back through the tool registry. The
 //! engine only exposes the primitives it drives (read, write, delete, rename).
 
 use crate::core::fs_ops;
@@ -11,7 +12,7 @@ use crate::errors::{Result, ToolError};
 use crate::mcp::ToolSchema;
 use crate::mcp::registry::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The `edits` items schema, byte for byte what the C# SDK generates from
 /// `List<EditSpec>` (property order included, and no `required` list).
@@ -127,7 +128,7 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("patch_text", "Multi-file V4A patch text to apply within the volume."),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
-            apply_patch(&ctx, &client, &mount, &a.str("patch_text")?).await
+            fs_ops::apply_patch(&client, &ctx.state.safety, &ctx.person, &mount, &a.str("patch_text")?).await
         }),
     );
 }
@@ -140,234 +141,6 @@ fn edit_specs(a: &crate::mcp::Args) -> Result<Vec<Value>> {
         Some(Value::Array(v)) => Ok(v.clone()),
         Some(_) => Err(ToolError::invalid_argument("argument 'edits' must be an array of objects")),
         None => Err(ToolError::invalid_argument("missing required argument 'edits'")),
-    }
-}
-
-// ─────────────────────────────────────────────────────── apply_patch (V4A) ────
-
-/// Apply every operation of a V4A patch, in order. Port of the C#
-/// `FsOps.ApplyPatch`. Key: `files`, one entry per touched path.
-async fn apply_patch(
-    ctx: &crate::mcp::registry::ToolCtx,
-    client: &crate::storage::VolumeClient,
-    mount: &str,
-    patch_text: &str,
-) -> Result<Value> {
-    let safety = &ctx.state.safety;
-    let person = &ctx.person;
-    let ops = parse_patch(patch_text)?;
-    let mut touched: Vec<Value> = Vec::with_capacity(ops.len());
-    for op in &ops {
-        let norm = safety.normalize_path(&op.path)?;
-        match op.kind {
-            OpKind::Add => {
-                let data = op.add_content.as_bytes();
-                safety.charge_write(person, mount, data.len() as i64)?;
-                client.write_bytes_atomic(&norm, data).await?;
-                touched.push(json!({"path": norm, "op": "add"}));
-            }
-            OpKind::Delete => {
-                safety.ensure_read_before_write(person, mount, &norm)?;
-                client.delete_file(&norm).await?;
-                touched.push(json!({"path": norm, "op": "delete"}));
-            }
-            OpKind::Update => {
-                safety.ensure_read_before_write(person, mount, &norm)?;
-                let old = client.read_text(&norm).await?;
-                let neu = apply_update(&old, op)?;
-                let data = neu.as_bytes();
-                safety.charge_write(person, mount, data.len() as i64)?;
-                client.write_bytes_atomic(&norm, data).await?;
-                // Two audit entries per updated file, because the C# writes one
-                // inside its shared Commit helper and one in the loop tail. The
-                // duplicate is observable through fs.audit_log, so it is kept.
-                safety.record_audit(person, mount, "apply_patch", &norm, "");
-                match &op.move_to {
-                    Some(target) => {
-                        let dst = safety.normalize_path(target)?;
-                        client.rename(&norm, &dst).await?;
-                        touched.push(json!({"path": norm, "op": "update", "moved_to": dst}));
-                    }
-                    None => touched.push(json!({"path": norm, "op": "update"})),
-                }
-            }
-        }
-        safety.record_audit(person, mount, "apply_patch", &norm, "");
-    }
-    Ok(json!({"files": touched}))
-}
-
-const BEGIN: &str = "*** Begin Patch";
-const END: &str = "*** End Patch";
-const ADD: &str = "*** Add File: ";
-const UPDATE: &str = "*** Update File: ";
-const DELETE: &str = "*** Delete File: ";
-const MOVE: &str = "*** Move to: ";
-const HUNK_MARKER: &str = "@@";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpKind {
-    Add,
-    Update,
-    Delete,
-}
-
-/// One hunk: the removed and added lines, plus the context that frames them.
-#[derive(Debug, Default)]
-struct Hunk {
-    removed: Vec<String>,
-    added: Vec<String>,
-    context_before: Vec<String>,
-    context_after: Vec<String>,
-}
-
-#[derive(Debug)]
-struct FileOp {
-    kind: OpKind,
-    path: String,
-    move_to: Option<String>,
-    add_content: String,
-    hunks: Vec<Hunk>,
-}
-
-impl FileOp {
-    fn new(kind: OpKind, path: String) -> Self {
-        Self { kind, path, move_to: None, add_content: String::new(), hunks: Vec::new() }
-    }
-}
-
-/// Parse the `*** Begin Patch` envelope into file operations.
-fn parse_patch(text: &str) -> Result<Vec<FileOp>> {
-    let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
-    if lines.first().map(|l| l.trim()) != Some(BEGIN) {
-        return Err(ToolError::invalid_argument("patch must start with '*** Begin Patch'"));
-    }
-    let mut ops: Vec<FileOp> = Vec::new();
-    let mut index = 1;
-    while index < lines.len() {
-        let line = lines[index];
-        if line.trim() == END {
-            return Ok(ops);
-        }
-        if let Some(rest) = line.strip_prefix(ADD) {
-            index = parse_add(&lines, index + 1, rest.trim().to_string(), &mut ops);
-        } else if let Some(rest) = line.strip_prefix(UPDATE) {
-            index = parse_update(&lines, index + 1, rest.trim().to_string(), &mut ops);
-        } else if let Some(rest) = line.strip_prefix(DELETE) {
-            ops.push(FileOp::new(OpKind::Delete, rest.trim().to_string()));
-            index += 1;
-        } else {
-            return Err(ToolError::invalid_argument(format!("unexpected patch line: '{line}'")));
-        }
-    }
-    Err(ToolError::invalid_argument("patch missing '*** End Patch'"))
-}
-
-/// Body of an `Add File` block: every line, with one leading '+' stripped.
-fn parse_add(lines: &[&str], mut index: usize, path: String, ops: &mut Vec<FileOp>) -> usize {
-    let mut body: Vec<&str> = Vec::new();
-    while index < lines.len() && !is_marker(lines[index]) {
-        body.push(lines[index].strip_prefix('+').unwrap_or(lines[index]));
-        index += 1;
-    }
-    let mut op = FileOp::new(OpKind::Add, path);
-    op.add_content = body.join("\n");
-    ops.push(op);
-    index
-}
-
-/// Body of an `Update File` block: an optional `Move to:` then hunks.
-fn parse_update(lines: &[&str], mut index: usize, path: String, ops: &mut Vec<FileOp>) -> usize {
-    let mut op = FileOp::new(OpKind::Update, path);
-    if let Some(target) = lines.get(index).and_then(|l| l.strip_prefix(MOVE)) {
-        op.move_to = Some(target.trim().to_string());
-        index += 1;
-    }
-    // `current` is an index into op.hunks so the borrow checker stays out of the
-    // way while the vector grows.
-    let mut current: Option<usize> = None;
-    while index < lines.len() && !is_file_marker(lines[index]) {
-        let raw = lines[index];
-        if raw.starts_with(HUNK_MARKER) {
-            op.hunks.push(Hunk::default());
-            current = Some(op.hunks.len() - 1);
-            index += 1;
-            continue;
-        }
-        let slot = match current {
-            Some(i) => i,
-            None => {
-                op.hunks.push(Hunk::default());
-                current = Some(op.hunks.len() - 1);
-                op.hunks.len() - 1
-            }
-        };
-        classify_line(raw, &mut op.hunks[slot]);
-        index += 1;
-    }
-    ops.push(op);
-    index
-}
-
-/// '+' adds, '-' removes, anything else is context: before the first change when
-/// the hunk is still empty, after it otherwise.
-fn classify_line(raw: &str, hunk: &mut Hunk) {
-    if let Some(rest) = raw.strip_prefix('+') {
-        hunk.added.push(rest.to_string());
-    } else if let Some(rest) = raw.strip_prefix('-') {
-        hunk.removed.push(rest.to_string());
-    } else {
-        let text = raw.strip_prefix(' ').unwrap_or(raw).to_string();
-        if !hunk.removed.is_empty() || !hunk.added.is_empty() {
-            hunk.context_after.push(text);
-        } else {
-            hunk.context_before.push(text);
-        }
-    }
-}
-
-fn is_marker(line: &str) -> bool {
-    line.trim() == END || is_file_marker(line)
-}
-
-fn is_file_marker(line: &str) -> bool {
-    line.starts_with(ADD) || line.starts_with(UPDATE) || line.starts_with(DELETE) || line.trim() == END
-}
-
-/// Rebuild the old block (context + removed) and swap in the new one. An empty
-/// old block means "replace the whole file with the new block".
-fn apply_update(original: &str, op: &FileOp) -> Result<String> {
-    let mut content = original.to_string();
-    for hunk in &op.hunks {
-        let old_block = join_block(&hunk.context_before, &hunk.removed, &hunk.context_after);
-        let new_block = join_block(&hunk.context_before, &hunk.added, &hunk.context_after);
-        if !old_block.is_empty() && !content.contains(&old_block) {
-            return Err(ToolError::no_match(format!(
-                "hunk context not found in '{}'",
-                op.path
-            )));
-        }
-        content = if old_block.is_empty() {
-            new_block
-        } else {
-            replace_first(&content, &old_block, &new_block)
-        };
-    }
-    Ok(content)
-}
-
-fn join_block(before: &[String], middle: &[String], after: &[String]) -> String {
-    let mut all: Vec<&str> = Vec::with_capacity(before.len() + middle.len() + after.len());
-    all.extend(before.iter().map(String::as_str));
-    all.extend(middle.iter().map(String::as_str));
-    all.extend(after.iter().map(String::as_str));
-    all.join("\n")
-}
-
-fn replace_first(haystack: &str, search: &str, replace: &str) -> String {
-    match haystack.find(search) {
-        None => haystack.to_string(),
-        Some(i) => format!("{}{replace}{}", &haystack[..i], &haystack[i + search.len()..]),
     }
 }
 
@@ -603,60 +376,14 @@ mod tests {
         assert_eq!(err.code, code::NO_MATCH);
     }
 
-    /// Running out of lines without `*** End Patch` is an error. A trailing empty
-    /// line instead reports `unexpected patch line`, exactly like the C#.
-    #[test]
-    fn parse_patch_requires_the_end_marker() {
-        let err = parse_patch("*** Begin Patch\n*** Delete File: /a").unwrap_err();
-        assert!(err.message.contains("End Patch"), "got {}", err.message);
 
-        let trailing = parse_patch("*** Begin Patch\n*** Delete File: /a\n").unwrap_err();
-        assert!(trailing.message.contains("unexpected patch line"));
-    }
 
-    #[test]
-    fn parse_patch_rejects_an_unexpected_line() {
-        let err = parse_patch("*** Begin Patch\ngarbage\n*** End Patch\n").unwrap_err();
-        assert!(err.message.contains("unexpected patch line"));
-    }
 
-    /// Context lines frame the change: before it when the hunk is still empty,
-    /// after it once a +/- line has been seen.
-    #[test]
-    fn classify_line_splits_context_around_the_change() {
-        let mut h = Hunk::default();
-        classify_line(" ctx1", &mut h);
-        classify_line("-old", &mut h);
-        classify_line("+new", &mut h);
-        classify_line(" ctx2", &mut h);
-        assert_eq!(h.context_before, vec!["ctx1"]);
-        assert_eq!(h.removed, vec!["old"]);
-        assert_eq!(h.added, vec!["new"]);
-        assert_eq!(h.context_after, vec!["ctx2"]);
-    }
 
-    /// A hunk with no context and no removals replaces the whole file.
-    #[test]
-    fn apply_update_with_an_empty_old_block_replaces_everything() {
-        let mut op = FileOp::new(OpKind::Update, "/a.txt".into());
-        let mut hunk = Hunk::default();
-        hunk.added.push("only".into());
-        op.hunks.push(hunk);
-        assert_eq!(apply_update("whatever", &op).unwrap(), "only");
-    }
 
-    #[test]
-    fn replace_first_only_touches_the_first_occurrence() {
-        assert_eq!(replace_first("a b a", "a", "z"), "z b a");
-        assert_eq!(replace_first("abc", "zz", "y"), "abc");
-    }
 
-    /// CRLF input parses like LF: the parser trims trailing carriage returns.
-    #[test]
-    fn parse_patch_tolerates_crlf() {
-        let ops = parse_patch("*** Begin Patch\r\n*** Delete File: /a.txt\r\n*** End Patch\r\n").unwrap();
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].kind, OpKind::Delete);
-        assert_eq!(ops[0].path, "/a.txt");
-    }
+
+
+
+
 }
