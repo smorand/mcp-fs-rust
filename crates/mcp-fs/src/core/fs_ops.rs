@@ -589,6 +589,40 @@ async fn commit(
 
 /// Create or overwrite a file. No-clobber by default.
 /// Keys: `path`, `bytes_written`, `overwritten`, `diff`.
+/// Write raw bytes, charging the quota and auditing like every other write.
+///
+/// The binary sibling of [`write_text`], used by the REST upload route. That route
+/// used to call the volume client directly, which charged nothing against the write
+/// quota and left no audit entry, so the highest volume write path was also the one
+/// with no accounting. No diff is produced: the payload is not necessarily text.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_bytes(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    data: &[u8],
+    overwrite: bool,
+    create_parents: bool,
+) -> Result<Value> {
+    let exists = client.exists(norm).await?;
+    if exists && !overwrite {
+        return Err(ToolError::no_clobber(format!("'{norm}' exists (pass overwrite=true)")));
+    }
+    if exists {
+        safety.ensure_read_before_write(person, mount_id, norm)?;
+    }
+    if create_parents {
+        ensure_parents(client, norm).await?;
+    }
+    safety.charge_write(person, mount_id, data.len() as i64)?;
+    client.write_bytes_atomic(norm, data).await?;
+    safety.record_read(person, mount_id, norm);
+    safety.record_audit(person, mount_id, "write", norm, &format!("{} bytes", data.len()));
+    Ok(json!({ "path": norm, "bytes_written": data.len(), "overwritten": exists }))
+}
+
 pub async fn write_text(
     client: &VolumeClient,
     safety: &SafetyManager,
@@ -2807,6 +2841,50 @@ mod tests {
         move_path(&f.v, &f.s, P, M, "/src", "/dst", true).await.unwrap();
         assert_eq!(f.v.read_text("/dst/a.txt").await.unwrap(), "keep");
         assert!(!f.v.exists("/dst/stale.txt").await.unwrap(), "stale entry removed");
+    }
+
+    #[tokio::test]
+    async fn write_bytes_charges_the_quota_and_audits() {
+        let f = fixture();
+        let payload = vec![7u8; 64];
+        let r = write_bytes(&f.v, &f.s, P, M, "/blob.bin", &payload, false, true).await.unwrap();
+        assert_eq!(r["bytes_written"], 64);
+        assert_eq!(r["overwritten"], false);
+        assert_eq!(f.s.bytes_written(P, M), 64, "the quota was charged");
+        let log = f.s.audit(P, M);
+        assert_eq!(log.last().unwrap().op, "write");
+        assert_eq!(log.last().unwrap().detail, "64 bytes");
+        assert_eq!(f.v.read_bytes("/blob.bin").await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn write_bytes_refuses_to_exceed_the_quota() {
+        let f = fixture_with(SafetyConfig { write_quota_bytes: 10, ..Default::default() });
+        let e = write_bytes(&f.v, &f.s, P, M, "/big.bin", &[0u8; 11], false, true)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, crate::errors::code::WRITE_QUOTA_EXCEEDED);
+        assert!(!f.v.exists("/big.bin").await.unwrap(), "nothing written");
+    }
+
+    #[tokio::test]
+    async fn write_bytes_honours_no_clobber() {
+        let f = fixture();
+        write_bytes(&f.v, &f.s, P, M, "/x.bin", b"a", false, true).await.unwrap();
+        let e = write_bytes(&f.v, &f.s, P, M, "/x.bin", b"b", false, true).await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NO_CLOBBER);
+        // The first write recorded a read, so overwriting passes the guard.
+        write_bytes(&f.v, &f.s, P, M, "/x.bin", b"b", true, true).await.unwrap();
+        assert_eq!(f.v.read_bytes("/x.bin").await.unwrap(), b"b");
+    }
+
+    /// Binary payloads must survive untouched (no utf8 lossy conversion).
+    #[tokio::test]
+    async fn write_bytes_round_trips_non_utf8() {
+        let f = fixture();
+        let payload = vec![0xff, 0x00, 0xfe, 0x80];
+        write_bytes(&f.v, &f.s, P, M, "/raw.bin", &payload, false, true).await.unwrap();
+        assert_eq!(f.v.read_bytes("/raw.bin").await.unwrap(), payload);
     }
 
     // ── V4A patch internals (moved here with the engine) ──────────────────

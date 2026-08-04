@@ -359,7 +359,9 @@ async fn list(
     .await
 }
 
-/// Create a directory, parents included. Idempotent, like the C# helper.
+/// Create a directory. Same parameters and audit trail as the tool: this used to call
+/// the volume client directly, so `parents` and `exist_ok` were ignored and the
+/// mutation left no trace.
 async fn mkdir(
     State(state): State<Arc<AppState>>,
     Path(mount): Path<String>,
@@ -369,14 +371,21 @@ async fn mkdir(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        r.client.makedirs(&norm, true).await?;
-        Ok(json!({"path": norm, "created": true}))
+        fs_ops::mkdir(
+            &r.client,
+            r.safety(),
+            &r.person,
+            &r.mount,
+            &norm,
+            a.bool_or("parents", true),
+            a.bool_or("exist_ok", true),
+        )
+        .await
     })
     .await
 }
 
-/// Delete a path. The bytes plane deletes for real (no trash), like the C#: the
-/// trash is an agent safety net, a UI has its own undo story.
+/// Delete a path, with the same `recursive` and `trash` semantics as the tool.
 async fn delete(
     State(state): State<Arc<AppState>>,
     Path(mount): Path<String>,
@@ -487,7 +496,20 @@ async fn upload(
             };
             let joined = format!("{}/{}", base.trim_end_matches('/'), rel);
             let dest = r.norm(&PosixPath::normpath(&joined))?;
-            r.client.write_bytes_atomic(&dest, data).await?;
+            // Through the engine so an upload is charged against the write quota and
+            // audited. Writing via the volume client (as this did) made the highest
+            // volume write path the only one with no accounting at all.
+            fs_ops::write_bytes(
+                &r.client,
+                r.safety(),
+                &r.person,
+                &r.mount,
+                &dest,
+                data,
+                true,
+                true,
+            )
+            .await?;
             written.push(dest);
         }
         Ok(json!({"written": written, "count": written.len()}))
@@ -1973,6 +1995,58 @@ mod tests {
         let (status, bytes) = h.get_raw(&u("download?path=/docs/note.txt")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(bytes, b"uploaded bytes");
+    }
+
+    /// An upload must be charged against the write quota and audited. It used to write
+    /// through the volume client, so the highest volume write path had no accounting:
+    /// a caller could push unlimited bytes and leave no trace.
+    #[tokio::test]
+    async fn upload_is_charged_against_the_quota_and_audited() {
+        let h = Harness::new().await;
+        let boundary = "Q-BOUNDARY";
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"directory\"\r\n\r\n/up\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"m.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\n0123456789\r\n\
+             --{b}--\r\n",
+            b = boundary
+        );
+        let (status, _) = h
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri(u("upload"))
+                    .header("Authorization", format!("Bearer {}", h.owner_token))
+                    .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(
+            h.state.safety.bytes_written(OWNER, MOUNT),
+            10,
+            "the ten uploaded bytes must be charged"
+        );
+        let log = h.state.safety.audit(OWNER, MOUNT);
+        let entry = log.last().expect("an audit entry for the upload");
+        assert_eq!(entry.op, "write");
+        assert_eq!(entry.path, "/up/m.txt");
+        assert_eq!(entry.detail, "10 bytes");
+    }
+
+    /// mkdir goes through the engine, so it is audited like the tool.
+    #[tokio::test]
+    async fn mkdir_is_audited() {
+        let h = Harness::new().await;
+        let (status, _) = h.post(&u("mkdir"), json!({"path": "/audited-dir"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let log = h.state.safety.audit(OWNER, MOUNT);
+        assert!(
+            log.iter().any(|e| e.op == "mkdir" && e.path == "/audited-dir"),
+            "no mkdir audit entry: {log:?}"
+        );
     }
 
     #[tokio::test]
