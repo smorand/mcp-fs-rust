@@ -15,9 +15,13 @@
 //!
 //! Deliberate parity choices, all matching the C# byte for byte:
 //!
-//! * Capability strings are copied verbatim, including `agent=mcp-fs/0.1.0`.
-//! * The pack is always full (no real have/want negotiation): every wanted tip is
-//!   inserted recursively and a NAK is sent.
+//! * Capability strings match the reference, including `agent=mcp-fs/0.1.0`, with one
+//!   addition: `multi_ack_detailed` on upload-pack, which git requires over smart HTTP
+//!   (see `UPLOAD_PACK_CAPABILITIES`).
+//! * The pack is always full (no real have/want negotiation): a revwalk is pushed with
+//!   every wanted tip and fed to `insert_walk`, so the pack carries the tips plus their
+//!   whole ancestry, then a NAK is sent. A want that is not a commit (a tag or a bare
+//!   tree) still goes through `insert_recursive`.
 //! * The receive-pack report DOES send the `unpack ok` line that git's report-status
 //!   requires. The C# omits it, which makes a real `git push` report a failure even
 //!   though the refs update correctly. This is a deliberate divergence: reproducing a

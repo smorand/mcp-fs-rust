@@ -41,18 +41,18 @@ From `cargo test --workspace` on the current tree:
 
 | Target | Result |
 |---|---|
-| `mcp-fs` lib | 752 passed, 1 ignored |
+| `mcp-fs` lib | 754 passed, 1 ignored |
 | `parity-harness` bin | 32 passed |
 | `mcp-fs` bin | 0 (the binary is a thin `main`) |
 | doctests | 0 passed, 3 ignored (wiring examples marked `ignore`) |
 
-Per area, from `cargo test -p mcp-fs --lib -- --list` (753 tests, the ignored one
+Per area, from `cargo test -p mcp-fs --lib -- --list` (755 tests, the ignored one
 included):
 
 | Area | Tests | Area | Tests |
 |---|---|---|---|
 | `tools` | 176 | `mcp` | 23 |
-| `git` | 115 | `util` | 20 |
+| `git` | 117 | `util` | 20 |
 | `core` | 113 | `cli` | 15 |
 | `docs` | 106 | `safety` | 11 |
 | `api` | 65 | `app` | 11 |
@@ -63,7 +63,7 @@ included):
 | | | `errors` | 3 |
 
 Largest single modules: `core::fs_ops` 101, `docs::extract` 49,
-`api::dataplane` 48, `git::oauth` 41, `git::http` 38, `tools::git` 36.
+`api::dataplane` 48, `git::oauth` 41, `git::http` 40, `tools::git` 36.
 
 ## Opt in test
 
@@ -106,8 +106,8 @@ cargo run -p parity-harness -- compare \
 | Flag | Meaning |
 |---|---|
 | `--base` | server URL (capture defaults to `:5002`, compare to `:5003`) |
-| `--token` | bearer for that server; the identity must be a platform admin, since the corpus provisions a project |
-| `--owner` | owner used when provisioning the corpus project |
+| `--token` | bearer for that server. The identity must be a platform admin (the harness provisions with `admin.create_project`) and in practice the same person as `--owner`, because the `fs.*` steps run as the token identity |
+| `--owner` | owner of the corpus project; also added as a member during provisioning |
 | `--project` | reuse a fixed project id; the default is a fresh id per run, so a replay never inherits state |
 | `--out` / `--golden` | golden file to write / to compare against (`parity-golden.json`) |
 | `--relax-messages` | blank out free form message fields as well as error sentences |

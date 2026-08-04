@@ -45,8 +45,9 @@ unified diff of the change. Overwriting without `overwrite=true` is
 | `fs.insert_at_line` | insert before a 1 based line | `path`, `line:int`, `content` | `path`, `applied`, `line` | member |
 | `fs.apply_patch` | multi file V4A patch in one volume | `patch_text` | `files[]` of `{path, op, moved_to?}` (`op`: add / update / delete) | member |
 
-Every tool here enforces the read guard. A non unique `old_string` is
-`ERR_AMBIGUOUS_MATCH`, an absent one `ERR_NO_MATCH`. `edits[]` items are
+Every tool here enforces the read guard (`fs.apply_patch` on its update and
+delete operations, not on an add, which creates a new file). A non unique
+`old_string` is `ERR_AMBIGUOUS_MATCH`, an absent one `ERR_NO_MATCH`. `edits[]` items are
 `{old_string, new_string, replace_all?}`. `dry_run` returns the diff and writes
 nothing.
 

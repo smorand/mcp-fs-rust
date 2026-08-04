@@ -24,9 +24,9 @@ while keeping one bucket per volume. `git/odb.rs` owns
 (short sha) and listing.
 
 Known latent issue inherited from the reference: a colon is illegal in an NTFS
-filename, so the local blob backend cannot hold `git:{sha}` on a Windows host.
-Git on Windows needs the S3 backend until a key mapping lands in both
-implementations at once.
+filename, so the local blob backend cannot hold `git:{sha}` on a Windows host. Git
+on Windows needs the S3 backend until a key mapping lands in both implementations
+at once.
 
 ## SQLite index and on disk paths
 
@@ -107,9 +107,16 @@ Auth gate (`git/http/mod.rs::gate`), in order:
 Capabilities are advertised verbatim:
 `multi_ack multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0` for
 upload-pack, `report-status delete-refs side-band-64k quiet atomic ofs-delta
-agent=mcp-fs/0.1.0` for receive-pack. The pack is always full (every wanted tip
-inserted recursively, then a NAK): there is no real have/want negotiation, same as
-the reference.
+agent=mcp-fs/0.1.0` for receive-pack.
+
+There is no have/want negotiation: `have` lines are parsed and ignored, a NAK is
+sent, and the pack carries everything reachable from the wanted tips. It is built
+from a revwalk over those tips fed to `insert_walk`, not `insert_recursive`, which
+would omit ancestry and break any repository with more than one commit. Pack data
+goes out on side-band channel 1 in 65519 byte chunks, then a bare channel byte and
+a flush. On push, the report is wrapped in band 1 when the client negotiated
+`side-band-64k` and sent raw otherwise; without that wrapping git aborts with
+"bad band" after the refs have already been updated.
 
 ## `git.*` tool behaviour
 
@@ -117,9 +124,9 @@ Every tool authorizes membership first (`AppState::authorize`), then requires
 `git.init` to have run (`ERR_NOT_FOUND` with "call git.init first" otherwise).
 Parameters and return keys are in `.agent_docs/tools.md`. Notable points:
 
-* `git.status`, `git.branches`, `git.tags` read the SQLite refs directly.
-* `git.log`, `git.show`, `git.diff`, `git.blame` hydrate the on disk ODB from the
-  blob store first, then use libgit2.
+* `git.status`, `git.branches`, `git.tags` read the SQLite refs directly; `git.log`,
+  `git.show`, `git.diff`, `git.blame` hydrate the on disk ODB from the blob store
+  first, then use libgit2.
 * `git.commit` builds a tree from the **current volume content** (there is no
   index or working tree), writes the commit through the blob backed object db,
   moves `refs/heads/{branch}` and sets HEAD on the first commit. Author defaults
@@ -131,8 +138,7 @@ Parameters and return keys are in `.agent_docs/tools.md`. Notable points:
   detected provider when one exists, and reports which through the `auth` key.
 * Ref resolution reproduces a reference quirk on purpose: a name made only of hex
   characters is treated as a sha *before* `refs/heads/{name}` is tried, so a
-  branch named `beef` resolves to the sha `beef`.
-* Short shas are the first 8 characters, like the reference.
+  branch named `beef` resolves to the sha `beef`. Short shas are 8 characters.
 
 ## OAuth (device flow) and token persistence
 
@@ -180,18 +186,16 @@ git:
 
 ## Divergences from the reference
 
-Documented at their call sites, and each one is a case where copying the
-reference would copy a defect:
+Each one is a case where copying the reference would copy a defect, and each is
+documented at its call site. Headlines only:
 
-* `receive-pack` sends the `unpack ok` report line the protocol requires (the
-  reference omits it, so a real `git push` reports failure although refs update).
-* `multi_ack_detailed` is advertised (a stateless-rpc `git clone` refuses to
-  negotiate without it).
-* Git HTTP routes enforce project membership.
-* `git.max_pack_size_mb` is enforced.
-* Pushed objects are really indexed and imported.
-* No custom libgit2 ODB backend (see above).
+* the git protocol is actually usable (`multi_ack_detailed` advertised, full
+  ancestry in the pack, `unpack ok` sent, report framed on band 1);
+* membership is enforced on the HTTP routes;
+* `git.max_pack_size_mb` is enforced;
+* pushed objects are really indexed and imported;
+* no custom libgit2 ODB backend (see above);
 * `admin.delete_project` purges the git state instead of leaking it.
 
-The full list, including the non git ones and the harness findings, is in
+The authoritative list, with the reasoning and the non git divergences, is in
 [`.agent_docs/parity.md`](parity.md). Do not restate it elsewhere.
