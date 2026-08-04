@@ -122,3 +122,22 @@ reworded message passes while a wrong code fails.
 deliberately not compared, and the table of the differences that are expected to
 show up. A non zero difference count is not automatically a failure; it is a
 failure unless it is in that table.
+
+## The `agent` crate
+
+96 unit tests, all pure: none needs a server, an LLM or a terminal. The streaming
+accumulator is fed chunk JSON directly, which covers what actually breaks in the wild (a
+tool name split across chunks, out of order indices, a missing call id, a trailing nameless
+delta, malformed arguments).
+
+The interactive path cannot be unit tested. It is verified by driving a real pty: wait for
+the prompt, type with a typo, fix it with backspaces, submit, recall with the up arrow,
+abandon with Ctrl+C, then ask for markdown and assert on the rendered escapes. Both spinner
+bugs described in `.agent_docs/agent.md` were found that way, not by the test suite.
+
+Smoke test both stdin modes, since they take different code paths:
+
+```bash
+printf 'Liste mes projets.\nexit\n' | ./target/release/agent --user you   # piped
+./agent.sh --user you                                                     # interactive
+```

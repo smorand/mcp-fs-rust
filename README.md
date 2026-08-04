@@ -119,6 +119,31 @@ cargo clippy --all-targets -- -D warnings
 
 The suite is the quality gate and must be green before any commit.
 
+## Interactive CLI agent
+
+`crates/agent` builds an `agent` binary that drives the 55 tools through an LLM. It is a
+**client**, so it exercises the real MCP wire protocol the way any other client would.
+
+```bash
+./run.sh &                                                  # server on :5002
+mkdir -p .agent_keys
+./target/release/mcp-fs token you@example.com \
+    --key .keys/jwt.key > .agent_keys/you                   # one raw JWT per file
+export IBM_ICA_MODEL_KEY=...                                # or put it in .env
+./agent.sh --user you
+```
+
+Configured by `config/agent_test.yaml`: MCP endpoint, token directory, and any OpenAI
+compatible chat endpoint. `--conversation ID` resumes a transcript, `/help` lists the
+commands. It also works non interactively, which makes it scriptable:
+
+```bash
+printf 'Liste mes projets.\nexit\n' | ./target/release/agent --user you
+```
+
+`.agent_keys/` (bearer tokens) and `.agent_history/` (transcripts) are gitignored. See
+[`.agent_docs/agent.md`](.agent_docs/agent.md) for the terminal invariants it relies on.
+
 ## Parity harness
 
 The objective judge of 1:1 parity. It replays a corpus of MCP and REST calls against a
@@ -197,7 +222,7 @@ ignored: the bundled libgit2 is sha1 only.
 ## Documentation
 
 `AGENTS.md` is the compact index. Details live in [`.agent_docs/`](.agent_docs/):
-architecture, tools, api, git, config, testing, parity.
+architecture, tools, api, git, config, testing, parity, agent.
 
 ## License
 

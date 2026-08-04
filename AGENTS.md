@@ -4,7 +4,8 @@
 Rust port of the C# `mcp-fs`: a **streamable-HTTP MCP server** exposing a **simulated
 multi-project filesystem** (55 tools: 33 `fs.*`, 8 `admin.*`, 11 `git.*`, 3 `git.auth*`),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
-`/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/`.
+`/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/`. Ships with
+`agent`, an interactive CLI agent that drives the tools through an LLM (`./agent.sh`).
 
 **Strict 1:1 external parity with the C#** is the prime directive: same tool names,
 snake_case parameters, `ERR_*` codes, JSON shapes, SQLite schemas, git wire protocol and
@@ -23,6 +24,7 @@ git2 (libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap
 cargo clippy --all-targets -- -D warnings      quality gate, must be clean
 mcp-fs serve | keys | token | version
 cargo run -p parity-harness -- capture|compare  the 1:1 parity judge
+./agent.sh --user <name>              interactive CLI agent against a running server
 ```
 
 ## Project structure
@@ -50,6 +52,10 @@ cargo run -p parity-harness -- capture|compare  the 1:1 parity judge
   `repo.rs` (per project repository + write lock), `http/` (pkt-line, upload-pack,
   receive-pack), `oauth/` (store, AES-GCM cipher, encrypted persistence, device flow).
 - `crates/parity-harness/` : differential tester (`corpus.rs`, `normalize.rs`).
+- `crates/agent/` : the interactive CLI agent (an MCP **client**, not part of the server).
+  `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
+  streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
+  ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
 - `TOOL_CONTRACT.txt` : the 55 tool schemas and return shapes captured from the LIVE C#
   server. **This is the authoritative contract**; it beats reading the C# source.
 - `parity-golden.json` : captured C# baseline for the harness.
@@ -102,3 +108,4 @@ unsupported extraction format, numbered list markers kept in generated docx.
 - `.agent_docs/config.md` : full YAML schema, env expansion, secrets.
 - `.agent_docs/testing.md` : test layout, how to run the parity harness, MinIO opt-in.
 - `.agent_docs/parity.md` : what parity means here, how it is verified, known divergences.
+- `.agent_docs/agent.md` : the CLI agent, its config, and the terminal invariants it depends on.

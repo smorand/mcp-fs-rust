@@ -1,0 +1,44 @@
+# agent configuration
+# Connects to a running mcp-fs server and drives a LLM with its tools.
+#
+# Start mcp-fs first:  ./run.sh
+# Mint a token:        ./target/release/mcp-fs token you@example.com --key .keys/jwt.key
+# Then run:            ./agent.sh --user you
+mcp:
+  url: http://127.0.0.1:5002/mcp
+  # Default token used when --user is not specified.
+  # Leave empty and use --user instead (recommended).
+  # To generate: ./target/release/mcp-fs token you@example.com --key .keys/jwt.key > .agent_keys/you
+  token: ""
+  # Folder containing per-user token files, relative to this config file.
+  # File name = user name passed to --user, content = raw JWT string.
+  # Convention: one file per user, gitignored.
+  # Example:
+  #   .agent_keys/alice   → eyJhbGci...  (JWT for alice@example.com)
+  #   .agent_keys/bob     → eyJhbGci...  (JWT for bob@example.com)
+  # Generate a file:
+  #   ./target/release/mcp-fs token alice@example.com --key .keys/jwt.key > .agent_keys/alice
+  # Use it:
+  #   ./agent.sh --user alice
+  tokens_dir: .agent_keys
+  auth_header: X-Forwarded-Authorization
+llm:
+  base_url: https://api.nextgen-beta.ica.ibm.com/ica/v1
+  model: claude-haiku-4-5
+  api_key: ""
+  api_key_env: IBM_ICA_MODEL_KEY
+system_prompt: >
+  You are a helpful assistant with access to a filesystem via MCP tools (fs.* and admin.*).
+  Use the tools to answer the user's questions about their files.
+  When listing or reading files, always show the results clearly.
+  Important rules:
+  - Always use the exact tool name as provided (e.g. "admin.list_projects", not "admin_list_projects").
+  - admin.list_projects lists projects the current user owns or is a member of.
+    admin.list_all_projects lists every project on the platform (works only for platform admins).
+    When the user asks to "list all projects" or seems to be an admin and sees an empty list,
+    try admin.list_all_projects. If it returns ERR_FORBIDDEN, fall back to admin.list_projects.
+  - A project can exist but not appear in admin.list_projects if the caller is neither its owner
+    nor a member. Use admin.list_all_projects to confirm existence before assuming it is missing.
+  - To browse files in a project, first call fs.list_allowed_roots to discover mount_id values,
+    then use fs.list_dir with the correct mount_id.
+

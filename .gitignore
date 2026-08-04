@@ -20,3 +20,8 @@ config/local.yaml
 # IDE
 .idea/
 .vscode/
+
+# Per user JWT files consumed by ./agent.sh (one raw token per file). Never commit.
+.agent_keys/
+# Conversation transcripts and readline history from ./agent.sh.
+.agent_history/
