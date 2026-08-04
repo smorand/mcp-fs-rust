@@ -1132,6 +1132,7 @@ mod hashing {
         hex::encode(h.finalize())
     }
 
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1157,6 +1158,136 @@ mod hashing {
             assert_eq!(sha1_hex(&data), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
         }
     }
+}
+
+// ─────────────────────────────────────── symbol search and documents ────
+//
+// These four compositions sit here, in the engine, rather than in a tool module,
+// because BOTH the MCP tool layer and the REST data plane need them. Keeping two
+// copies (which is how they first landed) is a drift hazard: a fix on one path
+// would silently leave the other on the old behaviour. Walking, symbol lookup,
+// extraction and docx rendering themselves live in `crate::docs`.
+
+/// Symbol definitions across a subtree. Key: `definitions`, entries
+/// `{path, name, kind, line}`.
+pub async fn find_definitions(
+    client: &VolumeClient,
+    root: &str,
+    name: &str,
+    kind: Option<&str>,
+) -> Result<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (path, _) in iter_files(client, root, DEFAULT_EXCLUDES).await? {
+        // No grammar and no lexical pattern for this extension: skip the read
+        // entirely, like the reference does.
+        if crate::docs::language_for(&path).is_none() {
+            continue;
+        }
+        let source = client.read_text(&path).await?;
+        for d in crate::docs::find_definitions(&path, &source, name, kind) {
+            out.push(json!({"path": d.path, "name": d.name, "kind": d.kind, "line": d.line}));
+        }
+    }
+    Ok(json!({"definitions": out}))
+}
+
+/// Identifier references across a subtree. Key: `references`, entries
+/// `{path, line, kind}`. The name is the query, so it is not echoed per hit.
+pub async fn find_references(client: &VolumeClient, root: &str, name: &str) -> Result<Value> {
+    if name.is_empty() {
+        return Err(ToolError::invalid_argument("name is required"));
+    }
+    let mut out: Vec<Value> = Vec::new();
+    for (path, _) in iter_files(client, root, DEFAULT_EXCLUDES).await? {
+        if crate::docs::language_for(&path).is_none() {
+            continue;
+        }
+        let source = client.read_text(&path).await?;
+        for m in crate::docs::find_references(&path, &source, name) {
+            out.push(json!({"path": m.path, "line": m.line, "kind": m.kind}));
+        }
+    }
+    Ok(json!({"references": out}))
+}
+
+/// Extract a document to a companion `.md` and account for the write.
+///
+/// A cache hit wrote nothing, so it is not charged, not audited, and does not
+/// record a read. A miss charges the companion's size, records the read (so a
+/// follow-up edit on the companion passes the guard) and audits it.
+#[allow(clippy::too_many_arguments)]
+pub async fn extract_document(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    ocr_config: &crate::config::OcrConfig,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    max_chars: usize,
+    preview_chars: usize,
+    ocr: bool,
+    refresh: bool,
+) -> Result<Value> {
+    let provider = crate::docs::provider_from_config(ocr_config);
+    let payload = crate::docs::extract_text(
+        client,
+        provider.as_ref(),
+        norm,
+        max_chars,
+        preview_chars,
+        ocr,
+        refresh,
+    )
+    .await?;
+
+    let cached = payload.get("cached").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(md) = payload.get("md_path").and_then(Value::as_str)
+        && !cached
+    {
+        let bytes = client.stat(md).await?.size;
+        safety.charge_write(person, mount_id, bytes)?;
+        safety.record_read(person, mount_id, md);
+        safety.record_audit(person, mount_id, "extract_text", md, &format!("{bytes} bytes"));
+    }
+    Ok(payload)
+}
+
+/// Render Markdown to a `.docx` and store it. Keys: `path`, `bytes_written`,
+/// `overwritten`.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_docx(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    markdown: &str,
+    title: Option<&str>,
+    overwrite: bool,
+) -> Result<Value> {
+    if !norm.to_ascii_lowercase().ends_with(".docx") {
+        return Err(ToolError::invalid_argument("path must end with .docx"));
+    }
+    let exists = client.exists(norm).await?;
+    if exists && !overwrite {
+        return Err(ToolError::no_clobber(format!("'{norm}' exists (pass overwrite=true)")));
+    }
+    if exists {
+        safety.ensure_read_before_write(person, mount_id, norm)?;
+    }
+    let data = crate::docs::render_markdown_to_docx(markdown, title)?;
+    let parent = match norm.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(i) => norm[..i].to_string(),
+    };
+    if parent != "/" {
+        client.makedirs(&parent, true).await?;
+    }
+    safety.charge_write(person, mount_id, data.len() as i64)?;
+    client.write_bytes_atomic(norm, &data).await?;
+    safety.record_read(person, mount_id, norm);
+    safety.record_audit(person, mount_id, "write_docx", norm, &format!("{} bytes", data.len()));
+    Ok(json!({"path": norm, "bytes_written": data.len(), "overwritten": exists}))
 }
 
 #[cfg(test)]

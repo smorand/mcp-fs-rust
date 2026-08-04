@@ -11,12 +11,9 @@
 //! ever returns a typed `ToolError`, so there is nothing left to translate.
 
 use crate::core::fs_ops;
-use crate::errors::{Result, ToolError};
 use crate::mcp::ToolSchema;
 use crate::mcp::registry::{ToolRegistry, handler};
-use crate::storage::VolumeClient;
 use crate::tools::{norm_or, volume};
-use serde_json::{Value, json};
 
 pub fn register(reg: &mut ToolRegistry) {
     reg.add(
@@ -76,7 +73,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;
-            find_definitions(&client, &root, &a.str("name")?, a.opt_str("kind").as_deref()).await
+            fs_ops::find_definitions(&client, &root, &a.str("name")?, a.opt_str("kind").as_deref()).await
         }),
     );
 
@@ -88,52 +85,12 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;
-            find_references(&client, &root, &a.str("name")?).await
+            fs_ops::find_references(&client, &root, &a.str("name")?).await
         }),
     );
 }
 
-/// Definition hits across the subtree. Key: `definitions`, entries
-/// `{path, name, kind, line}`.
-async fn find_definitions(
-    client: &VolumeClient,
-    root: &str,
-    name: &str,
-    kind: Option<&str>,
-) -> Result<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    for (path, _) in fs_ops::iter_files(client, root, fs_ops::DEFAULT_EXCLUDES).await? {
-        // No known grammar and no lexical pattern for this extension: skip the
-        // read entirely, like the C# does.
-        if crate::docs::language_for(&path).is_none() {
-            continue;
-        }
-        let source = client.read_text(&path).await?;
-        for m in crate::docs::find_definitions(&path, &source, name, kind) {
-            out.push(json!({"path": m.path, "name": m.name, "kind": m.kind, "line": m.line}));
-        }
-    }
-    Ok(json!({"definitions": out}))
-}
 
-/// Reference hits across the subtree. Key: `references`, entries
-/// `{path, line, kind}` (the name is the query, so it is not echoed per hit).
-async fn find_references(client: &VolumeClient, root: &str, name: &str) -> Result<Value> {
-    if name.is_empty() {
-        return Err(ToolError::invalid_argument("name is required"));
-    }
-    let mut out: Vec<Value> = Vec::new();
-    for (path, _) in fs_ops::iter_files(client, root, fs_ops::DEFAULT_EXCLUDES).await? {
-        if crate::docs::language_for(&path).is_none() {
-            continue;
-        }
-        let source = client.read_text(&path).await?;
-        for m in crate::docs::find_references(&path, &source, name) {
-            out.push(json!({"path": m.path, "line": m.line, "kind": m.kind}));
-        }
-    }
-    Ok(json!({"references": out}))
-}
 
 #[cfg(test)]
 mod tests {

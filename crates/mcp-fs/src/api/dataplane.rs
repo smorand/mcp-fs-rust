@@ -823,7 +823,7 @@ async fn find_definition(
     let q = Q(q);
     guarded_json(state, headers, mount, |r| async move {
         let root = r.norm(q.str_or("root", "/"))?;
-        definitions_in(&r.client, &root, q.req_str("name")?, q.opt("kind")).await
+        fs_ops::find_definitions(&r.client, &root, q.req_str("name")?, q.opt("kind")).await
     })
     .await
 }
@@ -837,7 +837,7 @@ async fn find_references(
     let q = Q(q);
     guarded_json(state, headers, mount, |r| async move {
         let root = r.norm(q.str_or("root", "/"))?;
-        references_in(&r.client, &root, q.req_str("name")?).await
+        fs_ops::find_references(&r.client, &root, q.req_str("name")?).await
     })
     .await
 }
@@ -1116,8 +1116,12 @@ async fn extract_text(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        extract_document(
-            &r,
+        fs_ops::extract_document(
+            &r.client,
+            r.safety(),
+            &r.state.config.extract.ocr,
+            &r.person,
+            &r.mount,
             &norm,
             a.int_or("max_chars", 200_000).max(0) as usize,
             a.int_or("preview_chars", 4_000).max(0) as usize,
@@ -1138,8 +1142,11 @@ async fn write_docx(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        docx_document(
-            &r,
+        fs_ops::write_docx(
+            &r.client,
+            r.safety(),
+            &r.person,
+            &r.mount,
             &norm,
             &a.str("markdown")?,
             a.opt_str("title").as_deref(),
@@ -1148,119 +1155,6 @@ async fn write_docx(
         .await
     })
     .await
-}
-
-// ───────────────────────────────────────────────── compositions over docs/ ────
-//
-// The four helpers below mirror C# FsOps methods that have no `fs_ops`
-// counterpart yet (the search and document tool families are not landed). They
-// deliberately hold no logic of their own: walking, symbol lookup, extraction and
-// docx rendering all happen in `core::fs_ops` / `docs::*`. When the matching
-// `fs_ops` functions appear, delete these and call them instead.
-
-/// Port of the C# `FsOps.FindDefinitions`.
-async fn definitions_in(
-    client: &VolumeClient,
-    root: &str,
-    name: &str,
-    kind: Option<&str>,
-) -> Result<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    for (path, _) in fs_ops::iter_files(client, root, fs_ops::DEFAULT_EXCLUDES).await? {
-        if docs::language_for(&path).is_none() {
-            continue;
-        }
-        let source = client.read_text(&path).await?;
-        for d in docs::find_definitions(&path, &source, name, kind) {
-            out.push(json!({"path": d.path, "name": d.name, "kind": d.kind, "line": d.line}));
-        }
-    }
-    Ok(json!({"definitions": out}))
-}
-
-/// Port of the C# `FsOps.FindReferences`.
-async fn references_in(client: &VolumeClient, root: &str, name: &str) -> Result<Value> {
-    if name.is_empty() {
-        return Err(ToolError::invalid_argument("name is required"));
-    }
-    let mut out: Vec<Value> = Vec::new();
-    for (path, _) in fs_ops::iter_files(client, root, fs_ops::DEFAULT_EXCLUDES).await? {
-        if docs::language_for(&path).is_none() {
-            continue;
-        }
-        let source = client.read_text(&path).await?;
-        for m in docs::find_references(&path, &source, name) {
-            out.push(json!({"path": m.path, "line": m.line, "kind": m.kind}));
-        }
-    }
-    Ok(json!({"references": out}))
-}
-
-/// Port of the C# `FsOps.ExtractDocument`: the engine writes the companion `.md`,
-/// the caller owns the safety accounting around it.
-async fn extract_document(
-    r: &Req,
-    norm: &str,
-    max_chars: usize,
-    preview_chars: usize,
-    ocr: bool,
-    refresh: bool,
-) -> Result<Value> {
-    let provider = docs::provider_from_config(&r.state.config.extract.ocr);
-    let payload = docs::extract_text(
-        &r.client,
-        provider.as_ref(),
-        norm,
-        max_chars,
-        preview_chars,
-        ocr,
-        refresh,
-    )
-    .await?;
-
-    let md_path = payload.get("md_path").and_then(Value::as_str).map(str::to_string);
-    let cached = payload.get("cached").and_then(Value::as_bool).unwrap_or(false);
-    if let Some(md) = md_path
-        && !cached
-    {
-        let bytes = r.client.stat(&md).await?.size;
-        r.safety().charge_write(&r.person, &r.mount, bytes)?;
-        r.safety().record_read(&r.person, &r.mount, &md);
-        r.safety()
-            .record_audit(&r.person, &r.mount, "extract_text", &md, &format!("{bytes} bytes"));
-    }
-    Ok(payload)
-}
-
-/// Port of the C# `FsOps.WriteDocx`.
-async fn docx_document(
-    r: &Req,
-    norm: &str,
-    markdown: &str,
-    title: Option<&str>,
-    overwrite: bool,
-) -> Result<Value> {
-    if !norm.to_ascii_lowercase().ends_with(".docx") {
-        return Err(ToolError::invalid_argument("path must end with .docx"));
-    }
-    let exists = r.client.exists(norm).await?;
-    if exists && !overwrite {
-        return Err(ToolError::no_clobber(format!("'{norm}' exists (pass overwrite=true)")));
-    }
-    if exists {
-        r.safety().ensure_read_before_write(&r.person, &r.mount, norm)?;
-    }
-    let data = docs::render_markdown_to_docx(markdown, title)?;
-    let parent = PosixPath::dirname(norm);
-    if parent != "/" {
-        r.client.makedirs(&parent, true).await?;
-    }
-    r.safety().charge_write(&r.person, &r.mount, data.len() as i64)?;
-    r.client.write_bytes_atomic(norm, &data).await?;
-    r.safety().record_read(&r.person, &r.mount, norm);
-    r.safety()
-        .record_audit(&r.person, &r.mount, "write_docx", norm, &format!("{} bytes", data.len()));
-    Ok(json!({"path": norm, "bytes_written": data.len(), "overwritten": exists}))
 }
 
 #[cfg(test)]

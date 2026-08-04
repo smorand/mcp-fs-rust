@@ -62,7 +62,10 @@ cargo run -p parity-harness -- capture|compare  the 1:1 parity judge
   verbatim from `TOOL_CONTRACT.txt`.
 - Every `fs.*`/`git.*` handler: `state.authorize(mount_id, person)` first, then normalize
   every path through `state.safety.normalize_path`, then call the engine in `core::fs_ops`.
-  Never reimplement an operation in the tool layer.
+  Never reimplement an operation in the tool layer, and never in `api/dataplane.rs`
+  either: the MCP surface and the REST plane MUST share one implementation, otherwise a
+  fix on one path silently leaves the other on the old behaviour. `core::fs_ops` is the
+  only place an operation is written; both layers are thin adapters over it.
 - Platform admin manages projects and membership; it does NOT get implicit file access.
   Keep that separation.
 - SQLite is accessed only through `storage::sqlite::SqliteDb` (one connection, serialized,

@@ -4,12 +4,10 @@
 //! `FsOps.ExtractDocument` / `FsOps.WriteDocx` wrap around the engines in
 //! [`crate::docs`].
 
-use crate::errors::{Result, ToolError};
-use crate::mcp::registry::{ToolCtx, ToolRegistry, handler};
+use crate::core::fs_ops;
+use crate::mcp::registry::{ToolRegistry, handler};
 use crate::mcp::ToolSchema;
-use crate::storage::VolumeClient;
 use crate::tools::{norm, volume};
-use serde_json::{Value, json};
 
 /// The C# description is one concatenated string; it is the LLM facing doc for
 /// the whole extraction pipeline, so it is reproduced verbatim.
@@ -34,19 +32,19 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            let ocr = crate::docs::provider_from_config(&ctx.state.config.extract.ocr);
-            let payload = crate::docs::extract_text(
+            fs_ops::extract_document(
                 &client,
-                ocr.as_ref(),
+                &ctx.state.safety,
+                &ctx.state.config.extract.ocr,
+                &ctx.person,
+                &mount,
                 &path,
                 a.int_or("max_chars", 200_000).max(0) as usize,
                 a.int_or("preview_chars", 4_000).max(0) as usize,
                 a.bool_or("ocr", true),
                 a.bool_or("refresh", false),
             )
-            .await?;
-            account_for_companion(&ctx, &client, &mount, &payload).await?;
-            Ok(payload)
+            .await
         }),
     );
 
@@ -63,9 +61,10 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            write_docx(
-                &ctx,
+            fs_ops::write_docx(
                 &client,
+                &ctx.state.safety,
+                &ctx.person,
                 &mount,
                 &path,
                 &a.str("markdown")?,
@@ -77,75 +76,10 @@ pub fn register(reg: &mut ToolRegistry) {
     );
 }
 
-/// Charge the companion `.md`, mark it read and audit it.
-///
-/// Deviation from the C#, deliberate: the Rust engine owns the companion write,
-/// so the quota is charged just after that write instead of just before it. The
-/// observable payload is identical; the only difference is that a session which
-/// blows its quota on the last extraction still leaves the `.md` on disk.
-async fn account_for_companion(
-    ctx: &ToolCtx,
-    client: &VolumeClient,
-    mount: &str,
-    payload: &Value,
-) -> Result<()> {
-    // A cache hit wrote nothing, and a null md_path means the extraction produced
-    // no text worth storing.
-    if payload["cached"] == Value::Bool(true) {
-        return Ok(());
-    }
-    let Some(md) = payload["md_path"].as_str() else {
-        return Ok(());
-    };
-    let size = client.stat(md).await?.size;
-    let safety = &ctx.state.safety;
-    safety.charge_write(&ctx.person, mount, size)?;
-    // Recording the read lets a follow-up fs.edit on the companion pass the guard.
-    safety.record_read(&ctx.person, mount, md);
-    safety.record_audit(&ctx.person, mount, "extract_text", md, &format!("{size} bytes"));
-    Ok(())
-}
-
-/// Render Markdown to a `.docx` and store it. Keys: `path`, `bytes_written`,
-/// `overwritten`.
-async fn write_docx(
-    ctx: &ToolCtx,
-    client: &VolumeClient,
-    mount: &str,
-    norm: &str,
-    markdown: &str,
-    title: Option<&str>,
-    overwrite: bool,
-) -> Result<Value> {
-    if !norm.to_ascii_lowercase().ends_with(".docx") {
-        return Err(ToolError::invalid_argument("path must end with .docx"));
-    }
-    let exists = client.exists(norm).await?;
-    if exists && !overwrite {
-        return Err(ToolError::no_clobber(format!("'{norm}' exists (pass overwrite=true)")));
-    }
-    let safety = &ctx.state.safety;
-    if exists {
-        safety.ensure_read_before_write(&ctx.person, mount, norm)?;
-    }
-    let data = crate::docs::render_markdown_to_docx(markdown, title)?;
-    let parent = match norm.rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(i) => norm[..i].to_string(),
-    };
-    if parent != "/" {
-        client.makedirs(&parent, true).await?;
-    }
-    safety.charge_write(&ctx.person, mount, data.len() as i64)?;
-    client.write_bytes_atomic(norm, &data).await?;
-    safety.record_read(&ctx.person, mount, norm);
-    safety.record_audit(&ctx.person, mount, "write_docx", norm, &format!("{} bytes", data.len()));
-    Ok(json!({"path": norm, "bytes_written": data.len(), "overwritten": exists}))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use crate::errors::code;
     use crate::tools::testkit::{
         MOUNT, PERSON, assert_description, assert_family, assert_schema, harness,
