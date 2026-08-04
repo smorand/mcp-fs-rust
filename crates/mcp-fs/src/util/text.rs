@@ -49,28 +49,60 @@ pub fn indent_width(line: &str) -> usize {
     line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
 }
 
-/// Glob match on a whole path, supporting `*`, `?`, `**` and character classes.
-/// `**` crosses '/' boundaries; a single `*` does not.
-pub fn glob_match(pattern: &str, path: &str) -> bool {
-    match globset::GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
-        .map(|g| g.compile_matcher())
-    {
-        Ok(m) => m.is_match(path),
-        Err(_) => false,
-    }
-}
+/// Python `fnmatch` semantics, translated to a regex exactly like the C#
+/// `TextUtil.FnmatchToRegex`. This is the ONLY glob implementation in the tree, on
+/// purpose: `fs.glob` and `fs.grep` parity depends on a single `*` crossing '/'
+/// boundaries, which `globset` with `literal_separator(true)` does NOT do. Verified
+/// against the reference server: pattern `*.rs` matches `/src/nested.rs`.
+pub struct Fnmatch(Option<regex::Regex>);
 
-/// Match a bare name (no '/') against a pattern, used for exclusion lists where a
-/// pattern like `.git` or `*.tmp` should hit any path segment or file name.
-pub fn name_match(pattern: &str, name: &str) -> bool {
-    if pattern == name {
-        return true;
+impl Fnmatch {
+    pub fn new(pattern: &str) -> Self {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut source = String::from("(?s)^");
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            i += 1;
+            match c {
+                '*' => source.push_str(".*"),
+                '?' => source.push('.'),
+                '[' => {
+                    let mut j = i;
+                    if j < chars.len() && (chars[j] == '!' || chars[j] == '^') {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == ']' {
+                        j += 1;
+                    }
+                    while j < chars.len() && chars[j] != ']' {
+                        j += 1;
+                    }
+                    if j >= chars.len() {
+                        // Unterminated class: a literal '[', like fnmatch.
+                        source.push_str("\\[");
+                    } else {
+                        let inner: String = chars[i..j].iter().collect();
+                        i = j + 1;
+                        let mut inner = inner.replace('\\', "\\\\");
+                        if let Some(rest) = inner.strip_prefix('!') {
+                            inner = format!("^{rest}");
+                        }
+                        source.push('[');
+                        source.push_str(&inner);
+                        source.push(']');
+                    }
+                }
+                other => source.push_str(&regex::escape(&other.to_string())),
+            }
+        }
+        source.push('$');
+        // An unrepresentable class matches nothing rather than blowing up the call.
+        Self(regex::Regex::new(&source).ok())
     }
-    match globset::Glob::new(pattern).map(|g| g.compile_matcher()) {
-        Ok(m) => m.is_match(name),
-        Err(_) => false,
+
+    pub fn is_match(&self, name: &str) -> bool {
+        self.0.as_ref().is_some_and(|r| r.is_match(name))
     }
 }
 
@@ -118,29 +150,39 @@ mod tests {
         assert_eq!(indent_width("x"), 0);
     }
 
+    /// The behaviour that matters for parity: a single `*` crosses '/' like Python
+    /// fnmatch, verified against the reference server (`*.rs` matches `/src/nested.rs`).
     #[test]
-    fn glob_star_does_not_cross_slash() {
-        assert!(glob_match("*.rs", "main.rs"));
-        assert!(!glob_match("*.rs", "src/main.rs"));
-        assert!(glob_match("**/*.rs", "src/main.rs"));
-        assert!(glob_match("src/*.rs", "src/main.rs"));
+    fn star_crosses_slash_like_python_fnmatch() {
+        assert!(Fnmatch::new("*.rs").is_match("main.rs"));
+        assert!(Fnmatch::new("*.rs").is_match("/src/nested.rs"));
+        assert!(Fnmatch::new("**/*.rs").is_match("/src/nested.rs"));
+        assert!(Fnmatch::new("src/*.rs").is_match("src/main.rs"));
     }
 
     #[test]
-    fn glob_double_star_matches_everything() {
-        assert!(glob_match("**/*", "a/b/c.txt"));
-        assert!(glob_match("**/*.py", "src/doc/x.py"));
+    fn question_mark_matches_one_char() {
+        assert!(Fnmatch::new("a?c").is_match("abc"));
+        assert!(!Fnmatch::new("a?c").is_match("ac"));
     }
 
     #[test]
-    fn name_match_exact_and_pattern() {
-        assert!(name_match(".git", ".git"));
-        assert!(name_match("*.tmp", "a.tmp"));
-        assert!(!name_match("*.tmp", "a.txt"));
+    fn character_classes_and_negation() {
+        assert!(Fnmatch::new("[ab]x").is_match("ax"));
+        assert!(!Fnmatch::new("[ab]x").is_match("cx"));
+        assert!(Fnmatch::new("[!ab]x").is_match("cx"));
+        assert!(!Fnmatch::new("[!ab]x").is_match("ax"));
     }
 
     #[test]
-    fn invalid_glob_does_not_panic() {
-        assert!(!glob_match("[", "x"));
+    fn literal_dot_is_escaped() {
+        assert!(Fnmatch::new("a.txt").is_match("a.txt"));
+        assert!(!Fnmatch::new("a.txt").is_match("axtxt"));
+    }
+
+    #[test]
+    fn an_unterminated_class_is_a_literal_bracket() {
+        assert!(Fnmatch::new("[").is_match("["));
+        assert!(!Fnmatch::new("[").is_match("x"));
     }
 }

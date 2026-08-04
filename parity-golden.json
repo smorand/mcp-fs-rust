@@ -1,6 +1,6 @@
 {
   "base": "http://127.0.0.1:5002",
-  "project": "parity-aecae540",
+  "project": "parity-993c3400",
   "steps": {
     "admin_list_all_projects": {
       "status": 200,
@@ -3981,245 +3981,6 @@
                 }
               }
             },
-            "MultiEditBody": {
-              "required": [
-                "path",
-                "edits"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path within the volume."
-                },
-                "edits": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/EditSpec"
-                  },
-                  "description": "Ordered edits (old_string, new_string, replace_all) applied atomically."
-                },
-                "dry_run": {
-                  "type": "boolean",
-                  "description": "Return the diff without writing changes.",
-                  "default": false
-                }
-              }
-            },
-            "ReadManyBody": {
-              "required": [
-                "paths"
-              ],
-              "type": "object",
-              "properties": {
-                "paths": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "description": "Absolute POSIX paths to read, one entry per file."
-                },
-                "per_file_cap_lines": {
-                  "type": "integer",
-                  "description": "Maximum number of lines returned per file.",
-                  "format": "int32",
-                  "default": 500
-                }
-              }
-            },
-            "CreateEmptyBody": {
-              "required": [
-                "path"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path of the file to create."
-                },
-                "exist_ok": {
-                  "type": "boolean",
-                  "description": "Succeed silently if the file already exists.",
-                  "default": false
-                }
-              }
-            },
-            "EditSpec": {
-              "type": "object",
-              "properties": {
-                "old_string": {
-                  "type": "string"
-                },
-                "new_string": {
-                  "type": "string"
-                },
-                "replace_all": {
-                  "type": "boolean"
-                }
-              }
-            },
-            "EditBody": {
-              "required": [
-                "path",
-                "old_string",
-                "new_string"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path within the volume."
-                },
-                "old_string": {
-                  "type": "string",
-                  "description": "Exact text to find; must be unique unless replace_all is set."
-                },
-                "new_string": {
-                  "type": "string",
-                  "description": "Replacement text substituted for old_string."
-                },
-                "replace_all": {
-                  "type": "boolean",
-                  "description": "Replace every occurrence instead of requiring a unique match.",
-                  "default": false
-                },
-                "dry_run": {
-                  "type": "boolean",
-                  "description": "Return the diff without writing changes.",
-                  "default": false
-                }
-              }
-            },
-            "ApplyPatchBody": {
-              "required": [
-                "patch_text"
-              ],
-              "type": "object",
-              "properties": {
-                "patch_text": {
-                  "type": "string",
-                  "description": "Multi-file V4A patch text to apply within the volume."
-                }
-              }
-            },
-            "WriteDocxBody": {
-              "required": [
-                "path",
-                "markdown"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path of the .docx file to write."
-                },
-                "markdown": {
-                  "type": "string",
-                  "description": "Markdown source rendered into the Word document."
-                },
-                "title": {
-                  "type": "string",
-                  "description": "Optional document title.",
-                  "default": null,
-                  "nullable": true
-                },
-                "overwrite": {
-                  "type": "boolean",
-                  "description": "Allow overwriting an existing file (default no-clobber).",
-                  "default": false
-                }
-              }
-            },
-            "SearchReplaceBody": {
-              "required": [
-                "path",
-                "search_block",
-                "replace_block"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path within the volume."
-                },
-                "search_block": {
-                  "type": "string",
-                  "description": "Multi-line block of text to locate."
-                },
-                "replace_block": {
-                  "type": "string",
-                  "description": "Multi-line block that replaces search_block."
-                },
-                "fuzzy": {
-                  "type": "boolean",
-                  "description": "Allow whitespace tolerant (fuzzy) matching of search_block.",
-                  "default": false
-                }
-              }
-            },
-            "ExtractBody": {
-              "required": [
-                "path"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path of the source document."
-                },
-                "max_chars": {
-                  "type": "integer",
-                  "description": "Maximum characters of Markdown to store.",
-                  "format": "int32",
-                  "default": 200000
-                },
-                "preview_chars": {
-                  "type": "integer",
-                  "description": "Number of leading characters returned as a preview.",
-                  "format": "int32",
-                  "default": 4000
-                },
-                "ocr": {
-                  "type": "boolean",
-                  "description": "Enable OCR for images via a configured multimodal provider.",
-                  "default": true
-                },
-                "refresh": {
-                  "type": "boolean",
-                  "description": "Force re-extraction even if the companion .md is up to date.",
-                  "default": false
-                }
-              }
-            },
-            "MoveBody": {
-              "required": [
-                "source",
-                "destination"
-              ],
-              "type": "object",
-              "properties": {
-                "source": {
-                  "type": "string",
-                  "description": "Absolute POSIX source path to move."
-                },
-                "destination": {
-                  "type": "string",
-                  "description": "Absolute POSIX destination path."
-                }
-              }
-            },
-            "DeleteBody": {
-              "required": [
-                "path"
-              ],
-              "type": "object",
-              "properties": {
-                "path": {
-                  "type": "string",
-                  "description": "Absolute POSIX path to delete."
-                }
-              }
-            },
             "CopyBody": {
               "required": [
                 "source",
@@ -4247,15 +4008,28 @@
                 }
               }
             },
-            "MkdirBody": {
+            "MultiEditBody": {
               "required": [
-                "path"
+                "path",
+                "edits"
               ],
               "type": "object",
               "properties": {
                 "path": {
                   "type": "string",
-                  "description": "Absolute POSIX path of the directory to create."
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "edits": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EditSpec"
+                  },
+                  "description": "Ordered edits (old_string, new_string, replace_all) applied atomically."
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Return the diff without writing changes.",
+                  "default": false
                 }
               }
             },
@@ -4306,6 +4080,232 @@
                 "content": {
                   "type": "string",
                   "description": "Text content to insert."
+                }
+              }
+            },
+            "EditBody": {
+              "required": [
+                "path",
+                "old_string",
+                "new_string"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "old_string": {
+                  "type": "string",
+                  "description": "Exact text to find; must be unique unless replace_all is set."
+                },
+                "new_string": {
+                  "type": "string",
+                  "description": "Replacement text substituted for old_string."
+                },
+                "replace_all": {
+                  "type": "boolean",
+                  "description": "Replace every occurrence instead of requiring a unique match.",
+                  "default": false
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Return the diff without writing changes.",
+                  "default": false
+                }
+              }
+            },
+            "DeleteBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path to delete."
+                }
+              }
+            },
+            "MoveBody": {
+              "required": [
+                "source",
+                "destination"
+              ],
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Absolute POSIX source path to move."
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Absolute POSIX destination path."
+                }
+              }
+            },
+            "ApplyPatchBody": {
+              "required": [
+                "patch_text"
+              ],
+              "type": "object",
+              "properties": {
+                "patch_text": {
+                  "type": "string",
+                  "description": "Multi-file V4A patch text to apply within the volume."
+                }
+              }
+            },
+            "WriteDocxBody": {
+              "required": [
+                "path",
+                "markdown"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the .docx file to write."
+                },
+                "markdown": {
+                  "type": "string",
+                  "description": "Markdown source rendered into the Word document."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Optional document title.",
+                  "default": null,
+                  "nullable": true
+                },
+                "overwrite": {
+                  "type": "boolean",
+                  "description": "Allow overwriting an existing file (default no-clobber).",
+                  "default": false
+                }
+              }
+            },
+            "EditSpec": {
+              "type": "object",
+              "properties": {
+                "old_string": {
+                  "type": "string"
+                },
+                "new_string": {
+                  "type": "string"
+                },
+                "replace_all": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "CreateEmptyBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the file to create."
+                },
+                "exist_ok": {
+                  "type": "boolean",
+                  "description": "Succeed silently if the file already exists.",
+                  "default": false
+                }
+              }
+            },
+            "ExtractBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the source document."
+                },
+                "max_chars": {
+                  "type": "integer",
+                  "description": "Maximum characters of Markdown to store.",
+                  "format": "int32",
+                  "default": 200000
+                },
+                "preview_chars": {
+                  "type": "integer",
+                  "description": "Number of leading characters returned as a preview.",
+                  "format": "int32",
+                  "default": 4000
+                },
+                "ocr": {
+                  "type": "boolean",
+                  "description": "Enable OCR for images via a configured multimodal provider.",
+                  "default": true
+                },
+                "refresh": {
+                  "type": "boolean",
+                  "description": "Force re-extraction even if the companion .md is up to date.",
+                  "default": false
+                }
+              }
+            },
+            "ReadManyBody": {
+              "required": [
+                "paths"
+              ],
+              "type": "object",
+              "properties": {
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Absolute POSIX paths to read, one entry per file."
+                },
+                "per_file_cap_lines": {
+                  "type": "integer",
+                  "description": "Maximum number of lines returned per file.",
+                  "format": "int32",
+                  "default": 500
+                }
+              }
+            },
+            "SearchReplaceBody": {
+              "required": [
+                "path",
+                "search_block",
+                "replace_block"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path within the volume."
+                },
+                "search_block": {
+                  "type": "string",
+                  "description": "Multi-line block of text to locate."
+                },
+                "replace_block": {
+                  "type": "string",
+                  "description": "Multi-line block that replaces search_block."
+                },
+                "fuzzy": {
+                  "type": "boolean",
+                  "description": "Allow whitespace tolerant (fuzzy) matching of search_block.",
+                  "default": false
+                }
+              }
+            },
+            "MkdirBody": {
+              "required": [
+                "path"
+              ],
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Absolute POSIX path of the directory to create."
                 }
               }
             }

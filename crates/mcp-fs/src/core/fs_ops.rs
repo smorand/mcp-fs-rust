@@ -325,8 +325,8 @@ pub async fn glob_files(
     pattern: &str,
     extra_excludes: &[String],
 ) -> Result<Value> {
-    let matcher = Fnmatch::new(pattern);
-    let exclude_matchers: Vec<Fnmatch> = extra_excludes.iter().map(|g| Fnmatch::new(g)).collect();
+    let matcher = crate::util::text::Fnmatch::new(pattern);
+    let exclude_matchers: Vec<crate::util::text::Fnmatch> = extra_excludes.iter().map(|g| crate::util::text::Fnmatch::new(g)).collect();
     let mut matched: Vec<(String, f64)> = Vec::new();
     for (path, mtime) in iter_files(client, root, DEFAULT_EXCLUDES).await? {
         let name = match path.rfind('/') {
@@ -367,8 +367,8 @@ pub async fn grep_files(
         .case_insensitive(!case_sensitive)
         .build()
         .map_err(|e| ToolError::invalid_argument(format!("invalid pattern '{pattern}': {e}")))?;
-    let include = include_glob.map(Fnmatch::new);
-    let exclude = exclude_glob.map(Fnmatch::new);
+    let include = include_glob.map(crate::util::text::Fnmatch::new);
+    let exclude = exclude_glob.map(crate::util::text::Fnmatch::new);
 
     let mut hits: Vec<Value> = Vec::new();
     let mut files_with_matches: Vec<String> = Vec::new();
@@ -1114,182 +1114,48 @@ fn mime_guess(path: &str) -> Option<&'static str> {
     Some(m)
 }
 
-/// Python `fnmatch` semantics, translated to a regex exactly like the C#
-/// `TextUtil.FnmatchToRegex`. Deliberately NOT `util::text::glob_match`: fnmatch
-/// lets a single `*` cross '/' boundaries, and `fs.glob` / `fs.grep` parity
-/// depends on that looser behaviour.
-struct Fnmatch(Option<regex::Regex>);
-
-impl Fnmatch {
-    fn new(pattern: &str) -> Self {
-        let chars: Vec<char> = pattern.chars().collect();
-        let mut source = String::from("(?s)^");
-        let mut i = 0usize;
-        while i < chars.len() {
-            let c = chars[i];
-            i += 1;
-            match c {
-                '*' => source.push_str(".*"),
-                '?' => source.push('.'),
-                '[' => {
-                    let mut j = i;
-                    if j < chars.len() && (chars[j] == '!' || chars[j] == '^') {
-                        j += 1;
-                    }
-                    if j < chars.len() && chars[j] == ']' {
-                        j += 1;
-                    }
-                    while j < chars.len() && chars[j] != ']' {
-                        j += 1;
-                    }
-                    if j >= chars.len() {
-                        // Unterminated class: a literal '[', like fnmatch.
-                        source.push_str("\\[");
-                    } else {
-                        let inner: String = chars[i..j].iter().collect();
-                        i = j + 1;
-                        let mut inner = inner.replace('\\', "\\\\");
-                        if let Some(rest) = inner.strip_prefix('!') {
-                            inner = format!("^{rest}");
-                        }
-                        source.push('[');
-                        source.push_str(&inner);
-                        source.push(']');
-                    }
-                }
-                other => source.push_str(&regex::escape(&other.to_string())),
-            }
-        }
-        source.push('$');
-        // An unrepresentable class matches nothing rather than blowing up the call.
-        Self(regex::Regex::new(&source).ok())
-    }
-
-    fn is_match(&self, name: &str) -> bool {
-        self.0.as_ref().is_some_and(|r| r.is_match(name))
-    }
-}
-
-/// md5 and sha1 are implemented here rather than pulled in as dependencies so
-/// this module stays self-contained; both are fully covered by known-answer tests.
+/// md5 and sha1 come from the audited RustCrypto crates rather than a local
+/// implementation: `fs.hash` advertises them as content hashes, and hand rolling a
+/// digest is avoidable risk. sha256 comes from the same family via `VolumeClient`.
 mod hashing {
-    const MD5_S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-
-    const MD5_K: [u32; 64] = [
-        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, 0xf57c_0faf, 0x4787_c62a, 0xa830_4613,
-        0xfd46_9501, 0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, 0x6b90_1122, 0xfd98_7193,
-        0xa679_438e, 0x49b4_0821, 0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, 0xd62f_105d,
-        0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, 0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, 0xfffa_3942, 0x8771_f681, 0x6d9d_6122,
-        0xfde5_380c, 0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, 0x289b_7ec6, 0xeaa1_27fa,
-        0xd4ef_3085, 0x0488_1d05, 0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, 0xf429_2244,
-        0x432a_ff97, 0xab94_23a7, 0xfc93_a039, 0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, 0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb,
-        0xeb86_d391,
-    ];
-
-    /// Pad to a multiple of 64 bytes: 0x80, zeros, then the bit length.
-    fn pad(data: &[u8], little_endian_length: bool) -> Vec<u8> {
-        let mut m = data.to_vec();
-        let bit_len = (data.len() as u64).wrapping_mul(8);
-        m.push(0x80);
-        while m.len() % 64 != 56 {
-            m.push(0);
-        }
-        if little_endian_length {
-            m.extend_from_slice(&bit_len.to_le_bytes());
-        } else {
-            m.extend_from_slice(&bit_len.to_be_bytes());
-        }
-        m
-    }
+    use md5::Digest as _;
 
     pub fn md5_hex(data: &[u8]) -> String {
-        let mut h: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-        let msg = pad(data, true);
-        for chunk in msg.chunks(64) {
-            let mut m = [0u32; 16];
-            for (k, word) in m.iter_mut().enumerate() {
-                *word = u32::from_le_bytes([
-                    chunk[k * 4],
-                    chunk[k * 4 + 1],
-                    chunk[k * 4 + 2],
-                    chunk[k * 4 + 3],
-                ]);
-            }
-            let (mut a, mut b, mut c, mut d) = (h[0], h[1], h[2], h[3]);
-            for i in 0..64 {
-                let (f, g) = match i / 16 {
-                    0 => ((b & c) | (!b & d), i),
-                    1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                    2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                    _ => (c ^ (b | !d), (7 * i) % 16),
-                };
-                let f = f
-                    .wrapping_add(a)
-                    .wrapping_add(MD5_K[i])
-                    .wrapping_add(m[g]);
-                a = d;
-                d = c;
-                c = b;
-                b = b.wrapping_add(f.rotate_left(MD5_S[i]));
-            }
-            h[0] = h[0].wrapping_add(a);
-            h[1] = h[1].wrapping_add(b);
-            h[2] = h[2].wrapping_add(c);
-            h[3] = h[3].wrapping_add(d);
-        }
-        h.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
+        let mut h = md5::Md5::new();
+        h.update(data);
+        hex::encode(h.finalize())
     }
 
     pub fn sha1_hex(data: &[u8]) -> String {
-        let mut h: [u32; 5] =
-            [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
-        let msg = pad(data, false);
-        for chunk in msg.chunks(64) {
-            let mut w = [0u32; 80];
-            for (k, word) in w.iter_mut().take(16).enumerate() {
-                *word = u32::from_be_bytes([
-                    chunk[k * 4],
-                    chunk[k * 4 + 1],
-                    chunk[k * 4 + 2],
-                    chunk[k * 4 + 3],
-                ]);
-            }
-            for i in 16..80 {
-                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-            }
-            let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-            for (i, wi) in w.iter().enumerate() {
-                let (f, k) = match i {
-                    0..=19 => ((b & c) | (!b & d), 0x5A82_7999u32),
-                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-                    _ => (b ^ c ^ d, 0xCA62_C1D6),
-                };
-                let temp = a
-                    .rotate_left(5)
-                    .wrapping_add(f)
-                    .wrapping_add(e)
-                    .wrapping_add(k)
-                    .wrapping_add(*wi);
-                e = d;
-                d = c;
-                c = b.rotate_left(30);
-                b = a;
-                a = temp;
-            }
-            h[0] = h[0].wrapping_add(a);
-            h[1] = h[1].wrapping_add(b);
-            h[2] = h[2].wrapping_add(c);
-            h[3] = h[3].wrapping_add(d);
-            h[4] = h[4].wrapping_add(e);
+        let mut h = sha1::Sha1::new();
+        h.update(data);
+        hex::encode(h.finalize())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Known answer vectors, so a crate swap cannot silently change `fs.hash`.
+        #[test]
+        fn md5_known_answers() {
+            assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+            assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
         }
-        h.iter().flat_map(|w| w.to_be_bytes()).map(|b| format!("{b:02x}")).collect()
+
+        #[test]
+        fn sha1_known_answers() {
+            assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+            assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        }
+
+        /// Multi block input, past the 64 byte compression boundary.
+        #[test]
+        fn multi_block_input() {
+            let data = vec![b'a'; 1000];
+            assert_eq!(md5_hex(&data), "cabe45dcc9ae5b66ba86600cca6b8ba8");
+            assert_eq!(sha1_hex(&data), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
+        }
     }
 }
 
@@ -2430,15 +2296,15 @@ mod tests {
     #[test]
     fn fnmatch_star_crosses_slashes_like_python() {
         // This is why fs.glob does not use util::text::glob_match.
-        assert!(Fnmatch::new("*.rs").is_match("/src/main.rs"));
-        assert!(Fnmatch::new("/src/*").is_match("/src/a/b.rs"));
-        assert!(!Fnmatch::new("*.rs").is_match("/src/main.txt"));
-        assert!(Fnmatch::new("a?c").is_match("abc"));
-        assert!(Fnmatch::new("[abc]x").is_match("bx"));
-        assert!(!Fnmatch::new("[!abc]x").is_match("bx"));
-        assert!(Fnmatch::new("[!abc]x").is_match("dx"));
+        assert!(crate::util::text::Fnmatch::new("*.rs").is_match("/src/main.rs"));
+        assert!(crate::util::text::Fnmatch::new("/src/*").is_match("/src/a/b.rs"));
+        assert!(!crate::util::text::Fnmatch::new("*.rs").is_match("/src/main.txt"));
+        assert!(crate::util::text::Fnmatch::new("a?c").is_match("abc"));
+        assert!(crate::util::text::Fnmatch::new("[abc]x").is_match("bx"));
+        assert!(!crate::util::text::Fnmatch::new("[!abc]x").is_match("bx"));
+        assert!(crate::util::text::Fnmatch::new("[!abc]x").is_match("dx"));
         // an unterminated class degrades to a literal bracket
-        assert!(Fnmatch::new("a[bc").is_match("a[bc"));
+        assert!(crate::util::text::Fnmatch::new("a[bc").is_match("a[bc"));
     }
 
     #[test]

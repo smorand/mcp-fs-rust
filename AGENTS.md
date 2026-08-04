@@ -75,6 +75,10 @@ cargo run -p parity-harness -- capture|compare  the 1:1 parity judge
 - Comments explain WHY. No dashes as punctuation anywhere in code, comments or output.
 - Adding a storage backend: implement the trait in `storage/traits.rs` plus a branch in
   `storage/mod.rs`.
+- Glob matching goes through `util::text::Fnmatch`, the single implementation in the tree.
+  It is Python `fnmatch` semantics, so a single `*` DOES cross a '/' boundary (verified
+  against the reference: `*.rs` matches `/src/nested.rs`). Do not reach for `globset` with
+  `literal_separator`, it would silently narrow `fs.glob` and `fs.grep`.
 
 ## Quality gate
 `cargo test --workspace` and `cargo clippy --all-targets -- -D warnings` must both be
