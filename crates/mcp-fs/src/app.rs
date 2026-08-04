@@ -50,10 +50,10 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     let safety = Arc::new(SafetyManager::new(config.safety.clone()));
     let identity = Arc::new(IdentityResolver::new(&config.auth));
 
-    // TODO(tools): the tool families are not in the tree yet. Once
-    // `crate::tools::register_all(&mut registry)` exists, make this `let mut`
-    // and call it here; `tools/list` stays empty until then.
-    let registry = ToolRegistry::new();
+    // The git families are only registered when the subsystem is on, so a server
+    // with git disabled advertises exactly the tools it can serve.
+    let mut registry = ToolRegistry::new();
+    crate::tools::register_all(&mut registry, config.git.enabled);
 
     let mcp_path = config.server.mcp_path.clone();
     if !mcp_path.starts_with('/') {
@@ -69,10 +69,27 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         registry: Arc::new(registry),
     });
 
-    Ok(Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .route(&mcp_path, post(mcp_endpoint))
-        .with_state(state))
+        .with_state(state.clone());
+
+    // The REST data plane and its OpenAPI surface are opt-out via config, matching
+    // the C#: with `api.enabled: false` the server is MCP only and both 404.
+    if state.config.api.enabled {
+        router = router
+            .merge(crate::api::router(state.clone()))
+            .merge(crate::api::openapi_router(state.clone()));
+    }
+
+    // Git HTTP smart protocol, only when the subsystem is enabled. The tools and
+    // these routes must share one repository store so they share the write locks.
+    if state.config.git.enabled {
+        let git_store = crate::git::GitRepoStore::shared(state.config.clone());
+        router = router.merge(crate::git::http::router(state.clone(), git_store));
+    }
+
+    Ok(router)
 }
 
 /// Bind and serve until Ctrl+C.

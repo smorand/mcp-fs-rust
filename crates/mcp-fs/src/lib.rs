@@ -3,6 +3,7 @@
 //! external parity (tool names, parameters, `ERR_*` codes, JSON shapes, SQLite
 //! schemas, git wire protocol, REST routes).
 
+pub mod api;
 pub mod app;
 pub mod cli;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod mcp;
 pub mod safety;
 pub mod state;
 pub mod storage;
+pub mod tools;
 pub mod util;
 
 pub use errors::{Result, ToolError};

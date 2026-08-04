@@ -38,9 +38,10 @@ enum Cmd {
         base: String,
         #[arg(long)]
         token: String,
-        /// Project to provision and exercise.
-        #[arg(long, default_value = "parity-probe")]
-        project: String,
+        /// Project to provision and exercise. Defaults to a fresh id per run so the
+        /// replay never inherits state from a previous capture.
+        #[arg(long)]
+        project: Option<String>,
         /// Owner used when provisioning the project.
         #[arg(long)]
         owner: String,
@@ -53,8 +54,8 @@ enum Cmd {
         base: String,
         #[arg(long)]
         token: String,
-        #[arg(long, default_value = "parity-probe")]
-        project: String,
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long)]
         owner: String,
         #[arg(long, default_value = "parity-golden.json")]
@@ -164,6 +165,17 @@ impl Client {
     }
 }
 
+/// A fresh project id per run. Cleaning up a project is not enough on the reference
+/// implementation (tearing a project down leaves its volume behind), so a replay that
+/// reused one id would hit ERR_NO_CLOBBER on every write the second time around.
+fn fresh_project() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("parity-{:x}", n & 0xffff_ffff)
+}
+
 /// Extract the JSON payload from an SSE frame, or parse the body as plain JSON.
 fn parse_sse_or_json(text: &str) -> Option<Value> {
     for line in text.lines() {
@@ -209,9 +221,17 @@ async fn replay(c: &Client, project: &str, owner: &str, opts: &Options) -> Resul
             }
             corpus::Step::Public { path, .. } => c.public(path).await?,
         };
-        let normalized = body.as_ref().map(|b| match &step {
-            corpus::Step::Mcp { .. } => normalize::normalize_rpc(b, opts),
-            _ => normalize::normalize(b, opts),
+        let normalized = body.as_ref().map(|b| {
+            let mut n = match &step {
+                corpus::Step::Mcp { .. } => normalize::normalize_rpc(b, opts),
+                _ => normalize::normalize(b, opts),
+            };
+            // Drop host-environment noise and unspecified ordering for the few steps
+            // where it would report noise instead of a behavioural difference.
+            normalize::tame_environment(step.label(), &mut n, project);
+            // The project id is per run, so mask it everywhere it surfaces.
+            normalize::mask_project(&mut n, project);
+            n
         });
         out.insert(
             step.label().to_string(),
@@ -280,6 +300,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Capture { base, token, project, owner, out } => {
+            let project = project.unwrap_or_else(fresh_project);
             let c = Client::new(&base, &token);
             let opts = Options::default();
             let steps = replay(&c, &project, &owner, &opts).await?;
@@ -294,6 +315,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Compare { base, token, project, owner, golden, relax_messages } => {
+            let project = project.unwrap_or_else(fresh_project);
             let raw = std::fs::read_to_string(&golden)
                 .with_context(|| format!("reading golden file {}", golden.display()))?;
             let g: Golden = serde_json::from_str(&raw)?;

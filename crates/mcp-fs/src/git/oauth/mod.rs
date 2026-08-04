@@ -1,8 +1,8 @@
-//! OAuth token storage for `git.auth`: cipher, in memory store, encrypted
-//! persistence. Port of the C# `Git/OAuth/*` minus the device flow itself, which
-//! belongs to the tools layer (it makes outbound HTTP calls, this module does not).
+//! OAuth support for `git.auth`: cipher, in memory store, encrypted persistence,
+//! and the device flow HTTP client. Port of the C# `Git/OAuth/*`.
 
 pub mod cipher;
+pub mod device_flow;
 pub mod persistence;
 pub mod store;
 
