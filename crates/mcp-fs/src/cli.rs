@@ -41,6 +41,15 @@ pub enum Command {
         /// Config file path. Overrides MCP_FS_CONFIG and the dir/name pair.
         #[arg(short = 'c', long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Force git.enabled = true (overrides config YAML).
+        #[arg(long)]
+        git: bool,
+        /// Force web.enabled = true (overrides config YAML).
+        #[arg(long)]
+        web: bool,
+        /// Force context7.enabled = true (overrides config YAML).
+        #[arg(long)]
+        context7: bool,
     },
     /// Generate an RS256 keypair (jwt.key private, jwt.pub public).
     Keys {
@@ -83,7 +92,7 @@ pub async fn run() -> ExitCode {
 
 /// Run an already parsed CLI. Split out so tests can drive it without a process.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command.unwrap_or(Command::Serve { config: None }) {
+    match cli.command.unwrap_or(Command::Serve { config: None, git: false, web: false, context7: false }) {
         Command::Version => {
             println!("{}", crate::app::VERSION);
             Ok(())
@@ -92,7 +101,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Token { email, key, issuer, claim, ttl } => {
             cmd_token(&email, key.as_deref(), &issuer, &claim, ttl)
         }
-        Command::Serve { config } => cmd_serve(config.as_deref()).await,
+        Command::Serve { config, git, web, context7 } => cmd_serve(config.as_deref(), git, web, context7).await,
     }
 }
 
@@ -119,10 +128,13 @@ fn cmd_token(
     Ok(())
 }
 
-async fn cmd_serve(explicit: Option<&std::path::Path>) -> anyhow::Result<()> {
+async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool) -> anyhow::Result<()> {
     crate::logging::init();
     let resolved = resolve_config_path(explicit);
-    let config = ServerConfig::load(&resolved)?;
+    let mut config = ServerConfig::load(&resolved)?;
+    if git      { config.git.enabled = true; }
+    if web      { config.web.enabled = true; }
+    if context7 { config.context7.enabled = true; }
     // The banner goes to stderr so it never pollutes a piped stdout.
     eprintln!(
         "Serving mcp-fs {} on {}:{} (config={})",
@@ -231,11 +243,23 @@ mod tests {
             vec!["mcp-fs", "serve", "-c", "a.yaml"],
         ] {
             match Cli::parse_from(args).command {
-                Some(Command::Serve { config }) => {
+                Some(Command::Serve { config, .. }) => {
                     assert_eq!(config, Some(PathBuf::from("a.yaml")));
                 }
                 other => panic!("expected serve, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn serve_accepts_git_web_context7_flags() {
+        match Cli::parse_from(["mcp-fs", "serve", "--git", "--web", "--context7"]).command {
+            Some(Command::Serve { git, web, context7, .. }) => {
+                assert!(git);
+                assert!(web);
+                assert!(context7);
+            }
+            other => panic!("expected serve, got {other:?}"),
         }
     }
 

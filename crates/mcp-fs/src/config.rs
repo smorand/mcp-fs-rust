@@ -234,6 +234,51 @@ impl Default for GitConfig {
     }
 }
 
+fn d_web_safe_search() -> String { "moderate".to_string() }
+fn d_web_max_results() -> usize { 10 }
+fn d_web_request_timeout() -> u64 { 10 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    pub enabled: bool,
+    pub max_results: usize,
+    pub request_timeout_secs: u64,
+    pub safe_search: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_results: d_web_max_results(),
+            request_timeout_secs: d_web_request_timeout(),
+            safe_search: d_web_safe_search(),
+        }
+    }
+}
+
+fn d_context7_api_url() -> String { "https://context7.com/api".to_string() }
+fn d_context7_request_timeout() -> u64 { 30 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Context7Config {
+    pub enabled: bool,
+    pub api_url: String,
+    pub request_timeout_secs: u64,
+}
+
+impl Default for Context7Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: d_context7_api_url(),
+            request_timeout_secs: d_context7_request_timeout(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -244,6 +289,8 @@ pub struct ServerConfig {
     pub extract: ExtractConfig,
     pub api: ApiConfig,
     pub git: GitConfig,
+    pub web: WebConfig,
+    pub context7: Context7Config,
 }
 
 impl ServerConfig {

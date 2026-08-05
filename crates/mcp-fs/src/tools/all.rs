@@ -2,22 +2,40 @@
 //!
 //! Order matters: `tools/list` renders the registry in registration order, so the
 //! `fs.*` families come first, then `admin.*`, then the git families when git is
-//! enabled. That reproduces the C# ordering, where `git.*` tools are only added to
-//! the MCP surface if `git.enabled` is true.
+//! enabled, and the optional web and context7 families last.
 
-/// Register every tool: the fs.* families, then admin.*, then git.* when enabled.
-pub fn register_all(reg: &mut crate::mcp::ToolRegistry, git_enabled: bool) {
+/// Which optional tool families to register.
+pub struct EnabledFeatures {
+    pub git: bool,
+    pub web: bool,
+    pub context7: bool,
+}
+
+/// Register every tool: the fs.* families, then admin.*, then the optional families.
+pub fn register_all(
+    reg: &mut crate::mcp::ToolRegistry,
+    features: &EnabledFeatures,
+    config: &crate::config::ServerConfig,
+) {
     super::register_fs(reg);
     super::admin::register(reg);
-    if git_enabled {
+    if features.git {
         super::git::register(reg);
         super::git_auth::register(reg);
+    }
+    if features.web {
+        super::web::register(reg, &config.web);
+    }
+    if features.context7 {
+        super::context7::register(reg, &config.context7);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::mcp::ToolRegistry;
+
+    use super::EnabledFeatures;
 
     /// With git disabled the git families must be absent, not merely unreachable:
     /// an LLM must not see a tool it cannot call.
@@ -39,6 +57,18 @@ mod tests {
         assert_eq!(reg.len(), 8 + 11 + 3);
         assert!(reg.resolve("git.remote_clone").is_some());
         assert!(reg.resolve("git.auth_revoke").is_some());
+    }
+
+    #[test]
+    fn web_and_context7_tools_register_when_enabled() {
+        let mut reg = ToolRegistry::new();
+        let features = EnabledFeatures { git: false, web: true, context7: true };
+        let config = crate::config::ServerConfig::default();
+        super::register_all(&mut reg, &features, &config);
+        // 33 fs + 8 admin + 4 web + 2 context7 = 47
+        assert_eq!(reg.len(), 47);
+        assert!(reg.resolve("web.search").is_some());
+        assert!(reg.resolve("context7.resolve_library_id").is_some());
     }
 
     /// Whole surface parity gate for the 22 tools of this agent: every `admin.*`,

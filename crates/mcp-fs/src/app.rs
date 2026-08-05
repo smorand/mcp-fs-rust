@@ -59,10 +59,15 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         );
     }
 
-    // The git families are only registered when the subsystem is on, so a server
-    // with git disabled advertises exactly the tools it can serve.
+    // The git, web, and context7 families are only registered when their subsystem
+    // is on, so a server with them disabled advertises exactly the tools it can serve.
     let mut registry = ToolRegistry::new();
-    crate::tools::register_all(&mut registry, config.git.enabled);
+    let features = crate::tools::all::EnabledFeatures {
+        git:      config.git.enabled,
+        web:      config.web.enabled,
+        context7: config.context7.enabled,
+    };
+    crate::tools::register_all(&mut registry, &features, &config);
 
     let mcp_path = config.server.mcp_path.clone();
     if !mcp_path.starts_with('/') {
