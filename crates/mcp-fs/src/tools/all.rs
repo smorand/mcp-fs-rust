@@ -90,8 +90,8 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 33 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 75
-        // + 1 doc.to_docx if pandoc is in PATH, 0 otherwise
-        let doc_count = if which::which("pandoc").is_ok() { 1 } else { 0 };
+        // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
+        let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
         assert_eq!(reg.len(), 75 + doc_count);
     }
 

@@ -6,22 +6,31 @@
 
 ### Générateur DOCX depuis Markdown ou HTML
 
-Convertit un fichier Markdown ou HTML présent dans un volume en fichier `.docx`, avec support
-d'un template Word optionnel pour la mise en forme (styles, en-tête, pied de page, logo).
-
-- Tool MCP: `doc.to_docx`
-- Params: `mount_id`, `src_path` (Markdown ou HTML), `dst_path` (.docx), `template_path?` (template .docx dans le volume)
-- Implémentation: `pandoc` (disponible sur le système) appelé en subprocess avec `--reference-doc` pour le template
-- Si pas de template: génère un .docx avec les styles par défaut de pandoc
-- Famille `doc.*` à créer, activée par `--doc` / `doc.enabled: true` dans le YAML
+*Implémenté: `doc.to_docx`.*
 
 ### Générateur PPTX depuis Markdown ou HTML
 
-Génère une présentation PowerPoint depuis un fichier Markdown ou HTML présent dans un volume.
+*Implémenté: `doc.to_pptx`.*
 
-- Tool MCP: `doc.to_pptx`
-- Params: `mount_id`, `src_path` (Markdown ou HTML), `dst_path` (.pptx), `template_path?` (template .pptx dans le volume)
-- Format Markdown: `---` = séparateur de slide, `# Titre` = titre de slide, bullets = contenu
-- Format HTML: structure en sections `<section>` ou `<h1>`/`<h2>` selon les conventions pandoc
-- Implémentation: `pandoc` avec writer `pptx` + `--reference-doc` pour le template
-- Même famille `doc.*` que le générateur DOCX
+---
+
+## Éditeur HTML single-page (docx-style et pptx-style)
+
+Permet au LLM de créer et modifier des documents HTML single-page dans un volume,
+le tout avec un mini-navigateur éditable qui synchronise les modifications manuelles
+en temps réel dans le filesystem.
+
+Deux modes de document:
+- **docx-style**: document CMS-like avec en-têtes, images, sections. Rendu Word-like dans le navigateur.
+- **pptx-style**: présentation avec slides navigables (précédent/suivant), chaque `<section>` = une slide.
+
+Fonctionnalités:
+- Template initial (HTML ou YAML) pour amorcer la structure.
+- Le LLM travaille sur l'HTML brut via `fs.*` tools.
+- Un mini-serveur local sert l'HTML et watch les changements fichier (WebSocket).
+  Les éditions manuelles dans le navigateur écrivent dans le fichier du volume.
+- Single-page (CSS et JS inline): pas de dépendances externes, facile à télécharger.
+- Tools MCP envisagés: `doc.open_editor` (démarre le mini-serveur + ouvre le navigateur),
+  `doc.create_html_doc`, `doc.create_html_slides`.
+
+*Sujet complexe, à cadrer en session dédiée.*
