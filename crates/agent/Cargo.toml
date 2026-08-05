@@ -11,7 +11,7 @@ name = "agent"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 futures = { workspace = true }
+libc = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

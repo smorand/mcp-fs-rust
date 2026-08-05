@@ -8,6 +8,27 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+/// How many times to retry a failed LLM call before giving up.
+pub const MAX_RETRIES: u32 = 10;
+/// Base delay in milliseconds; doubles on every attempt (capped at 30 s).
+const RETRY_BASE_MS: u64 = 1_000;
+const RETRY_CAP_MS: u64 = 30_000;
+
+/// Whether an error is worth retrying (network/gateway transients only).
+fn is_retriable(msg: &str) -> bool {
+    // HTTP 429 or any 5xx, plus lower level connection failures.
+    msg.contains("429")
+        || msg.contains("500")
+        || msg.contains("502")
+        || msg.contains("503")
+        || msg.contains("504")
+        || msg.contains("connection")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("reset")
+        || msg.contains("broken")
+}
+
 /// A message in the conversation, in wire shape.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -143,6 +164,49 @@ impl LlmClient {
             }
         }
         Ok(finish(turn, partial))
+    }
+
+    /// Like [`stream_turn`] but retries on transient errors (network failures, 5xx, 429).
+    ///
+    /// Retry is only safe before the first token arrives: once the model starts streaming,
+    /// stopping and restarting would produce duplicate or contradictory output. The callback
+    /// receives a boolean that is `true` on a retry so the caller can reset any display state.
+    ///
+    /// Backoff: 1 s, 2 s, 4 s … capped at 30 s. Up to [`MAX_RETRIES`] attempts total.
+    pub async fn stream_turn_with_retry(
+        &self,
+        messages: &[Message],
+        tools: &[Value],
+        mut on_text: impl FnMut(&str),
+        mut on_retry: impl FnMut(u32, &str),
+    ) -> Result<Turn> {
+        let mut attempt = 0u32;
+        loop {
+            let mut got_token = false;
+            // Shadow on_text to detect whether any token arrived before an error.
+            let result = self
+                .stream_turn(messages, tools, |chunk| {
+                    got_token = true;
+                    on_text(chunk);
+                })
+                .await;
+
+            match result {
+                Ok(turn) => return Ok(turn),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Never retry if tokens already came through: the stream is partial.
+                    if got_token || !is_retriable(&msg) || attempt >= MAX_RETRIES - 1 {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    let delay_ms =
+                        (RETRY_BASE_MS * (1u64 << attempt.min(5))).min(RETRY_CAP_MS);
+                    on_retry(attempt, &msg);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
     }
 }
 
@@ -434,5 +498,16 @@ mod tests {
         let out = squash(&"x ".repeat(400));
         assert_eq!(out.chars().count(), 300);
         assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn is_retriable_matches_gateway_and_network_errors() {
+        assert!(is_retriable("chat endpoint returned 502 Bad Gateway"));
+        assert!(is_retriable("chat endpoint returned 503 Service Unavailable"));
+        assert!(is_retriable("chat endpoint returned 429 Too Many Requests"));
+        assert!(is_retriable("connection refused"));
+        assert!(is_retriable("request timed out"));
+        assert!(!is_retriable("chat endpoint returned 400 Bad Request"));
+        assert!(!is_retriable("unknown tool 'fs.read'"));
     }
 }

@@ -50,8 +50,48 @@ const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 
+/// Install a one-shot SIGINT handler that clears any spinner/partial line before the
+/// default handler kills the process.
+///
+/// The handler writes "\r\x1b[2K" (move to column 0, erase to end of line) then
+/// reinstalls SIG_DFL so the signal propagates normally: the process still exits on
+/// Ctrl+C, but without leaving a "thinking" frame stranded in the terminal.
+///
+/// This is a raw libc signal handler, not a tokio async one, because the spinner runs
+/// on a background task and SIGINT can arrive at any moment, including while the runtime
+/// is blocked on a network read. A libc handler guarantees the write happens before the
+/// process unwinds regardless of runtime state.
+///
+/// SAFETY: `write` and `signal` are async-signal-safe on POSIX. No allocations, no
+/// locks, no non-reentrant calls are made inside the handler.
+#[cfg(unix)]
+fn install_sigint_cleanup() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe extern "C" fn handler(_sig: libc::c_int) {
+        // Erase the current line, then restore the default handler and re-raise so the
+        // process exits with the normal SIGINT disposition.
+        let clear = b"\r\x1b[2K";
+        unsafe {
+            libc::write(libc::STDOUT_FILENO, clear.as_ptr().cast(), clear.len());
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::raise(libc::SIGINT);
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_sigint_cleanup() {}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    install_sigint_cleanup();
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -121,7 +161,9 @@ async fn run() -> Result<()> {
 
     let mut history = vec![Message::System(system_prompt.clone())];
     if !session.is_new() {
-        history.extend(replay(&session));
+        let messages = replay(&session);
+        print_transcript(&messages);
+        history.extend(messages);
     }
 
     println!(
@@ -170,9 +212,11 @@ async fn run() -> Result<()> {
                 session = Session::open(&history_dir, Some(id));
                 history = vec![Message::System(system_prompt.clone())];
                 if !session.is_new() {
-                    history.extend(replay(&session));
+                    let messages = replay(&session);
+                    print_transcript(&messages);
+                    history.extend(messages);
                 }
-                println!("{DIM}  Switched to conversation {YELLOW}{}{RESET}\n", session.id());
+                println!("{DIM}  Switched to conversation {YELLOW}{}{RESET}", session.id());
                 continue;
             }
 
@@ -188,7 +232,7 @@ async fn run() -> Result<()> {
 
         // ── agentic loop: stream, run tools, repeat until the model stops asking ──
         loop {
-            let mut think = Some(Spinner::start("thinking", "36"));
+            let mut think = Some(Spinner::start("", "36"));
             // A sync handle, because the streaming callback cannot await. Silencing it
             // inside the callback is what keeps frames from landing between tokens.
             let silencer = think.as_ref().map(Spinner::silencer);
@@ -196,18 +240,32 @@ async fn run() -> Result<()> {
             let mut first_token = true;
 
             let turn = llm
-                .stream_turn(&history, &declarations, |chunk| {
-                    if first_token {
-                        first_token = false;
-                        if let Some(s) = &silencer {
-                            s.silence();
+                .stream_turn_with_retry(
+                    &history,
+                    &declarations,
+                    |chunk| {
+                        if first_token {
+                            first_token = false;
+                            if let Some(s) = &silencer {
+                                s.silence();
+                            }
+                            println!();
                         }
-                        println!();
-                    }
-                    print!("{chunk}");
-                    let _ = std::io::stdout().flush();
-                    streamed.push_str(chunk);
-                })
+                        print!("{chunk}");
+                        let _ = std::io::stdout().flush();
+                        streamed.push_str(chunk);
+                    },
+                    |attempt, _err| {
+                        // Overwrite the spinner line with a transient retry notice.
+                        // The spinner task may still be running, but the carriage return
+                        // puts us at column 0 and \x1b[2K clears the line, so whichever
+                        // frame the task drew last is gone before we paint the message.
+                        let delay_s = (1u64 << attempt.min(5)).min(30);
+                        print!("\r\x1b[2K  {DIM}retrying ({attempt}/{}) in {delay_s}s…{RESET}",
+                            llm::MAX_RETRIES);
+                        let _ = std::io::stdout().flush();
+                    },
+                )
                 .await;
 
             // Always stop through the helper: assigning None would drop the struct and,
@@ -307,6 +365,31 @@ fn replay(session: &Session) -> Vec<Message> {
             _ => Message::User(m.content),
         })
         .collect()
+}
+
+/// Reprint a loaded transcript to stdout so resuming a conversation feels continuous.
+///
+/// User turns are shown with the same `❯` prompt, assistant turns are rendered as
+/// markdown. A dim separator marks the boundary between the replayed history and the
+/// live session that follows.
+fn print_transcript(messages: &[Message]) {
+    if messages.is_empty() {
+        return;
+    }
+    for msg in messages {
+        match msg {
+            Message::User(text) => {
+                println!("\n{CYAN}❯{RESET} {text}");
+            }
+            Message::Assistant(text) => {
+                println!();
+                ui::render_markdown(text);
+                println!();
+            }
+            _ => {}
+        }
+    }
+    println!("{DIM}{}  end of history{}{RESET}", "\u{2500}".repeat(8), "\u{2500}".repeat(8));
 }
 
 /// Resolve the bearer token: `--user` wins, then the config value.

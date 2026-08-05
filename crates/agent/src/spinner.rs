@@ -110,8 +110,19 @@ impl Drop for Spinner {
     ///
     /// Without this, dropping the struct instead of stopping it leaves the task alive for
     /// the rest of the process, painting frames over everything printed afterwards.
+    ///
+    /// We also clear the spinner line here so that a SIGINT (or any other abrupt path that
+    /// drops the spinner without going through `stop`) does not leave a half-drawn frame
+    /// stranded in the terminal. The write is best-effort: errors are silently ignored
+    /// because a destructor must not panic.
     fn drop(&mut self) {
-        self.gate.stop.store(true, Ordering::SeqCst);
+        if self.active && !self.gate.stop.swap(true, Ordering::SeqCst) {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+        } else {
+            self.gate.stop.store(true, Ordering::SeqCst);
+        }
         if let Some(h) = self.handle.take() {
             h.abort();
         }

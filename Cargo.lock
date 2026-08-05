@@ -61,6 +61,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

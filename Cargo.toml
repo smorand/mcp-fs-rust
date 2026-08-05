@@ -63,6 +63,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 # ── terminal ui (agent) ────────────────────────────────────────────────────────
 crossterm = "0.29"
 unicode-width = "0.2"
+libc = "0.2"
 
 # ── cli / logging / misc ───────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive"] }
