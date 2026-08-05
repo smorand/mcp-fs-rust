@@ -35,6 +35,9 @@ struct Cli {
     /// Resume, or create, a named conversation.
     #[arg(long)]
     conversation: Option<String>,
+    /// Compaction threshold in thousands of tokens (0 = disabled). Overrides the config value.
+    #[arg(long)]
+    compaction_threshold: Option<u32>,
     /// Print the resolved MCP endpoint and exit.
     ///
     /// This exists so `agent.sh` can find the endpoint without reimplementing the config
@@ -106,6 +109,9 @@ async fn run() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(default_config_path);
     let cfg = AgentConfig::load(&config_path)
         .with_context(|| format!("cannot load config, looked for {}", config_path.display()))?;
+
+    // Compaction threshold: CLI flag wins over the config value.
+    let threshold_k = cli.compaction_threshold.unwrap_or(cfg.context_compaction_threshold_k);
 
     // Answered before anything else: no token, no key and no server are needed to report
     // which endpoint the config names.
@@ -225,6 +231,22 @@ async fn run() -> Result<()> {
             }
             break line.trim().to_string();
         };
+
+        // Compaction check: beginning of turn, before adding the new user message.
+        if threshold_k > 0 && llm::estimate_tokens(&history) > threshold_k as usize * 1000 {
+            let mut compact = Some(Spinner::start("compacting context\u{2026}", "35"));
+            match llm.compact_context(&history, &declarations).await {
+                Ok(new_history) => {
+                    stop_if_running(&mut compact).await;
+                    history = new_history;
+                    println!("{DIM}  \u{21AF} context compacted{RESET}");
+                }
+                Err(e) => {
+                    stop_if_running(&mut compact).await;
+                    eprintln!("{RED}[warn]{RESET} compaction failed (continuing without): {}", error_chain(&e));
+                }
+            }
+        }
 
         history.push(Message::User(text.clone()));
         let _ = session.append("user", &text);

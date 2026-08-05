@@ -42,3 +42,8 @@ system_prompt: >
   - To browse files in a project, first call fs.list_allowed_roots to discover mount_id values,
     then use fs.list_dir with the correct mount_id.
 
+# Automatic context compaction threshold in thousands of tokens (0 = disabled).
+# When the estimated conversation length exceeds this value, older messages are
+# summarised into a single condensed system block before the next turn.
+context_compaction_threshold_k: 256
+

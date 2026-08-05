@@ -65,6 +65,8 @@ pub struct AgentConfig {
     pub mcp: McpConfig,
     pub llm: LlmConfig,
     pub system_prompt: String,
+    /// Compaction threshold in thousands of tokens (0 = disabled). Default: 256.
+    pub context_compaction_threshold_k: u32,
 }
 
 impl Default for AgentConfig {
@@ -76,6 +78,7 @@ impl Default for AgentConfig {
                  MCP tools (fs.* and admin.*). Use the tools to answer the user's \
                  questions about their files."
                 .to_string(),
+            context_compaction_threshold_k: 256,
         }
     }
 }
@@ -111,6 +114,27 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(body.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn compaction_threshold_defaults_to_256() {
+        let f = write_yaml("mcp:\n  url: http://x/mcp\n");
+        let c = AgentConfig::load(f.path()).unwrap();
+        assert_eq!(c.context_compaction_threshold_k, 256);
+    }
+
+    #[test]
+    fn compaction_threshold_zero_means_disabled() {
+        let f = write_yaml("context_compaction_threshold_k: 0\n");
+        let c = AgentConfig::load(f.path()).unwrap();
+        assert_eq!(c.context_compaction_threshold_k, 0);
+    }
+
+    #[test]
+    fn compaction_threshold_explicit_value_is_read() {
+        let f = write_yaml("context_compaction_threshold_k: 128\n");
+        let c = AgentConfig::load(f.path()).unwrap();
+        assert_eq!(c.context_compaction_threshold_k, 128);
     }
 
     #[test]
