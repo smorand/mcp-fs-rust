@@ -1243,6 +1243,7 @@ mod tests {
                 safety: Arc::new(SafetyManager::new(config.safety.clone())),
                 identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
                 registry: Arc::new(ToolRegistry::new()),
+                editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             });
 
             Self {

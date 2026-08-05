@@ -1139,6 +1139,7 @@ mod tests {
             safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
+            editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         });
         let git = Arc::new(GitRepoStore::new(config));
         if initialized {
@@ -1238,6 +1239,7 @@ mod tests {
             safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
+            editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         });
         let git = Arc::new(GitRepoStore::new(config));
         git.init_repo("proj").await.unwrap();

@@ -22,6 +22,7 @@ pub mod db;
 pub mod doc;
 pub mod document;
 pub mod edit;
+pub mod editor;
 pub mod git;
 pub mod git_auth;
 pub mod lifecycle;
@@ -160,6 +161,7 @@ pub(crate) mod testkit {
             safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
+            editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         });
         Harness { _dir: dir, state }
     }
@@ -190,6 +192,7 @@ pub(crate) mod testkit {
             safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
+            editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         });
         Harness { _dir: dir, state }
     }

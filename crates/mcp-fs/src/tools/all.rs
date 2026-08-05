@@ -40,6 +40,7 @@ pub fn register_all(
     }
     if features.doc {
         super::doc::register(reg, &config.doc);
+        super::editor::register(reg);
     }
 }
 
@@ -91,8 +92,9 @@ mod tests {
         super::register_all(&mut reg, &features, &config);
         // 33 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 75
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
+        // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 75 + doc_count);
+        assert_eq!(reg.len(), 75 + doc_count + 3);
     }
 
     /// Whole surface parity gate for the 22 tools of this agent: every `admin.*`,

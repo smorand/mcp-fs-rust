@@ -14,23 +14,13 @@
 
 ---
 
-## Éditeur HTML single-page (docx-style et pptx-style)
+## ~~Éditeur HTML single-page~~ ✅ Implémenté
 
-Permet au LLM de créer et modifier des documents HTML single-page dans un volume,
-le tout avec un mini-navigateur éditable qui synchronise les modifications manuelles
-en temps réel dans le filesystem.
+Trois tools MCP dans la famille `doc.*`:
+- `doc.open_editor` — démarre un mini-serveur HTTP+WebSocket par éditeur, crée le fichier si absent (mode `doc` ou `slides`), ouvre le navigateur, retourne `editor_id` + URL.
+- `doc.close_editor` — arrête l'éditeur et libère le port.
+- `doc.list_editors` — liste les éditeurs actifs.
 
-Deux modes de document:
-- **docx-style**: document CMS-like avec en-têtes, images, sections. Rendu Word-like dans le navigateur.
-- **pptx-style**: présentation avec slides navigables (précédent/suivant), chaque `<section>` = une slide.
-
-Fonctionnalités:
-- Template initial (HTML ou YAML) pour amorcer la structure.
-- Le LLM travaille sur l'HTML brut via `fs.*` tools.
-- Un mini-serveur local sert l'HTML et watch les changements fichier (WebSocket).
-  Les éditions manuelles dans le navigateur écrivent dans le fichier du volume.
-- Single-page (CSS et JS inline): pas de dépendances externes, facile à télécharger.
-- Tools MCP envisagés: `doc.open_editor` (démarre le mini-serveur + ouvre le navigateur),
-  `doc.create_html_doc`, `doc.create_html_slides`.
-
-*Sujet complexe, à cadrer en session dédiée.*
+Sync bidirectionnel: browser → volume via WS `save`, volume → browser via poll mtime 500ms + WS `reload`.
+Activé avec le flag `--doc` (même feature que `doc.to_docx` / `doc.to_pptx`).
+17 tests dans `tools::editor`.

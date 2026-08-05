@@ -9,6 +9,7 @@ use crate::mcp::ToolRegistry;
 use crate::safety::SafetyManager;
 use crate::storage::traits::AdminBackend;
 use crate::storage::StoreManager;
+use crate::tools::editor::EditorRegistry;
 use std::sync::Arc;
 
 pub struct AppState {
@@ -18,6 +19,7 @@ pub struct AppState {
     pub safety: Arc<SafetyManager>,
     pub identity: Arc<IdentityResolver>,
     pub registry: Arc<ToolRegistry>,
+    pub editors: Arc<EditorRegistry>,
 }
 
 impl AppState {

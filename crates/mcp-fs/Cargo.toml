@@ -90,3 +90,4 @@ tree-sitter-ruby = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 reqwest = { workspace = true }
+tokio-tungstenite = "0.30.0"

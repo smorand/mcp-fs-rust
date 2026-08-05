@@ -302,6 +302,7 @@ pub(crate) mod test_support {
                 // The tools never dispatch through the registry, so an empty one
                 // is enough here; tests keep their own registry to call into.
                 registry: Arc::new(ToolRegistry::new()),
+                editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             });
             Self { dir, state }
         }

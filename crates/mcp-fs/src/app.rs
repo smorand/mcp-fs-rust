@@ -84,6 +84,7 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         safety,
         identity,
         registry: Arc::new(registry),
+        editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
     });
 
     let mut router = Router::new()
