@@ -311,6 +311,23 @@ impl Default for DbConfig {
     }
 }
 
+fn d_pandoc_timeout() -> u64 { 30 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocConfig {
+    pub enabled: bool,
+    /// Path to the pandoc binary. Empty means resolve from PATH at startup.
+    pub pandoc_bin: String,
+    /// Timeout in seconds for one pandoc subprocess call.
+    pub pandoc_timeout_secs: u64,
+}
+impl Default for DocConfig {
+    fn default() -> Self {
+        Self { enabled: false, pandoc_bin: String::new(), pandoc_timeout_secs: d_pandoc_timeout() }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -325,6 +342,7 @@ pub struct ServerConfig {
     pub context7: Context7Config,
     pub sqlite: SqliteConfig,
     pub db: DbConfig,
+    pub doc: DocConfig,
 }
 
 impl ServerConfig {

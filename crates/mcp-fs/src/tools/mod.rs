@@ -19,6 +19,7 @@ pub mod admin;
 pub mod all;
 pub mod context7;
 pub mod db;
+pub mod doc;
 pub mod document;
 pub mod edit;
 pub mod git;

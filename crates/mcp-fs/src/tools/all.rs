@@ -11,6 +11,7 @@ pub struct EnabledFeatures {
     pub context7: bool,
     pub sqlite: bool,
     pub db: bool,
+    pub doc: bool,
 }
 
 /// Register every tool: the fs.* families, then admin.*, then the optional families.
@@ -36,6 +37,9 @@ pub fn register_all(
     }
     if features.db {
         super::db::register(reg, &config.db);
+    }
+    if features.doc {
+        super::doc::register(reg, &config.doc);
     }
 }
 
@@ -70,7 +74,7 @@ mod tests {
     #[test]
     fn web_and_context7_tools_register_when_enabled() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false };
+        let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false, doc: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 33 fs + 8 admin + 5 web + 2 context7 = 48
@@ -82,11 +86,13 @@ mod tests {
     #[test]
     fn all_features_enabled_count() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true };
+        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 33 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 75
-        assert_eq!(reg.len(), 75);
+        // + 1 doc.to_docx if pandoc is in PATH, 0 otherwise
+        let doc_count = if which::which("pandoc").is_ok() { 1 } else { 0 };
+        assert_eq!(reg.len(), 75 + doc_count);
     }
 
     /// Whole surface parity gate for the 22 tools of this agent: every `admin.*`,

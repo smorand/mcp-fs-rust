@@ -71,6 +71,8 @@ datafusion = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 
+which = { workspace = true }
+
 # ── document extraction / code symbols (docs module) ───────────────────────────
 pdf-extract = { workspace = true }
 quick-xml = { workspace = true }

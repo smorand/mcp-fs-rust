@@ -56,6 +56,9 @@ pub enum Command {
         /// Force db.enabled = true (overrides config YAML).
         #[arg(long)]
         db: bool,
+        /// Force doc.enabled = true (overrides config YAML).
+        #[arg(long)]
+        doc: bool,
     },
     /// Generate an RS256 keypair (jwt.key private, jwt.pub public).
     Keys {
@@ -98,7 +101,7 @@ pub async fn run() -> ExitCode {
 
 /// Run an already parsed CLI. Split out so tests can drive it without a process.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command.unwrap_or(Command::Serve { config: None, git: false, web: false, context7: false, sqlite: false, db: false }) {
+    match cli.command.unwrap_or(Command::Serve { config: None, git: false, web: false, context7: false, sqlite: false, db: false, doc: false }) {
         Command::Version => {
             println!("{}", crate::app::VERSION);
             Ok(())
@@ -107,7 +110,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Token { email, key, issuer, claim, ttl } => {
             cmd_token(&email, key.as_deref(), &issuer, &claim, ttl)
         }
-        Command::Serve { config, git, web, context7, sqlite, db } => cmd_serve(config.as_deref(), git, web, context7, sqlite, db).await,
+        Command::Serve { config, git, web, context7, sqlite, db, doc } => cmd_serve(config.as_deref(), git, web, context7, sqlite, db, doc).await,
     }
 }
 
@@ -134,7 +137,7 @@ fn cmd_token(
     Ok(())
 }
 
-async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool, sqlite: bool, db: bool) -> anyhow::Result<()> {
+async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool, sqlite: bool, db: bool, doc: bool) -> anyhow::Result<()> {
     crate::logging::init();
     let resolved = resolve_config_path(explicit);
     let mut config = ServerConfig::load(&resolved)?;
@@ -143,6 +146,7 @@ async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, con
     if context7 { config.context7.enabled = true; }
     if sqlite   { config.sqlite.enabled = true; }
     if db       { config.db.enabled = true; }
+    if doc      { config.doc.enabled = true; }
     // The banner goes to stderr so it never pollutes a piped stdout.
     eprintln!(
         "Serving mcp-fs {} on {}:{} (config={})",
