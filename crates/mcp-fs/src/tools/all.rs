@@ -65,8 +65,8 @@ mod tests {
         let features = EnabledFeatures { git: false, web: true, context7: true };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 33 fs + 8 admin + 4 web + 2 context7 = 47
-        assert_eq!(reg.len(), 47);
+        // 33 fs + 8 admin + 5 web + 2 context7 = 48
+        assert_eq!(reg.len(), 48);
         assert!(reg.resolve("web.search").is_some());
         assert!(reg.resolve("context7.resolve_library_id").is_some());
     }

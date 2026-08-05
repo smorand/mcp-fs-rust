@@ -1,12 +1,24 @@
-//! Web search tools: DuckDuckGo search, news, suggestions, and page fetch.
+//! Web search tools: DuckDuckGo search, news, suggestions, page fetch, and binary download.
 //!
 //! These tools require no API key. They are registered only when `web.enabled`
-//! is true. No mount_id is involved: web tools are stateless and do not touch
-//! any volume.
+//! is true.
+//!
+//! Most tools are stateless: they return content to the LLM, which then decides
+//! what to do with it. Two tools can also write directly into a volume:
+//! - `web.fetch` accepts optional `mount_id`+`save_path` to bypass the context
+//!   window entirely for large pages or when the raw HTML is needed.
+//! - `web.download` always writes binary content (images, PDFs, ZIPs...) to a
+//!   volume; binary data cannot be passed through the LLM context.
+//!
+//! When writing to a volume the caller is subject to the same quota and ACL
+//! rules as `fs.write`: the bearer token must be a member of the project and
+//! the session write quota applies.
 
+use crate::core::fs_ops;
 use crate::errors::ToolError;
 use crate::mcp::registry::handler;
 use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::{norm, volume};
 use serde_json::{Value, json};
 
 /// Register the four `web.*` tools.
@@ -43,14 +55,93 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
     reg.add(
         ToolSchema::new(
             "web.fetch",
-            "Fetch the content of a web page and return its text.",
+            "Fetch the content of a web page. \
+             By default strips HTML tags, caps at 50 000 chars, and returns the text to the \
+             LLM (good for summarising or extracting information). \
+             Provide mount_id + save_path to write the raw content directly into a volume \
+             instead: use this when the page is large, when you need the original HTML, or \
+             when the content should be persisted without consuming context window tokens.",
         )
         .req_str("url", "URL to fetch (must start with http:// or https://).")
-        .opt_int("timeout_secs", 10, "Request timeout in seconds (capped at 30)."),
-        handler(|_ctx, a| async move {
+        .opt_int("timeout_secs", 10, "Request timeout in seconds (capped at 30).")
+        .opt_str_null(
+            "mount_id",
+            "If set together with save_path, write the fetched content into this volume \
+             instead of returning it to the LLM.",
+        )
+        .opt_str_null(
+            "save_path",
+            "Absolute POSIX destination path within the volume (requires mount_id).",
+        ),
+        handler(|ctx, a| async move {
             let url = a.str("url")?;
             let timeout = a.int_or("timeout_secs", 10).clamp(1, 30) as u64;
-            web_fetch(&url, timeout).await
+            let mount_id = a.opt_str("mount_id");
+            let save_path = a.opt_str("save_path");
+            match (mount_id, save_path) {
+                (Some(_), None) | (None, Some(_)) => Err(ToolError::invalid_argument(
+                    "mount_id and save_path must both be provided, or neither",
+                )),
+                (Some(mid), Some(sp)) => {
+                    // Write the raw bytes directly into the volume; the content never
+                    // passes through the LLM context window.
+                    let fake_a = crate::mcp::Args::new(json!({"mount_id": mid, "path": sp}));
+                    let (mount, client) = volume(&ctx, &fake_a).await?;
+                    let path = norm(&ctx, &fake_a, "path")?;
+                    let (bytes, _content_type) = fetch_raw(&url, timeout).await?;
+                    fs_ops::write_bytes(
+                        &client,
+                        &ctx.state.safety,
+                        &ctx.person,
+                        &mount,
+                        &path,
+                        &bytes,
+                        true,
+                        true,
+                    ).await
+                }
+                (None, None) => web_fetch(&url, timeout).await,
+            }
+        }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "web.download",
+            "Download a URL and write the raw bytes directly into a volume file. \
+             Unlike web.fetch this tool does not pass content through the LLM context window, \
+             making it the right choice for images, PDFs, ZIPs, and other binary files. \
+             The session write quota and project ACL apply exactly as for fs.write.",
+        )
+        .req_str("url", "URL to download (must start with http:// or https://).")
+        .req_str("mount_id", "Project/volume id to write into.")
+        .req_str("path", "Absolute POSIX destination path within the volume.")
+        .opt_int("timeout_secs", 30, "Request timeout in seconds (capped at 120)."),
+        handler(|ctx, a| async move {
+            let url = a.str("url")?;
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ToolError::invalid_argument(
+                    "url must start with http:// or https://",
+                ));
+            }
+            let timeout = a.int_or("timeout_secs", 30).clamp(1, 120) as u64;
+            let (mount, client) = volume(&ctx, &a).await?;
+            let path = norm(&ctx, &a, "path")?;
+            let (bytes, content_type) = fetch_raw(&url, timeout).await?;
+            let mut result = fs_ops::write_bytes(
+                &client,
+                &ctx.state.safety,
+                &ctx.person,
+                &mount,
+                &path,
+                &bytes,
+                true,
+                true,
+            ).await?;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("content_type".to_string(), Value::String(content_type));
+            }
+            Ok(result)
         }),
     );
 
@@ -252,11 +343,11 @@ async fn web_news(query: &str, max_results: usize, time_range: Option<&str>) -> 
     Ok(Value::String(serde_json::to_string_pretty(&results).unwrap_or_default()))
 }
 
-async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(ToolError::invalid_argument("url must start with http:// or https://"));
-    }
-
+/// Fetch a URL and return the raw bytes plus the Content-Type header value.
+///
+/// Used by both `web.fetch` (save mode) and `web.download`. The URL validation
+/// (http/https prefix) is the caller's responsibility.
+async fn fetch_raw(url: &str, timeout_secs: u64) -> crate::errors::Result<(Vec<u8>, String)> {
     let client = build_client(timeout_secs)?;
     let resp = client
         .get(url)
@@ -269,15 +360,26 @@ async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value>
                 ToolError::internal(format!("fetch request failed: {e}"))
             }
         })?;
-
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
+        .unwrap_or("application/octet-stream")
         .to_string();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ToolError::internal(format!("read response: {e}")))?;
+    Ok((bytes.to_vec(), content_type))
+}
 
-    let body = resp.text().await.map_err(|e| ToolError::internal(format!("read response: {e}")))?;
+async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(ToolError::invalid_argument("url must start with http:// or https://"));
+    }
+
+    let (bytes, content_type) = fetch_raw(url, timeout_secs).await?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let text = if content_type.contains("text/html") {
         strip_html(&body)
@@ -343,8 +445,11 @@ mod tests {
 
     #[test]
     fn four_web_tools_register() {
-        assert_eq!(reg().len(), 4);
-        assert_eq!(reg().names(), ["web.search", "web.news", "web.fetch", "web.suggestions"]);
+        assert_eq!(reg().len(), 5);
+        assert_eq!(
+            reg().names(),
+            ["web.search", "web.news", "web.fetch", "web.download", "web.suggestions"]
+        );
     }
 
     #[test]
