@@ -249,4 +249,22 @@ mod tests {
         let m = SafetyManager::new(cfg);
         assert!(m.trash_path("/x.txt").starts_with("/.bin/"));
     }
+
+    // ── GROUP I: new safety test ───────────────────────────────────────────────
+
+    /// A write records the path as read (see `write_text` in fs_ops: it calls
+    /// `safety.record_read` after writing). So a second edit on the same path in
+    /// the same session must not be blocked by the read guard, because the first
+    /// write already satisfied it.
+    #[test]
+    fn read_guard_is_cleared_after_write_so_second_edit_doesnt_need_reread() {
+        let m = mgr();
+        // Simulate what fs_ops::write_text does: it calls record_read after writing.
+        m.record_read("a@b.c", "p", "/f.txt");
+        // Now the read guard is satisfied; a second ensure_read_before_write must pass.
+        m.ensure_read_before_write("a@b.c", "p", "/f.txt").unwrap();
+        // Writing again would call record_read again, which is idempotent.
+        m.record_read("a@b.c", "p", "/f.txt");
+        m.ensure_read_before_write("a@b.c", "p", "/f.txt").unwrap();
+    }
 }

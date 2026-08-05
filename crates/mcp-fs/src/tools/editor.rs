@@ -798,4 +798,169 @@ mod tests {
         let html = "<html><body><p>x</p></body></html>";
         assert_eq!(inject_content(html, "new"), html);
     }
+
+    // ── new tests ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_editor_invalid_mode_returns_err_invalid_argument() {
+        let h = harness_with_extra(register_editor).await;
+        let err = h.call("doc.open_editor", json!({
+            "mount_id": MOUNT, "path": "/doc.html", "mode": "pdf"
+        })).await.unwrap_err();
+        assert!(err.message.contains("mode must be"), "expected mode error, got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn close_editor_unknown_id_returns_err_not_found() {
+        let h = harness_with_extra(register_editor).await;
+        let random_id = uuid::Uuid::new_v4().to_string();
+        let err = h.call("doc.close_editor", json!({"editor_id": random_id})).await.unwrap_err();
+        assert_eq!(err.code, crate::errors::code::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_editors_returns_empty_array_when_none_open() {
+        let h = harness_with_extra(register_editor).await;
+        let r = h.call("doc.list_editors", json!({})).await.unwrap();
+        assert_eq!(r["editors"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn ws_unknown_message_type_is_silently_ignored() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TMsg;
+        use futures::SinkExt;
+
+        let h = harness_with_extra(register_editor).await;
+        h.seed("/ping_test.html", r#"<!DOCTYPE html><html><body><div id="content"><p>original</p></div></body></html>"#).await;
+        let r = h.call("doc.open_editor", json!({
+            "mount_id": MOUNT, "path": "/ping_test.html", "mode": "doc"
+        })).await.unwrap();
+        let port = {
+            let url = r["url"].as_str().unwrap();
+            url.split(':').next_back().unwrap().parse::<u16>().unwrap()
+        };
+        let id = r["editor_id"].as_str().unwrap().to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let (mut ws, _) = connect_async(&ws_url).await.unwrap();
+
+        // Send an unknown message type; the server must not crash or write anything.
+        let ping_msg = json!({"type": "ping"}).to_string();
+        ws.send(TMsg::Text(ping_msg.into())).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let content = h.client().await.read_text("/ping_test.html").await.unwrap();
+        assert!(content.contains("original"), "file must be unchanged after unknown message type");
+
+        ws.close(None).await.ok();
+        h.call("doc.close_editor", json!({"editor_id": id})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_save_without_content_marker_is_a_noop() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TMsg;
+        use futures::SinkExt;
+
+        let h = harness_with_extra(register_editor).await;
+        // File has no <div id="content"> marker.
+        h.seed("/no_marker.html", "<html><body><p>no marker here</p></body></html>").await;
+        let r = h.call("doc.open_editor", json!({
+            "mount_id": MOUNT, "path": "/no_marker.html", "mode": "doc"
+        })).await.unwrap();
+        let port = {
+            let url = r["url"].as_str().unwrap();
+            url.split(':').next_back().unwrap().parse::<u16>().unwrap()
+        };
+        let id = r["editor_id"].as_str().unwrap().to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let (mut ws, _) = connect_async(&ws_url).await.unwrap();
+
+        let save_msg = json!({"type": "save", "html": "<p>injected</p>"}).to_string();
+        ws.send(TMsg::Text(save_msg.into())).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // inject_content returns original when marker is absent, so file must be unchanged.
+        let content = h.client().await.read_text("/no_marker.html").await.unwrap();
+        assert!(content.contains("no marker here"), "file must be unchanged when no marker");
+        assert!(!content.contains("injected"), "injected content must not appear");
+
+        ws.close(None).await.ok();
+        h.call("doc.close_editor", json!({"editor_id": id})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_ws_clients_all_receive_reload() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TMsg;
+        use futures::StreamExt;
+
+        let h = harness_with_extra(register_editor).await;
+        h.seed("/multi_ws.html", r#"<!DOCTYPE html><html><body><div id="content"><p>v1</p></div></body></html>"#).await;
+        let r = h.call("doc.open_editor", json!({
+            "mount_id": MOUNT, "path": "/multi_ws.html", "mode": "doc"
+        })).await.unwrap();
+        let port = {
+            let url = r["url"].as_str().unwrap();
+            url.split(':').next_back().unwrap().parse::<u16>().unwrap()
+        };
+        let id = r["editor_id"].as_str().unwrap().to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let (ws1, _) = connect_async(&ws_url).await.unwrap();
+        let (ws2, _) = connect_async(&ws_url).await.unwrap();
+
+        // Wait one poll cycle so the watcher records the initial mtime.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // External write to trigger the watcher.
+        h.client().await
+            .write_text_atomic("/multi_ws.html",
+                r#"<!DOCTYPE html><html><body><div id="content"><p>v2</p></div></body></html>"#)
+            .await.unwrap();
+
+        // Both clients should get a reload message within 2 s.
+        let recv_reload = |mut ws: tokio_tungstenite::WebSocketStream<_>| async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                async move {
+                    loop {
+                        match ws.next().await {
+                            Some(Ok(TMsg::Text(t))) => {
+                                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
+                                if v["type"] == "reload" { return v; }
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+            ).await.expect("expected reload message within 2s")
+        };
+
+        let (m1, m2) = tokio::join!(recv_reload(ws1), recv_reload(ws2));
+        assert_eq!(m1["type"], "reload");
+        assert_eq!(m2["type"], "reload");
+        assert!(m1["html"].as_str().unwrap().contains("v2"));
+        assert!(m2["html"].as_str().unwrap().contains("v2"));
+
+        h.call("doc.close_editor", json!({"editor_id": id})).await.unwrap();
+    }
+
+    #[test]
+    fn inject_content_with_empty_new_content() {
+        let html = r#"<html><body><div id="content"><p>original</p></div></body></html>"#;
+        let result = inject_content(html, "");
+        let extracted = extract_content(&result);
+        assert_eq!(extracted, Some("".to_string()), "extract after inject-empty must return Some empty string");
+    }
 }

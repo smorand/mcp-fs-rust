@@ -376,6 +376,53 @@ mod tests {
         assert_eq!(err.code, code::NO_MATCH);
     }
 
+    // ── new tests ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn edit_on_a_directory_is_invalid_argument() {
+        let h = harness().await;
+        h.call("fs.mkdir", serde_json::json!({"mount_id": MOUNT, "path": "/mydir"})).await.unwrap();
+        // Record the dir path as read so the guard lets us through to the actual error.
+        h.state.safety.record_read(crate::tools::testkit::PERSON, MOUNT, "/mydir");
+        let err = h
+            .call("fs.edit", serde_json::json!({
+                "mount_id": MOUNT,
+                "path": "/mydir",
+                "old_string": "x",
+                "new_string": "y"
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+    }
+
+    #[tokio::test]
+    async fn insert_at_line_negative_clamps_to_zero() {
+        let h = harness().await;
+        h.seed("/ins.txt", "first\n").await;
+        // line=-5 clamps to 0, which inserts before the first line.
+        let r = h
+            .call("fs.insert_at_line", serde_json::json!({
+                "mount_id": MOUNT,
+                "path": "/ins.txt",
+                "line": -5,
+                "content": "top"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r["applied"], true);
+        let content = h.client().await.read_text("/ins.txt").await.unwrap();
+        assert!(content.starts_with("top"), "expected 'top' at the start, got: {content}");
+    }
+
+
+
+
+
+
+
+
+
 
 
 

@@ -194,6 +194,72 @@ mod tests {
         assert_eq!(again["created"], false);
     }
 
+    // ── new tests ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_with_overwrite_false_on_existing_file_is_409() {
+        let h = harness().await;
+        h.seed("/exists.txt", "old content").await;
+        let err = h
+            .call("fs.write", json!({"mount_id": MOUNT, "path": "/exists.txt", "content": "new content"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+    }
+
+    #[tokio::test]
+    async fn write_creates_nested_parents_automatically() {
+        let h = harness().await;
+        let r = h
+            .call("fs.write", json!({"mount_id": MOUNT, "path": "/a/b/c/deep.txt", "content": "hello"}))
+            .await
+            .unwrap();
+        assert_eq!(r["path"], "/a/b/c/deep.txt");
+        assert_eq!(r["bytes_written"], 5);
+        let text = h.client().await.read_text("/a/b/c/deep.txt").await.unwrap();
+        assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn write_with_empty_content_is_zero_bytes() {
+        let h = harness().await;
+        let r = h
+            .call("fs.write", json!({"mount_id": MOUNT, "path": "/empty.txt", "content": ""}))
+            .await
+            .unwrap();
+        assert_eq!(r["bytes_written"], 0);
+        let stat = h
+            .call("fs.stat", json!({"mount_id": MOUNT, "path": "/empty.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(stat["size"], 0);
+    }
+
+    #[tokio::test]
+    async fn write_quota_exceeded_returns_err_quota_exceeded() {
+        use crate::tools::testkit::harness_with;
+        let h = harness_with(|cfg| {
+            cfg.safety.write_quota_bytes = 10;
+        }).await;
+        let err = h
+            .call("fs.write", json!({"mount_id": MOUNT, "path": "/big.txt", "content": "x".repeat(100)}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+    }
+
+    #[tokio::test]
+    async fn append_to_a_directory_is_invalid_argument() {
+        let h = harness().await;
+        h.call("fs.mkdir", json!({"mount_id": MOUNT, "path": "/mydir"})).await.unwrap();
+        let err = h
+            .call("fs.append", json!({"mount_id": MOUNT, "path": "/mydir", "content": "x"}))
+            .await
+            .unwrap_err();
+        // The storage layer returns ERR_INVALID_ARGUMENT for writing to a directory.
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+    }
+
     /// A fresh write counts as a read, so the overwrite passes the read guard.
     #[tokio::test]
     async fn overwrite_after_a_write_is_allowed_and_returns_a_diff() {

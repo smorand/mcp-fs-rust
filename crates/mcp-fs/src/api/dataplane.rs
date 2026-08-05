@@ -2185,4 +2185,75 @@ mod tests {
         assert!(REST_ROUTES.contains(&("GET", "download-zip")));
         assert!(REST_ROUTES.contains(&("POST", "write-docx")));
     }
+
+    // ── GROUP J: new dataplane tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn upload_zero_byte_file_is_allowed() {
+        let h = Harness::new().await;
+        let boundary = "Z-BOUNDARY";
+        // Build the multipart body explicitly with no file content (0 bytes).
+        // In multipart, the \r\n immediately before "--boundary" is the part
+        // delimiter and is not included in the part body, so this uploads 0 bytes.
+        let body = [
+            format!("--{boundary}\r\n"),
+            "Content-Disposition: form-data; name=\"directory\"\r\n\r\n/empty\r\n".to_string(),
+            format!("--{boundary}\r\n"),
+            "Content-Disposition: form-data; name=\"files\"; filename=\"zero.txt\"\r\n".to_string(),
+            "Content-Type: text/plain\r\n\r\n".to_string(),
+            // empty body: zero bytes between header-separator and closing delimiter
+            format!("\r\n--{boundary}--\r\n"),
+        ]
+        .concat();
+        let (status, raw) = h
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri(u("upload"))
+                    .header("Authorization", format!("Bearer {}", h.owner_token))
+                    .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "zero-byte upload must succeed, body: {}", String::from_utf8_lossy(&raw));
+        let v: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["count"], 1, "expected one file written");
+
+        // Verify via stat that size is 0.
+        let (stat_status, stat_v) = h.get(&u("stat?path=/empty/zero.txt")).await;
+        assert_eq!(stat_status, StatusCode::OK);
+        assert_eq!(stat_v["size"], 0);
+    }
+
+    #[tokio::test]
+    async fn download_zip_of_a_single_file_returns_valid_zip() {
+        let h = Harness::new().await;
+        // Put the file inside a directory; download-zip on the directory yields one entry.
+        h.seed("/solo/only.txt", "the only file").await;
+
+        let response = h
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(u("download-zip?path=/solo"))
+                    .header("Authorization", format!("Bearer {}", h.owner_token))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/zip");
+
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..2], b"PK", "must be a valid zip file");
+
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+        assert_eq!(archive.len(), 1, "zip must contain exactly one entry");
+        let entry = archive.by_index(0).unwrap();
+        assert_eq!(entry.name(), "only.txt");
+    }
 }

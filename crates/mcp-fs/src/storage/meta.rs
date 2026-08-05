@@ -622,4 +622,32 @@ mod tests {
         let e = s.put_file("/d", Some("x"), 1, MODE_FILE).await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
     }
+
+    // ── GROUP G: new blob refcount test ────────────────────────────────────────
+
+    /// Write a file, copy it (refcount 2), then delete both. After both are gone
+    /// the blob_refs row is removed (refcount hit 0), so the metadata store no
+    /// longer references the sha.  The VolumeClient.blob.exists check is done in
+    /// the volume tests; here we verify the meta side: put, copy, delete x2.
+    #[tokio::test]
+    async fn blob_refcount_drops_to_zero_after_all_referencing_files_deleted() {
+        let s = store();
+        let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        // Write two files pointing at the same blob (refcount 2).
+        s.put_file("/a.txt", Some(sha), 4, MODE_FILE).await.unwrap();
+        s.put_file("/b.txt", Some(sha), 4, MODE_FILE).await.unwrap();
+
+        // Delete first file: refcount drops to 1, gc returns None.
+        let gc1 = s.delete_file("/a.txt").await.unwrap();
+        assert_eq!(gc1, None, "refcount was 2; blob must survive first delete");
+
+        // Delete second file: refcount drops to 0, gc returns the sha.
+        let gc2 = s.delete_file("/b.txt").await.unwrap();
+        assert_eq!(
+            gc2.as_deref(),
+            Some(sha),
+            "refcount hit 0; blob must be returned for GC"
+        );
+    }
 }

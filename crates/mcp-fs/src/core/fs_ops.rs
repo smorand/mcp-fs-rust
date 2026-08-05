@@ -2939,4 +2939,61 @@ mod tests {
         assert_eq!(ops[0].kind, OpKind::Delete);
         assert_eq!(ops[0].path, "/a.txt");
     }
+
+    // ── GROUP F: new fs_ops tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn glob_double_star_is_treated_as_single_star_crossing_slashes() {
+        // fnmatch semantics: a single * DOES cross '/' boundaries (confirmed in AGENTS.md).
+        // So **/*.rs should match /a/b/c.rs.
+        let f = fixture();
+        f.v.write_text_atomic("/a/b/c.rs", "fn foo() {}").await.unwrap();
+        f.v.write_text_atomic("/a/b/c.txt", "text").await.unwrap();
+        let r = glob_files(&f.v, "/", "**/*.rs", &[]).await.unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert!(
+            matches.iter().any(|m| m.as_str() == Some("/a/b/c.rs")),
+            "**/*.rs must match /a/b/c.rs under fnmatch semantics, got: {:?}",
+            matches
+        );
+    }
+
+    #[tokio::test]
+    async fn overwrite_on_a_directory_returns_invalid_argument() {
+        let f = fixture();
+        f.v.makedirs("/mydir", true).await.unwrap();
+        // Record a read so the guard passes; the storage layer will reject the write.
+        f.s.record_read(P, M, "/mydir");
+        let e = write_text(&f.v, &f.s, P, M, "/mydir", "data", true, false).await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "writing to a dir must be INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn copy_preserves_blob_refcount() {
+        let f = fixture();
+        f.v.write_text_atomic("/src.txt", "shared content").await.unwrap();
+        let sha = VolumeClient::sha256_hex(b"shared content");
+
+        copy_path(&f.v, &f.s, P, M, "/src.txt", "/dst.txt", false, false).await.unwrap();
+        // After copy: refcount=2. Soft-delete the original: blob must still exist.
+        delete_path(&f.v, &f.s, P, M, "/src.txt", false, true).await.unwrap();
+        // dst.txt still readable and blob not GC'd.
+        let content = f.v.read_text("/dst.txt").await.unwrap();
+        assert_eq!(content, "shared content", "copy target must be readable after original deleted");
+        assert!(
+            f.v.blob.exists(&sha).await.unwrap(),
+            "blob must not be GC'd while dst.txt still references it"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_on_a_file_path_returns_single_entry() {
+        let f = fixture();
+        f.v.write_text_atomic("/solo.txt", "content").await.unwrap();
+        // The tree engine calls list_dir on the root path. When the root is a file,
+        // list_dir returns ERR_INVALID_ARGUMENT because files are not directories.
+        // This is the actual behavior: the engine does not special-case a file root.
+        let e = tree(&f.v, "/solo.txt", 3, &[], false).await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+    }
 }

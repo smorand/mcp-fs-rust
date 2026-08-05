@@ -329,4 +329,41 @@ mod tests {
         let err = h.call("fs.read_lines", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::INVALID_ARGUMENT);
     }
+
+    // ── new tests ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_bytes_on_a_directory_is_invalid_argument() {
+        let h = harness().await;
+        h.call("fs.mkdir", json!({"mount_id": MOUNT, "path": "/d"})).await.unwrap();
+        let err = h
+            .call("fs.read_bytes", json!({"mount_id": MOUNT, "path": "/d"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::INVALID_ARGUMENT);
+    }
+
+    #[tokio::test]
+    async fn read_many_empty_paths_array_returns_empty_results() {
+        let h = harness().await;
+        let r = h
+            .call("fs.read_many", json!({"mount_id": MOUNT, "paths": []}))
+            .await
+            .unwrap();
+        let files = r["files"].as_array().unwrap();
+        assert!(files.is_empty(), "expected empty results for empty paths array");
+    }
+
+    #[tokio::test]
+    async fn count_lines_on_empty_file_returns_zero() {
+        let h = harness().await;
+        h.call("fs.write", json!({"mount_id": MOUNT, "path": "/empty.txt", "content": ""}))
+            .await
+            .unwrap();
+        let r = h
+            .call("fs.count_lines", json!({"mount_id": MOUNT, "path": "/empty.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(r["total_lines"], 0);
+    }
 }

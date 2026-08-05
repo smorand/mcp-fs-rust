@@ -390,4 +390,50 @@ mod tests {
         let r = IdentityResolver::new(&auth);
         assert!(r.verify("anything").is_err());
     }
+
+    // ── GROUP H: new identity tests ─────────────────────────────────────────
+
+    /// A token whose exp is exactly at the skew boundary (now - 29) is still valid:
+    /// the library adds `leeway` seconds to exp before comparing, so exp+30 > now.
+    #[test]
+    fn token_exactly_at_30s_skew_is_valid() {
+        let (pk, pubk) = keypair();
+        let r = IdentityResolver::from_pem(&pubk, Some("web-a2a"), "email").unwrap();
+        // exp = now - 29: within the 30s skew window.
+        let t = mint(
+            &pk,
+            json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() - 29, "nbf": now() - 60}),
+        );
+        assert!(
+            r.verify(&t).is_ok(),
+            "token expiring 29s ago must be accepted within 30s skew"
+        );
+    }
+
+    /// A token whose exp is just beyond the skew boundary (now - 31) must be rejected.
+    #[test]
+    fn token_just_beyond_30s_skew_is_rejected() {
+        let (pk, pubk) = keypair();
+        let r = IdentityResolver::from_pem(&pubk, Some("web-a2a"), "email").unwrap();
+        // exp = now - 31: just outside the 30s skew window.
+        let t = mint(
+            &pk,
+            json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() - 31, "nbf": now() - 60}),
+        );
+        assert!(
+            r.verify(&t).is_err(),
+            "token expiring 31s ago must be rejected (beyond 30s skew)"
+        );
+    }
+
+    /// A token with no `exp` claim must be rejected; we require expiry.
+    #[test]
+    fn token_without_exp_claim_is_rejected() {
+        let (pk, pubk) = keypair();
+        let r = IdentityResolver::from_pem(&pubk, Some("web-a2a"), "email").unwrap();
+        // No `exp` field at all.
+        let t = mint(&pk, json!({"email": "a@b.c", "iss": "web-a2a"}));
+        let e = r.verify(&t).unwrap_err();
+        assert_eq!(e.code, crate::errors::code::UNAUTHENTICATED);
+    }
 }

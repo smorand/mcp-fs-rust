@@ -261,4 +261,36 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["name"], "Node");
     }
+
+    // ── new tests ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn glob_on_empty_volume_returns_empty_array() {
+        let h = harness().await;
+        let r = h
+            .call("fs.glob", json!({"mount_id": MOUNT, "pattern": "*"}))
+            .await
+            .unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert!(matches.is_empty(), "expected no matches on empty volume");
+        assert_eq!(r["truncated"], false);
+    }
+
+    /// With max_matches=0 the loop terminates before any hit is added (hits.len() >= 0
+    /// is immediately true) and the result is an empty matches array.
+    #[tokio::test]
+    async fn grep_with_max_matches_zero_returns_empty() {
+        let h = harness().await;
+        h.seed("/data.txt", "needle\nneedle\nneedle\n").await;
+        let r = h
+            .call("fs.grep", json!({
+                "mount_id": MOUNT,
+                "pattern": "needle",
+                "max_matches": 0
+            }))
+            .await
+            .unwrap();
+        let matches = r["matches"].as_array().unwrap();
+        assert!(matches.is_empty(), "expected empty matches with max_matches=0");
+    }
 }
