@@ -130,10 +130,18 @@ accumulator is fed chunk JSON directly, which covers what actually breaks in the
 tool name split across chunks, out of order indices, a missing call id, a trailing nameless
 delta, malformed arguments).
 
-The interactive path cannot be unit tested. It is verified by driving a real pty: wait for
-the prompt, type with a typo, fix it with backspaces, submit, recall with the up arrow,
-abandon with Ctrl+C, then ask for markdown and assert on the rendered escapes. Both spinner
-bugs described in `.agent_docs/agent.md` were found that way, not by the test suite.
+The interactive path cannot be unit tested, so `scripts/pty_check.py` drives the real binary
+through a pty and reads back a virtual screen. Self contained: ephemeral port, temp state,
+its own token, seeded readline history, no LLM key needed.
+
+```bash
+cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
+```
+
+Eleven editor checks. Every one was validated by reintroducing the bug it guards, including
+the case where the repainted text is correct but sits one row too high. The spinner bugs and
+the backspace gap described in `.agent_docs/agent.md` were all found this way, not by the
+test suite.
 
 Smoke test both stdin modes, since they take different code paths:
 

@@ -129,8 +129,9 @@ impl InputReader {
 
     /// The interactive editor, only reached when stdin is a terminal.
     fn read_line_interactive(&mut self, prompt: &str) -> Result<Input> {
-        // Only the part of the prompt after the last newline shares the cursor's row.
-        let prompt_cols = display_width(prompt.rsplit('\n').next().unwrap_or(prompt));
+        // Only the part of the prompt after the last newline shares the cursor's row, and
+        // its colour escapes occupy no cells.
+        let prompt_cols = visible_width(visible_prompt(prompt));
 
         let mut buf: Vec<char> = Vec::new();
         let mut cursor = 0usize;
@@ -168,16 +169,19 @@ impl InputReader {
                 }
                 KeyCode::Backspace => {
                     if cursor > 0 {
-                        let from = cursor;
+                        // Measure against the buffer as it still is: after the removal the
+                        // widths shift, and the physical cursor has not moved yet.
+                        let from_row = row_of(prompt_cols, &buf, cursor);
                         buf.remove(cursor - 1);
                         cursor -= 1;
-                        redraw(prompt, prompt_cols, &buf, from, cursor);
+                        redraw(prompt, prompt_cols, &buf, from_row, cursor);
                     }
                 }
                 KeyCode::Delete => {
                     if cursor < buf.len() {
+                        let from_row = row_of(prompt_cols, &buf, cursor);
                         buf.remove(cursor);
-                        redraw(prompt, prompt_cols, &buf, cursor, cursor);
+                        redraw(prompt, prompt_cols, &buf, from_row, cursor);
                     }
                 }
                 KeyCode::Left => {
@@ -205,17 +209,17 @@ impl InputReader {
                     move_cursor(prompt_cols, &buf, from, cursor);
                 }
                 KeyCode::Char('k') if ctrl => {
-                    let from = cursor;
+                    // The physical cursor sits at `cursor`, not at the old end: the text
+                    // after it is erased by the redraw either way.
+                    let from_row = row_of(prompt_cols, &buf, cursor);
                     buf.truncate(cursor);
-                    // The physical cursor did not move, so `from` is the cursor, not the
-                    // old end: the text after it is erased by the redraw either way.
-                    redraw(prompt, prompt_cols, &buf, from, cursor);
+                    redraw(prompt, prompt_cols, &buf, from_row, cursor);
                 }
                 KeyCode::Char('u') if ctrl => {
-                    let from = cursor;
+                    let from_row = row_of(prompt_cols, &buf, cursor);
                     buf.drain(..cursor);
                     cursor = 0;
-                    redraw(prompt, prompt_cols, &buf, from, cursor);
+                    redraw(prompt, prompt_cols, &buf, from_row, cursor);
                 }
                 KeyCode::Up => {
                     if hist_idx > 0 {
@@ -224,7 +228,8 @@ impl InputReader {
                         }
                         hist_idx -= 1;
                         let entry = self.history[hist_idx].clone();
-                        replace_buffer(prompt, prompt_cols, &mut buf, &mut cursor, &entry);
+                        let from_row = row_of(prompt_cols, &buf, cursor);
+                        replace_buffer(prompt, prompt_cols, &mut buf, &mut cursor, &entry, from_row);
                     }
                 }
                 KeyCode::Down => {
@@ -235,11 +240,12 @@ impl InputReader {
                         } else {
                             self.history[hist_idx].clone()
                         };
-                        replace_buffer(prompt, prompt_cols, &mut buf, &mut cursor, &entry);
+                        let from_row = row_of(prompt_cols, &buf, cursor);
+                        replace_buffer(prompt, prompt_cols, &mut buf, &mut cursor, &entry, from_row);
                     }
                 }
                 KeyCode::Char(c) if !ctrl && !modifiers.contains(KeyModifiers::ALT) => {
-                    let from = cursor;
+                    let from_row = row_of(prompt_cols, &buf, cursor);
                     buf.insert(cursor, c);
                     cursor += 1;
                     // Fast path: appending at the end without landing exactly on the wrap
@@ -250,7 +256,7 @@ impl InputReader {
                         print!("{c}");
                         let _ = std::io::stdout().flush();
                     } else {
-                        redraw(prompt, prompt_cols, &buf, from, cursor);
+                        redraw(prompt, prompt_cols, &buf, from_row, cursor);
                     }
                 }
                 _ => {}
@@ -269,9 +275,47 @@ fn term_cols() -> usize {
     terminal::size().map(|(c, _)| c as usize).unwrap_or(80).max(20)
 }
 
-/// Display width of a string, counting a wide character as two cells.
-fn display_width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+/// The part of a prompt that shares the cursor's row: everything after the last newline.
+fn visible_prompt(prompt: &str) -> &str {
+    match prompt.rfind('\n') {
+        Some(i) => &prompt[i + 1..],
+        None => prompt,
+    }
+}
+
+/// Cells a string occupies on screen, skipping ANSI escape sequences.
+///
+/// A styled prompt such as "\x1b[36m>\x1b[0m " paints two cells, but its bytes include
+/// the escape sequences. Measuring those as printable is what made every repositioning
+/// land seven columns too far right, which showed up as an unerasable gap after a
+/// backspace: the fast path for plain typing never repositions, so only a redraw exposed it.
+fn visible_width(s: &str) -> usize {
+    let mut cols = 0usize;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\x1b' {
+            cols += c.width().unwrap_or(0);
+            continue;
+        }
+        // CSI: ESC '[' parameters, terminated by a byte in @ to ~.
+        if it.peek() == Some(&'[') {
+            it.next();
+            for t in it.by_ref() {
+                if ('\x40'..='\x7e').contains(&t) {
+                    break;
+                }
+            }
+        } else {
+            // A non CSI escape: any intermediate bytes in 0x20 to 0x2F, then one final
+            // byte. "ESC ( B" is three characters, so dropping a fixed two would leave
+            // the 'B' behind and count it as text.
+            while it.peek().is_some_and(|c| ('\x20'..='\x2f').contains(c)) {
+                it.next();
+            }
+            it.next();
+        }
+    }
+    cols
 }
 
 /// Display width of the whole buffer.
@@ -282,6 +326,11 @@ fn content_width(buf: &[char]) -> usize {
 /// Display width of the buffer up to a content cursor.
 fn width_upto(buf: &[char], cursor: usize) -> usize {
     buf[..cursor.min(buf.len())].iter().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// The screen row a content cursor sits on, counted from the first row of the input area.
+fn row_of(prompt_cols: usize, buf: &[char], cursor: usize) -> usize {
+    row_col(prompt_cols, buf, cursor).0
 }
 
 /// The row and column a content cursor sits at, given the prompt width.
@@ -304,8 +353,11 @@ fn move_to_end(prompt_cols: usize, buf: &[char], cursor: usize) {
 }
 
 /// Erase the whole input area and repaint it, leaving the cursor at `to`.
-fn redraw(prompt: &str, prompt_cols: usize, buf: &[char], from: usize, to: usize) {
-    let (from_row, _) = row_col(prompt_cols, buf, from.min(buf.len().max(from)));
+///
+/// `from_row` is where the physical cursor is RIGHT NOW, measured by the caller against the
+/// buffer as it was BEFORE the edit. Deriving it here from the new buffer would be wrong:
+/// the widths have already shifted while the terminal cursor has not moved.
+fn redraw(prompt: &str, prompt_cols: usize, buf: &[char], from_row: usize, to: usize) {
     let mut out = std::io::stdout();
 
     // Back to the first row of the input area, then clear everything below.
@@ -314,9 +366,8 @@ fn redraw(prompt: &str, prompt_cols: usize, buf: &[char], from: usize, to: usize
     }
     let _ = write!(out, "\x1b[1G\x1b[0J");
 
-    let visible = prompt.rsplit('\n').next().unwrap_or(prompt);
     let content: String = buf.iter().collect();
-    let _ = write!(out, "{visible}{content}");
+    let _ = write!(out, "{}{content}", visible_prompt(prompt));
 
     // Reposition: printing left the cursor at the end of the content.
     let (end_row, _) = row_col(prompt_cols, buf, buf.len());
@@ -342,10 +393,10 @@ fn move_cursor(prompt_cols: usize, buf: &[char], from: usize, to: usize) {
     let _ = out.flush();
 }
 
-/// Swap in a history entry.
+/// Swap in a history entry, leaving the cursor at the end of the new text.
 ///
-/// `from` is the CURRENT cursor, not the old end. The reference implementation passed the
-/// old end here, which over scrolled whenever the cursor was not already at the end, for
+/// `from_row` comes from the CURRENT cursor, not the old end. The reference implementation
+/// used the old end, which over scrolled whenever the cursor was not already there, for
 /// instance Home followed by Up on a wrapped line.
 fn replace_buffer(
     prompt: &str,
@@ -353,23 +404,14 @@ fn replace_buffer(
     buf: &mut Vec<char>,
     cursor: &mut usize,
     text: &str,
+    from_row: usize,
 ) {
-    let from = *cursor;
-    let old = std::mem::take(buf);
-    // The old buffer decides how far up the physical cursor is, so measure against it.
-    let (from_row, _) = row_col(prompt_cols, &old, from);
+    buf.clear();
     buf.extend(text.chars());
     *cursor = buf.len();
-
-    let mut out = std::io::stdout();
-    if from_row > 0 {
-        let _ = write!(out, "\x1b[{from_row}A");
-    }
-    let _ = write!(out, "\x1b[1G\x1b[0J");
-    let visible = prompt.rsplit('\n').next().unwrap_or(prompt);
-    let content: String = buf.iter().collect();
-    let _ = write!(out, "{visible}{content}");
-    let _ = out.flush();
+    // The cursor ends at the end of the content, which is exactly where the repaint leaves
+    // it, so this is the same operation as a redraw targeting the end.
+    redraw(prompt, prompt_cols, buf, from_row, *cursor);
 }
 
 #[cfg(test)]
@@ -377,10 +419,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_width_counts_wide_characters_as_two() {
-        assert_eq!(display_width("abc"), 3);
-        assert_eq!(display_width("❯ "), 2, "the prompt glyph is one cell");
-        assert_eq!(display_width("漢字"), 4, "each CJK char takes two cells");
+    fn visible_width_counts_wide_characters_as_two() {
+        assert_eq!(visible_width("abc"), 3);
+        assert_eq!(visible_width("❯ "), 2, "the prompt glyph is one cell");
+        assert_eq!(visible_width("漢字"), 4, "each CJK char takes two cells");
+    }
+
+    /// The bug behind the unerasable gap after a backspace: the colour escapes in the
+    /// prompt were measured as printable cells, so every repositioning landed seven
+    /// columns too far right. Plain typing never repositions, which is why only a redraw
+    /// showed it.
+    #[test]
+    fn visible_width_ignores_ansi_escapes_in_the_prompt() {
+        let styled = "\x1b[36m❯\x1b[0m ";
+        assert_eq!(visible_width(styled), 2, "two painted cells, not nine");
+        // The naive measure is what used to be used, and it is off by exactly seven.
+        let naive: usize = styled.chars().map(|c| c.width().unwrap_or(0)).sum();
+        assert_eq!(naive, 9);
+        assert_eq!(naive - visible_width(styled), 7, "the size of the gap that appeared");
+    }
+
+    #[test]
+    fn visible_width_handles_the_escape_forms_that_appear_in_practice() {
+        assert_eq!(visible_width("\x1b[1;4;97mtitle\x1b[0m"), 5, "multi parameter CSI");
+        assert_eq!(visible_width("\x1b[0Kx"), 1, "a non colour CSI still occupies nothing");
+        assert_eq!(visible_width("\x1b(Bx"), 1, "a two character escape");
+        assert_eq!(visible_width("\x1b[36m"), 0, "a bare escape paints nothing");
+        assert_eq!(visible_width("a\x1b[38;5;208mb"), 2, "text either side is counted");
+    }
+
+    #[test]
+    fn visible_prompt_keeps_only_the_last_visual_line() {
+        assert_eq!(visible_prompt("\n\x1b[36m❯\x1b[0m "), "\x1b[36m❯\x1b[0m ");
+        assert_eq!(visible_prompt("  "), "  ", "a continuation prompt has no newline");
+        assert_eq!(visible_prompt("a\nb\nc"), "c");
+    }
+
+    /// The whole point of the fix: with a styled prompt the geometry must match the two
+    /// cells actually painted, so a redraw puts the cursor back on the text.
+    #[test]
+    fn the_geometry_of_a_styled_prompt_matches_what_is_painted() {
+        let prompt = "\n\x1b[36m❯\x1b[0m ";
+        let cols = visible_width(visible_prompt(prompt));
+        assert_eq!(cols, 2);
+
+        let buf: Vec<char> = "hello".chars().collect();
+        // Five characters after a two cell prompt end at column 7, on row 0.
+        assert_eq!(row_col(cols, &buf, buf.len()), (0, 7));
+        // And after deleting one, at column 6, not 13.
+        let shorter: Vec<char> = "hell".chars().collect();
+        assert_eq!(row_col(cols, &shorter, shorter.len()), (0, 6));
+    }
+
+    #[test]
+    fn row_of_agrees_with_row_col() {
+        let buf: Vec<char> = "x".repeat(200).chars().collect();
+        for cursor in [0, 10, 79, 80, 199, 200] {
+            assert_eq!(row_of(2, &buf, cursor), row_col(2, &buf, cursor).0, "at {cursor}");
+        }
     }
 
     #[test]
@@ -461,9 +557,7 @@ mod tests {
     #[test]
     fn the_prompt_width_only_counts_the_last_visual_line() {
         // "\n❯ " puts the glyph on a fresh row, so only two cells share the cursor row.
-        let p = "\n❯ ";
-        let visible = p.rsplit('\n').next().unwrap();
-        assert_eq!(display_width(visible), 2);
+        assert_eq!(visible_width(visible_prompt("\n❯ ")), 2);
     }
 
     #[test]

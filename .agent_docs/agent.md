@@ -87,15 +87,23 @@ The rewind counts **real screen rows**, not newlines: `rows_consumed` adds `widt
 line, so a wrapped line does not leave debris. Counting newlines alone, as the reference did,
 breaks as soon as one line is longer than the terminal.
 
-**Widths are display widths.** `input.rs` measures with `unicode-width`, so a CJK or emoji
-character occupying two cells does not desynchronise the wrap arithmetic. The reference
-counted characters.
+**Widths are display widths, and escapes count for nothing.** `input.rs` measures with
+`unicode-width`, so a CJK or emoji character occupying two cells does not desynchronise the
+wrap arithmetic; the reference counted characters. It also measures through
+`visible_width`, which skips ANSI sequences. That second part was a bug I shipped: the
+prompt is `"\n\x1b[36m❯\x1b[0m "`, whose escape bytes were counted as printable, so
+`prompt_cols` was 9 instead of 2. Every repositioning then landed **seven columns too far
+right**. Plain typing takes a fast path that never repositions, so nothing showed until a
+redraw ran, and it surfaced as an unerasable gap after a backspace:
+`❯ abcd       XY`. Verified both ways on a pty.
 
-**The redraw invariant.** Every redraw takes `from` (the content cursor where the *physical*
-cursor currently sits) and `to` (where it must end up). Deriving the row from the buffer length
-instead would move up the wrong number of rows whenever the cursor is not at the end. The
-reference passed the old end when swapping in a history entry, which over scrolled after
-`Home` then `Up` on a wrapped line; the port passes the real cursor.
+**The redraw invariant.** Every redraw takes `from_row` (the screen row where the *physical*
+cursor currently sits) and `to` (the content cursor it must end up at). `from_row` is computed
+by the caller **before** mutating the buffer, because after an edit the widths have shifted
+while the terminal cursor has not moved: deriving it inside `redraw` from the new buffer is
+wrong whenever the edited characters have different widths. The reference passed the old end
+when swapping in a history entry, which over scrolled after `Home` then `Up` on a wrapped
+line, repainting one row too high and silently overwriting the output above.
 
 **No TTY means no editing.** `crossterm` raw mode fails on a pipe, so a non terminal stdin
 falls back to a plain line read. That is what makes the agent scriptable:
@@ -108,10 +116,36 @@ streaming accumulator is tested by feeding it chunk JSON directly, which covers 
 actually break in the wild: a name split across chunks, out of order indices, a missing call
 id, a trailing nameless delta, malformed arguments.
 
-The interactive path cannot be unit tested, so it is verified by driving a real pty. The driver
-waits for the prompt, types with a typo, fixes it with backspaces, submits, recalls the line
-with the up arrow, abandons it with Ctrl+C, then asks for markdown and checks the rendered
-escapes. That is how both spinner bugs were found.
+The interactive path cannot be unit tested: a wrong prompt width still passes every assertion
+about the width function, because the mistake is at the call site. `scripts/pty_check.py`
+drives the real binary through a pty, applies its output to a small virtual screen, and reads
+back what a human would see. It is self contained: it starts a server on an ephemeral port in
+a temp directory, mints its own token, runs the agent with its cwd inside that directory, and
+seeds `.agent_history/readline.txt` so the recall checks never submit a line and never need a
+working LLM key.
+
+```bash
+cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
+```
+
+Eleven checks: backspace leaving no gap, typing resuming on the text, `Ctrl+U` killing back to
+the cursor, `Ctrl+A` then `Ctrl+K`, insert and backspace mid line, a wrapped line staying
+intact, backspace across the wrap, recall with the cursor on the first row of a wrapped line,
+the recall staying on its own screen row, `Down` restoring the stashed line, and plain recall.
+
+Each check earns its place by failing when the corresponding bug is reintroduced, which was
+verified by putting each one back:
+
+| Reintroduced bug | Caught by |
+|---|---|
+| prompt width counting ANSI escapes | `typing resumes on the text`, `a wrapped line is intact` |
+| `from_row` measured from the old end | `the recall stays on its own row` |
+
+The second one is worth noting: the repainted **text** is correct, it just sits one row too
+high, so only pinning the absolute row catches it. Checking the input area alone passes.
+
+The spinner bugs were found the same way, by watching a driven pty session rather than by the
+test suite.
 
 Manual smoke test, both stdin modes:
 

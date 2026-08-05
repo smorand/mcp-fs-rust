@@ -144,6 +144,13 @@ printf 'Liste mes projets.\nexit\n' | ./target/release/agent --user you
 `.agent_keys/` (bearer tokens) and `.agent_history/` (transcripts) are gitignored. See
 [`.agent_docs/agent.md`](.agent_docs/agent.md) for the terminal invariants it relies on.
 
+The line editor is verified on a real pty, because terminal geometry bugs pass every unit
+test: a wrong prompt width is a mistake at the call site, not in the width function.
+
+```bash
+cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
+```
+
 ## Parity harness
 
 The objective judge of 1:1 parity. It replays a corpus of MCP and REST calls against a

@@ -25,6 +25,7 @@ cargo clippy --all-targets -- -D warnings      quality gate, must be clean
 mcp-fs serve | keys | token | version
 cargo run -p parity-harness -- capture|compare  the 1:1 parity judge
 ./agent.sh --user <name>              interactive CLI agent against a running server
+python3 scripts/pty_check.py          agent line editor checks on a real pty
 ```
 
 ## Project structure
