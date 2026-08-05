@@ -66,6 +66,8 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         git:      config.git.enabled,
         web:      config.web.enabled,
         context7: config.context7.enabled,
+        sqlite:   config.sqlite.enabled,
+        db:       config.db.enabled,
     };
     crate::tools::register_all(&mut registry, &features, &config);
 

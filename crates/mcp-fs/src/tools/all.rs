@@ -9,6 +9,8 @@ pub struct EnabledFeatures {
     pub git: bool,
     pub web: bool,
     pub context7: bool,
+    pub sqlite: bool,
+    pub db: bool,
 }
 
 /// Register every tool: the fs.* families, then admin.*, then the optional families.
@@ -28,6 +30,12 @@ pub fn register_all(
     }
     if features.context7 {
         super::context7::register(reg, &config.context7);
+    }
+    if features.sqlite {
+        super::sqlite::register(reg, &config.sqlite);
+    }
+    if features.db {
+        super::db::register(reg, &config.db);
     }
 }
 
@@ -62,13 +70,23 @@ mod tests {
     #[test]
     fn web_and_context7_tools_register_when_enabled() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: false, web: true, context7: true };
+        let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 33 fs + 8 admin + 5 web + 2 context7 = 48
         assert_eq!(reg.len(), 48);
         assert!(reg.resolve("web.search").is_some());
         assert!(reg.resolve("context7.resolve_library_id").is_some());
+    }
+
+    #[test]
+    fn all_features_enabled_count() {
+        let mut reg = ToolRegistry::new();
+        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true };
+        let config = crate::config::ServerConfig::default();
+        super::register_all(&mut reg, &features, &config);
+        // 33 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 75
+        assert_eq!(reg.len(), 75);
     }
 
     /// Whole surface parity gate for the 22 tools of this agent: every `admin.*`,

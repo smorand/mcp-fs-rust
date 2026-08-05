@@ -18,6 +18,7 @@
 pub mod admin;
 pub mod all;
 pub mod context7;
+pub mod db;
 pub mod document;
 pub mod edit;
 pub mod git;
@@ -27,6 +28,7 @@ pub mod listing;
 pub mod metadata;
 pub mod read;
 pub mod search;
+pub mod sqlite;
 pub mod web;
 pub mod write;
 
@@ -149,6 +151,36 @@ pub(crate) mod testkit {
 
         let mut registry = ToolRegistry::new();
         super::register_fs(&mut registry);
+
+        let state = Arc::new(AppState {
+            config: config.clone(),
+            admin,
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
+            safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
+            identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+            registry: Arc::new(registry),
+        });
+        Harness { _dir: dir, state }
+    }
+
+    /// Harness with extra registrations applied after the default `register_fs`.
+    pub async fn harness_with_extra(
+        extra: impl FnOnce(&mut ToolRegistry, &crate::config::ServerConfig),
+    ) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.infra.meta.dir = dir.path().join("volumes").display().to_string();
+        config.infra.blob.dir = dir.path().join("blobs").display().to_string();
+        config.auth.jwt.public_key_path = String::new();
+        let config = Arc::new(config);
+
+        let admin = Arc::new(crate::storage::admin::SqliteAdminStore::in_memory().unwrap());
+        admin.connect().await.unwrap();
+        admin.create_project(MOUNT, PERSON).await.unwrap();
+
+        let mut registry = ToolRegistry::new();
+        super::register_fs(&mut registry);
+        extra(&mut registry, &config);
 
         let state = Arc::new(AppState {
             config: config.clone(),

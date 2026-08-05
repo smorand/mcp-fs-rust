@@ -279,6 +279,38 @@ impl Default for Context7Config {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqliteConfig {
+    pub enabled: bool,
+    /// Maximum rows returned by sqlite.query (hard cap: 10 000).
+    pub max_result_rows: usize,
+    /// Per-statement wall-clock timeout in seconds.
+    pub statement_timeout_secs: u64,
+}
+
+impl Default for SqliteConfig {
+    fn default() -> Self {
+        Self { enabled: false, max_result_rows: 1_000, statement_timeout_secs: 30 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DbConfig {
+    pub enabled: bool,
+    /// Maximum rows returned by db.query / db.sample (hard cap: 10 000).
+    pub max_result_rows: usize,
+    /// Refuse files larger than this (bytes). Default 100 MiB.
+    pub max_file_bytes: usize,
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self { enabled: false, max_result_rows: 1_000, max_file_bytes: 100 * 1024 * 1024 }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -291,6 +323,8 @@ pub struct ServerConfig {
     pub git: GitConfig,
     pub web: WebConfig,
     pub context7: Context7Config,
+    pub sqlite: SqliteConfig,
+    pub db: DbConfig,
 }
 
 impl ServerConfig {

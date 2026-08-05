@@ -50,6 +50,12 @@ pub enum Command {
         /// Force context7.enabled = true (overrides config YAML).
         #[arg(long)]
         context7: bool,
+        /// Force sqlite.enabled = true (overrides config YAML).
+        #[arg(long)]
+        sqlite: bool,
+        /// Force db.enabled = true (overrides config YAML).
+        #[arg(long)]
+        db: bool,
     },
     /// Generate an RS256 keypair (jwt.key private, jwt.pub public).
     Keys {
@@ -92,7 +98,7 @@ pub async fn run() -> ExitCode {
 
 /// Run an already parsed CLI. Split out so tests can drive it without a process.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command.unwrap_or(Command::Serve { config: None, git: false, web: false, context7: false }) {
+    match cli.command.unwrap_or(Command::Serve { config: None, git: false, web: false, context7: false, sqlite: false, db: false }) {
         Command::Version => {
             println!("{}", crate::app::VERSION);
             Ok(())
@@ -101,7 +107,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Token { email, key, issuer, claim, ttl } => {
             cmd_token(&email, key.as_deref(), &issuer, &claim, ttl)
         }
-        Command::Serve { config, git, web, context7 } => cmd_serve(config.as_deref(), git, web, context7).await,
+        Command::Serve { config, git, web, context7, sqlite, db } => cmd_serve(config.as_deref(), git, web, context7, sqlite, db).await,
     }
 }
 
@@ -128,13 +134,15 @@ fn cmd_token(
     Ok(())
 }
 
-async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool) -> anyhow::Result<()> {
+async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool, sqlite: bool, db: bool) -> anyhow::Result<()> {
     crate::logging::init();
     let resolved = resolve_config_path(explicit);
     let mut config = ServerConfig::load(&resolved)?;
     if git      { config.git.enabled = true; }
     if web      { config.web.enabled = true; }
     if context7 { config.context7.enabled = true; }
+    if sqlite   { config.sqlite.enabled = true; }
+    if db       { config.db.enabled = true; }
     // The banner goes to stderr so it never pollutes a piped stdout.
     eprintln!(
         "Serving mcp-fs {} on {}:{} (config={})",
@@ -248,6 +256,17 @@ mod tests {
                 }
                 other => panic!("expected serve, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn serve_accepts_sqlite_and_db_flags() {
+        match Cli::parse_from(["mcp-fs", "serve", "--sqlite", "--db"]).command {
+            Some(Command::Serve { sqlite, db, .. }) => {
+                assert!(sqlite);
+                assert!(db);
+            }
+            other => panic!("expected serve, got {other:?}"),
         }
     }
 

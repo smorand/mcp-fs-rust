@@ -77,6 +77,11 @@ async-trait = "0.1"
 futures = "0.3"
 tempfile = "3"
 
+# ── analytics ─────────────────────────────────────────────────────────────────
+datafusion = { version = "43", features = ["parquet"] }
+arrow = "53"
+parquet = { version = "53", features = ["arrow"] }
+
 # ── document extraction / code symbols (docs module) ───────────────────────────
 pdf-extract = "0.12"
 quick-xml = "0.41"
