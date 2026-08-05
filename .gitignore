@@ -25,3 +25,7 @@ config/local.yaml
 .agent_keys/
 # Conversation transcripts and readline history from ./agent.sh.
 .agent_history/
+# Server logs written by ./agent.sh when it starts the server itself.
+mcp_*.log
+# Byte cache from importing scripts/pty_check.py as a module.
+__pycache__/

@@ -125,13 +125,17 @@ The suite is the quality gate and must be green before any commit.
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash
-./run.sh &                                                  # server on :5002
 mkdir -p .agent_keys
 ./target/release/mcp-fs token you@example.com \
     --key .keys/jwt.key > .agent_keys/you                   # one raw JWT per file
 export IBM_ICA_MODEL_KEY=...                                # or put it in .env
 ./agent.sh --user you
 ```
+
+`agent.sh` starts the server itself when nothing answers on the configured endpoint, logging
+to `mcp_<datetime>.log`, and stops it again when the agent exits. A server that was already
+running is left alone. A watchdog keyed on the agent's pid covers the case where the wrapper
+is killed outright.
 
 Configured by `config/agent_test.yaml`: MCP endpoint, token directory, and any OpenAI
 compatible chat endpoint. `--conversation ID` resumes a transcript, `/help` lists the

@@ -35,6 +35,12 @@ struct Cli {
     /// Resume, or create, a named conversation.
     #[arg(long)]
     conversation: Option<String>,
+    /// Print the resolved MCP endpoint and exit.
+    ///
+    /// This exists so `agent.sh` can find the endpoint without reimplementing the config
+    /// resolution and a YAML parse in shell, where both would silently drift.
+    #[arg(long)]
+    print_mcp_url: bool,
 }
 
 const DIM: &str = "\x1b[2m";
@@ -60,6 +66,13 @@ async fn run() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(default_config_path);
     let cfg = AgentConfig::load(&config_path)
         .with_context(|| format!("cannot load config, looked for {}", config_path.display()))?;
+
+    // Answered before anything else: no token, no key and no server are needed to report
+    // which endpoint the config names.
+    if cli.print_mcp_url {
+        println!("{}", cfg.mcp.url);
+        return Ok(());
+    }
 
     // History lives beside the working directory, so different checkouts stay separate.
     let history_dir = std::env::current_dir()?.join(".agent_history");

@@ -5,18 +5,51 @@ not part of the server: it speaks MCP over HTTP to whatever endpoint the config 
 exercises the real wire protocol the way any other client would. That is the point, it is the
 end to end test of the tool surface.
 
-Run it with `./agent.sh` (sources `.env`, builds release, execs the binary).
+Run it with `./agent.sh`, which sources `.env`, builds, **starts the server if nothing is
+listening**, and stops that server again when the agent exits.
 
 ## Setup
 
 ```bash
-./run.sh &                                                  # server on :5002
 mkdir -p .agent_keys
 ./target/release/mcp-fs token you@example.com \
     --key .keys/jwt.key > .agent_keys/you                   # one raw JWT per file
 export IBM_ICA_MODEL_KEY=...                                # or put it in .env
-./agent.sh --user you
+./agent.sh --user you                                       # starts the server if needed
 ```
+
+## Server lifecycle in `agent.sh`
+
+The endpoint comes from `agent --print-mcp-url`, so `--config` and `$AGENT_CONFIG` are
+honoured and there is no second YAML parser in shell to drift out of step. The script probes
+`/health` at that host and port, which needs no bearer and proves the HTTP server answers
+rather than merely that the port is held.
+
+| Situation | Behaviour |
+|---|---|
+| Something answers already | left alone, it belongs to whoever started it |
+| Nothing answers | bootstrap `config/local.yaml` and `.keys` like `run.sh`, start `mcp-fs serve` in the background logging to `mcp_<datetime>.log`, wait for `/health` |
+| Started but never answers | print the reason and the tail of the log, then exit non zero, having stopped it |
+| Agent exits, crashes, Ctrl+C, terminal closed | the EXIT trap stops the server (SIGTERM, then SIGKILL after five seconds) |
+| The wrapper itself is SIGKILLed | a watchdog on the AGENT's pid stops the server once the agent ends |
+
+Three details are load bearing:
+
+**Only the server we started is stopped.** `SERVER_PID` stays empty when the probe succeeded,
+so a session against a server from `./run.sh` cannot take it down.
+
+**The watchdog watches the agent, not the wrapper.** A `SIGKILL` on the wrapper leaves no
+chance to run a trap, so a detached watcher keyed on the agent's pid closes that hole. Keying
+it on the wrapper would be worse than the leak: it would tear the server down under a session
+that is still alive and still using it. Verified by killing the wrapper with `-9`, confirming
+the session survives, then killing the agent and watching the server go.
+
+**`<&0` on the agent is not decoration.** The agent runs in the background only so the
+watchdog knows its pid, and a non interactive shell points an asynchronous job's stdin at
+`/dev/null` unless a redirection says otherwise. Without `<&0` the line editor has no
+terminal: measured directly, `isatty` is false and `tcsetattr` fails with
+`Operation not supported by device`. The editor is re verified through the wrapper, not only
+against the binary.
 
 `.agent_keys/` and `.agent_history/` are gitignored: the first holds bearer tokens, the
 second holds transcripts.

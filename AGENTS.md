@@ -24,7 +24,7 @@ git2 (libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap
 cargo clippy --all-targets -- -D warnings      quality gate, must be clean
 mcp-fs serve | keys | token | version
 cargo run -p parity-harness -- capture|compare  the 1:1 parity judge
-./agent.sh --user <name>              interactive CLI agent against a running server
+./agent.sh --user <name>              interactive CLI agent; starts/stops the server if needed
 python3 scripts/pty_check.py          agent line editor checks on a real pty
 ```
 
