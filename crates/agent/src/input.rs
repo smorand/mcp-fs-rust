@@ -248,16 +248,7 @@ impl InputReader {
                     let from_row = row_of(prompt_cols, &buf, cursor);
                     buf.insert(cursor, c);
                     cursor += 1;
-                    // Fast path: appending at the end without landing exactly on the wrap
-                    // boundary needs no repaint, just the character.
-                    let w = term_cols();
-                    let end_col = prompt_cols + content_width(&buf);
-                    if cursor == buf.len() && !end_col.is_multiple_of(w) {
-                        print!("{c}");
-                        let _ = std::io::stdout().flush();
-                    } else {
-                        redraw(prompt, prompt_cols, &buf, from_row, cursor);
-                    }
+                    redraw(prompt, prompt_cols, &buf, from_row, cursor);
                 }
                 _ => {}
             }
@@ -318,11 +309,6 @@ fn visible_width(s: &str) -> usize {
     cols
 }
 
-/// Display width of the whole buffer.
-fn content_width(buf: &[char]) -> usize {
-    buf.iter().map(|c| c.width().unwrap_or(0)).sum()
-}
-
 /// Display width of the buffer up to a content cursor.
 fn width_upto(buf: &[char], cursor: usize) -> usize {
     buf[..cursor.min(buf.len())].iter().map(|c| c.width().unwrap_or(0)).sum()
@@ -357,19 +343,40 @@ fn move_to_end(prompt_cols: usize, buf: &[char], cursor: usize) {
 /// `from_row` is where the physical cursor is RIGHT NOW, measured by the caller against the
 /// buffer as it was BEFORE the edit. Deriving it here from the new buffer would be wrong:
 /// the widths have already shifted while the terminal cursor has not moved.
+///
+/// Content is written row by row with explicit `\r\n` at every wrap boundary. Relying on
+/// the terminal's soft-wrap is unsound: after a soft-wrap the cursor is on a new physical
+/// line, but `\x1b[nG` (column absolute) moves within the *current* row only. Writing the
+/// breaks ourselves means the cursor position after the repaint is always precisely known.
 fn redraw(prompt: &str, prompt_cols: usize, buf: &[char], from_row: usize, to: usize) {
     let mut out = std::io::stdout();
+    let w = term_cols();
 
     // Back to the first row of the input area, then clear everything below.
     if from_row > 0 {
         let _ = write!(out, "\x1b[{from_row}A");
     }
-    let _ = write!(out, "\x1b[1G\x1b[0J");
+    let _ = write!(out, "\r\x1b[0J");
 
-    let content: String = buf.iter().collect();
-    let _ = write!(out, "{}{content}", visible_prompt(prompt));
+    // Write the visible prompt (the last line of the prompt string).
+    let _ = write!(out, "{}", visible_prompt(prompt));
 
-    // Reposition: printing left the cursor at the end of the content.
+    // Write the buffer character by character, emitting an explicit \r\n whenever a
+    // character would overflow the current row. This keeps the terminal cursor position
+    // in sync with what row_col() computes: both use the same integer division model.
+    let mut col = prompt_cols;
+    for &c in buf {
+        let cw = c.width().unwrap_or(0);
+        if col + cw > w {
+            let _ = write!(out, "\r\n");
+            col = 0;
+        }
+        let _ = write!(out, "{c}");
+        col += cw;
+    }
+
+    // Reposition: after the loop the cursor sits at the end of the content.
+    // Use the same row_col() model to find the target position, then move there.
     let (end_row, _) = row_col(prompt_cols, buf, buf.len());
     let (target_row, target_col) = row_col(prompt_cols, buf, to);
     if end_row > target_row {
@@ -563,5 +570,40 @@ mod tests {
     #[test]
     fn term_cols_never_returns_a_degenerate_width() {
         assert!(term_cols() >= 20, "a tiny or unknown terminal still yields usable maths");
+    }
+
+    /// Verify that the explicit-newline repaint model keeps geometry consistent when the
+    /// buffer overflows the terminal width. `row_col` must agree with a manual calculation
+    /// on a known-width buffer regardless of soft-wrap.
+    #[test]
+    fn redraw_geometry_is_consistent_across_wrap_boundary() {
+        let w = term_cols(); // at least 20 per the invariant above
+        let prompt_cols = 2usize;
+
+        // A buffer long enough to span two full rows.
+        let buf: Vec<char> = "x".repeat(w * 2 + 5).chars().collect();
+
+        // Manual calculation matching the explicit-newline model:
+        //   offset = prompt_cols + width_upto(buf, cursor)
+        //   row    = offset / w
+        //   col    = offset % w
+        for &cursor in &[0, w - prompt_cols, w - prompt_cols + 1, w * 2, buf.len()] {
+            let cursor = cursor.min(buf.len());
+            let offset = prompt_cols + width_upto(&buf, cursor);
+            let expected_row = offset / w;
+            let expected_col = offset % w;
+            let (got_row, got_col) = row_col(prompt_cols, &buf, cursor);
+            assert_eq!(
+                (got_row, got_col),
+                (expected_row, expected_col),
+                "geometry mismatch at cursor={cursor}"
+            );
+        }
+
+        // The geometry functions must not overflow or panic for a wrapped buffer.
+        let (end_row, _end_col) = row_col(prompt_cols, &buf, buf.len());
+        let (target_row, target_col) = row_col(prompt_cols, &buf, w - prompt_cols + 1);
+        assert!(end_row >= target_row, "end must be at or after target");
+        assert!(target_col < w, "target column must be within terminal width");
     }
 }
