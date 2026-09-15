@@ -95,15 +95,17 @@ impl OAuthTokenStore {
     /// The composition root entry point: persistent when `MCPFS_TOKEN_KEY` is set
     /// and decodes to 32 bytes, memory only otherwise. A malformed key is an error
     /// rather than a silent downgrade, so a typo cannot quietly lose tokens.
-    pub async fn from_env(config: &ServerConfig) -> Result<Self> {
+    /// Takes the process wide registry rather than building one: on a server
+    /// backend the persistence holds its pool open for the life of the store, so a
+    /// private registry here would be a second pool against the configured budget.
+    pub async fn from_env(
+        config: &ServerConfig,
+        registry: &crate::storage::RelationalRegistry,
+    ) -> Result<Self> {
         match std::env::var(TOKEN_KEY_ENV) {
             Ok(raw) if !raw.trim().is_empty() => {
                 let k = cipher::decode_key(&raw)?;
-                // The registry is local: this runs once at startup, so there is
-                // no pool to share with a later caller.
-                let registry = crate::storage::RelationalRegistry::new();
-                let p =
-                    crate::storage::build_oauth_persistence(config, &registry, k).await?;
+                let p = crate::storage::build_oauth_persistence(config, registry, k).await?;
                 Self::with_persistence(p).await
             }
             _ => Ok(Self::new()),
@@ -359,7 +361,8 @@ mod tests {
         c.infra.meta.dir = dir.path().join("state/volumes").display().to_string();
         // The env var is process wide, so assert on the absent case only when unset.
         if std::env::var(TOKEN_KEY_ENV).is_err() {
-            let s = OAuthTokenStore::from_env(&c).await.unwrap();
+            let reg = crate::storage::RelationalRegistry::new();
+            let s = OAuthTokenStore::from_env(&c, &reg).await.unwrap();
             assert!(!s.is_persistent());
             assert!(!dir.path().join("state/oauth.db").exists());
         }

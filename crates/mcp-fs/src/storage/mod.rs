@@ -51,6 +51,24 @@ impl RelationalRegistry {
         Self::default()
     }
 
+    /// How many distinct engine handles are cached.
+    ///
+    /// Exists so a test can prove that the whole process shares one pool per DSN:
+    /// counting is the only externally visible difference between one shared
+    /// registry and several private ones, since each private one would cache the
+    /// same target separately.
+    #[cfg(any(feature = "postgres", feature = "sqlserver"))]
+    pub async fn pool_count(&self) -> usize {
+        self.shared.lock().await.len()
+    }
+
+    /// Always 0 without a SQL driver: nothing is ever cached, so there is no pool
+    /// to count and callers do not need to be feature gated themselves.
+    #[cfg(not(any(feature = "postgres", feature = "sqlserver")))]
+    pub async fn pool_count(&self) -> usize {
+        0
+    }
+
     /// A stable key for one connection target.
     ///
     /// The DSN is hashed rather than stored: a map key is easy to print by
@@ -66,6 +84,14 @@ impl RelationalRegistry {
         h.update(schema.as_bytes());
         format!("{backend}:{:x}", h.finalize())
     }
+}
+
+/// A private pool cache, for a test that builds one store directly and does not care
+/// about sharing. Production code takes the process wide registry from the
+/// composition root instead, which is what keeps the connection count honest.
+#[cfg(test)]
+pub(crate) fn test_registry() -> Arc<RelationalRegistry> {
+    Arc::new(RelationalRegistry::new())
 }
 
 /// Open, or reuse, the relational engine one store block points at.
@@ -367,17 +393,22 @@ pub async fn build_oauth_persistence(
 pub struct StoreManager {
     config: Arc<ServerConfig>,
     clients: Mutex<HashMap<String, Arc<VolumeClient>>>,
-    /// Shared so every volume of one SQL deployment reuses a single pool.
-    registry: RelationalRegistry,
+    /// Handed in rather than created here, so the ACL store, every volume and the
+    /// git index all share one pool per DSN. Owning it would give this manager a
+    /// private pool, and the process would then open `max_connections` once per
+    /// owner while the operator configured that number once.
+    relational: Arc<RelationalRegistry>,
 }
 
 impl StoreManager {
-    pub fn new(config: Arc<ServerConfig>) -> Self {
-        Self {
-            config,
-            clients: Mutex::new(HashMap::new()),
-            registry: RelationalRegistry::new(),
-        }
+    pub fn new(config: Arc<ServerConfig>, relational: Arc<RelationalRegistry>) -> Self {
+        Self { config, clients: Mutex::new(HashMap::new()), relational }
+    }
+
+    /// The shared pool cache, so a caller that builds another relational consumer
+    /// can pass the same one instead of starting a second.
+    pub fn relational(&self) -> &Arc<RelationalRegistry> {
+        &self.relational
     }
 
     /// Get (or open) the client for a project.
@@ -386,7 +417,7 @@ impl StoreManager {
         if let Some(c) = guard.get(project_id) {
             return Ok(c.clone());
         }
-        let meta = build_meta_store(&self.config, &self.registry, project_id).await?;
+        let meta = build_meta_store(&self.config, &self.relational, project_id).await?;
         let blob = build_blob_store(&self.config, project_id)?;
         blob.ensure_bucket().await?;
         let client = Arc::new(VolumeClient::new(project_id, meta, blob));
@@ -430,7 +461,7 @@ impl StoreManager {
         // explicitly. Both tables go in one transaction: a half torn down volume
         // would leave refcounts referring to nodes that no longer exist.
         let db = build_relational_db(
-            &self.registry,
+            &self.relational,
             "meta",
             RelationalTarget {
                 backend: &self.config.infra.meta.backend,
@@ -466,10 +497,128 @@ mod tests {
         Arc::new(c)
     }
 
+    /// The pool cache is handed to every consumer rather than owned by one, so a
+    /// server that enables git does not open a second pool against the same DSN.
+    /// `max_connections` is configured once, so the process must honour it once.
+    #[tokio::test]
+    async fn one_registry_is_shared_by_the_store_manager_and_the_git_store() {
+        let d = tempfile::tempdir().unwrap();
+        let config = cfg(d.path());
+        let relational = Arc::new(RelationalRegistry::new());
+
+        // Exactly how the composition root wires them: one registry, cloned.
+        let stores = StoreManager::new(config.clone(), relational.clone());
+        let git = crate::git::repo::GitRepoStore::new(
+            config.clone(),
+            stores.relational().clone(),
+        );
+
+        assert!(
+            Arc::ptr_eq(&relational, stores.relational()),
+            "the store manager must use the registry it was handed, not a private one"
+        );
+        assert!(
+            Arc::ptr_eq(stores.relational(), git.relational()),
+            "the git index must share the pool cache the metadata stores use"
+        );
+    }
+
+    /// Guards the composition root itself. The signatures force a registry to be
+    /// passed, so the only way back to a second pool is to construct one at a call
+    /// site: this fails the moment `app.rs` grows another `RelationalRegistry::new`.
+    #[test]
+    fn the_composition_root_builds_exactly_one_registry() {
+        let app_rs = include_str!("../app.rs");
+        let built = app_rs.matches("RelationalRegistry::new(").count();
+        assert_eq!(
+            built, 1,
+            "app.rs must build one registry and thread it into every consumer, found {built}"
+        );
+    }
+
+    /// The rest of the serving path must never mint a registry either. `app.rs` is
+    /// covered above and `migrate.rs` is exempt because it is a one shot offline
+    /// command wiring two distinct databases. This caught a real second pool in the
+    /// OAuth token store, which is built lazily on first request, not at startup,
+    /// and then holds its pool for the life of the process.
+    #[test]
+    fn no_serving_module_builds_its_own_registry() {
+        // Every module that reaches a relational store outside the composition root.
+        let sources: [(&str, &str); 4] = [
+            ("git/oauth/store.rs", include_str!("../git/oauth/store.rs")),
+            ("tools/git_auth.rs", include_str!("../tools/git_auth.rs")),
+            ("tools/git.rs", include_str!("../tools/git.rs")),
+            ("git/repo.rs", include_str!("../git/repo.rs")),
+        ];
+        for (name, src) in sources {
+            // Test fixtures legitimately build private registries, so only count
+            // constructions outside the test module.
+            let production = src.split("mod tests").next().unwrap_or(src);
+            let built = production.matches("RelationalRegistry::new(").count();
+            assert_eq!(
+                built, 0,
+                "{name} must take the shared registry, not build one, found {built}"
+            );
+        }
+    }
+
+    /// The behavioural half of the sharing guarantee: one registry across the ACL
+    /// store, a volume's metadata and the git index opens ONE pool for one DSN,
+    /// where private registries would open one each. Skipped when no PostgreSQL is
+    /// reachable, so the default `cargo test` run needs no database.
+    #[tokio::test]
+    async fn one_dsn_yields_one_pool_across_every_consumer() {
+        let Ok(dsn) = std::env::var("MCPFS_TEST_PG_DSN") else {
+            eprintln!("skipping the pool sharing check: MCPFS_TEST_PG_DSN is unset");
+            return;
+        };
+        if !cfg!(feature = "postgres") {
+            eprintln!("skipping the pool sharing check: built without --features postgres");
+            return;
+        }
+
+        let d = tempfile::tempdir().unwrap();
+        let mut c = (*cfg(d.path())).clone();
+        // One DSN behind all three stores, which is the deployment this protects.
+        for store in [
+            &mut c.infra.meta.backend,
+            &mut c.infra.admin.backend,
+            &mut c.infra.git.backend,
+        ] {
+            *store = backend::POSTGRES.to_string();
+        }
+        c.infra.meta.dsn = Dsn::new(dsn.clone());
+        c.infra.admin.dsn = Dsn::new(dsn.clone());
+        c.infra.git.dsn = Dsn::new(dsn);
+        let config = Arc::new(c);
+
+        let shared = Arc::new(RelationalRegistry::new());
+        build_admin_store(&config, &shared).await.unwrap().connect().await.unwrap();
+        build_meta_store(&config, &shared, "poolshare").await.unwrap();
+        build_git_db(&config, &shared, "poolshare").await.unwrap();
+        assert_eq!(
+            shared.pool_count().await,
+            1,
+            "the ACL store, the volume metadata and the git index must reuse one pool"
+        );
+
+        // The contrast that makes the count above meaningful: give each consumer its
+        // own registry and the same work opens a pool per registry.
+        let private_a = Arc::new(RelationalRegistry::new());
+        let private_b = Arc::new(RelationalRegistry::new());
+        build_meta_store(&config, &private_a, "poolshare").await.unwrap();
+        build_git_db(&config, &private_b, "poolshare").await.unwrap();
+        assert_eq!(
+            private_a.pool_count().await + private_b.pool_count().await,
+            2,
+            "two registries must open two pools, otherwise the assertion above proves nothing"
+        );
+    }
+
     #[tokio::test]
     async fn client_is_cached_per_project() {
         let d = tempfile::tempdir().unwrap();
-        let m = StoreManager::new(cfg(d.path()));
+        let m = StoreManager::new(cfg(d.path()), test_registry());
         let a = m.client("proj").await.unwrap();
         let b = m.client("proj").await.unwrap();
         assert!(Arc::ptr_eq(&a, &b), "same client instance is reused");
@@ -479,7 +628,7 @@ mod tests {
     async fn provision_then_teardown_removes_state() {
         let d = tempfile::tempdir().unwrap();
         let config = cfg(d.path());
-        let m = StoreManager::new(config.clone());
+        let m = StoreManager::new(config.clone(), test_registry());
 
         m.provision_volume("proj").await.unwrap();
         let c = m.client("proj").await.unwrap();
@@ -581,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn volumes_are_isolated_from_each_other() {
         let d = tempfile::tempdir().unwrap();
-        let m = StoreManager::new(cfg(d.path()));
+        let m = StoreManager::new(cfg(d.path()), test_registry());
         let a = m.client("proj-a").await.unwrap();
         let b = m.client("proj-b").await.unwrap();
         a.write_text_atomic("/only-in-a.txt", "x").await.unwrap();

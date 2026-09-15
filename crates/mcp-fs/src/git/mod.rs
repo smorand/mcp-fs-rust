@@ -17,7 +17,7 @@
 //! use mcp_fs::git;
 //!
 //! let git_store = git::GitRepoStore::shared(state.config.clone());
-//! let tokens = git::OAuthTokenStore::from_env(&state.config)?;
+//! let tokens = git::OAuthTokenStore::from_env(&state.config, state.stores.relational())?;
 //! if state.config.git.enabled {
 //!     app = app.merge(git::http::router(state.clone(), git_store.clone()));
 //! }

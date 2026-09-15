@@ -191,9 +191,9 @@ mod tests {
         assert_eq!(names, vec![sha], "only the final blob should remain");
     }
 
-    /// The two character shard directory is part of the on-disk contract shared with
-    /// the C# implementation. A volume written by one must be readable by the other,
-    /// so this layout is asserted explicitly.
+    /// The two character shard directory is part of this project's on-disk contract:
+    /// an existing deployment's blobs must stay readable after an upgrade, so the
+    /// layout is asserted explicitly rather than left to the implementation.
     #[tokio::test]
     async fn on_disk_layout_is_sharded_by_first_two_chars() {
         let (d, s) = store();
@@ -204,7 +204,7 @@ mod tests {
         assert!(expected.exists(), "expected sharded path {}", expected.display());
         assert!(
             !d.path().join("mcpfs-test").join(sha).exists(),
-            "a flat layout would break compatibility with existing C# volumes"
+            "a flat layout would orphan the blobs of every existing deployment"
         );
         assert_eq!(s.get(sha, 0, None).await.unwrap(), b"hello");
     }

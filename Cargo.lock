@@ -3728,19 +3728,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "parity-harness"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

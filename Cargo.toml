@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mcp-fs", "crates/parity-harness", "crates/agent"]
+members = ["crates/mcp-fs", "crates/agent"]
 
 [workspace.package]
 version = "0.1.0"

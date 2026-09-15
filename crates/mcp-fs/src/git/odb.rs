@@ -3,9 +3,8 @@
 //! Git objects are stored in the volume's [`BlobBackend`] under the key
 //! `git:{sha}` holding the canonical git object bytes `{type} {len}\0{payload}`,
 //! with a `(hash, type, size)` row in [`RelationalGitDb`] used for `ForEach` and
-//! short sha (prefix) lookups. Byte for byte the same layout as the C#
-//! `Git/BlobBackedOdbBackend.cs`, so a volume written by either implementation is
-//! readable by the other.
+//! short sha (prefix) lookups. The key layout is a stable on disk contract, so an
+//! existing deployment's git objects stay readable across upgrades.
 //!
 //! # Deviation from the C#: no custom libgit2 ODB backend
 //!

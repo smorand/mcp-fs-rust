@@ -220,7 +220,7 @@ git.tags
   required: ['mount_id']
 
 
-=== EXACT RETURN SHAPES (captured from the running C# server) ===
+=== EXACT RETURN SHAPES (the contract this server keeps; sample values are illustrative) ===
 fs.write: {"path": "/a.txt", "bytes_written": 12, "overwritten": false, "diff": ""}
 fs.read: {"content": "1\thello\n2\tworld", "total_lines": 2, "truncated": false, "next_offset": null}
 fs.read_bytes: {"base64": "aGVsbG8Kd29ybGQK", "mime_type": "text/plain", "length": 12}

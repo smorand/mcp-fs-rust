@@ -342,7 +342,7 @@ mod tests {
         admin.add_member("proj-a", "Member@Example.com", "owner@example.com").await.unwrap();
         admin.create_project("proj-b", "other@example.com").await.unwrap();
 
-        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()));
+        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry());
         let a = stores.client("proj-a").await.unwrap();
         a.write_text_atomic("/dir/one.txt", "hello").await.unwrap();
         a.write_text_atomic("/dir/two.txt", "world").await.unwrap();
@@ -408,7 +408,7 @@ mod tests {
         let admin = crate::storage::build_admin_store(&from, &reg).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "o@e.com").await.unwrap();
-        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()));
+        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry());
         stores.client("proj").await.unwrap().write_text_atomic("/f.txt", "x").await.unwrap();
 
         let report = migrate(&from, &to).await.unwrap();
@@ -427,7 +427,7 @@ mod tests {
         let admin = crate::storage::build_admin_store(&from, &reg).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "o@e.com").await.unwrap();
-        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()));
+        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry());
         let c = stores.client("proj").await.unwrap();
         c.write_text_atomic("/a.txt", "a").await.unwrap();
         c.write_text_atomic("/b.txt", "b").await.unwrap();
@@ -471,7 +471,7 @@ mod tests {
         let admin = crate::storage::build_admin_store(&from, &reg).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "o@e.com").await.unwrap();
-        crate::storage::StoreManager::new(Arc::new(from.clone()))
+        crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry())
             .client("proj")
             .await
             .unwrap()
@@ -481,7 +481,7 @@ mod tests {
 
         migrate(&from, &to).await.unwrap();
 
-        let dst_stores = crate::storage::StoreManager::new(Arc::new(to.clone()));
+        let dst_stores = crate::storage::StoreManager::new(Arc::new(to.clone()), crate::storage::test_registry());
         let c = dst_stores.client("proj").await.unwrap();
         c.write_text_atomic("/new.txt", "new").await.unwrap();
         assert_eq!(c.read_text("/kept.txt").await.unwrap(), "kept");

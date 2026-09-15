@@ -9,7 +9,7 @@
 //! reached zero and the caller garbage collects it.
 
 use crate::errors::{Result, ToolError};
-use crate::storage::rel::dialect::{Assign, ColumnType, Upsert};
+use crate::storage::rel::dialect::{Assign, ColumnType, Dialect, Upsert};
 use crate::storage::rel::schema::{Column, Index, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
 use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow};
@@ -23,6 +23,33 @@ const VOLUME_ID_LEN: u32 = 64;
 /// Keyed because the primary key and the parent index both use a path. SQL Server
 /// cannot index unbounded text, so a length is required rather than optional.
 const PATH_LEN: u32 = 450;
+
+/// SQL Server caps a CLUSTERED index key at 900 bytes, and `NVARCHAR` costs 2 bytes
+/// per character, so the primary key `(volume_id, path)` has 450 characters to share.
+///
+/// The limit bites on the actual row, not on the declared widths: a 449 character
+/// path under a 9 character volume id built a 916 byte key and the server refused it
+/// with error 1946. So the column may be wider than any path this store will accept.
+const SQLSERVER_KEY_CHARS: usize = 900 / 2;
+
+/// `admin::validate_project_id` caps a project id at 32 characters, and the volume id
+/// IS the project id, so this is the worst case share of the key budget. Budgeting the
+/// worst case keeps the ceiling identical in every project: a path that fits in one
+/// volume must not be refused in another just because its name is longer.
+const MAX_VOLUME_ID_CHARS: usize = 32;
+
+/// The longest path that fits the primary key whatever the project id is called.
+///
+/// Deliberately below [`PATH_LEN`]: the column can hold more characters than a key
+/// entry can carry, and it is the key that fails. Public because
+/// [`max_path_len`] turns it into the caller facing limit, and the guard that rejects
+/// an over long path MUST derive from the same arithmetic as the schema.
+pub const MAX_PATH_CHARS: usize = SQLSERVER_KEY_CHARS - MAX_VOLUME_ID_CHARS;
+
+// The character budget must really fit 900 bytes. Checked at compile time because the
+// tempting mistake is to raise the budget as though a character cost one byte, and
+// that failure would otherwise appear only against a real SQL Server.
+const _: () = assert!(SQLSERVER_KEY_CHARS * 2 <= 900);
 /// A hex sha256 is 64 characters. Doubled, so a longer digest stays storable.
 const SHA_LEN: u32 = 128;
 
@@ -33,6 +60,49 @@ const NODE_COLS: [&str; 11] = [
     "volume_id", "path", "parent", "name", "kind", "size", "mode", "mtime", "ctime", "atime",
     "sha256",
 ];
+
+/// The longest path the metadata backend can store, when it has a limit at all.
+///
+/// Only SQL Server does: `path` is part of the primary key and of the `parent`
+/// index, and SQL Server cannot index unbounded text, so the column is
+/// `NVARCHAR(PATH_LEN)` there while SQLite and PostgreSQL take unbounded `TEXT`.
+/// Returning `None` for those two is deliberate: a PostgreSQL deployment must not
+/// inherit a restriction that only exists because of another engine.
+pub fn max_path_len(backend: &str) -> Option<usize> {
+    match backend {
+        crate::config::backend::SQLSERVER => Some(MAX_PATH_CHARS),
+        _ => None,
+    }
+}
+
+/// [`max_path_len`] for a store that already holds a dialect rather than the
+/// configured backend name. Same constant, so the two cannot disagree.
+fn max_path_len_for(dialect: Dialect) -> Option<usize> {
+    match dialect {
+        Dialect::SqlServer => Some(MAX_PATH_CHARS),
+        Dialect::Sqlite | Dialect::Postgres => None,
+    }
+}
+
+/// Refuse a path the `nodes` columns cannot hold.
+///
+/// `SafetyManager::ensure_path_fits` already rejects an over long path the caller
+/// supplied, but a move or a copy re-roots each descendant under a new prefix, so a
+/// destination that fits can still produce children that do not. This is the
+/// backstop on the computed form, at the one place every write funnels through.
+fn ensure_storable_path(dialect: Dialect, path: &str) -> Result<()> {
+    let Some(limit) = max_path_len_for(dialect) else {
+        return Ok(());
+    };
+    let len = path.chars().count();
+    if len <= limit {
+        return Ok(());
+    }
+    Err(ToolError::invalid_argument(format!(
+        "path is {len} characters but this backend allows at most {limit}: '{path}' would be \
+         created by re-rooting under a longer prefix, so choose a shorter destination"
+    )))
+}
 
 /// The tables this store owns.
 pub fn schema() -> SchemaSet {
@@ -396,6 +466,7 @@ impl MetaBackend for RelationalMetaStore {
         mode: i64,
     ) -> Result<Option<String>> {
         let dialect = self.db.dialect();
+        ensure_storable_path(dialect, path)?;
         let put_sql = self.put_node_sql();
         let volume = self.volume_id.clone();
         let path = path.to_string();
@@ -544,8 +615,9 @@ impl MetaBackend for RelationalMetaStore {
 
     async fn mkdirs(&self, path: &str, exist_ok: bool) -> Result<()> {
         let volume = self.volume_id.clone();
-        let path = path.to_string();
         let dialect = self.db.dialect();
+        ensure_storable_path(dialect, path)?;
+        let path = path.to_string();
         run_retrying(&*self.db, move |tx| {
             let (volume, path) = (volume.clone(), path.clone());
             Box::pin(async move {
@@ -563,8 +635,9 @@ impl MetaBackend for RelationalMetaStore {
 
     async fn mkdir(&self, path: &str) -> Result<()> {
         let volume = self.volume_id.clone();
-        let path = path.to_string();
         let dialect = self.db.dialect();
+        ensure_storable_path(dialect, path)?;
+        let path = path.to_string();
         run_retrying(&*self.db, move |tx| {
             let (volume, path) = (volume.clone(), path.clone());
             Box::pin(async move {
@@ -642,6 +715,11 @@ impl MetaBackend for RelationalMetaStore {
                     } else {
                         format!("{}{}", dst, &old[src.len()..])
                     };
+                    // A descendant grows by however much `dst` is longer than `src`, so
+                    // it can overflow the column even though `dst` itself fitted. The
+                    // whole rename is one transaction, so refusing here leaves the tree
+                    // untouched rather than half moved.
+                    ensure_storable_path(dialect, &new)?;
                     tx.execute(
                         &Query::new(
                             "UPDATE nodes SET path=?1, parent=?2, name=?3 \
@@ -670,6 +748,108 @@ mod tests {
 
     async fn store() -> RelationalMetaStore {
         RelationalMetaStore::in_memory("proj").await.unwrap()
+    }
+
+    /// Only SQL Server bounds a path, and both accessors must agree, since one
+    /// serves the safety guard and the other the store itself.
+    #[test]
+    fn the_path_ceiling_is_sqlserver_only_and_agrees_across_accessors() {
+        use crate::config::backend;
+        assert_eq!(max_path_len(backend::SQLSERVER), Some(MAX_PATH_CHARS));
+        // The ceiling must leave room for the longest project id inside the 900 byte
+        // clustered key, which is what SQL Server actually enforces.
+        assert_eq!(MAX_PATH_CHARS, 418);
+        // The volume budget must match the real project id cap, since the volume id IS
+        // the project id: if validation ever allowed a longer one, the key would grow.
+        let longest_ok = "p".repeat(MAX_VOLUME_ID_CHARS);
+        assert!(crate::storage::admin::validate_project_id(&longest_ok).is_ok());
+        let one_over = "p".repeat(MAX_VOLUME_ID_CHARS + 1);
+        assert!(
+            crate::storage::admin::validate_project_id(&one_over).is_err(),
+            "a project id longer than the budgeted worst case must be impossible"
+        );
+        assert_eq!(max_path_len(backend::SQLITE), None);
+        assert_eq!(max_path_len(backend::POSTGRES), None);
+
+        assert_eq!(max_path_len_for(Dialect::SqlServer), max_path_len(backend::SQLSERVER));
+        assert_eq!(max_path_len_for(Dialect::Sqlite), max_path_len(backend::SQLITE));
+        assert_eq!(max_path_len_for(Dialect::Postgres), max_path_len(backend::POSTGRES));
+    }
+
+    /// The backstop for a computed path. A move or a copy re-roots descendants, so a
+    /// destination that fits can still produce children that do not.
+    #[test]
+    fn the_store_refuses_a_computed_path_past_the_column_width() {
+        let limit = MAX_PATH_CHARS;
+        let at_limit = format!("/{}", "a".repeat(limit - 1));
+        let over = format!("/{}", "a".repeat(limit));
+
+        assert!(ensure_storable_path(Dialect::SqlServer, &at_limit).is_ok());
+        let e = ensure_storable_path(Dialect::SqlServer, &over).unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains(&format!("{}", limit + 1)));
+        assert!(e.message.contains("re-rooting"), "explains the cause: {}", e.message);
+
+        // An unbounded engine takes it, so the restriction stays where it belongs.
+        assert!(ensure_storable_path(Dialect::Sqlite, &over).is_ok());
+        assert!(ensure_storable_path(Dialect::Postgres, &over).is_ok());
+    }
+
+    /// A rename whose destination fits but whose descendants would not must fail as a
+    /// whole: the transaction is one unit, so the tree stays where it was.
+    #[tokio::test]
+    async fn a_rename_that_would_overflow_a_descendant_is_refused_live() {
+        let Ok(dsn) = std::env::var("MCPFS_TEST_MSSQL_DSN") else {
+            eprintln!("skipping the live path ceiling check: MCPFS_TEST_MSSQL_DSN is unset");
+            return;
+        };
+        if !cfg!(feature = "sqlserver") {
+            eprintln!("skipping the live path ceiling check: built without --features sqlserver");
+            return;
+        }
+        #[cfg(feature = "sqlserver")]
+        {
+            let db = crate::storage::rel::SqlServerRelationalDb::connect(
+                &dsn,
+                crate::storage::rel::PoolSettings {
+                    max_connections: 2,
+                    acquire_timeout: std::time::Duration::from_secs(10),
+                },
+            )
+            .await
+            .expect("connect to the test SQL Server");
+            let db: Arc<dyn RelationalDb> = Arc::new(db);
+            let s = RelationalMetaStore::open(db, &"p".repeat(MAX_VOLUME_ID_CHARS)).await.unwrap();
+            s.remove_subtree("/src").await.ok();
+            s.remove_subtree("/dst").await.ok();
+
+            // A path at the ceiling must round trip under the LONGEST project id, which
+            // is the case the arithmetic budgets for. This is what caught the original
+            // 450 character ceiling: it built a 916 byte key and SQL Server refused it.
+            let deep = format!("/{}", "a".repeat(MAX_PATH_CHARS - 1));
+            assert_eq!(deep.chars().count(), MAX_PATH_CHARS);
+            s.put_file(&deep, Some("shalimit"), 3, crate::storage::traits::MODE_FILE)
+                .await
+                .expect("a path at the ceiling must be storable");
+            assert!(s.get(&deep).await.unwrap().is_some(), "and readable back");
+            s.remove_subtree(&deep).await.unwrap();
+
+            // Now a short tree, moved under a prefix long enough to overflow a child.
+            let child = "/src/".to_string() + &"b".repeat(40);
+            s.put_file(&child, Some("shamove"), 3, crate::storage::traits::MODE_FILE)
+                .await
+                .unwrap();
+            let long_dst = format!("/{}", "d".repeat(MAX_PATH_CHARS - 20));
+            assert!(long_dst.chars().count() <= MAX_PATH_CHARS, "the destination fits");
+
+            let e = s.rename("/src", &long_dst).await.unwrap_err();
+            assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+            assert!(
+                s.get(&child).await.unwrap().is_some(),
+                "the refused rename must leave the tree untouched"
+            );
+            s.remove_subtree("/src").await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 # mcp-fs (Rust)
 
 ## Overview
-Rust port of the C# `mcp-fs`: a **streamable-HTTP MCP server** exposing a **simulated
+A **streamable-HTTP MCP server** exposing a **simulated
 multi-project filesystem** (55 tools: 33 `fs.*`, 8 `admin.*`, 11 `git.*`, 3 `git.auth*`),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/`. Ships with
@@ -11,9 +11,11 @@ Server state (metadata tree, ACL, git index, OAuth tokens) lives in a relational
 **SQLite** by default, **PostgreSQL** or **SQL Server** per store via config. Blob bytes
 stay in `infra.blob` (local or S3).
 
-Started as a strict 1:1 port of a C# implementation. **That parity constraint is retired**;
-this project has its own lifecycle. `TOOL_CONTRACT.txt` remains authoritative for tool
-names, parameters and descriptions. Details and the divergence record: `.agent_docs/parity.md`.
+Started as a strict 1:1 port of a C# implementation. **That is history**: the C# is not a
+reference, must not be read, and is diverging by design (it has no PostgreSQL support,
+which is not its target). This project's own tool contract is authoritative:
+`TOOL_CONTRACT.txt` for humans, `tool-contract-golden.json` machine checked on every test
+run. Lineage and design decisions: `.agent_docs/lineage.md`.
 
 Stack: Rust 2024, axum + tokio, rusqlite (bundled), sqlx (optional, PostgreSQL),
 tiberius-ng + bb8 (optional, SQL Server), aws-sdk-s3, jsonwebtoken + rsa, git2 (libgit2),
@@ -31,7 +33,8 @@ cargo clippy --all-targets --all-features -- -D warnings   quality gate, must be
 mcp-fs serve | keys | token | migrate | version
 mcp-fs migrate --from a.yaml --to b.yaml  offline copy of relational state between backends
 docker compose -f docker-compose.test.yml up -d  postgres + mssql for the opt-in suites
-cargo run -p parity-harness -- capture|compare  regression corpus, no longer a gate
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
+                                      regenerate the frozen tool contract, then review the diff
 ./agent.sh --user <name>              interactive CLI agent; starts/stops the server if needed
 python3 scripts/pty_check.py          agent line editor checks on a real pty
 ```
@@ -41,7 +44,7 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
 - `app.rs` : axum Router assembly, shared state, the MCP endpoint, `/health`.
 - `mcp/` : the hand-rolled MCP layer. `mod.rs` (JSON-RPC + SSE framing, result/error helpers),
   `registry.rs` (name -> schema + handler, dot/underscore tolerant resolve), `schema.rs`
-  (declarative builder reproducing the C# JSON Schema exactly), `args.rs` (typed, tolerant
+  (declarative builder emitting the frozen JSON Schema exactly), `args.rs` (typed, tolerant
   argument accessors).
 - `config.rs` : full `ServerConfig` + `${VAR}` expansion + `Dsn` (redacts in Debug and
   Display) + boot validation of every `infra.*` store.
@@ -66,21 +69,23 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
 - `git/` : `db.rs` (SQLite index), `odb.rs` (objects in the blob store under `git:{sha}`),
   `repo.rs` (per project repository + write lock), `http/` (pkt-line, upload-pack,
   receive-pack), `oauth/` (store, AES-GCM cipher, encrypted persistence, device flow).
-- `crates/parity-harness/` : differential tester (`corpus.rs`, `normalize.rs`).
 - `crates/agent/` : the interactive CLI agent (an MCP **client**, not part of the server).
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 55 tool schemas and return shapes captured from the LIVE C#
-  server. **This is the authoritative contract**; it beats reading the C# source.
-- `parity-golden.json` : captured C# baseline for the harness.
+- `TOOL_CONTRACT.txt` : the 55 tool schemas and return shapes, human readable. **This is
+  the authoritative contract.**
+- `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
+  every name, description and `inputSchema` against it, serialized, so a reordered schema
+  key fails too. Never hand edited: regenerate with `MCPFS_REWRITE_TOOL_CONTRACT=1` and
+  review the diff (`tools/contract_golden.rs`).
 
 ## Conventions
 - `mount_id` is a required parameter on every `fs.*` and `git.*` tool. Errors are
   `ToolError::<code>(msg)` carrying a stable `ERR_*`.
-- Tool parameter names are snake_case so the generated JSON schema matches the C#.
-  Parameter descriptions are the LLM-facing docs and are compared for parity: copy them
-  verbatim from `TOOL_CONTRACT.txt`.
+- Tool parameter names are snake_case, which is what the generated JSON schema exposes.
+  Parameter descriptions are the LLM-facing docs and are frozen: copy them verbatim from
+  `TOOL_CONTRACT.txt`, and treat any edit as a deliberate contract change.
 - Every `fs.*`/`git.*` handler: `state.authorize(mount_id, person)` first, then normalize
   every path through `state.safety.normalize_path`, then call the engine in `core::fs_ops`.
   Never reimplement an operation in the tool layer, and never in `api/dataplane.rs`
@@ -118,14 +123,14 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
 must both be clean before any commit. `--all-features` matters: without it the two
 optional drivers are never compiled.
 
-## Deliberate divergences from the C#
-Parity is retired, so these are simply current behaviour; each is documented at its call
-site and recorded in `.agent_docs/parity.md`: `unpack ok` in the push report, membership
-enforced on git routes, `max_pack_size_mb` enforced, pushed objects really indexed, no
-custom libgit2 ODB backend (blob store is the source of truth, bytes identical),
-`ERR_NOT_SUPPORTED` for an unsupported extraction format, numbered list markers kept in
-generated docx, plus the two schema changes parity had blocked: `volume_id` multi tenancy
-and dialect binary typing for the OAuth token.
+## Behaviour worth knowing
+Each is documented at its call site and recorded in `.agent_docs/lineage.md`: `unpack ok`
+in the push report, membership enforced on git routes, `max_pack_size_mb` enforced, pushed
+objects really indexed, no custom libgit2 ODB backend (blob store is the source of truth,
+bytes identical), `ERR_NOT_SUPPORTED` for an unsupported extraction format, numbered list
+markers kept in generated docx, `volume_id` multi tenancy, dialect binary typing for the
+OAuth token, and `TextKey(n)` bounded keys (SQL Server cannot index `NVARCHAR(MAX)`, so
+keyed text has a length ceiling there).
 
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
@@ -133,7 +138,8 @@ and dialect binary typing for the OAuth token.
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, OAuth.
 - `.agent_docs/config.md` : full YAML schema, backends and dsn, resolution order, secrets.
-- `.agent_docs/backends.md` : the relational layer, adding a backend, dialect checklist.
+- `.agent_docs/backends.md` : the relational layer, adding a backend, dialect checklist,
+  and the SQL Server driver decision record (read before touching `rel/sqlserver.rs`).
 - `.agent_docs/testing.md` : test layout, PostgreSQL/SQL Server and MinIO opt-in suites.
-- `.agent_docs/parity.md` : the C# lineage, why parity is retired, the divergence record.
+- `.agent_docs/lineage.md` : the C# lineage, why it is no longer a reference, design decisions.
 - `.agent_docs/agent.md` : the CLI agent, its config, and the terminal invariants it depends on.

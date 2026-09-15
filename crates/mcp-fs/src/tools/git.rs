@@ -307,7 +307,9 @@ async fn authorize(
     injected: Option<Arc<GitRepoStore>>,
 ) -> Result<Arc<GitRepoStore>> {
     ctx.state.authorize(mount_id, &ctx.person).await?;
-    Ok(injected.unwrap_or_else(|| GitRepoStore::shared(ctx.state.config.clone())))
+    Ok(injected.unwrap_or_else(|| {
+        GitRepoStore::shared(ctx.state.config.clone(), ctx.state.stores.relational().clone())
+    }))
 }
 
 /// Authorize, require `git.init` to have run, and open the repository.
@@ -687,7 +689,11 @@ async fn remote_clone(
         Some(p) => {
             let store = match tokens {
                 Some(t) => t,
-                None => super::git_auth::token_store(&ctx.state.config).await?,
+                None => super::git_auth::token_store(
+                    &ctx.state.config,
+                    ctx.state.stores.relational(),
+                )
+                .await?,
             };
             store.get_token(&ctx.person, p).map(|s| s.access_token)
         }
@@ -1109,7 +1115,7 @@ mod tests {
         async fn build(tweak: impl FnOnce(&mut crate::config::ServerConfig)) -> Env {
             let f = Fixture::with_config(tweak).await;
             f.seed_project(MOUNT, OWNER).await;
-            let git = Arc::new(GitRepoStore::new(f.state.config.clone()));
+            let git = Arc::new(GitRepoStore::new(f.state.config.clone(), crate::storage::test_registry()));
             let tokens = Arc::new(OAuthTokenStore::new());
             let mut reg = ToolRegistry::new();
             register_with(&mut reg, Some(git.clone()), Some(tokens.clone()));

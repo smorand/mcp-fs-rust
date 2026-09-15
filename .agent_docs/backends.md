@@ -111,6 +111,63 @@ touching those tables. Omitting it in a read leaks another volume's rows; omitti
 a delete or a refcount update corrupts another volume. The conformance suite runs the
 server engines against one shared instance precisely so a missing predicate shows up.
 
+## Decision: which SQL Server driver, 2026-09-15
+
+This is the least comfortable dependency choice in the project, so the reasoning is
+recorded in full rather than left implicit. Revisit it deliberately, not by accident.
+
+### The constraint that removes the obvious answer
+
+`sqlx` drives PostgreSQL here, so the appealing design is one toolkit for all three
+engines. That design does not exist: **sqlx removed its MSSQL driver in 0.7 and the
+rewrite has never shipped** (checked again at 0.9.0). Any SQL Server support therefore
+means a second, unrelated driver next to `sqlx`. There is no way to avoid that.
+
+### The options, as they actually stood
+
+| | `tiberius-ng` (chosen) | `tiberius` | `odbc-api` |
+|---|---|---|---|
+| Version, date | 0.13.1, 2026-08-30 | 0.12.3, **2024-07-19** | 29.0.0, 2026-07-19 |
+| Downloads | ~3.5k total | ~5.2M total, but stale | ~1.6M, ~253k recent |
+| Maintenance | active, single maintainer, young fork | **unmaintained, open unpatched advisories** | healthy, widely used |
+| Deploy cost | **none**, pure Rust, `cargo build` | none | **needs a system ODBC driver manager plus a C toolchain on every host** |
+| Async | native | native | blocking, needs `spawn_blocking` |
+
+### Why `tiberius-ng` won
+
+The deciding factor is deployment posture, not driver quality. Everything else in this
+server builds and runs with no external system dependency: `rusqlite` is `bundled`, `sqlx`
+and `reqwest` use `rustls` rather than system OpenSSL. `odbc-api` would be the first
+component to require an `apt install` or `brew install` before the server can start, and
+it would have to be present inside any container image too. That is a permanent, visible
+tax on every operator, including those who never enable SQL Server.
+
+`tiberius` was excluded outright: an unmaintained driver shipping known unpatched
+advisories is not a candidate regardless of its download count.
+
+### What we are accepting, stated plainly
+
+`tiberius-ng` is a young fork with one maintainer and very low traffic. **It could stop
+being maintained.** That risk is accepted knowingly, on three conditions, all of which
+hold today:
+
+1. **It is optional.** The `sqlserver` cargo feature is off by default, so a default build
+   contains neither the crate nor its risk. Verify with `cargo tree --depth 1`.
+2. **It is pinned exactly** (`=0.13.1`), so a surprise release cannot arrive silently.
+3. **The blast radius is one file.** The driver only ever appears behind `RelationalDb`.
+   `rel/sqlserver.rs` is the sole place it is named; no store, tool or route knows it
+   exists.
+
+### The migration path, if it does die
+
+Switch to `odbc-api` and accept the system dependency. Concretely: rewrite
+`rel/sqlserver.rs` against `odbc-api`, wrap its blocking calls in `spawn_blocking` the way
+`rel/sqlite.rs` already does for `rusqlite`, and document the driver manager as an install
+prerequisite for the `sqlserver` feature. Nothing outside that file changes, and the
+backend conformance suite in `storage/conformance.rs` is what proves the replacement
+behaves identically: run it against a real server before and after. The abstraction is
+the mitigation, and this is the scenario it was built for.
+
 ## Gotchas from the original port, 2026-09-15
 
 Recorded because each one cost real time and none is guessable from the code alone.
@@ -119,10 +176,9 @@ Recorded because each one cost real time and none is guessable from the code alo
   rewrite has never shipped, so the appealing "one toolkit, three engines" design is not
   available. SQL Server needs a second driver, which is why `tiberius-ng` plus `bb8` sits
   beside `sqlx`.
-* **`tiberius` itself is unmaintained.** No release since 2024 and it ships unpatched
-  advisories. `tiberius-ng` is the maintained fork, pinned exactly (`=0.13.1`) because it
-  is young and low traffic. If it goes stale, `odbc-api` is the fallback and only
-  `sqlserver.rs` changes. This is the weakest dependency in the tree; keep it optional.
+* **`tiberius` itself is unmaintained**, which is why the fork is used. The full driver
+  comparison and the exit plan are in the decision record above; read it before changing
+  or upgrading anything under `rel/sqlserver.rs`.
 * **`tiberius` has no transaction object.** `BEGIN`, `COMMIT` and `ROLLBACK` are ordinary
   statements, so `MssqlTx` owns a pooled connection for the transaction's whole life to
   keep the statements on one session.

@@ -1616,7 +1616,7 @@ mod tests {
         Fix {
             _dir: d,
             v: VolumeClient::new("p", meta, blob),
-            s: SafetyManager::new(cfg),
+            s: SafetyManager::new(cfg, None),
         }
     }
 

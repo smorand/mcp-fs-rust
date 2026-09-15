@@ -10,12 +10,12 @@ Server state (metadata tree, ACL, git index, OAuth tokens) = **SQLite** by defau
 filesystem** (default) or **MinIO/S3**, content-addressed by sha256. Auth = verified
 **RS256 bearer JWT**.
 
-This began as a Rust port of the
-[C# implementation](https://github.com/smorand/mcp-fs-csharp). **That 1:1 parity
-constraint is retired**: the project now has its own lifecycle, which is what allowed the
-relational backends to exist. The tool surface is still a contract and is still pinned by
-tests. See [`.agent_docs/parity.md`](.agent_docs/parity.md) for the lineage and the full
-record of where behaviour diverged.
+This began as a Rust port of a C# implementation. **That is history**: the port constraint
+is gone, the two projects have separate lifecycles and deployment targets, and they are
+diverging by design (the C# has no PostgreSQL support, because that is not its target).
+The tool surface is still a contract and is still pinned by tests. See
+[`.agent_docs/lineage.md`](.agent_docs/lineage.md) for the lineage and the design
+decisions worth knowing.
 
 ## Cargo features
 
@@ -27,6 +27,11 @@ A default build is SQLite only and carries no database driver beyond bundled `ru
 | `postgres` | PostgreSQL | `sqlx` |
 | `sqlserver` | SQL Server | `tiberius-ng` + `bb8` |
 | `all-backends` | both | |
+
+`tiberius-ng` is a young, low traffic fork, chosen because `sqlx` has no MSSQL driver and
+the alternative (`odbc-api`) would require a system driver manager on every host. It is
+pinned, optional, and confined to one file. The full comparison and the exit plan are in
+[`.agent_docs/backends.md`](.agent_docs/backends.md#decision-which-sql-server-driver-2026-09-15).
 
 ```bash
 cargo build --release --features postgres
@@ -254,77 +259,57 @@ test: a wrong prompt width is a mistake at the call site, not in the width funct
 cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
 ```
 
-## Regression harness
+## The tool contract is frozen
 
-A 128 step corpus of MCP and REST calls, replayed against a running server and diffed
-against a golden capture. It was built as the 1:1 parity judge and is **no longer a gate**,
-since there is nothing left to be equal to; it is kept because the corpus covers the MCP
-surface, the REST plane and every error path more broadly than the unit tests do. Point it
-at a previous build to use it as a regression check:
+The 55 tool names, descriptions and `inputSchema` values are a client and an LLM facing
+contract, so they are snapshotted in `tool-contract-golden.json` and compared on every test
+run, serialized form included, which means even a reordered schema key fails the build.
+`TOOL_CONTRACT.txt` is the human readable companion.
+
+Changing the contract is deliberate, never a hand edit:
 
 ```bash
-cargo run -p parity-harness -- capture \
-  --base http://127.0.0.1:5002 --token "$TOKEN" \
-  --owner admin@example.com --out baseline.json
-
-# change something, restart, then
-cargo run -p parity-harness -- compare \
-  --base http://127.0.0.1:5002 --token "$TOKEN" \
-  --owner admin@example.com --golden baseline.json
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
 ```
 
-Volatile values (timestamps, version, host paths) are normalized, and an error text is
-reduced to `tool + ERR_* code` so a reworded message passes while a wrong code fails.
-`parity-golden.json` is the committed C# baseline and still backs the tool schema equality
-tests.
+Then review the diff: a description edit is one line, and 55 changed tools means something
+went wrong.
 
-## Divergences from the C# origin
+## Design decisions worth knowing
 
-Each is a case where mirroring the reference would mirror a defect. The full table, with
-the harness step that proves each one, is in [`.agent_docs/parity.md`](.agent_docs/parity.md).
+Stated on their own terms; the full record is in
+[`.agent_docs/lineage.md`](.agent_docs/lineage.md), and each is documented at its call site.
 
-**Errors are usable.** The reference answers a missing file or a missing argument with
-`"An error occurred invoking 'fs.read'."` carrying **no error code** (its storage layer
-raises a bare `IOException`, which is not an `McpException`), so a client cannot tell a
-missing file from a bad argument from a crash. Here every failure carries its `ERR_*`
-code. On the REST plane the reference maps six codes and defaults the rest to a generic
-400, so a spent quota, a missing read precondition, an ambiguous match and an unsupported
-format were indistinguishable by status; here they are 429, 428, 409 and 501, and a
-missing file is 404 rather than 500.
+**Errors are usable.** Every failure carries one of the 14 `ERR_*` codes, and the REST
+status suggests a remedy rather than a generic 400: a missing file is 404, a spent quota
+429, a missing read before write 428, a duplicate project 409, an unsupported extraction
+format 501, and an edit that matched nothing or matched ambiguously 422.
 
-**A real `git clone` and `git push` work.** Three reference defects made the documented
-git protocol unusable: `upload-pack` did not advertise `multi_ack_detailed` (which git
-requires over smart HTTP), the pack was built without a commit's ancestry so any
-repository with more than one commit was incomplete, and the `receive-pack` report was not
-side-band framed so git aborted after the push had landed. Also: `unpack ok` is sent,
-project membership is enforced on the git routes (the reference let any verified token
-read or write any project), `max_pack_size_mb` is enforced, and pushed objects are really
-indexed.
+**A real `git clone` and `git push` work.** Smart HTTP is unforgiving: `upload-pack`
+advertises `multi_ack_detailed`, the pack is built from a revwalk so a commit's ancestry is
+included (otherwise any repository with more than one commit is incomplete), and the
+`receive-pack` report is side-band framed once the client negotiated it, or git aborts after
+the push has already landed. `unpack ok` is sent, project membership is enforced on every
+git route, `max_pack_size_mb` is enforced, and pushed objects are really indexed.
+Verified end to end: clone, commit, push, reclone.
 
-**Data safety and accounting on the REST plane.** Four routes called the storage layer
-directly instead of the engine, so the REST door behaved differently from the tool for the
-same operation: `delete` skipped the trash, ignored `allow_hard_delete` and removed a whole
-tree without asking for `recursive`; `move` had no no clobber rule; `upload` charged
-nothing against the write quota, making the highest volume write path the only one with no
-accounting; and none of them wrote an audit entry, so a REST mutation left no trace. All
-four now go through the engine. The git write paths had the same gap: `git.remote_clone`
-imported a whole working tree and `git.checkout_file` restored a file with nothing charged
-against the quota, so git was a way around it. The clone is now charged up front, before
-the first write, so an import that does not fit leaves the volume untouched instead of half
-populated. Related engine bug found on the way: `fs.move` with `overwrite: true` always
-failed, because the flag was checked and then ignored.
+**One implementation per operation.** `core::fs_ops` is the only place an operation is
+written; the MCP tool layer and the REST plane are thin adapters over it, including the V4A
+patch engine. This is why the REST `delete` honours trash, `allow_hard_delete` and
+`recursive`, why `upload` is quota charged and audited like any other write, and why
+`git.remote_clone` charges the whole import up front so a repository that does not fit
+leaves the volume untouched instead of half populated. `git.checkout_file` is charged too:
+restoring from history is a write.
 
-**Correctness fixes.** `auth.jwt.algorithms` is honoured instead of parsed and ignored
-(with unsupported names logged at startup and the HMAC family refused on purpose).
-Listing a file is a 400 rather than a 200 with an invented empty listing. `fs.tree` at
-exactly the node cap returns every node instead of dropping the last one and claiming to
-be truncated. Symbol references come back ordered by line. An invalid `fs.grep` regex is
-a stable 400.
-
-**Structural.** One implementation per operation in `core::fs_ops`, shared by the MCP
-surface and the REST plane, including the V4A patch engine. No custom libgit2 ODB backend
-(`git2` cannot express one from safe Rust): the blob store is the source of truth and is
-synced around libgit2 calls, with identical stored bytes.
+**Correctness.** `auth.jwt.algorithms` is honoured, with unsupported names logged at
+startup and the HMAC family refused on purpose (an `HS*` algorithm with a public key file
+would let anyone holding that key mint tokens). Listing a file is a 400 rather than an
+invented empty listing. `fs.tree` at exactly the node cap returns every node. Symbol
+references come back ordered by line. An invalid `fs.grep` regex is a stable 400. A
+subtree `LIKE` pattern is escaped, so a file named `a_b` no longer matches its sibling
+`axb` and a subtree delete cannot remove unrelated rows. No custom libgit2 ODB backend
+(`git2` cannot express one from safe Rust): the blob store is the source of truth, with
+identical stored bytes.
 
 ## Not supported
 
@@ -340,7 +325,7 @@ stored in the relational database.
 ## Documentation
 
 `AGENTS.md` is the compact index. Details live in [`.agent_docs/`](.agent_docs/):
-architecture, tools, api, git, config, backends, testing, parity, agent.
+architecture, tools, api, git, config, backends, testing, lineage, agent.
 
 ## License
 

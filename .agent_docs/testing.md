@@ -15,15 +15,22 @@ Three levels, all inside the crate:
 | Tool level | `tools::testkit::harness()` builds a **real `AppState`** (SQLite metadata in a temp dir, local blobs, in memory ACL, the real registry) and dispatches through `registry.call`, the same path `tools/call` uses | `tools/*` |
 | Integration | the **real axum router** driven with `tower::ServiceExt::oneshot`, so requests go through routing, identity, the membership gate and the handlers | `app.rs`, `api/dataplane.rs`, `api/openapi.rs`, `git/http/mod.rs` |
 
-Schema parity is also a test: `tools/mod.rs` and `tools/all.rs` compare all 55
-descriptions and `inputSchema` values against `parity-golden.json`, serialized, so
-even a property key order change fails the build. Those two tests skip with a
-message when the golden file is absent, since it lives at the repo root outside
-the crate.
+The tool contract is also a test: `tools/mod.rs` and `tools/all.rs` compare all 55
+descriptions and `inputSchema` values against `tool-contract-golden.json`,
+serialized, so even a property key order change fails the build.
+`tools/contract_golden.rs` owns the file and adds the both directions check, so a
+tool added to the registry but never written to the contract fails too. All three
+skip with a message when the file is absent, since it lives at the repo root
+outside the crate.
 
-Beyond the crate, `crates/parity-harness` is a binary that replays a corpus
-against a **live server** over HTTP. Its own 32 tests cover the corpus and the
-normalizer.
+The contract is regenerated deliberately, never hand edited:
+
+```bash
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
+```
+
+Review the diff afterwards: a description edit is one line, and 55 changed tools
+means something went wrong.
 
 ## Running
 
@@ -44,17 +51,17 @@ From `cargo test --workspace` on the current tree:
 
 | Target | Result |
 |---|---|
-| `mcp-fs` lib | 965 passed, 1 ignored |
+| `mcp-fs` lib | 978 passed, 1 ignored |
 | `agent` bin | 111 passed |
-| `parity-harness` bin | 32 passed |
 | `mcp-fs` bin | 0 (the binary is a thin `main`) |
 | doctests | 0 passed, 3 ignored (wiring examples marked `ignore`) |
 
 That is the default feature set, so SQLite only. The relational conformance cases add
 themselves per engine when their dsn is present.
 
-Per area, from `cargo test -p mcp-fs --lib -- --list` (755 tests, the ignored one
-included):
+Per area, from `cargo test -p mcp-fs --lib -- --list` (978 entries, the ignored one and
+the live database cases included). The per area rows below are indicative: they are not
+recounted on every change, so trust the total above:
 
 | Area | Tests | Area | Tests |
 |---|---|---|---|
@@ -138,46 +145,29 @@ MCPFS_MINIO_SECRET_KEY=secret \
 Without the service the test does not run at all (`--ignored` is required), which
 is why `./test.sh` is green on a machine with nothing installed.
 
-## Parity harness
+## The differential harness is gone
 
-**No longer a gate.** Parity with the C# is retired (see [`parity.md`](parity.md)), so a
-difference here is information rather than a failure. It is kept because the 128 step
-corpus is a real regression suite over the MCP surface, the REST plane and every error
-path. Point it at a previous build of this server to use it that way.
+`crates/parity-harness` replayed a corpus against a live server and compared the result
+to a C# capture. It has been **deleted**: the C# is no longer a reference (see
+[`lineage.md`](lineage.md)), so a difference against it was a false signal rather than a
+regression. Its 32 tests covered the corpus and the normalizer, both of which existed only
+to serve that comparison.
 
-Two modes, so two servers never need to be up at the same time:
+What replaced it, and why nothing was lost that mattered:
 
-```bash
-# capture the reference (C#) into a golden file
-cargo run -p parity-harness -- capture \
-  --base http://127.0.0.1:5002 --token "$CS_TOKEN" \
-  --owner admin@example.com --out parity-golden.json
-
-# compare this implementation against that file
-cargo run -p parity-harness -- compare \
-  --base http://127.0.0.1:5003 --token "$RUST_TOKEN" \
-  --owner admin@example.com --golden parity-golden.json
-```
-
-| Flag | Meaning |
+| Was covered by the harness | Now covered by |
 |---|---|
-| `--base` | server URL (capture defaults to `:5002`, compare to `:5003`) |
-| `--token` | bearer for that server. The identity must be a platform admin (the harness provisions with `admin.create_project`) and in practice the same person as `--owner`, because the `fs.*` steps run as the token identity |
-| `--owner` | owner of the corpus project; also added as a member during provisioning |
-| `--project` | reuse a fixed project id; the default is a fresh id per run, so a replay never inherits state |
-| `--out` / `--golden` | golden file to write / to compare against (`parity-golden.json`) |
-| `--relax-messages` | blank out free form message fields as well as error sentences |
+| the 55 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
+| the MCP wire framing and JSON-RPC behaviour | `app.rs` router tests driven with `oneshot` |
+| the REST plane, every route | `api/dataplane.rs` and `api/openapi.rs` tests |
+| every error path and `ERR_*` code | per module tests next to each error |
+| the git smart protocol | `git/http/mod.rs` tests, plus a real clone/push/reclone |
+| behaviour across engines | `storage/conformance.rs`, one suite per engine |
 
-`parity-golden.json` is the committed baseline. Recapture it after touching the
-corpus and commit it with the change. Volatile values (timestamps, version, host
-paths) are normalized, and an error text is reduced to `tool + ERR_* code`, so a
-reworded message passes while a wrong code fails.
-
-**Interpreting the output is documented once, in
-[`.agent_docs/parity.md`](parity.md)**: what is inside the contract, what is
-deliberately not compared, and the table of the differences that are expected to
-show up. A non zero difference count is not automatically a failure; it is a
-failure unless it is in that table.
+To compare this server against a **previous build of itself**, which is what the harness
+was useful for after parity was retired, drive the real surface instead: the tool level
+tests and the conformance suite already cover it, and `mcp-fs migrate` round trips state
+between engines so a copy can be diffed row for row.
 
 ## The `agent` crate
 

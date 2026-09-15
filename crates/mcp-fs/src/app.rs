@@ -43,14 +43,19 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     let config = Arc::new(config);
 
-    // One registry for the whole process, so the ACL store and every volume of a
-    // SQL deployment reuse one connection pool.
-    let registry = crate::storage::RelationalRegistry::new();
-    let admin = crate::storage::build_admin_store(&config, &registry).await?;
+    // One registry for the whole process, so the ACL store, every volume and the
+    // git index reuse one connection pool per DSN. It is threaded explicitly into
+    // every consumer: a second registry would open `max_connections` again, so the
+    // process would exceed the single number the operator configured.
+    let relational = Arc::new(crate::storage::RelationalRegistry::new());
+    let admin = crate::storage::build_admin_store(&config, &relational).await?;
     admin.connect().await?;
 
-    let stores = Arc::new(StoreManager::new(config.clone()));
-    let safety = Arc::new(SafetyManager::new(config.safety.clone()));
+    let stores = Arc::new(StoreManager::new(config.clone(), relational.clone()));
+    let safety = Arc::new(SafetyManager::new(
+        config.safety.clone(),
+        crate::storage::meta::max_path_len(&config.infra.meta.backend),
+    ));
     let identity = Arc::new(IdentityResolver::new(&config.auth));
     // A configured algorithm this build cannot verify would otherwise be ignored in
     // silence, leaving the operator believing a policy is in force when it is not.
@@ -106,7 +111,10 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     // Git HTTP smart protocol, only when the subsystem is enabled. The tools and
     // these routes must share one repository store so they share the write locks.
     if state.config.git.enabled {
-        let git_store = crate::git::GitRepoStore::shared(state.config.clone());
+        // Same registry as the metadata and ACL stores, so enabling git does not
+        // silently double the connection count.
+        let git_store =
+            crate::git::GitRepoStore::shared(state.config.clone(), state.stores.relational().clone());
         router = router.merge(crate::git::http::router(state.clone(), git_store));
     }
 

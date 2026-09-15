@@ -5,9 +5,9 @@
 //! `tools/call` with no `initialize` handshake and no session header. `rmcp` 3.1
 //! always requires `initialize` first (even with `NeverSessionManager`), so it
 //! cannot reproduce that contract. A tools-only MCP surface is small, and owning
-//! the wire format guarantees the 1:1 parity this port requires.
+//! the wire format keeps that contract under our control.
 //!
-//! Wire contract captured from the running C# server:
+//! Wire contract, originally captured from the C# server and now frozen as ours:
 //! * response headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache,no-store`
 //! * body framing: `event: message\ndata: {json}\n\n`
 //! * success: `{"result":{"content":[{"type":"text","text":"<json>"}]},"id":N,"jsonrpc":"2.0"}`

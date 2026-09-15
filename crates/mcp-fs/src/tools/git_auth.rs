@@ -38,9 +38,14 @@ static TOKENS: tokio::sync::OnceCell<Result<Arc<OAuthTokenStore>>> =
 /// Process wide device flow client. Reuses one `reqwest` connection pool.
 static FLOW: OnceLock<Result<Arc<dyn DeviceFlowClient>>> = OnceLock::new();
 
-pub async fn token_store(config: &ServerConfig) -> Result<Arc<OAuthTokenStore>> {
+pub async fn token_store(
+    config: &ServerConfig,
+    registry: &crate::storage::RelationalRegistry,
+) -> Result<Arc<OAuthTokenStore>> {
     TOKENS
-        .get_or_init(|| async { OAuthTokenStore::from_env(config).await.map(Arc::new) })
+        .get_or_init(|| async {
+            OAuthTokenStore::from_env(config, registry).await.map(Arc::new)
+        })
         .await
         .clone()
 }
@@ -125,7 +130,7 @@ async fn resolve_tokens(
 ) -> Result<Arc<OAuthTokenStore>> {
     match injected {
         Some(t) => Ok(t),
-        None => token_store(&ctx.state.config).await,
+        None => token_store(&ctx.state.config, ctx.state.stores.relational()).await,
     }
 }
 

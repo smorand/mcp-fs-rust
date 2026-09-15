@@ -198,7 +198,8 @@ mod tests {
         assert_family(register, NAMES);
     }
 
-    /// Captured from the live C# server (`parity-golden.json`, `tools_list`).
+    /// Pinned inline as well as in `tool-contract-golden.json`, so this fails with a
+    /// readable diff even when the contract file is absent.
     #[test]
     fn fs_read_schema_matches_the_contract() {
         assert_schema(

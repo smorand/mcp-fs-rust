@@ -104,7 +104,7 @@ pub fn router(app: Arc<AppState>, git: Arc<GitRepoStore>) -> Router {
 
 /// [`router`] using the process wide store, for callers that have only the state.
 pub fn router_with_shared_store(app: Arc<AppState>) -> Router {
-    let git = GitRepoStore::shared(app.config.clone());
+    let git = GitRepoStore::shared(app.config.clone(), app.stores.relational().clone());
     router(app, git)
 }
 
@@ -690,7 +690,7 @@ mod tests {
     }
 
     async fn entry(root: &std::path::Path) -> (Arc<GitRepoStore>, Arc<GitRepoEntry>) {
-        let store = Arc::new(GitRepoStore::new(config(root)));
+        let store = Arc::new(GitRepoStore::new(config(root), crate::storage::test_registry()));
         let e = store.init_repo("proj").await.unwrap();
         (store, e)
     }
@@ -1137,13 +1137,16 @@ mod tests {
         let app = Arc::new(crate::state::AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
-            safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            safety: Arc::new(crate::safety::SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         });
-        let git = Arc::new(GitRepoStore::new(config));
+        let git = Arc::new(GitRepoStore::new(config, crate::storage::test_registry()));
         if initialized {
             git.init_repo("proj").await.unwrap();
         }
@@ -1239,13 +1242,16 @@ mod tests {
         let app = Arc::new(crate::state::AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
-            safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            safety: Arc::new(crate::safety::SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         });
-        let git = Arc::new(GitRepoStore::new(config));
+        let git = Arc::new(GitRepoStore::new(config, crate::storage::test_registry()));
         git.init_repo("proj").await.unwrap();
         let router = router(app, git);
 
