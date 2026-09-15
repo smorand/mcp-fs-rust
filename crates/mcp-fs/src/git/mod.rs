@@ -34,7 +34,7 @@ pub mod oauth;
 pub mod odb;
 pub mod repo;
 
-pub use db::{GitObjectRow, GitRefRow, SqliteGitDb};
-pub use oauth::{OAuthSession, OAuthTokenStore, SqliteOAuthPersistence};
+pub use db::{GitObjectRow, GitRefRow, RelationalGitDb};
+pub use oauth::{OAuthSession, OAuthTokenStore, RelationalOAuthPersistence};
 pub use odb::{BlobObjectDb, blob_key, deserialize, serialize};
 pub use repo::{GitRepoEntry, GitRepoStore};

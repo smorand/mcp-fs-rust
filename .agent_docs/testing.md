@@ -10,7 +10,8 @@ Three levels, all inside the crate:
 
 | Level | How | Where |
 |---|---|---|
-| Unit | plain functions and in memory SQLite (`SqliteDb::open_in_memory`, `SqliteAdminStore::in_memory`) plus `tempfile` dirs for blobs | every module |
+| Unit | plain functions and in memory SQLite (`SqliteRelationalDb::open_in_memory`, `RelationalAdminStore::in_memory`) plus `tempfile` dirs for blobs | every module |
+| Conformance | one set of assertions run against **every** relational engine | `storage/conformance.rs` |
 | Tool level | `tools::testkit::harness()` builds a **real `AppState`** (SQLite metadata in a temp dir, local blobs, in memory ACL, the real registry) and dispatches through `registry.call`, the same path `tools/call` uses | `tools/*` |
 | Integration | the **real axum router** driven with `tower::ServiceExt::oneshot`, so requests go through routing, identity, the membership gate and the handlers | `app.rs`, `api/dataplane.rs`, `api/openapi.rs`, `git/http/mod.rs` |
 
@@ -30,10 +31,12 @@ normalizer.
 ./test.sh                                    # cargo test --workspace
 cargo test -p mcp-fs                         # the server crate only
 cargo test -p mcp-fs --lib storage::         # one area
-cargo clippy --all-targets -- -D warnings    # second half of the quality gate
+cargo test --workspace --all-features        # includes the postgres and sqlserver drivers
+cargo clippy --all-targets --all-features -- -D warnings   # second half of the quality gate
 ```
 
-Both must be clean before any commit.
+Both must be clean before any commit. Use `--all-features` on the clippy gate, otherwise
+the two optional drivers are never compiled and their warnings never surface.
 
 ## Current counts
 
@@ -41,29 +44,78 @@ From `cargo test --workspace` on the current tree:
 
 | Target | Result |
 |---|---|
-| `mcp-fs` lib | 754 passed, 1 ignored |
+| `mcp-fs` lib | 965 passed, 1 ignored |
+| `agent` bin | 111 passed |
 | `parity-harness` bin | 32 passed |
 | `mcp-fs` bin | 0 (the binary is a thin `main`) |
 | doctests | 0 passed, 3 ignored (wiring examples marked `ignore`) |
+
+That is the default feature set, so SQLite only. The relational conformance cases add
+themselves per engine when their dsn is present.
 
 Per area, from `cargo test -p mcp-fs --lib -- --list` (755 tests, the ignored one
 included):
 
 | Area | Tests | Area | Tests |
 |---|---|---|---|
-| `tools` | 176 | `mcp` | 23 |
-| `git` | 117 | `util` | 20 |
-| `core` | 113 | `cli` | 15 |
-| `docs` | 106 | `safety` | 11 |
-| `api` | 65 | `app` | 11 |
-| `storage` | 62 | `identity` | 10 |
+| `tools` | 255 | `mcp` | 23 |
+| `storage` | 132 | `cli` | 23 |
+| `core` | 132 | `util` | 21 |
+| `git` | 117 | `config` | 21 |
+| `docs` | 106 | `identity` | 18 |
+| `api` | 71 | `safety` | 12 |
+| | | `app` | 11 |
 | | | `keys` | 9 |
-| | | `config` | 9 |
+| | | `migrate` | 5 |
 | | | `logging` | 5 |
-| | | `errors` | 3 |
+| | | `errors` | 5 |
 
 Largest single modules: `core::fs_ops` 101, `docs::extract` 49,
-`api::dataplane` 48, `git::oauth` 41, `git::http` 40, `tools::git` 36.
+`api::dataplane` 48, `git::oauth` 41, `git::http` 40, `tools::git` 36,
+`storage::meta` 32.
+
+`storage` grew most, from 62, because the relational layer carries its own suite:
+`storage::rel::dialect` 17, `storage::rel::sqlite` 14 and `storage::rel` 12 cover
+placeholder rendering, upsert and DDL per dialect, `LIKE` escaping and the retry helper
+with no database at all.
+
+## Relational conformance: PostgreSQL and SQL Server
+
+The per store test modules cover their own logic against SQLite. `storage/conformance.rs`
+answers a different question: does a store behave **the same** on another engine? Every
+case takes an `Engine` and runs once per backend.
+
+SQLite always runs. The server engines run only when their dsn is in the environment, so
+`cargo test --workspace` stays green with no Docker and nothing installed.
+
+| Variable | Enables |
+|---|---|
+| `MCPFS_TEST_PG_DSN` | the PostgreSQL cases |
+| `MCPFS_TEST_MSSQL_DSN` | the SQL Server cases |
+
+```bash
+docker compose -f docker-compose.test.yml up -d      # postgres:16 on 55432, mssql 2022 on 51433
+
+MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
+MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
+  cargo test --workspace --all-features
+
+docker compose -f docker-compose.test.yml down -v
+```
+
+The ports are deliberately unusual so this never collides with a real PostgreSQL on 5432
+or SQL Server on 1433. Both services declare a healthcheck because the tests connect
+immediately, and SQL Server needs tens of seconds before it accepts a login. PostgreSQL
+data is on `tmpfs`: throwaway, and faster.
+
+`--all-features` is required, since the drivers are behind the `postgres` and `sqlserver`
+cargo features. Without them the dsn variables are ignored.
+
+**Isolation differs per engine, and that is the point.** SQLite hands out a private in
+memory database per call, while the server engines share one instance, so every case
+derives unique ids from a per run tag. A case that passes on all three has been proven not
+to depend on having the database to itself, which is what catches a statement missing its
+`volume_id` predicate.
 
 ## Opt in test
 
@@ -88,8 +140,12 @@ is why `./test.sh` is green on a machine with nothing installed.
 
 ## Parity harness
 
-The objective judge of 1:1 parity. Two modes, so the two servers never need to be
-up at the same time:
+**No longer a gate.** Parity with the C# is retired (see [`parity.md`](parity.md)), so a
+difference here is information rather than a failure. It is kept because the 128 step
+corpus is a real regression suite over the MCP surface, the REST plane and every error
+path. Point it at a previous build of this server to use it that way.
+
+Two modes, so two servers never need to be up at the same time:
 
 ```bash
 # capture the reference (C#) into a golden file

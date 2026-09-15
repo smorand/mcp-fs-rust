@@ -147,7 +147,7 @@ pub(crate) mod testkit {
         tweak(&mut config);
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::SqliteAdminStore::in_memory().unwrap());
+        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 
@@ -177,7 +177,7 @@ pub(crate) mod testkit {
         config.auth.jwt.public_key_path = String::new();
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::SqliteAdminStore::in_memory().unwrap());
+        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 

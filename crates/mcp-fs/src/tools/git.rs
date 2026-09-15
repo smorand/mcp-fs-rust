@@ -23,7 +23,7 @@
 //! HTTP handlers do.
 
 use crate::errors::{Result, ToolError};
-use crate::git::db::SqliteGitDb;
+use crate::git::db::RelationalGitDb;
 use crate::git::{GitRepoEntry, GitRepoStore};
 use crate::mcp::registry::{ToolCtx, handler};
 use crate::mcp::{ToolRegistry, ToolSchema};
@@ -361,7 +361,7 @@ fn parse_oid(sha: &str) -> Result<Oid> {
 /// The C# order is reproduced including its quirk: a name made only of hex
 /// characters is treated as a sha *before* `refs/heads/{name}` is tried, so a
 /// branch named `beef` resolves to the sha `beef`. Kept for parity.
-async fn resolve_ref(db: &SqliteGitDb, ref_or_sha: &str) -> Result<Option<String>> {
+async fn resolve_ref(db: &RelationalGitDb, ref_or_sha: &str) -> Result<Option<String>> {
     if let Some(entry) = db.get_ref(ref_or_sha).await? {
         if entry.symbolic {
             return Ok(db.get_ref(&entry.target).await?.map(|r| r.target));
@@ -687,7 +687,7 @@ async fn remote_clone(
         Some(p) => {
             let store = match tokens {
                 Some(t) => t,
-                None => super::git_auth::token_store(&ctx.state.config)?,
+                None => super::git_auth::token_store(&ctx.state.config).await?,
             };
             store.get_token(&ctx.person, p).map(|s| s.access_token)
         }
@@ -1840,7 +1840,7 @@ mod tests {
         let e = Env::new().await;
         e.tokens
             .store_token(OWNER, "github", "gho_supersecret", vec!["repo".into()],
-                         Utc::now() + chrono::Duration::hours(1), None)
+                         Utc::now() + chrono::Duration::hours(1), None).await
             .unwrap();
         let err = e
             .call(
@@ -1886,7 +1886,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_ref_follows_symbolic_refs_and_falls_back_to_short_names() {
-        let db = SqliteGitDb::open_in_memory().unwrap();
+        let db = RelationalGitDb::open_in_memory().await.unwrap();
         let sha = "b".repeat(40);
         db.set_ref("HEAD", "refs/heads/main", true).await.unwrap();
         db.set_ref("refs/heads/main", &sha, false).await.unwrap();
@@ -1902,7 +1902,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_symbolic_head_with_no_branch_yet_resolves_to_nothing() {
-        let db = SqliteGitDb::open_in_memory().unwrap();
+        let db = RelationalGitDb::open_in_memory().await.unwrap();
         db.set_ref("HEAD", "refs/heads/main", true).await.unwrap();
         assert_eq!(resolve_ref(&db, "HEAD").await.unwrap(), None);
     }

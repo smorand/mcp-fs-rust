@@ -5,15 +5,37 @@ A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
-Metadata tree = **SQLite** (one db per volume). File bytes = **local filesystem**
-(default) or **MinIO/S3**, content-addressed by sha256. ACL = **SQLite**. Auth =
-verified **RS256 bearer JWT**.
+Server state (metadata tree, ACL, git index, OAuth tokens) = **SQLite** by default, or
+**PostgreSQL** or **SQL Server** chosen per store in the config. File bytes = **local
+filesystem** (default) or **MinIO/S3**, content-addressed by sha256. Auth = verified
+**RS256 bearer JWT**.
 
-This is a Rust port of the [C# implementation](https://github.com/smorand/mcp-fs-csharp)
-with **strict 1:1 external parity**: same tool names, same snake_case parameters, same
-`ERR_*` codes, same JSON shapes, same SQLite schemas, same git wire protocol, same REST
-routes. An existing MCP, REST or git client cannot tell the two apart, and a volume
-written by one is readable by the other.
+This began as a Rust port of the
+[C# implementation](https://github.com/smorand/mcp-fs-csharp). **That 1:1 parity
+constraint is retired**: the project now has its own lifecycle, which is what allowed the
+relational backends to exist. The tool surface is still a contract and is still pinned by
+tests. See [`.agent_docs/parity.md`](.agent_docs/parity.md) for the lineage and the full
+record of where behaviour diverged.
+
+## Cargo features
+
+A default build is SQLite only and carries no database driver beyond bundled `rusqlite`.
+
+| Feature | Adds | Driver |
+|---|---|---|
+| (default) | SQLite | `rusqlite`, bundled |
+| `postgres` | PostgreSQL | `sqlx` |
+| `sqlserver` | SQL Server | `tiberius-ng` + `bb8` |
+| `all-backends` | both | |
+
+```bash
+cargo build --release --features postgres
+cargo build --release --features all-backends
+```
+
+SQL Server needs a second driver because **sqlx removed its MSSQL support in 0.7** and the
+rewrite has never shipped. Both are optional so a default build carries neither the
+dependency nor its TLS stack.
 
 ## Quickstart
 
@@ -53,11 +75,36 @@ Interactive API docs: <http://127.0.0.1:5002/api/docs> (spec at `/api/swagger.js
 mcp-fs serve [--config PATH]      run the server
 mcp-fs keys  [--dir DIR]          generate an RS256 keypair (default .keys)
 mcp-fs token <email> [--key PATH] [--ttl SECONDS]
+mcp-fs migrate --from A.yaml --to B.yaml   copy relational state between backends
 mcp-fs version
 ```
 
-Config resolution: `--config`, else `$MCP_FS_CONFIG`, else
-`${MCP_FS_CONFIG_DIR:-config}/${MCP_FS_CONFIG_NAME:-local}.yaml`.
+Config resolution, highest priority first: `--config`, else `$MCP_FS_CONFIG`, else
+`~/.config/mcp-fs/config.yaml` when it exists, else
+`${MCP_FS_CONFIG_DIR:-config}/${MCP_FS_CONFIG_NAME:-local}.yaml`. The first two are used
+as given; the last two are probed, and when neither exists the error lists every path
+tried.
+
+### Switching backend with data in place
+
+`migrate` is how you move an existing deployment onto PostgreSQL or SQL Server. It copies
+every row the server owns, from the engines one config names to the engines the other
+names.
+
+```bash
+mcp-fs migrate --from config/sqlite.yaml --to config/postgres.yaml
+```
+
+**Run it with the server stopped**: it takes no locks against a live writer, so a
+concurrent write would be missed. The copy is row for row rather than a replay through the
+store API, so every `mtime` and `ctime` is preserved exactly.
+
+Two things are deliberately not moved. **Blob bytes** stay put, because the blob store is
+configured separately and a relational change does not affect it; every `sha256` is
+instead checked against the destination blob store and reported when missing. **OAuth
+tokens** are skipped, because they are session state encrypted with `MCPFS_TOKEN_KEY` and
+copying ciphertext to a deployment with a different key would produce rows that never
+decrypt. A device flow re establishes them.
 
 ## Configuration
 
@@ -69,6 +116,26 @@ cp config/local.yaml.template config/local.yaml   # SQLite + local blobs, zero s
 cp config/minio.yaml.template config/local.yaml   # SQLite + MinIO/S3 blobs
 ```
 
+Each of the four relational stores is configured independently under `infra`, so you can
+move them one at a time:
+
+```yaml
+infra:
+  meta:                          # the per volume file tree
+    backend: postgres            # sqlite | postgres | sqlserver
+    dsn: "${MCPFS_META_DSN}"     # secret, required for a server engine
+    schema: mcpfs                # postgres only
+    pool: { max_connections: 20, acquire_timeout_secs: 10 }
+  admin: { backend: postgres, dsn: "${MCPFS_META_DSN}" }   # projects and ACL
+  git:   { backend: postgres, dsn: "${MCPFS_META_DSN}" }   # git index
+  oauth: { backend: sqlite }                               # OAuth tokens
+```
+
+Pointing several stores at one dsn is the expected setup: table names do not collide and
+one connection pool is shared. Misconfiguration fails at boot, not on first use: a missing
+dsn, a dsn set on a `sqlite` store, an unknown backend name, or a backend whose cargo
+feature was not compiled in are each rejected with the offending key named.
+
 `${VAR}` and `${VAR:-default}` are expanded from the environment before the YAML is
 parsed, so **secrets never live in a committed file**. Put them in a gitignored `.env`
 (template: `.env.example`), which `run.sh` sources:
@@ -78,21 +145,33 @@ parsed, so **secrets never live in a committed file**. Put them in a gitignored 
 | `MCPFS_MINIO_SECRET_KEY` | S3/MinIO secret key |
 | `MCPFS_GITHUB_CLIENT_SECRET` | GitHub App secret for the `git.auth` device flow |
 | `MCPFS_TOKEN_KEY` | 32 byte base64 key; when set, OAuth tokens are persisted encrypted (AES-256-GCM). Unset means in-memory only |
+| any name you pick | a store `dsn`, for example `${MCPFS_META_DSN}` |
+
+A dsn normally carries a password, so it is treated as a secret: the type redacts itself in
+both `Debug` and `Display`, and a test asserts it never reaches a log line, a boot banner
+or an error message.
 
 Full schema in [`.agent_docs/config.md`](.agent_docs/config.md).
 
 ## What lives where
 
-| Data | Backend | Location |
+| Data | Backend | Location under the SQLite default |
 |---|---|---|
-| File tree metadata | SQLite | `state/volumes/{project}.db` |
+| File tree metadata | `infra.meta` | `state/volumes/{project}.db` |
 | File bytes | local fs or S3 | `state/blobs/{bucket}/{sha[..2]}/{sha}` or bucket `mcpfs-{project}` |
-| Projects and ACL | SQLite | `state/admin.db` |
-| Git objects and refs | blob store + SQLite | key `git:{sha}`, `state/git/{project}.db` |
-| OAuth tokens (opt-in) | encrypted SQLite | `state/oauth.db` |
+| Projects and ACL | `infra.admin` | `state/admin.db` |
+| Git objects and refs | blob store + `infra.git` | key `git:{sha}`, `state/git/{project}.db` |
+| OAuth tokens (opt-in) | `infra.oauth`, encrypted | `state/oauth.db` |
+| Git working directories | always on disk | `state/git-repos/{project}/` |
 
-`state/` is the whole database. Back it up, and note that in MinIO mode the bytes live
-in the bucket while the metadata stays in `state/`: a project needs **both halves**.
+`state/` is the whole database under the default. Back it up, and note that in MinIO mode
+the bytes live in the bucket while the metadata stays in `state/`: a project needs **both
+halves**.
+
+On PostgreSQL or SQL Server one database holds every volume, discriminated by a
+`volume_id` column, since creating a database per project on the fly is not viable. Blob
+bytes never move into the relational database, and `state/git-repos/` stays on disk
+because libgit2 needs a real working directory.
 
 ## Security model
 
@@ -114,10 +193,30 @@ in the bucket while the metadata stays in `state/`: a project needs **both halve
 ```bash
 ./build.sh                       # cargo build --release
 ./test.sh                        # cargo test --workspace
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The suite is the quality gate and must be green before any commit.
+The suite is the quality gate and must be green before any commit. Use `--all-features` on
+clippy, otherwise the two optional drivers are never compiled and their warnings never
+surface.
+
+The default run needs no database and no Docker. To exercise PostgreSQL and SQL Server,
+bring the services up and pass their dsn; the cases skip themselves when the variables are
+absent:
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+
+MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
+MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
+  cargo test --workspace --all-features
+
+docker compose -f docker-compose.test.yml down -v
+```
+
+One conformance suite runs the same assertions against every engine, which is what proves a
+store behaves identically on all three. See
+[`.agent_docs/testing.md`](.agent_docs/testing.md).
 
 ## Interactive CLI agent
 
@@ -155,28 +254,31 @@ test: a wrong prompt width is a mistake at the call site, not in the width funct
 cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
 ```
 
-## Parity harness
+## Regression harness
 
-The objective judge of 1:1 parity. It replays a corpus of MCP and REST calls against a
-server and diffs against a golden capture of the C# reference:
+A 128 step corpus of MCP and REST calls, replayed against a running server and diffed
+against a golden capture. It was built as the 1:1 parity judge and is **no longer a gate**,
+since there is nothing left to be equal to; it is kept because the corpus covers the MCP
+surface, the REST plane and every error path more broadly than the unit tests do. Point it
+at a previous build to use it as a regression check:
 
 ```bash
-# capture from the reference implementation
 cargo run -p parity-harness -- capture \
-  --base http://127.0.0.1:5002 --token "$CS_TOKEN" \
-  --owner admin@example.com --out parity-golden.json
+  --base http://127.0.0.1:5002 --token "$TOKEN" \
+  --owner admin@example.com --out baseline.json
 
-# compare this implementation against it
+# change something, restart, then
 cargo run -p parity-harness -- compare \
-  --base http://127.0.0.1:5003 --token "$RUST_TOKEN" \
-  --owner admin@example.com --golden parity-golden.json
+  --base http://127.0.0.1:5002 --token "$TOKEN" \
+  --owner admin@example.com --golden baseline.json
 ```
 
 Volatile values (timestamps, version, host paths) are normalized, and an error text is
 reduced to `tool + ERR_* code` so a reworded message passes while a wrong code fails.
-`parity-golden.json` is the committed baseline.
+`parity-golden.json` is the committed C# baseline and still backs the tool schema equality
+tests.
 
-## Deliberate divergences from the C#
+## Divergences from the C# origin
 
 Each is a case where mirroring the reference would mirror a defect. The full table, with
 the harness step that proves each one, is in [`.agent_docs/parity.md`](.agent_docs/parity.md).
@@ -227,13 +329,18 @@ synced around libgit2 calls, with identical stored bytes.
 ## Not supported
 
 Audio and video extraction (needs a speech model) and legacy binary Office formats
-(`.doc`, `.xls`, `.ppt`), same as the reference. `object_format: sha256` is accepted and
-ignored: the bundled libgit2 is sha1 only.
+(`.doc`, `.xls`, `.ppt`). `object_format: sha256` is accepted and ignored: the bundled
+libgit2 is sha1 only.
+
+On the relational side: there is no online migration (`mcp-fs migrate` is offline, run with
+the server stopped) and no automated downgrade, since a database written by the current
+code carries a `volume_id` column older code does not know about. Blob bytes are never
+stored in the relational database.
 
 ## Documentation
 
 `AGENTS.md` is the compact index. Details live in [`.agent_docs/`](.agent_docs/):
-architecture, tools, api, git, config, testing, parity, agent.
+architecture, tools, api, git, config, backends, testing, parity, agent.
 
 ## License
 

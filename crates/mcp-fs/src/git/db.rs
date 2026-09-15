@@ -1,14 +1,25 @@
-//! Per project SQLite index for git metadata (objects, refs, remotes).
+//! Per project git index (objects, refs, remotes) on any [`RelationalDb`].
 //!
-//! Port of the C# `Git/SqliteGitDb.cs`. Same three tables, same column names and
-//! types, same statement semantics (`INSERT OR REPLACE` upserts), so a database
-//! written by either implementation is readable by the other.
+//! Rows carry a `volume_id` so one PostgreSQL or SQL Server database can hold the
+//! index of every project. Under SQLite there is still one file per project, at
+//! `state/git/{project_id}.db` (see `ServerConfig::git_db_path`), and the column
+//! is constant within it.
 //!
-//! Physical path: `state/git/{project_id}.db` (see `ServerConfig::git_db_path`).
+//! Object bytes are NOT here: they live in the blob store under `git:{sha}`. This
+//! table is an index over them, which is what makes a short sha lookup cheap.
 
 use crate::errors::Result;
-use crate::storage::sqlite::SqliteDb;
-use std::path::Path;
+use crate::storage::rel::dialect::{ColumnType, Upsert};
+use crate::storage::rel::schema::{Column, SchemaSet, Table};
+use crate::storage::rel::{Query, RelationalDb};
+use std::sync::Arc;
+
+/// A project id is at most 32 characters.
+const VOLUME_ID_LEN: u32 = 64;
+/// A hex sha256 is 64 characters; doubled so a longer digest still fits a key.
+const HASH_LEN: u32 = 128;
+/// Ref names are short in practice, but a tag can nest deeply.
+const REF_NAME_LEN: u32 = 400;
 
 /// One row of the `git_objects` index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,240 +38,290 @@ pub struct GitRefRow {
     pub symbolic: bool,
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS git_objects (
-    hash    TEXT PRIMARY KEY NOT NULL,
-    type    TEXT NOT NULL,
-    size    INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS git_refs (
-    name     TEXT PRIMARY KEY NOT NULL,
-    target   TEXT NOT NULL,
-    symbolic INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS git_remotes (
-    name TEXT PRIMARY KEY NOT NULL,
-    url  TEXT NOT NULL
-);
-";
+/// The tables this store owns, named once so a purge cannot miss one.
+pub const TABLES: [&str; 3] = ["git_objects", "git_refs", "git_remotes"];
 
-#[derive(Clone)]
-pub struct SqliteGitDb {
-    db: SqliteDb,
+/// The tables this store owns.
+pub fn schema() -> SchemaSet {
+    let volume = || Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN));
+    SchemaSet::new(
+        vec![
+            Table::new(
+                "git_objects",
+                vec![
+                    volume(),
+                    Column::required("hash", ColumnType::TextKey(HASH_LEN)),
+                    Column::required("type", ColumnType::Text),
+                    Column::required("size", ColumnType::BigInt),
+                ],
+                vec!["volume_id", "hash"],
+            ),
+            Table::new(
+                "git_refs",
+                vec![
+                    volume(),
+                    Column::required("name", ColumnType::TextKey(REF_NAME_LEN)),
+                    Column::required("target", ColumnType::Text),
+                    Column::required("symbolic", ColumnType::BigInt).default("0"),
+                ],
+                vec!["volume_id", "name"],
+            ),
+            Table::new(
+                "git_remotes",
+                vec![
+                    volume(),
+                    Column::required("name", ColumnType::TextKey(REF_NAME_LEN)),
+                    Column::required("url", ColumnType::Text),
+                ],
+                vec!["volume_id", "name"],
+            ),
+        ],
+        Vec::new(),
+    )
 }
 
-impl SqliteGitDb {
-    /// Open (creating the file and its parent directories) and apply the schema.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = SqliteDb::open(path)?;
-        db.execute_batch(SCHEMA)?;
-        Ok(Self { db })
+pub struct RelationalGitDb {
+    db: Arc<dyn RelationalDb>,
+    volume_id: String,
+}
+
+impl RelationalGitDb {
+    /// Apply the schema and return the index for one project.
+    pub async fn open(db: Arc<dyn RelationalDb>, volume_id: impl Into<String>) -> Result<Self> {
+        let me = Self { db, volume_id: volume_id.into() };
+        me.db.migrate(&schema()).await?;
+        Ok(me)
     }
 
-    /// In memory database, for tests.
-    pub fn open_in_memory() -> Result<Self> {
-        let db = SqliteDb::open_in_memory()?;
-        db.execute_batch(SCHEMA)?;
-        Ok(Self { db })
+    /// In memory SQLite index, for tests.
+    pub async fn open_in_memory() -> Result<Self> {
+        let db = Arc::new(crate::storage::rel::SqliteRelationalDb::open_in_memory()?);
+        Self::open(db, "test").await
+    }
+
+    pub fn volume_id(&self) -> &str {
+        &self.volume_id
+    }
+
+    /// Table names visible to this connection, for diagnostics and tests.
+    pub async fn table_names(&self) -> Result<Vec<String>> {
+        let rows = self.db.query(&Query::new(self.db.dialect().table_names_query())).await?;
+        rows.iter().map(|r| r.text(0)).collect()
+    }
+
+    fn upsert_sql(&self, table: &'static str, columns: Vec<&'static str>) -> String {
+        self.db
+            .dialect()
+            .render_upsert(&Upsert::replace(table, columns, vec!["volume_id", "name"]))
     }
 
     // ── objects ─────────────────────────────────────────────────────────────
 
     /// Index one object. `size` is the payload length, header excluded.
     pub async fn record_object(&self, hash: &str, kind: &str, size: i64) -> Result<()> {
-        let (hash, kind) = (hash.to_string(), kind.to_string());
+        let sql = self.db.dialect().render_upsert(&Upsert::replace(
+            "git_objects",
+            vec!["volume_id", "hash", "type", "size"],
+            vec!["volume_id", "hash"],
+        ));
         self.db
-            .run(move |tx| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO git_objects(hash, type, size) VALUES(?1, ?2, ?3)",
-                    (&hash, &kind, size),
-                )?;
-                Ok(())
-            })
-            .await
+            .execute(&Query::new(sql).bind(&self.volume_id).bind(hash).bind(kind).bind(size))
+            .await?;
+        Ok(())
     }
 
     pub async fn object_exists(&self, hash: &str) -> Result<bool> {
-        let hash = hash.to_string();
-        self.db
-            .run(move |tx| {
-                let n: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM git_objects WHERE hash=?1",
-                    [&hash],
-                    |r| r.get(0),
-                )?;
-                Ok(n > 0)
-            })
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT 1 FROM git_objects WHERE volume_id=?1 AND hash=?2")
+                    .bind(&self.volume_id)
+                    .bind(hash),
+            )
+            .await?;
+        Ok(row.is_some())
     }
 
     pub async fn get_object(&self, hash: &str) -> Result<Option<GitObjectRow>> {
-        let hash = hash.to_string();
-        self.db
-            .run(move |tx| {
-                let mut st = tx.prepare(
-                    "SELECT hash, type, size FROM git_objects WHERE hash=?1",
-                )?;
-                let mut rows = st.query([&hash])?;
-                match rows.next()? {
-                    Some(r) => Ok(Some(GitObjectRow {
-                        hash: r.get(0)?,
-                        kind: r.get(1)?,
-                        size: r.get(2)?,
-                    })),
-                    None => Ok(None),
-                }
-            })
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT hash, type, size FROM git_objects \
+                     WHERE volume_id=?1 AND hash=?2",
+                )
+                .bind(&self.volume_id)
+                .bind(hash),
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(Some(GitObjectRow {
+                hash: r.text(0)?,
+                kind: r.text(1)?,
+                size: r.i64(2)?,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Every indexed hash starting with `prefix`. Used for short sha resolution.
+    ///
+    /// The prefix is escaped: a sha is hex so it cannot hold a wildcard today, but
+    /// an unescaped `LIKE` argument is the bug this store just fixed elsewhere.
     pub async fn find_objects_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let like = format!("{prefix}%");
-        self.db
-            .run(move |tx| {
-                let mut st = tx.prepare(
-                    "SELECT hash FROM git_objects WHERE hash LIKE ?1 ORDER BY hash",
-                )?;
-                let rows = st.query_map([&like], |r| r.get::<_, String>(0))?;
-                let mut out = Vec::new();
-                for r in rows {
-                    out.push(r?);
-                }
-                Ok(out)
-            })
-            .await
+        let pattern = format!("{}%", self.db.dialect().escape_like_literal(prefix));
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT hash FROM git_objects \
+                     WHERE volume_id=?1 AND hash LIKE ?2 ESCAPE '\\' ORDER BY hash",
+                )
+                .bind(&self.volume_id)
+                .bind(pattern),
+            )
+            .await?;
+        rows.iter().map(|r| r.text(0)).collect()
     }
 
-    /// Full object index. Replaces the C# `ForEachObjectAsync` callback: returning
-    /// the rows keeps the SQLite lock short and lets the caller await freely.
+    /// Full object index. Returning rows keeps the database lock short and lets
+    /// the caller await freely.
     pub async fn list_objects(&self) -> Result<Vec<GitObjectRow>> {
-        self.db
-            .run(|tx| {
-                let mut st = tx.prepare("SELECT hash, type, size FROM git_objects")?;
-                let rows = st.query_map([], |r| {
-                    Ok(GitObjectRow { hash: r.get(0)?, kind: r.get(1)?, size: r.get(2)? })
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    out.push(r?);
-                }
-                Ok(out)
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT hash, type, size FROM git_objects WHERE volume_id=?1",
+                )
+                .bind(&self.volume_id),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(GitObjectRow { hash: r.text(0)?, kind: r.text(1)?, size: r.i64(2)? })
             })
-            .await
+            .collect()
     }
 
     pub async fn count_objects(&self) -> Result<i64> {
-        self.db
-            .run(|tx| Ok(tx.query_row("SELECT COUNT(*) FROM git_objects", [], |r| r.get(0))?))
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT COUNT(*) FROM git_objects WHERE volume_id=?1")
+                    .bind(&self.volume_id),
+            )
+            .await?;
+        match row {
+            Some(r) => r.i64(0),
+            None => Ok(0),
+        }
     }
 
     // ── refs ────────────────────────────────────────────────────────────────
 
     pub async fn get_ref(&self, name: &str) -> Result<Option<GitRefRow>> {
-        let name = name.to_string();
-        self.db
-            .run(move |tx| {
-                let mut st =
-                    tx.prepare("SELECT target, symbolic FROM git_refs WHERE name=?1")?;
-                let mut rows = st.query([&name])?;
-                match rows.next()? {
-                    Some(r) => Ok(Some(GitRefRow {
-                        name: name.clone(),
-                        target: r.get(0)?,
-                        symbolic: r.get::<_, i64>(1)? != 0,
-                    })),
-                    None => Ok(None),
-                }
-            })
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT target, symbolic FROM git_refs WHERE volume_id=?1 AND name=?2",
+                )
+                .bind(&self.volume_id)
+                .bind(name),
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(Some(GitRefRow {
+                name: name.to_string(),
+                target: r.text(0)?,
+                // Stored as an integer on every engine, so the boolean mapping
+                // stays here rather than in the value model.
+                symbolic: r.i64(1)? != 0,
+            })),
+            None => Ok(None),
+        }
     }
 
     pub async fn set_ref(&self, name: &str, target: &str, symbolic: bool) -> Result<()> {
-        let (name, target) = (name.to_string(), target.to_string());
+        let sql = self.upsert_sql("git_refs", vec!["volume_id", "name", "target", "symbolic"]);
         self.db
-            .run(move |tx| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO git_refs(name, target, symbolic) VALUES(?1, ?2, ?3)",
-                    (&name, &target, i64::from(symbolic)),
-                )?;
-                Ok(())
-            })
-            .await
+            .execute(
+                &Query::new(sql)
+                    .bind(&self.volume_id)
+                    .bind(name)
+                    .bind(target)
+                    .bind(i64::from(symbolic)),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn delete_ref(&self, name: &str) -> Result<()> {
-        let name = name.to_string();
         self.db
-            .run(move |tx| {
-                tx.execute("DELETE FROM git_refs WHERE name=?1", [&name])?;
-                Ok(())
-            })
-            .await
+            .execute(
+                &Query::new("DELETE FROM git_refs WHERE volume_id=?1 AND name=?2")
+                    .bind(&self.volume_id)
+                    .bind(name),
+            )
+            .await?;
+        Ok(())
     }
 
-    /// All refs ordered by name, exactly like the C# `ListRefsAsync`.
+    /// All refs ordered by name.
     pub async fn list_refs(&self) -> Result<Vec<GitRefRow>> {
-        self.db
-            .run(|tx| {
-                let mut st =
-                    tx.prepare("SELECT name, target, symbolic FROM git_refs ORDER BY name")?;
-                let rows = st.query_map([], |r| {
-                    Ok(GitRefRow {
-                        name: r.get(0)?,
-                        target: r.get(1)?,
-                        symbolic: r.get::<_, i64>(2)? != 0,
-                    })
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    out.push(r?);
-                }
-                Ok(out)
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT name, target, symbolic FROM git_refs \
+                     WHERE volume_id=?1 ORDER BY name",
+                )
+                .bind(&self.volume_id),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(GitRefRow {
+                    name: r.text(0)?,
+                    target: r.text(1)?,
+                    symbolic: r.i64(2)? != 0,
+                })
             })
-            .await
+            .collect()
     }
 
     // ── remotes ─────────────────────────────────────────────────────────────
 
     pub async fn add_remote(&self, name: &str, url: &str) -> Result<()> {
-        let (name, url) = (name.to_string(), url.to_string());
+        let sql = self.upsert_sql("git_remotes", vec!["volume_id", "name", "url"]);
         self.db
-            .run(move |tx| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO git_remotes(name, url) VALUES(?1, ?2)",
-                    (&name, &url),
-                )?;
-                Ok(())
-            })
-            .await
+            .execute(&Query::new(sql).bind(&self.volume_id).bind(name).bind(url))
+            .await?;
+        Ok(())
     }
 
     pub async fn remove_remote(&self, name: &str) -> Result<()> {
-        let name = name.to_string();
         self.db
-            .run(move |tx| {
-                tx.execute("DELETE FROM git_remotes WHERE name=?1", [&name])?;
-                Ok(())
-            })
-            .await
+            .execute(
+                &Query::new("DELETE FROM git_remotes WHERE volume_id=?1 AND name=?2")
+                    .bind(&self.volume_id)
+                    .bind(name),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn list_remotes(&self) -> Result<Vec<(String, String)>> {
-        self.db
-            .run(|tx| {
-                let mut st = tx.prepare("SELECT name, url FROM git_remotes ORDER BY name")?;
-                let rows = st.query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?;
-                let mut out = Vec::new();
-                for r in rows {
-                    out.push(r?);
-                }
-                Ok(out)
-            })
-            .await
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT name, url FROM git_remotes WHERE volume_id=?1 ORDER BY name",
+                )
+                .bind(&self.volume_id),
+            )
+            .await?;
+        rows.iter().map(|r| Ok((r.text(0)?, r.text(1)?))).collect()
     }
 }
 
@@ -268,29 +329,19 @@ impl SqliteGitDb {
 mod tests {
     use super::*;
 
-    async fn db() -> SqliteGitDb {
-        SqliteGitDb::open_in_memory().unwrap()
+    async fn db() -> RelationalGitDb {
+        RelationalGitDb::open_in_memory().await.unwrap()
     }
 
+    /// Introspection goes through the dialect instead of `sqlite_master`, which
+    /// only exists on one of the three engines.
     #[tokio::test]
-    async fn schema_has_the_three_csharp_tables() {
+    async fn schema_has_the_three_tables() {
         let d = db().await;
-        let names: Vec<String> = d
-            .db
-            .run(|tx| {
-                let mut st = tx.prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-                )?;
-                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
-                let mut v = Vec::new();
-                for r in rows {
-                    v.push(r?);
-                }
-                Ok(v)
-            })
-            .await
-            .unwrap();
-        assert_eq!(names, vec!["git_objects", "git_refs", "git_remotes"]);
+        assert_eq!(
+            d.table_names().await.unwrap(),
+            vec!["git_objects", "git_refs", "git_remotes"]
+        );
     }
 
     #[tokio::test]
@@ -420,14 +471,18 @@ mod tests {
     async fn state_survives_reopen_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("git").join("proj.db");
+        let open = |p: &std::path::Path| {
+            let db = crate::storage::rel::SqliteRelationalDb::open(p).unwrap();
+            RelationalGitDb::open(Arc::new(db), "proj")
+        };
         {
-            let d = SqliteGitDb::open(&path).unwrap();
+            let d = open(&path).await.unwrap();
             d.set_ref("HEAD", "refs/heads/main", true).await.unwrap();
             d.record_object("deadbeef", "commit", 120).await.unwrap();
         }
         assert!(path.exists(), "open must create the db file and its parents");
 
-        let d2 = SqliteGitDb::open(&path).unwrap();
+        let d2 = open(&path).await.unwrap();
         assert!(d2.get_ref("HEAD").await.unwrap().unwrap().symbolic);
         assert_eq!(d2.get_object("deadbeef").await.unwrap().unwrap().size, 120);
     }

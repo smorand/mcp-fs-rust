@@ -15,6 +15,7 @@ pub mod identity;
 pub mod keys;
 pub mod logging;
 pub mod mcp;
+pub mod migrate;
 pub mod safety;
 pub mod state;
 pub mod storage;

@@ -8,6 +8,7 @@
 //! straight into a file.
 
 use crate::config::ServerConfig;
+use crate::errors::ToolError;
 use crate::keys;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -19,12 +20,24 @@ pub const ENV_CONFIG: &str = "MCP_FS_CONFIG";
 pub const ENV_CONFIG_DIR: &str = "MCP_FS_CONFIG_DIR";
 /// Env var holding the config file stem (default `local`).
 pub const ENV_CONFIG_NAME: &str = "MCP_FS_CONFIG_NAME";
+/// XDG base directory for user configuration, when set.
+pub const ENV_XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
+/// Fallback base for the user config directory.
+pub const ENV_HOME: &str = "HOME";
+
+/// Our directory inside the XDG config home, and the file we look for there.
+pub const XDG_APP_DIR: &str = "mcp-fs";
+pub const XDG_CONFIG_FILE: &str = "config.yaml";
 
 const ABOUT: &str =
     "mcp-fs: filesystem MCP server (SQLite metadata, object store or local blobs)";
-const AFTER_HELP: &str = "Config resolution: --config, else MCP_FS_CONFIG, else \
-                          MCP_FS_CONFIG_DIR (default 'config') / MCP_FS_CONFIG_NAME \
-                          (default 'local').yaml";
+const AFTER_HELP: &str = "Config resolution, highest priority first:\n\
+     \x20 1. --config PATH (-c)\n\
+     \x20 2. $MCP_FS_CONFIG\n\
+     \x20 3. ~/.config/mcp-fs/config.yaml (honours $XDG_CONFIG_HOME), when it exists\n\
+     \x20 4. $MCP_FS_CONFIG_DIR (default 'config') / $MCP_FS_CONFIG_NAME (default 'local').yaml\n\
+     \nCases 1 and 2 are used as given, so a missing file is reported by name. Cases 3\n\
+     and 4 are probed, and when neither exists every path tried is listed.";
 
 #[derive(Debug, Parser)]
 #[command(name = "mcp-fs", version, about = ABOUT, after_help = AFTER_HELP)]
@@ -84,6 +97,18 @@ pub enum Command {
         #[arg(long, value_name = "SECONDS", default_value_t = keys::DEFAULT_TTL_SECONDS)]
         ttl: i64,
     },
+    /// Copy every relational row from one deployment's backends to another's.
+    ///
+    /// Offline: stop the server first. Blob bytes and OAuth tokens are not moved,
+    /// see the `migrate` module docs.
+    Migrate {
+        /// Config naming the backends to read from.
+        #[arg(long, value_name = "PATH")]
+        from: PathBuf,
+        /// Config naming the backends to write to.
+        #[arg(long, value_name = "PATH")]
+        to: PathBuf,
+    },
     /// Print the version and exit.
     Version,
 }
@@ -111,7 +136,21 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             cmd_token(&email, key.as_deref(), &issuer, &claim, ttl)
         }
         Command::Serve { config, git, web, context7, sqlite, db, doc } => cmd_serve(config.as_deref(), git, web, context7, sqlite, db, doc).await,
+        Command::Migrate { from, to } => cmd_migrate(&from, &to).await,
     }
+}
+
+async fn cmd_migrate(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+    crate::logging::init();
+    // Both configs are named explicitly: a migration that silently resolved one
+    // side from the environment could write to the wrong deployment.
+    let source = ServerConfig::load(from)?;
+    let dest = ServerConfig::load(to)?;
+    eprintln!("migrating {} -> {}", from.display(), to.display());
+    let report = crate::migrate::run(&source, &dest).await?;
+    // stdout carries the machine readable total, so the verb is usable in a script.
+    println!("{}", report.total_rows());
+    Ok(())
 }
 
 fn cmd_keys(dir: &std::path::Path) -> anyhow::Result<()> {
@@ -139,8 +178,7 @@ fn cmd_token(
 
 async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool, sqlite: bool, db: bool, doc: bool) -> anyhow::Result<()> {
     crate::logging::init();
-    let resolved = resolve_config_path(explicit);
-    let mut config = ServerConfig::load(&resolved)?;
+    let (mut config, resolved) = load_config(explicit)?;
     if git      { config.git.enabled = true; }
     if web      { config.web.enabled = true; }
     if context7 { config.context7.enabled = true; }
@@ -158,34 +196,89 @@ async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, con
     crate::app::serve(config).await
 }
 
-/// Config path resolution, mirroring the C# `ConfigLoader.ResolveConfigPath`:
-/// `--config`, else `MCP_FS_CONFIG`, else
+/// Config path resolution: `--config`, else `MCP_FS_CONFIG`, else
+/// `~/.config/mcp-fs/config.yaml` when it exists, else
 /// `{MCP_FS_CONFIG_DIR|config}/{MCP_FS_CONFIG_NAME|local}.yaml`.
-pub fn resolve_config_path(explicit: Option<&std::path::Path>) -> PathBuf {
-    resolve_config_path_with(explicit, |k| std::env::var(k).ok())
+///
+/// `Err` carries every path that was probed, for a boot message that says where
+/// to put the file instead of naming one location the user may not have expected.
+pub fn resolve_config_path(
+    explicit: Option<&std::path::Path>,
+) -> std::result::Result<PathBuf, Vec<PathBuf>> {
+    resolve_config_path_with(explicit, |k| std::env::var(k).ok(), |p| p.exists())
 }
 
-/// Same resolution with an injectable environment, so it is testable without
-/// mutating the process environment (which races across test threads).
+/// Same resolution with an injectable environment and an injectable existence
+/// probe, so precedence is testable without touching the process environment
+/// (which races across test threads) or the real filesystem.
 pub fn resolve_config_path_with(
     explicit: Option<&std::path::Path>,
     env: impl Fn(&str) -> Option<String>,
-) -> PathBuf {
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::result::Result<PathBuf, Vec<PathBuf>> {
     let non_blank = |v: String| {
         let t = v.trim().to_string();
         (!t.is_empty()).then_some(t)
     };
+
+    // An explicitly named file is authoritative even when absent: the caller asked
+    // for that path, so the not found error must name it rather than silently
+    // falling through to a different file.
     if let Some(p) = explicit
         && !p.as_os_str().is_empty()
     {
-        return p.to_path_buf();
+        return Ok(p.to_path_buf());
     }
     if let Some(v) = env(ENV_CONFIG).and_then(non_blank) {
-        return PathBuf::from(v);
+        return Ok(PathBuf::from(v));
     }
+
+    let mut tried = Vec::new();
+
+    // The user wide location, probed only: an absent file here is the normal case
+    // for a project local checkout and must not shadow the directory below.
+    if let Some(base) = env(ENV_XDG_CONFIG_HOME)
+        .and_then(non_blank)
+        .map(PathBuf::from)
+        .or_else(|| env(ENV_HOME).and_then(non_blank).map(|h| PathBuf::from(h).join(".config")))
+    {
+        let candidate = base.join(XDG_APP_DIR).join(XDG_CONFIG_FILE);
+        if exists(&candidate) {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
     let dir = env(ENV_CONFIG_DIR).and_then(non_blank).unwrap_or_else(|| "config".into());
     let name = env(ENV_CONFIG_NAME).and_then(non_blank).unwrap_or_else(|| "local".into());
-    PathBuf::from(dir).join(format!("{name}.yaml"))
+    let candidate = PathBuf::from(dir).join(format!("{name}.yaml"));
+    if exists(&candidate) {
+        return Ok(candidate);
+    }
+    tried.push(candidate);
+
+    Err(tried)
+}
+
+/// Resolve, then load, reporting every probed path when nothing was found.
+fn load_config(explicit: Option<&std::path::Path>) -> Result<(ServerConfig, PathBuf), ToolError> {
+    match resolve_config_path(explicit) {
+        Ok(path) => {
+            let config = ServerConfig::load(&path)?;
+            Ok((config, path))
+        }
+        Err(tried) => {
+            let list = tried
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(ToolError::invalid_argument(format!(
+                "no configuration file found, tried: {list}. \
+                 Pass --config PATH, set MCP_FS_CONFIG, or create one of those files"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -202,44 +295,149 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    #[test]
-    fn explicit_path_wins_over_everything() {
-        let p = resolve_config_path_with(Some(std::path::Path::new("/tmp/x.yaml")), |k| {
-            (k == ENV_CONFIG).then(|| "/env.yaml".to_string())
-        });
-        assert_eq!(p, PathBuf::from("/tmp/x.yaml"));
+    /// Every candidate exists, so each test below observes precedence alone.
+    fn all_exist(_: &std::path::Path) -> bool {
+        true
+    }
+
+    fn none_exist(_: &std::path::Path) -> bool {
+        false
     }
 
     #[test]
-    fn env_config_wins_over_the_dir_name_pair() {
-        let p = resolve_config_path_with(None, |k| match k {
-            ENV_CONFIG => Some("/env.yaml".into()),
-            ENV_CONFIG_DIR => Some("other".into()),
-            _ => None,
-        });
-        assert_eq!(p, PathBuf::from("/env.yaml"));
+    fn explicit_path_wins_over_everything() {
+        let p = resolve_config_path_with(
+            Some(std::path::Path::new("/tmp/x.yaml")),
+            |k| match k {
+                ENV_CONFIG => Some("/env.yaml".to_string()),
+                ENV_HOME => Some("/home/me".to_string()),
+                _ => None,
+            },
+            all_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/tmp/x.yaml"));
+    }
+
+    /// An explicitly named file is used even when absent, so the not found error
+    /// names the path the caller actually asked for.
+    #[test]
+    fn explicit_path_is_used_even_when_it_does_not_exist() {
+        let p = resolve_config_path_with(
+            Some(std::path::Path::new("/tmp/absent.yaml")),
+            no_env,
+            none_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/tmp/absent.yaml"));
+    }
+
+    #[test]
+    fn env_config_wins_over_xdg_and_the_dir_name_pair() {
+        let p = resolve_config_path_with(
+            None,
+            |k| match k {
+                ENV_CONFIG => Some("/env.yaml".into()),
+                ENV_CONFIG_DIR => Some("other".into()),
+                ENV_XDG_CONFIG_HOME => Some("/xdg".into()),
+                _ => None,
+            },
+            all_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/env.yaml"));
+    }
+
+    #[test]
+    fn env_config_is_used_even_when_it_does_not_exist() {
+        let p = resolve_config_path_with(
+            None,
+            |k| (k == ENV_CONFIG).then(|| "/env.yaml".to_string()),
+            none_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/env.yaml"));
+    }
+
+    #[test]
+    fn xdg_config_home_is_probed_before_the_dir_name_pair() {
+        let p = resolve_config_path_with(
+            None,
+            |k| (k == ENV_XDG_CONFIG_HOME).then(|| "/xdg".to_string()),
+            all_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/xdg/mcp-fs/config.yaml"));
+    }
+
+    #[test]
+    fn home_supplies_the_xdg_base_when_the_variable_is_unset() {
+        let p = resolve_config_path_with(
+            None,
+            |k| (k == ENV_HOME).then(|| "/home/me".to_string()),
+            all_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/home/me/.config/mcp-fs/config.yaml"));
+    }
+
+    /// The new step must not shadow a project local checkout, which is the common
+    /// case: no user wide file, so the directory pair still wins.
+    #[test]
+    fn an_absent_xdg_file_falls_through_to_the_dir_name_pair() {
+        let p = resolve_config_path_with(
+            None,
+            |k| (k == ENV_HOME).then(|| "/home/me".to_string()),
+            |path| path == std::path::Path::new("config/local.yaml"),
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("config/local.yaml"));
     }
 
     #[test]
     fn dir_and_name_compose_the_default() {
-        assert_eq!(resolve_config_path_with(None, no_env), PathBuf::from("config/local.yaml"));
-        let p = resolve_config_path_with(None, |k| match k {
-            ENV_CONFIG_DIR => Some("/etc/mcpfs".into()),
-            ENV_CONFIG_NAME => Some("prod".into()),
-            _ => None,
-        });
-        assert_eq!(p, PathBuf::from("/etc/mcpfs/prod.yaml"));
+        assert_eq!(
+            resolve_config_path_with(None, no_env, all_exist).unwrap(),
+            PathBuf::from("config/local.yaml")
+        );
+        let p = resolve_config_path_with(
+            None,
+            |k| match k {
+                ENV_CONFIG_DIR => Some("/etc/mcpfs".into()),
+                ENV_CONFIG_NAME => Some("prod".into()),
+                _ => None,
+            },
+            all_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("/etc/mcpfs/prod.yaml"));
     }
 
     #[test]
     fn blank_env_values_fall_back_to_defaults() {
-        let p = resolve_config_path_with(None, |k| match k {
-            ENV_CONFIG => Some("   ".into()),
-            ENV_CONFIG_DIR => Some("".into()),
-            ENV_CONFIG_NAME => Some(" ".into()),
-            _ => None,
-        });
-        assert_eq!(p, PathBuf::from("config/local.yaml"));
+        let p = resolve_config_path_with(
+            None,
+            |k| match k {
+                ENV_CONFIG => Some("   ".into()),
+                ENV_CONFIG_DIR => Some("".into()),
+                ENV_CONFIG_NAME => Some(" ".into()),
+                ENV_XDG_CONFIG_HOME => Some("  ".into()),
+                _ => None,
+            },
+            all_exist,
+        );
+        assert_eq!(p.unwrap(), PathBuf::from("config/local.yaml"));
+    }
+
+    /// With nothing on disk the caller gets every probed path, so the boot message
+    /// can tell the operator where the file may live.
+    #[test]
+    fn nothing_found_reports_every_path_tried() {
+        let tried = resolve_config_path_with(
+            None,
+            |k| (k == ENV_HOME).then(|| "/home/me".to_string()),
+            none_exist,
+        )
+        .expect_err("no candidate exists");
+        assert_eq!(
+            tried,
+            vec![
+                PathBuf::from("/home/me/.config/mcp-fs/config.yaml"),
+                PathBuf::from("config/local.yaml"),
+            ]
+        );
     }
 
     #[test]

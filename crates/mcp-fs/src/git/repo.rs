@@ -4,7 +4,7 @@
 //! cached in process:
 //!
 //! ```text
-//! state/git/{project_id}.db       SqliteGitDb (refs, objects index, remotes)
+//! state/git/{project_id}.db       RelationalGitDb (refs, objects index, remotes)
 //! state/git-repos/{project_id}/   bare libgit2 directory (HEAD, config, hooks)
 //! ```
 //!
@@ -24,7 +24,7 @@
 
 use crate::config::ServerConfig;
 use crate::errors::{Result, ToolError};
-use crate::git::db::SqliteGitDb;
+use crate::git::db::RelationalGitDb;
 use crate::git::odb::BlobObjectDb;
 use crate::storage::BlobBackend;
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub struct GitRepoEntry {
     pub project_id: String,
     /// libgit2 handle. `git2::Repository` is `Send` but not `Sync`, hence the mutex.
     pub repo: Mutex<git2::Repository>,
-    pub db: Arc<SqliteGitDb>,
+    pub db: Arc<RelationalGitDb>,
     pub objects: Arc<BlobObjectDb>,
     pub blobs: Arc<dyn BlobBackend>,
     /// Held for the whole of a push, so two concurrent `git-receive-pack` calls
@@ -47,13 +47,19 @@ pub struct GitRepoEntry {
 pub struct GitRepoStore {
     config: Arc<ServerConfig>,
     entries: Mutex<HashMap<String, Arc<GitRepoEntry>>>,
+    /// Shared so every project's index reuses one connection pool.
+    registry: crate::storage::RelationalRegistry,
 }
 
 static SHARED: OnceLock<Arc<GitRepoStore>> = OnceLock::new();
 
 impl GitRepoStore {
     pub fn new(config: Arc<ServerConfig>) -> Self {
-        Self { config, entries: Mutex::new(HashMap::new()) }
+        Self {
+            config,
+            entries: Mutex::new(HashMap::new()),
+            registry: crate::storage::RelationalRegistry::new(),
+        }
     }
 
     /// The process wide instance, matching the C# DI singleton. The composition
@@ -107,7 +113,9 @@ impl GitRepoStore {
                 return true;
             }
         }
-        self.config.git_db_path(project_id).exists()
+        // The bare repository directory exists on every backend, whereas the index
+        // is a file only under SQLite, so this is the portable signal.
+        self.config.git_repo_dir(project_id).exists()
     }
 
     /// Drop the in process entry, leaving the on disk state alone (C# parity).
@@ -117,25 +125,35 @@ impl GitRepoStore {
         Ok(())
     }
 
-    /// Drop the entry and delete the on disk state (index db plus bare repo dir).
+    /// Drop the entry and delete the state (index plus bare repo dir).
     /// Git objects live in the volume's blob bucket, removed by the volume teardown.
     pub async fn purge_repo(&self, project_id: &str) -> Result<()> {
         self.teardown_repo(project_id).await?;
-        let db = self.config.git_db_path(project_id);
-        for suffix in ["", "-wal", "-shm"] {
-            let p = if suffix.is_empty() {
-                db.clone()
-            } else {
-                std::path::PathBuf::from(format!("{}{}", db.display(), suffix))
-            };
-            let _ = tokio::fs::remove_file(&p).await;
+
+        if self.config.infra.git.backend == crate::config::backend::SQLITE {
+            // The index is a file, so removing it removes every row with it.
+            let db = self.config.git_db_path(project_id);
+            for suffix in ["", "-wal", "-shm"] {
+                let p = if suffix.is_empty() {
+                    db.clone()
+                } else {
+                    std::path::PathBuf::from(format!("{}{}", db.display(), suffix))
+                };
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+        } else {
+            // On a shared database the index is a set of rows. Skipping this would
+            // let a project recreated under the same id inherit the old refs and
+            // object index, which is the defect this function exists to prevent.
+            crate::storage::purge_git_rows(&self.config, &self.registry, project_id).await?;
         }
+
         let _ = tokio::fs::remove_dir_all(self.config.git_repo_dir(project_id)).await;
         Ok(())
     }
 
     /// The metadata index for a project, opening it if needed.
-    pub async fn get_db(&self, project_id: &str) -> Result<Arc<SqliteGitDb>> {
+    pub async fn get_db(&self, project_id: &str) -> Result<Arc<RelationalGitDb>> {
         Ok(self.get_or_open_repo(project_id).await?.db.clone())
     }
 
@@ -153,7 +171,6 @@ impl GitRepoStore {
 
     async fn create_entry(&self, project_id: &str, init: bool) -> Result<Arc<GitRepoEntry>> {
         let repo_dir = self.config.git_repo_dir(project_id);
-        let db_path = self.config.git_db_path(project_id);
 
         tokio::fs::create_dir_all(&repo_dir).await?;
 
@@ -167,7 +184,10 @@ impl GitRepoStore {
                 .map_err(|e| ToolError::internal(format!("git open failed: {e}")))?
         };
 
-        let db = Arc::new(SqliteGitDb::open(&db_path)?);
+        // Through the factory, so `infra.git.backend` actually selects the engine.
+        // This used to open a SQLite file directly, which made the git index the
+        // one piece of relational state the configuration could not move.
+        let db = crate::storage::build_git_db(&self.config, &self.registry, project_id).await?;
         let blobs = crate::storage::build_blob_store(&self.config, project_id)?;
         blobs.ensure_bucket().await?;
         let objects = Arc::new(BlobObjectDb::new(blobs.clone(), db.clone()));

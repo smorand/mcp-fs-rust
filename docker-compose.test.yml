@@ -1,0 +1,51 @@
+# Databases for the opt-in relational integration tests.
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
+#   MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
+#     cargo test --workspace --all-features
+#   docker compose -f docker-compose.test.yml down -v
+#
+# Without those variables the tests skip themselves, so `cargo test --workspace`
+# stays green with no Docker installed. Ports are unusual on purpose, so this never
+# collides with a real PostgreSQL on 5432 or SQL Server on 1433.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mcpfs
+      POSTGRES_PASSWORD: mcpfs
+      POSTGRES_DB: mcpfs
+    ports:
+      - "55432:5432"
+    # The tests connect immediately, so readiness has to be observable.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcpfs -d mcpfs"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    tmpfs:
+      # Throwaway data: no volume to clean up, and a faster test run.
+      - /var/lib/postgresql/data
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      # Must satisfy the SQL Server password policy or the container exits at boot.
+      MSSQL_SA_PASSWORD: "mcpfs_Passw0rd"
+      MSSQL_PID: Developer
+    ports:
+      - "51433:1433"
+    # SQL Server takes tens of seconds before it accepts logins, far longer than
+    # PostgreSQL, so the probe has a much longer runway before it gives up.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s

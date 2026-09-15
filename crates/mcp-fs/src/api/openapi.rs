@@ -1204,7 +1204,9 @@ mod tests {
         config.git.enabled = git;
         let config = Arc::new(config);
 
-        let admin = crate::storage::build_admin_store(&config).unwrap();
+        let registry = crate::storage::RelationalRegistry::new();
+            let admin =
+                crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
 
         let mut registry = ToolRegistry::new();

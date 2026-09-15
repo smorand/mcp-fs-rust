@@ -133,7 +133,7 @@ async fn info_refs(
     }
 
     if let Err(resp) = gate(&st, &mount_id, &headers, is_upload).await {
-        return resp;
+        return *resp;
     }
 
     let entry = match st.git.get_or_open_repo(&mount_id).await {
@@ -169,7 +169,7 @@ async fn upload_pack(
     body: Bytes,
 ) -> Response {
     if let Err(resp) = gate(&st, &mount_id, &headers, true).await {
-        return resp;
+        return *resp;
     }
     let entry = match st.git.get_or_open_repo(&mount_id).await {
         Ok(e) => e,
@@ -190,7 +190,7 @@ async fn receive_pack(
 ) -> Response {
     // Push always needs an identity: anonymous_read is read only, by definition.
     if let Err(resp) = gate(&st, &mount_id, &headers, false).await {
-        return resp;
+        return *resp;
     }
     let max = max_pack_bytes(&st.app);
     if body.len() > max {
@@ -241,7 +241,7 @@ async fn gate(
     mount_id: &str,
     headers: &HeaderMap,
     is_read: bool,
-) -> std::result::Result<Option<String>, Response> {
+) -> std::result::Result<Option<String>, Box<Response>> {
     let person = st.app.identity.resolve(|name| header_value(headers, name)).ok();
 
     match &person {
@@ -252,23 +252,23 @@ async fn gate(
                     header::WWW_AUTHENTICATE,
                     header::HeaderValue::from_static("Bearer realm=\"mcp-fs\""),
                 );
-                return Err(resp);
+                return Err(Box::new(resp));
             }
         }
         Some(p) => {
             // Not in the C#: a verified token alone used to grant access to every
             // project. Git traffic is project data, so it needs membership.
             if let Err(e) = st.app.admin.require_member(mount_id, p).await {
-                return Err(error_response(&e));
+                return Err(Box::new(error_response(&e)));
             }
         }
     }
 
     if !st.git.is_initialized(mount_id).await {
-        return Err(text(
+        return Err(Box::new(text(
             StatusCode::NOT_FOUND,
             &format!("repository '{mount_id}' not found"),
-        ));
+        )));
     }
     Ok(person)
 }
@@ -1128,7 +1128,9 @@ mod tests {
         c.git.max_pack_size_mb = max_pack_mb;
         let config = Arc::new(c);
 
-        let admin = crate::storage::build_admin_store(&config).unwrap();
+        let registry = crate::storage::RelationalRegistry::new();
+            let admin =
+                crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "owner@test.com").await.unwrap();
 
@@ -1229,7 +1231,9 @@ mod tests {
         c.auth.jwt.public_key_path = pub_path.display().to_string();
         let config = Arc::new(c);
 
-        let admin = crate::storage::build_admin_store(&config).unwrap();
+        let registry = crate::storage::RelationalRegistry::new();
+            let admin =
+                crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "owner@test.com").await.unwrap();
         let app = Arc::new(crate::state::AppState {

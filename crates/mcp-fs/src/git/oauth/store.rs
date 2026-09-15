@@ -11,7 +11,7 @@
 use crate::config::ServerConfig;
 use crate::errors::Result;
 use crate::git::oauth::cipher;
-use crate::git::oauth::persistence::SqliteOAuthPersistence;
+use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -59,7 +59,7 @@ struct Entry {
 
 pub struct OAuthTokenStore {
     sessions: RwLock<HashMap<String, Entry>>,
-    persistence: Option<Arc<SqliteOAuthPersistence>>,
+    persistence: Option<Arc<RelationalOAuthPersistence>>,
 }
 
 fn key(person: &str, provider: &str) -> String {
@@ -79,9 +79,11 @@ impl OAuthTokenStore {
     }
 
     /// Store backed by encrypted persistence, preloaded from it.
-    pub fn with_persistence(persistence: Arc<SqliteOAuthPersistence>) -> Result<Self> {
+    pub async fn with_persistence(
+        persistence: Arc<RelationalOAuthPersistence>,
+    ) -> Result<Self> {
         let mut sessions = HashMap::new();
-        for (person, provider, session) in persistence.load_all()? {
+        for (person, provider, session) in persistence.load_all().await? {
             sessions.insert(
                 key(&person, &provider),
                 Entry { person, provider, session },
@@ -93,12 +95,16 @@ impl OAuthTokenStore {
     /// The composition root entry point: persistent when `MCPFS_TOKEN_KEY` is set
     /// and decodes to 32 bytes, memory only otherwise. A malformed key is an error
     /// rather than a silent downgrade, so a typo cannot quietly lose tokens.
-    pub fn from_env(config: &ServerConfig) -> Result<Self> {
+    pub async fn from_env(config: &ServerConfig) -> Result<Self> {
         match std::env::var(TOKEN_KEY_ENV) {
             Ok(raw) if !raw.trim().is_empty() => {
                 let k = cipher::decode_key(&raw)?;
-                let p = SqliteOAuthPersistence::open(config.oauth_db_path(), k)?;
-                Self::with_persistence(Arc::new(p))
+                // The registry is local: this runs once at startup, so there is
+                // no pool to share with a later caller.
+                let registry = crate::storage::RelationalRegistry::new();
+                let p =
+                    crate::storage::build_oauth_persistence(config, &registry, k).await?;
+                Self::with_persistence(p).await
             }
             _ => Ok(Self::new()),
         }
@@ -109,7 +115,7 @@ impl OAuthTokenStore {
         self.persistence.is_some()
     }
 
-    pub fn store_token(
+    pub async fn store_token(
         &self,
         person: &str,
         provider: &str,
@@ -137,7 +143,7 @@ impl OAuthTokenStore {
             );
         }
         if let Some(p) = &self.persistence {
-            p.upsert(person, provider, &session)?;
+            p.upsert(person, provider, &session).await?;
         }
         Ok(())
     }
@@ -147,7 +153,7 @@ impl OAuthTokenStore {
         guard.get(&key(person, provider)).map(|e| e.session.clone())
     }
 
-    pub fn revoke_token(&self, person: &str, provider: &str) -> Result<()> {
+    pub async fn revoke_token(&self, person: &str, provider: &str) -> Result<()> {
         let removed = {
             let mut guard = self.sessions.write().expect("token store lock poisoned");
             guard.remove(&key(person, provider))
@@ -155,8 +161,8 @@ impl OAuthTokenStore {
         if let Some(p) = &self.persistence {
             // Delete with the stored casing when known, so the row really goes.
             match &removed {
-                Some(e) => p.delete(&e.person, &e.provider)?,
-                None => p.delete(person, provider)?,
+                Some(e) => p.delete(&e.person, &e.provider).await?,
+                None => p.delete(person, provider).await?,
             }
         }
         Ok(())
@@ -196,8 +202,8 @@ mod tests {
         OAuthTokenStore::new()
     }
 
-    #[test]
-    fn store_then_get() {
+    #[tokio::test]
+    async fn store_then_get() {
         let s = store();
         s.store_token(
             "alice@test.com",
@@ -206,7 +212,7 @@ mod tests {
             vec!["repo".into()],
             future(),
             None,
-        )
+        ).await
         .unwrap();
         let got = s.get_token("alice@test.com", "github").unwrap();
         assert_eq!(got.access_token, "gho_1");
@@ -216,10 +222,10 @@ mod tests {
         assert!(!s.is_persistent());
     }
 
-    #[test]
-    fn keying_is_caseless_on_both_parts() {
+    #[tokio::test]
+    async fn keying_is_caseless_on_both_parts() {
         let s = store();
-        s.store_token("Alice@Test.COM", "GitHub", "tok", vec![], future(), None).unwrap();
+        s.store_token("Alice@Test.COM", "GitHub", "tok", vec![], future(), None).await.unwrap();
         assert!(s.get_token("alice@test.com", "github").is_some());
         assert!(s.get_token("ALICE@TEST.COM", "GITHUB").is_some());
         assert!(s.get_token("alice@test.com", "gitlab").is_none());
@@ -227,19 +233,19 @@ mod tests {
         assert_eq!(key("A@B.C", "GitHub"), "a@b.c:github");
     }
 
-    #[test]
-    fn store_overwrites_the_same_key_regardless_of_casing() {
+    #[tokio::test]
+    async fn store_overwrites_the_same_key_regardless_of_casing() {
         let s = store();
-        s.store_token("a@t.c", "github", "first", vec![], future(), None).unwrap();
-        s.store_token("A@T.C", "GITHUB", "second", vec![], future(), None).unwrap();
+        s.store_token("a@t.c", "github", "first", vec![], future(), None).await.unwrap();
+        s.store_token("A@T.C", "GITHUB", "second", vec![], future(), None).await.unwrap();
         assert_eq!(s.get_token("a@t.c", "github").unwrap().access_token, "second");
         assert_eq!(s.list_ids().len(), 1);
     }
 
-    #[test]
-    fn providers_are_independent() {
+    #[tokio::test]
+    async fn providers_are_independent() {
         let s = store();
-        s.store_token("a@t.c", "github", "gh", vec![], future(), None).unwrap();
+        s.store_token("a@t.c", "github", "gh", vec![], future(), None).await.unwrap();
         s.store_token(
             "a@t.c",
             "gitlab",
@@ -247,7 +253,7 @@ mod tests {
             vec!["api".into()],
             future(),
             Some("https://gitlab.example.test".into()),
-        )
+        ).await
         .unwrap();
         assert_eq!(s.get_token("a@t.c", "github").unwrap().access_token, "gh");
         let gl = s.get_token("a@t.c", "gitlab").unwrap();
@@ -258,29 +264,29 @@ mod tests {
         ]);
     }
 
-    #[test]
-    fn has_valid_token_respects_expiry() {
+    #[tokio::test]
+    async fn has_valid_token_respects_expiry() {
         let s = store();
-        s.store_token("a@t.c", "github", "fresh", vec![], future(), None).unwrap();
+        s.store_token("a@t.c", "github", "fresh", vec![], future(), None).await.unwrap();
         assert!(s.has_valid_token("a@t.c", "github"));
         assert!(s.has_valid_token("A@T.C", "GitHub"), "expiry check is caseless too");
 
-        s.store_token("b@t.c", "github", "stale", vec![], past(), None).unwrap();
+        s.store_token("b@t.c", "github", "stale", vec![], past(), None).await.unwrap();
         assert!(!s.has_valid_token("b@t.c", "github"));
         // an expired session is still retrievable, only "valid" is false
         assert_eq!(s.get_token("b@t.c", "github").unwrap().access_token, "stale");
         assert!(!s.has_valid_token("nobody@t.c", "github"));
     }
 
-    #[test]
-    fn revoke_removes_the_session() {
+    #[tokio::test]
+    async fn revoke_removes_the_session() {
         let s = store();
-        s.store_token("a@t.c", "github", "tok", vec![], future(), None).unwrap();
-        s.revoke_token("A@T.C", "GITHUB").unwrap();
+        s.store_token("a@t.c", "github", "tok", vec![], future(), None).await.unwrap();
+        s.revoke_token("A@T.C", "GITHUB").await.unwrap();
         assert!(s.get_token("a@t.c", "github").is_none());
         assert!(!s.has_valid_token("a@t.c", "github"));
         // revoking twice is a no-op
-        s.revoke_token("a@t.c", "github").unwrap();
+        s.revoke_token("a@t.c", "github").await.unwrap();
     }
 
     #[test]
@@ -297,15 +303,24 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
     }
 
-    #[test]
-    fn persistent_store_loads_and_writes_through() {
+    /// SQLite backed persistence at a real path, so a restart can be simulated.
+    async fn open_persistence(
+        path: &std::path::Path,
+        k: [u8; cipher::KEY_SIZE],
+    ) -> Arc<RelationalOAuthPersistence> {
+        let db = Arc::new(crate::storage::rel::SqliteRelationalDb::open(path).unwrap());
+        Arc::new(RelationalOAuthPersistence::open(db, k).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn persistent_store_loads_and_writes_through() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state/oauth.db");
         let k = [42u8; cipher::KEY_SIZE];
 
         {
-            let p = Arc::new(SqliteOAuthPersistence::open(&path, k).unwrap());
-            let s = OAuthTokenStore::with_persistence(p).unwrap();
+            let p = open_persistence(&path, k).await;
+            let s = OAuthTokenStore::with_persistence(p).await.unwrap();
             assert!(s.is_persistent());
             s.store_token(
                 "Alice@Test.com",
@@ -314,13 +329,13 @@ mod tests {
                 vec!["repo".into()],
                 future(),
                 None,
-            )
+            ).await
             .unwrap();
         }
 
         // a restart must find the session again, keyed caselessly
-        let p2 = Arc::new(SqliteOAuthPersistence::open(&path, k).unwrap());
-        let s2 = OAuthTokenStore::with_persistence(p2.clone()).unwrap();
+        let p2 = open_persistence(&path, k).await;
+        let s2 = OAuthTokenStore::with_persistence(p2.clone()).await.unwrap();
         let got = s2.get_token("alice@test.com", "GITHUB").unwrap();
         assert_eq!(got.access_token, "gho_persisted");
         assert!(s2.has_valid_token("alice@test.com", "github"));
@@ -331,20 +346,20 @@ mod tests {
         );
 
         // revoke must clear the row too
-        s2.revoke_token("alice@test.com", "github").unwrap();
-        assert_eq!(p2.count().unwrap(), 0);
-        let s3 = OAuthTokenStore::with_persistence(p2).unwrap();
+        s2.revoke_token("alice@test.com", "github").await.unwrap();
+        assert_eq!(p2.count().await.unwrap(), 0);
+        let s3 = OAuthTokenStore::with_persistence(p2).await.unwrap();
         assert!(s3.get_token("alice@test.com", "github").is_none());
     }
 
-    #[test]
-    fn from_env_is_memory_only_without_a_key() {
+    #[tokio::test]
+    async fn from_env_is_memory_only_without_a_key() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = ServerConfig::default();
         c.infra.meta.dir = dir.path().join("state/volumes").display().to_string();
         // The env var is process wide, so assert on the absent case only when unset.
         if std::env::var(TOKEN_KEY_ENV).is_err() {
-            let s = OAuthTokenStore::from_env(&c).unwrap();
+            let s = OAuthTokenStore::from_env(&c).await.unwrap();
             assert!(!s.is_persistent());
             assert!(!dir.path().join("state/oauth.db").exists());
         }

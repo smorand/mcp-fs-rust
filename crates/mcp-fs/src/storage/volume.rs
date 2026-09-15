@@ -211,18 +211,18 @@ impl VolumeClient {
 mod tests {
     use super::*;
     use crate::storage::blob::local::LocalBlobStore;
-    use crate::storage::meta::SqliteMetaStore;
+    use crate::storage::meta::RelationalMetaStore;
 
-    fn vol() -> (tempfile::TempDir, VolumeClient) {
+    async fn vol() -> (tempfile::TempDir, VolumeClient) {
         let d = tempfile::tempdir().unwrap();
-        let meta = Arc::new(SqliteMetaStore::in_memory().unwrap());
+        let meta = Arc::new(RelationalMetaStore::in_memory("test").await.unwrap());
         let blob = Arc::new(LocalBlobStore::new(d.path(), "mcpfs-test"));
         (d, VolumeClient::new("test", meta, blob))
     }
 
     #[tokio::test]
     async fn write_then_read_roundtrip() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/a.txt", "hello").await.unwrap();
         assert_eq!(v.read_text("/a.txt").await.unwrap(), "hello");
         let n = v.stat("/a.txt").await.unwrap();
@@ -241,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_file_stores_no_blob() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.create_empty("/e.txt").await.unwrap();
         let n = v.stat("/e.txt").await.unwrap();
         assert_eq!(n.sha256, None);
@@ -251,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn identical_content_shares_one_blob() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/a.txt", "same").await.unwrap();
         v.write_text_atomic("/b.txt", "same").await.unwrap();
         let sha = VolumeClient::sha256_hex(b"same");
@@ -268,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_gcs_the_replaced_blob() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/a.txt", "old").await.unwrap();
         let old_sha = VolumeClient::sha256_hex(b"old");
         v.write_text_atomic("/a.txt", "new").await.unwrap();
@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_is_metadata_only() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/a.txt", "payload").await.unwrap();
         v.copy_file("/a.txt", "/b.txt").await.unwrap();
         let a = v.stat("/a.txt").await.unwrap();
@@ -293,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_range_slices() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/r.txt", "0123456789").await.unwrap();
         assert_eq!(v.read_range("/r.txt", 0, 4).await.unwrap(), b"0123");
         assert_eq!(v.read_range("/r.txt", 4, 3).await.unwrap(), b"456");
@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_tree_removes_everything_and_gcs() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/d/a.txt", "1").await.unwrap();
         v.write_text_atomic("/d/sub/b.txt", "2").await.unwrap();
         let sha1 = VolumeClient::sha256_hex(b"1");
@@ -313,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_tree_recreates_structure() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/s/a.txt", "1").await.unwrap();
         v.write_text_atomic("/s/sub/b.txt", "2").await.unwrap();
         v.copy_tree("/s", "/t").await.unwrap();
@@ -324,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn walk_reports_dirs_and_files() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/w/a.txt", "1").await.unwrap();
         v.write_text_atomic("/w/sub/b.txt", "2").await.unwrap();
         let walked = v.walk("/w").await.unwrap();
@@ -337,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn reading_a_directory_is_an_error() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.mkdir("/d").await.unwrap();
         let e = v.read_bytes("/d").await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
@@ -345,14 +345,14 @@ mod tests {
 
     #[tokio::test]
     async fn stat_missing_is_not_found() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         let e = v.stat("/nope").await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn rename_moves_file() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/a.txt", "x").await.unwrap();
         v.rename("/a.txt", "/b.txt").await.unwrap();
         assert!(!v.exists("/a.txt").await.unwrap());

@@ -1,227 +1,391 @@
-//! SQLite metadata backend: the directory tree plus blob reference counts.
-//! One database file per volume. 1:1 port of the C# `Storage/SqliteMetaStore.cs`
-//! including the exact schema, so a volume written by either implementation is
-//! readable by the other. This store never touches bytes.
+//! Metadata backend: the directory tree plus blob reference counts.
+//!
+//! Storage is any [`RelationalDb`], so the engine is a configuration choice. Rows
+//! carry a `volume_id` discriminator: under SQLite there is still one database
+//! file per volume and the column is constant, while a single PostgreSQL or SQL
+//! Server database can hold every volume without a database per project.
+//!
+//! This store never touches bytes. It hands back the sha of a blob whose refcount
+//! reached zero and the caller garbage collects it.
 
 use crate::errors::{Result, ToolError};
-use crate::storage::sqlite::SqliteDb;
+use crate::storage::rel::dialect::{Assign, ColumnType, Upsert};
+use crate::storage::rel::schema::{Column, Index, SchemaSet, Table};
+use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
 use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow};
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
-use rusqlite::{Row, Transaction};
-use std::path::Path;
+use std::sync::Arc;
 
-const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS nodes (
-        path   TEXT PRIMARY KEY,
-        parent TEXT,
-        name   TEXT NOT NULL,
-        kind   TEXT NOT NULL,
-        size   INTEGER NOT NULL DEFAULT 0,
-        mode   INTEGER NOT NULL,
-        mtime  REAL NOT NULL,
-        ctime  REAL NOT NULL,
-        atime  REAL NOT NULL,
-        sha256 TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent);
-    CREATE TABLE IF NOT EXISTS blob_refs (
-        sha256   TEXT PRIMARY KEY,
-        refcount INTEGER NOT NULL,
-        size     INTEGER NOT NULL
-    );
-";
+/// A project id is at most 32 characters (see `admin::validate_project_id`), so
+/// this leaves room to spare while staying inside a SQL Server index key.
+const VOLUME_ID_LEN: u32 = 64;
+/// Keyed because the primary key and the parent index both use a path. SQL Server
+/// cannot index unbounded text, so a length is required rather than optional.
+const PATH_LEN: u32 = 450;
+/// A hex sha256 is 64 characters. Doubled, so a longer digest stays storable.
+const SHA_LEN: u32 = 128;
 
-const SELECT_COLS: &str =
-    "path, parent, name, kind, size, mode, mtime, ctime, atime, sha256";
+const SELECT_COLS: &str = "path, parent, name, kind, size, mode, mtime, ctime, atime, sha256";
 
-pub struct SqliteMetaStore {
-    db: SqliteDb,
+/// Every column of `nodes`, in the order the upserts bind them.
+const NODE_COLS: [&str; 11] = [
+    "volume_id", "path", "parent", "name", "kind", "size", "mode", "mtime", "ctime", "atime",
+    "sha256",
+];
+
+/// The tables this store owns.
+pub fn schema() -> SchemaSet {
+    SchemaSet::new(
+        vec![
+            Table::new(
+                "nodes",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("path", ColumnType::TextKey(PATH_LEN)),
+                    // Indexed, so it is keyed rather than unbounded text.
+                    Column::new("parent", ColumnType::TextKey(PATH_LEN)),
+                    Column::required("name", ColumnType::Text),
+                    Column::required("kind", ColumnType::Text),
+                    Column::required("size", ColumnType::BigInt).default("0"),
+                    Column::required("mode", ColumnType::BigInt),
+                    Column::required("mtime", ColumnType::Double),
+                    Column::required("ctime", ColumnType::Double),
+                    Column::required("atime", ColumnType::Double),
+                    Column::new("sha256", ColumnType::Text),
+                ],
+                vec!["volume_id", "path"],
+            ),
+            Table::new(
+                "blob_refs",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("sha256", ColumnType::TextKey(SHA_LEN)),
+                    Column::required("refcount", ColumnType::BigInt),
+                    Column::required("size", ColumnType::BigInt),
+                ],
+                vec!["volume_id", "sha256"],
+            ),
+        ],
+        vec![Index {
+            name: "idx_nodes_parent",
+            table: "nodes",
+            // Volume first: every lookup filters on it before the parent.
+            columns: vec!["volume_id", "parent"],
+        }],
+    )
 }
 
-impl SqliteMetaStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = SqliteDb::open(path)?;
-        db.execute_batch(SCHEMA)?;
-        // Ensure the root directory node exists.
-        let now = now_unix();
-        db.run_sync(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO nodes(path,parent,name,kind,size,mode,mtime,ctime,atime,sha256)
-                 VALUES('/',NULL,'','dir',0,?1,?2,?3,?4,NULL)",
-                (MODE_DIR, now, now, now),
-            )?;
-            Ok(())
-        })?;
-        Ok(Self { db })
+/// The metadata tree of one volume.
+pub struct RelationalMetaStore {
+    db: Arc<dyn RelationalDb>,
+    volume_id: String,
+}
+
+impl RelationalMetaStore {
+    /// Apply the schema, ensure the root directory row, and return the store.
+    pub async fn open(db: Arc<dyn RelationalDb>, volume_id: impl Into<String>) -> Result<Self> {
+        let store = Self { db, volume_id: volume_id.into() };
+        store.db.migrate(&schema()).await?;
+        store.ensure_root().await?;
+        Ok(store)
     }
 
-    pub fn in_memory() -> Result<Self> {
-        let db = SqliteDb::open_in_memory()?;
-        db.execute_batch(SCHEMA)?;
-        let now = now_unix();
-        db.run_sync(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO nodes(path,parent,name,kind,size,mode,mtime,ctime,atime,sha256)
-                 VALUES('/',NULL,'','dir',0,?1,?2,?3,?4,NULL)",
-                (MODE_DIR, now, now, now),
-            )?;
-            Ok(())
-        })?;
-        Ok(Self { db })
+    /// In memory SQLite store, for tests.
+    pub async fn in_memory(volume_id: &str) -> Result<Self> {
+        let db = Arc::new(crate::storage::rel::SqliteRelationalDb::open_in_memory()?);
+        Self::open(db, volume_id).await
     }
 
-    fn read_row(r: &Row<'_>) -> rusqlite::Result<NodeRow> {
+    pub fn volume_id(&self) -> &str {
+        &self.volume_id
+    }
+
+    /// Insert the root node unless it is already there. Idempotent, so reopening
+    /// an existing volume leaves its root untouched.
+    async fn ensure_root(&self) -> Result<()> {
+        let now = now_unix();
+        let sql = self.db.dialect().render_upsert(&Upsert::ignore(
+            "nodes",
+            NODE_COLS.to_vec(),
+            vec!["volume_id", "path"],
+        ));
+        self.db
+            .execute(
+                &Query::new(sql)
+                    .bind(&self.volume_id)
+                    .bind("/")
+                    .bind(None::<String>)
+                    .bind("")
+                    .bind("dir")
+                    .bind(0i64)
+                    .bind(MODE_DIR)
+                    .bind(now)
+                    .bind(now)
+                    .bind(now)
+                    .bind(None::<String>),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn read_row(r: &RowValues) -> Result<NodeRow> {
         Ok(NodeRow {
-            path: r.get(0)?,
-            parent: r.get(1)?,
-            name: r.get(2)?,
-            kind: r.get(3)?,
-            size: r.get(4)?,
-            mode: r.get(5)?,
-            mtime: r.get(6)?,
-            ctime: r.get(7)?,
-            atime: r.get(8)?,
-            sha256: r.get(9)?,
+            path: r.text(0)?,
+            parent: r.opt_text(1)?,
+            name: r.text(2)?,
+            kind: r.text(3)?,
+            size: r.i64(4)?,
+            mode: r.i64(5)?,
+            mtime: r.f64(6)?,
+            ctime: r.f64(7)?,
+            atime: r.f64(8)?,
+            sha256: r.opt_text(9)?,
         })
     }
 
-    // ── sync helpers, all inside a transaction ───────────────────────────────
-
-    fn exists(tx: &Transaction<'_>, path: &str) -> Result<bool> {
-        let n: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE path=?1",
-            [path],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+    /// A `LIKE` pattern matching every strict descendant of `path`.
+    ///
+    /// The prefix is escaped, so a path holding `%` or `_` matches only itself.
+    /// Without this a file called `a_b` pulls in its sibling `axb`, which turned a
+    /// subtree delete into a delete of unrelated rows.
+    fn descendant_pattern(&self, path: &str) -> String {
+        let base = self.db.dialect().escape_like_literal(path.trim_end_matches('/'));
+        format!("{base}/%")
     }
 
-    fn incref(tx: &Transaction<'_>, sha: Option<&str>, size: i64) -> Result<()> {
-        if let Some(sha) = sha {
-            tx.execute(
-                "INSERT INTO blob_refs(sha256,refcount,size) VALUES(?1,1,?2)
-                 ON CONFLICT(sha256) DO UPDATE SET refcount=refcount+1",
-                (sha, size),
-            )?;
-        }
-        Ok(())
+    /// The upsert that writes a file row, rendered for this engine.
+    fn put_node_sql(&self) -> String {
+        self.db.dialect().render_upsert(&Upsert::replace(
+            "nodes",
+            NODE_COLS.to_vec(),
+            vec!["volume_id", "path"],
+        ))
     }
+}
 
-    /// Decrement a blob refcount. Returns true when it hit 0 (caller GCs the blob).
-    fn decref(tx: &Transaction<'_>, sha: Option<&str>) -> Result<bool> {
-        let Some(sha) = sha else { return Ok(false) };
-        let current: Option<i64> = tx
-            .query_row("SELECT refcount FROM blob_refs WHERE sha256=?1", [sha], |r| r.get(0))
-            .ok();
-        let Some(refcount) = current else { return Ok(false) };
-        let remaining = refcount - 1;
-        if remaining <= 0 {
-            tx.execute("DELETE FROM blob_refs WHERE sha256=?1", [sha])?;
-            Ok(true)
-        } else {
-            tx.execute(
-                "UPDATE blob_refs SET refcount=?1 WHERE sha256=?2",
-                (remaining, sha),
-            )?;
-            Ok(false)
-        }
+// ── transaction helpers ─────────────────────────────────────────────────────────
+//
+// Free functions rather than methods: they take the transaction, so they compose
+// inside a `run_retrying` body without borrowing the store mutably.
+
+async fn tx_exists(tx: &mut dyn RelationalTx, volume: &str, path: &str) -> Result<bool> {
+    let row = tx
+        .query_opt(
+            &Query::new("SELECT 1 FROM nodes WHERE volume_id=?1 AND path=?2")
+                .bind(volume)
+                .bind(path),
+        )
+        .await?;
+    Ok(row.is_some())
+}
+
+async fn tx_kind(tx: &mut dyn RelationalTx, volume: &str, path: &str) -> Result<Option<String>> {
+    let row = tx
+        .query_opt(
+            &Query::new("SELECT kind FROM nodes WHERE volume_id=?1 AND path=?2")
+                .bind(volume)
+                .bind(path),
+        )
+        .await?;
+    match row {
+        Some(r) => Ok(Some(r.text(0)?)),
+        None => Ok(None),
     }
+}
 
-    fn insert_dir(tx: &Transaction<'_>, path: &str) -> Result<()> {
-        let now = now_unix();
+/// Add one reference to a blob, creating the row on first use.
+async fn tx_incref(
+    tx: &mut dyn RelationalTx,
+    dialect: crate::storage::rel::Dialect,
+    volume: &str,
+    sha: Option<&str>,
+    size: i64,
+) -> Result<()> {
+    let Some(sha) = sha else { return Ok(()) };
+    let sql = dialect.render_upsert(&Upsert::update(
+        "blob_refs",
+        vec!["volume_id", "sha256", "refcount", "size"],
+        vec!["volume_id", "sha256"],
+        vec![Assign::expr("refcount", "{target}.refcount + 1")],
+    ));
+    tx.execute(&Query::new(sql).bind(volume).bind(sha).bind(1i64).bind(size)).await?;
+    Ok(())
+}
+
+/// Drop one reference. Returns true when it reached zero, so the caller GCs.
+async fn tx_decref(
+    tx: &mut dyn RelationalTx,
+    volume: &str,
+    sha: Option<&str>,
+) -> Result<bool> {
+    let Some(sha) = sha else { return Ok(false) };
+    let row = tx
+        .query_opt(
+            &Query::new("SELECT refcount FROM blob_refs WHERE volume_id=?1 AND sha256=?2")
+                .bind(volume)
+                .bind(sha),
+        )
+        .await?;
+    let Some(row) = row else { return Ok(false) };
+    let remaining = row.i64(0)? - 1;
+    if remaining <= 0 {
         tx.execute(
-            "INSERT INTO nodes(path,parent,name,kind,size,mode,mtime,ctime,atime,sha256)
-             VALUES(?1,?2,?3,'dir',0,?4,?5,?6,?7,NULL)",
-            (
-                path,
-                PosixPath::parent_of(path),
-                PosixPath::name_of(path),
-                MODE_DIR,
-                now,
-                now,
-                now,
-            ),
-        )?;
-        Ok(())
+            &Query::new("DELETE FROM blob_refs WHERE volume_id=?1 AND sha256=?2")
+                .bind(volume)
+                .bind(sha),
+        )
+        .await?;
+        return Ok(true);
     }
+    tx.execute(
+        &Query::new("UPDATE blob_refs SET refcount=?1 WHERE volume_id=?2 AND sha256=?3")
+            .bind(remaining)
+            .bind(volume)
+            .bind(sha),
+    )
+    .await?;
+    Ok(false)
+}
 
-    fn mkdirs_chain(tx: &Transaction<'_>, path: &str) -> Result<()> {
-        let mut current = String::new();
-        for part in path.trim_matches('/').split('/').filter(|p| !p.is_empty()) {
-            current = format!("{current}/{part}");
-            let kind: Option<String> = tx
-                .query_row("SELECT kind FROM nodes WHERE path=?1", [&current], |r| r.get(0))
-                .ok();
-            match kind.as_deref() {
-                None => Self::insert_dir(tx, &current)?,
-                Some("dir") => {}
-                Some(_) => {
+/// Insert a directory node, tolerating a row a concurrent writer created first.
+///
+/// Returns false when the row was already there. A plain INSERT here was a real
+/// race: SQLite serializes every writer behind one mutex, so a check then insert
+/// could not interleave, but PostgreSQL and SQL Server run writers at the same
+/// time and two of them creating the same parent directory raised a duplicate key.
+/// Both callers need the outcome, so the conflict is reported rather than hidden:
+/// [`tx_mkdirs_chain`] revalidates that the winner stored a directory, and `mkdir`
+/// turns it into the `no_clobber` its contract promises.
+async fn tx_insert_dir(
+    tx: &mut dyn RelationalTx,
+    dialect: crate::storage::rel::Dialect,
+    volume: &str,
+    path: &str,
+) -> Result<bool> {
+    let now = now_unix();
+    let sql = dialect.render_upsert(&Upsert::ignore(
+        "nodes",
+        NODE_COLS.to_vec(),
+        vec!["volume_id", "path"],
+    ));
+    let affected = tx
+        .execute(
+            &Query::new(sql)
+                .bind(volume)
+                .bind(path)
+                .bind(PosixPath::parent_of(path))
+                .bind(PosixPath::name_of(path))
+                .bind("dir")
+                .bind(0i64)
+                .bind(MODE_DIR)
+                .bind(now)
+                .bind(now)
+                .bind(now)
+                .bind(None::<String>),
+        )
+        .await?;
+    Ok(affected > 0)
+}
+
+/// Create every missing directory along `path`, failing if a component is a file.
+async fn tx_mkdirs_chain(
+    tx: &mut dyn RelationalTx,
+    dialect: crate::storage::rel::Dialect,
+    volume: &str,
+    path: &str,
+) -> Result<()> {
+    let mut current = String::new();
+    for part in path.trim_matches('/').split('/').filter(|p| !p.is_empty()) {
+        current = format!("{current}/{part}");
+        match tx_kind(tx, volume, &current).await?.as_deref() {
+            None => {
+                // A concurrent writer may have created this component between the
+                // read and the insert, so the insert tolerates the collision and
+                // the kind is confirmed afterwards: losing the race to a file must
+                // still refuse, otherwise a file would gain children.
+                if !tx_insert_dir(tx, dialect, volume, &current).await?
+                    && tx_kind(tx, volume, &current).await?.as_deref() != Some("dir")
+                {
                     return Err(ToolError::no_clobber(format!(
                         "'{current}' already exists and is not a directory"
                     )));
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn ensure_parents(tx: &Transaction<'_>, path: &str) -> Result<()> {
-        if let Some(parent) = PosixPath::parent_of(path)
-            && parent != "/" {
-                Self::mkdirs_chain(tx, &parent)?;
+            Some("dir") => {}
+            Some(_) => {
+                return Err(ToolError::no_clobber(format!(
+                    "'{current}' already exists and is not a directory"
+                )));
             }
-        Ok(())
+        }
     }
+    Ok(())
+}
+
+async fn tx_ensure_parents(
+    tx: &mut dyn RelationalTx,
+    dialect: crate::storage::rel::Dialect,
+    volume: &str,
+    path: &str,
+) -> Result<()> {
+    if let Some(parent) = PosixPath::parent_of(path)
+        && parent != "/"
+    {
+        tx_mkdirs_chain(tx, dialect, volume, &parent).await?;
+    }
+    Ok(())
 }
 
 #[async_trait]
-impl MetaBackend for SqliteMetaStore {
+impl MetaBackend for RelationalMetaStore {
     async fn get(&self, path: &str) -> Result<Option<NodeRow>> {
-        let path = path.to_string();
-        self.db
-            .run(move |tx| {
-                let mut st = tx.prepare(&format!(
-                    "SELECT {SELECT_COLS} FROM nodes WHERE path=?1"
-                ))?;
-                let mut rows = st.query([&path])?;
-                match rows.next()? {
-                    Some(r) => Ok(Some(SqliteMetaStore::read_row(r)?)),
-                    None => Ok(None),
-                }
-            })
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(format!(
+                    "SELECT {SELECT_COLS} FROM nodes WHERE volume_id=?1 AND path=?2"
+                ))
+                .bind(&self.volume_id)
+                .bind(path),
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(Some(Self::read_row(&r)?)),
+            None => Ok(None),
+        }
     }
 
     async fn list_children(&self, parent: &str) -> Result<Vec<NodeRow>> {
-        let parent = parent.to_string();
-        self.db
-            .run(move |tx| {
-                let mut st = tx.prepare(&format!(
-                    "SELECT {SELECT_COLS} FROM nodes WHERE parent=?1 ORDER BY name"
-                ))?;
-                let out = st
-                    .query_map([&parent], SqliteMetaStore::read_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
-            })
-            .await
+        let rows = self
+            .db
+            .query(
+                &Query::new(format!(
+                    "SELECT {SELECT_COLS} FROM nodes \
+                     WHERE volume_id=?1 AND parent=?2 ORDER BY name"
+                ))
+                .bind(&self.volume_id)
+                .bind(parent),
+            )
+            .await?;
+        rows.iter().map(Self::read_row).collect()
     }
 
     async fn subtree(&self, root: &str) -> Result<Vec<NodeRow>> {
-        let root = root.to_string();
-        self.db
-            .run(move |tx| {
-                let prefix = format!("{}/%", root.trim_end_matches('/'));
-                let mut st = tx.prepare(&format!(
-                    "SELECT {SELECT_COLS} FROM nodes WHERE path=?1 OR path LIKE ?2 ORDER BY path"
-                ))?;
-                let out = st
-                    .query_map([&root, &prefix], SqliteMetaStore::read_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
-            })
-            .await
+        let rows = self
+            .db
+            .query(
+                &Query::new(format!(
+                    "SELECT {SELECT_COLS} FROM nodes \
+                     WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\') \
+                     ORDER BY path"
+                ))
+                .bind(&self.volume_id)
+                .bind(root)
+                .bind(self.descendant_pattern(root)),
+            )
+            .await?;
+        rows.iter().map(Self::read_row).collect()
     }
 
     async fn put_file(
@@ -231,173 +395,247 @@ impl MetaBackend for SqliteMetaStore {
         size: i64,
         mode: i64,
     ) -> Result<Option<String>> {
+        let dialect = self.db.dialect();
+        let put_sql = self.put_node_sql();
+        let volume = self.volume_id.clone();
         let path = path.to_string();
         let sha = sha256.map(str::to_string);
-        self.db
-            .run(move |tx| {
-                Self::ensure_parents(tx, &path)?;
-                // Preserve the original ctime when overwriting.
-                let existing: Option<(String, f64, Option<String>)> = tx
-                    .query_row(
-                        "SELECT kind, ctime, sha256 FROM nodes WHERE path=?1",
-                        [&path],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        // Idempotent: every value written is derived from rows read in the same
+        // transaction, so a retry recomputes from the rolled back original state.
+        // The captures are owned and re-cloned per attempt, so no attempt can see
+        // a value the previous one produced.
+        run_retrying(&*self.db, move |tx| {
+            let (volume, put_sql, path, sha) =
+                (volume.clone(), put_sql.clone(), path.clone(), sha.clone());
+            Box::pin(async move {
+                tx_ensure_parents(tx, dialect, &volume, &path).await?;
+                let existing = tx
+                    .query_opt(
+                        &Query::new(
+                            "SELECT kind, ctime, sha256 FROM nodes \
+                             WHERE volume_id=?1 AND path=?2",
+                        )
+                        .bind(&volume)
+                        .bind(&path),
                     )
-                    .ok();
+                    .await?;
+
                 let mut ctime = now_unix();
                 let mut old_sha: Option<String> = None;
-                if let Some((kind, c, s)) = existing {
-                    if kind == "dir" {
+                if let Some(row) = existing {
+                    if row.text(0)? == "dir" {
                         return Err(ToolError::invalid_argument(format!(
                             "'{path}' is a directory"
                         )));
                     }
-                    ctime = c;
-                    old_sha = s;
+                    ctime = row.f64(1)?;
+                    old_sha = row.opt_text(2)?;
                 }
-                let now = now_unix();
+
                 let mut gc = None;
                 if old_sha.as_deref() != sha.as_deref() {
-                    Self::incref(tx, sha.as_deref(), size)?;
-                    if Self::decref(tx, old_sha.as_deref())? {
+                    tx_incref(tx, dialect, &volume, sha.as_deref(), size).await?;
+                    if tx_decref(tx, &volume, old_sha.as_deref()).await? {
                         gc = old_sha;
                     }
                 }
+
+                let now = now_unix();
                 tx.execute(
-                    "INSERT OR REPLACE INTO nodes(path,parent,name,kind,size,mode,mtime,ctime,atime,sha256)
-                     VALUES(?1,?2,?3,'file',?4,?5,?6,?7,?8,?9)",
-                    (
-                        &path,
-                        PosixPath::parent_of(&path),
-                        PosixPath::name_of(&path),
-                        size,
-                        mode,
-                        now,
-                        ctime,
-                        now,
-                        &sha,
-                    ),
-                )?;
+                    &Query::new(put_sql)
+                        .bind(&volume)
+                        .bind(&path)
+                        .bind(PosixPath::parent_of(&path))
+                        .bind(PosixPath::name_of(&path))
+                        .bind("file")
+                        .bind(size)
+                        .bind(mode)
+                        .bind(now)
+                        .bind(ctime)
+                        .bind(now)
+                        .bind(sha.clone()),
+                )
+                .await?;
                 Ok(gc)
             })
-            .await
+        })
+        .await
     }
 
     async fn delete_file(&self, path: &str) -> Result<Option<String>> {
+        let volume = self.volume_id.clone();
         let path = path.to_string();
-        self.db
-            .run(move |tx| {
-                let found: Option<(String, Option<String>)> = tx
-                    .query_row(
-                        "SELECT kind, sha256 FROM nodes WHERE path=?1",
-                        [&path],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+        run_retrying(&*self.db, move |tx| {
+            let (volume, path) = (volume.clone(), path.clone());
+            Box::pin(async move {
+                let found = tx
+                    .query_opt(
+                        &Query::new(
+                            "SELECT kind, sha256 FROM nodes WHERE volume_id=?1 AND path=?2",
+                        )
+                        .bind(&volume)
+                        .bind(&path),
                     )
-                    .ok();
-                let Some((kind, sha)) = found else {
+                    .await?;
+                let Some(row) = found else {
                     return Err(ToolError::not_found(format!("'{path}' not found")));
                 };
-                if kind == "dir" {
+                if row.text(0)? == "dir" {
                     return Err(ToolError::invalid_argument(format!("'{path}' is a directory")));
                 }
-                let gc = if Self::decref(tx, sha.as_deref())? { sha } else { None };
-                tx.execute("DELETE FROM nodes WHERE path=?1", [&path])?;
+                let sha = row.opt_text(1)?;
+                let gc = if tx_decref(tx, &volume, sha.as_deref()).await? { sha } else { None };
+                tx.execute(
+                    &Query::new("DELETE FROM nodes WHERE volume_id=?1 AND path=?2")
+                        .bind(&volume)
+                        .bind(&path),
+                )
+                .await?;
                 Ok(gc)
             })
-            .await
+        })
+        .await
     }
 
     async fn remove_subtree(&self, path: &str) -> Result<Vec<String>> {
+        let pattern = self.descendant_pattern(path);
+        let volume = self.volume_id.clone();
         let path = path.to_string();
-        self.db
-            .run(move |tx| {
-                let prefix = format!("{}/%", path.trim_end_matches('/'));
-                let shas: Vec<Option<String>> = {
-                    let mut st = tx.prepare(
-                        "SELECT sha256 FROM nodes WHERE path=?1 OR path LIKE ?2",
-                    )?;
-                    st.query_map([&path, &prefix], |r| r.get(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?
-                };
+        run_retrying(&*self.db, move |tx| {
+            let (volume, path, pattern) = (volume.clone(), path.clone(), pattern.clone());
+            // The accumulator is built inside the body, so a retry starts from an
+            // empty list instead of appending to the previous attempt's result.
+            Box::pin(async move {
+                let rows = tx
+                    .query(
+                        &Query::new(
+                            "SELECT sha256 FROM nodes \
+                             WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\')",
+                        )
+                        .bind(&volume)
+                        .bind(&path)
+                        .bind(&pattern),
+                    )
+                    .await?;
+                let shas: Vec<Option<String>> =
+                    rows.iter().map(|r| r.opt_text(0)).collect::<Result<_>>()?;
+
                 let mut gc = Vec::new();
-                for sha in shas.iter() {
-                    if sha.is_some() && Self::decref(tx, sha.as_deref())? {
-                        gc.push(sha.clone().unwrap());
+                for sha in &shas {
+                    if sha.is_some() && tx_decref(tx, &volume, sha.as_deref()).await? {
+                        gc.extend(sha.clone());
                     }
                 }
                 tx.execute(
-                    "DELETE FROM nodes WHERE path=?1 OR path LIKE ?2",
-                    [&path, &prefix],
-                )?;
+                    &Query::new(
+                        "DELETE FROM nodes \
+                         WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\')",
+                    )
+                    .bind(&volume)
+                    .bind(&path)
+                    .bind(&pattern),
+                )
+                .await?;
                 Ok(gc)
             })
-            .await
+        })
+        .await
     }
 
     async fn mkdirs(&self, path: &str, exist_ok: bool) -> Result<()> {
+        let volume = self.volume_id.clone();
         let path = path.to_string();
-        self.db
-            .run(move |tx| {
-                let kind: Option<String> = tx
-                    .query_row("SELECT kind FROM nodes WHERE path=?1", [&path], |r| r.get(0))
-                    .ok();
-                if let Some(kind) = kind {
+        let dialect = self.db.dialect();
+        run_retrying(&*self.db, move |tx| {
+            let (volume, path) = (volume.clone(), path.clone());
+            Box::pin(async move {
+                if let Some(kind) = tx_kind(tx, &volume, &path).await? {
                     if kind != "dir" || !exist_ok {
                         return Err(ToolError::no_clobber(format!("'{path}' already exists")));
                     }
                     return Ok(());
                 }
-                Self::mkdirs_chain(tx, &path)
+                tx_mkdirs_chain(tx, dialect, &volume, &path).await
             })
-            .await
+        })
+        .await
     }
 
     async fn mkdir(&self, path: &str) -> Result<()> {
+        let volume = self.volume_id.clone();
         let path = path.to_string();
-        self.db
-            .run(move |tx| {
+        let dialect = self.db.dialect();
+        run_retrying(&*self.db, move |tx| {
+            let (volume, path) = (volume.clone(), path.clone());
+            Box::pin(async move {
                 if let Some(parent) = PosixPath::parent_of(&path)
-                    && !Self::exists(tx, &parent)? {
-                        return Err(ToolError::not_found(format!("'{parent}' not found")));
-                    }
-                if Self::exists(tx, &path)? {
+                    && !tx_exists(tx, &volume, &parent).await?
+                {
+                    return Err(ToolError::not_found(format!("'{parent}' not found")));
+                }
+                if tx_exists(tx, &volume, &path).await? {
                     return Err(ToolError::no_clobber(format!("'{path}' already exists")));
                 }
-                Self::insert_dir(tx, &path)
+                // The insert reports a collision instead of raising a duplicate
+                // key, so a writer that lost the race gets the documented error.
+                if tx_insert_dir(tx, dialect, &volume, &path).await? {
+                    Ok(())
+                } else {
+                    Err(ToolError::no_clobber(format!("'{path}' already exists")))
+                }
             })
-            .await
+        })
+        .await
     }
 
     async fn rmdir(&self, path: &str) -> Result<()> {
-        let path = path.to_string();
         self.db
-            .run(move |tx| {
-                tx.execute("DELETE FROM nodes WHERE path=?1 AND kind='dir'", [&path])?;
-                Ok(())
-            })
-            .await
+            .execute(
+                &Query::new(
+                    "DELETE FROM nodes WHERE volume_id=?1 AND path=?2 AND kind='dir'",
+                )
+                .bind(&self.volume_id)
+                .bind(path),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn rename(&self, src: &str, dst: &str) -> Result<()> {
-        let src = src.to_string();
-        let dst = dst.to_string();
-        self.db
-            .run(move |tx| {
-                if !Self::exists(tx, &src)? {
+        let pattern = self.descendant_pattern(src);
+        // Shortest path first, so a parent is renamed before its children and no
+        // intermediate state collides with a row that has not moved yet.
+        let order = self.db.dialect().length_fn();
+        let dialect = self.db.dialect();
+        let volume = self.volume_id.clone();
+        let (src, dst) = (src.to_string(), dst.to_string());
+        run_retrying(&*self.db, move |tx| {
+            let (volume, src, dst, pattern) =
+                (volume.clone(), src.clone(), dst.clone(), pattern.clone());
+            Box::pin(async move {
+                if !tx_exists(tx, &volume, &src).await? {
                     return Err(ToolError::not_found(format!("'{src}' not found")));
                 }
-                if Self::exists(tx, &dst)? {
+                if tx_exists(tx, &volume, &dst).await? {
                     return Err(ToolError::no_clobber(format!("'{dst}' already exists")));
                 }
-                Self::ensure_parents(tx, &dst)?;
-                let prefix = format!("{}/%", src.trim_end_matches('/'));
-                let paths: Vec<String> = {
-                    let mut st = tx.prepare(
-                        "SELECT path FROM nodes WHERE path=?1 OR path LIKE ?2 ORDER BY length(path)",
-                    )?;
-                    st.query_map([&src, &prefix], |r| r.get(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?
-                };
+                tx_ensure_parents(tx, dialect, &volume, &dst).await?;
+
+                let rows = tx
+                    .query(
+                        &Query::new(format!(
+                            "SELECT path FROM nodes \
+                             WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\') \
+                             ORDER BY {order}(path)"
+                        ))
+                        .bind(&volume)
+                        .bind(&src)
+                        .bind(&pattern),
+                    )
+                    .await?;
+                let paths: Vec<String> =
+                    rows.iter().map(|r| r.text(0)).collect::<Result<_>>()?;
+
                 for old in paths {
                     let new = if old == src {
                         dst.clone()
@@ -405,33 +643,60 @@ impl MetaBackend for SqliteMetaStore {
                         format!("{}{}", dst, &old[src.len()..])
                     };
                     tx.execute(
-                        "UPDATE nodes SET path=?1, parent=?2, name=?3 WHERE path=?4",
-                        (
-                            &new,
-                            PosixPath::parent_of(&new),
-                            PosixPath::name_of(&new),
-                            &old,
-                        ),
-                    )?;
+                        &Query::new(
+                            "UPDATE nodes SET path=?1, parent=?2, name=?3 \
+                             WHERE volume_id=?4 AND path=?5",
+                        )
+                        .bind(&new)
+                        .bind(PosixPath::parent_of(&new))
+                        .bind(PosixPath::name_of(&new))
+                        .bind(&volume)
+                        .bind(&old),
+                    )
+                    .await?;
                 }
                 Ok(())
             })
-            .await
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::rel::{Dialect, SqliteRelationalDb};
     use crate::storage::traits::MODE_FILE;
 
-    fn store() -> SqliteMetaStore {
-        SqliteMetaStore::in_memory().unwrap()
+    async fn store() -> RelationalMetaStore {
+        RelationalMetaStore::in_memory("proj").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema_declares_both_tables_keyed_by_volume() {
+        let s = schema();
+        let nodes = s.tables.iter().find(|t| t.name == "nodes").expect("nodes table");
+        assert_eq!(nodes.primary_key, vec!["volume_id", "path"]);
+        let refs = s.tables.iter().find(|t| t.name == "blob_refs").expect("blob_refs table");
+        assert_eq!(refs.primary_key, vec!["volume_id", "sha256"]);
+        // The parent index must lead with the volume, every lookup filters on it.
+        assert_eq!(s.indexes[0].columns, vec!["volume_id", "parent"]);
+    }
+
+    /// The escape clause and the escaped prefix have to travel together: a
+    /// pattern without `ESCAPE` treats our backslash as a literal character.
+    #[tokio::test]
+    async fn descendant_pattern_escapes_wildcards() {
+        let s = store().await;
+        assert_eq!(s.descendant_pattern("/a/b"), "/a/b/%");
+        assert_eq!(s.descendant_pattern("/50%"), "/50\\%/%");
+        assert_eq!(s.descendant_pattern("/a_b"), "/a\\_b/%");
+        assert_eq!(s.descendant_pattern("/d/"), "/d/%", "a trailing slash is dropped");
     }
 
     #[tokio::test]
     async fn root_exists_after_open() {
-        let s = store();
+        let s = store().await;
         let root = s.get("/").await.unwrap().expect("root node");
         assert_eq!(root.kind, "dir");
         assert_eq!(root.name, "");
@@ -439,9 +704,21 @@ mod tests {
         assert_eq!(root.mode, MODE_DIR);
     }
 
+    /// Reopening must not reset the tree, which is what makes `migrate` plus
+    /// `ensure_root` safe to run on every open.
+    #[tokio::test]
+    async fn reopening_keeps_existing_rows() {
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let first = RelationalMetaStore::open(db.clone(), "proj").await.unwrap();
+        first.put_file("/a.txt", Some("s"), 1, MODE_FILE).await.unwrap();
+
+        let second = RelationalMetaStore::open(db, "proj").await.unwrap();
+        assert!(second.get("/a.txt").await.unwrap().is_some(), "row survived reopen");
+    }
+
     #[tokio::test]
     async fn put_file_creates_parents_and_increfs() {
-        let s = store();
+        let s = store().await;
         let gc = s.put_file("/a/b/c.txt", Some("sha1"), 3, MODE_FILE).await.unwrap();
         assert_eq!(gc, None);
         assert!(s.get("/a").await.unwrap().unwrap().is_dir());
@@ -454,11 +731,9 @@ mod tests {
         assert_eq!(f.parent.as_deref(), Some("/a/b"));
     }
 
-    /// Two files with identical content share one blob (refcount 2); the blob is
-    /// only GC'd on the second delete.
     #[tokio::test]
     async fn dedup_refcount_and_gc_at_zero() {
-        let s = store();
+        let s = store().await;
         s.put_file("/a.txt", Some("same"), 4, MODE_FILE).await.unwrap();
         s.put_file("/b.txt", Some("same"), 4, MODE_FILE).await.unwrap();
 
@@ -471,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_gcs_old_blob_and_keeps_ctime() {
-        let s = store();
+        let s = store().await;
         s.put_file("/a.txt", Some("old"), 3, MODE_FILE).await.unwrap();
         let ctime0 = s.get("/a.txt").await.unwrap().unwrap().ctime;
 
@@ -484,16 +759,15 @@ mod tests {
 
     #[tokio::test]
     async fn rewriting_same_sha_does_not_gc() {
-        let s = store();
+        let s = store().await;
         s.put_file("/a.txt", Some("x"), 1, MODE_FILE).await.unwrap();
         let gc = s.put_file("/a.txt", Some("x"), 1, MODE_FILE).await.unwrap();
         assert_eq!(gc, None);
     }
 
-    /// An empty file stores no blob: sha256 is NULL and nothing is refcounted.
     #[tokio::test]
     async fn empty_file_has_no_blob() {
-        let s = store();
+        let s = store().await;
         s.put_file("/e.txt", None, 0, MODE_FILE).await.unwrap();
         let f = s.get("/e.txt").await.unwrap().unwrap();
         assert_eq!(f.sha256, None);
@@ -504,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_children_is_sorted_by_name() {
-        let s = store();
+        let s = store().await;
         for p in ["/c.txt", "/a.txt", "/b.txt"] {
             s.put_file(p, Some(p), 1, MODE_FILE).await.unwrap();
         }
@@ -515,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn subtree_includes_root_and_descendants() {
-        let s = store();
+        let s = store().await;
         s.put_file("/d/x.txt", Some("1"), 1, MODE_FILE).await.unwrap();
         s.put_file("/d/sub/y.txt", Some("2"), 1, MODE_FILE).await.unwrap();
         s.put_file("/outside.txt", Some("3"), 1, MODE_FILE).await.unwrap();
@@ -530,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_subtree_gcs_all_orphaned_blobs() {
-        let s = store();
+        let s = store().await;
         s.put_file("/d/a.txt", Some("s1"), 1, MODE_FILE).await.unwrap();
         s.put_file("/d/b.txt", Some("s2"), 1, MODE_FILE).await.unwrap();
         let mut gc = s.remove_subtree("/d").await.unwrap();
@@ -542,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_subtree_keeps_blob_shared_outside() {
-        let s = store();
+        let s = store().await;
         s.put_file("/d/a.txt", Some("shared"), 1, MODE_FILE).await.unwrap();
         s.put_file("/keep.txt", Some("shared"), 1, MODE_FILE).await.unwrap();
         let gc = s.remove_subtree("/d").await.unwrap();
@@ -551,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdir_requires_existing_parent_and_rejects_duplicates() {
-        let s = store();
+        let s = store().await;
         let e = s.mkdir("/nope/child").await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::NOT_FOUND);
 
@@ -562,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdirs_is_idempotent_when_exist_ok() {
-        let s = store();
+        let s = store().await;
         s.mkdirs("/a/b/c", true).await.unwrap();
         s.mkdirs("/a/b/c", true).await.unwrap();
         assert!(s.get("/a/b/c").await.unwrap().unwrap().is_dir());
@@ -572,8 +846,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mkdirs_refuses_to_tunnel_through_a_file() {
+        let s = store().await;
+        s.put_file("/f", Some("x"), 1, MODE_FILE).await.unwrap();
+        let e = s.mkdirs("/f/child", true).await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NO_CLOBBER);
+    }
+
+    #[tokio::test]
     async fn rename_moves_whole_subtree() {
-        let s = store();
+        let s = store().await;
         s.put_file("/src/a.txt", Some("1"), 1, MODE_FILE).await.unwrap();
         s.put_file("/src/sub/b.txt", Some("2"), 1, MODE_FILE).await.unwrap();
 
@@ -587,7 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_rejects_missing_source_and_existing_target() {
-        let s = store();
+        let s = store().await;
         s.put_file("/a.txt", Some("1"), 1, MODE_FILE).await.unwrap();
         s.put_file("/b.txt", Some("2"), 1, MODE_FILE).await.unwrap();
 
@@ -603,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_file_errors_are_typed() {
-        let s = store();
+        let s = store().await;
         assert_eq!(
             s.delete_file("/nope").await.unwrap_err().code,
             crate::errors::code::NOT_FOUND
@@ -617,37 +899,195 @@ mod tests {
 
     #[tokio::test]
     async fn put_file_over_a_directory_is_rejected() {
-        let s = store();
+        let s = store().await;
         s.mkdir("/d").await.unwrap();
         let e = s.put_file("/d", Some("x"), 1, MODE_FILE).await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
     }
 
-    // ── GROUP G: new blob refcount test ────────────────────────────────────────
-
-    /// Write a file, copy it (refcount 2), then delete both. After both are gone
-    /// the blob_refs row is removed (refcount hit 0), so the metadata store no
-    /// longer references the sha.  The VolumeClient.blob.exists check is done in
-    /// the volume tests; here we verify the meta side: put, copy, delete x2.
     #[tokio::test]
     async fn blob_refcount_drops_to_zero_after_all_referencing_files_deleted() {
-        let s = store();
+        let s = store().await;
         let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
-        // Write two files pointing at the same blob (refcount 2).
         s.put_file("/a.txt", Some(sha), 4, MODE_FILE).await.unwrap();
         s.put_file("/b.txt", Some(sha), 4, MODE_FILE).await.unwrap();
 
-        // Delete first file: refcount drops to 1, gc returns None.
         let gc1 = s.delete_file("/a.txt").await.unwrap();
         assert_eq!(gc1, None, "refcount was 2; blob must survive first delete");
 
-        // Delete second file: refcount drops to 0, gc returns the sha.
         let gc2 = s.delete_file("/b.txt").await.unwrap();
         assert_eq!(
             gc2.as_deref(),
             Some(sha),
             "refcount hit 0; blob must be returned for GC"
         );
+    }
+
+    #[tokio::test]
+    async fn rmdir_only_removes_a_directory() {
+        let s = store().await;
+        s.mkdir("/d").await.unwrap();
+        s.put_file("/f.txt", Some("x"), 1, MODE_FILE).await.unwrap();
+        s.rmdir("/d").await.unwrap();
+        assert!(s.get("/d").await.unwrap().is_none());
+        s.rmdir("/f.txt").await.unwrap();
+        assert!(s.get("/f.txt").await.unwrap().is_some(), "a file is not a directory");
+    }
+
+    // ── the LIKE escaping regression: a wildcard in a name must not over match ──
+
+    /// `_` is a single character wildcard. Before the prefix was escaped, the
+    /// subtree of `/a_b` also matched `/axb`, so an unrelated sibling was listed.
+    #[tokio::test]
+    async fn subtree_does_not_match_a_sibling_through_an_underscore() {
+        let s = store().await;
+        s.put_file("/a_b/inside.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        s.put_file("/axb/outside.txt", Some("2"), 1, MODE_FILE).await.unwrap();
+
+        let paths: Vec<String> =
+            s.subtree("/a_b").await.unwrap().into_iter().map(|n| n.path).collect();
+        assert!(paths.contains(&"/a_b/inside.txt".to_string()));
+        assert!(
+            !paths.contains(&"/axb/outside.txt".to_string()),
+            "an underscore must match itself, not any character: {paths:?}"
+        );
+    }
+
+    /// `%` matches any run of characters, so an unescaped `/50%` prefix matched
+    /// every path starting with `/50`. Deleting it took the siblings with it.
+    #[tokio::test]
+    async fn remove_subtree_does_not_delete_a_sibling_through_a_percent() {
+        let s = store().await;
+        s.put_file("/50%/inside.txt", Some("in"), 1, MODE_FILE).await.unwrap();
+        s.put_file("/50off/outside.txt", Some("out"), 1, MODE_FILE).await.unwrap();
+
+        let gc = s.remove_subtree("/50%").await.unwrap();
+        assert_eq!(gc, vec!["in"], "only the blob inside the subtree is orphaned");
+        assert!(s.get("/50%/inside.txt").await.unwrap().is_none(), "the subtree is gone");
+        assert!(
+            s.get("/50off/outside.txt").await.unwrap().is_some(),
+            "a percent must match itself, not any prefix"
+        );
+    }
+
+    /// The same over match in `rename` silently moved a sibling into the target.
+    #[tokio::test]
+    async fn rename_does_not_drag_a_sibling_along() {
+        let s = store().await;
+        s.put_file("/a_b/inside.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        s.put_file("/axb/outside.txt", Some("2"), 1, MODE_FILE).await.unwrap();
+
+        s.rename("/a_b", "/moved").await.unwrap();
+        assert!(s.get("/moved/inside.txt").await.unwrap().is_some());
+        assert!(
+            s.get("/axb/outside.txt").await.unwrap().is_some(),
+            "the sibling must stay where it was"
+        );
+        assert!(s.get("/moved/outside.txt").await.unwrap().is_none());
+    }
+
+    /// A backslash is the escape character itself, so a path containing one has
+    /// to survive a round trip through the pattern.
+    #[tokio::test]
+    async fn a_backslash_in_a_name_is_escaped_not_dropped() {
+        let s = store().await;
+        s.put_file("/a\\b/inside.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        let paths: Vec<String> =
+            s.subtree("/a\\b").await.unwrap().into_iter().map(|n| n.path).collect();
+        assert!(paths.contains(&"/a\\b/inside.txt".to_string()), "{paths:?}");
+    }
+
+    // ── volume isolation, newly possible to get wrong ──────────────────────────
+
+    /// Two volumes sharing one database must not see each other's rows. Without
+    /// the volume_id filter every query would return both trees.
+    #[tokio::test]
+    async fn volumes_sharing_a_database_are_isolated() {
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let a = RelationalMetaStore::open(db.clone(), "vol-a").await.unwrap();
+        let b = RelationalMetaStore::open(db, "vol-b").await.unwrap();
+
+        a.put_file("/only-in-a.txt", Some("sa"), 1, MODE_FILE).await.unwrap();
+        assert!(a.get("/only-in-a.txt").await.unwrap().is_some());
+        assert!(b.get("/only-in-a.txt").await.unwrap().is_none());
+
+        assert_eq!(b.list_children("/").await.unwrap().len(), 0);
+        assert_eq!(a.list_children("/").await.unwrap().len(), 1);
+    }
+
+    /// Refcounts are per volume, so deleting a file in one volume must not GC a
+    /// blob another volume still references, and must still GC its own.
+    #[tokio::test]
+    async fn refcounts_do_not_leak_across_volumes() {
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let a = RelationalMetaStore::open(db.clone(), "vol-a").await.unwrap();
+        let b = RelationalMetaStore::open(db, "vol-b").await.unwrap();
+
+        a.put_file("/f.txt", Some("shared"), 1, MODE_FILE).await.unwrap();
+        b.put_file("/f.txt", Some("shared"), 1, MODE_FILE).await.unwrap();
+
+        let gc = a.delete_file("/f.txt").await.unwrap();
+        assert_eq!(
+            gc.as_deref(),
+            Some("shared"),
+            "volume a held the only reference it knows about"
+        );
+        assert!(b.get("/f.txt").await.unwrap().is_some(), "volume b is untouched");
+        let gc_b = b.delete_file("/f.txt").await.unwrap();
+        assert_eq!(gc_b.as_deref(), Some("shared"), "volume b GCs its own reference");
+    }
+
+    /// A subtree removal in one volume must not touch an identically named path
+    /// in another.
+    #[tokio::test]
+    async fn remove_subtree_is_scoped_to_its_volume() {
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let a = RelationalMetaStore::open(db.clone(), "vol-a").await.unwrap();
+        let b = RelationalMetaStore::open(db, "vol-b").await.unwrap();
+
+        a.put_file("/d/x.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        b.put_file("/d/x.txt", Some("2"), 1, MODE_FILE).await.unwrap();
+
+        a.remove_subtree("/d").await.unwrap();
+        assert!(a.get("/d/x.txt").await.unwrap().is_none());
+        assert!(b.get("/d/x.txt").await.unwrap().is_some(), "volume b keeps its tree");
+    }
+
+    #[tokio::test]
+    async fn rename_is_scoped_to_its_volume() {
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let a = RelationalMetaStore::open(db.clone(), "vol-a").await.unwrap();
+        let b = RelationalMetaStore::open(db, "vol-b").await.unwrap();
+
+        a.put_file("/src/f.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        b.put_file("/src/f.txt", Some("2"), 1, MODE_FILE).await.unwrap();
+
+        a.rename("/src", "/dst").await.unwrap();
+        assert!(a.get("/dst/f.txt").await.unwrap().is_some());
+        assert!(b.get("/src/f.txt").await.unwrap().is_some(), "volume b did not move");
+        assert!(b.get("/dst/f.txt").await.unwrap().is_none());
+    }
+
+    /// `rename` orders by path length so a parent moves before its children. On
+    /// SQL Server that function is spelled differently, so the store asks the
+    /// dialect rather than hardcoding it.
+    #[test]
+    fn rename_orders_by_the_dialect_length_function() {
+        assert_eq!(Dialect::Sqlite.length_fn(), "length");
+        assert_eq!(Dialect::SqlServer.length_fn(), "LEN");
+    }
+
+    /// A deep tree exercises the ordering: every child must land under its moved
+    /// parent instead of being orphaned.
+    #[tokio::test]
+    async fn rename_moves_a_deep_tree_in_parent_first_order() {
+        let s = store().await;
+        s.put_file("/a/b/c/d/deep.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        s.rename("/a", "/z").await.unwrap();
+        assert!(s.get("/z/b/c/d/deep.txt").await.unwrap().is_some());
+        assert!(s.get("/a").await.unwrap().is_none());
+        let moved = s.get("/z/b/c/d").await.unwrap().unwrap();
+        assert_eq!(moved.parent.as_deref(), Some("/z/b/c"));
     }
 }

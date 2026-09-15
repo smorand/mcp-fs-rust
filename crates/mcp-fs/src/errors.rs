@@ -23,16 +23,31 @@ pub mod code {
 }
 
 /// An expected, user-facing error (4xx-style). Rendered to the client as
-/// `"{code}: {message}"`, exactly like the C# `ToolError`.
+/// `"{code}: {message}"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     pub code: &'static str,
     pub message: String,
+    /// True when the cause is transient, so re-running the same work can succeed.
+    ///
+    /// Only a driver sets this, and only when it knows the failure was a
+    /// serialization conflict, a deadlock victim, a pool timeout or a dropped
+    /// connection. It carries no meaning to the client: the wire shape stays
+    /// `{code}: {message}`, because a retry is the server's job, not the caller's.
+    pub retryable: bool,
 }
 
 impl ToolError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), retryable: false }
+    }
+
+    /// Mark this error transient. Named as a verb so it never reads like a query
+    /// of the `retryable` field it sets.
+    #[must_use]
+    pub fn mark_retryable(mut self) -> Self {
+        self.retryable = true;
+        self
     }
 
     // ── constructors, one per code (keeps call sites terse and consistent) ────

@@ -1,274 +1,301 @@
-//! SQLite ACL registry: projects and their members. 1:1 port of the C#
-//! `Storage/SqliteAdminStore.cs`, same schema so the db is interchangeable.
+//! ACL registry: projects and their members, on any [`RelationalDb`].
 //!
-//! All identity comparisons are caseless (`normalize_identity`).
+//! Unlike the metadata tree there is no `volume_id` here: the registry is global
+//! to the deployment, one row per project and one per membership.
+//!
+//! All identity comparisons are caseless (`normalize_identity`), so a person
+//! added as `Bob@Example.com` is the same member as `bob@example.com`.
 
 use crate::errors::{Result, ToolError};
-use crate::storage::sqlite::SqliteDb;
+use crate::storage::rel::dialect::{Assign, ColumnType, Upsert};
+use crate::storage::rel::schema::{Column, ForeignKey, SchemaSet, Table};
+use crate::storage::rel::{Query, RelationalDb, RowValues};
 use crate::storage::traits::{AdminBackend, Member, Project};
 use crate::util::{normalize_identity, now_iso};
 use async_trait::async_trait;
-use rusqlite::Row;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Arc;
 
-const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS project (
-        id         TEXT PRIMARY KEY,
-        owner      TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS project_member (
-        project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
-        person     TEXT NOT NULL,
-        role       TEXT NOT NULL,
-        added_by   TEXT NOT NULL,
-        added_at   TEXT NOT NULL,
-        PRIMARY KEY (project_id, person)
-    );
-";
+/// A project id is at most 32 characters, an email comfortably under 320.
+const PROJECT_ID_LEN: u32 = 64;
+const PERSON_LEN: u32 = 320;
 
 pub const ROLE_OWNER: &str = "owner";
 pub const ROLE_MEMBER: &str = "member";
 
-pub struct SqliteAdminStore {
-    path: PathBuf,
-    db: OnceLock<SqliteDb>,
-    in_memory: bool,
+/// The tables this store owns.
+pub fn schema() -> SchemaSet {
+    SchemaSet::new(
+        vec![
+            Table::new(
+                "project",
+                vec![
+                    Column::required("id", ColumnType::TextKey(PROJECT_ID_LEN)),
+                    Column::required("owner", ColumnType::Text),
+                    Column::required("created_at", ColumnType::Text),
+                ],
+                vec!["id"],
+            ),
+            Table::new(
+                "project_member",
+                vec![
+                    Column::required("project_id", ColumnType::TextKey(PROJECT_ID_LEN)),
+                    Column::required("person", ColumnType::TextKey(PERSON_LEN)),
+                    Column::required("role", ColumnType::Text),
+                    Column::required("added_by", ColumnType::Text),
+                    Column::required("added_at", ColumnType::Text),
+                ],
+                vec!["project_id", "person"],
+            )
+            // Deleting a project takes its memberships with it, so the registry
+            // cannot keep a membership pointing at a project that is gone.
+            .foreign_key(ForeignKey {
+                columns: vec!["project_id"],
+                references_table: "project",
+                references_columns: vec!["id"],
+                on_delete_cascade: true,
+            }),
+        ],
+        Vec::new(),
+    )
 }
 
-impl SqliteAdminStore {
-    pub fn new(path: impl AsRef<Path>) -> Self {
-        Self { path: path.as_ref().to_path_buf(), db: OnceLock::new(), in_memory: false }
+pub struct RelationalAdminStore {
+    db: Arc<dyn RelationalDb>,
+}
+
+impl RelationalAdminStore {
+    /// The schema is applied by [`AdminBackend::connect`], which the composition
+    /// root calls at startup, so constructing a store performs no IO.
+    pub fn new(db: Arc<dyn RelationalDb>) -> Self {
+        Self { db }
     }
 
-    /// Connected in-memory store, for tests.
-    pub fn in_memory() -> Result<Self> {
-        let s = Self { path: PathBuf::new(), db: OnceLock::new(), in_memory: true };
-        let db = SqliteDb::open_in_memory()?;
-        db.execute_batch(SCHEMA)?;
-        let _ = s.db.set(db);
+    /// Connected in memory store, for tests.
+    pub async fn in_memory() -> Result<Self> {
+        let db = Arc::new(crate::storage::rel::SqliteRelationalDb::open_in_memory()?);
+        let s = Self::new(db);
+        s.connect().await?;
         Ok(s)
     }
 
-    fn store(&self) -> Result<&SqliteDb> {
-        self.db.get().ok_or_else(|| ToolError::internal("admin store is not connected"))
+    fn read_project(r: &RowValues) -> Result<Project> {
+        Ok(Project { id: r.text(0)?, owner: r.text(1)?, created_at: r.text(2)? })
     }
 
-    fn read_project(r: &Row<'_>) -> rusqlite::Result<Project> {
-        Ok(Project { id: r.get(0)?, owner: r.get(1)?, created_at: r.get(2)? })
-    }
-
-    fn read_member(r: &Row<'_>) -> rusqlite::Result<Member> {
+    fn read_member(r: &RowValues) -> Result<Member> {
         Ok(Member {
-            project_id: r.get(0)?,
-            person: r.get(1)?,
-            role: r.get(2)?,
-            added_by: r.get(3)?,
-            added_at: r.get(4)?,
+            project_id: r.text(0)?,
+            person: r.text(1)?,
+            role: r.text(2)?,
+            added_by: r.text(3)?,
+            added_at: r.text(4)?,
         })
+    }
+
+    async fn project_exists(&self, id: &str) -> Result<bool> {
+        let row = self
+            .db
+            .query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(id))
+            .await?;
+        Ok(row.is_some())
     }
 }
 
 #[async_trait]
-impl AdminBackend for SqliteAdminStore {
+impl AdminBackend for RelationalAdminStore {
     async fn connect(&self) -> Result<()> {
-        if self.db.get().is_some() {
-            return Ok(());
-        }
-        if self.in_memory {
-            return Ok(());
-        }
-        let db = SqliteDb::open(&self.path)?;
-        db.execute_batch(SCHEMA)?;
-        let _ = self.db.set(db);
-        Ok(())
+        self.db.migrate(&schema()).await
     }
 
     async fn create_project(&self, project_id: &str, owner: &str) -> Result<Project> {
         let id = project_id.to_string();
         let owner = normalize_identity(owner);
-        self.store()?
-            .run(move |tx| {
-                let exists: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM project WHERE id=?1",
-                    [&id],
-                    |r| r.get(0),
-                )?;
-                if exists > 0 {
-                    return Err(ToolError::project_exists(&id));
-                }
-                let now = now_iso();
-                tx.execute(
-                    "INSERT INTO project(id, owner, created_at) VALUES(?1,?2,?3)",
-                    (&id, &owner, &now),
-                )?;
-                tx.execute(
-                    "INSERT INTO project_member(project_id, person, role, added_by, added_at)
-                     VALUES(?1,?2,?3,?4,?5)",
-                    (&id, &owner, ROLE_OWNER, &owner, &now),
-                )?;
-                Ok(Project { id, owner, created_at: now })
-            })
-            .await
+        let mut tx = self.db.begin().await?;
+        // Safe to retry in principle: a failed attempt rolls back, so the duplicate
+        // check would re-read the original state. Left on an owned handle because
+        // creating a project is a cold path where a serialization conflict is
+        // vanishingly unlikely, and the sequential form reads better than a closure.
+        let exists = tx
+            .query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(&id))
+            .await?;
+        if exists.is_some() {
+            return Err(ToolError::project_exists(&id));
+        }
+        let now = now_iso();
+        tx.execute(
+            &Query::new("INSERT INTO project (id, owner, created_at) VALUES (?1, ?2, ?3)")
+                .bind(&id)
+                .bind(&owner)
+                .bind(&now),
+        )
+        .await?;
+        tx.execute(
+            &Query::new(
+                "INSERT INTO project_member (project_id, person, role, added_by, added_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(&id)
+            .bind(&owner)
+            .bind(ROLE_OWNER)
+            .bind(&owner)
+            .bind(&now),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Project { id, owner, created_at: now })
     }
 
     async fn delete_project(&self, project_id: &str) -> Result<()> {
-        let id = project_id.to_string();
-        self.store()?
-            .run(move |tx| {
-                // members cascade via the foreign key
-                tx.execute("DELETE FROM project WHERE id=?1", [&id])?;
-                Ok(())
-            })
-            .await
+        // Memberships cascade via the foreign key.
+        self.db
+            .execute(&Query::new("DELETE FROM project WHERE id=?1").bind(project_id))
+            .await?;
+        Ok(())
     }
 
     async fn add_member(&self, project_id: &str, person: &str, added_by: &str) -> Result<Member> {
         let id = project_id.to_string();
         let person = normalize_identity(person);
         let added_by = normalize_identity(added_by);
-        self.store()?
-            .run(move |tx| {
-                let exists: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM project WHERE id=?1",
-                    [&id],
-                    |r| r.get(0),
-                )?;
-                if exists == 0 {
-                    return Err(ToolError::project_not_found(&id));
-                }
-                let now = now_iso();
-                // Never demote the owner to member.
-                let role: String = tx
-                    .query_row(
-                        "SELECT role FROM project_member WHERE project_id=?1 AND person=?2",
-                        (&id, &person),
-                        |r| r.get(0),
-                    )
-                    .unwrap_or_else(|_| ROLE_MEMBER.to_string());
-                tx.execute(
-                    "INSERT INTO project_member(project_id, person, role, added_by, added_at)
-                     VALUES(?1,?2,?3,?4,?5)
-                     ON CONFLICT(project_id, person) DO UPDATE SET added_by=excluded.added_by",
-                    (&id, &person, &role, &added_by, &now),
-                )?;
-                Ok(Member {
-                    project_id: id,
-                    person,
-                    role,
-                    added_by,
-                    added_at: now,
-                })
-            })
-            .await
+
+        // Same reasoning as create_project: idempotent, but a cold path, so the
+        // owned handle is preferred over the retry helper.
+        let mut tx = self.db.begin().await?;
+        let exists = tx
+            .query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(&id))
+            .await?;
+        if exists.is_none() {
+            return Err(ToolError::project_not_found(&id));
+        }
+        // Keep the role a member already has, so re-adding an owner never demotes
+        // them to a plain member.
+        let role = tx
+            .query_opt(
+                &Query::new(
+                    "SELECT role FROM project_member WHERE project_id=?1 AND person=?2",
+                )
+                .bind(&id)
+                .bind(&person),
+            )
+            .await?
+            .map(|r| r.text(0))
+            .transpose()?
+            .unwrap_or_else(|| ROLE_MEMBER.to_string());
+
+        let now = now_iso();
+        // Re-adding an existing member refreshes who added them, nothing else.
+        let sql = self.db.dialect().render_upsert(&Upsert::update(
+            "project_member",
+            vec!["project_id", "person", "role", "added_by", "added_at"],
+            vec!["project_id", "person"],
+            vec![Assign::inserted("added_by")],
+        ));
+        tx.execute(
+            &Query::new(sql)
+                .bind(&id)
+                .bind(&person)
+                .bind(&role)
+                .bind(&added_by)
+                .bind(&now),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Member { project_id: id, person, role, added_by, added_at: now })
     }
 
     async fn remove_member(&self, project_id: &str, person: &str) -> Result<()> {
-        let id = project_id.to_string();
-        let person = normalize_identity(person);
-        self.store()?
-            .run(move |tx| {
-                tx.execute(
-                    "DELETE FROM project_member WHERE project_id=?1 AND person=?2 AND role<>'owner'",
-                    (&id, &person),
-                )?;
-                Ok(())
-            })
-            .await
+        // The owner is never removable, which is why the role is part of the
+        // predicate rather than checked separately.
+        self.db
+            .execute(
+                &Query::new(
+                    "DELETE FROM project_member \
+                     WHERE project_id=?1 AND person=?2 AND role<>'owner'",
+                )
+                .bind(project_id)
+                .bind(normalize_identity(person)),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn get_project(&self, project_id: &str) -> Result<Option<Project>> {
-        let id = project_id.to_string();
-        self.store()?
-            .run(move |tx| {
-                let mut st =
-                    tx.prepare("SELECT id, owner, created_at FROM project WHERE id=?1")?;
-                let mut rows = st.query([&id])?;
-                match rows.next()? {
-                    Some(r) => Ok(Some(SqliteAdminStore::read_project(r)?)),
-                    None => Ok(None),
-                }
-            })
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT id, owner, created_at FROM project WHERE id=?1")
+                    .bind(project_id),
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(Some(Self::read_project(&r)?)),
+            None => Ok(None),
+        }
     }
 
     async fn list_projects_for(&self, person: &str) -> Result<Vec<Project>> {
-        let person = normalize_identity(person);
-        self.store()?
-            .run(move |tx| {
-                let mut st = tx.prepare(
-                    "SELECT p.id, p.owner, p.created_at FROM project p
-                     JOIN project_member m ON m.project_id = p.id
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT p.id, p.owner, p.created_at FROM project p \
+                     JOIN project_member m ON m.project_id = p.id \
                      WHERE m.person = ?1 ORDER BY p.id",
-                )?;
-                let out = st
-                    .query_map([&person], SqliteAdminStore::read_project)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
-            })
-            .await
+                )
+                .bind(normalize_identity(person)),
+            )
+            .await?;
+        rows.iter().map(Self::read_project).collect()
     }
 
     async fn list_all_projects(&self) -> Result<Vec<Project>> {
-        self.store()?
-            .run(|tx| {
-                let mut st =
-                    tx.prepare("SELECT id, owner, created_at FROM project ORDER BY id")?;
-                let out = st
-                    .query_map([], SqliteAdminStore::read_project)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
-            })
-            .await
+        let rows = self
+            .db
+            .query(&Query::new("SELECT id, owner, created_at FROM project ORDER BY id"))
+            .await?;
+        rows.iter().map(Self::read_project).collect()
     }
 
     async fn list_all_persons(&self) -> Result<Vec<String>> {
-        self.store()?
-            .run(|tx| {
-                let mut st =
-                    tx.prepare("SELECT DISTINCT person FROM project_member ORDER BY person")?;
-                let out = st
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
-            })
-            .await
+        let rows = self
+            .db
+            .query(&Query::new(
+                "SELECT DISTINCT person FROM project_member ORDER BY person",
+            ))
+            .await?;
+        rows.iter().map(|r| r.text(0)).collect()
     }
 
     async fn list_members(&self, project_id: &str) -> Result<Vec<Member>> {
-        let id = project_id.to_string();
-        self.store()?
-            .run(move |tx| {
-                let mut st = tx.prepare(
-                    "SELECT project_id, person, role, added_by, added_at
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT project_id, person, role, added_by, added_at \
                      FROM project_member WHERE project_id=?1 ORDER BY person",
-                )?;
-                let out = st
-                    .query_map([&id], SqliteAdminStore::read_member)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(out)
-            })
-            .await
+                )
+                .bind(project_id),
+            )
+            .await?;
+        rows.iter().map(Self::read_member).collect()
     }
 
     async fn is_member(&self, project_id: &str, person: &str) -> Result<bool> {
-        let id = project_id.to_string();
-        let person = normalize_identity(person);
-        self.store()?
-            .run(move |tx| {
-                let n: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM project_member WHERE project_id=?1 AND person=?2",
-                    (&id, &person),
-                    |r| r.get(0),
-                )?;
-                Ok(n > 0)
-            })
-            .await
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT 1 FROM project_member WHERE project_id=?1 AND person=?2",
+                )
+                .bind(project_id)
+                .bind(normalize_identity(person)),
+            )
+            .await?;
+        Ok(row.is_some())
     }
 
     async fn require_member(&self, project_id: &str, person: &str) -> Result<()> {
-        if self.get_project(project_id).await?.is_none() {
+        if !self.project_exists(project_id).await? {
             return Err(ToolError::project_not_found(project_id));
         }
         if !self.is_member(project_id, person).await? {
@@ -293,8 +320,8 @@ impl AdminBackend for SqliteAdminStore {
     }
 }
 
-/// Project id rule, identical to the C# regex `^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$`:
-/// 3 to 32 chars, lowercase letters/digits/hyphens, alphanumeric bounds.
+/// Project id rule: 3 to 32 chars, lowercase letters/digits/hyphens, alphanumeric
+/// bounds. Matches the regex `^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$`.
 pub fn validate_project_id(id: &str) -> Result<()> {
     let ok = id.len() >= 3
         && id.len() <= 32
@@ -322,10 +349,8 @@ pub fn validate_project_id(id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    async fn store() -> SqliteAdminStore {
-        let s = SqliteAdminStore::in_memory().unwrap();
-        s.connect().await.unwrap();
-        s
+    async fn store() -> RelationalAdminStore {
+        RelationalAdminStore::in_memory().await.unwrap()
     }
 
     #[tokio::test]
@@ -453,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn project_id_error_message_matches_csharp() {
+    fn project_id_error_message_is_stable() {
         let e = validate_project_id("ab").unwrap_err();
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
         assert_eq!(

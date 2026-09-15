@@ -1232,7 +1232,9 @@ mod tests {
             config.infra.admin.path = root.join("admin.db").display().to_string();
             let config = Arc::new(config);
 
-            let admin = crate::storage::build_admin_store(&config).unwrap();
+            let registry = crate::storage::RelationalRegistry::new();
+            let admin =
+                crate::storage::build_admin_store(&config, &registry).await.unwrap();
             admin.connect().await.unwrap();
             admin.create_project(MOUNT, OWNER).await.unwrap();
 

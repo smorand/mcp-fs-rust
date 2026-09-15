@@ -43,7 +43,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     let config = Arc::new(config);
 
-    let admin = crate::storage::build_admin_store(&config)?;
+    // One registry for the whole process, so the ACL store and every volume of a
+    // SQL deployment reuse one connection pool.
+    let registry = crate::storage::RelationalRegistry::new();
+    let admin = crate::storage::build_admin_store(&config, &registry).await?;
     admin.connect().await?;
 
     let stores = Arc::new(StoreManager::new(config.clone()));

@@ -262,7 +262,7 @@ pub(crate) mod test_support {
     use crate::safety::SafetyManager;
     use crate::state::AppState;
     use crate::storage::StoreManager;
-    use crate::storage::admin::SqliteAdminStore;
+    use crate::storage::admin::RelationalAdminStore;
     use crate::storage::traits::AdminBackend;
     use serde_json::Value;
     use std::sync::Arc;
@@ -290,7 +290,7 @@ pub(crate) mod test_support {
             tweak(&mut config);
             let config = Arc::new(config);
 
-            let admin = Arc::new(SqliteAdminStore::in_memory().unwrap());
+            let admin = Arc::new(RelationalAdminStore::in_memory().await.unwrap());
             admin.connect().await.unwrap();
 
             let state = Arc::new(AppState {

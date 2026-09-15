@@ -1,137 +1,159 @@
-# Parity: what it means here and how it is verified
+# Lineage: the C# origin, and why parity is retired
 
-The prime directive of this port is **strict 1:1 external parity** with the C#
-implementation (`../mcp-fs-csharp`): an existing MCP, REST or git client must not be able
-to tell the two servers apart, and a volume written by one must be readable by the other.
+This server began as a strict 1:1 port of a C# implementation (`../mcp-fs-csharp`).
+**That constraint is retired.** The project now has its own lifecycle: a change is judged
+on whether it is correct and useful here, not on whether the C# does the same thing.
 
-## What is inside the contract
+Two things follow, and both matter when reading older code or comments:
 
-| Surface | Pinned |
+* **A comment or doc that justifies a behaviour by "the C# does it this way" is stale.**
+  The behaviour may still be right, but the reason no longer holds on its own. Do not
+  preserve a shape solely because the reference had it.
+* **Nothing requires reading `../mcp-fs-csharp` any more.** `TOOL_CONTRACT.txt` remains
+  the captured tool surface and is still the authority on tool names, parameters and
+  descriptions, because those are a client contract regardless of where they came from.
+
+## What parity bought, and what is kept
+
+The port produced a large, precise regression corpus, and that value survives its
+retirement. The MCP wire framing, the 55 tool schemas, the `ERR_*` codes, the REST routes
+and the git smart protocol were all pinned against a live reference rather than inferred,
+and the tests that pin them still run.
+
+| Kept | Why it stays |
 |---|---|
-| MCP tools | the 55 names, every parameter name (snake_case), type, default and `required` list, and every parameter description (they are the LLM facing docs) |
-| MCP wire | `Content-Type: text/event-stream`, `event: message\ndata: {json}\n\n` framing, the `result`/`id`/`jsonrpc` key order, `initialize` capabilities, 401 as JSON, 202 for notifications, `-32602` unknown tool, `-32601` unknown method |
-| Tool results | every key of every returned object |
-| Errors | the 14 `ERR_*` codes and their HTTP mapping (403/404/409/400/401) |
-| Storage | the `nodes`, `blob_refs`, `project`, `project_member` schemas; content addressing by sha256; refcount GC at 0; an empty file storing no blob; the local blob layout `{root}/{sha[..2]}/{sha}`; the S3 layout `bucket mcpfs-{project}`, key = sha256; git objects under key `git:{sha}` in the `{type} {len}\0{payload}` format |
-| REST | every route and query/body parameter name, snake_case JSON |
-| Git | the smart HTTP wire protocol (pkt-line, upload-pack, receive-pack) |
-| Config | every YAML key, its default, and `${VAR}` / `${VAR:-default}` expansion |
-| CLI | `serve`, `keys`, `token`, `version` |
+| The 55 tool names, parameters and descriptions | a client and an LLM contract; `TOOL_CONTRACT.txt` is authoritative |
+| Tool schema equality tests against `parity-golden.json` | the cheapest guard against accidental schema drift, and still green |
+| The 14 `ERR_*` codes and their HTTP mapping | a client branches on these |
+| The MCP wire framing and JSON-RPC behaviour | captured live with `curl`, encoded in `app.rs` assertions |
+| The blob layouts, `{root}/{sha[..2]}/{sha}` and `git:{sha}` | an on disk contract that existing volumes rely on |
+| `crates/parity-harness` | kept runnable and green, see below |
 
-## What is NOT inside the contract
+## What changed once parity was retired
 
-Deliberately not compared, because nothing observable depends on it:
+### Schema divergences taken deliberately
 
-- **`tools/list` ordering.** Clients look a tool up by name. The set and each tool's
-  schema are compared strictly; the registration order is an implementation detail on
-  both sides.
-- **Wall clock values**: `mtime`, `ctime`, `atime`, `timestamp`, `created_at`,
-  `added_at`, `expires_at`, the epoch embedded in a trash path, the server version.
-- **Host paths** in a message.
-- **The wording of an error sentence.** The `ERR_*` code is what a client matches on, so
-  the harness reduces an error text to `tool + code`. A different code still fails.
-- **OpenAPI component schema names** (`MkdirBody` vs `MkdirBody2`): the shape is
-  compared, the generated name is not.
-- **Environment**: projects and users that exist on one server from real use.
+Both were blocked by parity and are the reason it had to go. Neither is reversible by an
+older reader of the same database.
 
-## How it is verified
+**1. `volume_id` on `nodes`, `blob_refs` and the three `git_*` tables.**
+SQLite gets one database file per volume, so a tenant column was unnecessary. PostgreSQL
+and SQL Server cannot create a database per project on the fly, so one database holds
+every volume and the tenant became the first column of the primary key
+(`PRIMARY KEY (volume_id, path)`). Under SQLite the column is still written but constant
+per file, so that deployment is unchanged in layout and behaviour.
 
-Three layers, from cheapest to strongest.
+*Consequence:* a database written by the current code carries a column the pre port code
+does not know about. SQLite tolerates the extra column on read, but there is no automated
+downgrade. `mcp-fs migrate` covers the forward direction only.
 
-**1. Schema equality tests (unit).** `tools/mod.rs` and `tools/all.rs` compare all 55
-descriptions and `inputSchema` values against `parity-golden.json`, *serialized*, so even
-property key order drift fails the build. This is the fastest guard and it runs on every
-`cargo test`.
+**2. Dialect binary typing for the OAuth token.**
+`token_enc` was `BLOB`. It is now `BLOB`, `BYTEA` or `VARBINARY(MAX)` depending on the
+engine. The encryption is untouched (AES-256-GCM keyed by `MCPFS_TOKEN_KEY`); only the
+column type is rendered per dialect.
 
-**2. The differential harness (integration).** `crates/parity-harness` replays a 128 step
-corpus (`corpus.rs`) covering the MCP surface, the REST plane, every error path, the four
-tolerant string-array shapes, unicode, special characters and boundary values. It runs in
-two modes so the two servers never need to be up together:
+A third change is worth listing beside them because it is also schema shaped:
+`ColumnType::TextKey(n)` renders as bounded `NVARCHAR(n)` on SQL Server, because SQL
+Server cannot index `NVARCHAR(MAX)`. Keyed text therefore has a length limit there that
+it does not have elsewhere.
+
+### The bug that parity would have required preserving
+
+Subtree read, subtree delete and rename built `path LIKE '{prefix}/%'` with an unescaped
+prefix. A file named `a_b` matched its sibling `axb`, so a subtree delete could remove
+unrelated rows. Under parity the correct move would have been to reproduce it. It is
+fixed instead: all three sites route through one `descendant_pattern` helper that escapes
+`\`, `%`, `_` and, on SQL Server, `[`.
+
+### The differential harness
+
+`crates/parity-harness` is **no longer a gate**, because there is no longer a reference to
+be equal to. It is kept runnable and green because the corpus is a genuine 128 step
+regression suite over the MCP surface, the REST plane and every error path, and deleting
+it would throw away coverage that the unit tests do not replicate.
+
+Use it as a regression check against a previous build of this server:
 
 ```bash
-cargo run -p parity-harness -- capture --base http://127.0.0.1:5002 --token "$CS"   --owner admin@example.com --out parity-golden.json
-cargo run -p parity-harness -- compare --base http://127.0.0.1:5003 --token "$RUST" --owner admin@example.com --golden parity-golden.json
+cargo run -p parity-harness -- capture --base http://127.0.0.1:5002 --token "$T" \
+  --owner admin@example.com --out baseline.json
+# make a change, restart, then
+cargo run -p parity-harness -- compare --base http://127.0.0.1:5002 --token "$T" \
+  --owner admin@example.com --golden baseline.json
 ```
 
-`parity-golden.json` is the committed C# baseline. A fresh project id is generated per
-run (tearing a project down on the reference leaves its volume behind, so a reused id
-would hit `ERR_NO_CLOBBER` on the second replay) and the id is masked in the recorded
-output so two runs are comparable.
+`parity-golden.json` remains the committed C# baseline. It still backs the tool schema
+equality tests, which is why it is not deleted, but a difference against it in the
+harness is now information rather than a failure.
 
-**3. Live protocol checks.** The wire contract in `mcp/mod.rs` was captured with `curl`
-against the running C# server, not inferred from its source, and the framing assertions
-in `app.rs` encode it.
+## The divergence record
 
-## Current result
-
-**134 steps compared, 13 differences, every one deliberate.** The instruction is now to
-fix what can be fixed on the Rust side rather than mirror a defect, so this list is a
-changelog of intentional improvements, not a parity debt.
+The list below is why parity was worth abandoning: each entry is a place where copying
+the reference would have copied a defect. It is kept as the rationale behind current
+behaviour. Each is also documented at its call site.
 
 ### Errors carry a usable code and a usable status
 
-| Step(s) | Reference | Here | Why |
+| Case | Reference | Here | Why |
 |---|---|---|---|
-| `read_missing`, `stat_missing`, `read_a_dir`, `traversal`, `missing_required_arg` | `"An error occurred invoking 'fs.read'."` with **no code** | `ERR_NOT_FOUND` / `ERR_INVALID_ARGUMENT` | The reference storage layer raises a bare `IOException`, which is not an `McpException`, so the SDK emits a generic sentence. A client cannot tell a missing file from a bad argument from a crash. |
-| `rest_missing` | HTTP 500 | HTTP 404 | Same leak on the REST plane: an absent file was reported as a server failure. |
-| `rest_edit_no_match`, `rest_edit_ambiguous` | HTTP 400 | HTTP 422 | The reference maps six codes and defaults the rest to a generic 400 (`GetValueOrDefault(code, 400)`), so "the text is not there" looked like "your request is malformed". 422 says the request was fine and the content was not. |
-| `rest_extract_unsupported` | HTTP 400, `ERR_INVALID_ARGUMENT` | HTTP 501, `ERR_NOT_SUPPORTED` | Asking to extract an `.mp3` is not a malformed request, it is a capability this server does not have. |
-| (not in the corpus) quota, read guard, duplicate project | HTTP 400 for all three | 429, 428, 409 | The status is the first thing a caller branches on: a spent budget, a missing precondition and a name conflict are three different situations with three different remedies. |
-
-Note for the record: an earlier draft of this document claimed the reference sent unmapped
-codes to 500. That was wrong, it defaults to 400. The harness caught it.
+| missing file, bad argument, read a directory, traversal | `"An error occurred invoking 'fs.read'."`, **no code** | `ERR_NOT_FOUND` / `ERR_INVALID_ARGUMENT` | the reference storage layer raised a bare `IOException`, so the SDK emitted a generic sentence and a client could not tell a missing file from a bad argument from a crash |
+| missing file over REST | HTTP 500 | HTTP 404 | an absent file is not a server failure |
+| edit with no match, ambiguous match | HTTP 400 | HTTP 422 | the request was well formed and the content was not; the reference defaulted every unmapped code to 400 |
+| unsupported extraction format | HTTP 400, `ERR_INVALID_ARGUMENT` | HTTP 501, `ERR_NOT_SUPPORTED` | asking to extract an `.mp3` is a missing capability, not a malformed request |
+| quota, read guard, duplicate project | HTTP 400 for all three | 429, 428, 409 | a spent budget, a missing precondition and a name conflict need three different remedies |
 
 ### Behaviour that was simply incorrect
 
-| Step(s) | Reference | Here | Why |
-|---|---|---|---|
-| `rest_list_a_file` | HTTP 200 with `{"entries": []}` | HTTP 400 `ERR_INVALID_ARGUMENT` | Listing a file is a caller mistake. Answering 200 with an empty listing invents a directory that does not exist and hides the bug. |
-| `rest_delete` | `{"deleted": true}`, no trash, no audit, a whole tree removed without `recursive` | the tool payload `{path, trashed, trash_path}`, honouring `recursive` and `trash` | The REST route called the volume client directly, so the same delete through two doors behaved differently and the REST door was the destructive one: it skipped the trash, ignored `safety.allow_hard_delete`, needed no `recursive`, and left no audit entry. `move` had the same shape of bug (no no clobber). Both now go through the engine. |
-| `upload` | no quota charge, no audit entry | charged and audited like every write | The highest volume write path was the only one with no accounting: a caller could push unlimited bytes and leave no trace. Verified live: a 50 byte upload against a 30 byte quota is now 429. |
-| `mkdir` (REST) | `parents` and `exist_ok` ignored, no audit entry | same parameters and audit as the tool | It called the volume client directly. |
-| (unit tested) `git.remote_clone` | wrote every file with no quota charge and no audit entry | the whole import is charged up front, then audited | An import that does not fit must leave the volume untouched rather than half populated, so the total is charged before the first write. A large repository therefore needs `safety.write_quota_bytes` raised, which is the honest trade: a bulk write is still a write. Verified live: a 900 byte repository against a 500 byte quota is refused and the volume stays empty. |
-| (unit tested) `git.checkout_file` | audited, but not charged | charged too | Restoring a file from history is a write. |
-| (unit tested) `fs.move` with `overwrite: true` | always failed with `ERR_NO_CLOBBER` | replaces the destination | The flag was checked and then ignored: the metadata store refuses to rename onto an existing path, so `overwrite` was dead code on both surfaces. The destination is now cleared first, GCing what it referenced. |
-| `find_refs_py` | references ordered `[3, 2]` | `[2, 3]` | The reference order is a tree-sitter traversal artifact. Ascending by line is deterministic and useful. |
-| (unit tested) `fs.tree` at exactly the node cap | one node short, flagged `truncated` | complete, `truncated: false` | The cap was checked after incrementing, so the cap-th node was dropped and a tree that fitted was reported as incomplete. |
-| `swagger_json` | `/api/fs/roots` absent | documented | ASP.NET excludes terminal `RequestDelegate` handlers from its OpenAPI document, so the reference page hides a route it serves. |
+| Case | Reference | Here |
+|---|---|---|
+| list a file | HTTP 200 with `{"entries": []}` | `ERR_INVALID_ARGUMENT`: inventing an empty directory hides a caller bug |
+| REST delete | `{"deleted": true}`, no trash, no audit, recursive regardless | the tool payload, honouring `recursive` and `trash`; the REST door was the destructive one because it bypassed the engine |
+| upload | no quota charge, no audit | charged and audited, like every other write |
+| REST mkdir | `parents` and `exist_ok` ignored, no audit | same parameters and audit as the tool |
+| `git.remote_clone` | wrote every file with no charge, no audit | whole import charged up front, then audited, so a repository that does not fit leaves the volume untouched |
+| `git.checkout_file` | audited, not charged | charged: restoring from history is a write |
+| `fs.move` with `overwrite: true` | always `ERR_NO_CLOBBER` | replaces the destination, GCing what it referenced; the flag was dead code |
+| `fs.tree` at exactly the node cap | one node short, flagged `truncated` | complete, `truncated: false` |
+| `find_refs` ordering | `[3, 2]`, a traversal artifact | ascending by line |
+| `swagger.json` | `/api/fs/roots` missing | documented |
 
-### Not reachable by the corpus, listed for completeness
+### Git, where the reference could not actually clone or push
 
-- **The git protocol actually works.** Three reference defects, each verified against both
-  servers, made a real `git clone` or `git push` impossible: `upload-pack` did not
-  advertise `multi_ack_detailed` (required over smart HTTP); the pack was built with
-  `insert_recursive`, which omits a commit's ancestry, so any repository with more than one
-  commit produced an incomplete pack; and the `receive-pack` report was raw pkt-lines even
-  when the client negotiated `side-band-64k`, so git aborted with `bad band #117` after the
-  push had landed. Fixed with the detailed capability, a revwalk fed to `insert_walk`, and
-  band 1 framing. Verified end to end: clone, commit, push, reclone.
-- `receive-pack` sends the `unpack ok` report line the protocol requires.
-- Git HTTP routes enforce project membership; the reference only checked that the repo
-  existed, so any verified token could read or write any project.
-- `git.max_pack_size_mb` is enforced; the reference parsed it and never used it.
-- Pushed objects are really indexed and imported; the reference path was a stub.
-- `auth.jwt.algorithms` is honoured. The reference parsed the key and hardcoded RS256, so a
-  configured policy was silently ignored. Unsupported names are logged at startup, and the
-  HMAC family is refused on purpose (an `HS*` algorithm with a public key file would let
-  anyone holding that key mint tokens).
-- No custom libgit2 ODB backend (`git2` cannot express one from safe Rust): the blob store
-  is the source of truth and is synced around libgit2 calls. Stored bytes are identical.
-- Generated `.docx` keeps numbered list markers and renders fenced code as monospaced
-  paragraphs instead of leaking the backtick lines.
-- `is_owner` and `is_admin` flags are computed caselessly, like the checks that authorize.
-- An invalid `fs.grep` regex is `ERR_INVALID_ARGUMENT`; the reference let the exception
-  escape into a generic internal error.
-- One implementation per operation, shared by the MCP surface and the REST plane
-  (`core::fs_ops`), including the V4A patch engine, which used to live in the tool layer and
-  force the REST route to dispatch back through the tool registry.
+Three defects, each verified against both servers, made real git use impossible:
+`upload-pack` did not advertise `multi_ack_detailed`, which smart HTTP requires; the pack
+was built with `insert_recursive`, which omits a commit's ancestry, so any repository with
+more than one commit produced an incomplete pack; and the `receive-pack` report was raw
+pkt-lines even when the client had negotiated `side-band-64k`, so git aborted with
+`bad band #117` after the push had landed. Fixed with the detailed capability, a revwalk
+fed to `insert_walk`, and band 1 framing. Verified end to end: clone, commit, push,
+reclone.
 
-## Working on parity
+Also on git: the `unpack ok` report line the protocol requires is sent; routes enforce
+project membership, where the reference only checked that the repo existed, so any
+verified token could read or write any project; `max_pack_size_mb` is enforced rather than
+parsed and ignored; and pushed objects are really indexed instead of stubbed.
 
-- When a behaviour is unclear, **ask the running reference server**, do not read its
-  source and guess. That is how the wire framing, the `mode` string (`"0o644"`), the
-  read-guard being satisfied by a write, and the sharded blob layout were all pinned.
-- `TOOL_CONTRACT.txt` is the captured tool surface and beats the C# source on conflict.
-- Recapture the golden after touching the corpus, and commit it with the change.
-- If you must diverge, it has to be because parity would reproduce a defect. Document it
-  at the call site, in this table, and in `README.md`.
+### Remaining smaller ones
+
+* `auth.jwt.algorithms` is honoured. The reference parsed it and hardcoded RS256, so a
+  configured policy was silently ignored. The HMAC family is refused on purpose: an `HS*`
+  algorithm with a public key file would let anyone holding that key mint tokens.
+* No custom libgit2 ODB backend, which `git2` cannot express from safe Rust. The blob
+  store is the source of truth and is synced around libgit2 calls; stored bytes are
+  identical.
+* Generated `.docx` keeps numbered list markers and renders fenced code as monospaced
+  paragraphs instead of leaking backtick lines.
+* `is_owner` and `is_admin` are computed caselessly, matching the checks that authorize.
+* An invalid `fs.grep` regex is `ERR_INVALID_ARGUMENT` rather than an escaped exception.
+* One implementation per operation, shared by MCP and REST (`core::fs_ops`), including the
+  V4A patch engine, which used to live in the tool layer and forced the REST route to
+  dispatch back through the tool registry.
+
+## Working on this codebase now
+
+* **Judge a change on its merits here.** Correctness, the tool contract, and the tests.
+* **`TOOL_CONTRACT.txt` still wins** on tool names, parameters and descriptions.
+* **Do not add a "the C# does X" justification.** If a behaviour is right, say why it is
+  right.
+* **Keep the harness green.** When a change is a deliberate improvement over the recorded
+  baseline, recapture and commit the new baseline with the change, and note it here.
