@@ -4,7 +4,7 @@
 //! cached in process:
 //!
 //! ```text
-//! state/git/{project_id}.db       SqliteGitDb (refs, objects index, remotes)
+//! state/git/{project_id}.db       RelationalGitDb (refs, objects index, remotes)
 //! state/git-repos/{project_id}/   bare libgit2 directory (HEAD, config, hooks)
 //! ```
 //!
@@ -24,7 +24,7 @@
 
 use crate::config::ServerConfig;
 use crate::errors::{Result, ToolError};
-use crate::git::db::SqliteGitDb;
+use crate::git::db::RelationalGitDb;
 use crate::git::odb::BlobObjectDb;
 use crate::storage::BlobBackend;
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub struct GitRepoEntry {
     pub project_id: String,
     /// libgit2 handle. `git2::Repository` is `Send` but not `Sync`, hence the mutex.
     pub repo: Mutex<git2::Repository>,
-    pub db: Arc<SqliteGitDb>,
+    pub db: Arc<RelationalGitDb>,
     pub objects: Arc<BlobObjectDb>,
     pub blobs: Arc<dyn BlobBackend>,
     /// Held for the whole of a push, so two concurrent `git-receive-pack` calls
@@ -47,21 +47,40 @@ pub struct GitRepoEntry {
 pub struct GitRepoStore {
     config: Arc<ServerConfig>,
     entries: Mutex<HashMap<String, Arc<GitRepoEntry>>>,
+    /// Handed in rather than created here, so a git index on PostgreSQL reuses the
+    /// pool the metadata and ACL stores already opened. Owning it would double the
+    /// process connection count against a single configured `max_connections`.
+    relational: Arc<crate::storage::RelationalRegistry>,
 }
 
 static SHARED: OnceLock<Arc<GitRepoStore>> = OnceLock::new();
 
 impl GitRepoStore {
-    pub fn new(config: Arc<ServerConfig>) -> Self {
-        Self { config, entries: Mutex::new(HashMap::new()) }
+    pub fn new(
+        config: Arc<ServerConfig>,
+        relational: Arc<crate::storage::RelationalRegistry>,
+    ) -> Self {
+        Self { config, entries: Mutex::new(HashMap::new()), relational }
     }
 
-    /// The process wide instance, matching the C# DI singleton. The composition
-    /// root and the `git.*` tools must share one store, otherwise each would keep
-    /// its own repository handles and write locks. Tests build their own store
-    /// with [`Self::new`] instead, since this one is fixed for the process.
-    pub fn shared(config: Arc<ServerConfig>) -> Arc<Self> {
-        SHARED.get_or_init(|| Arc::new(Self::new(config))).clone()
+    /// The process wide instance. The composition root and the `git.*` tools must
+    /// share one store, otherwise each would keep its own repository handles and
+    /// write locks. Tests build their own store with [`Self::new`] instead, since
+    /// this one is fixed for the process.
+    ///
+    /// The arguments of every call after the first are ignored, which is why the
+    /// composition root has to be the first caller: it is the only one holding the
+    /// process wide pool cache.
+    pub fn shared(
+        config: Arc<ServerConfig>,
+        relational: Arc<crate::storage::RelationalRegistry>,
+    ) -> Arc<Self> {
+        SHARED.get_or_init(|| Arc::new(Self::new(config, relational))).clone()
+    }
+
+    /// The shared pool cache this store was built with.
+    pub fn relational(&self) -> &Arc<crate::storage::RelationalRegistry> {
+        &self.relational
     }
 
     pub fn config(&self) -> &Arc<ServerConfig> {
@@ -107,7 +126,9 @@ impl GitRepoStore {
                 return true;
             }
         }
-        self.config.git_db_path(project_id).exists()
+        // The bare repository directory exists on every backend, whereas the index
+        // is a file only under SQLite, so this is the portable signal.
+        self.config.git_repo_dir(project_id).exists()
     }
 
     /// Drop the in process entry, leaving the on disk state alone (C# parity).
@@ -117,25 +138,35 @@ impl GitRepoStore {
         Ok(())
     }
 
-    /// Drop the entry and delete the on disk state (index db plus bare repo dir).
+    /// Drop the entry and delete the state (index plus bare repo dir).
     /// Git objects live in the volume's blob bucket, removed by the volume teardown.
     pub async fn purge_repo(&self, project_id: &str) -> Result<()> {
         self.teardown_repo(project_id).await?;
-        let db = self.config.git_db_path(project_id);
-        for suffix in ["", "-wal", "-shm"] {
-            let p = if suffix.is_empty() {
-                db.clone()
-            } else {
-                std::path::PathBuf::from(format!("{}{}", db.display(), suffix))
-            };
-            let _ = tokio::fs::remove_file(&p).await;
+
+        if self.config.infra.git.backend == crate::config::backend::SQLITE {
+            // The index is a file, so removing it removes every row with it.
+            let db = self.config.git_db_path(project_id);
+            for suffix in ["", "-wal", "-shm"] {
+                let p = if suffix.is_empty() {
+                    db.clone()
+                } else {
+                    std::path::PathBuf::from(format!("{}{}", db.display(), suffix))
+                };
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+        } else {
+            // On a shared database the index is a set of rows. Skipping this would
+            // let a project recreated under the same id inherit the old refs and
+            // object index, which is the defect this function exists to prevent.
+            crate::storage::purge_git_rows(&self.config, &self.relational, project_id).await?;
         }
+
         let _ = tokio::fs::remove_dir_all(self.config.git_repo_dir(project_id)).await;
         Ok(())
     }
 
     /// The metadata index for a project, opening it if needed.
-    pub async fn get_db(&self, project_id: &str) -> Result<Arc<SqliteGitDb>> {
+    pub async fn get_db(&self, project_id: &str) -> Result<Arc<RelationalGitDb>> {
         Ok(self.get_or_open_repo(project_id).await?.db.clone())
     }
 
@@ -153,7 +184,6 @@ impl GitRepoStore {
 
     async fn create_entry(&self, project_id: &str, init: bool) -> Result<Arc<GitRepoEntry>> {
         let repo_dir = self.config.git_repo_dir(project_id);
-        let db_path = self.config.git_db_path(project_id);
 
         tokio::fs::create_dir_all(&repo_dir).await?;
 
@@ -167,7 +197,10 @@ impl GitRepoStore {
                 .map_err(|e| ToolError::internal(format!("git open failed: {e}")))?
         };
 
-        let db = Arc::new(SqliteGitDb::open(&db_path)?);
+        // Through the factory, so `infra.git.backend` actually selects the engine.
+        // This used to open a SQLite file directly, which made the git index the
+        // one piece of relational state the configuration could not move.
+        let db = crate::storage::build_git_db(&self.config, &self.relational, project_id).await?;
         let blobs = crate::storage::build_blob_store(&self.config, project_id)?;
         blobs.ensure_bucket().await?;
         let objects = Arc::new(BlobObjectDb::new(blobs.clone(), db.clone()));
@@ -207,7 +240,7 @@ mod tests {
     async fn init_creates_the_expected_layout() {
         let d = tempfile::tempdir().unwrap();
         let cfg = config(d.path());
-        let store = GitRepoStore::new(cfg.clone());
+        let store = GitRepoStore::new(cfg.clone(), crate::storage::test_registry());
 
         store.init_repo("proj").await.unwrap();
 
@@ -224,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn init_sets_head_symbolic_to_main() {
         let d = tempfile::tempdir().unwrap();
-        let store = GitRepoStore::new(config(d.path()));
+        let store = GitRepoStore::new(config(d.path()), crate::storage::test_registry());
         let e = store.init_repo("proj").await.unwrap();
         let head = e.db.get_ref("HEAD").await.unwrap().unwrap();
         assert_eq!(head.target, "refs/heads/main");
@@ -234,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn entries_are_cached_per_project() {
         let d = tempfile::tempdir().unwrap();
-        let store = GitRepoStore::new(config(d.path()));
+        let store = GitRepoStore::new(config(d.path()), crate::storage::test_registry());
         let a = store.get_or_open_repo("proj").await.unwrap();
         let b = store.get_or_open_repo("proj").await.unwrap();
         assert!(Arc::ptr_eq(&a, &b), "one entry per project");
@@ -245,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn is_initialized_tracks_the_db_file() {
         let d = tempfile::tempdir().unwrap();
-        let store = GitRepoStore::new(config(d.path()));
+        let store = GitRepoStore::new(config(d.path()), crate::storage::test_registry());
         assert!(!store.is_initialized("proj").await);
         store.init_repo("proj").await.unwrap();
         assert!(store.is_initialized("proj").await);
@@ -257,7 +290,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let cfg = config(d.path());
         let sha = {
-            let store = GitRepoStore::new(cfg.clone());
+            let store = GitRepoStore::new(cfg.clone(), crate::storage::test_registry());
             let e = store.init_repo("proj").await.unwrap();
             e.db.set_ref("refs/heads/main", "a".repeat(40).as_str(), false).await.unwrap();
             let sha = e.objects.write(git2::ObjectType::Blob, b"persisted").await.unwrap();
@@ -269,7 +302,7 @@ mod tests {
         };
 
         // brand new store, cold in memory map
-        let store2 = GitRepoStore::new(cfg.clone());
+        let store2 = GitRepoStore::new(cfg.clone(), crate::storage::test_registry());
         assert!(store2.is_initialized("proj").await);
         let db = store2.get_db("proj").await.unwrap();
         assert_eq!(
@@ -284,7 +317,7 @@ mod tests {
     async fn purge_removes_on_disk_state() {
         let d = tempfile::tempdir().unwrap();
         let cfg = config(d.path());
-        let store = GitRepoStore::new(cfg.clone());
+        let store = GitRepoStore::new(cfg.clone(), crate::storage::test_registry());
         store.init_repo("proj").await.unwrap();
 
         store.purge_repo("proj").await.unwrap();
@@ -298,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn write_lock_serializes_pushes() {
         let d = tempfile::tempdir().unwrap();
-        let store = GitRepoStore::new(config(d.path()));
+        let store = GitRepoStore::new(config(d.path()), crate::storage::test_registry());
         let entry = store.init_repo("proj").await.unwrap();
 
         let guard = entry.write_lock.lock().await;
@@ -317,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn open_uses_a_separate_blob_bucket_per_project() {
         let d = tempfile::tempdir().unwrap();
-        let store = GitRepoStore::new(config(d.path()));
+        let store = GitRepoStore::new(config(d.path()), crate::storage::test_registry());
         let a = store.init_repo("proj-a").await.unwrap();
         let b = store.init_repo("proj-b").await.unwrap();
         let sha = a.objects.write(git2::ObjectType::Blob, b"only in a").await.unwrap();

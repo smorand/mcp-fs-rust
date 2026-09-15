@@ -348,7 +348,9 @@ fn pdf_title(data: &[u8]) -> Option<String> {
 /// coincides with Latin-1 for everything we care about.
 fn decode_pdf_text(raw: &[u8]) -> String {
     if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
-        let units: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        // A trailing odd byte cannot form a code unit, so the remainder is dropped.
+        let units: Vec<u16> =
+            raw[2..].as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c)).collect();
         return String::from_utf16_lossy(&units);
     }
     raw.iter().map(|b| *b as char).collect()
@@ -1097,13 +1099,13 @@ mod tests {
     use super::*;
     use crate::docs::ocr::{NullOcrProvider, OcrProvider};
     use crate::storage::blob::local::LocalBlobStore;
-    use crate::storage::meta::SqliteMetaStore;
+    use crate::storage::meta::RelationalMetaStore;
     use async_trait::async_trait;
     use std::sync::Arc;
 
-    fn vol() -> (tempfile::TempDir, VolumeClient) {
+    async fn vol() -> (tempfile::TempDir, VolumeClient) {
         let d = tempfile::tempdir().unwrap();
-        let meta = Arc::new(SqliteMetaStore::in_memory().unwrap());
+        let meta = Arc::new(RelationalMetaStore::in_memory("test").await.unwrap());
         let blob = Arc::new(LocalBlobStore::new(d.path(), "mcpfs-docs-test"));
         (d, VolumeClient::new("test", meta, blob))
     }
@@ -1557,7 +1559,7 @@ mod tests {
 
     #[tokio::test]
     async fn extract_text_on_a_text_file_writes_no_companion() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/notes.txt", "hello world").await.unwrap();
         let null = NullOcrProvider;
         let out = extract_text(&v, &null, "/notes.txt", 1000, 5, true, false).await.unwrap();
@@ -1573,7 +1575,7 @@ mod tests {
 
     #[tokio::test]
     async fn extract_text_on_a_csv_writes_the_companion_md() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/data.csv", "a,b\n1,2\n").await.unwrap();
         let null = NullOcrProvider;
         let out = extract_text(&v, &null, "/data.csv", 100_000, 4_000, true, false).await.unwrap();
@@ -1588,7 +1590,7 @@ mod tests {
 
     #[tokio::test]
     async fn companion_md_is_reused_when_up_to_date() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/data.csv", "a,b\n1,2\n").await.unwrap();
         let null = NullOcrProvider;
         extract_text(&v, &null, "/data.csv", 100_000, 4_000, true, false).await.unwrap();
@@ -1607,7 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_forces_re_extraction_over_the_companion() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/data.csv", "a,b\n1,2\n").await.unwrap();
         let null = NullOcrProvider;
         extract_text(&v, &null, "/data.csv", 100_000, 4_000, true, false).await.unwrap();
@@ -1621,7 +1623,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_companion_is_regenerated() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/data.csv", "a,b\n1,2\n").await.unwrap();
         let null = NullOcrProvider;
         extract_text(&v, &null, "/data.csv", 100_000, 4_000, true, false).await.unwrap();
@@ -1636,7 +1638,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_chars_bounds_the_stored_markdown_and_preview_bounds_the_reply() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         let long: String = (0..300).map(|i| format!("row{i},value{i}\n")).collect();
         v.write_text_atomic("/big.csv", &long).await.unwrap();
         let null = NullOcrProvider;
@@ -1649,7 +1651,7 @@ mod tests {
 
     #[tokio::test]
     async fn preview_larger_than_the_text_returns_everything() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/s.txt", "short").await.unwrap();
         let null = NullOcrProvider;
         let out = extract_text(&v, &null, "/s.txt", 1000, 10_000, true, false).await.unwrap();
@@ -1658,7 +1660,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_extraction_writes_no_companion_and_reports_null_md_path() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_bytes_atomic("/scan.png", b"\x89PNG not a real image").await.unwrap();
         let null = NullOcrProvider;
         let out = extract_text(&v, &null, "/scan.png", 1000, 100, true, false).await.unwrap();
@@ -1670,7 +1672,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_format_returns_err_not_supported() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_bytes_atomic("/talk.mp3", b"ID3fake").await.unwrap();
         let null = NullOcrProvider;
         let err = extract_text(&v, &null, "/talk.mp3", 1000, 100, true, false).await.unwrap_err();
@@ -1680,7 +1682,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_source_is_not_found() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         let null = NullOcrProvider;
         let err = extract_text(&v, &null, "/nope.pdf", 1000, 100, true, false).await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::NOT_FOUND);
@@ -1689,7 +1691,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_directory_is_not_a_file() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.makedirs("/dir", true).await.unwrap();
         let null = NullOcrProvider;
         let err = extract_text(&v, &null, "/dir", 1000, 100, true, false).await.unwrap_err();
@@ -1698,7 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn broken_docx_reports_could_not_extract() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_bytes_atomic("/bad.docx", b"not a zip at all").await.unwrap();
         let null = NullOcrProvider;
         let err = extract_text(&v, &null, "/bad.docx", 1000, 100, true, false).await.unwrap_err();
@@ -1708,7 +1710,7 @@ mod tests {
 
     #[tokio::test]
     async fn html_source_gets_a_companion_md() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_text_atomic("/page.html", "<h1>Title</h1>\n<p>Body</p>").await.unwrap();
         let null = NullOcrProvider;
         let out = extract_text(&v, &null, "/page.html", 1000, 100, true, false).await.unwrap();
@@ -1718,7 +1720,7 @@ mod tests {
 
     #[tokio::test]
     async fn pdf_end_to_end_writes_the_companion() {
-        let (_d, v) = vol();
+        let (_d, v) = vol().await;
         v.write_bytes_atomic("/doc.pdf", &tiny_pdf()).await.unwrap();
         let null = NullOcrProvider;
         let out = extract_text(&v, &null, "/doc.pdf", 100_000, 4_000, true, false).await.unwrap();

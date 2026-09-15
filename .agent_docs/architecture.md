@@ -28,20 +28,26 @@ plane can never disagree.
                     |                                          |
         +-----------v------------------------------------------v----------+
         | storage: VolumeClient (MetaBackend + BlobBackend), AdminBackend  |
-        | SqliteMetaStore | LocalBlobStore / S3BlobStore | SqliteAdminStore|
+        | RelationalMetaStore | LocalBlobStore / S3BlobStore | Relational- |
+        | AdminStore                                          | ...        |
+        +-----------+------------------------------------------+----------+
+                    |
+        +-----------v------------------------------------------------------+
+        | storage::rel: RelationalDb / RelationalTx + Dialect              |
+        | SqliteRelationalDb | PgRelationalDb | MssqlRelationalDb          |
         +------------------------------------------------------------------+
 ```
 
 ## Storage model
 
-A volume is a pair: a metadata tree in SQLite and content addressed bytes in a
-blob store. The two are bound by `storage::volume::VolumeClient`.
+A volume is a pair: a metadata tree in a relational database and content addressed
+bytes in a blob store. The two are bound by `storage::volume::VolumeClient`.
 
 | Table | Where | Columns |
 |---|---|---|
-| `nodes` | `state/volumes/{project}.db` | `path` (PK), `parent`, `name`, `kind` (dir/file), `size`, `mode`, `mtime`, `ctime`, `atime`, `sha256` |
-| `blob_refs` | same db | `sha256` (PK), `refcount`, `size` |
-| `project`, `project_member` | `state/admin.db` | ACL registry, all identities normalized caseless |
+| `nodes` | `state/volumes/{project}.db`, or one shared database | `volume_id` + `path` (PK), `parent`, `name`, `kind` (dir/file), `size`, `mode`, `mtime`, `ctime`, `atime`, `sha256` |
+| `blob_refs` | same db | `volume_id` + `sha256` (PK), `refcount`, `size` |
+| `project`, `project_member` | `state/admin.db`, or one shared database | ACL registry, all identities normalized caseless |
 
 Rules that the on disk contract depends on (`storage/meta.rs`,
 `storage/volume.rs`):
@@ -67,6 +73,41 @@ Rules that the on disk contract depends on (`storage/meta.rs`,
 * **Git objects share the bucket** under the key `git:{sha}`, holding the
   canonical `{type} {len}\0{payload}` bytes. A sha256 is plain hex, so the prefix
   makes a collision impossible. See `.agent_docs/git.md`.
+
+## The relational layer
+
+Every store speaks `storage::rel::RelationalDb` rather than a driver, so the metadata
+tree, the ACL registry, the git index and the OAuth store each run on SQLite (default),
+PostgreSQL or SQL Server, chosen per store in the config. Full reference in
+[`backends.md`](backends.md).
+
+```text
+RelationalMetaStore  RelationalAdminStore  RelationalGitDb  RelationalOAuthPersistence
+         |                   |                   |                    |
+         +---------+---------+---------+---------+--------------------+
+                   |  RelationalDb (dyn) + Dialect
+     +-------------+--------------+----------------+
+     |                            |                |
+SqliteRelationalDb        PgRelationalDb    MssqlRelationalDb
+(serialized, actor)       (sqlx pool)       (bb8 + tiberius-ng)
+```
+
+Three properties matter above the layer:
+
+* **A transaction is an owned handle.** `db.begin()` returns a `Box<dyn RelationalTx>`;
+  `commit()` consumes it and a drop rolls back. Not a closure, because a closure cannot
+  carry a value out and is unusable across these call sites.
+* **`run_retrying` is opt in and asserts idempotence.** It re runs the whole closure on a
+  transient failure (up to `MAX_TX_ATTEMPTS`, 3). Work that touches state outside the
+  transaction must use `begin()` instead. See `backends.md`.
+* **`volume_id` scopes every row.** One shared PostgreSQL or SQL Server database holds
+  every volume, so `volume_id` is the first key column of `nodes`, `blob_refs` and the
+  `git_*` tables and belongs in every `WHERE` clause. Under SQLite it is constant per
+  file, so that deployment keeps one file per volume.
+
+`storage::RelationalRegistry` opens one pool per distinct backend, dsn and schema triple
+and shares it process wide, so pointing all four stores at one dsn uses one pool. SQLite
+is excluded from that sharing: each file keeps its own serialized connection.
 
 ## Write, read, delete end to end
 
@@ -129,11 +170,19 @@ and never leaks across callers.
 
 ## Concurrency
 
-* **One SQLite connection per database**, wrapped in a mutex, opened with
+* **SQLite: one connection per database**, wrapped in a mutex, opened with
   `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`. Every access runs
   in a transaction (commit on `Ok`, rollback on `Err`) inside
   `tokio::task::spawn_blocking`, so a request thread never blocks on the db and
-  "database is locked" cannot happen from within the process.
+  "database is locked" cannot happen from within the process. A transaction is driven
+  by a short lived actor holding the lock for its whole life, because a
+  `rusqlite::Transaction` borrows its `Connection` and a `MutexGuard` is not `Send`, so
+  it cannot be held across an `.await`.
+* **PostgreSQL and SQL Server: a real connection pool** (`pool.max_connections`,
+  `pool.acquire_timeout_secs`), so writes run concurrently instead of serialized. That
+  makes two failures newly possible which SQLite could not produce: a serialization
+  conflict and a deadlock victim. Both are marked `retryable` and are re run by
+  `rel::run_retrying`, which is why work wrapped in it must be idempotent.
 * **`StoreManager` caches one `VolumeClient` per project** behind a tokio mutex;
   the first access provisions the blob bucket.
 * **Git**: one `GitRepoEntry` per project, `git2::Repository` behind a mutex
@@ -159,3 +208,17 @@ quota, an edit without a prior read, an ambiguous match and an unsupported forma
 were indistinguishable by status. Here they are 429, 428, 409 and 501 respectively,
 and `ToolError::is_client_error` tells the logging layer whether a failure was the
 caller's fault, so a 4xx stays concise and monitoring is not paged for it.
+
+### Transient database failures
+
+A remote database adds failure modes an in process SQLite call could not have: a
+serialization conflict, a deadlock victim, a pool timeout and a dropped connection. These
+carry no new `ERR_*` code, so the code list stays at 14. Instead `ToolError` has a
+`retryable` flag, set by `mark_retryable()` at the driver boundary, and
+`rel::run_retrying` is the only thing that reads it.
+
+The reason it is a flag and not a code: whether a failure is worth retrying is orthogonal
+to what a client should be told. A caller still sees `ERR_INTERNAL_ERROR`, because a
+conflict the server already retried three times is a server problem, not something the
+caller can fix by changing the request. The message names the real cause, so a pool
+timeout never reads as a generic SQLite failure.

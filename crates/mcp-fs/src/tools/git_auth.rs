@@ -30,13 +30,24 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// `git.remote_clone` reads it, so they must be the same instance; the error is
 /// cached too, because a malformed `MCPFS_TOKEN_KEY` must fail loudly every time
 /// instead of silently downgrading to memory only storage.
-static TOKENS: OnceLock<Result<Arc<OAuthTokenStore>>> = OnceLock::new();
+/// A `tokio::sync::OnceCell` rather than a `OnceLock`: building the store now
+/// loads the encrypted rows through an async driver, so initialisation awaits.
+static TOKENS: tokio::sync::OnceCell<Result<Arc<OAuthTokenStore>>> =
+    tokio::sync::OnceCell::const_new();
 
 /// Process wide device flow client. Reuses one `reqwest` connection pool.
 static FLOW: OnceLock<Result<Arc<dyn DeviceFlowClient>>> = OnceLock::new();
 
-pub fn token_store(config: &ServerConfig) -> Result<Arc<OAuthTokenStore>> {
-    TOKENS.get_or_init(|| OAuthTokenStore::from_env(config).map(Arc::new)).clone()
+pub async fn token_store(
+    config: &ServerConfig,
+    registry: &crate::storage::RelationalRegistry,
+) -> Result<Arc<OAuthTokenStore>> {
+    TOKENS
+        .get_or_init(|| async {
+            OAuthTokenStore::from_env(config, registry).await.map(Arc::new)
+        })
+        .await
+        .clone()
 }
 
 fn device_flow(config: &ServerConfig) -> Result<Arc<dyn DeviceFlowClient>> {
@@ -72,7 +83,7 @@ pub fn register_with(
             async move {
                 let provider = a.str("provider")?;
                 let instance_url = a.opt_str("instance_url");
-                let tokens = resolve_tokens(&ctx, t)?;
+                let tokens = resolve_tokens(&ctx, t).await?;
                 let flow = match f {
                     Some(f) => f,
                     None => device_flow(&ctx.state.config)?,
@@ -92,7 +103,7 @@ pub fn register_with(
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
             async move {
-                let tokens = resolve_tokens(&ctx, t)?;
+                let tokens = resolve_tokens(&ctx, t).await?;
                 auth_status(&ctx, a.opt_str("provider").as_deref(), &tokens)
             }
         }),
@@ -106,17 +117,20 @@ pub fn register_with(
             let t = t.clone();
             async move {
                 let provider = a.str("provider")?;
-                let tokens = resolve_tokens(&ctx, t)?;
-                auth_revoke(&ctx, &provider, &tokens)
+                let tokens = resolve_tokens(&ctx, t).await?;
+                auth_revoke(&ctx, &provider, &tokens).await
             }
         }),
     );
 }
 
-fn resolve_tokens(ctx: &ToolCtx, injected: Option<Arc<OAuthTokenStore>>) -> Result<Arc<OAuthTokenStore>> {
+async fn resolve_tokens(
+    ctx: &ToolCtx,
+    injected: Option<Arc<OAuthTokenStore>>,
+) -> Result<Arc<OAuthTokenStore>> {
     match injected {
         Some(t) => Ok(t),
-        None => token_store(&ctx.state.config),
+        None => token_store(&ctx.state.config, ctx.state.stores.relational()).await,
     }
 }
 
@@ -181,14 +195,17 @@ fn spawn_poller(
             match flow.poll_for_token(&code).await {
                 Ok(poll) if poll.success => {
                     let Some(token) = poll.access_token else { return };
-                    if let Err(e) = tokens.store_token(
-                        &person,
-                        &provider,
-                        &token,
-                        poll.scopes,
-                        poll.expires_at,
-                        instance_url,
-                    ) {
+                    if let Err(e) = tokens
+                        .store_token(
+                            &person,
+                            &provider,
+                            &token,
+                            poll.scopes,
+                            poll.expires_at,
+                            instance_url,
+                        )
+                        .await
+                    {
                         // The message never contains the token itself.
                         tracing::warn!("git.auth: cannot store the {provider} token: {e}");
                     }
@@ -235,9 +252,13 @@ fn status_for(person: &str, provider: &str, tokens: &OAuthTokenStore, single: bo
     Value::Object(out)
 }
 
-fn auth_revoke(ctx: &ToolCtx, provider: &str, tokens: &OAuthTokenStore) -> Result<Value> {
+async fn auth_revoke(
+    ctx: &ToolCtx,
+    provider: &str,
+    tokens: &OAuthTokenStore,
+) -> Result<Value> {
     let person = require_identity(ctx)?;
-    tokens.revoke_token(&person, provider)?;
+    tokens.revoke_token(&person, provider).await?;
     Ok(json!({"provider": provider, "revoked": true}))
 }
 
@@ -481,7 +502,7 @@ mod tests {
         assert_eq!(out, json!({"authenticated": false, "provider": "github"}));
 
         tokens
-            .store_token(PERSON, "github", "tok", vec!["repo".into()], future(), None)
+            .store_token(PERSON, "github", "tok", vec!["repo".into()], future(), None).await
             .unwrap();
         let out = f
             .call(&r, PERSON, "git.auth_status", json!({"provider":"github"}))
@@ -498,7 +519,7 @@ mod tests {
     async fn auth_status_reports_all_providers_when_none_is_given() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
         tokens
-            .store_token(PERSON, "gitlab", "tok", vec!["api".into()], future(), None)
+            .store_token(PERSON, "gitlab", "tok", vec!["api".into()], future(), None).await
             .unwrap();
 
         let out = f.call(&r, PERSON, "git.auth_status", json!({})).await.unwrap();
@@ -523,7 +544,7 @@ mod tests {
                 vec![],
                 Utc::now() - chrono::Duration::minutes(1),
                 None,
-            )
+            ).await
             .unwrap();
         let out = f
             .call(&r, PERSON, "git.auth_status", json!({"provider":"github"}))
@@ -535,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_clears_the_token_and_is_idempotent() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
-        tokens.store_token(PERSON, "github", "tok", vec![], future(), None).unwrap();
+        tokens.store_token(PERSON, "github", "tok", vec![], future(), None).await.unwrap();
 
         let out = f
             .call(&r, PERSON, "git.auth_revoke", json!({"provider":"github"}))
@@ -551,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn tokens_are_per_person() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
-        tokens.store_token(PERSON, "github", "mine", vec![], future(), None).unwrap();
+        tokens.store_token(PERSON, "github", "mine", vec![], future(), None).await.unwrap();
         let out = f
             .call(&r, "other@test.com", "git.auth_status", json!({"provider":"github"}))
             .await

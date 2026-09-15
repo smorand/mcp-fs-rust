@@ -156,7 +156,12 @@ async fn delete_project(
     // The C# only dropped the in process git entry, so state/git/{id}.db survived
     // and a project recreated under the same id inherited stale refs. Purge it.
     if ctx.state.config.git.enabled {
-        let store = git.unwrap_or_else(|| GitRepoStore::shared(ctx.state.config.clone()));
+        let store = git.unwrap_or_else(|| {
+            GitRepoStore::shared(
+                ctx.state.config.clone(),
+                ctx.state.stores.relational().clone(),
+            )
+        });
         store.purge_repo(project_id).await?;
     }
     ctx.state.admin.delete_project(project_id).await?;
@@ -262,7 +267,7 @@ pub(crate) mod test_support {
     use crate::safety::SafetyManager;
     use crate::state::AppState;
     use crate::storage::StoreManager;
-    use crate::storage::admin::SqliteAdminStore;
+    use crate::storage::admin::RelationalAdminStore;
     use crate::storage::traits::AdminBackend;
     use serde_json::Value;
     use std::sync::Arc;
@@ -290,14 +295,17 @@ pub(crate) mod test_support {
             tweak(&mut config);
             let config = Arc::new(config);
 
-            let admin = Arc::new(SqliteAdminStore::in_memory().unwrap());
+            let admin = Arc::new(RelationalAdminStore::in_memory().await.unwrap());
             admin.connect().await.unwrap();
 
             let state = Arc::new(AppState {
                 config: config.clone(),
                 admin,
-                stores: Arc::new(StoreManager::new(config.clone())),
-                safety: Arc::new(SafetyManager::new(config.safety.clone())),
+                stores: Arc::new(StoreManager::new(config.clone(), crate::storage::test_registry())),
+                safety: Arc::new(SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
                 identity: Arc::new(IdentityResolver::new(&config.auth)),
                 // The tools never dispatch through the registry, so an empty one
                 // is enough here; tests keep their own registry to call into.
@@ -695,7 +703,7 @@ mod tests {
         let f = Fixture::with_config(|c| c.git.enabled = true).await;
         f.seed_project("gitproj", "owner@test.com").await;
 
-        let git = Arc::new(GitRepoStore::new(f.state.config.clone()));
+        let git = Arc::new(GitRepoStore::new(f.state.config.clone(), crate::storage::test_registry()));
         git.init_repo("gitproj").await.unwrap();
         assert!(f.state.config.git_db_path("gitproj").exists());
 

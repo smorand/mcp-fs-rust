@@ -1605,18 +1605,18 @@ mod tests {
         s: SafetyManager,
     }
 
-    fn fixture() -> Fix {
-        fixture_with(SafetyConfig::default())
+    async fn fixture() -> Fix {
+        fixture_with(SafetyConfig::default()).await
     }
 
-    fn fixture_with(cfg: SafetyConfig) -> Fix {
-        let meta = Arc::new(crate::storage::meta::SqliteMetaStore::in_memory().unwrap());
+    async fn fixture_with(cfg: SafetyConfig) -> Fix {
+        let meta = Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
         let d = tempfile::tempdir().unwrap();
         let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
         Fix {
             _dir: d,
             v: VolumeClient::new("p", meta, blob),
-            s: SafetyManager::new(cfg),
+            s: SafetyManager::new(cfg, None),
         }
     }
 
@@ -1634,7 +1634,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_window_numbers_lines_and_reports_total() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "one\ntwo\nthree\n").await;
         let r = read_window(&f.v, &f.s, P, M, "/a.txt", 0, 2000, true).await.unwrap();
         assert_eq!(s(&r, "content"), "1\tone\n2\ttwo\n3\tthree");
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_window_without_numbers_is_raw_join() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "one\ntwo\n").await;
         let r = read_window(&f.v, &f.s, P, M, "/a.txt", 0, 2000, false).await.unwrap();
         assert_eq!(s(&r, "content"), "one\ntwo");
@@ -1653,7 +1653,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_window_pages_and_sets_next_offset() {
-        let f = fixture();
+        let f = fixture().await;
         let body: String = (1..=10).map(|i| format!("l{i}\n")).collect();
         seed(&f, "/a.txt", &body).await;
         let r = read_window(&f.v, &f.s, P, M, "/a.txt", 0, 4, true).await.unwrap();
@@ -1669,7 +1669,7 @@ mod tests {
     /// The per-call limit is bounded by safety.max_read_lines.
     #[tokio::test]
     async fn read_window_respects_max_read_lines_cap() {
-        let f = fixture_with(SafetyConfig { max_read_lines: 2, ..Default::default() });
+        let f = fixture_with(SafetyConfig { max_read_lines: 2, ..Default::default() }).await;
         seed(&f, "/a.txt", "a\nb\nc\nd\n").await;
         let r = read_window(&f.v, &f.s, P, M, "/a.txt", 0, 1000, true).await.unwrap();
         assert_eq!(s(&r, "content"), "1\ta\n2\tb");
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_window_on_empty_file() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/e.txt", "").await;
         let r = read_window(&f.v, &f.s, P, M, "/e.txt", 0, 2000, true).await.unwrap();
         assert_eq!(s(&r, "content"), "");
@@ -1688,7 +1688,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_window_missing_file_is_not_found() {
-        let f = fixture();
+        let f = fixture().await;
         let e = read_window(&f.v, &f.s, P, M, "/nope.txt", 0, 10, true).await.unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
     }
@@ -1696,7 +1696,7 @@ mod tests {
     /// A read is what unlocks a later edit.
     #[tokio::test]
     async fn read_records_the_read_guard() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/g.txt", "x\n").await.unwrap();
         let e = edit_unique(&f.v, &f.s, P, M, "/g.txt", "x", "y", false, false).await.unwrap_err();
         assert_eq!(e.code, code::EDIT_WITHOUT_PRIOR_READ);
@@ -1708,7 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_bytes_is_base64_with_mime() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.json", "{\"k\":1}").await;
         let r = read_bytes_b64(&f.v, &f.s, P, M, "/a.json", 0, 65536).await.unwrap();
         assert_eq!(s(&r, "base64"), "eyJrIjoxfQ==");
@@ -1718,7 +1718,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_bytes_slices_and_defaults_mime() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/blob.bin", "0123456789").await;
         let r = read_bytes_b64(&f.v, &f.s, P, M, "/blob.bin", 4, 3).await.unwrap();
         let raw = base64::engine::general_purpose::STANDARD
@@ -1731,7 +1731,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_lines_is_inclusive_and_one_based() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "a\nb\nc\nd\n").await;
         let r = read_lines(&f.v, &f.s, P, M, "/a.txt", 2, 3).await.unwrap();
         assert_eq!(s(&r, "content"), "2\tb\n3\tc");
@@ -1740,7 +1740,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_lines_clamps_out_of_range_bounds() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "a\nb\n").await;
         let r = read_lines(&f.v, &f.s, P, M, "/a.txt", 0, 99).await.unwrap();
         assert_eq!(s(&r, "content"), "1\ta\n2\tb");
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_section_grows_the_indentation_block() {
-        let f = fixture();
+        let f = fixture().await;
         let src = "def outer():\n    a = 1\n    b = 2\nnext_top = 3\n";
         seed(&f, "/x.py", src).await;
         // anchor on "b = 2" pulls in the def line above and stops at the dedent
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_section_honours_max_lines() {
-        let f = fixture();
+        let f = fixture().await;
         let src = "top\n  a\n  b\n  c\n  d\n";
         seed(&f, "/x.txt", src).await;
         let r = read_section(&f.v, &f.s, P, M, "/x.txt", 2, 2).await.unwrap();
@@ -1772,7 +1772,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_section_on_empty_file_is_invalid_argument() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/e.txt", "").await;
         let e = read_section(&f.v, &f.s, P, M, "/e.txt", 1, 10).await.unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
@@ -1781,7 +1781,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_many_isolates_per_file_errors() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/ok.txt", "hello\n").await;
         let paths = vec!["/ok.txt".to_string(), "/missing.txt".to_string()];
         let r = read_many(&f.v, &f.s, P, M, &paths, 500).await.unwrap();
@@ -1797,7 +1797,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_many_normalizes_and_truncates() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/d/a.txt", "1\n2\n3\n").await;
         let paths = vec!["d/../d/a.txt".to_string()];
         let r = read_many(&f.v, &f.s, P, M, &paths, 2).await.unwrap();
@@ -1809,7 +1809,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_and_tail_number_real_line_positions() {
-        let f = fixture();
+        let f = fixture().await;
         let body: String = (1..=6).map(|i| format!("l{i}\n")).collect();
         seed(&f, "/a.txt", &body).await;
         let h = head(&f.v, &f.s, P, M, "/a.txt", 2).await.unwrap();
@@ -1820,7 +1820,7 @@ mod tests {
 
     #[tokio::test]
     async fn tail_more_lines_than_the_file_has() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "only\n").await;
         let t = tail(&f.v, &f.s, P, M, "/a.txt", 50).await.unwrap();
         assert_eq!(s(&t, "content"), "1\tonly");
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_lines_ignores_the_trailing_terminator() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "a\nb\n").await.unwrap();
         assert_eq!(count_lines(&f.v, "/a.txt").await.unwrap()["total_lines"], 2);
         f.v.write_text_atomic("/b.txt", "a\nb").await.unwrap();
@@ -1839,7 +1839,7 @@ mod tests {
 
     #[tokio::test]
     async fn unicode_content_round_trips_through_read() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/u.txt", "héllo ✅\nmünd\n").await;
         let r = read_window(&f.v, &f.s, P, M, "/u.txt", 0, 10, true).await.unwrap();
         assert_eq!(s(&r, "content"), "1\théllo ✅\n2\tmünd");
@@ -1850,7 +1850,7 @@ mod tests {
 
     #[tokio::test]
     async fn stat_reports_posix_shape() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "12345").await.unwrap();
         let r = stat_info(&f.v, "/a.txt").await.unwrap();
         assert_eq!(s(&r, "path"), "/a.txt");
@@ -1864,7 +1864,7 @@ mod tests {
 
     #[tokio::test]
     async fn stat_on_a_directory() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.mkdir("/d").await.unwrap();
         let r = stat_info(&f.v, "/d").await.unwrap();
         assert_eq!(s(&r, "kind"), "dir");
@@ -1873,14 +1873,14 @@ mod tests {
 
     #[tokio::test]
     async fn stat_missing_is_not_found() {
-        let f = fixture();
+        let f = fixture().await;
         let e = stat_info(&f.v, "/nope").await.unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn exists_reports_kind_or_null() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         let r = exists_info(&f.v, "/a.txt").await.unwrap();
         assert_eq!(r["exists"], true);
@@ -1893,7 +1893,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_supports_the_four_algorithms() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "abc").await.unwrap();
         let md5 = hash_file(&f.v, "/a.txt", "md5").await.unwrap();
         assert_eq!(s(&md5, "hash"), "900150983cd24fb0d6963f7d28e17f72");
@@ -1916,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_of_an_empty_file_matches_known_digests() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.create_empty("/e.txt").await.unwrap();
         assert_eq!(
             s(&hash_file(&f.v, "/e.txt", "md5").await.unwrap(), "hash"),
@@ -1930,7 +1930,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_rejects_an_unknown_algorithm() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         let e = hash_file(&f.v, "/a.txt", "crc32").await.unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
@@ -1940,7 +1940,7 @@ mod tests {
     /// A multi-block payload exercises the md5/sha1 chunk loops.
     #[tokio::test]
     async fn hash_of_a_multi_block_payload() {
-        let f = fixture();
+        let f = fixture().await;
         let body = "a".repeat(1000);
         f.v.write_text_atomic("/big.txt", &body).await.unwrap();
         assert_eq!(
@@ -1957,7 +1957,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_matches_by_path_or_name_newest_first() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/src/a.rs", "1").await.unwrap();
         f.v.write_text_atomic("/src/b.txt", "2").await.unwrap();
         f.v.write_text_atomic("/c.rs", "3").await.unwrap();
@@ -1971,7 +1971,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_prunes_default_excludes_and_extra_excludes() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/keep.rs", "1").await.unwrap();
         f.v.write_text_atomic("/target/gen.rs", "2").await.unwrap();
         f.v.write_text_atomic("/vendor/dep.rs", "3").await.unwrap();
@@ -1982,7 +1982,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_caps_at_one_hundred_and_flags_truncated() {
-        let f = fixture();
+        let f = fixture().await;
         for i in 0..105 {
             f.v.write_text_atomic(&format!("/f{i}.log"), "x").await.unwrap();
         }
@@ -1993,7 +1993,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_with_no_match_is_empty_not_an_error() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         let r = glob_files(&f.v, "/", "*.nope", &[]).await.unwrap();
         assert_eq!(r["matches"].as_array().unwrap().len(), 0);
@@ -2002,7 +2002,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_content_mode_returns_line_hits() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "alpha\nbeta\nalpha again\n").await.unwrap();
         let r = grep_files(&f.v, "/", "alpha", None, None, true, true, "content", 0, 100)
             .await
@@ -2018,7 +2018,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_context_lines_are_included() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "one\ntwo\nthree\nfour\n").await.unwrap();
         let r = grep_files(&f.v, "/", "three", None, None, true, true, "content", 1, 100)
             .await
@@ -2030,7 +2030,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_files_and_count_modes() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "hit\nhit\n").await.unwrap();
         f.v.write_text_atomic("/b.txt", "nope\n").await.unwrap();
         let files = grep_files(&f.v, "/", "hit", None, None, true, true, "files", 0, 100)
@@ -2049,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_literal_mode_does_not_treat_the_pattern_as_regex() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "a.c\nabc\n").await.unwrap();
         let lit = grep_files(&f.v, "/", "a.c", None, None, false, true, "content", 0, 100)
             .await
@@ -2065,7 +2065,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_case_insensitivity_and_globs() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.rs", "Needle\n").await.unwrap();
         f.v.write_text_atomic("/b.txt", "needle\n").await.unwrap();
         let sensitive = grep_files(&f.v, "/", "needle", None, None, true, true, "files", 0, 100)
@@ -2091,7 +2091,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_max_matches_truncates() {
-        let f = fixture();
+        let f = fixture().await;
         let body: String = (0..10).map(|_| "hit\n".to_string()).collect();
         f.v.write_text_atomic("/a.txt", &body).await.unwrap();
         let r = grep_files(&f.v, "/", "hit", None, None, true, true, "content", 0, 4)
@@ -2103,7 +2103,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_rejects_an_invalid_regex() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x\n").await.unwrap();
         let e = grep_files(&f.v, "/", "a(", None, None, true, true, "content", 0, 10)
             .await
@@ -2115,7 +2115,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_dir_hides_dotfiles_by_default_and_sorts_by_name() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/d/b.txt", "22").await.unwrap();
         f.v.write_text_atomic("/d/a.txt", "1").await.unwrap();
         f.v.write_text_atomic("/d/.hidden", "x").await.unwrap();
@@ -2137,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_dir_with_sizes_can_sort_by_size() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/d/big.txt", "aaaaa").await.unwrap();
         f.v.write_text_atomic("/d/small.txt", "a").await.unwrap();
         let r = list_dir(&f.v, "/d", false, "size", true).await.unwrap();
@@ -2151,7 +2151,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_dir_on_a_file_is_invalid_argument() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         let e = list_dir(&f.v, "/a.txt", false, "name", false).await.unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
@@ -2159,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_nests_children_and_prunes_defaults() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "1").await.unwrap();
         f.v.write_text_atomic("/sub/b.txt", "22").await.unwrap();
         f.v.write_text_atomic("/node_modules/junk.js", "x").await.unwrap();
@@ -2176,7 +2176,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_depth_zero_lists_only_the_top_level() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/sub/deep/x.txt", "1").await.unwrap();
         let r = tree(&f.v, "/", 0, &[], false).await.unwrap();
         let nodes = r["tree"].as_array().unwrap();
@@ -2187,7 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_extra_exclude_patterns_are_added() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/keep.txt", "1").await.unwrap();
         f.v.mkdir("/skipme").await.unwrap();
         let r = tree(&f.v, "/", 2, &["skipme".to_string()], false).await.unwrap();
@@ -2197,7 +2197,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_reports_truncated_when_the_node_cap_is_reached() {
-        let f = fixture();
+        let f = fixture().await;
         for i in 0..(TREE_CAP + 10) {
             f.v.write_text_atomic(&format!("/f{i}.txt"), "x").await.unwrap();
         }
@@ -2212,7 +2212,7 @@ mod tests {
     /// truncated. The old off-by-one returned one node short and set the flag.
     #[tokio::test]
     async fn tree_at_exactly_the_cap_is_complete_and_not_truncated() {
-        let f = fixture();
+        let f = fixture().await;
         for i in 0..TREE_CAP {
             f.v.write_text_atomic(&format!("/f{i}.txt"), "x").await.unwrap();
         }
@@ -2225,7 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_creates_parents_and_reports_bytes() {
-        let f = fixture();
+        let f = fixture().await;
         let r = write_text(&f.v, &f.s, P, M, "/a/b/c.txt", "hello", false, true).await.unwrap();
         assert_eq!(s(&r, "path"), "/a/b/c.txt");
         assert_eq!(r["bytes_written"], 5);
@@ -2237,7 +2237,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_is_no_clobber_by_default() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "old").await.unwrap();
         let e = write_text(&f.v, &f.s, P, M, "/a.txt", "new", false, true).await.unwrap_err();
         assert_eq!(e.code, code::NO_CLOBBER);
@@ -2247,7 +2247,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_needs_a_prior_read_and_returns_a_diff() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "old\n").await.unwrap();
         let e = write_text(&f.v, &f.s, P, M, "/a.txt", "new\n", true, true).await.unwrap_err();
         assert_eq!(e.code, code::EDIT_WITHOUT_PRIOR_READ);
@@ -2260,7 +2260,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_charges_the_session_quota() {
-        let f = fixture_with(SafetyConfig { write_quota_bytes: 4, ..Default::default() });
+        let f = fixture_with(SafetyConfig { write_quota_bytes: 4, ..Default::default() }).await;
         let e = write_text(&f.v, &f.s, P, M, "/a.txt", "12345", false, true).await.unwrap_err();
         assert_eq!(e.code, code::WRITE_QUOTA_EXCEEDED);
         assert!(!f.v.exists("/a.txt").await.unwrap(), "nothing was written");
@@ -2268,7 +2268,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_then_edit_needs_no_extra_read() {
-        let f = fixture();
+        let f = fixture().await;
         write_text(&f.v, &f.s, P, M, "/a.txt", "x\n", false, true).await.unwrap();
         let r = edit_unique(&f.v, &f.s, P, M, "/a.txt", "x", "y", false, false).await.unwrap();
         assert_eq!(r["applied"], true);
@@ -2277,7 +2277,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_requires_create_for_a_missing_file() {
-        let f = fixture();
+        let f = fixture().await;
         let e = append_text(&f.v, &f.s, P, M, "/a.txt", "x", false).await.unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
         assert!(e.message.contains("pass create=true"));
@@ -2289,7 +2289,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_concatenates_and_charges_only_the_delta() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "one\n").await.unwrap();
         let r = append_text(&f.v, &f.s, P, M, "/a.txt", "two\n", false).await.unwrap();
         assert_eq!(r["bytes_appended"], 4);
@@ -2299,7 +2299,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_empty_is_no_clobber_unless_exist_ok() {
-        let f = fixture();
+        let f = fixture().await;
         let r = create_empty(&f.v, &f.s, P, M, "/e.txt", false).await.unwrap();
         assert_eq!(r["created"], true);
         assert_eq!(f.v.stat("/e.txt").await.unwrap().size, 0);
@@ -2315,7 +2315,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_replaces_a_unique_occurrence() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "alpha\nbeta\n").await;
         let r = edit_unique(&f.v, &f.s, P, M, "/a.txt", "beta", "gamma", false, false).await.unwrap();
         assert_eq!(r["applied"], true);
@@ -2325,7 +2325,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_rejects_an_ambiguous_match() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "x\nx\n").await;
         let e = edit_unique(&f.v, &f.s, P, M, "/a.txt", "x", "y", false, false).await.unwrap_err();
         assert_eq!(e.code, code::AMBIGUOUS_MATCH);
@@ -2335,7 +2335,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_replace_all_rewrites_every_site() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "x\nx\nx\n").await;
         let r = edit_unique(&f.v, &f.s, P, M, "/a.txt", "x", "y", true, false).await.unwrap();
         assert_eq!(r["applied"], true);
@@ -2344,7 +2344,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_no_match_is_an_error() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "alpha\n").await;
         let e = edit_unique(&f.v, &f.s, P, M, "/a.txt", "zeta", "y", false, false).await.unwrap_err();
         assert_eq!(e.code, code::NO_MATCH);
@@ -2353,7 +2353,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_dry_run_returns_the_diff_without_writing() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "alpha\n").await;
         let r = edit_unique(&f.v, &f.s, P, M, "/a.txt", "alpha", "beta", false, true).await.unwrap();
         assert_eq!(r["applied"], false);
@@ -2364,7 +2364,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_applies_sequentially_and_counts_edits() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "one two three\n").await;
         let edits = vec![
             json!({"old_string": "one", "new_string": "1"}),
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_is_all_or_nothing() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "one two\n").await;
         let edits = vec![
             json!({"old_string": "one", "new_string": "1"}),
@@ -2391,7 +2391,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_accepts_replace_all_as_a_string() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "x x x\n").await;
         let edits = vec![json!({"old_string": "x", "new_string": "y", "replace_all": "TRUE"})];
         multi_edit(&f.v, &f.s, P, M, "/a.txt", &edits, false).await.unwrap();
@@ -2400,7 +2400,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_dry_run_does_not_write() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "a\n").await;
         let edits = vec![json!({"old_string": "a", "new_string": "b"})];
         let r = multi_edit(&f.v, &f.s, P, M, "/a.txt", &edits, true).await.unwrap();
@@ -2411,7 +2411,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_needs_a_prior_read() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "a\n").await.unwrap();
         let edits = vec![json!({"old_string": "a", "new_string": "b"})];
         let e = multi_edit(&f.v, &f.s, P, M, "/a.txt", &edits, false).await.unwrap_err();
@@ -2420,7 +2420,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_replace_swaps_an_exact_block() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "head\nold1\nold2\ntail\n").await;
         let r = search_replace(&f.v, &f.s, P, M, "/a.txt", "old1\nold2\n", "new\n", false)
             .await
@@ -2432,7 +2432,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_replace_without_fuzzy_requires_an_exact_block() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "head\nold  1\ntail\n").await;
         let e = search_replace(&f.v, &f.s, P, M, "/a.txt", "old 1\n", "new\n", false)
             .await
@@ -2443,7 +2443,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_replace_fuzzy_tolerates_small_differences() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "head\nold  value here\ntail\n").await;
         let r = search_replace(&f.v, &f.s, P, M, "/a.txt", "old value here\n", "new\n", true)
             .await
@@ -2454,7 +2454,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_replace_fuzzy_still_refuses_a_hopeless_block() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "aaaa\nbbbb\n").await;
         let e = search_replace(
             &f.v,
@@ -2474,7 +2474,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_at_line_puts_content_before_the_line() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "one\ntwo\n").await;
         let r = insert_at_line(&f.v, &f.s, P, M, "/a.txt", 2, "middle").await.unwrap();
         assert_eq!(r["applied"], true);
@@ -2484,7 +2484,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_at_line_clamps_beyond_the_end_and_before_the_start() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "one\n").await;
         insert_at_line(&f.v, &f.s, P, M, "/a.txt", 999, "last\n").await.unwrap();
         assert_eq!(f.v.read_text("/a.txt").await.unwrap(), "one\nlast\n");
@@ -2494,7 +2494,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_at_line_needs_a_prior_read() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "one\n").await.unwrap();
         let e = insert_at_line(&f.v, &f.s, P, M, "/a.txt", 1, "x").await.unwrap_err();
         assert_eq!(e.code, code::EDIT_WITHOUT_PRIOR_READ);
@@ -2504,7 +2504,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdir_creates_parents_and_audits() {
-        let f = fixture();
+        let f = fixture().await;
         let r = mkdir(&f.v, &f.s, P, M, "/a/b/c", true, true).await.unwrap();
         assert_eq!(s(&r, "path"), "/a/b/c");
         assert_eq!(r["created"], true);
@@ -2515,7 +2515,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdir_without_parents_on_an_existing_path() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.mkdir("/d").await.unwrap();
         let e = mkdir(&f.v, &f.s, P, M, "/d", false, false).await.unwrap_err();
         assert_eq!(e.code, code::NO_CLOBBER);
@@ -2525,7 +2525,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_soft_moves_into_the_trash() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         let r = delete_path(&f.v, &f.s, P, M, "/a.txt", false, true).await.unwrap();
         assert_eq!(r["trashed"], true);
@@ -2538,7 +2538,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_delete_is_refused_unless_configured() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         let e = delete_path(&f.v, &f.s, P, M, "/a.txt", false, false).await.unwrap_err();
         assert_eq!(e.code, code::NOT_SUPPORTED);
@@ -2547,7 +2547,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_delete_works_when_allowed() {
-        let f = fixture_with(SafetyConfig { allow_hard_delete: true, ..Default::default() });
+        let f = fixture_with(SafetyConfig { allow_hard_delete: true, ..Default::default() }).await;
         f.v.write_text_atomic("/d/a.txt", "x").await.unwrap();
         let file = delete_path(&f.v, &f.s, P, M, "/d/a.txt", false, false).await.unwrap();
         assert_eq!(file["trashed"], false);
@@ -2562,7 +2562,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_a_directory_needs_recursive() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/d/a.txt", "x").await.unwrap();
         let e = delete_path(&f.v, &f.s, P, M, "/d", false, true).await.unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
@@ -2571,14 +2571,14 @@ mod tests {
 
     #[tokio::test]
     async fn delete_a_missing_path_is_not_found() {
-        let f = fixture();
+        let f = fixture().await;
         let e = delete_path(&f.v, &f.s, P, M, "/nope", false, true).await.unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn move_renames_and_is_no_clobber() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "x").await.unwrap();
         f.v.write_text_atomic("/b.txt", "y").await.unwrap();
         let e = move_path(&f.v, &f.s, P, M, "/a.txt", "/b.txt", false).await.unwrap_err();
@@ -2593,14 +2593,14 @@ mod tests {
 
     #[tokio::test]
     async fn move_a_missing_source_is_not_found() {
-        let f = fixture();
+        let f = fixture().await;
         let e = move_path(&f.v, &f.s, P, M, "/nope", "/x", false).await.unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn copy_a_file_charges_quota_and_materializes_parents() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "hello").await.unwrap();
         let r = copy_path(&f.v, &f.s, P, M, "/a.txt", "/deep/b.txt", false, false).await.unwrap();
         assert_eq!(s(&r, "source"), "/a.txt");
@@ -2611,7 +2611,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_a_directory_needs_recursive_then_copies_the_tree() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/s/a.txt", "1").await.unwrap();
         f.v.write_text_atomic("/s/sub/b.txt", "2").await.unwrap();
         let e = copy_path(&f.v, &f.s, P, M, "/s", "/t", false, false).await.unwrap_err();
@@ -2625,7 +2625,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_is_no_clobber_and_reports_a_missing_source() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "1").await.unwrap();
         f.v.write_text_atomic("/b.txt", "2").await.unwrap();
         let clobber = copy_path(&f.v, &f.s, P, M, "/a.txt", "/b.txt", false, false).await.unwrap_err();
@@ -2640,7 +2640,7 @@ mod tests {
 
     #[tokio::test]
     async fn mutations_land_in_the_audit_log_in_order() {
-        let f = fixture();
+        let f = fixture().await;
         write_text(&f.v, &f.s, P, M, "/a.txt", "one\n", false, true).await.unwrap();
         edit_unique(&f.v, &f.s, P, M, "/a.txt", "one", "two", false, false).await.unwrap();
         move_path(&f.v, &f.s, P, M, "/a.txt", "/b.txt", false).await.unwrap();
@@ -2650,7 +2650,7 @@ mod tests {
 
     #[tokio::test]
     async fn soft_delete_of_a_directory_moves_the_whole_subtree() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/d/sub/a.txt", "x").await.unwrap();
         let r = delete_path(&f.v, &f.s, P, M, "/d", true, true).await.unwrap();
         let dst = s(&r, "trash_path");
@@ -2661,7 +2661,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwriting_with_identical_content_yields_an_empty_diff() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "same\n").await;
         let r = write_text(&f.v, &f.s, P, M, "/a.txt", "same\n", true, true).await.unwrap();
         assert_eq!(r["overwritten"], true);
@@ -2670,7 +2670,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_window_with_a_negative_offset_starts_at_the_top() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "a\nb\n").await;
         let r = read_window(&f.v, &f.s, P, M, "/a.txt", -2, 4, true).await.unwrap();
         // The window is clamped but the numbering still follows the requested offset.
@@ -2680,7 +2680,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_edit_with_no_edits_is_a_no_op_diff() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "a\n").await;
         let r = multi_edit(&f.v, &f.s, P, M, "/a.txt", &[], false).await.unwrap();
         assert_eq!(r["edits"], 0);
@@ -2690,7 +2690,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_into_an_empty_file() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/e.txt", "").await;
         insert_at_line(&f.v, &f.s, P, M, "/e.txt", 1, "first").await.unwrap();
         assert_eq!(f.v.read_text("/e.txt").await.unwrap(), "first\n");
@@ -2698,7 +2698,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_with_an_empty_old_string_never_matches() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/a.txt", "content\n").await;
         let e = edit_unique(&f.v, &f.s, P, M, "/a.txt", "", "x", false, false).await.unwrap_err();
         assert_eq!(e.code, code::NO_MATCH);
@@ -2706,7 +2706,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_preserves_unicode_around_the_replacement() {
-        let f = fixture();
+        let f = fixture().await;
         seed(&f, "/u.txt", "héllo ✅ wörld\n").await;
         edit_unique(&f.v, &f.s, P, M, "/u.txt", "✅", "❌", false, false).await.unwrap();
         assert_eq!(f.v.read_text("/u.txt").await.unwrap(), "héllo ❌ wörld\n");
@@ -2714,7 +2714,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_and_glob_are_scoped_to_the_root() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/in/a.txt", "needle\n").await.unwrap();
         f.v.write_text_atomic("/out/b.txt", "needle\n").await.unwrap();
         let g = glob_files(&f.v, "/in", "*.txt", &[]).await.unwrap();
@@ -2727,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_tree_over_an_existing_destination_needs_overwrite() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/s/a.txt", "new").await.unwrap();
         f.v.write_text_atomic("/t/a.txt", "old").await.unwrap();
         let e = copy_path(&f.v, &f.s, P, M, "/s", "/t", false, true).await.unwrap_err();
@@ -2817,7 +2817,7 @@ mod tests {
     /// NO_CLOBBER and the flag was dead.
     #[tokio::test]
     async fn move_with_overwrite_replaces_the_destination() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/from.txt", "new").await.unwrap();
         f.v.write_text_atomic("/onto.txt", "old").await.unwrap();
 
@@ -2834,7 +2834,7 @@ mod tests {
     /// Overwriting a directory destination clears the whole subtree first.
     #[tokio::test]
     async fn move_with_overwrite_replaces_a_directory_destination() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/src/a.txt", "keep").await.unwrap();
         f.v.write_text_atomic("/dst/stale.txt", "gone").await.unwrap();
 
@@ -2845,7 +2845,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_bytes_charges_the_quota_and_audits() {
-        let f = fixture();
+        let f = fixture().await;
         let payload = vec![7u8; 64];
         let r = write_bytes(&f.v, &f.s, P, M, "/blob.bin", &payload, false, true).await.unwrap();
         assert_eq!(r["bytes_written"], 64);
@@ -2859,7 +2859,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_bytes_refuses_to_exceed_the_quota() {
-        let f = fixture_with(SafetyConfig { write_quota_bytes: 10, ..Default::default() });
+        let f = fixture_with(SafetyConfig { write_quota_bytes: 10, ..Default::default() }).await;
         let e = write_bytes(&f.v, &f.s, P, M, "/big.bin", &[0u8; 11], false, true)
             .await
             .unwrap_err();
@@ -2869,7 +2869,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_bytes_honours_no_clobber() {
-        let f = fixture();
+        let f = fixture().await;
         write_bytes(&f.v, &f.s, P, M, "/x.bin", b"a", false, true).await.unwrap();
         let e = write_bytes(&f.v, &f.s, P, M, "/x.bin", b"b", false, true).await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::NO_CLOBBER);
@@ -2881,7 +2881,7 @@ mod tests {
     /// Binary payloads must survive untouched (no utf8 lossy conversion).
     #[tokio::test]
     async fn write_bytes_round_trips_non_utf8() {
-        let f = fixture();
+        let f = fixture().await;
         let payload = vec![0xff, 0x00, 0xfe, 0x80];
         write_bytes(&f.v, &f.s, P, M, "/raw.bin", &payload, false, true).await.unwrap();
         assert_eq!(f.v.read_bytes("/raw.bin").await.unwrap(), payload);
@@ -2946,7 +2946,7 @@ mod tests {
     async fn glob_double_star_is_treated_as_single_star_crossing_slashes() {
         // fnmatch semantics: a single * DOES cross '/' boundaries (confirmed in AGENTS.md).
         // So **/*.rs should match /a/b/c.rs.
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/a/b/c.rs", "fn foo() {}").await.unwrap();
         f.v.write_text_atomic("/a/b/c.txt", "text").await.unwrap();
         let r = glob_files(&f.v, "/", "**/*.rs", &[]).await.unwrap();
@@ -2960,7 +2960,7 @@ mod tests {
 
     #[tokio::test]
     async fn overwrite_on_a_directory_returns_invalid_argument() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.makedirs("/mydir", true).await.unwrap();
         // Record a read so the guard passes; the storage layer will reject the write.
         f.s.record_read(P, M, "/mydir");
@@ -2970,7 +2970,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_preserves_blob_refcount() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/src.txt", "shared content").await.unwrap();
         let sha = VolumeClient::sha256_hex(b"shared content");
 
@@ -2988,7 +2988,7 @@ mod tests {
 
     #[tokio::test]
     async fn tree_on_a_file_path_returns_single_entry() {
-        let f = fixture();
+        let f = fixture().await;
         f.v.write_text_atomic("/solo.txt", "content").await.unwrap();
         // The tree engine calls list_dir on the root path. When the root is a file,
         // list_dir returns ERR_INVALID_ARGUMENT because files are not directories.

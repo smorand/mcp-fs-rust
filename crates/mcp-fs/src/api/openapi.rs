@@ -1204,7 +1204,9 @@ mod tests {
         config.git.enabled = git;
         let config = Arc::new(config);
 
-        let admin = crate::storage::build_admin_store(&config).unwrap();
+        let registry = crate::storage::RelationalRegistry::new();
+            let admin =
+                crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
 
         let mut registry = ToolRegistry::new();
@@ -1232,8 +1234,11 @@ mod tests {
         Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
-            safety: Arc::new(SafetyManager::new(config.safety.clone())),
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            safety: Arc::new(SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),

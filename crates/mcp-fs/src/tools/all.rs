@@ -97,52 +97,26 @@ mod tests {
         assert_eq!(reg.len(), 75 + doc_count + 3);
     }
 
-    /// Whole surface parity gate for the 22 tools of this agent: every `admin.*`,
-    /// `git.*` and `git.auth*` schema and description is compared to the
-    /// `tools/list` captured from the running C# server, the serialized string
-    /// included, so a property key ORDER change fails too.
+    /// Whole surface gate for the 22 tools of this agent: every `admin.*`,
+    /// `git.*` and `git.auth*` schema and description is compared to the frozen
+    /// contract, the serialized string included, so a property key ORDER change
+    /// fails too.
     ///
-    /// The capture lives at the repo root, outside the crate, so the check is
+    /// The contract lives at the repo root, outside the crate, so the check is
     /// skipped with a message when it is absent; the per family tests still pin
     /// every schema inline.
     #[test]
-    fn every_admin_and_git_schema_matches_the_captured_csharp_tools_list() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity-golden.json");
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            eprintln!("skipped: {path} is absent");
-            return;
-        };
-        let golden: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let live = golden["steps"]["tools_list"]["body"]["result"]["tools"]
-            .as_array()
-            .expect("the capture must contain a tools/list step");
-
+    fn every_admin_and_git_schema_matches_the_frozen_tool_contract() {
         let mut reg = ToolRegistry::new();
         super::super::admin::register(&mut reg);
         super::super::git::register(&mut reg);
         super::super::git_auth::register(&mut reg);
-
-        let mut compared = 0;
-        for tool in live {
-            let name = tool["name"].as_str().unwrap();
-            if !(name.starts_with("admin.") || name.starts_with("git.")) {
-                continue;
-            }
-            compared += 1;
-            let mine = reg.resolve(name).unwrap_or_else(|| panic!("{name} is not registered"));
-            assert_eq!(
-                mine.schema.description,
-                tool["description"].as_str().unwrap(),
-                "description drift on {name}"
-            );
-            assert_eq!(mine.schema.input_schema(), tool["inputSchema"], "schema drift on {name}");
-            assert_eq!(
-                serde_json::to_string(&mine.schema.input_schema()).unwrap(),
-                serde_json::to_string(&tool["inputSchema"]).unwrap(),
-                "property key order drift on {name}"
-            );
-        }
-        assert_eq!(compared, 22, "the capture must cover all 8 admin.* and 14 git.* tools");
+        super::super::contract_golden::assert_family(
+            &reg,
+            |name| name.starts_with("admin.") || name.starts_with("git."),
+            22,
+            "admin.* and git.* tools",
+        );
     }
 
     /// Registration order is the `tools/list` order.

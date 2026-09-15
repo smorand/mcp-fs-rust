@@ -7,16 +7,19 @@
 //! call the engine. That keeps the MCP surface and the REST data plane on one
 //! implementation, which is the whole point of the split.
 //!
-//! Parity notes:
-//! * parameter names are snake_case so the generated schema matches the C#
-//!   surface byte for byte (see [`crate::mcp::schema`]),
-//! * parameter descriptions are the LLM facing docs and are copied verbatim from
-//!   the live C# server (captured in `TOOL_CONTRACT.txt` / `parity-golden.json`),
+//! Contract notes:
+//! * parameter names are snake_case, which is what the generated JSON Schema
+//!   exposes (see [`crate::mcp::schema`]),
+//! * parameter descriptions are the LLM facing docs and are frozen in
+//!   `TOOL_CONTRACT.txt` / `tool-contract-golden.json`, so editing one is a
+//!   deliberate contract change,
 //! * `authorize` runs before any storage access, and before path normalization,
 //!   so a non member gets `ERR_FORBIDDEN` rather than a path error.
 
 pub mod admin;
 pub mod all;
+#[cfg(test)]
+pub(crate) mod contract_golden;
 pub mod context7;
 pub mod db;
 pub mod doc;
@@ -147,7 +150,7 @@ pub(crate) mod testkit {
         tweak(&mut config);
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::SqliteAdminStore::in_memory().unwrap());
+        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 
@@ -157,8 +160,11 @@ pub(crate) mod testkit {
         let state = Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
-            safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            safety: Arc::new(crate::safety::SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
@@ -177,7 +183,7 @@ pub(crate) mod testkit {
         config.auth.jwt.public_key_path = String::new();
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::SqliteAdminStore::in_memory().unwrap());
+        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 
@@ -188,8 +194,11 @@ pub(crate) mod testkit {
         let state = Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
-            safety: Arc::new(crate::safety::SafetyManager::new(config.safety.clone())),
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            safety: Arc::new(crate::safety::SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
@@ -330,48 +339,23 @@ mod tests {
         assert_eq!(err.code, crate::errors::code::PROJECT_NOT_FOUND);
     }
 
-    /// Whole surface parity gate: every fs.* schema and description is compared to
-    /// the `tools/list` captured from the running C# server, serialized string
-    /// included, so a key ORDER change fails too.
+    /// Whole surface gate: every `fs.*` schema and description is compared to the
+    /// frozen contract, the serialized string included, so a key ORDER change
+    /// fails too.
     ///
-    /// The capture lives at the repo root and is not part of the crate, so the
+    /// The contract lives at the repo root and is not part of the crate, so the
     /// check is skipped (with a message) when it is not there; the per family
     /// tests still pin the schemas inline.
     #[test]
-    fn every_fs_schema_matches_the_captured_csharp_tools_list() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity-golden.json");
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            eprintln!("skipped: {path} is absent");
-            return;
-        };
-        let golden: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let live = golden["steps"]["tools_list"]["body"]["result"]["tools"]
-            .as_array()
-            .expect("the capture must contain a tools/list step");
-
+    fn every_fs_schema_matches_the_frozen_tool_contract() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        let mut compared = 0;
-        for tool in live {
-            let name = tool["name"].as_str().unwrap();
-            if !name.starts_with("fs.") {
-                continue;
-            }
-            compared += 1;
-            let mine = reg.resolve(name).unwrap_or_else(|| panic!("{name} is not registered"));
-            assert_eq!(
-                mine.schema.description,
-                tool["description"].as_str().unwrap(),
-                "description drift on {name}"
-            );
-            assert_eq!(mine.schema.input_schema(), tool["inputSchema"], "schema drift on {name}");
-            assert_eq!(
-                serde_json::to_string(&mine.schema.input_schema()).unwrap(),
-                serde_json::to_string(&tool["inputSchema"]).unwrap(),
-                "property key order drift on {name}"
-            );
-        }
-        assert_eq!(compared, 33, "the capture must cover all 33 fs.* tools");
+        super::contract_golden::assert_family(
+            &reg,
+            |name| name.starts_with("fs."),
+            33,
+            "fs.* tools",
+        );
     }
 }
 

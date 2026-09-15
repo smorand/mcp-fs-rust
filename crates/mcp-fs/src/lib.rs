@@ -1,7 +1,12 @@
 //! mcp-fs: a streamable-HTTP MCP server exposing a simulated multi-project
-//! filesystem. Rust port of the C#/.NET 9 implementation, with strict 1:1
-//! external parity (tool names, parameters, `ERR_*` codes, JSON shapes, SQLite
-//! schemas, git wire protocol, REST routes).
+//! filesystem, over SQLite, PostgreSQL or SQL Server.
+//!
+//! It began as a strict 1:1 port of a C#/.NET 9 implementation, which is why many
+//! comments still explain a shape by pointing at it. That lineage is history, not a
+//! constraint: parity was retired deliberately (see `.agent_docs/lineage.md`) and the
+//! frozen external contract is now this project's own, pinned by
+//! `tool-contract-golden.json`. A reference to the C# explains where a decision came
+//! from; it is never a reason to keep or change behaviour.
 
 pub mod api;
 pub mod app;
@@ -15,6 +20,7 @@ pub mod identity;
 pub mod keys;
 pub mod logging;
 pub mod mcp;
+pub mod migrate;
 pub mod safety;
 pub mod state;
 pub mod storage;

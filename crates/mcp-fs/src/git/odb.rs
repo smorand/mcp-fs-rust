@@ -2,10 +2,9 @@
 //!
 //! Git objects are stored in the volume's [`BlobBackend`] under the key
 //! `git:{sha}` holding the canonical git object bytes `{type} {len}\0{payload}`,
-//! with a `(hash, type, size)` row in [`SqliteGitDb`] used for `ForEach` and
-//! short sha (prefix) lookups. Byte for byte the same layout as the C#
-//! `Git/BlobBackedOdbBackend.cs`, so a volume written by either implementation is
-//! readable by the other.
+//! with a `(hash, type, size)` row in [`RelationalGitDb`] used for `ForEach` and
+//! short sha (prefix) lookups. The key layout is a stable on disk contract, so an
+//! existing deployment's git objects stay readable across upgrades.
 //!
 //! # Deviation from the C#: no custom libgit2 ODB backend
 //!
@@ -33,7 +32,7 @@
 //! every object. That is the price of not writing unsafe FFI.
 
 use crate::errors::{Result, ToolError, code};
-use crate::git::db::{GitObjectRow, SqliteGitDb};
+use crate::git::db::{GitObjectRow, RelationalGitDb};
 use crate::storage::BlobBackend;
 use git2::{ObjectType, Oid};
 use std::sync::Arc;
@@ -104,15 +103,15 @@ pub fn object_id(kind: ObjectType, payload: &[u8]) -> Result<String> {
 /// Read/write access to one project's git objects.
 pub struct BlobObjectDb {
     blobs: Arc<dyn BlobBackend>,
-    index: Arc<SqliteGitDb>,
+    index: Arc<RelationalGitDb>,
 }
 
 impl BlobObjectDb {
-    pub fn new(blobs: Arc<dyn BlobBackend>, index: Arc<SqliteGitDb>) -> Self {
+    pub fn new(blobs: Arc<dyn BlobBackend>, index: Arc<RelationalGitDb>) -> Self {
         Self { blobs, index }
     }
 
-    pub fn index(&self) -> &Arc<SqliteGitDb> {
+    pub fn index(&self) -> &Arc<RelationalGitDb> {
         &self.index
     }
 
@@ -318,11 +317,11 @@ mod tests {
     use super::*;
     use crate::storage::blob::local::LocalBlobStore;
 
-    fn odb() -> (tempfile::TempDir, BlobObjectDb) {
+    async fn odb() -> (tempfile::TempDir, BlobObjectDb) {
         let d = tempfile::tempdir().unwrap();
         let blobs: Arc<dyn BlobBackend> =
             Arc::new(LocalBlobStore::new(d.path(), "mcpfs-git-test"));
-        let index = Arc::new(SqliteGitDb::open_in_memory().unwrap());
+        let index = Arc::new(RelationalGitDb::open_in_memory().await.unwrap());
         (d, BlobObjectDb::new(blobs, index))
     }
 
@@ -404,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_then_read_round_trip() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let sha = o.write(ObjectType::Blob, b"hello").await.unwrap();
         assert_eq!(sha, "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0");
         assert!(o.exists(&sha).await.unwrap());
@@ -416,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_stores_under_the_git_prefixed_key() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let sha = o.write(ObjectType::Blob, b"x").await.unwrap();
         assert!(
             o.blobs().exists(&format!("git:{sha}")).await.unwrap(),
@@ -430,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_records_the_index_row() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let sha = o.write(ObjectType::Commit, b"tree x\n").await.unwrap();
         let row = o.index().get_object(&sha).await.unwrap().unwrap();
         assert_eq!(row.kind, "commit");
@@ -439,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_missing_is_not_found() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let e = o.read("0000000000000000000000000000000000000000").await.unwrap_err();
         assert_eq!(e.code, code::NOT_FOUND);
         assert!(!o.exists("dead").await.unwrap());
@@ -447,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_lookup_resolves_ambiguity() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let sha = o.write(ObjectType::Blob, b"hello").await.unwrap();
         let (found, kind, payload) = o.read_prefix(&sha[..7]).await.unwrap();
         assert_eq!(found, sha);
@@ -466,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_the_blob() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let sha = o.write(ObjectType::Blob, b"gone").await.unwrap();
         o.delete(&sha).await.unwrap();
         assert!(!o.exists(&sha).await.unwrap());
@@ -474,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_then_import_round_trips_through_libgit2() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let repo_dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();
 
@@ -497,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn seed_commit_writes_objects_libgit2_can_parse() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let (commit, tree, blob) = seed_commit(&o, "readme.txt", b"file content\n", "init")
             .await
             .unwrap();
@@ -519,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_reindexes_a_blob_missing_from_the_index() {
-        let (_d, o) = odb();
+        let (_d, o) = odb().await;
         let repo_dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();
         let oid = repo.blob(b"orphan").unwrap();

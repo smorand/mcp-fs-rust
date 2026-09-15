@@ -28,11 +28,11 @@ local blob backend cannot hold git objects on a Windows host. Windows is out of 
 for this port (POSIX hosts only), so the key is left readable as is; a Windows target
 would need a key mapping in the local backend, and the S3 backend is unaffected.
 
-## SQLite index and on disk paths
+## Relational index and on disk paths
 
 | Path | Content |
 |---|---|
-| `state/git/{project_id}.db` | `git_objects(hash PK, type, size)`, `git_refs(name PK, target, symbolic)`, `git_remotes(name PK, url)` |
+| `state/git/{project_id}.db` | `git_objects(volume_id + hash PK, type, size)`, `git_refs(volume_id + name PK, target, symbolic)`, `git_remotes(volume_id + name PK, url)` |
 | `state/git-repos/{project_id}/` | bare libgit2 directory (HEAD, config, hooks) plus a rebuildable object cache |
 | blob bucket, key `git:{sha}` | the objects themselves, source of truth |
 | `state/oauth.db` | encrypted OAuth tokens, only when `MCPFS_TOKEN_KEY` is set |
@@ -40,6 +40,12 @@ would need a key mapping in the local backend, and the S3 backend is unaffected.
 The index exists because the blob store cannot be enumerated cheaply: it answers
 "which objects exist", "what type and size", and short sha prefix lookups. Refs
 live there too, which is why `git.status` needs no libgit2 call.
+
+The two `.db` paths above are the SQLite default. The index is configured by `infra.git`
+and the token store by `infra.oauth`, so either can run on PostgreSQL or SQL Server
+instead, in which case one database holds every project and `volume_id` separates them
+(see [`backends.md`](backends.md)). **`state/git-repos/` always stays on disk**, whatever
+the index backend, because libgit2 needs a real working directory.
 
 ## Repository store and the write lock
 
@@ -124,7 +130,7 @@ Every tool authorizes membership first (`AppState::authorize`), then requires
 `git.init` to have run (`ERR_NOT_FOUND` with "call git.init first" otherwise).
 Parameters and return keys are in `.agent_docs/tools.md`. Notable points:
 
-* `git.status`, `git.branches`, `git.tags` read the SQLite refs directly; `git.log`,
+* `git.status`, `git.branches`, `git.tags` read the indexed refs directly; `git.log`,
   `git.show`, `git.diff`, `git.blame` hydrate the on disk ODB from the blob store
   first, then use libgit2.
 * `git.commit` builds a tree from the **current volume content** (there is no

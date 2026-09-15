@@ -17,7 +17,7 @@
 //! use mcp_fs::git;
 //!
 //! let git_store = git::GitRepoStore::shared(state.config.clone());
-//! let tokens = git::OAuthTokenStore::from_env(&state.config)?;
+//! let tokens = git::OAuthTokenStore::from_env(&state.config, state.stores.relational())?;
 //! if state.config.git.enabled {
 //!     app = app.merge(git::http::router(state.clone(), git_store.clone()));
 //! }
@@ -34,7 +34,7 @@ pub mod oauth;
 pub mod odb;
 pub mod repo;
 
-pub use db::{GitObjectRow, GitRefRow, SqliteGitDb};
-pub use oauth::{OAuthSession, OAuthTokenStore, SqliteOAuthPersistence};
+pub use db::{GitObjectRow, GitRefRow, RelationalGitDb};
+pub use oauth::{OAuthSession, OAuthTokenStore, RelationalOAuthPersistence};
 pub use odb::{BlobObjectDb, blob_key, deserialize, serialize};
 pub use repo::{GitRepoEntry, GitRepoStore};

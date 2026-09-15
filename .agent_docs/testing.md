@@ -10,19 +10,27 @@ Three levels, all inside the crate:
 
 | Level | How | Where |
 |---|---|---|
-| Unit | plain functions and in memory SQLite (`SqliteDb::open_in_memory`, `SqliteAdminStore::in_memory`) plus `tempfile` dirs for blobs | every module |
+| Unit | plain functions and in memory SQLite (`SqliteRelationalDb::open_in_memory`, `RelationalAdminStore::in_memory`) plus `tempfile` dirs for blobs | every module |
+| Conformance | one set of assertions run against **every** relational engine | `storage/conformance.rs` |
 | Tool level | `tools::testkit::harness()` builds a **real `AppState`** (SQLite metadata in a temp dir, local blobs, in memory ACL, the real registry) and dispatches through `registry.call`, the same path `tools/call` uses | `tools/*` |
 | Integration | the **real axum router** driven with `tower::ServiceExt::oneshot`, so requests go through routing, identity, the membership gate and the handlers | `app.rs`, `api/dataplane.rs`, `api/openapi.rs`, `git/http/mod.rs` |
 
-Schema parity is also a test: `tools/mod.rs` and `tools/all.rs` compare all 55
-descriptions and `inputSchema` values against `parity-golden.json`, serialized, so
-even a property key order change fails the build. Those two tests skip with a
-message when the golden file is absent, since it lives at the repo root outside
-the crate.
+The tool contract is also a test: `tools/mod.rs` and `tools/all.rs` compare all 55
+descriptions and `inputSchema` values against `tool-contract-golden.json`,
+serialized, so even a property key order change fails the build.
+`tools/contract_golden.rs` owns the file and adds the both directions check, so a
+tool added to the registry but never written to the contract fails too. All three
+skip with a message when the file is absent, since it lives at the repo root
+outside the crate.
 
-Beyond the crate, `crates/parity-harness` is a binary that replays a corpus
-against a **live server** over HTTP. Its own 32 tests cover the corpus and the
-normalizer.
+The contract is regenerated deliberately, never hand edited:
+
+```bash
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
+```
+
+Review the diff afterwards: a description edit is one line, and 55 changed tools
+means something went wrong.
 
 ## Running
 
@@ -30,10 +38,12 @@ normalizer.
 ./test.sh                                    # cargo test --workspace
 cargo test -p mcp-fs                         # the server crate only
 cargo test -p mcp-fs --lib storage::         # one area
-cargo clippy --all-targets -- -D warnings    # second half of the quality gate
+cargo test --workspace --all-features        # includes the postgres and sqlserver drivers
+cargo clippy --all-targets --all-features -- -D warnings   # second half of the quality gate
 ```
 
-Both must be clean before any commit.
+Both must be clean before any commit. Use `--all-features` on the clippy gate, otherwise
+the two optional drivers are never compiled and their warnings never surface.
 
 ## Current counts
 
@@ -41,29 +51,78 @@ From `cargo test --workspace` on the current tree:
 
 | Target | Result |
 |---|---|
-| `mcp-fs` lib | 754 passed, 1 ignored |
-| `parity-harness` bin | 32 passed |
+| `mcp-fs` lib | 978 passed, 1 ignored |
+| `agent` bin | 111 passed |
 | `mcp-fs` bin | 0 (the binary is a thin `main`) |
 | doctests | 0 passed, 3 ignored (wiring examples marked `ignore`) |
 
-Per area, from `cargo test -p mcp-fs --lib -- --list` (755 tests, the ignored one
-included):
+That is the default feature set, so SQLite only. The relational conformance cases add
+themselves per engine when their dsn is present.
+
+Per area, from `cargo test -p mcp-fs --lib -- --list` (978 entries, the ignored one and
+the live database cases included). The per area rows below are indicative: they are not
+recounted on every change, so trust the total above:
 
 | Area | Tests | Area | Tests |
 |---|---|---|---|
-| `tools` | 176 | `mcp` | 23 |
-| `git` | 117 | `util` | 20 |
-| `core` | 113 | `cli` | 15 |
-| `docs` | 106 | `safety` | 11 |
-| `api` | 65 | `app` | 11 |
-| `storage` | 62 | `identity` | 10 |
+| `tools` | 255 | `mcp` | 23 |
+| `storage` | 132 | `cli` | 23 |
+| `core` | 132 | `util` | 21 |
+| `git` | 117 | `config` | 21 |
+| `docs` | 106 | `identity` | 18 |
+| `api` | 71 | `safety` | 12 |
+| | | `app` | 11 |
 | | | `keys` | 9 |
-| | | `config` | 9 |
+| | | `migrate` | 5 |
 | | | `logging` | 5 |
-| | | `errors` | 3 |
+| | | `errors` | 5 |
 
 Largest single modules: `core::fs_ops` 101, `docs::extract` 49,
-`api::dataplane` 48, `git::oauth` 41, `git::http` 40, `tools::git` 36.
+`api::dataplane` 48, `git::oauth` 41, `git::http` 40, `tools::git` 36,
+`storage::meta` 32.
+
+`storage` grew most, from 62, because the relational layer carries its own suite:
+`storage::rel::dialect` 17, `storage::rel::sqlite` 14 and `storage::rel` 12 cover
+placeholder rendering, upsert and DDL per dialect, `LIKE` escaping and the retry helper
+with no database at all.
+
+## Relational conformance: PostgreSQL and SQL Server
+
+The per store test modules cover their own logic against SQLite. `storage/conformance.rs`
+answers a different question: does a store behave **the same** on another engine? Every
+case takes an `Engine` and runs once per backend.
+
+SQLite always runs. The server engines run only when their dsn is in the environment, so
+`cargo test --workspace` stays green with no Docker and nothing installed.
+
+| Variable | Enables |
+|---|---|
+| `MCPFS_TEST_PG_DSN` | the PostgreSQL cases |
+| `MCPFS_TEST_MSSQL_DSN` | the SQL Server cases |
+
+```bash
+docker compose -f docker-compose.test.yml up -d      # postgres:16 on 55432, mssql 2022 on 51433
+
+MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
+MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
+  cargo test --workspace --all-features
+
+docker compose -f docker-compose.test.yml down -v
+```
+
+The ports are deliberately unusual so this never collides with a real PostgreSQL on 5432
+or SQL Server on 1433. Both services declare a healthcheck because the tests connect
+immediately, and SQL Server needs tens of seconds before it accepts a login. PostgreSQL
+data is on `tmpfs`: throwaway, and faster.
+
+`--all-features` is required, since the drivers are behind the `postgres` and `sqlserver`
+cargo features. Without them the dsn variables are ignored.
+
+**Isolation differs per engine, and that is the point.** SQLite hands out a private in
+memory database per call, while the server engines share one instance, so every case
+derives unique ids from a per run tag. A case that passes on all three has been proven not
+to depend on having the database to itself, which is what catches a statement missing its
+`volume_id` predicate.
 
 ## Opt in test
 
@@ -86,42 +145,29 @@ MCPFS_MINIO_SECRET_KEY=secret \
 Without the service the test does not run at all (`--ignored` is required), which
 is why `./test.sh` is green on a machine with nothing installed.
 
-## Parity harness
+## The differential harness is gone
 
-The objective judge of 1:1 parity. Two modes, so the two servers never need to be
-up at the same time:
+`crates/parity-harness` replayed a corpus against a live server and compared the result
+to a C# capture. It has been **deleted**: the C# is no longer a reference (see
+[`lineage.md`](lineage.md)), so a difference against it was a false signal rather than a
+regression. Its 32 tests covered the corpus and the normalizer, both of which existed only
+to serve that comparison.
 
-```bash
-# capture the reference (C#) into a golden file
-cargo run -p parity-harness -- capture \
-  --base http://127.0.0.1:5002 --token "$CS_TOKEN" \
-  --owner admin@example.com --out parity-golden.json
+What replaced it, and why nothing was lost that mattered:
 
-# compare this implementation against that file
-cargo run -p parity-harness -- compare \
-  --base http://127.0.0.1:5003 --token "$RUST_TOKEN" \
-  --owner admin@example.com --golden parity-golden.json
-```
-
-| Flag | Meaning |
+| Was covered by the harness | Now covered by |
 |---|---|
-| `--base` | server URL (capture defaults to `:5002`, compare to `:5003`) |
-| `--token` | bearer for that server. The identity must be a platform admin (the harness provisions with `admin.create_project`) and in practice the same person as `--owner`, because the `fs.*` steps run as the token identity |
-| `--owner` | owner of the corpus project; also added as a member during provisioning |
-| `--project` | reuse a fixed project id; the default is a fresh id per run, so a replay never inherits state |
-| `--out` / `--golden` | golden file to write / to compare against (`parity-golden.json`) |
-| `--relax-messages` | blank out free form message fields as well as error sentences |
+| the 55 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
+| the MCP wire framing and JSON-RPC behaviour | `app.rs` router tests driven with `oneshot` |
+| the REST plane, every route | `api/dataplane.rs` and `api/openapi.rs` tests |
+| every error path and `ERR_*` code | per module tests next to each error |
+| the git smart protocol | `git/http/mod.rs` tests, plus a real clone/push/reclone |
+| behaviour across engines | `storage/conformance.rs`, one suite per engine |
 
-`parity-golden.json` is the committed baseline. Recapture it after touching the
-corpus and commit it with the change. Volatile values (timestamps, version, host
-paths) are normalized, and an error text is reduced to `tool + ERR_* code`, so a
-reworded message passes while a wrong code fails.
-
-**Interpreting the output is documented once, in
-[`.agent_docs/parity.md`](parity.md)**: what is inside the contract, what is
-deliberately not compared, and the table of the differences that are expected to
-show up. A non zero difference count is not automatically a failure; it is a
-failure unless it is in that table.
+To compare this server against a **previous build of itself**, which is what the harness
+was useful for after parity was retired, drive the real surface instead: the tool level
+tests and the conformance suite already cover it, and `mcp-fs migrate` round trips state
+between engines so a copy can be diffed row for row.
 
 ## The `agent` crate
 

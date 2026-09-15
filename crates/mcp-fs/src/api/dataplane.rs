@@ -1232,15 +1232,20 @@ mod tests {
             config.infra.admin.path = root.join("admin.db").display().to_string();
             let config = Arc::new(config);
 
-            let admin = crate::storage::build_admin_store(&config).unwrap();
+            let registry = crate::storage::RelationalRegistry::new();
+            let admin =
+                crate::storage::build_admin_store(&config, &registry).await.unwrap();
             admin.connect().await.unwrap();
             admin.create_project(MOUNT, OWNER).await.unwrap();
 
             let state = Arc::new(AppState {
                 config: config.clone(),
                 admin,
-                stores: Arc::new(crate::storage::StoreManager::new(config.clone())),
-                safety: Arc::new(SafetyManager::new(config.safety.clone())),
+                stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+                safety: Arc::new(SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
                 identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),

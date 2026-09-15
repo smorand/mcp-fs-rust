@@ -5,15 +5,42 @@ A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
-Metadata tree = **SQLite** (one db per volume). File bytes = **local filesystem**
-(default) or **MinIO/S3**, content-addressed by sha256. ACL = **SQLite**. Auth =
-verified **RS256 bearer JWT**.
+Server state (metadata tree, ACL, git index, OAuth tokens) = **SQLite** by default, or
+**PostgreSQL** or **SQL Server** chosen per store in the config. File bytes = **local
+filesystem** (default) or **MinIO/S3**, content-addressed by sha256. Auth = verified
+**RS256 bearer JWT**.
 
-This is a Rust port of the [C# implementation](https://github.com/smorand/mcp-fs-csharp)
-with **strict 1:1 external parity**: same tool names, same snake_case parameters, same
-`ERR_*` codes, same JSON shapes, same SQLite schemas, same git wire protocol, same REST
-routes. An existing MCP, REST or git client cannot tell the two apart, and a volume
-written by one is readable by the other.
+This began as a Rust port of a C# implementation. **That is history**: the port constraint
+is gone, the two projects have separate lifecycles and deployment targets, and they are
+diverging by design (the C# has no PostgreSQL support, because that is not its target).
+The tool surface is still a contract and is still pinned by tests. See
+[`.agent_docs/lineage.md`](.agent_docs/lineage.md) for the lineage and the design
+decisions worth knowing.
+
+## Cargo features
+
+A default build is SQLite only and carries no database driver beyond bundled `rusqlite`.
+
+| Feature | Adds | Driver |
+|---|---|---|
+| (default) | SQLite | `rusqlite`, bundled |
+| `postgres` | PostgreSQL | `sqlx` |
+| `sqlserver` | SQL Server | `tiberius-ng` + `bb8` |
+| `all-backends` | both | |
+
+`tiberius-ng` is a young, low traffic fork, chosen because `sqlx` has no MSSQL driver and
+the alternative (`odbc-api`) would require a system driver manager on every host. It is
+pinned, optional, and confined to one file. The full comparison and the exit plan are in
+[`.agent_docs/backends.md`](.agent_docs/backends.md#decision-which-sql-server-driver-2026-09-15).
+
+```bash
+cargo build --release --features postgres
+cargo build --release --features all-backends
+```
+
+SQL Server needs a second driver because **sqlx removed its MSSQL support in 0.7** and the
+rewrite has never shipped. Both are optional so a default build carries neither the
+dependency nor its TLS stack.
 
 ## Quickstart
 
@@ -53,11 +80,36 @@ Interactive API docs: <http://127.0.0.1:5002/api/docs> (spec at `/api/swagger.js
 mcp-fs serve [--config PATH]      run the server
 mcp-fs keys  [--dir DIR]          generate an RS256 keypair (default .keys)
 mcp-fs token <email> [--key PATH] [--ttl SECONDS]
+mcp-fs migrate --from A.yaml --to B.yaml   copy relational state between backends
 mcp-fs version
 ```
 
-Config resolution: `--config`, else `$MCP_FS_CONFIG`, else
-`${MCP_FS_CONFIG_DIR:-config}/${MCP_FS_CONFIG_NAME:-local}.yaml`.
+Config resolution, highest priority first: `--config`, else `$MCP_FS_CONFIG`, else
+`~/.config/mcp-fs/config.yaml` when it exists, else
+`${MCP_FS_CONFIG_DIR:-config}/${MCP_FS_CONFIG_NAME:-local}.yaml`. The first two are used
+as given; the last two are probed, and when neither exists the error lists every path
+tried.
+
+### Switching backend with data in place
+
+`migrate` is how you move an existing deployment onto PostgreSQL or SQL Server. It copies
+every row the server owns, from the engines one config names to the engines the other
+names.
+
+```bash
+mcp-fs migrate --from config/sqlite.yaml --to config/postgres.yaml
+```
+
+**Run it with the server stopped**: it takes no locks against a live writer, so a
+concurrent write would be missed. The copy is row for row rather than a replay through the
+store API, so every `mtime` and `ctime` is preserved exactly.
+
+Two things are deliberately not moved. **Blob bytes** stay put, because the blob store is
+configured separately and a relational change does not affect it; every `sha256` is
+instead checked against the destination blob store and reported when missing. **OAuth
+tokens** are skipped, because they are session state encrypted with `MCPFS_TOKEN_KEY` and
+copying ciphertext to a deployment with a different key would produce rows that never
+decrypt. A device flow re establishes them.
 
 ## Configuration
 
@@ -69,6 +121,26 @@ cp config/local.yaml.template config/local.yaml   # SQLite + local blobs, zero s
 cp config/minio.yaml.template config/local.yaml   # SQLite + MinIO/S3 blobs
 ```
 
+Each of the four relational stores is configured independently under `infra`, so you can
+move them one at a time:
+
+```yaml
+infra:
+  meta:                          # the per volume file tree
+    backend: postgres            # sqlite | postgres | sqlserver
+    dsn: "${MCPFS_META_DSN}"     # secret, required for a server engine
+    schema: mcpfs                # postgres only
+    pool: { max_connections: 20, acquire_timeout_secs: 10 }
+  admin: { backend: postgres, dsn: "${MCPFS_META_DSN}" }   # projects and ACL
+  git:   { backend: postgres, dsn: "${MCPFS_META_DSN}" }   # git index
+  oauth: { backend: sqlite }                               # OAuth tokens
+```
+
+Pointing several stores at one dsn is the expected setup: table names do not collide and
+one connection pool is shared. Misconfiguration fails at boot, not on first use: a missing
+dsn, a dsn set on a `sqlite` store, an unknown backend name, or a backend whose cargo
+feature was not compiled in are each rejected with the offending key named.
+
 `${VAR}` and `${VAR:-default}` are expanded from the environment before the YAML is
 parsed, so **secrets never live in a committed file**. Put them in a gitignored `.env`
 (template: `.env.example`), which `run.sh` sources:
@@ -78,21 +150,33 @@ parsed, so **secrets never live in a committed file**. Put them in a gitignored 
 | `MCPFS_MINIO_SECRET_KEY` | S3/MinIO secret key |
 | `MCPFS_GITHUB_CLIENT_SECRET` | GitHub App secret for the `git.auth` device flow |
 | `MCPFS_TOKEN_KEY` | 32 byte base64 key; when set, OAuth tokens are persisted encrypted (AES-256-GCM). Unset means in-memory only |
+| any name you pick | a store `dsn`, for example `${MCPFS_META_DSN}` |
+
+A dsn normally carries a password, so it is treated as a secret: the type redacts itself in
+both `Debug` and `Display`, and a test asserts it never reaches a log line, a boot banner
+or an error message.
 
 Full schema in [`.agent_docs/config.md`](.agent_docs/config.md).
 
 ## What lives where
 
-| Data | Backend | Location |
+| Data | Backend | Location under the SQLite default |
 |---|---|---|
-| File tree metadata | SQLite | `state/volumes/{project}.db` |
+| File tree metadata | `infra.meta` | `state/volumes/{project}.db` |
 | File bytes | local fs or S3 | `state/blobs/{bucket}/{sha[..2]}/{sha}` or bucket `mcpfs-{project}` |
-| Projects and ACL | SQLite | `state/admin.db` |
-| Git objects and refs | blob store + SQLite | key `git:{sha}`, `state/git/{project}.db` |
-| OAuth tokens (opt-in) | encrypted SQLite | `state/oauth.db` |
+| Projects and ACL | `infra.admin` | `state/admin.db` |
+| Git objects and refs | blob store + `infra.git` | key `git:{sha}`, `state/git/{project}.db` |
+| OAuth tokens (opt-in) | `infra.oauth`, encrypted | `state/oauth.db` |
+| Git working directories | always on disk | `state/git-repos/{project}/` |
 
-`state/` is the whole database. Back it up, and note that in MinIO mode the bytes live
-in the bucket while the metadata stays in `state/`: a project needs **both halves**.
+`state/` is the whole database under the default. Back it up, and note that in MinIO mode
+the bytes live in the bucket while the metadata stays in `state/`: a project needs **both
+halves**.
+
+On PostgreSQL or SQL Server one database holds every volume, discriminated by a
+`volume_id` column, since creating a database per project on the fly is not viable. Blob
+bytes never move into the relational database, and `state/git-repos/` stays on disk
+because libgit2 needs a real working directory.
 
 ## Security model
 
@@ -114,10 +198,30 @@ in the bucket while the metadata stays in `state/`: a project needs **both halve
 ```bash
 ./build.sh                       # cargo build --release
 ./test.sh                        # cargo test --workspace
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The suite is the quality gate and must be green before any commit.
+The suite is the quality gate and must be green before any commit. Use `--all-features` on
+clippy, otherwise the two optional drivers are never compiled and their warnings never
+surface.
+
+The default run needs no database and no Docker. To exercise PostgreSQL and SQL Server,
+bring the services up and pass their dsn; the cases skip themselves when the variables are
+absent:
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+
+MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
+MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
+  cargo test --workspace --all-features
+
+docker compose -f docker-compose.test.yml down -v
+```
+
+One conformance suite runs the same assertions against every engine, which is what proves a
+store behaves identically on all three. See
+[`.agent_docs/testing.md`](.agent_docs/testing.md).
 
 ## Interactive CLI agent
 
@@ -155,85 +259,73 @@ test: a wrong prompt width is a mistake at the call site, not in the width funct
 cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
 ```
 
-## Parity harness
+## The tool contract is frozen
 
-The objective judge of 1:1 parity. It replays a corpus of MCP and REST calls against a
-server and diffs against a golden capture of the C# reference:
+The 55 tool names, descriptions and `inputSchema` values are a client and an LLM facing
+contract, so they are snapshotted in `tool-contract-golden.json` and compared on every test
+run, serialized form included, which means even a reordered schema key fails the build.
+`TOOL_CONTRACT.txt` is the human readable companion.
+
+Changing the contract is deliberate, never a hand edit:
 
 ```bash
-# capture from the reference implementation
-cargo run -p parity-harness -- capture \
-  --base http://127.0.0.1:5002 --token "$CS_TOKEN" \
-  --owner admin@example.com --out parity-golden.json
-
-# compare this implementation against it
-cargo run -p parity-harness -- compare \
-  --base http://127.0.0.1:5003 --token "$RUST_TOKEN" \
-  --owner admin@example.com --golden parity-golden.json
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
 ```
 
-Volatile values (timestamps, version, host paths) are normalized, and an error text is
-reduced to `tool + ERR_* code` so a reworded message passes while a wrong code fails.
-`parity-golden.json` is the committed baseline.
+Then review the diff: a description edit is one line, and 55 changed tools means something
+went wrong.
 
-## Deliberate divergences from the C#
+## Design decisions worth knowing
 
-Each is a case where mirroring the reference would mirror a defect. The full table, with
-the harness step that proves each one, is in [`.agent_docs/parity.md`](.agent_docs/parity.md).
+Stated on their own terms; the full record is in
+[`.agent_docs/lineage.md`](.agent_docs/lineage.md), and each is documented at its call site.
 
-**Errors are usable.** The reference answers a missing file or a missing argument with
-`"An error occurred invoking 'fs.read'."` carrying **no error code** (its storage layer
-raises a bare `IOException`, which is not an `McpException`), so a client cannot tell a
-missing file from a bad argument from a crash. Here every failure carries its `ERR_*`
-code. On the REST plane the reference maps six codes and defaults the rest to a generic
-400, so a spent quota, a missing read precondition, an ambiguous match and an unsupported
-format were indistinguishable by status; here they are 429, 428, 409 and 501, and a
-missing file is 404 rather than 500.
+**Errors are usable.** Every failure carries one of the 14 `ERR_*` codes, and the REST
+status suggests a remedy rather than a generic 400: a missing file is 404, a spent quota
+429, a missing read before write 428, a duplicate project 409, an unsupported extraction
+format 501, and an edit that matched nothing or matched ambiguously 422.
 
-**A real `git clone` and `git push` work.** Three reference defects made the documented
-git protocol unusable: `upload-pack` did not advertise `multi_ack_detailed` (which git
-requires over smart HTTP), the pack was built without a commit's ancestry so any
-repository with more than one commit was incomplete, and the `receive-pack` report was not
-side-band framed so git aborted after the push had landed. Also: `unpack ok` is sent,
-project membership is enforced on the git routes (the reference let any verified token
-read or write any project), `max_pack_size_mb` is enforced, and pushed objects are really
-indexed.
+**A real `git clone` and `git push` work.** Smart HTTP is unforgiving: `upload-pack`
+advertises `multi_ack_detailed`, the pack is built from a revwalk so a commit's ancestry is
+included (otherwise any repository with more than one commit is incomplete), and the
+`receive-pack` report is side-band framed once the client negotiated it, or git aborts after
+the push has already landed. `unpack ok` is sent, project membership is enforced on every
+git route, `max_pack_size_mb` is enforced, and pushed objects are really indexed.
+Verified end to end: clone, commit, push, reclone.
 
-**Data safety and accounting on the REST plane.** Four routes called the storage layer
-directly instead of the engine, so the REST door behaved differently from the tool for the
-same operation: `delete` skipped the trash, ignored `allow_hard_delete` and removed a whole
-tree without asking for `recursive`; `move` had no no clobber rule; `upload` charged
-nothing against the write quota, making the highest volume write path the only one with no
-accounting; and none of them wrote an audit entry, so a REST mutation left no trace. All
-four now go through the engine. The git write paths had the same gap: `git.remote_clone`
-imported a whole working tree and `git.checkout_file` restored a file with nothing charged
-against the quota, so git was a way around it. The clone is now charged up front, before
-the first write, so an import that does not fit leaves the volume untouched instead of half
-populated. Related engine bug found on the way: `fs.move` with `overwrite: true` always
-failed, because the flag was checked and then ignored.
+**One implementation per operation.** `core::fs_ops` is the only place an operation is
+written; the MCP tool layer and the REST plane are thin adapters over it, including the V4A
+patch engine. This is why the REST `delete` honours trash, `allow_hard_delete` and
+`recursive`, why `upload` is quota charged and audited like any other write, and why
+`git.remote_clone` charges the whole import up front so a repository that does not fit
+leaves the volume untouched instead of half populated. `git.checkout_file` is charged too:
+restoring from history is a write.
 
-**Correctness fixes.** `auth.jwt.algorithms` is honoured instead of parsed and ignored
-(with unsupported names logged at startup and the HMAC family refused on purpose).
-Listing a file is a 400 rather than a 200 with an invented empty listing. `fs.tree` at
-exactly the node cap returns every node instead of dropping the last one and claiming to
-be truncated. Symbol references come back ordered by line. An invalid `fs.grep` regex is
-a stable 400.
-
-**Structural.** One implementation per operation in `core::fs_ops`, shared by the MCP
-surface and the REST plane, including the V4A patch engine. No custom libgit2 ODB backend
-(`git2` cannot express one from safe Rust): the blob store is the source of truth and is
-synced around libgit2 calls, with identical stored bytes.
+**Correctness.** `auth.jwt.algorithms` is honoured, with unsupported names logged at
+startup and the HMAC family refused on purpose (an `HS*` algorithm with a public key file
+would let anyone holding that key mint tokens). Listing a file is a 400 rather than an
+invented empty listing. `fs.tree` at exactly the node cap returns every node. Symbol
+references come back ordered by line. An invalid `fs.grep` regex is a stable 400. A
+subtree `LIKE` pattern is escaped, so a file named `a_b` no longer matches its sibling
+`axb` and a subtree delete cannot remove unrelated rows. No custom libgit2 ODB backend
+(`git2` cannot express one from safe Rust): the blob store is the source of truth, with
+identical stored bytes.
 
 ## Not supported
 
 Audio and video extraction (needs a speech model) and legacy binary Office formats
-(`.doc`, `.xls`, `.ppt`), same as the reference. `object_format: sha256` is accepted and
-ignored: the bundled libgit2 is sha1 only.
+(`.doc`, `.xls`, `.ppt`). `object_format: sha256` is accepted and ignored: the bundled
+libgit2 is sha1 only.
+
+On the relational side: there is no online migration (`mcp-fs migrate` is offline, run with
+the server stopped) and no automated downgrade, since a database written by the current
+code carries a `volume_id` column older code does not know about. Blob bytes are never
+stored in the relational database.
 
 ## Documentation
 
 `AGENTS.md` is the compact index. Details live in [`.agent_docs/`](.agent_docs/):
-architecture, tools, api, git, config, testing, parity, agent.
+architecture, tools, api, git, config, backends, testing, lineage, agent.
 
 ## License
 

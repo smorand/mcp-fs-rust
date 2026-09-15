@@ -7,5 +7,5 @@ pub mod persistence;
 pub mod store;
 
 pub use cipher::{decode_key, generate_key_base64};
-pub use persistence::SqliteOAuthPersistence;
+pub use persistence::RelationalOAuthPersistence;
 pub use store::{OAuthSession, OAuthTokenStore, TOKEN_KEY_ENV};

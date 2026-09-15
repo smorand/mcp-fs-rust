@@ -33,12 +33,76 @@ reference clock skew.
 |---|---|---|---|
 | `admins` | list of strings | `[]` | platform admins, matched caselessly. Grants project and membership management, **not** file access (see `.agent_docs/tools.md`) |
 
-## `infra.meta`
+## Relational stores: `infra.meta`, `infra.admin`, `infra.git`, `infra.oauth`
+
+Four stores hold the server's relational state, each configured independently and each
+accepting the same three backends. Details of the layer are in
+[`backends.md`](backends.md).
+
+| Backend | Compiled | Needs |
+|---|---|---|
+| `sqlite` | always | a path, no dsn |
+| `postgres` | `--features postgres` | a dsn |
+| `sqlserver` | `--features sqlserver` | a dsn |
+
+Keys shared by all four sections:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `backend` | string | `sqlite` | only `sqlite` is implemented; anything else is `ERR_INVALID_ARGUMENT` |
-| `dir` | string | `state/volumes` | one db per volume: `{dir}/{project_id}.db`. Its parent is the state root, from which the git and oauth paths are derived |
+| `backend` | string | `sqlite` | `sqlite`, `postgres` or `sqlserver`. Anything else is `ERR_INVALID_ARGUMENT` naming the accepted values |
+| `dsn` | string | `""` | PostgreSQL and SQL Server only. **Secret**: inject it with `${VAR}` |
+| `schema` | string | `public` | PostgreSQL only: the schema holding our tables |
+| `pool.max_connections` | int | `10` | server engines only; SQLite keeps one serialized connection by design |
+| `pool.acquire_timeout_secs` | int | `30` | server engines only: how long a request waits for a pooled connection |
+
+Plus one SQLite path key per section:
+
+| Section | Key | Default | Holds |
+|---|---|---|---|
+| `infra.meta` | `dir` | `state/volumes` | one db per volume, `{dir}/{project_id}.db`. Its parent is the state root, from which the git and oauth paths are derived |
+| `infra.admin` | `path` | `state/admin.db` | ACL registry (`project`, `project_member`) |
+| `infra.git` | (derived) | `{state_root}/git/{project_id}.db` | git index (`git_objects`, `git_refs`, `git_remotes`) |
+| `infra.oauth` | (derived) | `{state_root}/oauth.db` | encrypted OAuth tokens |
+
+`infra.git` and `infra.oauth` are new sections. They were previously hardcoded to those
+derived paths, which is still exactly what an absent section means, so no existing config
+changes behaviour.
+
+### Validation at boot
+
+All four are checked when the config loads, because a silent misconfiguration here is the
+real risk. Each failure is `ERR_INVALID_ARGUMENT` naming the offending key:
+
+* `backend` is not one of the three accepted values;
+* `backend` is `postgres` or `sqlserver` and `dsn` is empty;
+* `dsn` is set while `backend` is `sqlite`, which never reads a dsn. Rejected rather than
+  ignored, so a dsn that does nothing cannot look like it is in use;
+* `backend` names an engine this binary was not built with. The message names the cargo
+  feature to rebuild with, since the failure is a build choice and not a typo.
+
+Pointing several sections at the same dsn is supported and is the expected deployment:
+the table names do not collide, and one pool is shared per distinct backend, dsn and
+schema triple.
+
+### Example
+
+```yaml
+infra:
+  meta:
+    backend: postgres
+    dsn: "${MCPFS_META_DSN}"
+    schema: mcpfs
+    pool: { max_connections: 20, acquire_timeout_secs: 10 }
+  admin:
+    backend: postgres
+    dsn: "${MCPFS_META_DSN}"
+    schema: mcpfs
+  git:
+    backend: postgres
+    dsn: "${MCPFS_META_DSN}"
+  oauth:
+    backend: sqlite
+```
 
 ## `infra.blob`
 
@@ -54,12 +118,6 @@ reference clock skew.
 
 Path style addressing is always forced on S3 because MinIO requires it.
 
-## `infra.admin`
-
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `backend` | string | `sqlite` | only `sqlite` is implemented |
-| `path` | string | `state/admin.db` | ACL registry (`project`, `project_member`) |
 
 ## `safety`
 
@@ -109,8 +167,11 @@ Details in [`.agent_docs/git.md`](git.md).
 
 ## Derived paths
 
-Only `infra.meta.dir`, `infra.blob.dir` and `infra.admin.path` are configurable;
-everything else is derived, so moving `infra.meta.dir` moves the whole state tree.
+Under the SQLite backend, only `infra.meta.dir`, `infra.blob.dir` and
+`infra.admin.path` are configurable; everything else is derived, so moving
+`infra.meta.dir` moves the whole state tree. A store on PostgreSQL or SQL Server uses
+its dsn instead and ignores these paths, except `git_repo_dir`, which stays on disk
+because libgit2 needs a real working directory.
 
 | Helper | Value |
 |---|---|
@@ -147,6 +208,13 @@ composition root by name.
 | `MCPFS_MINIO_SECRET_KEY` | `infra.blob.secret_key` in `config/minio.yaml.template` |
 | `MCPFS_GITHUB_CLIENT_SECRET` | the `git.auth` GitHub device flow (name configurable) |
 | `MCPFS_TOKEN_KEY` | when set, OAuth tokens are persisted encrypted (AES-256-GCM, 32 byte base64 key); unset means memory only |
+| any name you choose | the `dsn` of a relational store, for example `${MCPFS_META_DSN}` |
+
+A **dsn is a secret**, because it usually carries a password. `dsn` is typed as `Dsn`,
+not `String`, and that type redacts itself in both `Debug` and `Display`, printing
+`Dsn(redacted)` or `redacted`. So a dsn cannot reach a log line, a boot banner or an
+error message even by accident, and there is a test asserting it. Never format a dsn
+with `{:?}` expecting to see it, and never add a field that prints one.
 
 * `.env` is **gitignored**; `.env.example` is tracked as the template. `run.sh`
   sources `.env` when present.
@@ -160,13 +228,25 @@ composition root by name.
 
 ## Config path resolution
 
-`mcp-fs serve` picks the file in this order:
+The config file is mandatory. `mcp-fs serve` picks it in this order, highest priority
+first, which is the same CLI then environment then file pattern the rest of the CLI
+follows:
 
-1. `--config PATH` (also `-c`),
-2. `$MCP_FS_CONFIG` (a full path),
-3. `${MCP_FS_CONFIG_DIR:-config}/${MCP_FS_CONFIG_NAME:-local}.yaml`.
+| # | Source | Behaviour |
+|---|---|---|
+| 1 | `--config PATH` (also `-c`) | used as given |
+| 2 | `$MCP_FS_CONFIG` (a full path) | used as given |
+| 3 | `~/.config/mcp-fs/config.yaml` | probed, used only when it exists |
+| 4 | `${MCP_FS_CONFIG_DIR:-config}/${MCP_FS_CONFIG_NAME:-local}.yaml` | probed, used only when it exists |
 
-A missing file is `ERR_INVALID_ARGUMENT` with the resolved path in the message; a
-YAML error reports the parse failure. The keypair is unrelated to this resolution:
-`mcp-fs keys --dir .keys` writes `jwt.key` and `jwt.pub`, and
-`auth.jwt.public_key_path` must point at the `.pub` file.
+Cases 1 and 2 are explicit, so a missing file is reported by the name you gave. Cases 3
+and 4 are probed, and when neither exists the error lists every path tried rather than
+naming just one.
+
+Step 3 honours `$XDG_CONFIG_HOME` when it is set and falls back to `$HOME/.config`. It
+is new, and because it only applies when the file exists it cannot disturb a checkout
+that relies on the working directory relative `config/local.yaml`.
+
+A missing or unreadable file is `ERR_INVALID_ARGUMENT`; a YAML error reports the parse
+failure. The keypair is unrelated to this resolution: `mcp-fs keys --dir .keys` writes
+`jwt.key` and `jwt.pub`, and `auth.jwt.public_key_path` must point at the `.pub` file.

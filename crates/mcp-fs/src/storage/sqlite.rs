@@ -74,6 +74,24 @@ impl SqliteDb {
             .map_err(|e| ToolError::internal(format!("sqlite task join: {e}")))?
     }
 
+    /// Lock the connection and hand it to a synchronous closure.
+    ///
+    /// Exposed for the relational adapter in `storage::rel::sqlite`: a rusqlite
+    /// `Transaction` borrows the `Connection` and a `MutexGuard` is not `Send`, so
+    /// an open transaction cannot cross an `.await`. The adapter therefore drives a
+    /// whole transaction from inside one blocking task that owns the lock for its
+    /// duration, which keeps the single writer serialization this type provides.
+    pub(crate) fn with_connection_blocking<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
+        f(&mut guard)
+    }
+
     /// Execute DDL / statements without a transaction wrapper (schema setup).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         let guard = self

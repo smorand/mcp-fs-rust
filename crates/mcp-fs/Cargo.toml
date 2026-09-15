@@ -15,6 +15,17 @@ path = "src/main.rs"
 name = "mcp_fs"
 path = "src/lib.rs"
 
+[features]
+default = []
+# A relational backend other than SQLite is opt in, so the default build keeps
+# the zero external service posture and gains no dependency surface.
+postgres = ["dep:sqlx"]
+# SQL Server through tiberius-ng plus a bb8 pool. Off by default: the fork is
+# young and a default build must carry neither it nor its TLS stack.
+sqlserver = ["dep:tiberius-ng", "dep:bb8", "dep:tokio-util"]
+# Every relational backend at once, for CI and for the quality gate.
+all-backends = ["postgres", "sqlserver"]
+
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -29,6 +40,10 @@ serde_yaml = { workspace = true }
 schemars = { workspace = true }
 
 rusqlite = { workspace = true }
+sqlx = { workspace = true, optional = true }
+tiberius-ng = { workspace = true, optional = true }
+bb8 = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 aws-credential-types = { workspace = true }

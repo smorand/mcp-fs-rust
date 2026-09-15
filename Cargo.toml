@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mcp-fs", "crates/parity-harness", "crates/agent"]
+members = ["crates/mcp-fs", "crates/agent"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +27,29 @@ schemars = "1"
 
 # ── storage ────────────────────────────────────────────────────────────────────
 rusqlite = { version = "0.37", features = ["bundled"] }
+# PostgreSQL, optional and off by default: a default build carries neither the
+# dependency nor its TLS stack. `macros` is deliberately absent because every
+# statement here is built at runtime, so the compile time query checker and its
+# offline metadata would be weight with no user.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
+# SQL Server, optional and off by default. `tiberius-ng` is the maintained fork of
+# `tiberius`, which had no release since 2024 and ships unpatched advisories; sqlx
+# has no MSSQL driver at all (removed in 0.7, never rewritten), so a separate
+# driver is the only option. Pinned exactly because the fork is young.
+# `rustls` instead of the default `native-tls` keeps OpenSSL out of the build.
+tiberius-ng = { version = "=0.13.1", default-features = false, features = [
+    "rustls",
+    "tds73",
+    "chrono",
+] }
+# Connection pooling for tiberius, which ships none of its own. bb8 is async and
+# already the pool behind several tokio ecosystem drivers.
+bb8 = "0.9"
+tokio-util = { version = "0.7", features = ["compat"] }
 aws-sdk-s3 = "1"
 aws-config = "1"
 aws-credential-types = "1"

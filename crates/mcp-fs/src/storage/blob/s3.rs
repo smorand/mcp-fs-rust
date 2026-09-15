@@ -1,8 +1,8 @@
 //! S3 / MinIO blob backend. Port of the C# `Storage/MinioBlobStore.cs`.
 //!
-//! One bucket per volume (`{bucket_prefix}{project_id}`), object key = sha256, so a
-//! bucket written by either implementation is readable by the other. Path-style
-//! addressing is forced, which is what MinIO needs.
+//! One bucket per volume (`{bucket_prefix}{project_id}`), object key = sha256. That
+//! naming is a stable contract: an existing bucket must stay readable after an
+//! upgrade. Path-style addressing is forced, which is what MinIO needs.
 
 use crate::config::BlobConfig;
 use crate::errors::{Result, ToolError};
