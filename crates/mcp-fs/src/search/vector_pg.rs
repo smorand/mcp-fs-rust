@@ -233,28 +233,162 @@ impl SearchBackend for PostgresVectorBackend {
 
 #[cfg(test)]
 mod tests {
-    // Live tests against a real Postgres + pgvector require MCPFS_TEST_PG_DSN.
-    // They are skipped automatically when the variable is unset.
+    // Live tests require MCPFS_TEST_PG_DSN and a Postgres instance with the
+    // `vector` extension. They skip automatically when the variable is unset.
+    //
+    // Tests that call `index_path` or `query_vector` need an embedding endpoint.
+    // Rather than require a live LLM, an inline axum stub is spawned that returns
+    // a fixed 3-dimensional vector for any input. This keeps the tests self-
+    // contained and deterministic.
 
-    async fn live_pool(schema: &str) -> Option<sqlx::PgPool> {
+    use super::*;
+    use crate::config::EmbeddingConfig;
+    use crate::errors::code;
+    use crate::search::SearchBackend;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    async fn live_backend(schema: &str, dims: u32, endpoint: &str) -> Option<PostgresVectorBackend> {
         let dsn = std::env::var("MCPFS_TEST_PG_DSN").ok().filter(|v| !v.trim().is_empty())?;
         use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
         let db = PostgresRelationalDb::connect(&dsn, schema, PoolSettings::default())
             .await
             .expect("MCPFS_TEST_PG_DSN is set but connection failed");
-        Some(db.pool().clone())
+        let client = Arc::new(reqwest::Client::new());
+        let cfg = EmbeddingConfig {
+            endpoint: endpoint.to_string(),
+            model: "fake".to_string(),
+            api_key_env: String::new(),
+            dimensions: dims,
+        };
+        Some(PostgresVectorBackend::new(db.pool().clone(), dims, client, cfg).await.unwrap())
+    }
+
+    /// Spawn a minimal axum server that returns a fixed 3-dim embedding for any
+    /// POST to `/v1/embeddings`. Returns the base URL, e.g. `http://127.0.0.1:PORT`.
+    async fn spawn_fake_embedding_server(dims: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = Router::new().route(
+            "/v1/embeddings",
+            post(move || async move {
+                // Return a fixed unit vector of the requested dimension.
+                let vec: Vec<f32> = (0..dims).map(|i| (i + 1) as f32 / dims as f32).collect();
+                Json(serde_json::json!({
+                    "data": [{"embedding": vec, "index": 0}],
+                    "model": "fake",
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1}
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    // ── tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn live_stats_zero_on_empty_volume() {
+        let base = spawn_fake_embedding_server(3).await;
+        let Some(b) = live_backend("mcpfs_vecpg_stats0", 3, &format!("{base}/v1/embeddings")).await
+        else {
+            return;
+        };
+        let s = b.stats("empty_vol").await.unwrap();
+        assert_eq!(s.vector_chunks, 0);
     }
 
     #[tokio::test]
-    async fn live_stats_returns_zero_on_empty_volume() {
-        use super::*;
-        let Some(pool) = live_pool("mcpfs_vecpg_test").await else {
+    async fn live_stats_counts_chunks_after_index() {
+        let base = spawn_fake_embedding_server(3).await;
+        let Some(b) =
+            live_backend("mcpfs_vecpg_stats2", 3, &format!("{base}/v1/embeddings")).await
+        else {
             return;
         };
-        let client = Arc::new(reqwest::Client::new());
-        let cfg = EmbeddingConfig::default();
-        let b = PostgresVectorBackend::new(pool, 3, client, cfg).await.unwrap();
-        let s = b.stats("empty_vol").await.unwrap();
-        assert_eq!(s.vector_chunks, 0);
+        b.index_path("v1", "/a.md", "alpha beta gamma", 200, 0).await.unwrap();
+        b.index_path("v1", "/b.md", "delta epsilon zeta", 200, 0).await.unwrap();
+        let s = b.stats("v1").await.unwrap();
+        assert_eq!(s.vector_chunks, 2, "expected 2 chunks after indexing 2 files");
+    }
+
+    #[tokio::test]
+    async fn live_index_and_query() {
+        let base = spawn_fake_embedding_server(3).await;
+        let Some(b) =
+            live_backend("mcpfs_vecpg_query", 3, &format!("{base}/v1/embeddings")).await
+        else {
+            return;
+        };
+        b.index_path("v1", "/doc.md", "rust is a systems language", 200, 0)
+            .await
+            .unwrap();
+        let r = b.query_vector("v1", "systems programming", 10).await.unwrap();
+        // The fake embedding server returns the same vector for every input, so
+        // the query finds the document (cosine distance 0 = identical vectors).
+        assert!(!r.is_empty(), "expected at least one result");
+        assert_eq!(r[0].path, "/doc.md");
+        assert!(r[0].score > 0.0, "score must be positive");
+        assert_eq!(r[0].rank, 1);
+    }
+
+    #[tokio::test]
+    async fn live_delete_removes_chunks() {
+        let base = spawn_fake_embedding_server(3).await;
+        let Some(b) =
+            live_backend("mcpfs_vecpg_del", 3, &format!("{base}/v1/embeddings")).await
+        else {
+            return;
+        };
+        b.index_path("v1", "/c.md", "content to delete", 200, 0).await.unwrap();
+        let deleted = b.delete_path("v1", "/c.md").await.unwrap();
+        assert!(deleted > 0, "delete must report at least one chunk removed");
+        let s = b.stats("v1").await.unwrap();
+        assert_eq!(s.vector_chunks, 0, "stats must reflect deletion");
+    }
+
+    #[tokio::test]
+    async fn live_idempotent_reindex() {
+        let base = spawn_fake_embedding_server(3).await;
+        let Some(b) =
+            live_backend("mcpfs_vecpg_idem", 3, &format!("{base}/v1/embeddings")).await
+        else {
+            return;
+        };
+        b.index_path("v1", "/d.md", "first content", 200, 0).await.unwrap();
+        // Re-index must replace, not duplicate.
+        b.index_path("v1", "/d.md", "second content", 200, 0).await.unwrap();
+        let s = b.stats("v1").await.unwrap();
+        assert_eq!(s.vector_chunks, 1, "re-index must replace, not append");
+    }
+
+    #[tokio::test]
+    async fn live_volume_isolation() {
+        let base = spawn_fake_embedding_server(3).await;
+        let ep = format!("{base}/v1/embeddings");
+        let Some(b) = live_backend("mcpfs_vecpg_iso", 3, &ep).await else { return };
+        b.index_path("vol_a", "/shared.md", "content in a", 200, 0).await.unwrap();
+        b.index_path("vol_b", "/shared.md", "content in b", 200, 0).await.unwrap();
+        assert_eq!(b.stats("vol_a").await.unwrap().vector_chunks, 1);
+        assert_eq!(b.stats("vol_b").await.unwrap().vector_chunks, 1);
+        // query_vector must only return rows from the requested volume.
+        let ra = b.query_vector("vol_a", "content", 10).await.unwrap();
+        assert!(ra.iter().all(|r| r.path == "/shared.md"));
+    }
+
+    #[tokio::test]
+    async fn live_query_bm25_returns_not_supported() {
+        let base = spawn_fake_embedding_server(3).await;
+        let Some(b) =
+            live_backend("mcpfs_vecpg_norag", 3, &format!("{base}/v1/embeddings")).await
+        else {
+            return;
+        };
+        let err = b.query_bm25("v1", "anything", 10).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
     }
 }

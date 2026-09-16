@@ -186,41 +186,105 @@ impl SearchBackend for PostgresBm25Backend {
 
 #[cfg(test)]
 mod tests {
+    use crate::errors::code;
     use crate::search::SearchBackend;
 
-    // Live tests against a real Postgres require MCPFS_TEST_PG_DSN to be set.
-    // They are skipped automatically in the default gate so no Docker is needed.
+    // Live tests require MCPFS_TEST_PG_DSN. They skip automatically when the
+    // variable is unset, so `cargo test --workspace` stays green with no Docker.
 
-    async fn live_pool(schema: &str) -> Option<sqlx::PgPool> {
+    async fn live_backend(schema: &str) -> Option<super::PostgresBm25Backend> {
         let dsn = std::env::var("MCPFS_TEST_PG_DSN").ok().filter(|v| !v.trim().is_empty())?;
         use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
         let db = PostgresRelationalDb::connect(&dsn, schema, PoolSettings::default())
             .await
             .expect("MCPFS_TEST_PG_DSN is set but connection failed");
-        Some(db.pool().clone())
+        Some(super::PostgresBm25Backend::new(db.pool().clone()).await.unwrap())
     }
 
     #[tokio::test]
     async fn live_index_and_query() {
-        let Some(pool) = live_pool("mcpfs_bm25pg_test").await else {
-            return;
-        };
-        let b = super::PostgresBm25Backend::new(pool).await.unwrap();
-        b.index_path("v1", "/a.md", "the quick brown fox", 200, 0).await.unwrap();
+        let Some(b) = live_backend("mcpfs_bm25pg_idx").await else { return };
+        b.index_path("v1", "/a.md", "the quick brown fox jumps", 200, 0).await.unwrap();
         let r = b.query_bm25("v1", "fox", 10).await.unwrap();
-        assert!(!r.is_empty());
+        assert!(!r.is_empty(), "expected at least one result");
         assert_eq!(r[0].path, "/a.md");
     }
 
     #[tokio::test]
+    async fn live_ranks_start_at_one() {
+        let Some(b) = live_backend("mcpfs_bm25pg_ranks").await else { return };
+        b.index_path("v1", "/a.md", "quick fox", 200, 0).await.unwrap();
+        b.index_path("v1", "/b.md", "quick fox brown", 200, 0).await.unwrap();
+        let r = b.query_bm25("v1", "fox", 10).await.unwrap();
+        assert_eq!(r[0].rank, 1, "first result must have rank 1");
+        for (i, res) in r.iter().enumerate() {
+            assert_eq!(res.rank, i + 1, "ranks must be consecutive");
+        }
+    }
+
+    #[tokio::test]
     async fn live_delete_removes_doc() {
-        let Some(pool) = live_pool("mcpfs_bm25pg_delete").await else {
-            return;
-        };
-        let b = super::PostgresBm25Backend::new(pool).await.unwrap();
-        b.index_path("v1", "/b.md", "hello world", 200, 0).await.unwrap();
-        b.delete_path("v1", "/b.md").await.unwrap();
+        let Some(b) = live_backend("mcpfs_bm25pg_del").await else { return };
+        b.index_path("v1", "/b.md", "hello world test", 200, 0).await.unwrap();
+        let deleted = b.delete_path("v1", "/b.md").await.unwrap();
+        assert!(deleted > 0, "delete must report at least one chunk removed");
         let r = b.query_bm25("v1", "hello", 10).await.unwrap();
-        assert!(r.is_empty());
+        assert!(r.is_empty(), "deleted doc must not appear in results");
+    }
+
+    #[tokio::test]
+    async fn live_stats_zero_on_empty_volume() {
+        let Some(b) = live_backend("mcpfs_bm25pg_stats").await else { return };
+        let s = b.stats("empty_vol").await.unwrap();
+        assert_eq!(s.bm25_docs, 0);
+        assert!(!s.bm25_warm, "empty volume must not be warm");
+    }
+
+    #[tokio::test]
+    async fn live_stats_counts_chunks_after_index() {
+        let Some(b) = live_backend("mcpfs_bm25pg_stats2").await else { return };
+        // Two files, each one chunk at this size.
+        b.index_path("v1", "/a.md", "alpha beta gamma", 200, 0).await.unwrap();
+        b.index_path("v1", "/b.md", "delta epsilon zeta", 200, 0).await.unwrap();
+        let s = b.stats("v1").await.unwrap();
+        assert_eq!(s.bm25_docs, 2, "expected 2 chunks");
+        assert!(s.bm25_warm, "non-empty volume must be warm");
+    }
+
+    #[tokio::test]
+    async fn live_idempotent_reindex() {
+        let Some(b) = live_backend("mcpfs_bm25pg_idem").await else { return };
+        b.index_path("v1", "/a.md", "first version content", 200, 0).await.unwrap();
+        // Re-index the same path: should replace, not duplicate.
+        b.index_path("v1", "/a.md", "second version content", 200, 0).await.unwrap();
+        let s = b.stats("v1").await.unwrap();
+        assert_eq!(s.bm25_docs, 1, "re-index must replace, not append");
+        // The old content must be gone.
+        let old = b.query_bm25("v1", "first", 10).await.unwrap();
+        assert!(old.is_empty(), "old content must not appear after re-index");
+        // The new content must be present.
+        let new = b.query_bm25("v1", "second", 10).await.unwrap();
+        assert!(!new.is_empty(), "new content must be findable");
+    }
+
+    #[tokio::test]
+    async fn live_volume_isolation() {
+        let Some(b) = live_backend("mcpfs_bm25pg_iso").await else { return };
+        b.index_path("vol_a", "/shared.md", "document in volume a", 200, 0).await.unwrap();
+        b.index_path("vol_b", "/shared.md", "document in volume b", 200, 0).await.unwrap();
+        // Query vol_a must not return vol_b rows.
+        let ra = b.query_bm25("vol_a", "document", 10).await.unwrap();
+        assert!(ra.iter().all(|r| r.path == "/shared.md"), "vol_a results must come from vol_a");
+        let cnt_a = b.stats("vol_a").await.unwrap().bm25_docs;
+        let cnt_b = b.stats("vol_b").await.unwrap().bm25_docs;
+        assert_eq!(cnt_a, 1);
+        assert_eq!(cnt_b, 1);
+    }
+
+    #[tokio::test]
+    async fn live_query_vector_returns_not_supported() {
+        let Some(b) = live_backend("mcpfs_bm25pg_norag").await else { return };
+        let err = b.query_vector("v1", "anything", 10).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
     }
 }

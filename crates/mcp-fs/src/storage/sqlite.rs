@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 /// for the entire process lifetime. The registration is a no-op when the
 /// `rag` feature is not compiled in.
 #[cfg(feature = "rag")]
-fn register_sqlite_vec() {
+pub(crate) fn register_sqlite_vec() {
     use std::sync::OnceLock;
     static REGISTERED: OnceLock<()> = OnceLock::new();
     REGISTERED.get_or_init(|| {

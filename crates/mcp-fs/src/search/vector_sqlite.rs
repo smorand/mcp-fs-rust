@@ -315,3 +315,130 @@ impl SearchBackend for SqliteVecBackend {
         vec!["rag"]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // These tests use the real sqlite-vec vec0 MATCH operator. They need the
+    // extension registered, which happens via the OnceLock in storage/sqlite.rs.
+    // Since tests run in the same process and OnceLock fires once, we call the
+    // registration function directly here.
+
+    use super::*;
+    use crate::config::EmbeddingConfig;
+    use crate::errors::code;
+    use crate::search::SearchBackend;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    fn register_extension() {
+        crate::storage::sqlite::register_sqlite_vec();
+    }
+
+    /// Spawn a minimal axum server returning a fixed N-dim embedding.
+    async fn spawn_fake_embedding(dims: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = Router::new().route(
+            "/v1/embeddings",
+            post(move || async move {
+                let vec: Vec<f32> = (0..dims).map(|i| (i + 1) as f32 / dims as f32).collect();
+                Json(serde_json::json!({
+                    "data": [{"embedding": vec, "index": 0}],
+                    "model": "fake",
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1}
+                }))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn backend(endpoint: &str, dims: u32) -> (SqliteVecBackend, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(reqwest::Client::new());
+        let cfg = EmbeddingConfig {
+            endpoint: endpoint.to_string(),
+            model: "fake".to_string(),
+            api_key_env: String::new(),
+            dimensions: dims,
+        };
+        let b = SqliteVecBackend::new(dims, dir.path().to_str().unwrap(), client, cfg);
+        (b, dir)
+    }
+
+    #[tokio::test]
+    async fn stats_zero_on_empty_volume() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        let s = b.stats("vol1").await.unwrap();
+        assert_eq!(s.vector_chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn index_increments_chunk_count() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol1", "/a.md", "hello world test", 200, 0).await.unwrap();
+        let s = b.stats("vol1").await.unwrap();
+        assert_eq!(s.vector_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_chunks() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol1", "/a.md", "some text to delete", 200, 0).await.unwrap();
+        let deleted = b.delete_path("vol1", "/a.md").await.unwrap();
+        assert!(deleted > 0, "delete must report at least one chunk removed");
+        let s = b.stats("vol1").await.unwrap();
+        assert_eq!(s.vector_chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn idempotent_reindex() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol1", "/a.md", "first content", 200, 0).await.unwrap();
+        b.index_path("vol1", "/a.md", "second content", 200, 0).await.unwrap();
+        let s = b.stats("vol1").await.unwrap();
+        assert_eq!(s.vector_chunks, 1, "re-index must replace, not append");
+    }
+
+    #[tokio::test]
+    async fn query_vector_returns_results() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol1", "/doc.md", "rust systems programming", 200, 0).await.unwrap();
+        // The fake server returns the same vector for every input, so cosine
+        // distance between query and stored embedding is 0 (identical).
+        let r = b.query_vector("vol1", "systems programming", 10).await.unwrap();
+        assert!(!r.is_empty(), "expected at least one result");
+        assert_eq!(r[0].path, "/doc.md");
+        assert_eq!(r[0].rank, 1);
+    }
+
+    #[tokio::test]
+    async fn volume_isolation() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol_a", "/x.md", "content a", 200, 0).await.unwrap();
+        b.index_path("vol_b", "/x.md", "content b", 200, 0).await.unwrap();
+        assert_eq!(b.stats("vol_a").await.unwrap().vector_chunks, 1);
+        assert_eq!(b.stats("vol_b").await.unwrap().vector_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn query_bm25_returns_not_supported() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        let err = b.query_bm25("vol1", "anything", 10).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
+    }
+}
