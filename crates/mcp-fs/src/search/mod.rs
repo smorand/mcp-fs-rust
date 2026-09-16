@@ -27,6 +27,8 @@ pub mod rerank;
 pub mod vector_sqlite;
 #[cfg(feature = "rag")]
 pub mod vector_pg;
+#[cfg(test)]
+pub mod e2e;
 
 /// One ranked result chunk returned by a search query.
 #[derive(Debug, Clone, serde::Serialize)]
