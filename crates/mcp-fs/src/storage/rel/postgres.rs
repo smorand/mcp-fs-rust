@@ -68,7 +68,9 @@ impl PostgresRelationalDb {
                     conn.execute(AssertSqlSafe("CREATE EXTENSION IF NOT EXISTS vector")).await?;
                     let ddl = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"");
                     conn.execute(AssertSqlSafe(ddl)).await?;
-                    let path = format!("SET search_path TO \"{schema}\"");
+                    // Include public so extension types (e.g. VECTOR from pgvector)
+                    // installed in public remain resolvable from any app schema.
+                    let path = format!("SET search_path TO \"{schema}\", public");
                     conn.execute(AssertSqlSafe(path)).await?;
                     Ok(())
                 })
