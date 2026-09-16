@@ -91,7 +91,10 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     let doc_service = crate::docs::service::from_config(&config.doc_service)?;
 
     // Build the search backend when enabled. None when search.enabled = false.
-    let search = crate::search::build_backend(&config)
+    // A dedicated HTTP client for embedding calls is built once here so its
+    // connection pool is reused across all index and query operations.
+    let search_http_client = Arc::new(reqwest::Client::new());
+    let search = crate::search::build_backend(&config, &relational, search_http_client)
         .await
         .map_err(|e| anyhow::anyhow!("search backend failed to start: {e}"))?;
 

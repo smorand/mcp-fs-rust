@@ -132,12 +132,12 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
                     (r, "bm25".to_string())
                 }
                 "rag" => {
-                    let r = backend.query_vector(&mount, &[], top_k).await?;
+                    let r = backend.query_vector(&mount, &query, top_k).await?;
                     (r, "rag".to_string())
                 }
                 "both" => {
                     let bm25 = backend.query_bm25(&mount, &query, top_k).await.unwrap_or_default();
-                    let vec = backend.query_vector(&mount, &[], top_k).await.unwrap_or_default();
+                    let vec = backend.query_vector(&mount, &query, top_k).await.unwrap_or_default();
                     let merged = rrf_merge(&bm25, &vec);
                     (merged, "both".to_string())
                 }
@@ -332,7 +332,7 @@ mod tests {
         let (h, _dir) = search_harness().await;
         // BM25 backend does not support vector queries.
         let backend = h.state.search.as_ref().unwrap();
-        let err = backend.query_vector(MOUNT, &[], 10).await.unwrap_err();
+        let err = backend.query_vector(MOUNT, "fox", 10).await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::NOT_SUPPORTED);
     }
 

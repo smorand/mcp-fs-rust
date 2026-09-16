@@ -241,7 +241,7 @@ impl SearchBackend for TantivyBm25Backend {
     async fn query_vector(
         &self,
         _volume_id: &str,
-        _query_vec: &[f32],
+        _query: &str,
         _top_k: usize,
     ) -> Result<Vec<SearchResult>> {
         Err(ToolError::not_supported(

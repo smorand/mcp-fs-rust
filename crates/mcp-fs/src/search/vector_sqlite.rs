@@ -4,14 +4,16 @@
 //! table. The sqlite-vec extension is registered once at process startup via
 //! `sqlite3_auto_extension` (see `storage/sqlite.rs`).
 //!
-//! This backend stores the Tantivy index directory path so `stats()` can check
-//! whether BM25 is also warm, for the combined "both" mode. In pure "rag" mode
-//! it always reports `bm25_warm: false`.
+//! Each `index_path` call embeds every chunk via the configured embedding
+//! endpoint before storing the resulting float vector. `query_vector` likewise
+//! embeds the query string before running the KNN `MATCH` scan, so callers
+//! never need to produce their own vectors.
 
 #![cfg(feature = "rag")]
 
+use crate::config::EmbeddingConfig;
 use crate::errors::{Result, ToolError};
-use crate::search::{IndexStats, SearchBackend, SearchResult};
+use crate::search::{IndexStats, SearchBackend, SearchResult, embedding};
 use async_trait::async_trait;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
@@ -27,18 +29,26 @@ struct VolumeConn {
 pub struct SqliteVecBackend {
     dimensions: u32,
     tantivy_dir: PathBuf,
+    /// Shared HTTP client for embedding calls.
+    client: Arc<reqwest::Client>,
+    /// Embedding model config (endpoint, model name, API key env).
+    embedding_config: EmbeddingConfig,
     /// Per-volume in-memory SQLite connections for the vector index.
-    /// Production use would point at the same per-volume file as the meta store;
-    /// for now we keep a separate in-memory store per volume so it compiles and
-    /// tests correctly without depending on the full storage layer.
     volumes: Arc<Mutex<HashMap<String, Arc<Mutex<VolumeConn>>>>>,
 }
 
 impl SqliteVecBackend {
-    pub fn new(dimensions: u32, tantivy_dir: &str) -> Self {
+    pub fn new(
+        dimensions: u32,
+        tantivy_dir: &str,
+        client: Arc<reqwest::Client>,
+        embedding_config: EmbeddingConfig,
+    ) -> Self {
         Self {
             dimensions,
             tantivy_dir: PathBuf::from(tantivy_dir),
+            client,
+            embedding_config,
             volumes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -54,17 +64,15 @@ impl SqliteVecBackend {
         let conn = Connection::open_in_memory()
             .map_err(|e| ToolError::internal(format!("sqlite-vec: open: {e}")))?;
 
-        // Register sqlite-vec extension.
+        // Ensure the sqlite-vec extension symbol is resolved at compile time.
         #[cfg(feature = "rag")]
         {
-            // The extension is registered at process start via sqlite3_auto_extension
-            // in storage/sqlite.rs. This is a compile-time marker only.
             let _ = sqlite_vec::sqlite3_vec_init as *const ();
         }
 
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS search_vec_meta (
-               rowid     INTEGER PRIMARY KEY,
+               rowid     INTEGER PRIMARY KEY AUTOINCREMENT,
                volume_id TEXT NOT NULL,
                path      TEXT NOT NULL,
                chunk_idx INTEGER NOT NULL,
@@ -98,13 +106,22 @@ impl SearchBackend for SqliteVecBackend {
         let vol = volume_id.to_string();
         let path_owned = path.to_string();
 
+        // Compute embeddings before entering the blocking closure: embedding
+        // calls are async and must not be made from within spawn_blocking.
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        for chunk_text in &chunks {
+            let emb = embedding::embed(&self.client, &self.embedding_config, chunk_text).await?;
+            embeddings.push(emb);
+        }
+
         tokio::task::spawn_blocking(move || {
             let guard = vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
 
-            // Idempotent: delete existing entries for this path.
+            // Idempotent: remove any existing rows for this path before re-inserting.
             guard.conn
                 .execute(
-                    "DELETE FROM search_vec WHERE rowid IN (SELECT rowid FROM search_vec_meta WHERE volume_id=?1 AND path=?2)",
+                    "DELETE FROM search_vec WHERE rowid IN \
+                     (SELECT rowid FROM search_vec_meta WHERE volume_id=?1 AND path=?2)",
                     params![vol, path_owned],
                 )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: delete vec: {e}")))?;
@@ -115,20 +132,36 @@ impl SearchBackend for SqliteVecBackend {
                 )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: delete meta: {e}")))?;
 
-            for (idx, chunk_text) in chunks.iter().enumerate() {
-                // For now store a zero vector (embedding is supplied by the caller
-                // in real usage; the vector_pg backend handles the actual embedding call).
-                // The sqlite-vec backend stores whatever floats it is handed.
-                // In the tool handler we embed first then call index_path; for the
-                // test path we just store zeros.
-                let zeros: Vec<f32> = vec![0.0f32; 1];
-                let _ = zeros; // will be replaced by real embedding in the tool
+            for (idx, (chunk_text, embedding)) in chunks.iter().zip(embeddings.iter()).enumerate() {
+                // Insert metadata row first; its auto-increment rowid is used
+                // to link the vec0 table row.
                 guard.conn
                     .execute(
-                        "INSERT INTO search_vec_meta (volume_id, path, chunk_idx, chunk_text) VALUES (?1,?2,?3,?4)",
+                        "INSERT INTO search_vec_meta (volume_id, path, chunk_idx, chunk_text) \
+                         VALUES (?1, ?2, ?3, ?4)",
                         params![vol, path_owned, idx as i64, chunk_text],
                     )
                     .map_err(|e| ToolError::internal(format!("sqlite-vec: insert meta: {e}")))?;
+
+                let meta_rowid = guard.conn.last_insert_rowid();
+
+                // Convert f32 slice to raw bytes for the vec0 MATCH interface.
+                //
+                // SAFETY: f32 is a plain-data type with no padding; reinterpreting
+                // its memory as bytes is always valid.
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        embedding.as_ptr().cast::<u8>(),
+                        embedding.len() * std::mem::size_of::<f32>(),
+                    )
+                };
+
+                guard.conn
+                    .execute(
+                        "INSERT INTO search_vec (rowid, embedding) VALUES (?1, ?2)",
+                        params![meta_rowid, bytes],
+                    )
+                    .map_err(|e| ToolError::internal(format!("sqlite-vec: insert vec: {e}")))?;
             }
             Ok(n)
         })
@@ -152,7 +185,8 @@ impl SearchBackend for SqliteVecBackend {
                 .unwrap_or(0);
             guard.conn
                 .execute(
-                    "DELETE FROM search_vec WHERE rowid IN (SELECT rowid FROM search_vec_meta WHERE volume_id=?1 AND path=?2)",
+                    "DELETE FROM search_vec WHERE rowid IN \
+                     (SELECT rowid FROM search_vec_meta WHERE volume_id=?1 AND path=?2)",
                     params![vol, path_owned],
                 )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: delete vec: {e}")))?;
@@ -182,34 +216,59 @@ impl SearchBackend for SqliteVecBackend {
     async fn query_vector(
         &self,
         volume_id: &str,
-        _query_vec: &[f32],
+        query: &str,
         top_k: usize,
     ) -> Result<Vec<SearchResult>> {
+        // Embed the query text before entering the blocking section.
+        let embedding = embedding::embed(&self.client, &self.embedding_config, query).await?;
+
         let vc = self.get_or_open(volume_id)?;
         let vol = volume_id.to_string();
 
         tokio::task::spawn_blocking(move || {
             let guard = vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
 
-            // Return metadata-only results (without real KNN, as embeddings are
-            // stored as zeros in this path). Real KNN requires the vec0 MATCH operator
-            // which needs the extension. For now return the top rows by rowid.
+            // Convert embedding to raw bytes for the vec0 MATCH operator.
+            //
+            // SAFETY: f32 is a plain-data type with no padding.
+            let bytes: Vec<u8> = unsafe {
+                std::slice::from_raw_parts(
+                    embedding.as_ptr().cast::<u8>(),
+                    embedding.len() * std::mem::size_of::<f32>(),
+                )
+                .to_vec()
+            };
+
             let mut stmt = guard.conn
                 .prepare(
-                    "SELECT path, chunk_text FROM search_vec_meta WHERE volume_id=?1 ORDER BY rowid LIMIT ?2",
+                    "SELECT m.path, m.chunk_text, v.distance \
+                     FROM search_vec v \
+                     JOIN search_vec_meta m ON m.rowid = v.rowid \
+                     WHERE m.volume_id = ?1 \
+                       AND v.embedding MATCH ?2 \
+                       AND k = ?3 \
+                     ORDER BY v.distance",
                 )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: prepare: {e}")))?;
 
             let rows: Vec<SearchResult> = stmt
-                .query_map(params![vol, top_k as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
+                .query_map(
+                    params![vol, rusqlite::types::Value::Blob(bytes), top_k as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, f64>(2)?,
+                        ))
+                    },
+                )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: query: {e}")))?
                 .enumerate()
                 .filter_map(|(i, r)| {
-                    r.ok().map(|(path, chunk)| SearchResult {
+                    r.ok().map(|(path, chunk, distance)| SearchResult {
                         path,
-                        score: 1.0 / (i as f32 + 1.0),
+                        // Convert cosine distance to a similarity score in [0,1].
+                        score: 1.0 - distance as f32,
                         chunk,
                         rank: i + 1,
                     })

@@ -2,11 +2,12 @@
 //!
 //! The `SearchBackend` trait is implemented by:
 //! - `bm25_sqlite` (Tantivy, always compiled, runs when `search.mode` is "bm25" or "both")
+//! - `bm25_pg` (PostgreSQL tsvector, `#[cfg(feature = "postgres")]`)
 //! - `vector_pg` (pgvector, `#[cfg(feature = "rag")]`)
 //! - `vector_sqlite` (sqlite-vec, `#[cfg(feature = "rag")]`)
 //!
 //! The factory `build_backend` in this module picks the right combination from
-//! the server config.
+//! the server config and the `infra.meta.backend` setting.
 
 use crate::config::ServerConfig;
 use crate::errors::{Result, ToolError};
@@ -14,6 +15,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 pub mod bm25_sqlite;
+#[cfg(feature = "postgres")]
+pub mod bm25_pg;
 pub mod chunker;
 pub mod fusion;
 #[cfg(feature = "rag")]
@@ -22,6 +25,8 @@ pub mod embedding;
 pub mod rerank;
 #[cfg(feature = "rag")]
 pub mod vector_sqlite;
+#[cfg(feature = "rag")]
+pub mod vector_pg;
 
 /// One ranked result chunk returned by a search query.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -77,10 +82,13 @@ pub trait SearchBackend: Send + Sync {
     ) -> Result<Vec<SearchResult>>;
 
     /// Vector KNN query. Returns the top `top_k` results by cosine similarity.
+    ///
+    /// The `query` text is embedded internally by the backend. Backends that do
+    /// not support vector search return `ERR_NOT_SUPPORTED`.
     async fn query_vector(
         &self,
         volume_id: &str,
-        query_vec: &[f32],
+        query: &str,
         top_k: usize,
     ) -> Result<Vec<SearchResult>>;
 
@@ -95,14 +103,21 @@ pub trait SearchBackend: Send + Sync {
 ///
 /// Returns `None` when `search.enabled` is false. The backend is shared across
 /// all requests, so it is returned as an `Arc`.
+///
+/// `relational` is the process-wide pool cache. `http_client` is reused across
+/// all embedding calls for the lifetime of the process.
+#[allow(unused_variables)] // relational and http_client are only used under feature flags
 pub async fn build_backend(
     config: &ServerConfig,
+    relational: &crate::storage::RelationalRegistry,
+    http_client: Arc<reqwest::Client>,
 ) -> Result<Option<Arc<dyn SearchBackend>>> {
     if !config.search.enabled {
         return Ok(None);
     }
 
     let mode = config.search.mode.as_str();
+    let meta_backend = config.infra.meta.backend.as_str();
 
     // RAG and both modes require an embedding endpoint. Config validation
     // already checks this, but guard again here so the error message is clear
@@ -113,32 +128,77 @@ pub async fn build_backend(
         ));
     }
 
-    let backend: Arc<dyn SearchBackend> = match mode {
-        "bm25" => {
-            let b = bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir);
-            Arc::new(b)
+    let backend: Arc<dyn SearchBackend> = match (mode, meta_backend) {
+        ("bm25", "postgres") => {
+            #[cfg(feature = "postgres")]
+            {
+                let pool = get_pg_pool(config, relational).await?;
+                Arc::new(bm25_pg::PostgresBm25Backend::new(pool).await?)
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                return Err(ToolError::not_supported(
+                    "search.mode=bm25 with backend=postgres requires the postgres feature",
+                ));
+            }
+        }
+        ("bm25", _) => {
+            Arc::new(bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir))
         }
         #[cfg(feature = "rag")]
-        "rag" => {
-            let b = vector_sqlite::SqliteVecBackend::new(
+        ("rag", "postgres") => {
+            let pool = get_pg_pool(config, relational).await?;
+            Arc::new(
+                vector_pg::PostgresVectorBackend::new(
+                    pool,
+                    config.search.embedding.dimensions,
+                    http_client,
+                    config.search.embedding.clone(),
+                )
+                .await?,
+            )
+        }
+        #[cfg(feature = "rag")]
+        ("rag", _) => {
+            Arc::new(vector_sqlite::SqliteVecBackend::new(
                 config.search.embedding.dimensions,
                 &config.search.tantivy_dir,
-            );
-            Arc::new(b)
+                http_client,
+                config.search.embedding.clone(),
+            ))
         }
         #[cfg(feature = "rag")]
-        "both" => {
-            let combined = CombinedBackend {
-                bm25: bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir),
-                vector: vector_sqlite::SqliteVecBackend::new(
+        ("both", "postgres") => {
+            let pool = get_pg_pool(config, relational).await?;
+            let bm25: Arc<dyn SearchBackend> =
+                Arc::new(bm25_pg::PostgresBm25Backend::new(pool.clone()).await?);
+            let vector: Arc<dyn SearchBackend> = Arc::new(
+                vector_pg::PostgresVectorBackend::new(
+                    pool,
+                    config.search.embedding.dimensions,
+                    http_client,
+                    config.search.embedding.clone(),
+                )
+                .await?,
+            );
+            Arc::new(CombinedBackend { bm25, vector, mode: "both".into() })
+        }
+        #[cfg(feature = "rag")]
+        ("both", _) => {
+            let bm25: Arc<dyn SearchBackend> = Arc::new(
+                bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir),
+            );
+            let vector: Arc<dyn SearchBackend> = Arc::new(
+                vector_sqlite::SqliteVecBackend::new(
                     config.search.embedding.dimensions,
                     &config.search.tantivy_dir,
+                    http_client,
+                    config.search.embedding.clone(),
                 ),
-                mode: "both".into(),
-            };
-            Arc::new(combined)
+            );
+            Arc::new(CombinedBackend { bm25, vector, mode: "both".into() })
         }
-        other => {
+        (other, _) => {
             return Err(ToolError::invalid_argument(format!(
                 "unknown search.mode '{other}', expected bm25, rag, or both"
             )));
@@ -148,12 +208,38 @@ pub async fn build_backend(
     Ok(Some(backend))
 }
 
-/// A backend that runs both BM25 and vector search, merging with RRF.
+/// Open (or reuse) a `PgPool` rooted at the same server as `infra.meta`.
+///
+/// We cannot downcast `Arc<dyn RelationalDb>` to `PostgresRelationalDb` to
+/// extract the pool, so a second pool object is created against the same DSN.
+/// PostgreSQL handles multiple pool objects sharing one server without issue;
+/// the pool is bounded by `pool.max_connections` so the connection count stays
+/// within the operator's configured limit.
+#[cfg(feature = "postgres")]
+async fn get_pg_pool(
+    config: &ServerConfig,
+    _relational: &crate::storage::RelationalRegistry,
+) -> Result<sqlx::PgPool> {
+    use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
+    let m = &config.infra.meta;
+    let pg = PostgresRelationalDb::connect(
+        m.dsn.expose(),
+        &m.schema,
+        PoolSettings {
+            max_connections: m.pool.max_connections,
+            acquire_timeout: std::time::Duration::from_secs(m.pool.acquire_timeout_secs),
+        },
+    )
+    .await?;
+    Ok(pg.pool().clone())
+}
+
+/// A backend that runs both BM25 and vector search in parallel, merging with RRF.
 /// Only compiled when the `rag` feature is on.
 #[cfg(feature = "rag")]
 struct CombinedBackend {
-    bm25: bm25_sqlite::TantivyBm25Backend,
-    vector: vector_sqlite::SqliteVecBackend,
+    bm25: Arc<dyn SearchBackend>,
+    vector: Arc<dyn SearchBackend>,
     mode: String,
 }
 
@@ -169,6 +255,7 @@ impl SearchBackend for CombinedBackend {
         chunk_overlap: usize,
     ) -> Result<usize> {
         let n1 = self.bm25.index_path(volume_id, path, text, chunk_size, chunk_overlap).await?;
+        // Index into vector store too; ignore the count (bm25 chunk count is authoritative).
         let _ = self.vector.index_path(volume_id, path, text, chunk_size, chunk_overlap).await?;
         Ok(n1)
     }
@@ -183,8 +270,8 @@ impl SearchBackend for CombinedBackend {
         self.bm25.query_bm25(volume_id, query, top_k).await
     }
 
-    async fn query_vector(&self, volume_id: &str, query_vec: &[f32], top_k: usize) -> Result<Vec<SearchResult>> {
-        self.vector.query_vector(volume_id, query_vec, top_k).await
+    async fn query_vector(&self, volume_id: &str, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        self.vector.query_vector(volume_id, query, top_k).await
     }
 
     async fn stats(&self, volume_id: &str) -> Result<IndexStats> {
