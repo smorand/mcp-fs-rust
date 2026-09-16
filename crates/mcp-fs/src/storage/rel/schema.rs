@@ -110,6 +110,23 @@ pub struct VirtualTableDef {
     pub dialect: Option<super::dialect::Dialect>,
 }
 
+/// One column added to a table that a deployed database already has.
+///
+/// `CREATE TABLE IF NOT EXISTS` cannot widen an existing table, so a column added
+/// after a release needs its own `ALTER TABLE`. Declaring it here keeps the DDL in
+/// the schema layer and rendered per dialect, instead of a hand written statement
+/// per engine in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMigration {
+    pub table: &'static str,
+    pub column: &'static str,
+    pub ty: ColumnType,
+    pub not_null: bool,
+    /// Raw SQL literal, for example `'none'`. Required: an existing row needs a
+    /// value for a `NOT NULL` column.
+    pub default: &'static str,
+}
+
 /// Every table and index one store needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaSet {
@@ -117,11 +134,37 @@ pub struct SchemaSet {
     pub indexes: Vec<Index>,
     pub typed_indexes: Vec<TypedIndex>,
     pub virtual_tables: Vec<VirtualTableDef>,
+    pub column_migrations: Vec<ColumnMigration>,
 }
 
 impl SchemaSet {
     pub fn new(tables: Vec<Table>, indexes: Vec<Index>) -> Self {
-        Self { tables, indexes, typed_indexes: Vec::new(), virtual_tables: Vec::new() }
+        Self {
+            tables,
+            indexes,
+            typed_indexes: Vec::new(),
+            virtual_tables: Vec::new(),
+            column_migrations: Vec::new(),
+        }
+    }
+
+    /// Declare a column added to an already deployed table.
+    pub fn column_migration(mut self, m: ColumnMigration) -> Self {
+        self.column_migrations.push(m);
+        self
+    }
+
+    /// The `ALTER TABLE ... ADD COLUMN` statements, rendered for this dialect.
+    ///
+    /// Kept out of [`Self::render`] because they are not self guarding on every
+    /// engine: SQLite has no `ADD COLUMN IF NOT EXISTS`, so its `migrate` probes
+    /// `pragma_table_info` first. PostgreSQL and SQL Server render their own
+    /// guard and can run the statement blind.
+    pub fn render_column_migrations(&self, dialect: Dialect) -> Vec<String> {
+        self.column_migrations
+            .iter()
+            .map(|m| super::dialect::render_column_migration(dialect, m))
+            .collect()
     }
 
     /// The DDL statements to apply, in order. Each is separately idempotent.
@@ -231,7 +274,7 @@ fn render_index(dialect: Dialect, index: &Index) -> String {
 
 /// Escape a single quoted SQL string literal. Only reached with our own static
 /// table names, but a guard beats trusting that they stay quote free.
-fn escape_sql_string(s: &str) -> String {
+pub(super) fn escape_sql_string(s: &str) -> String {
     s.replace("'", "''")
 }
 

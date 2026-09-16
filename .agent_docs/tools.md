@@ -1,4 +1,4 @@
-# Tool reference (57 tools)
+# Tool reference (59 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -133,18 +133,20 @@ written) and handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR through a
 configured multimodal provider, disabled by default) and text. Audio and video
 are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 
-## admin (8)
+## admin (10)
 
 | Tool | Purpose | Parameters | Returns | Auth |
 |---|---|---|---|---|
 | `admin.create_project` | create a project and provision its volume | `project_id`, `owner` | `project_id`, `owner`, `created_at` | admin |
 | `admin.delete_project` | delete a project and tear down its volume | `project_id` | `project_id`, `deleted` | owner/admin |
-| `admin.list_projects` | projects the caller can access | (none) | `projects[{project_id, owner, created_at, is_owner}]` | auth |
-| `admin.list_all_projects` | every project | (none) | `projects[{project_id, owner, created_at}]` | admin |
+| `admin.list_projects` | projects the caller can access | (none) | `projects[{project_id, owner, created_at, index_mode, is_owner}]` | auth |
+| `admin.list_all_projects` | every project | (none) | `projects[{project_id, owner, created_at, index_mode}]` | admin |
 | `admin.list_users` | every known person plus platform admins | (none) | `users[{person, is_admin}]` | admin |
 | `admin.add_member` | add a member | `project_id`, `person` | `project_id`, `person`, `role` | owner/admin |
 | `admin.remove_member` | remove a member | `project_id`, `person` | `project_id`, `person`, `removed` | owner/admin |
 | `admin.list_members` | members of a project | `project_id` | `project_id`, `members[{person, role, added_by}]` | member or admin |
+| `admin.set_index_mode` | set the search index mode and wipe or rebuild the index | `project_id`, `mode` | `project_id`, `index_mode`, `previous_mode`, `reindex_started` | owner/admin |
+| `admin.get_index_mode` | read the search index mode | `project_id` | `project_id`, `index_mode` | member or admin |
 
 `project_id` must be 3 to 32 characters of lowercase letters, digits and hyphens,
 with alphanumeric first and last characters. Creation provisions the volume and
@@ -192,8 +194,8 @@ token belongs to a person, not to a mount, hence no `mount_id`.
 | Verified identity | `IdentityResolver::verify`, RS256, `iss`, `exp`/`nbf`, 30s leeway | every tool call, checked before dispatch |
 | Membership | `AdminBackend::require_member` | every `fs.*` and `git.*` tool |
 | Platform admin | caseless match against `auth.admins` | `admin.create_project`, `admin.list_all_projects`, `admin.list_users` |
-| Owner or platform admin | `AppState::require_owner_or_admin` | `admin.delete_project`, `admin.add_member`, `admin.remove_member` |
-| Member or platform admin | inline in `tools/admin.rs` | `admin.list_members` |
+| Owner or platform admin | `AppState::require_owner_or_admin` | `admin.delete_project`, `admin.add_member`, `admin.remove_member`, `admin.set_index_mode` |
+| Member or platform admin | inline in `tools/admin.rs` | `admin.list_members`, `admin.get_index_mode` |
 
 **Separation of duties.** A platform admin manages projects and membership and
 can list everything, but membership is never implied: `AppState::authorize` is

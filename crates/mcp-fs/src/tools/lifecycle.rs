@@ -44,7 +44,10 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::delete_path(
+            // Collected first: a recursive delete takes every file underneath,
+            // and afterwards there is no tree left to enumerate.
+            let indexed = crate::search::indexer::paths_under(&ctx.state, &mount, &path, &client).await;
+            let out = fs_ops::delete_path(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -53,7 +56,9 @@ pub fn register(reg: &mut ToolRegistry) {
                 a.bool_or("recursive", false),
                 a.bool_or("trash", true),
             )
-            .await
+            .await?;
+            crate::search::indexer::after_delete_many(&ctx.state, &mount, &indexed).await;
+            Ok(out)
         }),
     );
 

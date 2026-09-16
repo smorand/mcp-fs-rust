@@ -202,6 +202,41 @@ impl SearchBackend for SqliteVecBackend {
         .map_err(|e| ToolError::internal(format!("sqlite-vec task join: {e}")))?
     }
 
+    async fn delete_all(&self, volume_id: &str) -> Result<usize> {
+        let vc = self.get_or_open(volume_id)?;
+        let vol = volume_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let guard =
+                vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
+            let count: usize = guard
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM search_vec_meta WHERE volume_id=?1",
+                    params![vol],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            // The vec0 rows are keyed by the meta rowid, so they go first: once
+            // the meta rows are gone the subquery can no longer find them.
+            guard
+                .conn
+                .execute(
+                    "DELETE FROM search_vec WHERE rowid IN \
+                     (SELECT rowid FROM search_vec_meta WHERE volume_id=?1)",
+                    params![vol],
+                )
+                .map_err(|e| ToolError::internal(format!("sqlite-vec: delete all vec: {e}")))?;
+            guard
+                .conn
+                .execute("DELETE FROM search_vec_meta WHERE volume_id=?1", params![vol])
+                .map_err(|e| ToolError::internal(format!("sqlite-vec: delete all meta: {e}")))?;
+            Ok(count)
+        })
+        .await
+        .map_err(|e| ToolError::internal(format!("sqlite-vec task join: {e}")))?
+    }
+
     async fn query_bm25(
         &self,
         _volume_id: &str,
@@ -431,6 +466,44 @@ mod tests {
         b.index_path("vol_b", "/x.md", "content b", 200, 0).await.unwrap();
         assert_eq!(b.stats("vol_a").await.unwrap().vector_chunks, 1);
         assert_eq!(b.stats("vol_b").await.unwrap().vector_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_all_removes_every_chunk_of_the_volume() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol1", "/a.md", "alpha", 200, 0).await.unwrap();
+        b.index_path("vol1", "/b.md", "beta", 200, 0).await.unwrap();
+        assert_eq!(b.stats("vol1").await.unwrap().vector_chunks, 2);
+
+        assert_eq!(b.delete_all("vol1").await.unwrap(), 2);
+        assert_eq!(b.stats("vol1").await.unwrap().vector_chunks, 0);
+        assert!(b.query_vector("vol1", "alpha", 10).await.unwrap().is_empty());
+
+        // Usable again straight after the wipe.
+        b.index_path("vol1", "/c.md", "gamma", 200, 0).await.unwrap();
+        assert_eq!(b.stats("vol1").await.unwrap().vector_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_all_is_scoped_to_one_volume() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        b.index_path("vol_a", "/x.md", "content a", 200, 0).await.unwrap();
+        b.index_path("vol_b", "/x.md", "content b", 200, 0).await.unwrap();
+        b.delete_all("vol_a").await.unwrap();
+        assert_eq!(b.stats("vol_a").await.unwrap().vector_chunks, 0);
+        assert_eq!(b.stats("vol_b").await.unwrap().vector_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_all_on_an_empty_volume_is_zero() {
+        register_extension();
+        let base = spawn_fake_embedding(3).await;
+        let (b, _d) = backend(&format!("{base}/v1/embeddings"), 3);
+        assert_eq!(b.delete_all("never-seen").await.unwrap(), 0);
     }
 
     #[tokio::test]

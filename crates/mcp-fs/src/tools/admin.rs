@@ -13,6 +13,8 @@
 //! | remove_member            | owner or platform admin                         |
 //! | list_members             | member, or platform admin (project must exist)  |
 //! | list_projects            | none, scoped to the caller's own projects       |
+//! | set_index_mode           | owner or platform admin                         |
+//! | get_index_mode           | member, or platform admin (project must exist)  |
 //!
 //! `create_project` provisions the volume and rolls the ACL row back if that
 //! fails, so a project row never points at a volume that was never created.
@@ -22,11 +24,13 @@ use crate::git::GitRepoStore;
 use crate::mcp::registry::{ToolCtx, handler};
 use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::storage::admin::validate_project_id;
+use crate::storage::traits::IndexMode;
 use crate::util::normalize_identity;
 use serde_json::{Value, json};
+use std::str::FromStr;
 use std::sync::Arc;
 
-/// Register the eight `admin.*` tools.
+/// Register the ten `admin.*` tools.
 pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None);
 }
@@ -122,6 +126,41 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
             list_members(&ctx, &project_id).await
         }),
     );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.set_index_mode",
+            "Set the search index mode for a project (owner or platform admin). \
+             none=no index, bm25=full-text only, rag=vector only, both=full-text and vector. \
+             Switching to an active mode triggers an initial full index of existing files in \
+             the background. Switching to none wipes the index immediately.",
+        )
+        .req_str("project_id", "Id of the project whose search index mode is set.")
+        .req_str(
+            "mode",
+            "New index mode: none, bm25, rag, or both. rag and both need a configured \
+             embedding endpoint. Any change to a different mode wipes the current index \
+             before rebuilding it, so setting the mode a project already has is a no-op \
+             that keeps the index intact.",
+        ),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            let mode = a.str("mode")?;
+            set_index_mode(&ctx, &project_id, &mode).await
+        }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.get_index_mode",
+            "Get the current search index mode for a project (member or platform admin).",
+        )
+        .req_str("project_id", "Id of the project whose search index mode is read."),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            get_index_mode(&ctx, &project_id).await
+        }),
+    );
 }
 
 // ── implementations ─────────────────────────────────────────────────────────
@@ -178,6 +217,7 @@ async fn list_projects(ctx: &ToolCtx) -> Result<Value> {
                 "project_id": p.id,
                 "owner": p.owner,
                 "created_at": p.created_at,
+                "index_mode": p.index_mode,
                 // Caseless, unlike the C# ordinal compare: the store normalizes
                 // the owner, so a mixed case caller must not be told it is not one.
                 "is_owner": normalize_identity(&p.owner) == person,
@@ -192,7 +232,14 @@ async fn list_all_projects(ctx: &ToolCtx) -> Result<Value> {
     let projects = ctx.state.admin.list_all_projects().await?;
     let entries: Vec<Value> = projects
         .into_iter()
-        .map(|p| json!({"project_id": p.id, "owner": p.owner, "created_at": p.created_at}))
+        .map(|p| {
+            json!({
+                "project_id": p.id,
+                "owner": p.owner,
+                "created_at": p.created_at,
+                "index_mode": p.index_mode,
+            })
+        })
         .collect();
     Ok(json!({"projects": entries}))
 }
@@ -253,6 +300,59 @@ async fn list_members(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
     Ok(json!({"project_id": project_id, "members": entries}))
 }
 
+/// Change a project's index mode, wiping and rebuilding the index to match.
+///
+/// The wipe finishes before the tool answers; the rebuild does not, so
+/// `reindex_started: true` means "a background pass is running", not "the volume
+/// is searchable". Poll `search.status` to watch it fill.
+async fn set_index_mode(ctx: &ToolCtx, project_id: &str, mode: &str) -> Result<Value> {
+    ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
+    let new_mode = IndexMode::from_str(mode)?;
+
+    let backend = ctx.state.search.as_ref().ok_or_else(|| {
+        ToolError::not_supported("search is not enabled; set search.enabled: true in config")
+    })?;
+    // A vector mode without an embedding endpoint would index nothing and report
+    // success, so it is refused at the gate rather than discovered in the logs.
+    if new_mode.needs_embedding() && ctx.state.config.search.embedding.endpoint.is_empty() {
+        return Err(ToolError::invalid_argument(format!(
+            "index mode '{new_mode}' requires search.embedding.endpoint to be configured"
+        )));
+    }
+
+    let old_mode = ctx.state.admin.get_index_mode(project_id).await?;
+    // Stored before the wipe: a crash between the two leaves the mode recorded
+    // and the index stale, which one more set_index_mode call repairs. The
+    // reverse would leave a wiped index that nothing ever rebuilds.
+    ctx.state.admin.set_index_mode(project_id, new_mode).await?;
+
+    let client = ctx.state.stores.client(project_id).await?;
+    let reindex_started = crate::search::indexer::ProjectIndexer::new(backend)
+        .on_mode_change(project_id, old_mode, new_mode, client)
+        .await?;
+
+    Ok(json!({
+        "project_id": project_id,
+        "index_mode": new_mode,
+        "previous_mode": old_mode,
+        "reindex_started": reindex_started,
+    }))
+}
+
+async fn get_index_mode(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
+    // Same gate as list_members: a plain member may read, and a platform admin
+    // skips membership but still needs the project to exist.
+    if ctx.state.is_admin(&ctx.person) {
+        if ctx.state.admin.get_project(project_id).await?.is_none() {
+            return Err(ToolError::project_not_found(project_id));
+        }
+    } else {
+        ctx.state.admin.require_member(project_id, &ctx.person).await?;
+    }
+    let mode = ctx.state.admin.get_index_mode(project_id).await?;
+    Ok(json!({"project_id": project_id, "index_mode": mode}))
+}
+
 // ── shared test fixtures ────────────────────────────────────────────────────
 
 /// Fixtures shared by the `admin.*`, `git.*` and `git.auth*` test modules: a real
@@ -286,6 +386,14 @@ pub(crate) mod test_support {
         }
 
         pub async fn with_config(tweak: impl FnOnce(&mut ServerConfig)) -> Self {
+            Self::with_config_and_search(tweak, None).await
+        }
+
+        /// Same, with a search backend injected, for the index mode tools.
+        pub async fn with_config_and_search(
+            tweak: impl FnOnce(&mut ServerConfig),
+            search: Option<Arc<dyn crate::search::SearchBackend>>,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let mut config = ServerConfig::default();
             config.infra.meta.dir = dir.path().join("state/volumes").display().to_string();
@@ -312,7 +420,7 @@ pub(crate) mod test_support {
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
-            search: None,
+            search,
             });
             Self { dir, state }
         }
@@ -353,7 +461,7 @@ mod tests {
         r
     }
 
-    const ALL_ADMIN_TOOLS: [&str; 8] = [
+    const ALL_ADMIN_TOOLS: [&str; 10] = [
         "admin.create_project",
         "admin.delete_project",
         "admin.list_projects",
@@ -362,12 +470,14 @@ mod tests {
         "admin.add_member",
         "admin.remove_member",
         "admin.list_members",
+        "admin.set_index_mode",
+        "admin.get_index_mode",
     ];
 
     #[test]
     fn every_admin_tool_is_registered() {
         let r = registry();
-        assert_eq!(r.len(), 8);
+        assert_eq!(r.len(), 10);
         for name in ALL_ADMIN_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -743,6 +853,193 @@ mod tests {
         assert_eq!(names, vec!["admin@example.com", "alice@test.com", "zoe@test.com"]);
         assert_eq!(users[0]["is_admin"], true);
         assert_eq!(users[1]["is_admin"], false);
+    }
+
+    // ── index mode ─────────────────────────────────────────────────────────
+
+    /// A fixture whose search backend is a real Tantivy index over a temp dir, so
+    /// the mode tools exercise a genuine wipe rather than a stub.
+    async fn index_mode_fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tantivy temp dir");
+        let backend: Arc<dyn crate::search::SearchBackend> =
+            Arc::new(crate::search::bm25_sqlite::TantivyBm25Backend::new(
+                dir.path().to_str().expect("temp dir has a utf-8 path"),
+            ));
+        // The backend keeps the directory alive through its own handle; leaking
+        // the guard keeps it on disk for the length of the test.
+        std::mem::forget(dir);
+        let f = Fixture::with_config_and_search(
+            |c| {
+                c.search.enabled = true;
+                c.search.mode = "bm25".into();
+            },
+            Some(backend),
+        )
+        .await;
+        f.seed_project("proj", "owner@test.com").await;
+        f
+    }
+
+    #[test]
+    fn index_mode_schemas_match_the_contract() {
+        let r = registry();
+        let s = &r.resolve("admin.set_index_mode").unwrap().schema;
+        assert_eq!(s.input_schema()["required"], json!(["project_id", "mode"]));
+        assert_eq!(
+            s.input_schema()["properties"]["project_id"]["description"],
+            "Id of the project whose search index mode is set."
+        );
+        assert!(s.description.starts_with("Set the search index mode for a project"));
+
+        let g = &r.resolve("admin.get_index_mode").unwrap().schema;
+        assert_eq!(
+            g.description,
+            "Get the current search index mode for a project (member or platform admin)."
+        );
+        assert_eq!(g.input_schema()["required"], json!(["project_id"]));
+    }
+
+    #[tokio::test]
+    async fn set_index_mode_owner_can_set_and_a_member_can_read() {
+        let f = index_mode_fixture().await;
+        f.state.admin.add_member("proj", "member@test.com", "owner@test.com").await.unwrap();
+        let r = registry();
+
+        let out = f
+            .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .await
+            .unwrap();
+        assert_eq!(out["project_id"], "proj");
+        assert_eq!(out["index_mode"], "bm25");
+        assert_eq!(out["previous_mode"], "none");
+        assert_eq!(out["reindex_started"], true);
+
+        let read = f
+            .call(&r, "member@test.com", "admin.get_index_mode", json!({"project_id":"proj"}))
+            .await
+            .unwrap();
+        assert_eq!(read, json!({"project_id":"proj","index_mode":"bm25"}));
+    }
+
+    /// Setting the mode a project already has must not throw its index away.
+    #[tokio::test]
+    async fn setting_the_same_mode_twice_starts_no_reindex() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        let args = json!({"project_id":"proj","mode":"bm25"});
+        f.call(&r, "owner@test.com", "admin.set_index_mode", args.clone()).await.unwrap();
+        let again =
+            f.call(&r, "owner@test.com", "admin.set_index_mode", args).await.unwrap();
+        assert_eq!(again["previous_mode"], "bm25");
+        assert_eq!(again["reindex_started"], false);
+    }
+
+    #[tokio::test]
+    async fn a_member_who_is_not_the_owner_cannot_set_the_index_mode() {
+        let f = index_mode_fixture().await;
+        f.state.admin.add_member("proj", "member@test.com", "owner@test.com").await.unwrap();
+        let r = registry();
+        let e = f
+            .call(&r, "member@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN);
+        // And nothing was changed.
+        assert_eq!(
+            f.state.admin.get_index_mode("proj").await.unwrap(),
+            IndexMode::None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_platform_admin_can_set_and_read_the_index_mode() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        f.call(&r, ADMIN, "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .await
+            .unwrap();
+        let out =
+            f.call(&r, ADMIN, "admin.get_index_mode", json!({"project_id":"proj"})).await.unwrap();
+        assert_eq!(out["index_mode"], "bm25");
+    }
+
+    #[tokio::test]
+    async fn a_non_member_cannot_read_the_index_mode() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        let e = f
+            .call(&r, "stranger@test.com", "admin.get_index_mode", json!({"project_id":"proj"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_index_mode_is_an_invalid_argument() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        let e = f
+            .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"fancy"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(e.message.contains("unknown index mode 'fancy'"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn rag_without_an_embedding_endpoint_is_an_invalid_argument() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        for mode in ["rag", "both"] {
+            let e = f
+                .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":mode}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT, "{mode} needs an endpoint");
+            assert!(e.message.contains("search.embedding.endpoint"), "{}", e.message);
+        }
+        assert_eq!(f.state.admin.get_index_mode("proj").await.unwrap(), IndexMode::None);
+    }
+
+    #[tokio::test]
+    async fn setting_a_mode_with_search_disabled_is_not_supported() {
+        let f = Fixture::new().await;
+        f.seed_project("proj", "owner@test.com").await;
+        let r = registry();
+        let e = f
+            .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+    }
+
+    #[tokio::test]
+    async fn index_mode_on_a_ghost_project_is_not_found() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        for (person, name, args) in [
+            (ADMIN, "admin.set_index_mode", json!({"project_id":"ghost","mode":"bm25"})),
+            (ADMIN, "admin.get_index_mode", json!({"project_id":"ghost"})),
+        ] {
+            let e = f.call(&r, person, name, args).await.unwrap_err();
+            assert_eq!(e.code, code::PROJECT_NOT_FOUND, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_project_listings_carry_the_index_mode() {
+        let f = index_mode_fixture().await;
+        let r = registry();
+        f.call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .await
+            .unwrap();
+
+        let mine =
+            f.call(&r, "owner@test.com", "admin.list_projects", json!({})).await.unwrap();
+        assert_eq!(mine["projects"][0]["index_mode"], "bm25");
+
+        let all = f.call(&r, ADMIN, "admin.list_all_projects", json!({})).await.unwrap();
+        assert_eq!(all["projects"][0]["index_mode"], "bm25");
     }
 
     #[tokio::test]

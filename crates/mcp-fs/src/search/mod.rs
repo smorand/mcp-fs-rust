@@ -19,6 +19,7 @@ pub mod bm25_sqlite;
 pub mod bm25_pg;
 pub mod chunker;
 pub mod fusion;
+pub mod indexer;
 #[cfg(feature = "rag")]
 pub mod embedding;
 #[cfg(feature = "rag")]
@@ -74,6 +75,13 @@ pub trait SearchBackend: Send + Sync {
     /// Remove all indexed chunks for `path` under `volume_id`.
     /// Returns the number of chunks deleted.
     async fn delete_path(&self, volume_id: &str, path: &str) -> Result<usize>;
+
+    /// Remove every indexed chunk of `volume_id`, whatever the path.
+    /// Returns the number of chunks deleted.
+    ///
+    /// This is the wipe half of a project index mode change, so it must be scoped
+    /// to the one volume: another project's chunks live in the same tables.
+    async fn delete_all(&self, volume_id: &str) -> Result<usize>;
 
     /// BM25 full-text query. Returns the top `top_k` results by relevance.
     async fn query_bm25(
@@ -266,6 +274,14 @@ impl SearchBackend for CombinedBackend {
         let n1 = self.bm25.delete_path(volume_id, path).await?;
         let _ = self.vector.delete_path(volume_id, path).await?;
         Ok(n1)
+    }
+
+    async fn delete_all(&self, volume_id: &str) -> Result<usize> {
+        // Both halves are wiped even if the first reports nothing, otherwise a
+        // mode change would leave the vector store holding stale chunks.
+        let n1 = self.bm25.delete_all(volume_id).await?;
+        let n2 = self.vector.delete_all(volume_id).await?;
+        Ok(n1 + n2)
     }
 
     async fn query_bm25(&self, volume_id: &str, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {

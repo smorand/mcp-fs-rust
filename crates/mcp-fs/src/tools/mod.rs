@@ -242,6 +242,9 @@ pub(crate) mod testkit {
 
         let mut registry = ToolRegistry::new();
         super::register_fs(&mut registry);
+        // The admin family carries `admin.set_index_mode`, which the auto index
+        // e2e tests drive through the same dispatch path as the writes it gates.
+        super::admin::register(&mut registry);
         // Register search tools when a backend is provided.
         if search.is_some() {
             super::search_semantic::register(&mut registry, &config.search);

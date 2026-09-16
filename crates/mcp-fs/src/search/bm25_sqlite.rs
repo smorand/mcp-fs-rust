@@ -24,6 +24,13 @@ use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 struct VolumeIndex {
     index: Index,
     schema: Schema,
+    /// Serializes the writers of this volume.
+    ///
+    /// Tantivy allows ONE `IndexWriter` per index and rejects a second with a
+    /// lock error. Auto indexing makes overlapping writers the normal case (two
+    /// writes a moment apart each spawn their own detached index task), and the
+    /// loser would silently drop a document, so they queue here instead.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 /// BM25 backend backed by one Tantivy directory per volume.
@@ -74,7 +81,7 @@ impl TantivyBm25Backend {
         )
         .map_err(|e| ToolError::internal(format!("tantivy: open or create index: {e}")))?;
 
-        let vi = Arc::new(VolumeIndex { index, schema });
+        let vi = Arc::new(VolumeIndex { index, schema, write_lock: tokio::sync::Mutex::new(()) });
 
         let mut guard = self
             .cache
@@ -104,8 +111,11 @@ impl SearchBackend for TantivyBm25Backend {
         let chunks = crate::search::chunker::chunk(text, chunk_size, chunk_overlap);
         let n = chunks.len();
         let path_owned = path.to_string();
+        let _writing = backend.write_lock.lock().await;
 
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking({
+            let backend = backend.clone();
+            move || {
             let path_field = backend.schema.get_field("path")
                 .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
             let chunk_idx_field = backend.schema.get_field("chunk_idx")
@@ -132,7 +142,7 @@ impl SearchBackend for TantivyBm25Backend {
             writer.commit()
                 .map_err(|e| ToolError::internal(format!("tantivy: commit: {e}")))?;
             Ok(n)
-        })
+        }})
         .await
         .map_err(|e| ToolError::internal(format!("tantivy task join: {e}")))?
     }
@@ -140,8 +150,11 @@ impl SearchBackend for TantivyBm25Backend {
     async fn delete_path(&self, volume_id: &str, path: &str) -> Result<usize> {
         let backend = self.get_or_open_volume(volume_id)?;
         let path_owned = path.to_string();
+        let _writing = backend.write_lock.lock().await;
 
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking({
+            let backend = backend.clone();
+            move || {
             let path_field = backend.schema.get_field("path")
                 .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
 
@@ -169,9 +182,41 @@ impl SearchBackend for TantivyBm25Backend {
                 .map_err(|e| ToolError::internal(format!("tantivy: commit delete: {e}")))?;
 
             Ok(count)
-        })
+        }})
         .await
         .map_err(|e| ToolError::internal(format!("tantivy task join: {e}")))?
+    }
+
+    async fn delete_all(&self, volume_id: &str) -> Result<usize> {
+        // Counted before the directory goes, because afterwards there is nothing
+        // left to count.
+        let count = self.stats(volume_id).await?.bm25_docs;
+
+        // Behind the same lock as the writers, so an in flight index_path cannot
+        // commit into a directory that is about to be removed.
+        let volume = self.get_or_open_volume(volume_id)?;
+        let _writing = volume.write_lock.lock().await;
+
+        // Dropping the whole directory beats deleting every term: Tantivy would
+        // keep the deleted segments until a merge, and the directory is always
+        // rebuildable from the volume.
+        {
+            let mut guard = self
+                .cache
+                .write()
+                .map_err(|_| ToolError::internal("tantivy cache rwlock poisoned"))?;
+            // The cached Index still points at the removed directory, so it must
+            // go with it or the next write would land in a ghost.
+            guard.remove(volume_id);
+        }
+        let dir = self.index_dir(volume_id);
+        if dir.exists() {
+            let dir_owned = dir.clone();
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir_owned))
+                .await
+                .map_err(|e| ToolError::internal(format!("tantivy task join: {e}")))??;
+        }
+        Ok(count)
     }
 
     async fn query_bm25(
@@ -315,6 +360,71 @@ mod tests {
         b.delete_path("vol1", "/a.md").await.unwrap();
         let results = b.query_bm25("vol1", "fox", 10).await.unwrap();
         assert!(results.is_empty(), "deleted doc must not appear in results");
+    }
+
+    #[tokio::test]
+    async fn delete_all_removes_every_chunk_of_the_volume() {
+        let (b, _d) = backend().await;
+        b.index_path("vol1", "/a.md", "alpha content about foxes", 200, 0).await.unwrap();
+        b.index_path("vol1", "/b.md", "beta content about foxes", 200, 0).await.unwrap();
+        assert_eq!(b.stats("vol1").await.unwrap().bm25_docs, 2);
+
+        let deleted = b.delete_all("vol1").await.unwrap();
+        assert_eq!(deleted, 2, "delete_all must report what it removed");
+
+        let s = b.stats("vol1").await.unwrap();
+        assert_eq!(s.bm25_docs, 0);
+        assert!(!s.bm25_warm, "the index directory is gone");
+        assert!(b.query_bm25("vol1", "foxes", 10).await.unwrap().is_empty());
+
+        // The volume must be usable again straight after the wipe.
+        b.index_path("vol1", "/c.md", "gamma content about foxes", 200, 0).await.unwrap();
+        assert_eq!(b.stats("vol1").await.unwrap().bm25_docs, 1);
+    }
+
+    /// Two writers on one Tantivy index collide on its lock file. Auto indexing
+    /// makes that the normal case, and the loser used to drop its document.
+    #[tokio::test]
+    async fn concurrent_index_calls_on_one_volume_all_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(TantivyBm25Backend::new(dir.path().to_str().unwrap()));
+
+        let mut tasks = Vec::new();
+        for i in 0..5u32 {
+            let b = b.clone();
+            tasks.push(tokio::task::spawn(async move {
+                b.index_path("vol1", &format!("/f{i}.md"), "shared marker text", 200, 0)
+                    .await
+                    .expect("a concurrent index call must not fail")
+            }));
+        }
+        for t in tasks {
+            t.await.expect("the task must not panic");
+        }
+
+        assert_eq!(
+            b.stats("vol1").await.unwrap().bm25_docs,
+            5,
+            "every concurrent write must reach the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_all_is_scoped_to_one_volume() {
+        let (b, _d) = backend().await;
+        b.index_path("vol_a", "/x.md", "content a", 200, 0).await.unwrap();
+        b.index_path("vol_b", "/x.md", "content b", 200, 0).await.unwrap();
+        b.delete_all("vol_a").await.unwrap();
+        assert_eq!(b.stats("vol_a").await.unwrap().bm25_docs, 0);
+        assert_eq!(b.stats("vol_b").await.unwrap().bm25_docs, 1, "the other volume survives");
+    }
+
+    /// A wipe of a volume that was never indexed is a no op, not an error: the
+    /// mode change path calls it unconditionally.
+    #[tokio::test]
+    async fn delete_all_on_an_empty_volume_is_zero() {
+        let (b, _d) = backend().await;
+        assert_eq!(b.delete_all("never-seen").await.unwrap(), 0);
     }
 
     #[tokio::test]

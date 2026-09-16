@@ -207,14 +207,35 @@ impl RelationalDb for SqliteRelationalDb {
 
     async fn migrate(&self, schema: &SchemaSet) -> Result<()> {
         let statements = schema.render(Dialect::Sqlite);
-        if statements.is_empty() {
-            return Ok(());
+        if !statements.is_empty() {
+            let sql = format!("{};", statements.join(";\n"));
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.execute_batch(&sql))
+                .await
+                .map_err(|e| ToolError::internal(format!("sqlite migrate task join: {e}")))??;
         }
-        let sql = format!("{};", statements.join(";\n"));
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.execute_batch(&sql))
-            .await
-            .map_err(|e| ToolError::internal(format!("sqlite migrate task join: {e}")))?
+
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the guard is a probe: the
+        // alternative, swallowing a "duplicate column name" error, would also
+        // swallow a genuinely broken migration.
+        for (m, statement) in schema
+            .column_migrations
+            .iter()
+            .zip(schema.render_column_migrations(Dialect::Sqlite))
+        {
+            let present = self
+                .query_opt(
+                    &Query::new("SELECT 1 FROM pragma_table_info(?1) WHERE name=?2")
+                        .bind(m.table)
+                        .bind(m.column),
+                )
+                .await?
+                .is_some();
+            if !present {
+                self.execute(&Query::new(statement)).await?;
+            }
+        }
+        Ok(())
     }
 }
 

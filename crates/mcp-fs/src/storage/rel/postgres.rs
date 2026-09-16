@@ -300,6 +300,13 @@ impl RelationalDb for PostgresRelationalDb {
                 .await
                 .map_err(map_error)?;
         }
+        // Rendered with their own `IF NOT EXISTS` guard, so a second apply is a no op.
+        for statement in schema.render_column_migrations(Dialect::Postgres) {
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(&mut *tx)
+                .await
+                .map_err(map_error)?;
+        }
         tx.commit().await.map_err(map_error)
     }
 }

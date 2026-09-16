@@ -60,7 +60,7 @@ mod tests {
     fn admin_tools_register_without_git() {
         let mut reg = ToolRegistry::new();
         super::super::admin::register(&mut reg);
-        assert_eq!(reg.len(), 8);
+        assert_eq!(reg.len(), 10);
         assert!(reg.resolve("git.init").is_none());
         assert!(reg.resolve("git.auth").is_none());
     }
@@ -71,7 +71,7 @@ mod tests {
         super::super::admin::register(&mut reg);
         super::super::git::register(&mut reg);
         super::super::git_auth::register(&mut reg);
-        assert_eq!(reg.len(), 8 + 11 + 3);
+        assert_eq!(reg.len(), 10 + 11 + 3);
         assert!(reg.resolve("git.remote_clone").is_some());
         assert!(reg.resolve("git.auth_revoke").is_some());
     }
@@ -82,8 +82,8 @@ mod tests {
         let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false, doc: false, search: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 35 fs + 8 admin + 5 web + 2 context7 = 50
-        assert_eq!(reg.len(), 50);
+        // 35 fs + 10 admin + 5 web + 2 context7 = 52
+        assert_eq!(reg.len(), 52);
         assert!(reg.resolve("web.search").is_some());
         assert!(reg.resolve("context7.resolve_library_id").is_some());
     }
@@ -94,11 +94,11 @@ mod tests {
         let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true, search: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 35 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 77
+        // 35 fs + 10 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 79
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 77 + doc_count + 3);
+        assert_eq!(reg.len(), 79 + doc_count + 3);
     }
 
     #[test]
@@ -108,15 +108,15 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        // Base 77 + doc + 3 editor + 4 search.*
-        assert_eq!(reg.len(), 77 + doc_count + 3 + 4);
+        // Base 79 + doc + 3 editor + 4 search.*
+        assert_eq!(reg.len(), 79 + doc_count + 3 + 4);
         assert!(reg.resolve("search.index").is_some());
         assert!(reg.resolve("search.query").is_some());
         assert!(reg.resolve("search.delete").is_some());
         assert!(reg.resolve("search.status").is_some());
     }
 
-    /// Whole surface gate for the 22 tools of this agent: every `admin.*`,
+    /// Whole surface gate for the 24 tools of this agent: every `admin.*`,
     /// `git.*` and `git.auth*` schema and description is compared to the frozen
     /// contract, the serialized string included, so a property key ORDER change
     /// fails too.
@@ -133,7 +133,7 @@ mod tests {
         super::super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("admin.") || name.starts_with("git."),
-            22,
+            24,
             "admin.* and git.* tools",
         );
     }

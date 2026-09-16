@@ -63,7 +63,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::write_docx(
+            let out = fs_ops::write_docx(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -73,7 +73,12 @@ pub fn register(reg: &mut ToolRegistry) {
                 a.opt_str("title").as_deref(),
                 a.bool_or("overwrite", false),
             )
-            .await
+            .await?;
+            // A .docx is a zip, so the reread skips it. The hook is here for the
+            // same reason as on every other write tool: one rule, no exceptions
+            // to remember when the extraction story changes.
+            crate::search::indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            Ok(out)
         }),
     );
 

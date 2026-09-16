@@ -29,7 +29,7 @@ pub mod sqlserver;
 pub mod sqlite;
 
 pub use dialect::{Assign, AssignValue, ColumnType, Dialect, Upsert, UpsertAction};
-pub use schema::{Column, ForeignKey, Index, SchemaSet, Table};
+pub use schema::{Column, ColumnMigration, ForeignKey, Index, SchemaSet, Table};
 pub use sqlite::SqliteRelationalDb;
 
 #[cfg(feature = "postgres")]

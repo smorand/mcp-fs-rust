@@ -109,6 +109,24 @@ impl SearchBackend for PostgresBm25Backend {
         Ok(cnt as usize)
     }
 
+    async fn delete_all(&self, volume_id: &str) -> Result<usize> {
+        let row = sqlx::query(AssertSqlSafe(
+            "WITH deleted AS (
+                DELETE FROM search_fts WHERE volume_id = $1
+                RETURNING 1
+             ) SELECT COUNT(*) AS cnt FROM deleted",
+        ))
+        .bind(volume_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ToolError::internal(format!("bm25_pg: delete all: {e}")))?;
+
+        let cnt: i64 = row
+            .try_get("cnt")
+            .map_err(|e| ToolError::internal(format!("bm25_pg: read count: {e}")))?;
+        Ok(cnt as usize)
+    }
+
     async fn query_bm25(
         &self,
         volume_id: &str,
@@ -279,6 +297,36 @@ mod tests {
         let cnt_b = b.stats("vol_b").await.unwrap().bm25_docs;
         assert_eq!(cnt_a, 1);
         assert_eq!(cnt_b, 1);
+    }
+
+    #[tokio::test]
+    async fn live_delete_all_removes_every_chunk_of_the_volume() {
+        let Some(b) = live_backend("mcpfs_bm25pg_delall").await else { return };
+        b.index_path("v1", "/a.md", "alpha content", 200, 0).await.unwrap();
+        b.index_path("v1", "/b.md", "beta content", 200, 0).await.unwrap();
+        assert_eq!(b.stats("v1").await.unwrap().bm25_docs, 2);
+
+        assert_eq!(b.delete_all("v1").await.unwrap(), 2, "delete_all reports what it removed");
+        assert_eq!(b.stats("v1").await.unwrap().bm25_docs, 0);
+        assert!(b.query_bm25("v1", "content", 10).await.unwrap().is_empty());
+    }
+
+    /// One database holds every volume, so a wipe without the volume_id filter
+    /// would empty another project's index.
+    #[tokio::test]
+    async fn live_delete_all_is_scoped_to_one_volume() {
+        let Some(b) = live_backend("mcpfs_bm25pg_delall_iso").await else { return };
+        b.index_path("vol_a", "/x.md", "content a", 200, 0).await.unwrap();
+        b.index_path("vol_b", "/x.md", "content b", 200, 0).await.unwrap();
+        b.delete_all("vol_a").await.unwrap();
+        assert_eq!(b.stats("vol_a").await.unwrap().bm25_docs, 0);
+        assert_eq!(b.stats("vol_b").await.unwrap().bm25_docs, 1, "the other volume survives");
+    }
+
+    #[tokio::test]
+    async fn live_delete_all_on_an_empty_volume_is_zero() {
+        let Some(b) = live_backend("mcpfs_bm25pg_delall_empty").await else { return };
+        assert_eq!(b.delete_all("never-seen").await.unwrap(), 0);
     }
 
     #[tokio::test]

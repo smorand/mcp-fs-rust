@@ -9,6 +9,7 @@ use crate::core::fs_ops;
 use crate::errors::ToolError;
 use crate::mcp::ToolSchema;
 use crate::mcp::registry::{ToolRegistry, handler};
+use crate::search::indexer;
 use crate::tools::{norm, volume};
 use base64::Engine as _;
 
@@ -23,17 +24,21 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::write_text(
+            let content = a.str("content")?;
+            let out = fs_ops::write_text(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
                 &mount,
                 &path,
-                &a.str("content")?,
+                &content,
                 a.bool_or("overwrite", false),
                 a.bool_or("create_parents", true),
             )
-            .await
+            .await?;
+            // The new text is already in hand, so no read back is needed.
+            indexer::after_write(&ctx.state, &mount, &path, &content).await;
+            Ok(out)
         }),
     );
 
@@ -46,7 +51,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::append_text(
+            let out = fs_ops::append_text(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -55,7 +60,10 @@ pub fn register(reg: &mut ToolRegistry) {
                 &a.str("content")?,
                 a.bool_or("create", false),
             )
-            .await
+            .await?;
+            // Only the appended fragment is in hand, so the whole file is re-read.
+            indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            Ok(out)
         }),
     );
 
@@ -104,7 +112,7 @@ pub fn register(reg: &mut ToolRegistry) {
                         "argument 'base64' is not valid base64: {e}"
                     ))
                 })?;
-            fs_ops::write_bytes_documented(
+            let out = fs_ops::write_bytes_documented(
                 &client,
                 &ctx.state.safety,
                 ctx.state.doc_service.as_deref(),
@@ -116,7 +124,10 @@ pub fn register(reg: &mut ToolRegistry) {
                 a.bool_or("create_parents", true),
                 a.bool_or("trigger_documentation_service", false),
             )
-            .await
+            .await?;
+            // A binary payload has no text to index and is skipped by the reread.
+            indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            Ok(out)
         }),
     );
 }

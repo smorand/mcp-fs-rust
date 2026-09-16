@@ -5,6 +5,7 @@
 //! enum means a statement is written once and rendered per engine, instead of
 //! being duplicated three times and drifting.
 
+use super::schema::{ColumnMigration, escape_sql_string};
 use crate::errors::{Result, ToolError};
 
 /// A supported relational engine.
@@ -404,11 +405,81 @@ impl Dialect {
     }
 }
 
+/// Render one [`ColumnMigration`] as this engine's `ALTER TABLE ... ADD COLUMN`.
+///
+/// PostgreSQL and SQL Server carry their own existence guard, so the statement is
+/// idempotent on its own. SQLite has no `ADD COLUMN IF NOT EXISTS` and no way to
+/// guard DDL inside a single statement, so its form is bare and the caller
+/// ([`super::SqliteRelationalDb::migrate`]) probes the column first.
+pub fn render_column_migration(dialect: Dialect, m: &ColumnMigration) -> String {
+    let table = dialect.quote_ident(m.table);
+    let column = dialect.quote_ident(m.column);
+    let ty = dialect.column_type(m.ty);
+    let not_null = if m.not_null { " NOT NULL" } else { "" };
+    let default = m.default;
+    match dialect {
+        Dialect::Sqlite => {
+            format!("ALTER TABLE {table} ADD COLUMN {column} {ty}{not_null} DEFAULT {default}")
+        }
+        Dialect::Postgres => format!(
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty}{not_null} DEFAULT {default}"
+        ),
+        Dialect::SqlServer => format!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'{}') \
+             AND name = N'{}') ALTER TABLE {table} ADD {column} {ty}{not_null} DEFAULT {default};",
+            escape_sql_string(m.table),
+            escape_sql_string(m.column)
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ALL: [Dialect; 3] = [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer];
+
+    fn index_mode_migration() -> ColumnMigration {
+        ColumnMigration {
+            table: "project",
+            column: "index_mode",
+            ty: ColumnType::Text,
+            not_null: true,
+            default: "'none'",
+        }
+    }
+
+    #[test]
+    fn column_migration_renders_per_engine() {
+        let m = index_mode_migration();
+        assert_eq!(
+            render_column_migration(Dialect::Sqlite, &m),
+            "ALTER TABLE \"project\" ADD COLUMN \"index_mode\" TEXT NOT NULL DEFAULT 'none'"
+        );
+        assert_eq!(
+            render_column_migration(Dialect::Postgres, &m),
+            "ALTER TABLE \"project\" ADD COLUMN IF NOT EXISTS \"index_mode\" \
+             TEXT NOT NULL DEFAULT 'none'"
+        );
+        let mssql = render_column_migration(Dialect::SqlServer, &m);
+        assert!(mssql.starts_with("IF NOT EXISTS (SELECT 1 FROM sys.columns"), "{mssql}");
+        assert!(
+            mssql.contains("ALTER TABLE [project] ADD [index_mode] NVARCHAR(MAX) NOT NULL DEFAULT 'none';"),
+            "{mssql}"
+        );
+    }
+
+    /// Only SQLite renders an unguarded statement, which is why its `migrate`
+    /// probes the column before running it.
+    #[test]
+    fn only_sqlite_renders_an_unguarded_column_migration() {
+        let m = index_mode_migration();
+        for d in [Dialect::Postgres, Dialect::SqlServer] {
+            let sql = render_column_migration(d, &m);
+            assert!(sql.contains("IF NOT EXISTS"), "{d:?} must guard: {sql}");
+        }
+        assert!(!render_column_migration(Dialect::Sqlite, &m).contains("IF NOT EXISTS"));
+    }
 
     #[test]
     fn placeholders_use_each_engines_syntax() {

@@ -11,6 +11,7 @@ use crate::core::fs_ops;
 use crate::errors::{Result, ToolError};
 use crate::mcp::ToolSchema;
 use crate::mcp::registry::{ToolRegistry, handler};
+use crate::search::indexer;
 use crate::tools::{norm, volume};
 use serde_json::Value;
 
@@ -34,7 +35,8 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::edit_unique(
+            let dry_run = a.bool_or("dry_run", false);
+            let out = fs_ops::edit_unique(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -43,9 +45,13 @@ pub fn register(reg: &mut ToolRegistry) {
                 &a.str("old_string")?,
                 &a.str("new_string")?,
                 a.bool_or("replace_all", false),
-                a.bool_or("dry_run", false),
+                dry_run,
             )
-            .await
+            .await?;
+            if !dry_run {
+                indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            }
+            Ok(out)
         }),
     );
 
@@ -63,16 +69,21 @@ pub fn register(reg: &mut ToolRegistry) {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
             let edits = edit_specs(&a)?;
-            fs_ops::multi_edit(
+            let dry_run = a.bool_or("dry_run", false);
+            let out = fs_ops::multi_edit(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
                 &mount,
                 &path,
                 &edits,
-                a.bool_or("dry_run", false),
+                dry_run,
             )
-            .await
+            .await?;
+            if !dry_run {
+                indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            }
+            Ok(out)
         }),
     );
 
@@ -86,7 +97,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::search_replace(
+            let out = fs_ops::search_replace(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -96,7 +107,9 @@ pub fn register(reg: &mut ToolRegistry) {
                 &a.str("replace_block")?,
                 a.bool_or("fuzzy", false),
             )
-            .await
+            .await?;
+            indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            Ok(out)
         }),
     );
 
@@ -109,7 +122,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::insert_at_line(
+            let out = fs_ops::insert_at_line(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -118,7 +131,9 @@ pub fn register(reg: &mut ToolRegistry) {
                 a.int("line")?,
                 &a.str("content")?,
             )
-            .await
+            .await?;
+            indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            Ok(out)
         }),
     );
 
@@ -128,9 +143,40 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("patch_text", "Multi-file V4A patch text to apply within the volume."),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
-            fs_ops::apply_patch(&client, &ctx.state.safety, &ctx.person, &mount, &a.str("patch_text")?).await
+            let out =
+                fs_ops::apply_patch(&client, &ctx.state.safety, &ctx.person, &mount, &a.str("patch_text")?)
+                    .await?;
+            reindex_patched_files(&ctx, &mount, &client, &out).await;
+            Ok(out)
         }),
     );
+}
+
+/// Reflect one patch in the search index: a patch touches several files and can
+/// add, update, delete and move in one call, so each entry of the report drives
+/// its own hook rather than assuming a single written path.
+async fn reindex_patched_files(
+    ctx: &crate::mcp::registry::ToolCtx,
+    mount: &str,
+    client: &crate::storage::VolumeClient,
+    report: &Value,
+) {
+    let Some(files) = report["files"].as_array() else { return };
+    for entry in files {
+        let Some(path) = entry["path"].as_str() else { continue };
+        match entry["op"].as_str() {
+            Some("delete") => indexer::after_delete(&ctx.state, mount, path).await,
+            Some("add" | "update") => match entry["moved_to"].as_str() {
+                // A move leaves nothing at the old path, so its chunks must go.
+                Some(moved_to) => {
+                    indexer::after_delete(&ctx.state, mount, path).await;
+                    indexer::after_write_reread(&ctx.state, mount, moved_to, client).await;
+                }
+                None => indexer::after_write_reread(&ctx.state, mount, path, client).await,
+            },
+            _ => {}
+        }
+    }
 }
 
 /// Take `edits` as raw JSON: the engine reads `old_string` / `new_string` /

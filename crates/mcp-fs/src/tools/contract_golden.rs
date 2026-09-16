@@ -1,6 +1,6 @@
 //! Test only access to the frozen MCP tool contract at the repo root.
 //!
-//! The 57 tool names, descriptions and `inputSchema` values are a client and an
+//! The 59 tool names, descriptions and `inputSchema` values are a client and an
 //! LLM facing contract. An accidental edit to a description silently changes what
 //! an agent is told a tool does, and a reordered schema key changes the bytes a
 //! client receives, so both are frozen in `tool-contract-golden.json` and a drift
@@ -8,7 +8,7 @@
 //!
 //! This is a snapshot of THIS server, not of anything external: the file is
 //! regenerated from the live registry, so the review is the diff. A one line
-//! description change shows up as one line; 57 changed tools means something went
+//! description change shows up as one line; 59 changed tools means something went
 //! wrong. Regenerate deliberately with:
 //!
 //! ```text
@@ -25,7 +25,7 @@ const REWRITE_ENV: &str = "MCPFS_REWRITE_TOOL_CONTRACT";
 pub(crate) const PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../tool-contract-golden.json");
 
-const NOTE: &str = "Frozen MCP tool contract: the 57 tool names, descriptions and inputSchema \
+const NOTE: &str = "Frozen MCP tool contract: the 59 tool names, descriptions and inputSchema \
 values this server must keep serving. Changing a name, a description or a schema here is a client \
 visible contract change, so this file is never hand edited: regenerate it deliberately with the \
 command below and review the diff.";
@@ -128,7 +128,7 @@ fn render(reg: &ToolRegistry) -> String {
 #[test]
 fn tool_contract_golden_is_current() {
     let reg = contract_registry();
-    assert_eq!(reg.len(), 57, "the frozen contract covers 35 fs, 8 admin and 14 git tools");
+    assert_eq!(reg.len(), 59, "the frozen contract covers 35 fs, 10 admin and 14 git tools");
     let rendered = render(&reg);
 
     if std::env::var_os(REWRITE_ENV).is_some() {

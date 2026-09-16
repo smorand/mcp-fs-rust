@@ -10,6 +10,10 @@ admin.delete_project
   desc: Delete a project and recursively tear down its volume (owner or platform admin).
   params: project_id:string
   required: ['project_id']
+admin.get_index_mode
+  desc: Get the current search index mode for a project (member or platform admin).
+  params: project_id:string
+  required: ['project_id']
 admin.list_all_projects
   desc: List every project (platform admin only).
   params: (none)
@@ -30,6 +34,10 @@ admin.remove_member
   desc: Remove a person from a project (owner or platform admin).
   params: project_id:string, person:string
   required: ['project_id', 'person']
+admin.set_index_mode
+  desc: Set the search index mode for a project (owner or platform admin). none=no index, bm25=full-text only, rag=vector only, both=full-text and vector. Switching to an active mode triggers an initial full index of existing files in the background. Switching to none wipes the index immediately.
+  params: project_id:string, mode:string
+  required: ['project_id', 'mode']
 fs.append
   desc: Append content to a file (optionally create it).
   params: mount_id:string, path:string, content:string, create:boolean=false
@@ -282,7 +290,9 @@ fs.delete: {"path": "/moved.txt", "trashed": true, "trash_path": "/.mcp_trash/17
 fs.mkdir: {"path": "/src", "created": true}
 fs.list_allowed_roots: {"person": "admin@example.com", "roots": [{"mount_id": "parity-probe", "root": "/", "owner": "admin@example.com"}]}
 fs.audit_log: {"entries": [{"timestamp": "<volatile>", "op": "edit", "path": "/a.txt", "detail": ""}, {"timestamp": "<volatile>", "op": "write", "path": "/dup.txt", "detail": "11 bytes"}, {"timestamp": "<volatile>", "op": "edit", "path": "/dup.txt", "detail": ""}, {"timestamp": "<volatile>", "op": "append", "path
-admin.list_projects: {"projects": [{"project_id": "parity-probe", "owner": "admin@example.com", "created_at": "<volatile>", "is_owner": true}]}
-admin.list_all_projects: {"projects": [{"project_id": "docling-scripts", "owner": "seb.morand@gmail.com", "created_at": "<volatile>"}, {"project_id": "mcp-fs", "owner": "user", "created_at": "<volatile>"}, {"project_id": "parity-probe", "owner": "admin@example.com", "created_at": "<volatile>"}]}
+admin.list_projects: {"projects": [{"project_id": "parity-probe", "owner": "admin@example.com", "created_at": "<volatile>", "index_mode": "none", "is_owner": true}]}
+admin.list_all_projects: {"projects": [{"project_id": "docling-scripts", "owner": "seb.morand@gmail.com", "created_at": "<volatile>", "index_mode": "none"}, {"project_id": "mcp-fs", "owner": "user", "created_at": "<volatile>", "index_mode": "none"}, {"project_id": "parity-probe", "owner": "admin@example.com", "created_at": "<volatile>", "index_mode": "none"}]}
 admin.list_users: {"users": [{"person": "admin@example.com", "is_admin": true}, {"person": "seb.morand@gmail.com", "is_admin": false}, {"person": "user", "is_admin": false}]}
 admin.list_members: {"project_id": "parity-probe", "members": [{"person": "admin@example.com", "role": "owner", "added_by": "admin@example.com"}]}
+admin.set_index_mode: {"project_id": "parity-probe", "index_mode": "bm25", "previous_mode": "none", "reindex_started": true}
+admin.get_index_mode: {"project_id": "parity-probe", "index_mode": "bm25"}

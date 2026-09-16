@@ -28,7 +28,7 @@ use crate::git::oauth::store::OAuthSession;
 use crate::storage::admin::{RelationalAdminStore, ROLE_OWNER};
 use crate::storage::meta::RelationalMetaStore;
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
-use crate::storage::traits::{AdminBackend, MODE_FILE, MetaBackend};
+use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
@@ -382,6 +382,46 @@ async fn admin_projects_and_members(engine: &Engine, tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `index_mode` column arrives through a `ColumnMigration`, which every
+/// engine guards differently. Applying the schema twice must stay a no op, and
+/// the column must be readable and writable afterwards on all of them.
+async fn admin_column_migration_is_idempotent(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let store = RelationalAdminStore::new(db.clone());
+    store.connect().await?;
+    // A store calls connect on every open, so the second apply is the real case.
+    store.connect().await?;
+
+    let proj = format!("{tag}-mode");
+    let created = store.create_project(&proj, "owner@test.com").await?;
+    assert_eq!(created.index_mode, IndexMode::None, "{who}: a new project starts at none");
+    assert_eq!(
+        store.get_index_mode(&proj).await?,
+        IndexMode::None,
+        "{who}: the column default is none"
+    );
+
+    for mode in [IndexMode::Bm25, IndexMode::Rag, IndexMode::Both, IndexMode::None] {
+        store.set_index_mode(&proj, mode).await?;
+        assert_eq!(store.get_index_mode(&proj).await?, mode, "{who}: {mode} round trips");
+        let p = store.get_project(&proj).await?.expect("the project exists");
+        assert_eq!(p.index_mode, mode, "{who}: get_project agrees with get_index_mode");
+    }
+
+    // A third apply, now that the column holds data, must not disturb it.
+    store.set_index_mode(&proj, IndexMode::Both).await?;
+    store.connect().await?;
+    assert_eq!(
+        store.get_index_mode(&proj).await?,
+        IndexMode::Both,
+        "{who}: re-migrating must not reset the stored mode"
+    );
+
+    store.delete_project(&proj).await?;
+    Ok(())
+}
+
 // ── git index cases ─────────────────────────────────────────────────────────────
 
 /// Purging one project's git index must not touch another's.
@@ -553,6 +593,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     meta_volume_isolation(engine, &tag).await?;
     meta_concurrent_writes(engine, &tag).await?;
     admin_projects_and_members(engine, &tag).await?;
+    admin_column_migration_is_idempotent(engine, &tag).await?;
     git_objects_refs_remotes(engine, &tag).await?;
     git_purge_is_scoped_to_one_volume(engine, &tag).await?;
     oauth_round_trip(engine, &tag).await?;

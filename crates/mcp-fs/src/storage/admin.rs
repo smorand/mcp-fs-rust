@@ -8,11 +8,12 @@
 
 use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{Assign, ColumnType, Upsert};
-use crate::storage::rel::schema::{Column, ForeignKey, SchemaSet, Table};
+use crate::storage::rel::schema::{Column, ColumnMigration, ForeignKey, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RowValues};
-use crate::storage::traits::{AdminBackend, Member, Project};
+use crate::storage::traits::{AdminBackend, IndexMode, Member, Project};
 use crate::util::{normalize_identity, now_iso};
 use async_trait::async_trait;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// A project id is at most 32 characters, an email comfortably under 320.
@@ -57,6 +58,15 @@ pub fn schema() -> SchemaSet {
         ],
         Vec::new(),
     )
+    // `project` shipped without this column, so a deployed database gains it here
+    // rather than through the CREATE TABLE, which only runs on an empty database.
+    .column_migration(ColumnMigration {
+        table: "project",
+        column: "index_mode",
+        ty: ColumnType::Text,
+        not_null: true,
+        default: "'none'",
+    })
 }
 
 pub struct RelationalAdminStore {
@@ -79,7 +89,12 @@ impl RelationalAdminStore {
     }
 
     fn read_project(r: &RowValues) -> Result<Project> {
-        Ok(Project { id: r.text(0)?, owner: r.text(1)?, created_at: r.text(2)? })
+        Ok(Project {
+            id: r.text(0)?,
+            owner: r.text(1)?,
+            created_at: r.text(2)?,
+            index_mode: IndexMode::from_str(&r.text(3)?)?,
+        })
     }
 
     fn read_member(r: &RowValues) -> Result<Member> {
@@ -142,7 +157,7 @@ impl AdminBackend for RelationalAdminStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(Project { id, owner, created_at: now })
+        Ok(Project { id, owner, created_at: now, index_mode: IndexMode::None })
     }
 
     async fn delete_project(&self, project_id: &str) -> Result<()> {
@@ -223,7 +238,7 @@ impl AdminBackend for RelationalAdminStore {
         let row = self
             .db
             .query_opt(
-                &Query::new("SELECT id, owner, created_at FROM project WHERE id=?1")
+                &Query::new("SELECT id, owner, created_at, index_mode FROM project WHERE id=?1")
                     .bind(project_id),
             )
             .await?;
@@ -238,7 +253,7 @@ impl AdminBackend for RelationalAdminStore {
             .db
             .query(
                 &Query::new(
-                    "SELECT p.id, p.owner, p.created_at FROM project p \
+                    "SELECT p.id, p.owner, p.created_at, p.index_mode FROM project p \
                      JOIN project_member m ON m.project_id = p.id \
                      WHERE m.person = ?1 ORDER BY p.id",
                 )
@@ -251,7 +266,9 @@ impl AdminBackend for RelationalAdminStore {
     async fn list_all_projects(&self) -> Result<Vec<Project>> {
         let rows = self
             .db
-            .query(&Query::new("SELECT id, owner, created_at FROM project ORDER BY id"))
+            .query(&Query::new(
+                "SELECT id, owner, created_at, index_mode FROM project ORDER BY id",
+            ))
             .await?;
         rows.iter().map(Self::read_project).collect()
     }
@@ -317,6 +334,32 @@ impl AdminBackend for RelationalAdminStore {
             )));
         }
         Ok(p)
+    }
+
+    async fn set_index_mode(&self, project_id: &str, mode: IndexMode) -> Result<()> {
+        let affected = self
+            .db
+            .execute(
+                &Query::new("UPDATE project SET index_mode=?1 WHERE id=?2")
+                    .bind(mode.as_str())
+                    .bind(project_id),
+            )
+            .await?;
+        if affected == 0 {
+            return Err(ToolError::project_not_found(project_id));
+        }
+        Ok(())
+    }
+
+    async fn get_index_mode(&self, project_id: &str) -> Result<IndexMode> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT index_mode FROM project WHERE id=?1").bind(project_id),
+            )
+            .await?
+            .ok_or_else(|| ToolError::project_not_found(project_id))?;
+        IndexMode::from_str(&row.text(0)?)
     }
 }
 
@@ -458,6 +501,85 @@ mod tests {
         s.create_project("p2", "a@t.c").await.unwrap();
         s.add_member("p1", "b@t.c", "a@t.c").await.unwrap();
         assert_eq!(s.list_all_persons().await.unwrap(), vec!["a@t.c", "b@t.c"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_project_defaults_to_index_mode_none() {
+        let s = store().await;
+        let p = s.create_project("proj", "o@t.c").await.unwrap();
+        assert_eq!(p.index_mode, IndexMode::None);
+        assert_eq!(s.get_index_mode("proj").await.unwrap(), IndexMode::None);
+        assert_eq!(
+            s.get_project("proj").await.unwrap().unwrap().index_mode,
+            IndexMode::None
+        );
+    }
+
+    #[tokio::test]
+    async fn index_mode_round_trips_through_the_store() {
+        let s = store().await;
+        s.create_project("proj", "o@t.c").await.unwrap();
+        for mode in [IndexMode::Bm25, IndexMode::Rag, IndexMode::Both, IndexMode::None] {
+            s.set_index_mode("proj", mode).await.unwrap();
+            assert_eq!(s.get_index_mode("proj").await.unwrap(), mode);
+            // Every read path must agree, not just the dedicated getter.
+            assert_eq!(s.get_project("proj").await.unwrap().unwrap().index_mode, mode);
+            assert_eq!(s.list_all_projects().await.unwrap()[0].index_mode, mode);
+            assert_eq!(s.list_projects_for("o@t.c").await.unwrap()[0].index_mode, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn index_mode_on_a_missing_project_is_not_found() {
+        let s = store().await;
+        assert_eq!(
+            s.get_index_mode("ghost").await.unwrap_err().code,
+            crate::errors::code::PROJECT_NOT_FOUND
+        );
+        assert_eq!(
+            s.set_index_mode("ghost", IndexMode::Bm25).await.unwrap_err().code,
+            crate::errors::code::PROJECT_NOT_FOUND
+        );
+    }
+
+    /// The real case the `ColumnMigration` exists for: a database created before
+    /// the column shipped. A fresh `connect()` would prove nothing, because
+    /// `CREATE TABLE` already carries every column, so the old table is built by
+    /// hand here.
+    #[tokio::test]
+    async fn column_migration_adds_index_mode_to_an_old_database() {
+        use crate::storage::rel::SqliteRelationalDb;
+
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        // The `project` table exactly as it shipped, without `index_mode`.
+        db.execute(&Query::new(
+            "CREATE TABLE \"project\" (\"id\" TEXT NOT NULL, \"owner\" TEXT NOT NULL, \
+             \"created_at\" TEXT NOT NULL, PRIMARY KEY (\"id\"))",
+        ))
+        .await
+        .unwrap();
+        db.execute(
+            &Query::new("INSERT INTO project (id, owner, created_at) VALUES (?1, ?2, ?3)")
+                .bind("legacy")
+                .bind("o@t.c")
+                .bind("2020-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let s = RelationalAdminStore::new(db);
+        s.connect().await.unwrap();
+
+        let p = s.get_project("legacy").await.unwrap().expect("the legacy row survives");
+        assert_eq!(p.index_mode, IndexMode::None, "an existing row defaults to none");
+
+        // Idempotent: connect runs on every open, so a second one must not fail.
+        s.connect().await.unwrap();
+        assert_eq!(s.get_index_mode("legacy").await.unwrap(), IndexMode::None);
+
+        // And the column is really usable afterwards.
+        s.set_index_mode("legacy", IndexMode::Both).await.unwrap();
+        assert_eq!(s.get_index_mode("legacy").await.unwrap(), IndexMode::Both);
     }
 
     /// Boundary table from the spec: 3 ok, 32 ok, 33 rejected, bad bounds rejected.

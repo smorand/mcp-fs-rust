@@ -458,7 +458,12 @@ impl RelationalDb for SqlServerRelationalDb {
         // left behind. The guard is a manual rollback because the statements run
         // through `batch` rather than through a transaction handle.
         SqlServerRelationalDb::batch(&mut conn, "BEGIN TRANSACTION").await?;
-        for statement in schema.render(Dialect::SqlServer) {
+        let statements = schema
+            .render(Dialect::SqlServer)
+            .into_iter()
+            // Rendered with their own sys.columns guard, so a second apply is a no op.
+            .chain(schema.render_column_migrations(Dialect::SqlServer));
+        for statement in statements {
             if let Err(e) = SqlServerRelationalDb::batch(&mut conn, &statement).await {
                 let _ = SqlServerRelationalDb::batch(&mut conn, "ROLLBACK TRANSACTION").await;
                 return Err(e);

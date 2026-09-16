@@ -26,6 +26,74 @@ search:
     top_n: 10           # how many chunks to send to the reranker
 ```
 
+## Per-project index mode
+
+`search.mode` above is the SERVER mode: which engine is wired. Whether a given
+project's content reaches that engine is a per-project property, `index_mode`, stored
+on the `project` row and managed by two tools:
+
+| tool | gate | returns |
+|---|---|---|
+| `admin.set_index_mode` | owner or platform admin | `project_id`, `index_mode`, `previous_mode`, `reindex_started` |
+| `admin.get_index_mode` | member, or platform admin | `project_id`, `index_mode` |
+
+Values: `none` (the default for every project, including every project that existed
+before the column shipped), `bm25`, `rag`, `both`. `rag` and `both` are refused with
+`ERR_INVALID_ARGUMENT` when `search.embedding.endpoint` is empty; any value is refused
+with `ERR_NOT_SUPPORTED` when `search.enabled` is false; an unknown value is
+`ERR_INVALID_ARGUMENT`.
+
+### Transitions
+
+| From \ To | none | bm25 | rag | both |
+|---|---|---|---|---|
+| **none** | no-op | wipe + full index | wipe + full index | wipe + full index |
+| **bm25** | wipe | no-op | wipe + full index | wipe + full index |
+| **rag** | wipe | wipe + full index | no-op | wipe + full index |
+| **both** | wipe | wipe + full index | wipe + full index | no-op |
+
+"Wipe" is `SearchBackend::delete_all(volume_id)`, scoped to the one volume, and it is
+finished before the tool answers. "Full index" is a detached `tokio` task walking every
+file of the volume, so a `reindex_started: true` answer means a pass is RUNNING, not
+that the volume is searchable. Poll `search.status` and watch `bm25_docs` /
+`vector_chunks` settle. A same-mode call is a real no-op: it neither wipes nor rebuilds,
+which is why it reports `reindex_started: false`.
+
+### Auto indexing
+
+While a project's mode is active, every write reaches the index without a
+`search.index` call: `fs.write`, `fs.append`, `fs.write_bytes`, `fs.write_docx`,
+`fs.edit`, `fs.multi_edit`, `fs.search_replace`, `fs.insert_at_line`, `fs.apply_patch`
+and the REST `POST /api/fs/{mount}/upload`. `fs.delete` removes the deleted path, and
+every file underneath it for a recursive delete. A `dry_run` edit writes nothing and so
+indexes nothing. Files that are not valid UTF-8 are skipped silently, which covers
+binary uploads and the `.docx` that `fs.write_docx` produces.
+
+The work is fire and forget (`search/indexer.rs`): the write returns as soon as the
+bytes are committed, and the index call runs on a detached task whose failures are a
+WARN log, never an error to the caller. **Trade-off**: an embedding round trip is
+50 to 300 ms, so a caller that writes and immediately queries can miss its own write.
+There is no read-your-write guarantee on the index. A caller that needs one must poll
+`search.status` or call `search.index` synchronously.
+
+When the mode is `none`, a write costs one extra `project` row read and nothing else.
+Chunking uses the `search.index` defaults (1000 / 100); there is no per-project chunk
+configuration.
+
+The mode decides WHETHER a project is indexed, not by which engine: the backend is
+process wide and serves whatever `search.mode` configured. Setting `bm25` on a server
+running `search.mode: rag` indexes into the vector store.
+
+### Crash mid-reindex
+
+The wipe commits before the rebuild starts, so a server that dies during the initial
+full index leaves the project with an active mode and a partial or empty index. The
+state is consistent, never corrupt, but nothing restarts the pass: call
+`admin.set_index_mode` with a DIFFERENT mode and back, or `search.index` with
+`recursive: true`, to rebuild. Same for the storage schema: `index_mode` is written
+before the wipe, so the failure mode is a stale index under a correct mode rather than
+a wiped index under a mode nothing will rebuild.
+
 ## Modes
 
 | mode  | BM25 engine    | Vector engine  | Merge | Reranking |
@@ -137,3 +205,12 @@ mode integration tests, use `scripts/search_embedding_fake.py` as a stub server.
 3. **Embedding dimension freeze**: once vectors are stored at dimension N, changing
    `search.embedding.dimensions` breaks all stored vectors silently. Delete chunks
    and re-index after any dimension change.
+
+4. **`delete_all` on Tantivy removes the index directory** (`{tantivy_dir}/{volume_id}/`)
+   rather than deleting term by term, which avoids segment fragmentation and is safe
+   because the directory is always rebuildable. The cached open index is evicted with
+   it, so the next write reopens a fresh one.
+
+5. **Auto indexing does not cover `fs.move` and `fs.copy`.** A moved or copied file
+   keeps the index entry of its old path and gains none at the new one until it is
+   written again. Re-run `search.index` after a large reorganisation.

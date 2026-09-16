@@ -549,6 +549,11 @@ async fn upload(
             )
             .await?;
             reports.push(result.get("documentation").cloned().unwrap_or(Value::Null));
+            // Same hook the MCP write tools run: an upload is a write, and the
+            // bytes are already here, so a text payload needs no read back.
+            if let Ok(text) = std::str::from_utf8(data) {
+                crate::search::indexer::after_write(&r.state, &r.mount, dest, text).await;
+            }
             written.push(dest.clone());
         }
         Ok(json!({"written": written, "count": written.len(), "documentation": reports}))
