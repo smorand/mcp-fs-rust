@@ -15,10 +15,12 @@ pub mod docx;
 pub mod extract;
 pub mod mime;
 pub mod ocr;
+pub mod service;
 pub mod symbols;
 
 pub use docx::render_markdown_to_docx;
 pub use extract::{ExtractResult, Extractor, companion_md_path, extract_text};
 pub use mime::guess as guess_mime;
 pub use ocr::{MultimodalOcrProvider, NullOcrProvider, OcrProvider, provider_from_config};
+pub use service::{ApiDocService, CliDocService, DOC_SERVICE_EXTS, DocService};
 pub use symbols::{Definition, Reference, find_definitions, find_references, language_for};

@@ -58,6 +58,10 @@ fs.delete
   desc: Delete a path (moves to trash by default).
   params: mount_id:string, path:string, recursive:boolean=false, trash:boolean=true
   required: ['mount_id', 'path']
+fs.documentize
+  desc: Generate the Markdown companion of a stored document.
+  params: mount_id:string, path:string, overwrite:boolean=false
+  required: ['mount_id', 'path']
 fs.edit
   desc: Replace a unique string; dry_run returns the diff.
   params: mount_id:string, path:string, old_string:string, new_string:string, replace_all:boolean=false, dry_run:boolean=false
@@ -158,6 +162,10 @@ fs.write
   desc: Create or overwrite a file (no-clobber by default, atomic).
   params: mount_id:string, path:string, content:string, overwrite:boolean=false, create_parents:boolean=true
   required: ['mount_id', 'path', 'content']
+fs.write_bytes
+  desc: Write raw bytes (base64) to a file.
+  params: mount_id:string, path:string, base64:string, overwrite:boolean=false, create_parents:boolean=true, trigger_documentation_service:boolean=false
+  required: ['mount_id', 'path', 'base64']
 fs.write_docx
   desc: Render Markdown into a .docx Word document and write it to the volume.
   params: mount_id:string, path:string, markdown:string, title:string=null, overwrite:boolean=false
@@ -222,6 +230,10 @@ git.tags
 
 === EXACT RETURN SHAPES (the contract this server keeps; sample values are illustrative) ===
 fs.write: {"path": "/a.txt", "bytes_written": 12, "overwritten": false, "diff": ""}
+fs.write_bytes: {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": {"md_path": "/deck.md", "bytes_written": 517}}
+fs.write_bytes(flag off): {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": null}
+fs.write_bytes(conversion failed): {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": {"error": {"code": "ERR_INTERNAL_ERROR", "message": "document service exited with exit code 1: ..."}}}
+fs.documentize: {"path": "/report.pdf", "md_path": "/report.md", "bytes_written": 517, "overwritten": false}
 fs.read: {"content": "1\thello\n2\tworld", "total_lines": 2, "truncated": false, "next_offset": null}
 fs.read_bytes: {"base64": "aGVsbG8Kd29ybGQK", "mime_type": "text/plain", "length": 12}
 fs.read_lines: {"content": "1\thello\n2\tworld", "total_lines": 2}

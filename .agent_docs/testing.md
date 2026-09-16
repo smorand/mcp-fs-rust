@@ -15,7 +15,7 @@ Three levels, all inside the crate:
 | Tool level | `tools::testkit::harness()` builds a **real `AppState`** (SQLite metadata in a temp dir, local blobs, in memory ACL, the real registry) and dispatches through `registry.call`, the same path `tools/call` uses | `tools/*` |
 | Integration | the **real axum router** driven with `tower::ServiceExt::oneshot`, so requests go through routing, identity, the membership gate and the handlers | `app.rs`, `api/dataplane.rs`, `api/openapi.rs`, `git/http/mod.rs` |
 
-The tool contract is also a test: `tools/mod.rs` and `tools/all.rs` compare all 55
+The tool contract is also a test: `tools/mod.rs` and `tools/all.rs` compare all 57
 descriptions and `inputSchema` values against `tool-contract-golden.json`,
 serialized, so even a property key order change fails the build.
 `tools/contract_golden.rs` owns the file and adds the both directions check, so a
@@ -29,7 +29,7 @@ The contract is regenerated deliberately, never hand edited:
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
 ```
 
-Review the diff afterwards: a description edit is one line, and 55 changed tools
+Review the diff afterwards: a description edit is one line, and 57 changed tools
 means something went wrong.
 
 ## Running
@@ -51,7 +51,7 @@ From `cargo test --workspace` on the current tree:
 
 | Target | Result |
 |---|---|
-| `mcp-fs` lib | 978 passed, 1 ignored |
+| `mcp-fs` lib | 1033 passed, 2 ignored |
 | `agent` bin | 111 passed |
 | `mcp-fs` bin | 0 (the binary is a thin `main`) |
 | doctests | 0 passed, 3 ignored (wiring examples marked `ignore`) |
@@ -59,27 +59,26 @@ From `cargo test --workspace` on the current tree:
 That is the default feature set, so SQLite only. The relational conformance cases add
 themselves per engine when their dsn is present.
 
-Per area, from `cargo test -p mcp-fs --lib -- --list` (978 entries, the ignored one and
+Per area, from `cargo test -p mcp-fs --lib -- --list` (1035 entries, the two ignored and
 the live database cases included). The per area rows below are indicative: they are not
 recounted on every change, so trust the total above:
 
 | Area | Tests | Area | Tests |
 |---|---|---|---|
-| `tools` | 255 | `mcp` | 23 |
-| `storage` | 132 | `cli` | 23 |
-| `core` | 132 | `util` | 21 |
-| `git` | 117 | `config` | 21 |
-| `docs` | 106 | `identity` | 18 |
-| `api` | 71 | `safety` | 12 |
+| `tools` | 267 | `config` | 30 |
+| `core` | 140 | `mcp` | 23 |
+| `storage` | 139 | `cli` | 23 |
+| `docs` | 121 | `util` | 21 |
+| `git` | 117 | `identity` | 18 |
+| `api` | 83 | `safety` | 18 |
 | | | `app` | 11 |
 | | | `keys` | 9 |
 | | | `migrate` | 5 |
 | | | `logging` | 5 |
 | | | `errors` | 5 |
 
-Largest single modules: `core::fs_ops` 101, `docs::extract` 49,
-`api::dataplane` 48, `git::oauth` 41, `git::http` 40, `tools::git` 36,
-`storage::meta` 32.
+Largest single modules: `core::fs_ops` 125, `api::dataplane` 64, `docs::extract` 49,
+`git::oauth` 41, `tools::git` 39, `storage::meta` 35, `config` 30.
 
 `storage` grew most, from 62, because the relational layer carries its own suite:
 `storage::rel::dialect` 17, `storage::rel::sqlite` 14 and `storage::rel` 12 cover
@@ -124,10 +123,32 @@ derives unique ids from a per run tag. A case that passes on all three has been 
 to depend on having the database to itself, which is what catches a statement missing its
 `volume_id` predicate.
 
-## Opt in test
+## Opt in tests
 
-One test is `#[ignore]`: `storage::blob::s3::tests::integration_put_get_range_delete`.
-It needs a live S3 compatible service, because faking S3 would test the fake and
+Two tests are `#[ignore]`, because each needs something the machine may not have.
+Both skip with a message rather than fail when it is missing, since "not
+installed" is not a regression.
+
+### The real document converter
+
+`docs::service::tests::real_doc_convert_produces_markdown_and_leaves_nothing_behind`
+shells out to a real `doc-convert` on `PATH` with a one page PDF built in the test
+(the repo carries no binary fixture). It asserts the Markdown comes back non
+empty, that the sandbox directory is gone afterwards, and that no `*_docling`
+leftovers were created next to the server's working directory. It takes tens of
+seconds, which is why it is not in the default run:
+
+```bash
+cargo test -p mcp-fs --lib docs::service -- --ignored
+```
+
+The other `docs::service` tests need nothing: the cli ones build a three line
+`/bin/sh` script as the converter, and the api ones drive an in process axum stub.
+
+### S3
+
+`storage::blob::s3::tests::integration_put_get_range_delete`
+needs a live S3 compatible service, because faking S3 would test the fake and
 not the SDK wiring (path style addressing, range requests, bucket lifecycle).
 
 Requirements: a server on `http://127.0.0.1:9000` with access key `admin` (both
@@ -145,6 +166,43 @@ MCPFS_MINIO_SECRET_KEY=secret \
 Without the service the test does not run at all (`--ignored` is required), which
 is why `./test.sh` is green on a machine with nothing installed.
 
+## Functional scenarios
+
+`tests/functional/run_all.sh [--user NAME] [FILTER]` sources every
+`tests/functional/scenarios/[0-9][0-9]_*.sh`, starting and stopping the server
+itself when nothing is listening. Most scenarios drive the CLI agent with piped
+prompts, so they need an LLM key; they assert loosely on the agent's prose.
+
+The two document service scenarios are the exception: they verify an exact HTTP
+chain, so they speak curl rather than English, and each starts **its own server**
+on its own port with its own throwaway state, because the runner's server has
+`doc_service` disabled. Their shared plumbing is
+`scenarios/_doc_service_common.sh` (the leading underscore keeps it out of the
+runner's glob; the scenarios source it explicitly).
+
+| Scenario | Needs | Covers |
+|---|---|---|
+| `25_doc_service_cli.sh` | `doc-convert` on `PATH` | `doc_service.mode: cli`: upload with the flag, both files listed, the companion non empty, `fs.documentize` no clobber then overwrite, an ineligible extension refused with nothing written |
+| `26_doc_service_api.sh` | `python3` and `doc-convert` | `doc_service.mode: api` against `scripts/doc_service_fake.py`, same chain over HTTP, plus a wrong token failing the conversion without losing the uploaded file |
+
+```bash
+./tests/functional/run_all.sh doc_service        # the two of them, roughly two minutes
+```
+
+Each skips with a clear message when its prerequisite is absent.
+
+`scripts/doc_service_fake.py` is stdlib only and implements exactly the contract
+`ApiDocService` speaks: `POST` multipart with a part named by `--file-field`
+(`file` by default, mirroring `doc_service.api.file_field`), an optional
+auth header checked by name and exact value, `200 text/markdown` with the
+Markdown as the body. It delegates to `doc-convert --stdout --quiet` in a
+throwaway directory. It is also the quickest way to develop against api mode by
+hand:
+
+```bash
+python3 scripts/doc_service_fake.py --port 8099 --auth-header X-Convert-Key --auth-token s3cret
+```
+
 ## The differential harness is gone
 
 `crates/parity-harness` replayed a corpus against a live server and compared the result
@@ -157,7 +215,7 @@ What replaced it, and why nothing was lost that mattered:
 
 | Was covered by the harness | Now covered by |
 |---|---|
-| the 55 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
+| the 57 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
 | the MCP wire framing and JSON-RPC behaviour | `app.rs` router tests driven with `oneshot` |
 | the REST plane, every route | `api/dataplane.rs` and `api/openapi.rs` tests |
 | every error path and `ERR_*` code | per module tests next to each error |

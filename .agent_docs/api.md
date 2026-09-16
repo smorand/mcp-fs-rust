@@ -3,7 +3,7 @@
 Mounted only when `api.enabled` is true (default). Two families share one guard:
 a **bytes plane** for a UI or a script (browse, upload, download, zip) and
 **endpoint for endpoint parity with the `fs.*` tools**, which calls the very same
-`core::fs_ops` functions the tools call. 36 routes, asserted against the
+`core::fs_ops` functions the tools call. 38 routes, asserted against the
 documentation table by a test, so a route cannot ship undocumented.
 
 Implementation: `api/dataplane.rs` (routes), `api/openapi.rs` (spec plus UI).
@@ -30,9 +30,19 @@ token as the password. A 401 body is `{"error": "ERR_UNAUTHENTICATED", "detail":
 | POST | `/api/fs/{mount_id}/mkdir` | body `path` | create with parents, idempotent |
 | POST | `/api/fs/{mount_id}/delete` | body `path` | **hard** delete (no trash), file or subtree; 404 `{detail}` when absent |
 | POST | `/api/fs/{mount_id}/move` | body `source`, `destination` | rename or relocate; 404 `{detail}` when the source is absent |
-| POST | `/api/fs/{mount_id}/upload` | multipart: file parts, field `directory` (destination, default `/`), repeated field `paths` (per file relative path) | `{written[], count}` |
+| POST | `/api/fs/{mount_id}/upload` | multipart: file parts, field `directory` (destination, default `/`), repeated field `paths` (per file relative path), field `trigger_documentation_service` (`"true"`/`"1"`) | `{written[], count, documentation[]}` |
 | GET | `/api/fs/{mount_id}/download` | query `path` (required) | raw bytes as an attachment, MIME guessed |
 | GET | `/api/fs/{mount_id}/download-zip` | query `path` (default `/`) | subtree as a zip, entry names relative to that root |
+
+`trigger_documentation_service` on the upload applies to **every** file of the
+form, and only `"true"` or `"1"` turn it on, because a form field is free text and
+a typo must not silently spend minutes of a converter's time. Eligibility is
+validated for all files through the engine's own gate **before the first byte is
+written**, so a mixed batch is refused with `ERR_NOT_SUPPORTED` (501) and nothing
+is stored. The response gains `documentation`, one entry per written file in
+order: `{md_path, bytes_written}`, `{error: {code, message}}`, or `null` when the
+flag was off. A conversion that fails after the source was written is reported
+there and never rolls the upload back.
 
 `delete` and `move` behave exactly like their tools: `delete` accepts `recursive`
 (required for a non empty directory) and `trash` (default true, so a delete is
@@ -89,6 +99,8 @@ JSON body, snake_case, same names and defaults as the tool minus `mount_id`.
 | `apply-patch` | `patch_text` | `fs.apply_patch` |
 | `extract-text` | `path`, `max_chars=200000`, `preview_chars=4000`, `ocr=true`, `refresh=false` | `fs.extract_text` |
 | `write-docx` | `path`, `markdown`, `title=null`, `overwrite=false` | `fs.write_docx` |
+| `write-bytes` | `path`, `base64`, `overwrite=false`, `create_parents=true`, `trigger_documentation_service=false` | `fs.write_bytes` |
+| `documentize` | `path`, `overwrite=false` | `fs.documentize` |
 
 Bodies go through the same tolerant accessors as `tools/call` arguments, so a
 REST body and an MCP argument object behave identically (a string array accepts an
@@ -149,7 +161,11 @@ the matching REST parameter or request body field. Consequences, all deliberate:
   `length`. Rename one side and the description silently disappears.
 
 The bytes plane routes have no tool, so they carry the small explicit summaries in
-`REST_ONLY` / `REST_ONLY_PARAMS`. `/health` is documented without a tool. The
+`REST_ONLY` / `REST_ONLY_PARAMS`. `upload` is the one route whose body is a form:
+its `multipart/form-data` schema is rendered inline by `upload_request_body`
+rather than living in `SCHEMAS` (which renders JSON bodies only, and has no way to
+spell a binary part), and its field descriptions go through the same lookup as
+every other parameter. `/health` is documented without a tool. The
 three git HTTP paths appear only when `git.enabled`, mirroring the router. The
 route and body shapes themselves live in the `OPERATIONS` and `SCHEMAS` tables,
 because the REST surface is not the tool surface (`mkdir` takes only `path` while

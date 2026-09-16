@@ -1,5 +1,5 @@
 {
-  "_note": "Frozen MCP tool contract: the 55 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
+  "_note": "Frozen MCP tool contract: the 57 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
   "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
   "tools": [
     {
@@ -308,6 +308,32 @@
             "description": "Move to trash instead of hard deleting.",
             "type": "boolean",
             "default": true
+          }
+        },
+        "required": [
+          "mount_id",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "fs.documentize",
+      "description": "Generate the Markdown companion of a stored document.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path of the stored document to convert. PowerPoint, Word, PDF, audio and video only.",
+            "type": "string"
+          },
+          "overwrite": {
+            "description": "Allow overwriting an existing companion .md (default no-clobber).",
+            "type": "boolean",
+            "default": false
           }
         },
         "required": [
@@ -1118,6 +1144,47 @@
           "mount_id",
           "path",
           "content"
+        ]
+      }
+    },
+    {
+      "name": "fs.write_bytes",
+      "description": "Write raw bytes (base64) to a file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path within the volume.",
+            "type": "string"
+          },
+          "base64": {
+            "description": "File content, base64 encoded.",
+            "type": "string"
+          },
+          "overwrite": {
+            "description": "Allow overwriting an existing file (default no-clobber).",
+            "type": "boolean",
+            "default": false
+          },
+          "create_parents": {
+            "description": "Create missing parent directories.",
+            "type": "boolean",
+            "default": true
+          },
+          "trigger_documentation_service": {
+            "description": "Also generate the Markdown companion (path.md) through the configured document service. Supported for PowerPoint, Word, PDF, audio and video only.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "mount_id",
+          "path",
+          "base64"
         ]
       }
     },

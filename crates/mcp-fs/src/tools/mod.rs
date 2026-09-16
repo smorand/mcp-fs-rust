@@ -141,6 +141,18 @@ pub(crate) mod testkit {
 
     /// Same, with a hook to tweak the config (quota, read guard, hard delete).
     pub async fn harness_with(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
+        harness_with_doc_service(tweak, None).await
+    }
+
+    /// Same again, with a document service handed straight to the state.
+    ///
+    /// The real one is built from config at boot; a test injects a stub here
+    /// instead, so the documentation surfaces are exercised without a converter
+    /// binary and without a network.
+    pub async fn harness_with_doc_service(
+        tweak: impl FnOnce(&mut ServerConfig),
+        doc_service: Option<Arc<dyn crate::docs::DocService>>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut config = ServerConfig::default();
         config.infra.meta.dir = dir.path().join("volumes").display().to_string();
@@ -168,6 +180,7 @@ pub(crate) mod testkit {
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service,
         });
         Harness { _dir: dir, state }
     }
@@ -202,6 +215,7 @@ pub(crate) mod testkit {
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
         });
         Harness { _dir: dir, state }
     }
@@ -238,7 +252,7 @@ mod tests {
     use serde_json::json;
     use testkit::{MOUNT, harness};
 
-    /// The 33 fs.* tools of this layer, in registration order.
+    /// The 35 fs.* tools of this layer, in registration order.
     const FS_TOOLS: &[&str] = &[
         "fs.read",
         "fs.read_bytes",
@@ -251,6 +265,7 @@ mod tests {
         "fs.write",
         "fs.append",
         "fs.create_empty",
+        "fs.write_bytes",
         "fs.edit",
         "fs.multi_edit",
         "fs.search_replace",
@@ -273,13 +288,14 @@ mod tests {
         "fs.audit_log",
         "fs.extract_text",
         "fs.write_docx",
+        "fs.documentize",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        assert_eq!(reg.len(), 33);
+        assert_eq!(reg.len(), 35);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -353,7 +369,7 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            33,
+            35,
             "fs.* tools",
         );
     }

@@ -58,6 +58,51 @@ impl fmt::Display for Dsn {
     }
 }
 
+/// An opaque credential.
+///
+/// Same contract as [`Dsn`], for a value that is a secret without being a
+/// connection string: `Debug` and `Display` both redact, so the token cannot
+/// reach a log line, a boot banner or an error message, and [`Self::expose`] is
+/// the single audited read point.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// An unset secret. `${VAR}` expands to the empty string when the variable is
+    /// not in the environment, so this is the normal state of an unused key.
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+
+    /// The real value, for handing to a transport and nothing else.
+    pub fn expose(&self) -> &str {
+        self.0.trim()
+    }
+}
+
+/// Deliberately lossy, for the same reason as [`Dsn`]: whether a token is set is
+/// worth reporting when diagnosing a boot failure, its contents never are.
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            f.write_str("Secret(unset)")
+        } else {
+            f.write_str("Secret(redacted)")
+        }
+    }
+}
+
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() { f.write_str("unset") } else { f.write_str("redacted") }
+    }
+}
+
 fn d_pool_max_connections() -> u32 { 10 }
 fn d_pool_acquire_timeout() -> u64 { 30 }
 fn d_pg_schema() -> String { "public".into() }
@@ -468,6 +513,104 @@ impl Default for DocConfig {
     }
 }
 
+/// The modes a [`DocServiceConfig`] may name.
+pub mod doc_service_mode {
+    pub const CLI: &str = "cli";
+    pub const API: &str = "api";
+
+    /// Every accepted value, for error messages.
+    pub const ALL: [&str; 2] = [CLI, API];
+}
+
+/// The single placeholder the CLI argv may carry, replaced by the document the
+/// converter must read. There is no `{output}`: the contract is stdout.
+pub const DOC_PLACEHOLDER: &str = "{document}";
+
+fn d_doc_service_mode() -> String { doc_service_mode::CLI.into() }
+fn d_doc_service_max_input_bytes() -> u64 { 512 * 1024 * 1024 }
+fn d_doc_service_timeout() -> u64 { 900 }
+fn d_doc_service_command() -> Vec<String> {
+    vec!["doc-convert".into(), "--stdout".into(), "--quiet".into(), DOC_PLACEHOLDER.into()]
+}
+fn d_doc_service_auth_header() -> String { "Authorization".into() }
+fn d_doc_service_file_field() -> String { "file".into() }
+
+/// CLI mode: an argv list, never a shell string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocServiceCliConfig {
+    /// argv, with exactly one `{document}` placeholder. argv[0] is the binary, so
+    /// a deployment that wants OS level containment wraps it there.
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+impl Default for DocServiceCliConfig {
+    fn default() -> Self {
+        Self { command: d_doc_service_command(), timeout_secs: d_doc_service_timeout() }
+    }
+}
+
+/// API mode: one HTTP endpoint taking `multipart/form-data` and answering Markdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocServiceApiConfig {
+    pub url: String,
+    /// Header NAME, not necessarily a bearer scheme.
+    pub auth_header: String,
+    /// Secret, so inject it with `${VAR}`. Sent verbatim, which is how one setting
+    /// covers both `Bearer ${TOKEN}` and a bare key.
+    pub auth_token: Secret,
+    /// Name of the `multipart/form-data` part carrying the document. Configurable
+    /// because a third party endpoint names it whatever it likes, and hardcoding
+    /// our own name would make this mode work only against our own service.
+    pub file_field: String,
+    /// Empty means the response body IS the Markdown; otherwise the body is JSON
+    /// and this names the field carrying it.
+    pub response_field: String,
+    pub timeout_secs: u64,
+}
+impl Default for DocServiceApiConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            auth_header: d_doc_service_auth_header(),
+            auth_token: Secret::default(),
+            file_field: d_doc_service_file_field(),
+            response_field: String::new(),
+            timeout_secs: d_doc_service_timeout(),
+        }
+    }
+}
+
+/// The external document to Markdown converter, off by default so no existing
+/// deployment changes behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocServiceConfig {
+    pub enabled: bool,
+    /// `cli` or `api`.
+    pub mode: String,
+    /// Overrides the built-in eligible set when non empty, so a deployment can
+    /// narrow it to what its converter really handles.
+    pub extensions: Vec<String>,
+    /// Refuse to convert an input larger than this.
+    pub max_input_bytes: u64,
+    pub cli: DocServiceCliConfig,
+    pub api: DocServiceApiConfig,
+}
+impl Default for DocServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: d_doc_service_mode(),
+            extensions: Vec::new(),
+            max_input_bytes: d_doc_service_max_input_bytes(),
+            cli: DocServiceCliConfig::default(),
+            api: DocServiceApiConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -483,6 +626,7 @@ pub struct ServerConfig {
     pub sqlite: SqliteConfig,
     pub db: DbConfig,
     pub doc: DocConfig,
+    pub doc_service: DocServiceConfig,
 }
 
 impl ServerConfig {
@@ -514,6 +658,7 @@ impl ServerConfig {
         validate_store("admin", &self.infra.admin.backend, &self.infra.admin.dsn)?;
         validate_store("git", &self.infra.git.backend, &self.infra.git.dsn)?;
         validate_store("oauth", &self.infra.oauth.backend, &self.infra.oauth.dsn)?;
+        validate_doc_service(&self.doc_service)?;
         Ok(())
     }
 
@@ -610,6 +755,69 @@ fn validate_store(section: &str, backend: &str, dsn: &Dsn) -> Result<()> {
         other => Err(ToolError::invalid_argument(format!(
             "unknown infra.{section}.backend '{other}', expected one of {}",
             backend::ALL.join(", ")
+        ))),
+    }
+}
+
+/// Check the `doc_service` block.
+///
+/// Only an enabled service is checked: a half filled block that nothing reads is
+/// not a misconfiguration. Once it is on, every failure below would otherwise
+/// surface as a failed conversion minutes into the first upload.
+fn validate_doc_service(cfg: &DocServiceConfig) -> Result<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    match cfg.mode.as_str() {
+        doc_service_mode::CLI => {
+            if cfg.cli.command.iter().all(|a| a.trim().is_empty()) {
+                return Err(ToolError::invalid_argument(
+                    "doc_service.cli.command is required when doc_service.mode is 'cli'",
+                ));
+            }
+            // The placeholder is how the converter learns which file to read, and a
+            // second one would hand it two documents it was never asked to merge.
+            let placeholders: usize =
+                cfg.cli.command.iter().map(|a| a.matches(DOC_PLACEHOLDER).count()).sum();
+            if placeholders != 1 {
+                return Err(ToolError::invalid_argument(format!(
+                    "doc_service.cli.command must contain exactly one '{DOC_PLACEHOLDER}' \
+                     placeholder across its arguments, found {placeholders}"
+                )));
+            }
+            Ok(())
+        }
+        doc_service_mode::API => {
+            let url = cfg.api.url.trim();
+            if url.is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "doc_service.api.url is required when doc_service.mode is 'api'",
+                ));
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ToolError::invalid_argument(format!(
+                    "doc_service.api.url must start with 'http://' or 'https://' (got '{url}')"
+                )));
+            }
+            // A token with nowhere to go would be silently dropped, leaving the
+            // operator believing the endpoint is authenticated.
+            if !cfg.api.auth_token.is_empty() && cfg.api.auth_header.trim().is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "doc_service.api.auth_header is required when doc_service.api.auth_token is set",
+                ));
+            }
+            // An unnamed part is rejected by every server, so catch it at boot
+            // rather than on the first upload.
+            if cfg.api.file_field.trim().is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "doc_service.api.file_field must not be empty",
+                ));
+            }
+            Ok(())
+        }
+        other => Err(ToolError::invalid_argument(format!(
+            "unknown doc_service.mode '{other}', expected one of {}",
+            doc_service_mode::ALL.join(", ")
         ))),
     }
 }
@@ -933,6 +1141,131 @@ infra:
         .unwrap();
         assert_eq!(parsed.infra.meta.dsn.expose(), "postgres://u:pw@h/db");
         unsafe { std::env::remove_var("MCPFS_TEST_META_DSN") };
+    }
+
+    // ── doc service ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn doc_service_defaults_are_off_and_cli() {
+        let c = ServerConfig::default();
+        assert!(!c.doc_service.enabled, "the feature must ship disabled");
+        assert_eq!(c.doc_service.mode, doc_service_mode::CLI);
+        assert!(c.doc_service.extensions.is_empty(), "empty means the built-in set");
+        assert_eq!(c.doc_service.max_input_bytes, 536_870_912);
+        assert_eq!(
+            c.doc_service.cli.command,
+            vec!["doc-convert", "--stdout", "--quiet", "{document}"]
+        );
+        assert_eq!(c.doc_service.cli.timeout_secs, 900);
+        assert_eq!(c.doc_service.api.auth_header, "Authorization");
+        assert_eq!(c.doc_service.api.timeout_secs, 900);
+        assert!(c.doc_service.api.url.is_empty());
+        assert!(c.doc_service.api.auth_token.is_empty());
+        assert_eq!(c.doc_service.api.file_field, "file");
+        assert!(c.doc_service.api.response_field.is_empty());
+    }
+
+    /// An api mode with nowhere to post to would fail on the first upload, minutes
+    /// after the operator stopped watching the boot.
+    #[test]
+    fn doc_service_api_without_a_url_is_rejected_and_names_the_key() {
+        let e = ServerConfig::from_yaml("doc_service:\n  enabled: true\n  mode: api\n")
+            .expect_err("api mode needs a url");
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("doc_service.api.url"), "{}", e.message);
+    }
+
+    /// An unnamed multipart part is rejected by every server, so the boot must
+    /// catch it rather than the first upload.
+    #[test]
+    fn doc_service_api_rejects_an_empty_file_field() {
+        let e = ServerConfig::from_yaml(
+            "doc_service:\n  enabled: true\n  mode: api\n  api:\n    url: https://host/convert\n    file_field: '  '\n",
+        )
+        .expect_err("the document part needs a name");
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("doc_service.api.file_field"), "{}", e.message);
+    }
+
+    #[test]
+    fn doc_service_api_rejects_a_non_http_url() {
+        let e = ServerConfig::from_yaml(
+            "doc_service:\n  enabled: true\n  mode: api\n  api:\n    url: ftp://host/convert\n",
+        )
+        .expect_err("only http(s) is spoken");
+        assert!(e.message.contains("doc_service.api.url"), "{}", e.message);
+    }
+
+    #[test]
+    fn doc_service_cli_without_the_document_placeholder_is_rejected() {
+        let e = ServerConfig::from_yaml(
+            "doc_service:\n  enabled: true\n  mode: cli\n  cli:\n    command: [doc-convert, --stdout]\n",
+        )
+        .expect_err("the converter would never be told which file to read");
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("doc_service.cli.command"), "{}", e.message);
+        assert!(e.message.contains(DOC_PLACEHOLDER), "{}", e.message);
+    }
+
+    #[test]
+    fn doc_service_cli_with_two_placeholders_is_rejected() {
+        let e = ServerConfig::from_yaml(
+            "doc_service:\n  enabled: true\n  cli:\n    command: [c, \"{document}\", \"{document}\"]\n",
+        )
+        .expect_err("two documents is not the contract");
+        assert!(e.message.contains("exactly one"), "{}", e.message);
+    }
+
+    #[test]
+    fn an_unknown_doc_service_mode_lists_the_accepted_values() {
+        let e = ServerConfig::from_yaml("doc_service:\n  enabled: true\n  mode: grpc\n")
+            .expect_err("grpc is not a doc service mode");
+        assert!(e.message.contains("doc_service.mode"), "{}", e.message);
+        for name in doc_service_mode::ALL {
+            assert!(e.message.contains(name), "{name} should be listed: {}", e.message);
+        }
+    }
+
+    /// A disabled block is never validated: an unfinished draft must not stop a boot
+    /// that does not use the feature.
+    #[test]
+    fn a_disabled_doc_service_is_not_validated() {
+        let c = ServerConfig::from_yaml("doc_service:\n  mode: api\n").expect("disabled is inert");
+        assert!(!c.doc_service.enabled);
+    }
+
+    /// Same guard as the dsn: the token must not reach a log line even through a
+    /// `{:?}` of the whole config.
+    #[test]
+    fn a_doc_service_token_never_appears_in_debug_or_display_output() {
+        const TOKEN: &str = "Bearer t0ps3cr3t";
+        let mut c = ServerConfig::default();
+        c.doc_service.api.auth_token = Secret::new(TOKEN);
+
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("t0ps3cr3t"), "the token leaked into Debug: {debug}");
+        assert!(debug.contains("Secret(redacted)"), "a set token should say so: {debug}");
+
+        let display = format!("{}", c.doc_service.api.auth_token);
+        assert_eq!(display, "redacted");
+        assert_eq!(format!("{:?}", Secret::default()), "Secret(unset)");
+        assert_eq!(format!("{}", Secret::default()), "unset");
+
+        // The transport still gets the real value, otherwise nothing authenticates.
+        assert_eq!(c.doc_service.api.auth_token.expose(), TOKEN);
+    }
+
+    /// A token belongs in an environment variable, never in a committed file.
+    #[test]
+    fn a_doc_service_token_arrives_through_env_expansion() {
+        unsafe { std::env::set_var("MCPFS_TEST_DOC_TOKEN", "Bearer from-env") };
+        let c = ServerConfig::from_yaml(
+            "doc_service:\n  enabled: true\n  mode: api\n  api:\n    url: https://convert.local/v1\n    auth_token: \"${MCPFS_TEST_DOC_TOKEN}\"\n",
+        )
+        .expect("a complete api block is valid");
+        assert_eq!(c.doc_service.api.auth_token.expose(), "Bearer from-env");
+        assert!(!format!("{c:?}").contains("from-env"));
+        unsafe { std::env::remove_var("MCPFS_TEST_DOC_TOKEN") };
     }
 
     #[test]

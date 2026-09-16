@@ -1,12 +1,16 @@
 //! Write family: `fs.write` (no-clobber and atomic), `fs.append`,
-//! `fs.create_empty`.
+//! `fs.create_empty`, `fs.write_bytes`.
 //!
-//! Port of the C# `Tools/WriteTools.cs`.
+//! Port of the C# `Tools/WriteTools.cs`, plus `fs.write_bytes`, which has no C#
+//! counterpart: it is the only way to put binary content in a volume through the
+//! MCP surface, and it is where the document service flag lives.
 
 use crate::core::fs_ops;
+use crate::errors::ToolError;
 use crate::mcp::ToolSchema;
 use crate::mcp::registry::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
+use base64::Engine as _;
 
 pub fn register(reg: &mut ToolRegistry) {
     reg.add(
@@ -74,16 +78,69 @@ pub fn register(reg: &mut ToolRegistry) {
             .await
         }),
     );
+
+    reg.add(
+        ToolSchema::new("fs.write_bytes", "Write raw bytes (base64) to a file.")
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .req_str("path", "Absolute POSIX path within the volume.")
+            .req_str("base64", "File content, base64 encoded.")
+            .opt_bool("overwrite", false, "Allow overwriting an existing file (default no-clobber).")
+            .opt_bool("create_parents", true, "Create missing parent directories.")
+            .opt_bool(
+                "trigger_documentation_service",
+                false,
+                "Also generate the Markdown companion (path.md) through the configured \
+                 document service. Supported for PowerPoint, Word, PDF, audio and video only.",
+            ),
+        handler(|ctx, a| async move {
+            let (mount, client) = volume(&ctx, &a).await?;
+            let path = norm(&ctx, &a, "path")?;
+            // The engine and the alphabet `fs.read_bytes` encodes with, so a read
+            // then write round trip is byte identical.
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(a.str("base64")?.trim())
+                .map_err(|e| {
+                    ToolError::invalid_argument(format!(
+                        "argument 'base64' is not valid base64: {e}"
+                    ))
+                })?;
+            fs_ops::write_bytes_documented(
+                &client,
+                &ctx.state.safety,
+                ctx.state.doc_service.as_deref(),
+                &ctx.person,
+                &mount,
+                &path,
+                &data,
+                a.bool_or("overwrite", false),
+                a.bool_or("create_parents", true),
+                a.bool_or("trigger_documentation_service", false),
+            )
+            .await
+        }),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::docs::service::StubDocService;
     use crate::errors::code;
-    use crate::tools::testkit::{MOUNT, assert_description, assert_family, assert_schema, harness};
-    use serde_json::json;
+    use crate::tools::testkit::{
+        MOUNT, PERSON, assert_description, assert_family, assert_schema, harness,
+        harness_with_doc_service,
+    };
+    use serde_json::{Value, json};
+    use std::sync::Arc;
 
-    const NAMES: &[&str] = &["fs.write", "fs.append", "fs.create_empty"];
+    const NAMES: &[&str] = &["fs.write", "fs.append", "fs.create_empty", "fs.write_bytes"];
+
+    /// What the injected stub converts every document to.
+    const STUB_MD: &str = "# converted by the stub\n";
+
+    fn b64(data: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
 
     #[test]
     fn family_registers_every_tool() {
@@ -258,6 +315,125 @@ mod tests {
             .unwrap_err();
         // The storage layer returns ERR_INVALID_ARGUMENT for writing to a directory.
         assert_eq!(err.code, code::INVALID_ARGUMENT);
+    }
+
+    // ── fs.write_bytes ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn fs_write_bytes_schema_matches_the_contract() {
+        assert_schema(
+            register,
+            "fs.write_bytes",
+            r#"{"type":"object","properties":{
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
+                 "path":{"description":"Absolute POSIX path within the volume.","type":"string"},
+                 "base64":{"description":"File content, base64 encoded.","type":"string"},
+                 "overwrite":{"description":"Allow overwriting an existing file (default no-clobber).","type":"boolean","default":false},
+                 "create_parents":{"description":"Create missing parent directories.","type":"boolean","default":true},
+                 "trigger_documentation_service":{"description":"Also generate the Markdown companion (path.md) through the configured document service. Supported for PowerPoint, Word, PDF, audio and video only.","type":"boolean","default":false}},
+               "required":["mount_id","path","base64"]}"#,
+        );
+        assert_description(register, "fs.write_bytes", "Write raw bytes (base64) to a file.");
+    }
+
+    /// The flag defaults to off, so the tool is a plain binary write and nothing
+    /// reaches the document service.
+    #[tokio::test]
+    async fn write_bytes_stores_the_decoded_bytes_and_no_companion() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+        let payload: Vec<u8> = vec![0x50, 0x4b, 0x03, 0x04, 0x00, 0xff];
+
+        let r = h
+            .call(
+                "fs.write_bytes",
+                json!({"mount_id": MOUNT, "path": "/deck.pptx", "base64": b64(&payload)}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(r["path"], "/deck.pptx");
+        assert_eq!(r["bytes_written"], 6);
+        assert_eq!(r["overwritten"], false);
+        assert_eq!(r["documentation"], Value::Null);
+        assert_eq!(h.client().await.read_bytes("/deck.pptx").await.unwrap(), payload);
+        assert!(!h.client().await.exists("/deck.md").await.unwrap());
+    }
+
+    /// The flag on: the source and its companion are both stored, and the
+    /// companion sits at the path `fs.extract_text` reads.
+    #[tokio::test]
+    async fn write_bytes_with_the_flag_stores_the_markdown_companion() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+
+        let r = h
+            .call(
+                "fs.write_bytes",
+                json!({"mount_id": MOUNT, "path": "/slides/deck.pptx", "base64": b64(b"PK-bytes"),
+                       "trigger_documentation_service": true}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(r["documentation"]["md_path"], "/slides/deck.md");
+        assert_eq!(r["documentation"]["bytes_written"], STUB_MD.len());
+        assert_eq!(h.client().await.read_text("/slides/deck.md").await.unwrap(), STUB_MD);
+
+        let log = h.state.safety.audit(PERSON, MOUNT);
+        assert_eq!(log.last().unwrap().op, "doc_service");
+    }
+
+    /// The eligibility gate runs before the write, so an ineligible extension
+    /// leaves nothing behind rather than a file without its companion.
+    #[tokio::test]
+    async fn write_bytes_refuses_an_ineligible_extension_and_writes_nothing() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+
+        let err = h
+            .call(
+                "fs.write_bytes",
+                json!({"mount_id": MOUNT, "path": "/notes.txt", "base64": b64(b"plain"),
+                       "trigger_documentation_service": true}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, code::NOT_SUPPORTED);
+        assert!(!h.client().await.exists("/notes.txt").await.unwrap(), "nothing may be written");
+    }
+
+    /// The flag while the feature is off must say so, not store the file silently
+    /// without its companion.
+    #[tokio::test]
+    async fn write_bytes_without_a_configured_service_is_not_supported() {
+        let h = harness().await;
+        let err = h
+            .call(
+                "fs.write_bytes",
+                json!({"mount_id": MOUNT, "path": "/deck.pptx", "base64": b64(b"PK"),
+                       "trigger_documentation_service": true}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
+        assert!(err.message.contains("not configured"), "{}", err.message);
+        assert!(!h.client().await.exists("/deck.pptx").await.unwrap());
+    }
+
+    /// Plan test 9: a payload that is not base64 is the caller's mistake, so it is
+    /// an invalid argument rather than a stored pile of garbage.
+    #[tokio::test]
+    async fn write_bytes_rejects_invalid_base64() {
+        let h = harness().await;
+        let err = h
+            .call(
+                "fs.write_bytes",
+                json!({"mount_id": MOUNT, "path": "/bad.bin", "base64": "not base64 at all!"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("base64"), "{}", err.message);
+        assert!(!h.client().await.exists("/bad.bin").await.unwrap());
     }
 
     /// A fresh write counts as a read, so the overwrite passes the read guard.

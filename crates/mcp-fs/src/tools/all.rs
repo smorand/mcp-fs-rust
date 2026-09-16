@@ -78,8 +78,8 @@ mod tests {
         let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false, doc: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 33 fs + 8 admin + 5 web + 2 context7 = 48
-        assert_eq!(reg.len(), 48);
+        // 35 fs + 8 admin + 5 web + 2 context7 = 50
+        assert_eq!(reg.len(), 50);
         assert!(reg.resolve("web.search").is_some());
         assert!(reg.resolve("context7.resolve_library_id").is_some());
     }
@@ -90,11 +90,11 @@ mod tests {
         let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 33 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 75
+        // 35 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 77
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 75 + doc_count + 3);
+        assert_eq!(reg.len(), 77 + doc_count + 3);
     }
 
     /// Whole surface gate for the 22 tools of this agent: every `admin.*`,

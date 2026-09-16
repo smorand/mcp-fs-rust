@@ -1,8 +1,10 @@
-//! Document family: `fs.extract_text`, `fs.write_docx`.
+//! Document family: `fs.extract_text`, `fs.write_docx`, `fs.documentize`.
 //!
 //! Port of the C# `Tools/DocumentTools.cs` plus the safety accounting the C#
 //! `FsOps.ExtractDocument` / `FsOps.WriteDocx` wrap around the engines in
-//! [`crate::docs`].
+//! [`crate::docs`]. `fs.documentize` has no C# counterpart: it is the retry
+//! surface of the external document service, and it writes the companion at the
+//! very path `fs.extract_text` reads, so the two never produce two files.
 
 use crate::core::fs_ops;
 use crate::mcp::registry::{ToolRegistry, handler};
@@ -74,18 +76,56 @@ pub fn register(reg: &mut ToolRegistry) {
             .await
         }),
     );
+
+    reg.add(
+        ToolSchema::new(
+            "fs.documentize",
+            "Generate the Markdown companion of a stored document.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str(
+            "path",
+            "Absolute POSIX path of the stored document to convert. PowerPoint, Word, \
+             PDF, audio and video only.",
+        )
+        .opt_bool(
+            "overwrite",
+            false,
+            "Allow overwriting an existing companion .md (default no-clobber).",
+        ),
+        handler(|ctx, a| async move {
+            let (mount, client) = volume(&ctx, &a).await?;
+            let path = norm(&ctx, &a, "path")?;
+            fs_ops::documentize(
+                &client,
+                &ctx.state.safety,
+                ctx.state.doc_service.as_deref(),
+                &ctx.person,
+                &mount,
+                &path,
+                a.bool_or("overwrite", false),
+            )
+            .await
+        }),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use crate::docs::service::StubDocService;
     use crate::errors::code;
     use crate::tools::testkit::{
         MOUNT, PERSON, assert_description, assert_family, assert_schema, harness,
+        harness_with_doc_service,
     };
+    use std::sync::Arc;
 
-    const NAMES: &[&str] = &["fs.extract_text", "fs.write_docx"];
+    const NAMES: &[&str] = &["fs.extract_text", "fs.write_docx", "fs.documentize"];
+
+    /// What the injected stub converts every document to.
+    const STUB_MD: &str = "# converted by the stub\n";
 
     #[test]
     fn family_registers_every_tool() {
@@ -251,5 +291,105 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
         assert_eq!(err.message, "path must end with .docx");
+    }
+
+    // ── fs.documentize ────────────────────────────────────────────────────────
+
+    #[test]
+    fn fs_documentize_schema_matches_the_contract() {
+        assert_schema(
+            register,
+            "fs.documentize",
+            r#"{"type":"object","properties":{
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
+                 "path":{"description":"Absolute POSIX path of the stored document to convert. PowerPoint, Word, PDF, audio and video only.","type":"string"},
+                 "overwrite":{"description":"Allow overwriting an existing companion .md (default no-clobber).","type":"boolean","default":false}},
+               "required":["mount_id","path"]}"#,
+        );
+        assert_description(
+            register,
+            "fs.documentize",
+            "Generate the Markdown companion of a stored document.",
+        );
+    }
+
+    /// The retry surface: it converts what is already stored and, unlike an
+    /// upload, honours the caller's `overwrite` on the companion.
+    #[tokio::test]
+    async fn documentize_writes_the_companion_and_is_no_clobber() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+        h.client().await.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
+
+        let r = h
+            .call("fs.documentize", json!({"mount_id": MOUNT, "path": "/report.pdf"}))
+            .await
+            .unwrap();
+        assert_eq!(r["path"], "/report.pdf");
+        assert_eq!(r["md_path"], "/report.md");
+        assert_eq!(r["bytes_written"], STUB_MD.len());
+        assert_eq!(r["overwritten"], false);
+        assert_eq!(h.client().await.read_text("/report.md").await.unwrap(), STUB_MD);
+
+        let err = h
+            .call("fs.documentize", json!({"mount_id": MOUNT, "path": "/report.pdf"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+
+        let again = h
+            .call(
+                "fs.documentize",
+                json!({"mount_id": MOUNT, "path": "/report.pdf", "overwrite": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["overwritten"], true);
+    }
+
+    /// The companion lands where `fs.extract_text` looks, so the built-in
+    /// extractor serves it as a cache hit instead of producing a second file.
+    #[tokio::test]
+    async fn a_documentized_companion_is_a_cache_hit_for_extract_text() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+        h.client().await.write_bytes_atomic("/report.pdf", b"%PDF-1.4 not really").await.unwrap();
+        h.call("fs.documentize", json!({"mount_id": MOUNT, "path": "/report.pdf"})).await.unwrap();
+
+        let r = h
+            .call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/report.pdf"}))
+            .await
+            .unwrap();
+        assert_eq!(r["cached"], true);
+        assert_eq!(r["preview"], STUB_MD);
+    }
+
+    #[tokio::test]
+    async fn documentize_refuses_an_ineligible_extension_and_a_missing_service() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+        h.seed("/notes.txt", "plain").await;
+        let err = h
+            .call("fs.documentize", json!({"mount_id": MOUNT, "path": "/notes.txt"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
+        assert!(!h.client().await.exists("/notes.md").await.unwrap());
+
+        let off = harness().await;
+        off.client().await.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
+        let err = off
+            .call("fs.documentize", json!({"mount_id": MOUNT, "path": "/report.pdf"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
+        assert!(err.message.contains("not configured"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn documentize_on_a_missing_file_is_not_found() {
+        let h = harness_with_doc_service(|_| {}, Some(Arc::new(StubDocService::ok(STUB_MD)))).await;
+        let err = h
+            .call("fs.documentize", json!({"mount_id": MOUNT, "path": "/nope.pdf"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
     }
 }

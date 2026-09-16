@@ -3,6 +3,7 @@
 //! Cheap to clone (everything behind `Arc`). Assembled once in `app::build`.
 
 use crate::config::ServerConfig;
+use crate::docs::DocService;
 use crate::errors::{Result, ToolError};
 use crate::identity::IdentityResolver;
 use crate::mcp::ToolRegistry;
@@ -20,6 +21,9 @@ pub struct AppState {
     pub identity: Arc<IdentityResolver>,
     pub registry: Arc<ToolRegistry>,
     pub editors: Arc<EditorRegistry>,
+    /// The external document to Markdown converter, `None` when `doc_service` is
+    /// disabled. Built once at boot so its HTTP connection pool is reused.
+    pub doc_service: Option<Arc<dyn DocService>>,
 }
 
 impl AppState {

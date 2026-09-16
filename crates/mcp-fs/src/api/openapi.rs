@@ -227,6 +227,12 @@ fn operation(op: &Op, catalog: &HashMap<String, ToolDoc>) -> Value {
             }),
         );
     }
+    // The one multipart route. Its form is described here rather than in
+    // [`SCHEMAS`], which renders JSON bodies only, and a binary file part has no
+    // equivalent there.
+    if op.sub == UPLOAD_SUB {
+        out.insert("requestBody".into(), upload_request_body(&describe));
+    }
     out.insert("responses".into(), json!({"200": {"description": "OK"}}));
     Value::Object(out)
 }
@@ -372,6 +378,48 @@ struct Op {
     body: &'static str,
 }
 
+/// The multipart upload, the only route whose body is a form rather than JSON.
+const UPLOAD_SUB: &str = "upload";
+
+/// The `multipart/form-data` body of the upload route.
+///
+/// Field descriptions go through the same `describe` lookup as every other
+/// parameter, so `trigger_documentation_service` reads the same on the Swagger
+/// page as it does in the tool schema an LLM is handed.
+fn upload_request_body(describe: &impl Fn(&str) -> Option<String>) -> Value {
+    let field = |ty: Value, name: &str| -> Value {
+        match describe(name) {
+            Some(d) => {
+                let mut schema = ty.as_object().cloned().unwrap_or_default();
+                schema.insert("description".into(), json!(d));
+                Value::Object(schema)
+            }
+            None => ty,
+        }
+    };
+    json!({
+        "content": {"multipart/form-data": {"schema": {
+            "type": "object",
+            "properties": {
+                "files": field(
+                    json!({"type": "array", "items": {"type": "string", "format": "binary"}}),
+                    "files",
+                ),
+                "directory": field(json!({"type": "string", "default": "/"}), "directory"),
+                "paths": field(
+                    json!({"type": "array", "items": {"type": "string"}}),
+                    "paths",
+                ),
+                "trigger_documentation_service": field(
+                    json!({"type": "string", "default": "false"}),
+                    "trigger_documentation_service",
+                ),
+            },
+        }}},
+        "required": true,
+    })
+}
+
 /// Summaries for the routes that have no MCP tool (the C# `RestOnly` map).
 const REST_ONLY: &[(&str, &str)] = &[
     ("upload", "Upload one or more files (multipart form) into a directory."),
@@ -382,6 +430,26 @@ const REST_ONLY: &[(&str, &str)] = &[
 /// Parameter descriptions for those same tool free routes.
 const REST_ONLY_PARAMS: &[(&str, &str, &str)] = &[
     ("upload", "mount_id", "Project/volume id the operation targets."),
+    ("upload", "files", "The files to store. Any part carrying a filename is one."),
+    (
+        "upload",
+        "directory",
+        "Absolute POSIX destination directory (defaults to the volume root).",
+    ),
+    (
+        "upload",
+        "paths",
+        "Per file relative path, repeated once per file and paired by position, \
+         which is how a folder upload keeps its structure.",
+    ),
+    (
+        "upload",
+        "trigger_documentation_service",
+        "'true' or '1' to also generate the Markdown companion (path.md) of every \
+         file through the configured document service. Supported for PowerPoint, \
+         Word, PDF, audio and video only, and the whole upload is refused before \
+         anything is written when one file is not.",
+    ),
     ("download", "mount_id", "Project/volume id the operation targets."),
     ("download", "path", "Absolute POSIX path of the file to download."),
     ("download-zip", "mount_id", "Project/volume id the operation targets."),
@@ -864,6 +932,22 @@ const OPERATIONS: &[Op] = &[
         body: "WriteDocxBody",
     },
     Op {
+        method: "POST",
+        sub: "write-bytes",
+        path: "/api/fs/{mount_id}/write-bytes",
+        tool: "fs.write_bytes",
+        params: NO_PARAMS,
+        body: "WriteBytesBody",
+    },
+    Op {
+        method: "POST",
+        sub: "documentize",
+        path: "/api/fs/{mount_id}/documentize",
+        tool: "fs.documentize",
+        params: NO_PARAMS,
+        body: "DocumentizeBody",
+    },
+    Op {
         method: "GET",
         sub: "find-definition",
         path: "/api/fs/{mount_id}/find-definition",
@@ -1121,6 +1205,24 @@ const SCHEMAS: &[Schema] = &[
         ],
     },
     Schema {
+        name: "WriteBytesBody",
+        tool: "fs.write_bytes",
+        required: &["path", "base64"],
+        props: &[
+            plain("path", "string"),
+            plain("base64", "string"),
+            flag("overwrite", false),
+            flag("create_parents", true),
+            flag("trigger_documentation_service", false),
+        ],
+    },
+    Schema {
+        name: "DocumentizeBody",
+        tool: "fs.documentize",
+        required: &["path"],
+        props: &[plain("path", "string"), flag("overwrite", false)],
+    },
+    Schema {
         name: "WriteDocxBody",
         tool: "fs.write_docx",
         required: &["path", "markdown"],
@@ -1242,6 +1344,7 @@ mod tests {
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
         })
     }
 
@@ -1380,7 +1483,58 @@ mod tests {
         assert_eq!(zip["summary"], "Download a directory subtree as a zip archive.");
         let upload = &v["paths"]["/api/fs/{mount_id}/upload"]["post"];
         assert_eq!(upload["summary"], "Upload one or more files (multipart form) into a directory.");
-        assert!(upload.get("requestBody").is_none(), "multipart is not a json body");
+        assert!(
+            upload["requestBody"]["content"].get("application/json").is_none(),
+            "the upload body is a form, never json"
+        );
+    }
+
+    /// The upload form is documented field by field, the documentation flag
+    /// included: a client that cannot see the field cannot use the feature.
+    #[tokio::test]
+    async fn the_upload_form_documents_its_fields_and_the_documentation_flag() {
+        let v = doc(false, false).await;
+        let form = &v["paths"]["/api/fs/{mount_id}/upload"]["post"]["requestBody"]["content"]
+            ["multipart/form-data"]["schema"];
+        assert_eq!(form["type"], "object");
+        assert_eq!(form["properties"]["files"]["items"]["format"], "binary");
+        assert!(
+            form["properties"]["directory"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("destination directory")
+        );
+        assert_eq!(form["properties"]["paths"]["items"]["type"], "string");
+        let trigger = &form["properties"]["trigger_documentation_service"];
+        assert_eq!(trigger["type"], "string");
+        assert_eq!(trigger["default"], "false");
+        assert!(
+            trigger["description"].as_str().unwrap().contains("Markdown companion"),
+            "{trigger}"
+        );
+    }
+
+    /// Plan test 23: the two document service routes are on the page with their
+    /// bodies, and the flag is declared on the JSON one too.
+    #[tokio::test]
+    async fn the_document_service_routes_are_documented() {
+        let v = doc(false, false).await;
+        for (path, schema) in [
+            ("/api/fs/{mount_id}/write-bytes", "WriteBytesBody"),
+            ("/api/fs/{mount_id}/documentize", "DocumentizeBody"),
+        ] {
+            assert_eq!(
+                v["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                format!("#/components/schemas/{schema}"),
+                "{path} is not documented"
+            );
+        }
+        let body = &v["components"]["schemas"]["WriteBytesBody"];
+        assert_eq!(body["required"], json!(["path", "base64"]));
+        assert_eq!(body["properties"]["trigger_documentation_service"]["default"], false);
+        assert_eq!(body["properties"]["create_parents"]["default"], true);
+        assert_eq!(v["components"]["schemas"]["DocumentizeBody"]["required"], json!(["path"]));
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde_json::{Value, json};
 use std::io::Write as _;
 use std::sync::Arc;
@@ -81,6 +82,8 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "apply-patch"),
     ("POST", "extract-text"),
     ("POST", "write-docx"),
+    ("POST", "write-bytes"),
+    ("POST", "documentize"),
 ];
 
 /// Request body ceiling for the JSON endpoints. Axum defaults to 2 MiB, which is
@@ -140,6 +143,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/apply-patch", post(apply_patch))
         .route("/api/fs/{mount_id}/extract-text", post(extract_text))
         .route("/api/fs/{mount_id}/write-docx", post(write_docx))
+        .route("/api/fs/{mount_id}/write-bytes", post(write_bytes))
+        .route("/api/fs/{mount_id}/documentize", post(documentize))
         // Applied outside the routes so the upload keeps its own larger ceiling.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
@@ -449,6 +454,11 @@ async fn move_path(
 /// Multipart upload. Any part carrying a filename is a file; `directory` is the
 /// destination root and the optional repeated `paths` field gives per file
 /// relative paths, which is how a folder upload preserves its structure.
+///
+/// The text field `trigger_documentation_service` (`"true"` or `"1"`) turns the
+/// Markdown companion on for EVERY file of the form. Eligibility is checked for
+/// all of them before the first byte is written, so a mixed batch fails with
+/// nothing stored rather than half an upload.
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path(mount): Path<String>,
@@ -460,6 +470,7 @@ async fn upload(
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         let mut directory = "/".to_string();
         let mut rel_paths: Vec<String> = Vec::new();
+        let mut documentation = false;
 
         // The whole form is read first: the C# `ReadFormAsync` sees every field
         // before pairing files with `paths`, so part order must not matter.
@@ -485,6 +496,12 @@ async fn upload(
                     match name.as_str() {
                         "directory" if !text.is_empty() => directory = text,
                         "paths" => rel_paths.push(text),
+                        // Anything other than an explicit yes is a no: a form
+                        // field is free text, and a typo must not silently spend
+                        // minutes of a converter's time.
+                        "trigger_documentation_service" => {
+                            documentation = matches!(text.trim(), "true" | "1");
+                        }
                         _ => {}
                     }
                 }
@@ -492,32 +509,49 @@ async fn upload(
         }
 
         let base = r.norm(&directory)?;
-        let mut written: Vec<String> = Vec::new();
-        for (index, (fname, data)) in files.iter().enumerate() {
+        let mut destinations: Vec<String> = Vec::with_capacity(files.len());
+        for (index, (fname, _)) in files.iter().enumerate() {
             let rel = match rel_paths.get(index) {
                 Some(p) if !p.is_empty() => p.as_str(),
                 _ if !fname.is_empty() => fname.as_str(),
                 _ => "file",
             };
             let joined = format!("{}/{}", base.trim_end_matches('/'), rel);
-            let dest = r.norm(&PosixPath::normpath(&joined))?;
+            destinations.push(r.norm(&PosixPath::normpath(&joined))?);
+        }
+
+        let doc_service = r.state.doc_service.as_deref();
+        if documentation {
+            // The engine's own gate, run over the whole batch first: one
+            // ineligible file fails the request with nothing written.
+            for dest in &destinations {
+                fs_ops::ensure_documentable(doc_service, dest)?;
+            }
+        }
+
+        let mut written: Vec<String> = Vec::new();
+        let mut reports: Vec<Value> = Vec::new();
+        for (dest, (_, data)) in destinations.iter().zip(files.iter()) {
             // Through the engine so an upload is charged against the write quota and
             // audited. Writing via the volume client (as this did) made the highest
             // volume write path the only one with no accounting at all.
-            fs_ops::write_bytes(
+            let result = fs_ops::write_bytes_documented(
                 &r.client,
                 r.safety(),
+                doc_service,
                 &r.person,
                 &r.mount,
-                &dest,
+                dest,
                 data,
                 true,
                 true,
+                documentation,
             )
             .await?;
-            written.push(dest);
+            reports.push(result.get("documentation").cloned().unwrap_or(Value::Null));
+            written.push(dest.clone());
         }
-        Ok(json!({"written": written, "count": written.len()}))
+        Ok(json!({"written": written, "count": written.len(), "documentation": reports}))
     })
     .await
 }
@@ -1185,6 +1219,62 @@ async fn write_docx(
     .await
 }
 
+/// The JSON mirror of `fs.write_bytes`: base64 in, the same engine underneath.
+async fn write_bytes(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guarded_json(state, headers, mount, |r| async move {
+        let a = body_args(&body)?;
+        let norm = r.norm(&a.str("path")?)?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(a.str("base64")?.trim())
+            .map_err(|e| {
+                ToolError::invalid_argument(format!("argument 'base64' is not valid base64: {e}"))
+            })?;
+        fs_ops::write_bytes_documented(
+            &r.client,
+            r.safety(),
+            r.state.doc_service.as_deref(),
+            &r.person,
+            &r.mount,
+            &norm,
+            &data,
+            a.bool_or("overwrite", false),
+            a.bool_or("create_parents", true),
+            a.bool_or("trigger_documentation_service", false),
+        )
+        .await
+    })
+    .await
+}
+
+/// The JSON mirror of `fs.documentize`.
+async fn documentize(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guarded_json(state, headers, mount, |r| async move {
+        let a = body_args(&body)?;
+        let norm = r.norm(&a.str("path")?)?;
+        fs_ops::documentize(
+            &r.client,
+            r.safety(),
+            r.state.doc_service.as_deref(),
+            &r.person,
+            &r.mount,
+            &norm,
+            a.bool_or("overwrite", false),
+        )
+        .await
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,6 +1301,15 @@ mod tests {
         /// A real `AppState` over throwaway directories, one project owned by
         /// `OWNER`, and signed tokens for a member and a non member.
         async fn new() -> Self {
+            Self::with_doc_service(None).await
+        }
+
+        /// Same, with a document service handed straight to the state. The real
+        /// one is built from config at boot; a test injects a stub here instead,
+        /// so the REST documentation surfaces run without a converter binary.
+        async fn with_doc_service(
+            doc_service: Option<Arc<dyn crate::docs::DocService>>,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let (key_path, pub_path) = keys::write_keypair(root.join("keys")).unwrap();
@@ -1249,6 +1348,7 @@ mod tests {
                 identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+                doc_service,
             });
 
             Self {
@@ -2186,9 +2286,11 @@ mod tests {
     async fn the_route_inventory_covers_every_registered_path() {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
-        assert_eq!(REST_ROUTES.len(), 36);
+        assert_eq!(REST_ROUTES.len(), 38);
         assert!(REST_ROUTES.contains(&("GET", "download-zip")));
         assert!(REST_ROUTES.contains(&("POST", "write-docx")));
+        assert!(REST_ROUTES.contains(&("POST", "write-bytes")));
+        assert!(REST_ROUTES.contains(&("POST", "documentize")));
     }
 
     // ── GROUP J: new dataplane tests ───────────────────────────────────────
@@ -2260,5 +2362,217 @@ mod tests {
         assert_eq!(archive.len(), 1, "zip must contain exactly one entry");
         let entry = archive.by_index(0).unwrap();
         assert_eq!(entry.name(), "only.txt");
+    }
+
+    // ── the document service plane ───────────────────────────────────────────
+
+    /// What the injected stub converts every document to.
+    const STUB_MD: &str = "# converted by the stub\n";
+
+    fn stubbed() -> Option<Arc<dyn crate::docs::DocService>> {
+        Some(Arc::new(crate::docs::service::StubDocService::ok(STUB_MD)))
+    }
+
+    fn b64(data: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
+    /// One multipart upload body: `(filename, bytes)` parts plus the optional
+    /// trigger field, built by hand because the shape is the contract.
+    fn upload_body(boundary: &str, files: &[(&str, &str)], trigger: Option<&str>) -> String {
+        let mut out = String::new();
+        if let Some(value) = trigger {
+            out.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; \
+                 name=\"trigger_documentation_service\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        for (name, content) in files {
+            out.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; \
+                 filename=\"{name}\"\r\n\r\n{content}\r\n"
+            ));
+        }
+        out.push_str(&format!("--{boundary}--\r\n"));
+        out
+    }
+
+    async fn upload(h: &Harness, body: String, boundary: &str) -> (StatusCode, Value) {
+        let (status, raw) = h
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri(u("upload"))
+                    .header("Authorization", format!("Bearer {}", h.owner_token))
+                    .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+        (status, serde_json::from_slice(&raw).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn write_bytes_stores_the_decoded_payload() {
+        let h = Harness::new().await;
+        let (status, v) = h
+            .post(&u("write-bytes"), json!({"path": "/raw/blob.bin", "base64": b64(&[0, 1, 2, 255])}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["bytes_written"], 4);
+        assert_eq!(v["documentation"], Value::Null);
+
+        let (status, bytes) = h.get_raw(&u("download?path=/raw/blob.bin")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, vec![0, 1, 2, 255]);
+    }
+
+    #[tokio::test]
+    async fn write_bytes_rejects_invalid_base64() {
+        let h = Harness::new().await;
+        let (status, v) =
+            h.post(&u("write-bytes"), json!({"path": "/bad.bin", "base64": "not base64!"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+    }
+
+    #[tokio::test]
+    async fn write_bytes_with_the_flag_stores_the_companion() {
+        let h = Harness::with_doc_service(stubbed()).await;
+        let (status, v) = h
+            .post(
+                &u("write-bytes"),
+                json!({"path": "/deck.pptx", "base64": b64(b"PK-bytes"),
+                       "trigger_documentation_service": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["documentation"]["md_path"], "/deck.md");
+
+        let (status, read) = h.get(&u("read?path=/deck.md&line_numbered=false")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["content"], STUB_MD.trim_end());
+    }
+
+    /// The pre-write gate, over REST: an ineligible extension is refused and the
+    /// file is not stored.
+    #[tokio::test]
+    async fn write_bytes_refuses_an_ineligible_extension() {
+        let h = Harness::with_doc_service(stubbed()).await;
+        let (status, v) = h
+            .post(
+                &u("write-bytes"),
+                json!({"path": "/notes.txt", "base64": b64(b"plain"),
+                       "trigger_documentation_service": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(v["error"], code::NOT_SUPPORTED);
+
+        let (_, exists) = h.get(&u("exists?path=/notes.txt")).await;
+        assert_eq!(exists["exists"], false, "nothing may be written");
+    }
+
+    #[tokio::test]
+    async fn documentize_converts_a_stored_file_and_is_no_clobber() {
+        let h = Harness::with_doc_service(stubbed()).await;
+        h.post(&u("write-bytes"), json!({"path": "/report.pdf", "base64": b64(b"%PDF")})).await;
+
+        let (status, v) = h.post(&u("documentize"), json!({"path": "/report.pdf"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["md_path"], "/report.md");
+        assert_eq!(v["overwritten"], false);
+
+        let (status, v) = h.post(&u("documentize"), json!({"path": "/report.pdf"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(v["error"], code::NO_CLOBBER);
+
+        let (status, v) =
+            h.post(&u("documentize"), json!({"path": "/report.pdf", "overwrite": true})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["overwritten"], true);
+    }
+
+    #[tokio::test]
+    async fn documentize_without_a_configured_service_is_not_supported() {
+        let h = Harness::new().await;
+        h.post(&u("write-bytes"), json!({"path": "/report.pdf", "base64": b64(b"%PDF")})).await;
+        let (_, v) = h.post(&u("documentize"), json!({"path": "/report.pdf"})).await;
+        assert_eq!(v["error"], code::NOT_SUPPORTED);
+        assert!(v["detail"].as_str().unwrap().contains("not configured"), "{v}");
+    }
+
+    /// The flag applies to every file of the form, and the response reports one
+    /// entry per written file.
+    #[tokio::test]
+    async fn upload_with_the_flag_documents_every_file() {
+        let h = Harness::with_doc_service(stubbed()).await;
+        let boundary = "DOC-BOUNDARY";
+        let body =
+            upload_body(boundary, &[("a.pptx", "PK-a"), ("b.pdf", "%PDF-b")], Some("true"));
+        let (status, v) = upload(&h, body, boundary).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["documentation"][0]["md_path"], "/a.md");
+        assert_eq!(v["documentation"][1]["md_path"], "/b.md");
+        for path in ["/a.md", "/b.md"] {
+            let (_, exists) = h.get(&u(&format!("exists?path={path}"))).await;
+            assert_eq!(exists["exists"], true, "{path} is missing");
+        }
+    }
+
+    /// Absent or anything other than true/1 leaves the flag off, and the
+    /// per file report is null rather than absent.
+    #[tokio::test]
+    async fn upload_without_the_flag_reports_no_documentation() {
+        let h = Harness::with_doc_service(stubbed()).await;
+        for trigger in [None, Some("no"), Some("false")] {
+            let boundary = "OFF-BOUNDARY";
+            let body = upload_body(boundary, &[("deck.pptx", "PK")], trigger);
+            let (status, v) = upload(&h, body, boundary).await;
+            assert_eq!(status, StatusCode::OK, "{trigger:?}");
+            assert_eq!(v["documentation"], json!([Value::Null]), "{trigger:?}");
+            let (_, exists) = h.get(&u("exists?path=/deck.md")).await;
+            assert_eq!(exists["exists"], false, "{trigger:?}");
+        }
+    }
+
+    /// A mixed batch is refused as a whole: eligibility is checked for every file
+    /// before the first one is written, so nothing is left behind.
+    #[tokio::test]
+    async fn upload_with_the_flag_fails_a_mixed_batch_with_nothing_written() {
+        let h = Harness::with_doc_service(stubbed()).await;
+        let boundary = "MIX-BOUNDARY";
+        let body =
+            upload_body(boundary, &[("deck.pptx", "PK"), ("notes.txt", "plain")], Some("1"));
+        let (status, v) = upload(&h, body, boundary).await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(v["error"], code::NOT_SUPPORTED);
+        for path in ["/deck.pptx", "/notes.txt", "/deck.md"] {
+            let (_, exists) = h.get(&u(&format!("exists?path={path}"))).await;
+            assert_eq!(exists["exists"], false, "{path} must not have been written");
+        }
+    }
+
+    /// A conversion that fails does not roll the upload back: the bytes the caller
+    /// sent are kept and the error is reported per file.
+    #[tokio::test]
+    async fn upload_keeps_the_files_when_the_conversion_fails() {
+        let failing = crate::docs::service::StubDocService::failing(ToolError::internal(
+            "converter exploded",
+        ));
+        let h = Harness::with_doc_service(Some(Arc::new(failing))).await;
+        let boundary = "ERR-BOUNDARY";
+        let body = upload_body(boundary, &[("deck.pptx", "PK")], Some("true"));
+        let (status, v) = upload(&h, body, boundary).await;
+
+        assert_eq!(status, StatusCode::OK, "a failed conversion is not a failed upload");
+        assert_eq!(v["documentation"][0]["error"]["code"], code::INTERNAL_ERROR);
+        let (_, exists) = h.get(&u("exists?path=/deck.pptx")).await;
+        assert_eq!(exists["exists"], true, "the source survives");
+        let (_, md) = h.get(&u("exists?path=/deck.md")).await;
+        assert_eq!(md["exists"], false);
     }
 }

@@ -1145,6 +1145,7 @@ mod tests {
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
         });
         let git = Arc::new(GitRepoStore::new(config, crate::storage::test_registry()));
         if initialized {
@@ -1250,6 +1251,7 @@ mod tests {
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
         });
         let git = Arc::new(GitRepoStore::new(config, crate::storage::test_registry()));
         git.init_repo("proj").await.unwrap();

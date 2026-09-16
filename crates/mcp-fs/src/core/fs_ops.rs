@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::core::diff;
+use crate::docs::service::{DocService, eligible_in};
 use crate::errors::{Result, ToolError};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
@@ -621,6 +622,160 @@ pub async fn write_bytes(
     safety.record_read(person, mount_id, norm);
     safety.record_audit(person, mount_id, "write", norm, &format!("{} bytes", data.len()));
     Ok(json!({ "path": norm, "bytes_written": data.len(), "overwritten": exists }))
+}
+
+/// Store raw bytes, optionally generating the Markdown companion through the
+/// configured document service. Keys: `path`, `bytes_written`, `overwritten`,
+/// `documentation` (null when not requested).
+///
+/// Every precondition of the conversion is checked BEFORE the first byte is
+/// written, so a flag set against an ineligible file stores nothing. Once the
+/// source is committed the opposite rule applies: a conversion failure neither
+/// rolls it back nor fails the call, because deleting a user's just uploaded file
+/// because a third party converter crashed is worse than returning it without its
+/// companion, and `documentize` is the retry surface.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_bytes_documented(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    doc: Option<&dyn DocService>,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    data: &[u8],
+    overwrite: bool,
+    create_parents: bool,
+    documentation: bool,
+) -> Result<Value> {
+    let service = if documentation {
+        let service = ensure_documentable(doc, norm)?;
+        ensure_input_size(service, norm, data.len())?;
+        Some(service)
+    } else {
+        None
+    };
+
+    let mut result =
+        write_bytes(client, safety, person, mount_id, norm, data, overwrite, create_parents).await?;
+
+    let report = match service {
+        None => Value::Null,
+        // The source was just written, so an older companion is stale by
+        // definition: the companion always overwrites here.
+        Some(service) => {
+            match write_companion(client, safety, service, person, mount_id, norm, data, true).await
+            {
+                Ok((md_path, bytes_written, _)) => json!({
+                    "md_path": md_path,
+                    "bytes_written": bytes_written,
+                }),
+                Err(e) => json!({ "error": { "code": e.code, "message": e.message } }),
+            }
+        }
+    };
+    if let Value::Object(map) = &mut result {
+        map.insert("documentation".into(), report);
+    }
+    Ok(result)
+}
+
+/// Run the document service on a file already stored in the volume and write its
+/// companion. Keys: `path`, `md_path`, `bytes_written`, `overwritten`.
+///
+/// Unlike the upload path this one honours the caller's `overwrite` on the
+/// companion, and a conversion failure IS the result: there is no source write to
+/// protect.
+pub async fn documentize(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    doc: Option<&dyn DocService>,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    overwrite: bool,
+) -> Result<Value> {
+    if !client.is_file(norm).await? {
+        return Err(ToolError::not_found(format!("not a file: {norm}")));
+    }
+    // Eligibility before the read: no point pulling a gigabyte the service would
+    // refuse anyway.
+    let service = ensure_documentable(doc, norm)?;
+    let data = client.read_bytes(norm).await?;
+    ensure_input_size(service, norm, data.len())?;
+
+    let (md_path, bytes_written, overwritten) =
+        write_companion(client, safety, service, person, mount_id, norm, &data, overwrite).await?;
+    safety.record_read(person, mount_id, norm);
+    Ok(json!({
+        "path": norm,
+        "md_path": md_path,
+        "bytes_written": bytes_written,
+        "overwritten": overwritten,
+    }))
+}
+
+/// The service, provided it is configured and accepts this path.
+///
+/// Public because the multipart upload validates EVERY file of a batch before it
+/// writes the first one, and that rule must be the engine's rather than a second
+/// copy of it living in the REST layer.
+pub fn ensure_documentable<'a>(
+    doc: Option<&'a dyn DocService>,
+    norm: &str,
+) -> Result<&'a dyn DocService> {
+    let service =
+        doc.ok_or_else(|| ToolError::not_supported("document service is not configured"))?;
+    let extensions = service.accepted_extensions();
+    if !eligible_in(norm, extensions) {
+        return Err(ToolError::not_supported(format!(
+            "'{norm}' cannot be documented, the document service accepts: {}",
+            extensions.join(", ")
+        )));
+    }
+    Ok(service)
+}
+
+/// The size gate. Separate from [`ensure_documentable`] only because
+/// `documentize` learns the size after reading, while an upload knows it up front.
+fn ensure_input_size(service: &dyn DocService, norm: &str, len: usize) -> Result<()> {
+    let cap = service.max_input_bytes();
+    if len as u64 > cap {
+        return Err(ToolError::invalid_argument(format!(
+            "'{norm}' is {len} bytes, over the doc_service.max_input_bytes limit of {cap}"
+        )));
+    }
+    Ok(())
+}
+
+/// Convert `data` and store the Markdown beside its source. Returns the companion
+/// path, its size and whether it replaced an existing file.
+///
+/// The companion goes to [`crate::docs::companion_md_path`], the very path
+/// `fs.extract_text` looks at, so a doc service companion is served as a cache hit
+/// by the built-in extractor at no extra cost. It is charged and audited like any
+/// write, under its own op so the audit log distinguishes it from a plain write.
+#[allow(clippy::too_many_arguments)]
+async fn write_companion(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    service: &dyn DocService,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    data: &[u8],
+    overwrite: bool,
+) -> Result<(String, usize, bool)> {
+    let md = crate::docs::companion_md_path(norm);
+    let overwritten = client.exists(&md).await?;
+    if overwritten && !overwrite {
+        return Err(ToolError::no_clobber(format!("'{md}' exists (pass overwrite=true)")));
+    }
+    let file_name = norm.rsplit('/').next().unwrap_or(norm);
+    let markdown = service.to_markdown(data, file_name).await?;
+    commit(client, safety, person, mount_id, &md, &markdown, "doc_service").await?;
+    // A fresh companion counts as read, so a follow-up edit passes the guard.
+    safety.record_read(person, mount_id, &md);
+    Ok((md, markdown.len(), overwritten))
 }
 
 pub async fn write_text(
@@ -2885,6 +3040,183 @@ mod tests {
         let payload = vec![0xff, 0x00, 0xfe, 0x80];
         write_bytes(&f.v, &f.s, P, M, "/raw.bin", &payload, false, true).await.unwrap();
         assert_eq!(f.v.read_bytes("/raw.bin").await.unwrap(), payload);
+    }
+
+    // ── the document service ──────────────────────────────────────────────
+
+    use crate::docs::service::StubDocService;
+
+    const MD: &str = "# converted by the stub\n";
+
+    /// A valid PowerPoint upload, flag off: byte identical to `write_bytes`, and
+    /// `documentation` is explicitly null rather than absent.
+    #[tokio::test]
+    async fn documented_write_with_the_flag_off_matches_write_bytes() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD);
+        let payload = vec![7u8; 64];
+
+        let plain = write_bytes(&f.v, &f.s, P, M, "/plain.pptx", &payload, false, true).await.unwrap();
+        let r = write_bytes_documented(
+            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", &payload, false, true, false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r["bytes_written"], plain["bytes_written"]);
+        assert_eq!(r["overwritten"], plain["overwritten"]);
+        assert_eq!(r["documentation"], Value::Null);
+        assert!(!f.v.exists("/deck.md").await.unwrap(), "no companion without the flag");
+    }
+
+    /// The whole feature in one test: both files stored, both charged, both audited.
+    #[tokio::test]
+    async fn documented_write_stores_the_companion_and_accounts_for_both() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD);
+        let payload = vec![7u8; 64];
+
+        let r = write_bytes_documented(
+            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", &payload, false, true, true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(s(&r, "path"), "/deck.pptx");
+        assert_eq!(r["bytes_written"], 64);
+        assert_eq!(s(&r["documentation"], "md_path"), "/deck.md");
+        assert_eq!(r["documentation"]["bytes_written"], MD.len());
+        assert_eq!(f.v.read_bytes("/deck.pptx").await.unwrap(), payload);
+        assert_eq!(f.v.read_text("/deck.md").await.unwrap(), MD);
+
+        assert_eq!(f.s.bytes_written(P, M), 64 + MD.len() as i64, "both writes charged");
+        let log = f.s.audit(P, M);
+        assert_eq!(log.len(), 2, "one entry per write: {log:?}");
+        assert_eq!(log[0].op, "write");
+        assert_eq!(log[0].path, "/deck.pptx");
+        assert_eq!(log[1].op, "doc_service");
+        assert_eq!(log[1].path, "/deck.md");
+    }
+
+    /// The pre-write validation is what is really under test: an ineligible
+    /// extension must leave nothing behind, not a file without its companion.
+    #[tokio::test]
+    async fn documented_write_refuses_an_ineligible_extension_before_writing() {
+        for path in ["/notes.txt", "/sheet.xlsx", "/logo.png"] {
+            let f = fixture().await;
+            let stub = StubDocService::ok(MD);
+            let e = write_bytes_documented(
+                &f.v, &f.s, Some(&stub), P, M, path, b"body", false, true, true,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.code, code::NOT_SUPPORTED, "{path}");
+            assert!(e.message.contains(".pptx"), "the accepted set is named: {}", e.message);
+            assert!(!f.v.exists(path).await.unwrap(), "{path} must not have been written");
+            assert_eq!(f.s.bytes_written(P, M), 0, "nothing charged");
+        }
+    }
+
+    /// The flag set while the feature is off must say so, not silently store the
+    /// file without its companion.
+    #[tokio::test]
+    async fn documented_write_without_a_service_writes_nothing() {
+        let f = fixture().await;
+        let e = write_bytes_documented(&f.v, &f.s, None, P, M, "/deck.pptx", b"body", false, true, true)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert!(e.message.contains("not configured"), "{}", e.message);
+        assert!(!f.v.exists("/deck.pptx").await.unwrap(), "nothing written");
+    }
+
+    /// Once the source is committed a converter crash is reported, never rolled back.
+    #[tokio::test]
+    async fn a_conversion_failure_keeps_the_upload_and_reports_the_error() {
+        let f = fixture().await;
+        let stub = StubDocService::failing(ToolError::internal("converter exploded"));
+
+        let r = write_bytes_documented(
+            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", b"body", false, true, true,
+        )
+        .await
+        .expect("a failed conversion is not a failed upload");
+
+        assert!(f.v.exists("/deck.pptx").await.unwrap(), "the source survives");
+        assert!(!f.v.exists("/deck.md").await.unwrap(), "no companion");
+        assert_eq!(r["documentation"]["error"]["code"], code::INTERNAL_ERROR);
+        assert_eq!(s(&r["documentation"]["error"], "message"), "converter exploded");
+    }
+
+    #[tokio::test]
+    async fn an_oversize_input_is_refused_before_writing() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD).with_max_input_bytes(8);
+        let e = write_bytes_documented(
+            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", &[0u8; 9], false, true, true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(e.message.contains("max_input_bytes"), "{}", e.message);
+        assert!(!f.v.exists("/deck.pptx").await.unwrap(), "nothing written");
+        assert_eq!(f.s.bytes_written(P, M), 0);
+    }
+
+    /// `documentize` is the retry surface, so it honours the caller's `overwrite`.
+    #[tokio::test]
+    async fn documentize_writes_the_companion_and_honours_no_clobber() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD);
+        f.v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
+
+        let r = documentize(&f.v, &f.s, Some(&stub), P, M, "/report.pdf", false).await.unwrap();
+        assert_eq!(s(&r, "path"), "/report.pdf");
+        assert_eq!(s(&r, "md_path"), "/report.md");
+        assert_eq!(r["bytes_written"], MD.len());
+        assert_eq!(r["overwritten"], false);
+        assert_eq!(f.v.read_text("/report.md").await.unwrap(), MD);
+
+        let e = documentize(&f.v, &f.s, Some(&stub), P, M, "/report.pdf", false).await.unwrap_err();
+        assert_eq!(e.code, code::NO_CLOBBER);
+
+        let second = StubDocService::ok("# rewritten\n");
+        let r2 = documentize(&f.v, &f.s, Some(&second), P, M, "/report.pdf", true).await.unwrap();
+        assert_eq!(r2["overwritten"], true);
+        assert_eq!(f.v.read_text("/report.md").await.unwrap(), "# rewritten\n");
+    }
+
+    /// The companion path is deliberately the one `fs.extract_text` looks at, so a
+    /// doc service companion is served as a cache hit by the built-in extractor.
+    #[tokio::test]
+    async fn the_companion_is_a_cache_hit_for_extract_text() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD);
+        write_bytes_documented(
+            &f.v, &f.s, Some(&stub), P, M, "/report.pdf", b"%PDF-1.4 not really a pdf", false, true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let r = extract_document(
+            &f.v,
+            &f.s,
+            &crate::config::OcrConfig::default(),
+            P,
+            M,
+            "/report.pdf",
+            100_000,
+            1_000,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r["cached"], true, "the doc service companion must be reused");
+        assert_eq!(s(&r, "md_path"), "/report.md");
+        assert_eq!(s(&r, "preview"), MD);
     }
 
     // ── V4A patch internals (moved here with the engine) ──────────────────

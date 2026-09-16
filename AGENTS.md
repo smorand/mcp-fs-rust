@@ -2,7 +2,7 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (55 tools: 33 `fs.*`, 8 `admin.*`, 11 `git.*`, 3 `git.auth*`),
+multi-project filesystem** (57 tools: 35 `fs.*`, 8 `admin.*`, 11 `git.*`, 3 `git.auth*`),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/`. Ships with
 `agent`, an interactive CLI agent that drives the tools through an LLM (`./agent.sh`).
@@ -10,6 +10,12 @@ a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger U
 Server state (metadata tree, ACL, git index, OAuth tokens) lives in a relational store:
 **SQLite** by default, **PostgreSQL** or **SQL Server** per store via config. Blob bytes
 stay in `infra.blob` (local or S3).
+
+An optional `doc_service` section plugs an external document to Markdown converter in,
+either a CLI (`doc-convert --stdout {document}`, sandboxed in a per call tempdir) or an
+HTTP endpoint. It is off by default and drives `fs.write_bytes`'s
+`trigger_documentation_service` flag, the same flag on the REST `/upload`, and
+`fs.documentize`. The companion is written at the path `fs.extract_text` already uses.
 
 Started as a strict 1:1 port of a C# implementation. **That is history**: the C# is not a
 reference, must not be read, and is diverging by design (it has no PostgreSQL support,
@@ -35,6 +41,7 @@ mcp-fs migrate --from a.yaml --to b.yaml  offline copy of relational state betwe
 docker compose -f docker-compose.test.yml up -d  postgres + mssql for the opt-in suites
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
+python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
 ./agent.sh --user <name>              interactive CLI agent; starts/stops the server if needed
 python3 scripts/pty_check.py          agent line editor checks on a real pty
 ```
@@ -62,7 +69,8 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
   pool cache, StoreManager).
 - `core/` : `fs_ops.rs` (every filesystem operation, the engine the tools call), `diff.rs`.
 - `docs/` : `extract.rs`, `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
-  `ocr.rs` (pluggable, null by default), `mime.rs`.
+  `ocr.rs` (pluggable, null by default), `mime.rs`, `service.rs` (the external
+  document to Markdown converter, cli or api, off by default).
 - `tools/` : one module per family, each `register(&mut ToolRegistry)`. `all.rs` has
   `register_all`.
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
@@ -73,7 +81,7 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 55 tool schemas and return shapes, human readable. **This is
+- `TOOL_CONTRACT.txt` : the 57 tool schemas and return shapes, human readable. **This is
   the authoritative contract.**
 - `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
   every name, description and `inputSchema` against it, serialized, so a reordered schema
@@ -134,7 +142,7 @@ keyed text has a length ceiling there).
 
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
-- `.agent_docs/tools.md` : the 55 tool reference (families, parameters, authorization).
+- `.agent_docs/tools.md` : the 57 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, OAuth.
 - `.agent_docs/config.md` : full YAML schema, backends and dsn, resolution order, secrets.

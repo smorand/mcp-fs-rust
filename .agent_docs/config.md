@@ -149,6 +149,116 @@ The prompt and the key are request material only: they are never logged, never
 echoed in an error and never returned to the caller, because tool output flows
 straight into an LLM context.
 
+## `doc_service`
+
+An external, stateless document to Markdown converter, in two interchangeable
+forms. It backs the `trigger_documentation_service` flag on byte uploads and the
+`fs.documentize` tool: the companion lands at the exact path `fs.extract_text`
+looks at (`toto.pptx` -> `toto.md`), so it is then served as a cache hit by the
+built-in extractor. **Off by default**, so no existing deployment changes.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | when false, the upload flag answers `ERR_NOT_SUPPORTED` rather than silently storing a file without its companion |
+| `mode` | string | `cli` | `cli` or `api`. Anything else is `ERR_INVALID_ARGUMENT` naming the accepted values |
+| `extensions` | list | `[]` | overrides the built-in eligible set when non empty, so a deployment can narrow it to what its converter really handles |
+| `max_input_bytes` | int | `536870912` (512 MiB) | refuse to convert beyond this; checked **before** any byte is written |
+| `cli.command` | list | `[doc-convert, --stdout, --quiet, {document}]` | argv, never a shell string. Exactly one `{document}` placeholder across the whole list |
+| `cli.timeout_secs` | int | `900` | wall clock ceiling for one conversion; on expiry the child is killed and reaped |
+| `api.url` | string | `""` | `POST` target; must start with `http://` or `https://` |
+| `api.auth_header` | string | `Authorization` | header **NAME**, not necessarily a bearer scheme |
+| `api.auth_token` | string | `""` | **Secret**: inject it with `${VAR}`. Sent **verbatim**, so a bearer is written `auth_token: "Bearer ${TOKEN}"`. Omitted entirely when empty |
+| `api.file_field` | string | `file` | name of the `multipart/form-data` part carrying the document, because a third party endpoint names it whatever it likes |
+| `api.response_field` | string | `""` | empty means the response body IS the Markdown; otherwise the body is JSON and this names the field carrying it |
+| `api.timeout_secs` | int | `900` | request timeout of the shared HTTP client, built once at boot |
+
+The built-in eligible set is PowerPoint (`.pptx .pptm .potx .ppsx .ppt`), Word
+(`.docx .doc`), PDF, audio (`.mp3 .m4a .wav .ogg .flac .aac .opus .wma`) and
+video (`.mp4 .mov .mkv .webm .avi .m4v .mpeg .mpg`). `.xlsx` and images are
+deliberately absent: `fs.extract_text` already covers them.
+
+### Validation at boot
+
+Checked only when `enabled` is true, because an unfinished draft must not stop a
+boot that does not use the feature. Each failure is `ERR_INVALID_ARGUMENT` naming
+the offending key:
+
+* `mode` is not one of the two accepted values;
+* `mode: cli` and `cli.command` is empty, or carries anything other than exactly
+  one `{document}` placeholder (none means the converter is never told which file
+  to read, two means it is handed a document it was never asked to merge);
+* `mode: api` and `api.url` is empty or is not `http://` / `https://`;
+* `api.auth_token` is set while `api.auth_header` is empty, which would silently
+  drop the token and leave the operator believing the endpoint is authenticated;
+* `api.file_field` is empty, which every server rejects on the first upload.
+
+### Example, cli mode
+
+```yaml
+doc_service:
+  enabled: true
+  mode: cli
+  max_input_bytes: 536870912
+  cli:
+    command: ["doc-convert", "--stdout", "--quiet", "{document}"]
+    timeout_secs: 900
+```
+
+### Example, api mode
+
+```yaml
+doc_service:
+  enabled: true
+  mode: api
+  extensions: [".pdf", ".pptx", ".docx"]
+  api:
+    url: https://convert.internal/v1/markdown
+    auth_header: Authorization
+    auth_token: "Bearer ${MCPFS_DOC_SERVICE_TOKEN}"
+    file_field: file
+    response_field: ""
+    timeout_secs: 900
+```
+
+The request is `POST url`, `multipart/form-data`, one part named by
+`api.file_field` (`file` by default) carrying the original filename and the MIME
+guessed from its extension (`application/octet-stream` when unknown), Markdown
+back on 2xx. Only the part name and the response shape are negotiable, which is
+what `api.file_field` and `api.response_field` are for: a third party endpoint
+needs no adapter of ours.
+
+### Sandboxing, and its limit
+
+In `cli` mode the converter is an arbitrary third party binary, so containment is
+by construction: every call gets a fresh temporary directory; the input is written
+inside it under a sanitized single segment name keeping the original extension;
+the child runs with that directory as its working directory and `{document}`
+expands to a **relative** `./name.ext`, so a converter that writes beside its
+input (as `doc-convert` does, it creates `toto_docling/`) writes inside the
+sandbox; `TMPDIR`, `TMP` and `TEMP` point there too; the command is an argv list
+so there is no shell, no redirection, no `&&` and no glob; only stdout is read;
+stderr is captured, capped at 8 KiB keeping the tail, and surfaced only on
+failure; and the directory is removed on every exit path, including a timeout,
+where the child is killed and reaped **before** the removal so no process is left
+writing into a directory being deleted.
+
+**This is not a hard OS sandbox, and it is not sold as one.** Containment is cwd
+plus a relative path plus `TMPDIR` plus argv-without-shell. A converter that
+writes to an absolute path or into `$HOME` escapes it and the cleanup will not
+catch it. Full containment is the operator's call and is deliberately left there,
+because a general purpose jail would break a converter that legitimately needs
+network access and a model cache: wrap argv[0] in your own jail, which is exactly
+why `command` is a list.
+
+```yaml
+doc_service:
+  cli:
+    command: ["docker", "run", "--rm", "-i", "my/doc-convert", "--stdout", "{document}"]
+```
+
+`env_clear` is deliberately NOT used: a converter legitimately needs `HOME`,
+`PATH` and its model caches.
+
 ## `git`
 
 | Key | Type | Default | Meaning |
@@ -208,6 +318,7 @@ composition root by name.
 | `MCPFS_MINIO_SECRET_KEY` | `infra.blob.secret_key` in `config/minio.yaml.template` |
 | `MCPFS_GITHUB_CLIENT_SECRET` | the `git.auth` GitHub device flow (name configurable) |
 | `MCPFS_TOKEN_KEY` | when set, OAuth tokens are persisted encrypted (AES-256-GCM, 32 byte base64 key); unset means memory only |
+| any name you choose | `doc_service.api.auth_token`, for example `${MCPFS_DOC_SERVICE_TOKEN}` |
 | any name you choose | the `dsn` of a relational store, for example `${MCPFS_META_DSN}` |
 
 A **dsn is a secret**, because it usually carries a password. `dsn` is typed as `Dsn`,
@@ -215,6 +326,12 @@ not `String`, and that type redacts itself in both `Debug` and `Display`, printi
 `Dsn(redacted)` or `redacted`. So a dsn cannot reach a log line, a boot banner or an
 error message even by accident, and there is a test asserting it. Never format a dsn
 with `{:?}` expecting to see it, and never add a field that prints one.
+
+`doc_service.api.auth_token` is typed `Secret`, the same newtype contract for a
+credential that is not a connection string: `Debug` prints `Secret(redacted)` or
+`Secret(unset)`, `Display` prints `redacted` or `unset`, and `expose()` is the
+single audited read point, used once where the request header is built. A test
+asserts the token does not appear in a `{:?}` of the whole config.
 
 * `.env` is **gitignored**; `.env.example` is tracked as the template. `run.sh`
   sources `.env` when present.

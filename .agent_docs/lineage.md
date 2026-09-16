@@ -38,7 +38,7 @@ an LLM facing contract regardless of where it came from. It is frozen in two pla
 
 | File | Role |
 |---|---|
-| `TOOL_CONTRACT.txt` | human readable reference for the 55 tools, their parameters and return shapes |
+| `TOOL_CONTRACT.txt` | human readable reference for the 57 tools, their parameters and return shapes |
 | `tool-contract-golden.json` | machine checked snapshot: names, descriptions and `inputSchema`, compared on every test run |
 
 Three tests enforce it (`tools/mod.rs`, `tools/all.rs`, `tools/contract_golden.rs`),
@@ -120,6 +120,45 @@ requires is sent. Routes enforce project membership, not merely that the repo ex
 `max_pack_size_mb` is enforced.
 
 Verified end to end: clone, commit, push, reclone.
+
+### Document as a service (2026-09-16)
+
+An external converter turns an uploaded document into its Markdown companion, driven by a
+per call flag rather than by a hook on every write: the caller decides, because converting
+on every eligible write would fire on edits and on internally generated files and would
+make every write pay a multi second latency.
+
+**The CLI converter is contained by construction, not by trust.** It is an arbitrary third
+party binary, so every call gets a fresh `TempDir`; the input is staged inside it under a
+sanitized single segment name keeping its extension; the child runs with that directory as
+its working directory and is handed a **relative** `./name.ext`, so a tool that writes
+beside its input (docling creates `name_docling/`) writes inside the sandbox; `TMPDIR`,
+`TMP` and `TEMP` point there too, while `env_clear` is deliberately NOT used because a
+converter legitimately needs `HOME`, `PATH` and its model cache; the command is an argv
+**list**, never a shell string, so there is no redirection, no `&&` and no glob; only
+stdout is read, and stderr is captured, capped at 8 KiB of its tail and surfaced only on
+failure, because a progress bar must never reach a log line; on timeout the child is
+killed and reaped **before** the directory is removed, so no process is left writing into
+a directory being deleted. This is not a hard OS sandbox: a converter writing to an
+absolute path or to `$HOME` escapes it, and real containment is the operator's call
+through argv[0] (`sandbox-exec`, `bwrap`, `docker run`), which is precisely why the
+command is a list.
+
+**An upload is never rolled back when the conversion fails.** Eligibility, configuration
+and size are all checked **before the first byte is written**, so a flag set on an
+ineligible file stores nothing at all. Once the source bytes are committed the rule
+inverts: a converter that crashes does not fail the call and does not delete the file. The
+response carries `documentation.error` instead. Deleting a user's just uploaded document
+because a third party binary segfaulted is worse than returning it without its companion,
+and `fs.documentize` exists as the retry surface. The same reasoning gives the multipart
+upload its all or nothing pre-pass: every file's eligibility is validated through the
+engine's own gate before any of them is written, so a mixed batch fails cleanly rather
+than half way.
+
+The companion path is deliberately the one `fs.extract_text` already uses
+(`report.pdf` -> `report.md`), so a doc service companion is served as a cache hit by the
+built-in extractor at no extra cost, and the two features can never produce two files for
+one document.
 
 ### Smaller ones
 

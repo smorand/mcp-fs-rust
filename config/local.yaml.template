@@ -50,6 +50,29 @@ extract:
     # api_key_env: MCP_FS_OCR_KEY
     # prompt: "Transcribe this document faithfully into Markdown."
 
+# External document to Markdown converter (opt-in), used by the
+# trigger_documentation_service flag on byte uploads and by fs.documentize.
+# PowerPoint, Word, PDF, audio and video only. Off by default.
+# doc_service:
+#   enabled: false
+#   mode: cli                      # cli | api
+#   extensions: []                 # empty = the built-in eligible set
+#   max_input_bytes: 536870912     # 512 MiB
+#   # cli mode: an argv list, never a shell string. Exactly one {document}
+#   # placeholder, expanded to a relative name inside a per-call sandbox. Wrap
+#   # argv[0] in sandbox-exec / bwrap / docker run for real OS containment.
+#   cli:
+#     command: ["doc-convert", "--stdout", "--quiet", "{document}"]
+#     timeout_secs: 900
+#   # api mode: POST multipart/form-data, Markdown back.
+#   api:
+#     url: ""
+#     auth_header: Authorization   # header NAME, not necessarily a bearer
+#     auth_token: "${MCPFS_DOC_SERVICE_TOKEN}"   # secret, sent verbatim
+#     file_field: file             # name of the multipart part carrying the document
+#     response_field: ""           # empty = the response body IS the markdown
+#     timeout_secs: 900
+
 # Git HTTP smart server (opt-in). When enabled, adds git.* MCP tools and
 # HTTP endpoints at /git/{mount_id}/info/refs etc.
 git:

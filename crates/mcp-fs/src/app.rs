@@ -85,6 +85,10 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         anyhow::bail!("server.mcp_path must start with '/' (got '{mcp_path}')");
     }
 
+    // Built once, here, so the api mode's HTTP client and its connection pool are
+    // reused across conversions instead of rebuilt per call.
+    let doc_service = crate::docs::service::from_config(&config.doc_service)?;
+
     let state = Arc::new(AppState {
         config,
         admin,
@@ -93,6 +97,7 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         identity,
         registry: Arc::new(registry),
         editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+        doc_service,
     });
 
     let mut router = Router::new()

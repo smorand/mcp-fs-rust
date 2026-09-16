@@ -178,6 +178,62 @@ On PostgreSQL or SQL Server one database holds every volume, discriminated by a
 bytes never move into the relational database, and `state/git-repos/` stays on disk
 because libgit2 needs a real working directory.
 
+## Document as a service
+
+An upload can carry its own Markdown companion. Set `trigger_documentation_service` on a
+byte upload and the file is stored **and** converted by an external, stateless document
+service, the result landing beside the source at the exact path `fs.extract_text` reads
+(`toto.pptx` -> `toto.md`), so the built-in extractor then serves it as a cache hit.
+PowerPoint, Word, PDF, audio and video only. The feature is **off by default**:
+
+```yaml
+doc_service:
+  enabled: true
+  mode: cli                      # cli | api
+  extensions: []                 # empty = the built-in eligible set
+  max_input_bytes: 536870912     # 512 MiB
+  cli:
+    command: ["doc-convert", "--stdout", "--quiet", "{document}"]
+    timeout_secs: 900
+  api:
+    url: "https://converter.internal/convert"
+    auth_header: Authorization   # header NAME, not necessarily a bearer
+    auth_token: "Bearer ${MCPFS_DOC_SERVICE_TOKEN}"   # secret, sent verbatim
+    file_field: file             # name of the multipart part carrying the document
+    response_field: ""           # empty = the response body IS the markdown
+    timeout_secs: 900
+```
+
+In `cli` mode the converter is an **argv list, never a shell string**, and every call runs
+in a fresh temporary directory: the input is staged inside it under a sanitized name, the
+child's working directory and `TMPDIR` point there, `{document}` expands to a relative
+`./name.ext`, and the directory is removed on every exit path including a timeout, which
+kills and reaps the child first. That contains a tool which writes beside its input; it is
+not a hard OS sandbox, so wrap argv[0] in `sandbox-exec`, `bwrap` or `docker run` if you
+need one. In `api` mode the request is `POST {url}`, `multipart/form-data`, one part named
+`file`; `scripts/doc_service_fake.py` implements exactly that contract for local
+development.
+
+Two tools and two routes:
+
+| Surface | Purpose |
+|---|---|
+| `fs.write_bytes` | write raw bytes (base64), with the `trigger_documentation_service` flag |
+| `fs.documentize` | convert a file already stored in the volume, the retry surface |
+| `POST /api/fs/{mount_id}/write-bytes` | the JSON mirror of `fs.write_bytes` |
+| `POST /api/fs/{mount_id}/documentize` | the JSON mirror of `fs.documentize` |
+
+The existing multipart `POST /api/fs/{mount_id}/upload` takes the same flag as a form field
+(`"true"` or `"1"`), applied to every file of the form, and answers with a `documentation`
+array holding one entry per file.
+
+Two rules worth knowing, both deliberate. **Eligibility is checked before the first byte is
+written**, so a flag set on a `.txt`, or on a mixed batch, fails with `ERR_NOT_SUPPORTED`
+and nothing is stored. **A failed conversion never rolls the upload back**: the file stays,
+the response carries `documentation.error`, and `fs.documentize` retries. Conversion is
+synchronous and slow (tens of seconds for a small PDF, minutes for a video), so set your
+client's read timeout accordingly.
+
 ## Security model
 
 - **Authentication**: RS256 JWT, signature, issuer and expiry verified (30s clock skew,
@@ -225,7 +281,7 @@ store behaves identically on all three. See
 
 ## Interactive CLI agent
 
-`crates/agent` builds an `agent` binary that drives the 55 tools through an LLM. It is a
+`crates/agent` builds an `agent` binary that drives the 57 tools through an LLM. It is a
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash
@@ -261,7 +317,7 @@ cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
 
 ## The tool contract is frozen
 
-The 55 tool names, descriptions and `inputSchema` values are a client and an LLM facing
+The 57 tool names, descriptions and `inputSchema` values are a client and an LLM facing
 contract, so they are snapshotted in `tool-contract-golden.json` and compared on every test
 run, serialized form included, which means even a reordered schema key fails the build.
 `TOOL_CONTRACT.txt` is the human readable companion.
@@ -272,7 +328,7 @@ Changing the contract is deliberate, never a hand edit:
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
 ```
 
-Then review the diff: a description edit is one line, and 55 changed tools means something
+Then review the diff: a description edit is one line, and 57 changed tools means something
 went wrong.
 
 ## Design decisions worth knowing

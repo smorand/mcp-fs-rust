@@ -1,4 +1,4 @@
-# Tool reference (55 tools)
+# Tool reference (57 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -23,17 +23,30 @@ Authorization column: **member** = project membership (`AppState::authorize`),
 | `fs.tail` | last N lines | `path`, `lines:int=20` | `content` | member |
 | `fs.count_lines` | line count without content | `path` | `total_lines` | member |
 
-## fs write (3)
+## fs write (4)
 
 | Tool | Purpose | Parameters | Returns | Auth |
 |---|---|---|---|---|
 | `fs.write` | create or overwrite, atomic | `path`, `content`, `overwrite:bool=false`, `create_parents:bool=true` | `path`, `bytes_written`, `overwritten`, `diff` | member |
 | `fs.append` | append, optionally create | `path`, `content`, `create:bool=false` | `path`, `bytes_appended` | member |
 | `fs.create_empty` | touch | `path`, `exist_ok:bool=false` | `path`, `created` | member |
+| `fs.write_bytes` | write raw bytes, base64 | `path`, `base64`, `overwrite:bool=false`, `create_parents:bool=true`, `trigger_documentation_service:bool=false` | `path`, `bytes_written`, `overwritten`, `documentation` | member |
 
 `fs.write` on an existing file needs a prior read in the session and returns the
 unified diff of the change. Overwriting without `overwrite=true` is
 `ERR_NO_CLOBBER`.
+
+`fs.write_bytes` is the only way to put binary content in a volume through MCP;
+`base64` is the standard alphabet with padding, the one `fs.read_bytes` returns,
+and anything else is `ERR_INVALID_ARGUMENT`. With
+`trigger_documentation_service` the file is also converted to Markdown by the
+configured `doc_service` and the companion stored beside it (`deck.pptx` ->
+`deck.md`): `documentation` is then `{md_path, bytes_written}`, or
+`{error: {code, message}}` when the conversion failed, and `null` when the flag
+was off. Eligibility (PowerPoint, Word, PDF, audio, video) and the size cap are
+checked **before anything is written**, so a flag on a `.txt` is
+`ERR_NOT_SUPPORTED` with no file stored; a conversion that fails afterwards never
+rolls the upload back.
 
 ## fs edit (5)
 
@@ -100,12 +113,20 @@ owner.
 `ERR_NOT_SUPPORTED`. `fs.list_allowed_roots` and `fs.audit_log` still take and
 check `mount_id` even though they never open the volume.
 
-## fs document (2)
+## fs document (3)
 
 | Tool | Purpose | Parameters | Returns | Auth |
 |---|---|---|---|---|
 | `fs.extract_text` | document to Markdown, stored as a companion `.md` | `path`, `max_chars:int=200000`, `preview_chars:int=4000`, `ocr:bool=true`, `refresh:bool=false` | `path`, `md_path`, `format`, `chars`, `cached`, `preview` | member |
 | `fs.write_docx` | render Markdown into a `.docx` | `path`, `markdown`, `title=null`, `overwrite:bool=false` | `path`, `bytes_written`, `overwritten` | member |
+| `fs.documentize` | convert a stored document through the external `doc_service` | `path`, `overwrite:bool=false` | `path`, `md_path`, `bytes_written`, `overwritten` | member |
+
+`fs.documentize` is the retry surface of the document service: it reads the file
+already in the volume, converts it and writes the companion at the same path
+`fs.extract_text` uses, so the built-in extractor then answers `cached: true`.
+Unlike an upload it honours the caller's `overwrite`, so an existing companion is
+`ERR_NO_CLOBBER`. It answers `ERR_NOT_SUPPORTED` when `doc_service` is disabled or
+the extension is not eligible, and `ERR_NOT_FOUND` when the path is not a file.
 
 `fs.extract_text` reuses an up to date companion (`cached: true`, nothing
 written) and handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR through a
