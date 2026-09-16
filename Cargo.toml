@@ -71,6 +71,10 @@ regex = "1"
 globset = "0.4"
 similar = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+tantivy = "0.26"
+# sqlite-vec is pre-v1: pinned exactly so an upstream breaking change cannot sneak in.
+sqlite-vec = "=0.1.9"
+zerocopy = { version = "0.7", features = ["derive"] }
 
 # ── crypto (oauth token at rest) ───────────────────────────────────────────────
 aes-gcm = "0.10"

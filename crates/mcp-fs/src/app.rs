@@ -77,6 +77,7 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         sqlite:   config.sqlite.enabled,
         db:       config.db.enabled,
         doc:      config.doc.enabled,
+        search:   config.search.enabled,
     };
     crate::tools::register_all(&mut registry, &features, &config);
 
@@ -89,6 +90,11 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     // reused across conversions instead of rebuilt per call.
     let doc_service = crate::docs::service::from_config(&config.doc_service)?;
 
+    // Build the search backend when enabled. None when search.enabled = false.
+    let search = crate::search::build_backend(&config)
+        .await
+        .map_err(|e| anyhow::anyhow!("search backend failed to start: {e}"))?;
+
     let state = Arc::new(AppState {
         config,
         admin,
@@ -98,6 +104,7 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         registry: Arc::new(registry),
         editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         doc_service,
+        search,
     });
 
     let mut router = Router::new()

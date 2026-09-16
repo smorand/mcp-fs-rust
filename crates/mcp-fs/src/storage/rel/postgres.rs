@@ -62,6 +62,10 @@ impl PostgresRelationalDb {
             .after_connect(move |conn, _meta| {
                 let schema = schema.clone();
                 Box::pin(async move {
+                    // pgvector must be enabled before the search_path is set;
+                    // otherwise CREATE EXTENSION applies to the wrong schema.
+                    #[cfg(feature = "rag")]
+                    conn.execute(AssertSqlSafe("CREATE EXTENSION IF NOT EXISTS vector")).await?;
                     let ddl = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"");
                     conn.execute(AssertSqlSafe(ddl)).await?;
                     let path = format!("SET search_path TO \"{schema}\"");

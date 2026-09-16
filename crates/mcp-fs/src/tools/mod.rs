@@ -33,6 +33,7 @@ pub mod listing;
 pub mod metadata;
 pub mod read;
 pub mod search;
+pub mod search_semantic;
 pub mod sqlite;
 pub mod web;
 pub mod write;
@@ -181,6 +182,7 @@ pub(crate) mod testkit {
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service,
+            search: None,
         });
         Harness { _dir: dir, state }
     }
@@ -216,6 +218,48 @@ pub(crate) mod testkit {
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
+            search: None,
+        });
+        Harness { _dir: dir, state }
+    }
+
+    /// Harness with a search backend injected, for `search.*` tool tests.
+    pub async fn harness_with_search(
+        tweak: impl FnOnce(&mut ServerConfig),
+        search: Option<Arc<dyn crate::search::SearchBackend>>,
+    ) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.infra.meta.dir = dir.path().join("volumes").display().to_string();
+        config.infra.blob.dir = dir.path().join("blobs").display().to_string();
+        config.auth.jwt.public_key_path = String::new();
+        tweak(&mut config);
+        let config = Arc::new(config);
+
+        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
+        admin.connect().await.unwrap();
+        admin.create_project(MOUNT, PERSON).await.unwrap();
+
+        let mut registry = ToolRegistry::new();
+        super::register_fs(&mut registry);
+        // Register search tools when a backend is provided.
+        if search.is_some() {
+            super::search_semantic::register(&mut registry, &config.search);
+        }
+
+        let state = Arc::new(AppState {
+            config: config.clone(),
+            admin,
+            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            safety: Arc::new(crate::safety::SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
+            identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+            registry: Arc::new(registry),
+            editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service: None,
+            search,
         });
         Harness { _dir: dir, state }
     }

@@ -1146,6 +1146,7 @@ mod tests {
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
+            search: None,
         });
         let git = Arc::new(GitRepoStore::new(config, crate::storage::test_registry()));
         if initialized {
@@ -1252,6 +1253,7 @@ mod tests {
             registry: Arc::new(crate::mcp::ToolRegistry::new()),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
+            search: None,
         });
         let git = Arc::new(GitRepoStore::new(config, crate::storage::test_registry()));
         git.init_repo("proj").await.unwrap();

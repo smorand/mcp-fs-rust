@@ -227,6 +227,23 @@ git.tags
   params: mount_id:string
   required: ['mount_id']
 
+search.delete
+  desc: Remove a path from the search index.
+  params: mount_id:string, path:string, recursive:boolean=false
+  required: ['mount_id', 'path']
+search.index
+  desc: Index a file or directory into the search engine for this volume.
+  params: mount_id:string, path:string, chunk_overlap:integer=100, chunk_size:integer=1000, recursive:boolean=false
+  required: ['mount_id', 'path']
+search.query
+  desc: Search indexed content. mode overrides the server default (bm25, rag, both).
+  params: mount_id:string, query:string, mode:string=null, rerank:boolean=true, top_k:integer=10
+  required: ['mount_id', 'query']
+search.status
+  desc: Report index statistics for this volume.
+  params: mount_id:string
+  required: ['mount_id']
+
 
 === EXACT RETURN SHAPES (the contract this server keeps; sample values are illustrative) ===
 fs.write: {"path": "/a.txt", "bytes_written": 12, "overwritten": false, "diff": ""}

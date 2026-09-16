@@ -1349,6 +1349,7 @@ mod tests {
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
                 doc_service,
+            search: None,
             });
 
             Self {

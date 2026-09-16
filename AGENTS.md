@@ -2,7 +2,8 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (57 tools: 35 `fs.*`, 8 `admin.*`, 11 `git.*`, 3 `git.auth*`),
+multi-project filesystem** (57 tools: 35 `fs.*`, 8 `admin.*`, 11 `git.*`, 3 `git.auth*`;
++ 4 `search.*` when search enabled),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/`. Ships with
 `agent`, an interactive CLI agent that drives the tools through an LLM (`./agent.sh`).
@@ -27,8 +28,9 @@ Stack: Rust 2024, axum + tokio, rusqlite (bundled), sqlx (optional, PostgreSQL),
 tiberius-ng + bb8 (optional, SQL Server), aws-sdk-s3, jsonwebtoken + rsa, git2 (libgit2),
 tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap, tracing.
 
-Cargo features, none in `default`: `postgres`, `sqlserver`, `all-backends`. A default build
-is SQLite only and carries neither driver.
+Cargo features, none in `default`: `postgres`, `sqlserver`, `rag`, `all-backends`. A default build
+is SQLite only and carries neither relational driver. The `rag` feature enables pgvector (PostgreSQL)
+and sqlite-vec (SQLite) for vector search; it implies `postgres`.
 
 ## Key commands
 ```
@@ -151,3 +153,4 @@ keyed text has a length ceiling there).
 - `.agent_docs/testing.md` : test layout, PostgreSQL/SQL Server and MinIO opt-in suites.
 - `.agent_docs/lineage.md` : the C# lineage, why it is no longer a reference, design decisions.
 - `.agent_docs/agent.md` : the CLI agent, its config, and the terminal invariants it depends on.
+- `.agent_docs/search.md` : search tools, BM25/RAG/reranking config, per-backend caveats.

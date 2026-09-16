@@ -71,26 +71,79 @@ pub struct Index {
     pub columns: Vec<&'static str>,
 }
 
+/// Index kind, used by [`TypedIndex`] to render PostgreSQL-specific index types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexKind {
+    /// Standard B-tree index (the default).
+    Standard,
+    /// GIN index (PostgreSQL only): used for tsvector full-text columns.
+    Gin,
+    /// IVFFlat index (PostgreSQL only): used for vector cosine similarity.
+    IvfFlat,
+}
+
+/// An index with an optional PostgreSQL-specific access method.
+///
+/// On non-PostgreSQL dialects, `Gin` renders as a standard index and `IvfFlat`
+/// is skipped entirely (sqlite-vec stores vectors in a vec0 virtual table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedIndex {
+    pub name: &'static str,
+    pub table: &'static str,
+    pub columns: Vec<&'static str>,
+    pub kind: IndexKind,
+}
+
+/// A virtual table declaration (SQLite only, for vec0 or FTS5).
+///
+/// These cannot be expressed as a column list, so they live outside the
+/// regular `Table` declaration and are emitted after regular tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualTableDef {
+    /// Table name.
+    pub name: &'static str,
+    /// Extension name, e.g. "vec0" or "fts5".
+    pub using: &'static str,
+    /// Column or parameter strings, e.g. ["embedding float[1536]"].
+    pub columns: Vec<String>,
+    /// When `Some(Dialect::Sqlite)`, only emit on that dialect and skip others.
+    pub dialect: Option<super::dialect::Dialect>,
+}
+
 /// Every table and index one store needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaSet {
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
+    pub typed_indexes: Vec<TypedIndex>,
+    pub virtual_tables: Vec<VirtualTableDef>,
 }
 
 impl SchemaSet {
     pub fn new(tables: Vec<Table>, indexes: Vec<Index>) -> Self {
-        Self { tables, indexes }
+        Self { tables, indexes, typed_indexes: Vec::new(), virtual_tables: Vec::new() }
     }
 
     /// The DDL statements to apply, in order. Each is separately idempotent.
     pub fn render(&self, dialect: Dialect) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.tables.len() + self.indexes.len());
+        let mut out = Vec::with_capacity(
+            self.tables.len() + self.indexes.len() + self.typed_indexes.len() + self.virtual_tables.len()
+        );
         for table in &self.tables {
             out.push(render_table(dialect, table));
         }
         for index in &self.indexes {
             out.push(render_index(dialect, index));
+        }
+        for tidx in &self.typed_indexes {
+            if let Some(sql) = render_typed_index(dialect, tidx) {
+                out.push(sql);
+            }
+        }
+        for vt in &self.virtual_tables {
+            if let Some(sql) = render_virtual_table(dialect, vt) {
+                out.push(sql);
+            }
         }
         out
     }
@@ -179,7 +232,56 @@ fn render_index(dialect: Dialect, index: &Index) -> String {
 /// Escape a single quoted SQL string literal. Only reached with our own static
 /// table names, but a guard beats trusting that they stay quote free.
 fn escape_sql_string(s: &str) -> String {
-    s.replace('\'', "''")
+    s.replace("'", "''")
+}
+
+fn render_typed_index(dialect: Dialect, tidx: &TypedIndex) -> Option<String> {
+    let cols = tidx
+        .columns
+        .iter()
+        .map(|c| dialect.quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let name = dialect.quote_ident(tidx.name);
+    let table = dialect.quote_ident(tidx.table);
+
+    match (&tidx.kind, dialect) {
+        // IvfFlat is a PostgreSQL-only index type: skip it on other engines.
+        (IndexKind::IvfFlat, Dialect::Sqlite | Dialect::SqlServer) => None,
+        (IndexKind::IvfFlat, Dialect::Postgres) => Some(format!(
+            "CREATE INDEX IF NOT EXISTS {name} ON {table} USING ivfflat ({cols} vector_cosine_ops)"
+        )),
+        // GIN is PostgreSQL-specific; on other engines fall back to a standard index.
+        (IndexKind::Gin, Dialect::Postgres) => Some(format!(
+            "CREATE INDEX IF NOT EXISTS {name} ON {table} USING GIN ({cols})"
+        )),
+        (IndexKind::Standard | IndexKind::Gin, Dialect::Sqlite | Dialect::Postgres) => Some(format!(
+            "CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"
+        )),
+        (IndexKind::Standard | IndexKind::Gin, Dialect::SqlServer) => Some(format!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{}' \
+             AND object_id = OBJECT_ID(N'{}')) CREATE INDEX {name} ON {table} ({cols});",
+            escape_sql_string(tidx.name),
+            escape_sql_string(tidx.table)
+        )),
+    }
+}
+
+fn render_virtual_table(dialect: Dialect, vt: &VirtualTableDef) -> Option<String> {
+    // Skip if restricted to a different dialect.
+    if vt.dialect.is_some_and(|d| d != dialect) {
+        return None;
+    }
+    // Virtual tables are only meaningful on SQLite; skip on others unless explicitly allowed.
+    if dialect != Dialect::Sqlite && vt.dialect.is_none() {
+        return None;
+    }
+    let name = dialect.quote_ident(vt.name);
+    let cols = vt.columns.join(", ");
+    Some(format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING {} ({cols})",
+        vt.using
+    ))
 }
 
 #[cfg(test)]

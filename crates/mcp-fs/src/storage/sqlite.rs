@@ -10,6 +10,30 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Register the sqlite-vec extension exactly once at process startup.
+///
+/// `sqlite3_auto_extension` installs a hook that is called for every new
+/// connection, so calling this once in `OnceLock::get_or_init` is sufficient
+/// for the entire process lifetime. The registration is a no-op when the
+/// `rag` feature is not compiled in.
+#[cfg(feature = "rag")]
+fn register_sqlite_vec() {
+    use std::sync::OnceLock;
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        // SAFETY: sqlite3_auto_extension is safe to call from Rust as long as
+        // the function pointer points to a valid SQLite extension entry point.
+        // sqlite_vec::sqlite3_vec_init satisfies this contract. The transmute
+        // is the same pattern used in the sqlite-vec crate itself.
+        unsafe {
+            #[allow(clippy::missing_transmute_annotations)]
+            rusqlite::ffi::sqlite3_auto_extension(Some(
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ())
+            ));
+        }
+    });
+}
+
 #[derive(Clone)]
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
@@ -23,6 +47,10 @@ impl SqliteDb {
             && !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
             }
+        // Register sqlite-vec before the first connection is opened so the
+        // auto-extension hook is in place when Connection::open runs.
+        #[cfg(feature = "rag")]
+        register_sqlite_vec();
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;

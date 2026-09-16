@@ -12,6 +12,7 @@ pub struct EnabledFeatures {
     pub sqlite: bool,
     pub db: bool,
     pub doc: bool,
+    pub search: bool,
 }
 
 /// Register every tool: the fs.* families, then admin.*, then the optional families.
@@ -41,6 +42,9 @@ pub fn register_all(
     if features.doc {
         super::doc::register(reg, &config.doc);
         super::editor::register(reg);
+    }
+    if features.search {
+        super::search_semantic::register(reg, &config.search);
     }
 }
 
@@ -75,7 +79,7 @@ mod tests {
     #[test]
     fn web_and_context7_tools_register_when_enabled() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false, doc: false };
+        let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false, doc: false, search: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 35 fs + 8 admin + 5 web + 2 context7 = 50
@@ -87,7 +91,7 @@ mod tests {
     #[test]
     fn all_features_enabled_count() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true };
+        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true, search: false };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 35 fs + 8 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 77
@@ -95,6 +99,21 @@ mod tests {
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
         assert_eq!(reg.len(), 77 + doc_count + 3);
+    }
+
+    #[test]
+    fn all_features_with_search_adds_four_tools() {
+        let mut reg = ToolRegistry::new();
+        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true, search: true };
+        let config = crate::config::ServerConfig::default();
+        super::register_all(&mut reg, &features, &config);
+        let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
+        // Base 77 + doc + 3 editor + 4 search.*
+        assert_eq!(reg.len(), 77 + doc_count + 3 + 4);
+        assert!(reg.resolve("search.index").is_some());
+        assert!(reg.resolve("search.query").is_some());
+        assert!(reg.resolve("search.delete").is_some());
+        assert!(reg.resolve("search.status").is_some());
     }
 
     /// Whole surface gate for the 22 tools of this agent: every `admin.*`,

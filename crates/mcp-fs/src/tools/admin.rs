@@ -312,6 +312,7 @@ pub(crate) mod test_support {
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
+            search: None,
             });
             Self { dir, state }
         }

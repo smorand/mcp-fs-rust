@@ -8,6 +8,7 @@ use crate::errors::{Result, ToolError};
 use crate::identity::IdentityResolver;
 use crate::mcp::ToolRegistry;
 use crate::safety::SafetyManager;
+use crate::search::SearchBackend;
 use crate::storage::traits::AdminBackend;
 use crate::storage::StoreManager;
 use crate::tools::editor::EditorRegistry;
@@ -24,6 +25,8 @@ pub struct AppState {
     /// The external document to Markdown converter, `None` when `doc_service` is
     /// disabled. Built once at boot so its HTTP connection pool is reused.
     pub doc_service: Option<Arc<dyn DocService>>,
+    /// The search backend, `None` when `search.enabled` is false.
+    pub search: Option<Arc<dyn SearchBackend>>,
 }
 
 impl AppState {

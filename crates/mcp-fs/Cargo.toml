@@ -23,8 +23,11 @@ postgres = ["dep:sqlx"]
 # SQL Server through tiberius-ng plus a bb8 pool. Off by default: the fork is
 # young and a default build must carry neither it nor its TLS stack.
 sqlserver = ["dep:tiberius-ng", "dep:bb8", "dep:tokio-util"]
+# RAG: pgvector (PostgreSQL) and sqlite-vec (SQLite) vector search. Implies postgres
+# so --features rag alone is sufficient for a PostgreSQL+vector build.
+rag = ["postgres", "dep:sqlite-vec", "dep:zerocopy"]
 # Every relational backend at once, for CI and for the quality gate.
-all-backends = ["postgres", "sqlserver"]
+all-backends = ["postgres", "sqlserver", "rag"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -101,6 +104,9 @@ tree-sitter-java = { workspace = true }
 tree-sitter-c = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 tree-sitter-ruby = { workspace = true }
+tantivy = { workspace = true }
+sqlite-vec = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

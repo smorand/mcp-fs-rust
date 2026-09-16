@@ -31,6 +31,11 @@ pub enum ColumnType {
     Double,
     /// Opaque bytes.
     Blob,
+    /// Full-text search vector: TSVECTOR on PostgreSQL, TEXT on other engines.
+    Tsvector,
+    /// Dense float vector of dimension N: VECTOR(N) on PostgreSQL, TEXT elsewhere.
+    /// On SQLite the actual vector storage uses a vec0 virtual table, not this column.
+    Vector(u32),
 }
 
 /// One assignment applied when an upsert hits an existing row.
@@ -216,11 +221,16 @@ impl Dialect {
             (Self::Sqlite, ColumnType::BigInt) => "INTEGER".into(),
             (Self::Sqlite, ColumnType::Double) => "REAL".into(),
             (Self::Sqlite, ColumnType::Blob) => "BLOB".into(),
+            // On SQLite, tsvector and vector fall back to TEXT. Vector storage
+            // uses the vec0 virtual table (see search/vector_sqlite.rs), not this column.
+            (Self::Sqlite, ColumnType::Tsvector | ColumnType::Vector(_)) => "TEXT".into(),
 
             (Self::Postgres, ColumnType::Text | ColumnType::TextKey(_)) => "TEXT".into(),
             (Self::Postgres, ColumnType::BigInt) => "BIGINT".into(),
             (Self::Postgres, ColumnType::Double) => "DOUBLE PRECISION".into(),
             (Self::Postgres, ColumnType::Blob) => "BYTEA".into(),
+            (Self::Postgres, ColumnType::Tsvector) => "TSVECTOR".into(),
+            (Self::Postgres, ColumnType::Vector(n)) => format!("VECTOR({n})"),
 
             (Self::SqlServer, ColumnType::Text) => "NVARCHAR(MAX)".into(),
             // A keyed text column must be sized: SQL Server refuses to index MAX.
@@ -228,6 +238,8 @@ impl Dialect {
             (Self::SqlServer, ColumnType::BigInt) => "BIGINT".into(),
             (Self::SqlServer, ColumnType::Double) => "FLOAT".into(),
             (Self::SqlServer, ColumnType::Blob) => "VARBINARY(MAX)".into(),
+            // SQL Server has no tsvector or pgvector; both degrade to TEXT.
+            (Self::SqlServer, ColumnType::Tsvector | ColumnType::Vector(_)) => "NVARCHAR(MAX)".into(),
         }
     }
 
@@ -498,6 +510,17 @@ mod tests {
             assert_eq!(Dialect::Postgres.column_type(ty), postgres, "{ty:?}");
             assert_eq!(Dialect::SqlServer.column_type(ty), sqlserver, "{ty:?}");
         }
+    }
+
+    #[test]
+    fn tsvector_and_vector_render_per_engine() {
+        assert_eq!(Dialect::Postgres.column_type(ColumnType::Tsvector), "TSVECTOR");
+        assert_eq!(Dialect::Postgres.column_type(ColumnType::Vector(1536)), "VECTOR(1536)");
+        // Non-PostgreSQL engines fall back to TEXT / NVARCHAR(MAX).
+        assert_eq!(Dialect::Sqlite.column_type(ColumnType::Tsvector), "TEXT");
+        assert_eq!(Dialect::Sqlite.column_type(ColumnType::Vector(768)), "TEXT");
+        assert_eq!(Dialect::SqlServer.column_type(ColumnType::Tsvector), "NVARCHAR(MAX)");
+        assert_eq!(Dialect::SqlServer.column_type(ColumnType::Vector(512)), "NVARCHAR(MAX)");
     }
 
     #[test]

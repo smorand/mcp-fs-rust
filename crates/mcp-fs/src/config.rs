@@ -496,7 +496,83 @@ impl Default for DbConfig {
     }
 }
 
+fn d_search_mode() -> String { "bm25".into() }
+fn d_search_tantivy_dir() -> String { "state/search".into() }
+fn d_embedding_dimensions() -> u32 { 1536 }
+fn d_rerank_top_n() -> usize { 10 }
 fn d_pandoc_timeout() -> u64 { 30 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// OpenAI-compatible /v1/embeddings URL.
+    pub endpoint: String,
+    /// Model name, e.g. text-embedding-3-small.
+    pub model: String,
+    /// Environment variable name holding the API key. Empty means unauthenticated.
+    pub api_key_env: String,
+    /// Embedding vector dimension; must match the model output.
+    pub dimensions: u32,
+}
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            model: String::new(),
+            api_key_env: String::new(),
+            dimensions: d_embedding_dimensions(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankConfig {
+    pub enabled: bool,
+    /// Cohere/Jina rerank URL.
+    pub endpoint: String,
+    pub model: String,
+    /// Environment variable name holding the API key.
+    pub api_key_env: String,
+    /// How many results to send to the reranker.
+    pub top_n: usize,
+}
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            model: String::new(),
+            api_key_env: String::new(),
+            top_n: d_rerank_top_n(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub enabled: bool,
+    /// Query mode: "bm25", "rag", or "both".
+    pub mode: String,
+    /// Base directory for Tantivy on-disk indexes (SQLite only).
+    pub tantivy_dir: String,
+    pub embedding: EmbeddingConfig,
+    pub reranking: RerankConfig,
+}
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: d_search_mode(),
+            tantivy_dir: d_search_tantivy_dir(),
+            embedding: EmbeddingConfig::default(),
+            reranking: RerankConfig::default(),
+        }
+    }
+}
+
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -627,6 +703,7 @@ pub struct ServerConfig {
     pub db: DbConfig,
     pub doc: DocConfig,
     pub doc_service: DocServiceConfig,
+    pub search: SearchConfig,
 }
 
 impl ServerConfig {
@@ -659,6 +736,7 @@ impl ServerConfig {
         validate_store("git", &self.infra.git.backend, &self.infra.git.dsn)?;
         validate_store("oauth", &self.infra.oauth.backend, &self.infra.oauth.dsn)?;
         validate_doc_service(&self.doc_service)?;
+        validate_search(&self.search)?;
         Ok(())
     }
 
@@ -755,6 +833,27 @@ fn validate_store(section: &str, backend: &str, dsn: &Dsn) -> Result<()> {
         other => Err(ToolError::invalid_argument(format!(
             "unknown infra.{section}.backend '{other}', expected one of {}",
             backend::ALL.join(", ")
+        ))),
+    }
+}
+
+/// Check the `search` block. Only validated when enabled.
+fn validate_search(cfg: &SearchConfig) -> Result<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    match cfg.mode.as_str() {
+        "bm25" => Ok(()),
+        "rag" | "both" => {
+            if cfg.embedding.endpoint.trim().is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "search.mode is 'rag' or 'both' but search.embedding.endpoint is empty",
+                ));
+            }
+            Ok(())
+        }
+        other => Err(ToolError::invalid_argument(format!(
+            "unknown search.mode '{other}', expected bm25, rag, or both"
         ))),
     }
 }
