@@ -410,7 +410,13 @@ async fn delete(
         // safety.allow_hard_delete, let a whole tree go without `recursive`, and
         // wrote no audit entry: the same delete through two doors behaved
         // differently, and the REST door was the destructive one.
-        fs_ops::delete_path(
+        //
+        // Collected first for the same reason `fs.delete` does it: a recursive
+        // delete takes every file underneath, and afterwards there is no tree
+        // left to enumerate. The hooks are the helpers the MCP door calls, so a
+        // file deleted here leaves the index exactly as one deleted there.
+        let indexed = crate::search::indexer::paths_under(&r.state, &r.mount, &norm, &r.client).await;
+        let out = fs_ops::delete_path(
             &r.client,
             r.safety(),
             &r.person,
@@ -419,7 +425,9 @@ async fn delete(
             a.bool_or("recursive", false),
             a.bool_or("trash", true),
         )
-        .await
+        .await?;
+        crate::search::indexer::after_delete_many(&r.state, &r.mount, &indexed).await;
+        Ok(out)
     })
     .await
 }

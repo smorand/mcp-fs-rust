@@ -70,6 +70,11 @@ bytes (see below). A `dry_run` edit writes nothing and so
 indexes nothing. Files that are not valid UTF-8 are skipped silently, which covers
 binary uploads and the `.docx` that `fs.write_docx` produces.
 
+The REST data plane is the same engine behind a second door, and it runs the same
+hooks: `POST /api/fs/{mount}/write`, `/delete`, `/move`, `/copy` and `/upload` index
+exactly what their `fs.*` twins index, recursive delete included. Write, delete, move,
+copy and upload behave identically through both doors.
+
 The work is fire and forget (`search/indexer.rs`): the write returns as soon as the
 bytes are committed, and the index call runs on a detached task whose failures are a
 WARN log, never an error to the caller. **Trade-off**: an embedding round trip is

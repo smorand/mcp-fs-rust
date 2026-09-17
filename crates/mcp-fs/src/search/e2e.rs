@@ -45,17 +45,136 @@ mod shared {
 
     // ── E2eHarness ───────────────────────────────────────────────────────────
 
+    /// A throwaway RSA keypair on disk, plus the public key path the harness
+    /// config points `auth.jwt` at.
+    ///
+    /// The REST plane has no back door: `person_of` resolves the caller by
+    /// verifying a bearer token, so an e2e harness that wants an HTTP surface
+    /// needs a real key and real tokens rather than an injected identity.
+    pub struct JwtKeys {
+        /// Keeps the key files alive for the duration of the test.
+        pub _dir: tempfile::TempDir,
+        pub private: std::path::PathBuf,
+        pub public: String,
+    }
+
+    /// Write a keypair for one harness.
+    pub fn jwt_keys() -> JwtKeys {
+        let dir = tempfile::tempdir().expect("failed to create key temp dir");
+        let (private, public) =
+            crate::keys::write_keypair(dir.path().join("keys")).expect("keypair must be writable");
+        JwtKeys { _dir: dir, private, public: public.display().to_string() }
+    }
+
     /// A thin wrapper around `testkit::Harness` that carries any extra resources
     /// needed by an e2e test (temp dirs, cleanup callbacks).
     pub struct E2eHarness {
         pub inner: Harness,
         /// Keeps the Tantivy temp dir alive for the duration of the test.
         pub _tantivy_dir: Option<tempfile::TempDir>,
+        /// The keypair whose public half this harness's `AppState` verifies.
+        pub keys: JwtKeys,
         /// Called when the harness is dropped (used for PG schema cleanup).
         pub cleanup: Option<Box<dyn FnOnce() + Send>>,
     }
 
     impl E2eHarness {
+        /// A bearer token for `person`, signed by this harness's key.
+        pub fn token_for(&self, person: &str) -> String {
+            crate::keys::mint_token_from_file(
+                &self.keys.private,
+                person,
+                crate::keys::DEFAULT_ISSUER,
+                crate::keys::DEFAULT_CLAIM,
+                3600,
+            )
+            .expect("the token must be mintable")
+        }
+
+        /// Drive one request through the REST data plane router, as `person`.
+        ///
+        /// The router is built from the very `Arc<AppState>` the tool calls use,
+        /// so a REST hook and an MCP hook are observed against one index.
+        /// `person` is a parameter so a test can send as somebody who must be
+        /// refused, instead of only ever as the owner.
+        pub async fn rest(
+            &self,
+            method: &str,
+            uri: &str,
+            content_type: &str,
+            body: Vec<u8>,
+            person: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            use tower::ServiceExt as _;
+
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", format!("Bearer {}", self.token_for(person)))
+                .header("Content-Type", content_type)
+                .body(axum::body::Body::from(body))
+                .expect("the request must be buildable");
+            let response = crate::api::dataplane::router(self.inner.state.clone())
+                .oneshot(request)
+                .await
+                .expect("the router is infallible");
+            let status = response.status();
+            let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the response body must be readable");
+            // A non JSON body (an empty 401, say) still has a status worth
+            // asserting on, so it becomes Null rather than a panic.
+            (status, serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null))
+        }
+
+        /// `POST /api/fs/{mount}/{sub}` with a JSON body, as `person`.
+        pub async fn rest_post(
+            &self,
+            mount: &str,
+            sub: &str,
+            body: serde_json::Value,
+            person: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            self.rest(
+                "POST",
+                &format!("/api/fs/{mount}/{sub}"),
+                "application/json",
+                body.to_string().into_bytes(),
+                person,
+            )
+            .await
+        }
+
+        /// `POST /api/fs/{mount}/upload` with one file part, as `person`.
+        ///
+        /// The multipart body is written out by hand because its exact shape is
+        /// the contract the handler parses, same as the data plane's own tests.
+        pub async fn rest_upload(
+            &self,
+            mount: &str,
+            directory: &str,
+            file_name: &str,
+            content: &str,
+            person: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            const BOUNDARY: &str = "E2E-BOUNDARY";
+            let body = format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"directory\"\r\n\r\n\
+                 {directory}\r\n\
+                 --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"files\"; \
+                 filename=\"{file_name}\"\r\n\r\n{content}\r\n\
+                 --{BOUNDARY}--\r\n"
+            );
+            self.rest(
+                "POST",
+                &format!("/api/fs/{mount}/upload"),
+                &format!("multipart/form-data; boundary={BOUNDARY}"),
+                body.into_bytes(),
+                person,
+            )
+            .await
+        }
+
         /// Dispatch a tool call through the registry, identical to `testkit::Harness::call`.
         pub async fn call(
             &self,
@@ -195,18 +314,21 @@ mod shared {
         )) as Arc<dyn crate::search::SearchBackend>;
 
         let endpoint_for_config = format!("{embedding_url}/v1/embeddings");
+        let keys = jwt_keys();
+        let public_key_path = keys.public.clone();
         let h = harness_with_search(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "rag".into();
                 c.search.embedding.endpoint = endpoint_for_config;
                 c.search.embedding.dimensions = dims;
+                c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
         )
         .await;
 
-        E2eHarness { inner: h, _tantivy_dir: Some(tantivy_dir), cleanup: None }
+        E2eHarness { inner: h, _tantivy_dir: Some(tantivy_dir), keys, cleanup: None }
     }
 
     /// Build a full harness wired with a real Tantivy BM25 backend and NO
@@ -222,16 +344,19 @@ mod shared {
             tantivy_dir.path().to_str().expect("temp dir has valid utf-8 path"),
         )) as Arc<dyn crate::search::SearchBackend>;
 
+        let keys = jwt_keys();
+        let public_key_path = keys.public.clone();
         let h = harness_with_search(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "bm25".into();
+                c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
         )
         .await;
 
-        E2eHarness { inner: h, _tantivy_dir: Some(tantivy_dir), cleanup: None }
+        E2eHarness { inner: h, _tantivy_dir: Some(tantivy_dir), keys, cleanup: None }
     }
 
     // ── PostgreSQL harness builder ────────────────────────────────────────────
@@ -271,12 +396,15 @@ mod shared {
             )) as Arc<dyn crate::search::SearchBackend>;
 
         let endpoint_for_config = format!("{embedding_url}/v1/embeddings");
+        let keys = jwt_keys();
+        let public_key_path = keys.public.clone();
         let h = harness_with_search(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "rag".into();
                 c.search.embedding.endpoint = endpoint_for_config;
                 c.search.embedding.dimensions = dims;
+                c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
         )
@@ -308,7 +436,7 @@ mod shared {
             .ok();
         });
 
-        E2eHarness { inner: h, _tantivy_dir: None, cleanup: Some(cleanup) }
+        E2eHarness { inner: h, _tantivy_dir: None, keys, cleanup: Some(cleanup) }
     }
 
     /// The PostgreSQL twin of [`make_sqlite_bm25_harness`]: a real tsvector
@@ -328,16 +456,24 @@ mod shared {
             PostgresBm25Backend::new(pool.clone()).await.expect("bm25 backend must build"),
         ) as Arc<dyn crate::search::SearchBackend>;
 
+        let keys = jwt_keys();
+        let public_key_path = keys.public.clone();
         let h = harness_with_search(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "bm25".into();
+                c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
         )
         .await;
 
-        E2eHarness { inner: h, _tantivy_dir: None, cleanup: Some(pg_schema_cleanup(pool, schema)) }
+        E2eHarness {
+            inner: h,
+            _tantivy_dir: None,
+            keys,
+            cleanup: Some(pg_schema_cleanup(pool, schema)),
+        }
     }
 
     /// Drop the test schema when the harness goes, so runs stay isolated.
@@ -380,6 +516,7 @@ mod shared {
 #[cfg(test)]
 mod scenarios {
     use super::shared::{E2eHarness, MOUNT};
+    use crate::tools::testkit::PERSON;
     use serde_json::json;
 
     /// Write a file with the mode active, then find it through `search.query`.
@@ -887,6 +1024,124 @@ mod scenarios {
         assert_eq!(h.chunk_count(MOUNT).await, 0, "a non utf-8 file must be skipped");
     }
 
+    // ── the same hooks, driven through the REST data plane ───────────────────
+    //
+    // The REST plane is a second door onto the same engine. These run the HTTP
+    // handlers against the harness's own `AppState`, so a hook that only exists
+    // on the MCP side shows up here as a failure rather than as silence.
+
+    /// A REST delete clears the index entry, exactly as `fs.delete` does.
+    pub async fn rest_delete_clears_the_index(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/gone.md", "content about the greater bilby").await;
+        h.await_chunks(MOUNT, 1).await;
+
+        let (status, body) =
+            h.rest_post(MOUNT, "delete", json!({"path": "/gone.md"}), PERSON).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST delete failed: {body}");
+
+        await_no_query_hit(h, mode, "bilby", "/gone.md").await;
+        h.await_chunks(MOUNT, 0).await;
+    }
+
+    /// A recursive REST delete must clear every file it removed, at every depth.
+    pub async fn rest_recursive_delete_clears_the_whole_subtree(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/tree/a.md", "alpha about the quoll").await;
+        h.write_file(MOUNT, "/tree/deep/b.md", "beta about the quoll").await;
+        h.await_chunks(MOUNT, 2).await;
+
+        let (status, body) = h
+            .rest_post(MOUNT, "delete", json!({"path": "/tree", "recursive": true}), PERSON)
+            .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST recursive delete failed: {body}");
+
+        for path in ["/tree/a.md", "/tree/deep/b.md"] {
+            await_no_query_hit(h, mode, "quoll", path).await;
+        }
+        h.await_chunks(MOUNT, 0).await;
+    }
+
+    /// A REST move takes the index entry with it, adding and losing nothing.
+    pub async fn rest_move_moves_the_index_entry(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/from.md", "content about the kakapo").await;
+        h.await_chunks(MOUNT, 1).await;
+
+        let (status, body) = h
+            .rest_post(MOUNT, "move", json!({"source": "/from.md", "destination": "/to.md"}), PERSON)
+            .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST move failed: {body}");
+
+        await_query_hit(h, mode, "kakapo", "/to.md").await;
+        await_no_query_hit(h, mode, "kakapo", "/from.md").await;
+        h.await_chunks(MOUNT, 1).await;
+    }
+
+    /// A REST copy leaves the source indexed and indexes the destination too.
+    pub async fn rest_copy_indexes_the_destination(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/orig.md", "content about the saiga antelope").await;
+        h.await_chunks(MOUNT, 1).await;
+
+        let (status, body) = h
+            .rest_post(MOUNT, "copy", json!({"source": "/orig.md", "destination": "/dup.md"}), PERSON)
+            .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST copy failed: {body}");
+
+        h.await_chunks(MOUNT, 2).await;
+        await_query_hit(h, mode, "saiga", "/dup.md").await;
+        await_query_hit(h, mode, "saiga", "/orig.md").await;
+    }
+
+    /// An upload is a write, so it must become searchable like one.
+    pub async fn rest_upload_indexes_the_file(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+
+        let (status, body) =
+            h.rest_upload(MOUNT, "/", "up.md", "content about the capybara", PERSON).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST upload failed: {body}");
+        assert_eq!(body["count"], 1, "the upload must have written one file, got {body}");
+
+        h.await_chunks(MOUNT, 1).await;
+        await_query_hit(h, mode, "capybara", "/up.md").await;
+    }
+
+    /// Mode none means the REST delete hook reads the project row and stops.
+    pub async fn rest_delete_under_mode_none_indexes_nothing(h: &E2eHarness) {
+        h.write_file(MOUNT, "/gone.md", "content that must not be indexed").await;
+        let (status, body) =
+            h.rest_post(MOUNT, "delete", json!({"path": "/gone.md"}), PERSON).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST delete failed: {body}");
+
+        // Nothing to wait for, so give a hook that should not exist the time to
+        // fire before concluding that it did not.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(h.chunk_count(MOUNT).await, 0, "mode none must index nothing on a delete");
+    }
+
+    /// A refused REST delete must not touch the index: the volume did not change,
+    /// so neither may the entries describing it.
+    pub async fn a_failed_rest_delete_leaves_the_index_alone(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/tree/a.md", "alpha about the vaquita").await;
+        h.write_file(MOUNT, "/tree/deep/b.md", "beta about the vaquita").await;
+        h.await_chunks(MOUNT, 2).await;
+
+        let (status, body) = h.rest_post(MOUNT, "delete", json!({"path": "/tree"}), PERSON).await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "deleting a non empty directory without recursive must fail, got {body}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(h.chunk_count(MOUNT).await, 2, "a failed delete must drop nothing");
+        for path in ["/tree/a.md", "/tree/deep/b.md"] {
+            await_query_hit(h, mode, "vaquita", path).await;
+        }
+    }
+
     /// Poll until `query` finds `path`, or fail: the index lags the write.
     async fn await_query_hit(h: &E2eHarness, mode: &str, query: &str, path: &str) {
         let deadline = std::time::Instant::now()
@@ -1385,6 +1640,41 @@ mod sqlite_rag {
     async fn e2e_sqlite_a_failed_move_leaves_the_index_alone() {
         scenarios::a_failed_move_leaves_the_index_alone(&h().await, "rag").await;
     }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_delete_clears_the_index() {
+        scenarios::rest_delete_clears_the_index(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_recursive_delete_clears_the_whole_subtree() {
+        scenarios::rest_recursive_delete_clears_the_whole_subtree(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_move_moves_the_index_entry() {
+        scenarios::rest_move_moves_the_index_entry(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_copy_indexes_the_destination() {
+        scenarios::rest_copy_indexes_the_destination(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_upload_indexes_the_file() {
+        scenarios::rest_upload_indexes_the_file(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_delete_under_mode_none_indexes_nothing() {
+        scenarios::rest_delete_under_mode_none_indexes_nothing(&h().await).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_a_failed_rest_delete_leaves_the_index_alone() {
+        scenarios::a_failed_rest_delete_leaves_the_index_alone(&h().await, "rag").await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1476,6 +1766,41 @@ mod sqlite_bm25 {
     #[tokio::test]
     async fn e2e_sqlite_bm25_a_failed_move_leaves_the_index_alone() {
         scenarios::a_failed_move_leaves_the_index_alone(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_delete_clears_the_index() {
+        scenarios::rest_delete_clears_the_index(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_recursive_delete_clears_the_whole_subtree() {
+        scenarios::rest_recursive_delete_clears_the_whole_subtree(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_move_moves_the_index_entry() {
+        scenarios::rest_move_moves_the_index_entry(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_copy_indexes_the_destination() {
+        scenarios::rest_copy_indexes_the_destination(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_upload_indexes_the_file() {
+        scenarios::rest_upload_indexes_the_file(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_delete_under_mode_none_indexes_nothing() {
+        scenarios::rest_delete_under_mode_none_indexes_nothing(&h().await).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_a_failed_rest_delete_leaves_the_index_alone() {
+        scenarios::a_failed_rest_delete_leaves_the_index_alone(&h().await, "bm25").await;
     }
 }
 
@@ -1998,6 +2323,48 @@ mod pg_rag {
         let Some(h) = h().await else { return };
         scenarios::a_failed_move_leaves_the_index_alone(&h, "rag").await;
     }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_delete_clears_the_index() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_delete_clears_the_index(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_recursive_delete_clears_the_whole_subtree() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_recursive_delete_clears_the_whole_subtree(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_move_moves_the_index_entry() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_move_moves_the_index_entry(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_copy_indexes_the_destination() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_copy_indexes_the_destination(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_upload_indexes_the_file() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_upload_indexes_the_file(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_delete_under_mode_none_indexes_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_delete_under_mode_none_indexes_nothing(&h).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_a_failed_rest_delete_leaves_the_index_alone() {
+        let Some(h) = h().await else { return };
+        scenarios::a_failed_rest_delete_leaves_the_index_alone(&h, "rag").await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2113,5 +2480,47 @@ mod pg_bm25 {
     async fn e2e_pg_bm25_a_failed_move_leaves_the_index_alone() {
         let Some(h) = h().await else { return };
         scenarios::a_failed_move_leaves_the_index_alone(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_delete_clears_the_index() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_delete_clears_the_index(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_recursive_delete_clears_the_whole_subtree() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_recursive_delete_clears_the_whole_subtree(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_move_moves_the_index_entry() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_move_moves_the_index_entry(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_copy_indexes_the_destination() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_copy_indexes_the_destination(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_upload_indexes_the_file() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_upload_indexes_the_file(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_delete_under_mode_none_indexes_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_delete_under_mode_none_indexes_nothing(&h).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_a_failed_rest_delete_leaves_the_index_alone() {
+        let Some(h) = h().await else { return };
+        scenarios::a_failed_rest_delete_leaves_the_index_alone(&h, "bm25").await;
     }
 }
