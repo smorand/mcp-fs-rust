@@ -42,7 +42,7 @@ use tokio::io::AsyncReadExt as _;
 pub const DOC_SERVICE_EXTS: &[&str] = &[
     ".pptx", ".pptm", ".potx", ".ppsx", ".ppt", // PowerPoint
     ".docx", ".doc", // Word
-    ".pdf",  // PDF
+    ".pdf", // PDF
     ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac", ".opus", ".wma", // audio
     ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg", // video
 ];
@@ -103,16 +103,12 @@ pub fn from_config(cfg: &DocServiceConfig) -> Result<Option<Arc<dyn DocService>>
     }
     let extensions = resolve_extensions(&cfg.extensions);
     match cfg.mode.as_str() {
-        doc_service_mode::CLI => Ok(Some(Arc::new(CliDocService::new(
-            cfg.cli.clone(),
-            extensions,
-            cfg.max_input_bytes,
-        )))),
-        doc_service_mode::API => Ok(Some(Arc::new(ApiDocService::new(
-            &cfg.api,
-            extensions,
-            cfg.max_input_bytes,
-        )?))),
+        doc_service_mode::CLI => {
+            Ok(Some(Arc::new(CliDocService::new(cfg.cli.clone(), extensions, cfg.max_input_bytes))))
+        }
+        doc_service_mode::API => {
+            Ok(Some(Arc::new(ApiDocService::new(&cfg.api, extensions, cfg.max_input_bytes)?)))
+        }
         other => Err(ToolError::invalid_argument(format!(
             "unknown doc_service.mode '{other}', expected one of {}",
             doc_service_mode::ALL.join(", ")
@@ -155,7 +151,9 @@ impl DocService for CliDocService {
         // Rule 1: a fresh directory per call, removed on every exit path because
         // it is dropped when this function returns.
         let dir = tempfile::TempDir::new().map_err(|e| {
-            ToolError::internal(format!("document service: cannot create a temporary directory: {e}"))
+            ToolError::internal(format!(
+                "document service: cannot create a temporary directory: {e}"
+            ))
         })?;
         // Rule 2: the input lands inside it, under a single segment name keeping
         // the original extension (the converter dispatches on it).
@@ -190,20 +188,24 @@ impl DocService for CliDocService {
         let mut child = command.spawn().map_err(|e| {
             ToolError::internal(format!("document service: cannot start '{program}': {e}"))
         })?;
-        let mut child_stdout = child.stdout.take().ok_or_else(|| {
-            ToolError::internal("document service: stdout was not captured")
-        })?;
-        let mut child_stderr = child.stderr.take().ok_or_else(|| {
-            ToolError::internal("document service: stderr was not captured")
-        })?;
+        let mut child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::internal("document service: stdout was not captured"))?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::internal("document service: stderr was not captured"))?;
 
         // The pipes are drained concurrently with the wait: a converter that fills
         // its stderr buffer would otherwise block forever on a write nobody reads.
         let waited = tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), async {
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let (read_out, read_err) =
-                tokio::join!(child_stdout.read_to_end(&mut out), child_stderr.read_to_end(&mut err));
+            let (read_out, read_err) = tokio::join!(
+                child_stdout.read_to_end(&mut out),
+                child_stderr.read_to_end(&mut err)
+            );
             read_out?;
             read_err?;
             let status = child.wait().await?;
@@ -327,15 +329,11 @@ impl DocService for ApiDocService {
                  doc_service.api.response_field is set: {e}"
             ))
         })?;
-        parsed
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                ToolError::internal(format!(
-                    "document service response carries no string field '{field}'"
-                ))
-            })
+        parsed.get(field).and_then(serde_json::Value::as_str).map(str::to_string).ok_or_else(|| {
+            ToolError::internal(format!(
+                "document service response carries no string field '{field}'"
+            ))
+        })
     }
 
     fn accepted_extensions(&self) -> &[String] {
@@ -359,7 +357,9 @@ fn sanitize_file_name(file_name: &str) -> String {
     };
     let keep = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .map(
+                |c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' },
+            )
             .collect()
     };
     let stem = keep(raw_stem).trim_matches('.').to_string();
@@ -435,11 +435,7 @@ impl StubDocService {
 
     /// A service that always fails, for the "the upload is never rolled back" path.
     pub fn failing(error: ToolError) -> Self {
-        Self {
-            outcome: Err(error),
-            extensions: resolve_extensions(&[]),
-            max_input_bytes: u64::MAX,
-        }
+        Self { outcome: Err(error), extensions: resolve_extensions(&[]), max_input_bytes: u64::MAX }
     }
 
     /// Narrow the input size cap, for the pre-write validation tests.
@@ -550,10 +546,8 @@ mod tests {
     async fn cli_returns_the_markdown_the_child_wrote_on_stdout() {
         let home = tempfile::tempdir().unwrap();
         let sh = script(home.path(), "conv.sh", "cat \"$1\"\n");
-        let svc = cli_service(
-            vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()],
-            30,
-        );
+        let svc =
+            cli_service(vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()], 30);
 
         let md = svc.to_markdown(b"# from the fixture\n", "deck.pptx").await.unwrap();
         assert_eq!(md, "# from the fixture\n");
@@ -574,10 +568,8 @@ mod tests {
              echo \"FILES=$(ls | tr '\\n' ' ')\"\n\
              echo \"TMPDIR=$TMPDIR\"\n",
         );
-        let svc = cli_service(
-            vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()],
-            30,
-        );
+        let svc =
+            cli_service(vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()], 30);
 
         let before = std::env::current_dir().unwrap();
         let md = svc.to_markdown(b"body", "deck.pptx").await.unwrap();
@@ -651,10 +643,8 @@ mod tests {
              echo 'the real cause' >&2\n\
              exit 3\n",
         );
-        let svc = cli_service(
-            vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()],
-            30,
-        );
+        let svc =
+            cli_service(vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()], 30);
 
         let e = svc.to_markdown(b"body", "deck.pptx").await.unwrap_err();
         assert_eq!(e.code, code::INTERNAL_ERROR);
@@ -668,10 +658,8 @@ mod tests {
     async fn cli_empty_stdout_is_a_failure_not_an_empty_document() {
         let home = tempfile::tempdir().unwrap();
         let sh = script(home.path(), "silent.sh", "exit 0\n");
-        let svc = cli_service(
-            vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()],
-            30,
-        );
+        let svc =
+            cli_service(vec![sh.display().to_string(), crate::config::DOC_PLACEHOLDER.into()], 30);
 
         let e = svc.to_markdown(b"body", "deck.pptx").await.unwrap_err();
         assert_eq!(e.code, code::INTERNAL_ERROR);
@@ -786,7 +774,8 @@ mod tests {
 
     #[tokio::test]
     async fn api_reads_the_body_or_the_configured_json_field() {
-        let (url, _) = stub_server(axum::http::StatusCode::OK, "# raw markdown", "authorization").await;
+        let (url, _) =
+            stub_server(axum::http::StatusCode::OK, "# raw markdown", "authorization").await;
         let raw = api_service(DocServiceApiConfig { url: url.clone(), ..Default::default() });
         assert_eq!(raw.to_markdown(b"x", "a.pdf").await.unwrap(), "# raw markdown");
 

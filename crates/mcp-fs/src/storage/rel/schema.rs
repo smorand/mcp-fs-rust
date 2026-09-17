@@ -170,7 +170,10 @@ impl SchemaSet {
     /// The DDL statements to apply, in order. Each is separately idempotent.
     pub fn render(&self, dialect: Dialect) -> Vec<String> {
         let mut out = Vec::with_capacity(
-            self.tables.len() + self.indexes.len() + self.typed_indexes.len() + self.virtual_tables.len()
+            self.tables.len()
+                + self.indexes.len()
+                + self.typed_indexes.len()
+                + self.virtual_tables.len(),
         );
         for table in &self.tables {
             out.push(render_table(dialect, table));
@@ -205,21 +208,12 @@ fn render_table(dialect: Dialect, table: &Table) -> String {
         parts.push(def);
     }
     if !table.primary_key.is_empty() {
-        let cols = table
-            .primary_key
-            .iter()
-            .map(|c| dialect.quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let cols =
+            table.primary_key.iter().map(|c| dialect.quote_ident(c)).collect::<Vec<_>>().join(", ");
         parts.push(format!("PRIMARY KEY ({cols})"));
     }
     for fk in &table.foreign_keys {
-        let cols = fk
-            .columns
-            .iter()
-            .map(|c| dialect.quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let cols = fk.columns.iter().map(|c| dialect.quote_ident(c)).collect::<Vec<_>>().join(", ");
         let ref_cols = fk
             .references_columns
             .iter()
@@ -251,12 +245,7 @@ fn render_table(dialect: Dialect, table: &Table) -> String {
 }
 
 fn render_index(dialect: Dialect, index: &Index) -> String {
-    let cols = index
-        .columns
-        .iter()
-        .map(|c| dialect.quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let cols = index.columns.iter().map(|c| dialect.quote_ident(c)).collect::<Vec<_>>().join(", ");
     let name = dialect.quote_ident(index.name);
     let table = dialect.quote_ident(index.table);
     match dialect {
@@ -279,12 +268,7 @@ pub(super) fn escape_sql_string(s: &str) -> String {
 }
 
 fn render_typed_index(dialect: Dialect, tidx: &TypedIndex) -> Option<String> {
-    let cols = tidx
-        .columns
-        .iter()
-        .map(|c| dialect.quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let cols = tidx.columns.iter().map(|c| dialect.quote_ident(c)).collect::<Vec<_>>().join(", ");
     let name = dialect.quote_ident(tidx.name);
     let table = dialect.quote_ident(tidx.table);
 
@@ -295,12 +279,12 @@ fn render_typed_index(dialect: Dialect, tidx: &TypedIndex) -> Option<String> {
             "CREATE INDEX IF NOT EXISTS {name} ON {table} USING ivfflat ({cols} vector_cosine_ops)"
         )),
         // GIN is PostgreSQL-specific; on other engines fall back to a standard index.
-        (IndexKind::Gin, Dialect::Postgres) => Some(format!(
-            "CREATE INDEX IF NOT EXISTS {name} ON {table} USING GIN ({cols})"
-        )),
-        (IndexKind::Standard | IndexKind::Gin, Dialect::Sqlite | Dialect::Postgres) => Some(format!(
-            "CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"
-        )),
+        (IndexKind::Gin, Dialect::Postgres) => {
+            Some(format!("CREATE INDEX IF NOT EXISTS {name} ON {table} USING GIN ({cols})"))
+        }
+        (IndexKind::Standard | IndexKind::Gin, Dialect::Sqlite | Dialect::Postgres) => {
+            Some(format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"))
+        }
         (IndexKind::Standard | IndexKind::Gin, Dialect::SqlServer) => Some(format!(
             "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{}' \
              AND object_id = OBJECT_ID(N'{}')) CREATE INDEX {name} ON {table} ({cols});",
@@ -321,10 +305,7 @@ fn render_virtual_table(dialect: Dialect, vt: &VirtualTableDef) -> Option<String
     }
     let name = dialect.quote_ident(vt.name);
     let cols = vt.columns.join(", ");
-    Some(format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING {} ({cols})",
-        vt.using
-    ))
+    Some(format!("CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING {} ({cols})", vt.using))
 }
 
 #[cfg(test)]
@@ -404,7 +385,9 @@ mod tests {
         }
         let sql = render_table(Dialect::SqlServer, &t);
         assert!(
-            sql.contains("FOREIGN KEY ([project_id]) REFERENCES [project] ([id]) ON DELETE CASCADE"),
+            sql.contains(
+                "FOREIGN KEY ([project_id]) REFERENCES [project] ([id]) ON DELETE CASCADE"
+            ),
             "{sql}"
         );
     }
@@ -422,7 +405,10 @@ mod tests {
         );
         let mssql = render_index(Dialect::SqlServer, &idx);
         assert!(mssql.starts_with("IF NOT EXISTS (SELECT 1 FROM sys.indexes"), "{mssql}");
-        assert!(mssql.contains("CREATE INDEX [idx_nodes_parent] ON [nodes] ([parent]);"), "{mssql}");
+        assert!(
+            mssql.contains("CREATE INDEX [idx_nodes_parent] ON [nodes] ([parent]);"),
+            "{mssql}"
+        );
     }
 
     #[test]

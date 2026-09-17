@@ -111,11 +111,8 @@ impl Upsert {
         columns: Vec<&'static str>,
         conflict: Vec<&'static str>,
     ) -> Self {
-        let sets = columns
-            .iter()
-            .filter(|c| !conflict.contains(c))
-            .map(|c| Assign::inserted(c))
-            .collect();
+        let sets =
+            columns.iter().filter(|c| !conflict.contains(c)).map(|c| Assign::inserted(c)).collect();
         Self { table, columns, conflict, action: UpsertAction::Update(sets) }
     }
 
@@ -240,7 +237,9 @@ impl Dialect {
             (Self::SqlServer, ColumnType::Double) => "FLOAT".into(),
             (Self::SqlServer, ColumnType::Blob) => "VARBINARY(MAX)".into(),
             // SQL Server has no tsvector or pgvector; both degrade to TEXT.
-            (Self::SqlServer, ColumnType::Tsvector | ColumnType::Vector(_)) => "NVARCHAR(MAX)".into(),
+            (Self::SqlServer, ColumnType::Tsvector | ColumnType::Vector(_)) => {
+                "NVARCHAR(MAX)".into()
+            }
         }
     }
 
@@ -271,9 +270,7 @@ impl Dialect {
                 "SELECT table_name FROM information_schema.tables \
                  WHERE table_schema = current_schema() ORDER BY table_name"
             }
-            Self::SqlServer => {
-                "SELECT name FROM sys.tables WHERE type = 'U' ORDER BY name"
-            }
+            Self::SqlServer => "SELECT name FROM sys.tables WHERE type = 'U' ORDER BY name",
         }
     }
 
@@ -313,16 +310,10 @@ impl Dialect {
     /// [`Self::render_placeholders`] like any other statement.
     pub fn render_upsert(self, upsert: &Upsert) -> String {
         let table = self.quote_ident(upsert.table);
-        let cols = upsert
-            .columns
-            .iter()
-            .map(|c| self.quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let values = (1..=upsert.columns.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let cols =
+            upsert.columns.iter().map(|c| self.quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let values =
+            (1..=upsert.columns.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
 
         match self {
             Self::Sqlite | Self::Postgres => {
@@ -464,7 +455,9 @@ mod tests {
         let mssql = render_column_migration(Dialect::SqlServer, &m);
         assert!(mssql.starts_with("IF NOT EXISTS (SELECT 1 FROM sys.columns"), "{mssql}");
         assert!(
-            mssql.contains("ALTER TABLE [project] ADD [index_mode] NVARCHAR(MAX) NOT NULL DEFAULT 'none';"),
+            mssql.contains(
+                "ALTER TABLE [project] ADD [index_mode] NVARCHAR(MAX) NOT NULL DEFAULT 'none';"
+            ),
             "{mssql}"
         );
     }
@@ -615,11 +608,7 @@ mod tests {
             assert_eq!(d.escape_like_literal("/a/b"), "/a/b", "{d:?} leaves plain text");
             assert_eq!(d.escape_like_literal("50%"), "50\\%", "{d:?} escapes percent");
             assert_eq!(d.escape_like_literal("a_b"), "a\\_b", "{d:?} escapes underscore");
-            assert_eq!(
-                d.escape_like_literal("a\\b"),
-                "a\\\\b",
-                "{d:?} escapes the escape char"
-            );
+            assert_eq!(d.escape_like_literal("a\\b"), "a\\\\b", "{d:?} escapes the escape char");
         }
     }
 

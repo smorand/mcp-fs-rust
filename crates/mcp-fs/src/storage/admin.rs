@@ -108,10 +108,8 @@ impl RelationalAdminStore {
     }
 
     async fn project_exists(&self, id: &str) -> Result<bool> {
-        let row = self
-            .db
-            .query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(id))
-            .await?;
+        let row =
+            self.db.query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(id)).await?;
         Ok(row.is_some())
     }
 }
@@ -130,9 +128,8 @@ impl AdminBackend for RelationalAdminStore {
         // check would re-read the original state. Left on an owned handle because
         // creating a project is a cold path where a serialization conflict is
         // vanishingly unlikely, and the sequential form reads better than a closure.
-        let exists = tx
-            .query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(&id))
-            .await?;
+        let exists =
+            tx.query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(&id)).await?;
         if exists.is_some() {
             return Err(ToolError::project_exists(&id));
         }
@@ -162,9 +159,7 @@ impl AdminBackend for RelationalAdminStore {
 
     async fn delete_project(&self, project_id: &str) -> Result<()> {
         // Memberships cascade via the foreign key.
-        self.db
-            .execute(&Query::new("DELETE FROM project WHERE id=?1").bind(project_id))
-            .await?;
+        self.db.execute(&Query::new("DELETE FROM project WHERE id=?1").bind(project_id)).await?;
         Ok(())
     }
 
@@ -176,9 +171,8 @@ impl AdminBackend for RelationalAdminStore {
         // Same reasoning as create_project: idempotent, but a cold path, so the
         // owned handle is preferred over the retry helper.
         let mut tx = self.db.begin().await?;
-        let exists = tx
-            .query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(&id))
-            .await?;
+        let exists =
+            tx.query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(&id)).await?;
         if exists.is_none() {
             return Err(ToolError::project_not_found(&id));
         }
@@ -186,11 +180,9 @@ impl AdminBackend for RelationalAdminStore {
         // them to a plain member.
         let role = tx
             .query_opt(
-                &Query::new(
-                    "SELECT role FROM project_member WHERE project_id=?1 AND person=?2",
-                )
-                .bind(&id)
-                .bind(&person),
+                &Query::new("SELECT role FROM project_member WHERE project_id=?1 AND person=?2")
+                    .bind(&id)
+                    .bind(&person),
             )
             .await?
             .map(|r| r.text(0))
@@ -205,15 +197,8 @@ impl AdminBackend for RelationalAdminStore {
             vec!["project_id", "person"],
             vec![Assign::inserted("added_by")],
         ));
-        tx.execute(
-            &Query::new(sql)
-                .bind(&id)
-                .bind(&person)
-                .bind(&role)
-                .bind(&added_by)
-                .bind(&now),
-        )
-        .await?;
+        tx.execute(&Query::new(sql).bind(&id).bind(&person).bind(&role).bind(&added_by).bind(&now))
+            .await?;
         tx.commit().await?;
         Ok(Member { project_id: id, person, role, added_by, added_at: now })
     }
@@ -266,9 +251,7 @@ impl AdminBackend for RelationalAdminStore {
     async fn list_all_projects(&self) -> Result<Vec<Project>> {
         let rows = self
             .db
-            .query(&Query::new(
-                "SELECT id, owner, created_at, index_mode FROM project ORDER BY id",
-            ))
+            .query(&Query::new("SELECT id, owner, created_at, index_mode FROM project ORDER BY id"))
             .await?;
         rows.iter().map(Self::read_project).collect()
     }
@@ -276,9 +259,7 @@ impl AdminBackend for RelationalAdminStore {
     async fn list_all_persons(&self) -> Result<Vec<String>> {
         let rows = self
             .db
-            .query(&Query::new(
-                "SELECT DISTINCT person FROM project_member ORDER BY person",
-            ))
+            .query(&Query::new("SELECT DISTINCT person FROM project_member ORDER BY person"))
             .await?;
         rows.iter().map(|r| r.text(0)).collect()
     }
@@ -301,11 +282,9 @@ impl AdminBackend for RelationalAdminStore {
         let row = self
             .db
             .query_opt(
-                &Query::new(
-                    "SELECT 1 FROM project_member WHERE project_id=?1 AND person=?2",
-                )
-                .bind(project_id)
-                .bind(normalize_identity(person)),
+                &Query::new("SELECT 1 FROM project_member WHERE project_id=?1 AND person=?2")
+                    .bind(project_id)
+                    .bind(normalize_identity(person)),
             )
             .await?;
         Ok(row.is_some())
@@ -354,9 +333,7 @@ impl AdminBackend for RelationalAdminStore {
     async fn get_index_mode(&self, project_id: &str) -> Result<IndexMode> {
         let row = self
             .db
-            .query_opt(
-                &Query::new("SELECT index_mode FROM project WHERE id=?1").bind(project_id),
-            )
+            .query_opt(&Query::new("SELECT index_mode FROM project WHERE id=?1").bind(project_id))
             .await?
             .ok_or_else(|| ToolError::project_not_found(project_id))?;
         IndexMode::from_str(&row.text(0)?)
@@ -368,17 +345,9 @@ impl AdminBackend for RelationalAdminStore {
 pub fn validate_project_id(id: &str) -> Result<()> {
     let ok = id.len() >= 3
         && id.len() <= 32
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && id
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && id
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && id.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id.chars().last().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
     if ok {
         Ok(())
     } else {
@@ -509,10 +478,7 @@ mod tests {
         let p = s.create_project("proj", "o@t.c").await.unwrap();
         assert_eq!(p.index_mode, IndexMode::None);
         assert_eq!(s.get_index_mode("proj").await.unwrap(), IndexMode::None);
-        assert_eq!(
-            s.get_project("proj").await.unwrap().unwrap().index_mode,
-            IndexMode::None
-        );
+        assert_eq!(s.get_project("proj").await.unwrap().unwrap().index_mode, IndexMode::None);
     }
 
     #[tokio::test]

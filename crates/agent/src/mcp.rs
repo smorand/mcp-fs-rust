@@ -52,9 +52,8 @@ impl McpClient {
     /// The tool catalogue, keyed by name so a call can resolve exactly.
     pub async fn list_tools(&self) -> Result<BTreeMap<String, Tool>> {
         let res = self.rpc("tools/list", json!({})).await?;
-        let arr = res["tools"]
-            .as_array()
-            .ok_or_else(|| anyhow!("tools/list returned no tools array"))?;
+        let arr =
+            res["tools"].as_array().ok_or_else(|| anyhow!("tools/list returned no tools array"))?;
         let mut out = BTreeMap::new();
         for t in arr {
             let name = t["name"].as_str().unwrap_or_default().to_string();

@@ -79,7 +79,15 @@ mod tests {
     #[test]
     fn web_and_context7_tools_register_when_enabled() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: false, web: true, context7: true, sqlite: false, db: false, doc: false, search: false };
+        let features = EnabledFeatures {
+            git: false,
+            web: true,
+            context7: true,
+            sqlite: false,
+            db: false,
+            doc: false,
+            search: false,
+        };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 35 fs + 10 admin + 5 web + 2 context7 = 52
@@ -91,7 +99,15 @@ mod tests {
     #[test]
     fn all_features_enabled_count() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true, search: false };
+        let features = EnabledFeatures {
+            git: true,
+            web: true,
+            context7: true,
+            sqlite: true,
+            db: true,
+            doc: true,
+            search: false,
+        };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 35 fs + 10 admin + 14 git + 5 web + 2 context7 + 8 sqlite + 5 db = 79
@@ -104,7 +120,15 @@ mod tests {
     #[test]
     fn all_features_with_search_adds_four_tools() {
         let mut reg = ToolRegistry::new();
-        let features = EnabledFeatures { git: true, web: true, context7: true, sqlite: true, db: true, doc: true, search: true };
+        let features = EnabledFeatures {
+            git: true,
+            web: true,
+            context7: true,
+            sqlite: true,
+            db: true,
+            doc: true,
+            search: true,
+        };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };

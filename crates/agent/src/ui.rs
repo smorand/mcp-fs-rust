@@ -93,10 +93,7 @@ pub fn markdown_to_ansi(text: &str) -> String {
             let _ = writeln!(out, "{BOLD_UNDERLINE_WHITE}{rest}{RESET}");
         } else if let Some(rest) = line.strip_prefix("# ") {
             let _ = writeln!(out, "{BOLD_UNDERLINE_WHITE}{rest}{RESET}");
-        } else if let Some(rest) = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-        {
+        } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
             let _ = writeln!(out, "  {DIM}{GLYPH_BULLET}{RESET} {}", inline_ansi(rest));
         } else if let Some(marker_len) = ordered_marker_len(line) {
             let (marker, rest) = line.split_at(marker_len);
@@ -125,11 +122,7 @@ fn ordered_marker_len(line: &str) -> Option<usize> {
         return None;
     }
     // Safe to slice: every counted byte is an ASCII digit, so this is a char boundary.
-    if line[digits..].starts_with(". ") {
-        Some(digits + 2)
-    } else {
-        None
-    }
+    if line[digits..].starts_with(". ") { Some(digits + 2) } else { None }
 }
 
 /// Apply inline emphasis. Scanning is left to right and the first rule that matches at a
@@ -213,28 +206,16 @@ fn render_arg(value: &Value) -> String {
 
 /// Collapse a successful tool result into a single capped line.
 fn success_preview(result: &str) -> String {
-    let segments: Vec<&str> = result
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(str::trim)
-        .collect();
+    let segments: Vec<&str> = result.split('\n').filter(|s| !s.is_empty()).map(str::trim).collect();
 
     let preview = if segments.len() <= 3 {
         segments.join(" \u{b7} ")
     } else {
-        format!(
-            "{}  \u{2026} (+{} lines)",
-            segments[..3].join(" \u{b7} "),
-            segments.len() - 3
-        )
+        format!("{}  \u{2026} (+{} lines)", segments[..3].join(" \u{b7} "), segments.len() - 3)
     };
 
     let preview = truncate_cols(&preview, PREVIEW_COLS, 137);
-    if preview.is_empty() {
-        "(empty)".to_string()
-    } else {
-        preview
-    }
+    if preview.is_empty() { "(empty)".to_string() } else { preview }
 }
 
 /// The already indented lines of a failed tool result: headline then dim cause chain.
@@ -406,10 +387,7 @@ mod tests {
     fn truncate_cols_counts_display_width() {
         // Each ideograph is two columns wide, so four of them exceed a limit of four.
         assert_eq!(truncate_cols("\u{4f60}\u{597d}", 4, 2), "\u{4f60}\u{597d}");
-        assert_eq!(
-            truncate_cols("\u{4f60}\u{597d}\u{4e16}\u{754c}", 4, 2),
-            "\u{4f60}\u{2026}"
-        );
+        assert_eq!(truncate_cols("\u{4f60}\u{597d}\u{4e16}\u{754c}", 4, 2), "\u{4f60}\u{2026}");
     }
 
     #[test]
@@ -424,18 +402,12 @@ mod tests {
 
     #[test]
     fn success_preview_joins_up_to_three_segments() {
-        assert_eq!(
-            success_preview("one\ntwo\nthree"),
-            "one \u{b7} two \u{b7} three"
-        );
+        assert_eq!(success_preview("one\ntwo\nthree"), "one \u{b7} two \u{b7} three");
     }
 
     #[test]
     fn success_preview_counts_the_extra_lines() {
-        assert_eq!(
-            success_preview("a\nb\nc\nd\ne"),
-            "a \u{b7} b \u{b7} c  \u{2026} (+2 lines)"
-        );
+        assert_eq!(success_preview("a\nb\nc\nd\ne"), "a \u{b7} b \u{b7} c  \u{2026} (+2 lines)");
     }
 
     #[test]

@@ -43,7 +43,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         ToolSchema::new("web.news", "Search recent news using DuckDuckGo.")
             .req_str("query", "News search query.")
             .opt_int("max_results", 10, "Maximum number of results to return (capped at 50).")
-            .opt_str_null("time_range", "Time range filter: d (day), w (week), m (month), y (year)."),
+            .opt_str_null(
+                "time_range",
+                "Time range filter: d (day), w (week), m (month), y (year).",
+            ),
         handler(|_ctx, a| async move {
             let query = a.str("query")?;
             let max = cap_results(a.int_or("max_results", 0), 10);
@@ -98,7 +101,8 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
                         &bytes,
                         true,
                         true,
-                    ).await
+                    )
+                    .await
                 }
                 (None, None) => web_fetch(&url, timeout).await,
             }
@@ -120,9 +124,7 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         handler(|ctx, a| async move {
             let url = a.str("url")?;
             if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(ToolError::invalid_argument(
-                    "url must start with http:// or https://",
-                ));
+                return Err(ToolError::invalid_argument("url must start with http:// or https://"));
             }
             let timeout = a.int_or("timeout_secs", 30).clamp(1, 120) as u64;
             let (mount, client) = volume(&ctx, &a).await?;
@@ -137,7 +139,8 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
                 &bytes,
                 true,
                 true,
-            ).await?;
+            )
+            .await?;
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("content_type".to_string(), Value::String(content_type));
             }
@@ -180,15 +183,20 @@ fn strip_html(s: &str) -> String {
     let mut in_tag = false;
     for ch in s.chars() {
         match ch {
-            '<' => { in_tag = true; }
-            '>' => { in_tag = false; }
-            _ if !in_tag => { out.push(ch); }
+            '<' => {
+                in_tag = true;
+            }
+            '>' => {
+                in_tag = false;
+            }
+            _ if !in_tag => {
+                out.push(ch);
+            }
             _ => {}
         }
     }
     // Decode entities after stripping tags.
-    out
-        .replace("&amp;", "&")
+    out.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -230,23 +238,23 @@ fn extract_href(haystack: &str) -> Option<String> {
     }
 }
 
-async fn web_search(query: &str, max_results: usize, safe_search: &str) -> crate::errors::Result<Value> {
+async fn web_search(
+    query: &str,
+    max_results: usize,
+    safe_search: &str,
+) -> crate::errors::Result<Value> {
     let encoded = urlencoding(query);
     let kp = safe_param(safe_search);
     let url = format!("https://html.duckduckgo.com/html/?q={encoded}&kp={kp}&kl=us-en");
 
     let client = build_client(10)?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                ToolError::internal("request timed out")
-            } else {
-                ToolError::internal(format!("search request failed: {e}"))
-            }
-        })?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            ToolError::internal("request timed out")
+        } else {
+            ToolError::internal(format!("search request failed: {e}"))
+        }
+    })?;
 
     let html = resp.text().await.map_err(|e| ToolError::internal(format!("read response: {e}")))?;
 
@@ -292,7 +300,11 @@ async fn web_search(query: &str, max_results: usize, safe_search: &str) -> crate
     Ok(Value::String(serde_json::to_string_pretty(&results).unwrap_or_default()))
 }
 
-async fn web_news(query: &str, max_results: usize, time_range: Option<&str>) -> crate::errors::Result<Value> {
+async fn web_news(
+    query: &str,
+    max_results: usize,
+    time_range: Option<&str>,
+) -> crate::errors::Result<Value> {
     let encoded = urlencoding(query);
     let df = match time_range {
         Some("d") => "d",
@@ -308,22 +320,16 @@ async fn web_news(query: &str, max_results: usize, time_range: Option<&str>) -> 
     };
 
     let client = build_client(10)?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                ToolError::internal("request timed out")
-            } else {
-                ToolError::internal(format!("news request failed: {e}"))
-            }
-        })?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            ToolError::internal("request timed out")
+        } else {
+            ToolError::internal(format!("news request failed: {e}"))
+        }
+    })?;
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| ToolError::internal(format!("parse news response: {e}")))?;
+    let body: Value =
+        resp.json().await.map_err(|e| ToolError::internal(format!("parse news response: {e}")))?;
 
     let empty = vec![];
     let items = body["results"].as_array().unwrap_or(&empty);
@@ -349,27 +355,21 @@ async fn web_news(query: &str, max_results: usize, time_range: Option<&str>) -> 
 /// (http/https prefix) is the caller's responsibility.
 async fn fetch_raw(url: &str, timeout_secs: u64) -> crate::errors::Result<(Vec<u8>, String)> {
     let client = build_client(timeout_secs)?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                ToolError::internal("request timed out")
-            } else {
-                ToolError::internal(format!("fetch request failed: {e}"))
-            }
-        })?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            ToolError::internal("request timed out")
+        } else {
+            ToolError::internal(format!("fetch request failed: {e}"))
+        }
+    })?;
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ToolError::internal(format!("read response: {e}")))?;
+    let bytes =
+        resp.bytes().await.map_err(|e| ToolError::internal(format!("read response: {e}")))?;
     Ok((bytes.to_vec(), content_type))
 }
 
@@ -381,11 +381,7 @@ async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value>
     let (bytes, content_type) = fetch_raw(url, timeout_secs).await?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
 
-    let text = if content_type.contains("text/html") {
-        strip_html(&body)
-    } else {
-        body
-    };
+    let text = if content_type.contains("text/html") { strip_html(&body) } else { body };
 
     let capped: String = text.chars().take(50_000).collect();
     Ok(Value::String(capped))
@@ -396,17 +392,13 @@ async fn web_suggestions(query: &str) -> crate::errors::Result<Value> {
     let url = format!("https://duckduckgo.com/ac/?q={encoded}&type=list");
 
     let client = build_client(10)?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                ToolError::internal("request timed out")
-            } else {
-                ToolError::internal(format!("suggestions request failed: {e}"))
-            }
-        })?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            ToolError::internal("request timed out")
+        } else {
+            ToolError::internal(format!("suggestions request failed: {e}"))
+        }
+    })?;
 
     let body: Value = resp
         .json()
@@ -422,8 +414,9 @@ fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             b' ' => out.push('+'),
             b => out.push_str(&format!("%{b:02X}")),
         }

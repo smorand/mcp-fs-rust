@@ -44,11 +44,8 @@ async fn open_db(
     client: &crate::storage::VolumeClient,
     db_path: &str,
 ) -> Result<(tempfile::NamedTempFile, Connection)> {
-    let bytes = if client.exists(db_path).await? {
-        client.read_bytes(db_path).await?
-    } else {
-        Vec::new()
-    };
+    let bytes =
+        if client.exists(db_path).await? { client.read_bytes(db_path).await? } else { Vec::new() };
 
     let tmp = tempfile::NamedTempFile::new()
         .map_err(|e| ToolError::internal(format!("temp file: {e}")))?;
@@ -70,8 +67,8 @@ async fn commit_db(
     mount_id: &str,
     db_path: &str,
 ) -> Result<()> {
-    let bytes = std::fs::read(tmp.path())
-        .map_err(|e| ToolError::internal(format!("read temp: {e}")))?;
+    let bytes =
+        std::fs::read(tmp.path()).map_err(|e| ToolError::internal(format!("read temp: {e}")))?;
     fs_ops::write_bytes(client, safety, person, mount_id, db_path, &bytes, true, true).await?;
     Ok(())
 }
@@ -96,9 +93,8 @@ fn require_select(sql: &str) -> Result<()> {
 
 /// Execute a SELECT and collect results as {columns, rows, row_count}.
 fn select_json(conn: &Connection, sql: &str, raw_params: &[Value], limit: usize) -> Result<Value> {
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?;
+    let mut stmt =
+        conn.prepare(sql).map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?;
 
     let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
@@ -168,7 +164,8 @@ pub fn parse_csv(bytes: &[u8], delimiter: char) -> Result<(Vec<String>, Vec<Vec<
     let text = String::from_utf8_lossy(bytes);
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
 
-    let header_line = lines.next().ok_or_else(|| ToolError::invalid_argument("CSV has no header row"))?;
+    let header_line =
+        lines.next().ok_or_else(|| ToolError::invalid_argument("CSV has no header row"))?;
     let headers: Vec<String> = header_line.split(delimiter).map(|s| s.trim().to_string()).collect();
 
     const ROW_CAP: usize = 100_000;
@@ -262,9 +259,12 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
 
     // sqlite.list_tables
     reg.add(
-        ToolSchema::new("sqlite.list_tables", "List tables and views in a SQLite database stored in a volume.")
-            .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("db_path", "Path to the .db file within the volume."),
+        ToolSchema::new(
+            "sqlite.list_tables",
+            "List tables and views in a SQLite database stored in a volume.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("db_path", "Path to the .db file within the volume."),
         handler(move |ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let db_path = norm(&ctx, &a, "db_path")?;
@@ -284,10 +284,13 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
 
     // sqlite.describe_table
     reg.add(
-        ToolSchema::new("sqlite.describe_table", "Describe the columns and indexes of a table in a SQLite database stored in a volume.")
-            .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("db_path", "Path to the .db file within the volume.")
-            .req_str("table", "Table name to inspect."),
+        ToolSchema::new(
+            "sqlite.describe_table",
+            "Describe the columns and indexes of a table in a SQLite database stored in a volume.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("db_path", "Path to the .db file within the volume.")
+        .req_str("table", "Table name to inspect."),
         handler(move |ctx, a| async move {
             let table = a.str("table")?;
             let (mount, client) = volume(&ctx, &a).await?;
@@ -337,9 +340,12 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
 
     // sqlite.vacuum
     reg.add(
-        ToolSchema::new("sqlite.vacuum", "Run VACUUM on a SQLite database stored in a volume to reclaim space.")
-            .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("db_path", "Path to the .db file within the volume."),
+        ToolSchema::new(
+            "sqlite.vacuum",
+            "Run VACUUM on a SQLite database stored in a volume to reclaim space.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("db_path", "Path to the .db file within the volume."),
         handler(move |ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let db_path = norm(&ctx, &a, "db_path")?;
@@ -358,13 +364,20 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
 
     // sqlite.import_csv
     reg.add(
-        ToolSchema::new("sqlite.import_csv", "Import a CSV file from the volume into a SQLite database table.")
-            .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("db_path", "Path to the target .db file within the volume.")
-            .req_str("csv_path", "Source CSV file path in the volume.")
-            .req_str("table", "Target table name.")
-            .opt_bool("create_table", true, "Create the table if it does not exist (infers schema from CSV header).")
-            .opt_str(",", ",", "Column delimiter character."),
+        ToolSchema::new(
+            "sqlite.import_csv",
+            "Import a CSV file from the volume into a SQLite database table.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("db_path", "Path to the target .db file within the volume.")
+        .req_str("csv_path", "Source CSV file path in the volume.")
+        .req_str("table", "Target table name.")
+        .opt_bool(
+            "create_table",
+            true,
+            "Create the table if it does not exist (infers schema from CSV header).",
+        )
+        .opt_str(",", ",", "Column delimiter character."),
         handler(move |ctx, a| async move {
             let csv_path_raw = a.str("csv_path")?;
             let table = a.str("table")?;
@@ -388,8 +401,9 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
                 let cols: Vec<String> = headers.iter().map(|h| format!("{h} TEXT")).collect();
                 let create_sql =
                     format!("CREATE TABLE IF NOT EXISTS \"{table}\" ({})", cols.join(", "));
-                conn.execute_batch(&create_sql)
-                    .map_err(|e| ToolError::invalid_argument(format!("CREATE TABLE failed: {e}")))?;
+                conn.execute_batch(&create_sql).map_err(|e| {
+                    ToolError::invalid_argument(format!("CREATE TABLE failed: {e}"))
+                })?;
             }
 
             let placeholders: Vec<&str> = headers.iter().map(|_| "?").collect();
@@ -418,8 +432,7 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
                         .map_err(|e| ToolError::internal(format!("insert row: {e}")))?;
                 }
                 drop(stmt);
-                tx.commit()
-                    .map_err(|e| ToolError::internal(format!("commit: {e}")))?;
+                tx.commit().map_err(|e| ToolError::internal(format!("commit: {e}")))?;
             }
 
             drop(conn);
@@ -500,8 +513,9 @@ fn parse_params(raw: Option<&str>) -> Result<Vec<Value>> {
     match raw {
         None => Ok(Vec::new()),
         Some(s) => {
-            let v: Value = serde_json::from_str(s)
-                .map_err(|e| ToolError::invalid_argument(format!("params must be a JSON array: {e}")))?;
+            let v: Value = serde_json::from_str(s).map_err(|e| {
+                ToolError::invalid_argument(format!("params must be a JSON array: {e}"))
+            })?;
             match v {
                 Value::Array(arr) => Ok(arr),
                 _ => Err(ToolError::invalid_argument("params must be a JSON array")),

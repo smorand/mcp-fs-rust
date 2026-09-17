@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
-use tantivy::schema::{FAST, STORED, Schema, STRING, TEXT, Value};
+use tantivy::schema::{FAST, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 /// A cached, open Tantivy index for one volume.
@@ -83,10 +83,8 @@ impl TantivyBm25Backend {
 
         let vi = Arc::new(VolumeIndex { index, schema, write_lock: tokio::sync::Mutex::new(()) });
 
-        let mut guard = self
-            .cache
-            .write()
-            .map_err(|_| ToolError::internal("tantivy cache rwlock poisoned"))?;
+        let mut guard =
+            self.cache.write().map_err(|_| ToolError::internal("tantivy cache rwlock poisoned"))?;
         // Another thread may have raced to insert the same volume; return whichever won.
         Ok(guard.entry(volume_id.to_string()).or_insert(vi).clone())
     }
@@ -116,33 +114,41 @@ impl SearchBackend for TantivyBm25Backend {
         tokio::task::spawn_blocking({
             let backend = backend.clone();
             move || {
-            let path_field = backend.schema.get_field("path")
-                .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
-            let chunk_idx_field = backend.schema.get_field("chunk_idx")
-                .map_err(|e| ToolError::internal(format!("tantivy: get chunk_idx field: {e}")))?;
-            let chunk_text_field = backend.schema.get_field("chunk_text")
-                .map_err(|e| ToolError::internal(format!("tantivy: get chunk_text field: {e}")))?;
+                let path_field = backend
+                    .schema
+                    .get_field("path")
+                    .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
+                let chunk_idx_field = backend.schema.get_field("chunk_idx").map_err(|e| {
+                    ToolError::internal(format!("tantivy: get chunk_idx field: {e}"))
+                })?;
+                let chunk_text_field = backend.schema.get_field("chunk_text").map_err(|e| {
+                    ToolError::internal(format!("tantivy: get chunk_text field: {e}"))
+                })?;
 
-            let mut writer: IndexWriter = backend.index
-                .writer(50_000_000)
-                .map_err(|e| ToolError::internal(format!("tantivy: create writer: {e}")))?;
+                let mut writer: IndexWriter = backend
+                    .index
+                    .writer(50_000_000)
+                    .map_err(|e| ToolError::internal(format!("tantivy: create writer: {e}")))?;
 
-            // Idempotent: delete existing chunks for this path before inserting.
-            writer.delete_term(Term::from_field_text(path_field, &path_owned));
+                // Idempotent: delete existing chunks for this path before inserting.
+                writer.delete_term(Term::from_field_text(path_field, &path_owned));
 
-            for (idx, chunk_text) in chunks.iter().enumerate() {
-                let mut doc = TantivyDocument::default();
-                doc.add_text(path_field, &path_owned);
-                doc.add_u64(chunk_idx_field, idx as u64);
-                doc.add_text(chunk_text_field, chunk_text);
-                writer.add_document(doc)
-                    .map_err(|e| ToolError::internal(format!("tantivy: add document: {e}")))?;
+                for (idx, chunk_text) in chunks.iter().enumerate() {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_text(path_field, &path_owned);
+                    doc.add_u64(chunk_idx_field, idx as u64);
+                    doc.add_text(chunk_text_field, chunk_text);
+                    writer
+                        .add_document(doc)
+                        .map_err(|e| ToolError::internal(format!("tantivy: add document: {e}")))?;
+                }
+
+                writer
+                    .commit()
+                    .map_err(|e| ToolError::internal(format!("tantivy: commit: {e}")))?;
+                Ok(n)
             }
-
-            writer.commit()
-                .map_err(|e| ToolError::internal(format!("tantivy: commit: {e}")))?;
-            Ok(n)
-        }})
+        })
         .await
         .map_err(|e| ToolError::internal(format!("tantivy task join: {e}")))?
     }
@@ -155,34 +161,40 @@ impl SearchBackend for TantivyBm25Backend {
         tokio::task::spawn_blocking({
             let backend = backend.clone();
             move || {
-            let path_field = backend.schema.get_field("path")
-                .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
+                let path_field = backend
+                    .schema
+                    .get_field("path")
+                    .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
 
-            // Count before deleting so we can return the count.
-            let reader = backend.index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::Manual)
-                .try_into()
-                .map_err(|e| ToolError::internal(format!("tantivy: build reader: {e}")))?;
-            let searcher = reader.searcher();
-            let term = Term::from_field_text(path_field, &path_owned);
-            let term_query = tantivy::query::TermQuery::new(
-                term.clone(),
-                tantivy::schema::IndexRecordOption::Basic,
-            );
-            let count = searcher
-                .search(&term_query, &Count)
-                .map_err(|e| ToolError::internal(format!("tantivy: count: {e}")))?;
+                // Count before deleting so we can return the count.
+                let reader = backend
+                    .index
+                    .reader_builder()
+                    .reload_policy(ReloadPolicy::Manual)
+                    .try_into()
+                    .map_err(|e| ToolError::internal(format!("tantivy: build reader: {e}")))?;
+                let searcher = reader.searcher();
+                let term = Term::from_field_text(path_field, &path_owned);
+                let term_query = tantivy::query::TermQuery::new(
+                    term.clone(),
+                    tantivy::schema::IndexRecordOption::Basic,
+                );
+                let count = searcher
+                    .search(&term_query, &Count)
+                    .map_err(|e| ToolError::internal(format!("tantivy: count: {e}")))?;
 
-            let mut writer: IndexWriter = backend.index
-                .writer(50_000_000)
-                .map_err(|e| ToolError::internal(format!("tantivy: create writer: {e}")))?;
-            writer.delete_term(term);
-            writer.commit()
-                .map_err(|e| ToolError::internal(format!("tantivy: commit delete: {e}")))?;
+                let mut writer: IndexWriter = backend
+                    .index
+                    .writer(50_000_000)
+                    .map_err(|e| ToolError::internal(format!("tantivy: create writer: {e}")))?;
+                writer.delete_term(term);
+                writer
+                    .commit()
+                    .map_err(|e| ToolError::internal(format!("tantivy: commit delete: {e}")))?;
 
-            Ok(count)
-        }})
+                Ok(count)
+            }
+        })
         .await
         .map_err(|e| ToolError::internal(format!("tantivy task join: {e}")))?
     }
@@ -229,12 +241,17 @@ impl SearchBackend for TantivyBm25Backend {
         let query_owned = query.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let path_field = backend.schema.get_field("path")
+            let path_field = backend
+                .schema
+                .get_field("path")
                 .map_err(|e| ToolError::internal(format!("tantivy: get path field: {e}")))?;
-            let chunk_text_field = backend.schema.get_field("chunk_text")
+            let chunk_text_field = backend
+                .schema
+                .get_field("chunk_text")
                 .map_err(|e| ToolError::internal(format!("tantivy: get chunk_text field: {e}")))?;
 
-            let reader = backend.index
+            let reader = backend
+                .index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::OnCommitWithDelay)
                 .try_into()
@@ -255,23 +272,15 @@ impl SearchBackend for TantivyBm25Backend {
                     .doc(doc_addr)
                     .map_err(|e| ToolError::internal(format!("tantivy: retrieve doc: {e}")))?;
 
-                let path = doc
-                    .get_first(path_field)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let path =
+                    doc.get_first(path_field).and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let chunk = doc
                     .get_first(chunk_text_field)
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
 
-                results.push(SearchResult {
-                    path,
-                    score,
-                    chunk,
-                    rank: results.len() + 1,
-                });
+                results.push(SearchResult { path, score, chunk, rank: results.len() + 1 });
             }
             // Re-number ranks after collecting.
             for (i, r) in results.iter_mut().enumerate() {
@@ -296,8 +305,8 @@ impl SearchBackend for TantivyBm25Backend {
 
     async fn stats(&self, volume_id: &str) -> Result<IndexStats> {
         let dir = self.index_dir(volume_id);
-        let warm = dir.exists()
-            && dir.read_dir().ok().map(|mut d| d.next().is_some()).unwrap_or(false);
+        let warm =
+            dir.exists() && dir.read_dir().ok().map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !warm {
             return Ok(IndexStats {
@@ -310,7 +319,8 @@ impl SearchBackend for TantivyBm25Backend {
 
         let backend = self.get_or_open_volume(volume_id)?;
         let count = tokio::task::spawn_blocking(move || {
-            let reader = backend.index
+            let reader = backend
+                .index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::Manual)
                 .try_into()

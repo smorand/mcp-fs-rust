@@ -173,12 +173,9 @@ impl Req {
 
 /// Bearer verification only, for the one route that is not scoped to a project.
 fn person_of(state: &AppState, headers: &HeaderMap) -> Result<String> {
-    state.identity.resolve(|name| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    })
+    state
+        .identity
+        .resolve(|name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string))
 }
 
 /// Bearer, then the project membership gate, then the operation.
@@ -206,7 +203,12 @@ where
 }
 
 /// A guarded handler that answers with the tool payload as JSON.
-async fn guarded_json<F, Fut>(state: Arc<AppState>, headers: HeaderMap, mount: String, op: F) -> Response
+async fn guarded_json<F, Fut>(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    mount: String,
+    op: F,
+) -> Response
 where
     F: FnOnce(Req) -> Fut,
     Fut: Future<Output = Result<Value>>,
@@ -217,10 +219,7 @@ where
 /// The C# 401 body. `detail` carries the full `CODE: message` rendering, verified
 /// against the reference server: `{"error":"ERR_X","detail":"ERR_X: message"}`.
 fn unauthorized(err: &ToolError) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": err.code, "detail": err.to_string()})),
-    )
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": err.code, "detail": err.to_string()})))
         .into_response()
 }
 
@@ -247,24 +246,18 @@ struct Q(Vec<(String, String)>);
 
 impl Q {
     fn opt(&self, key: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(k, v)| k == key && !v.is_empty())
-            .map(|(_, v)| v.as_str())
+        self.0.iter().find(|(k, v)| k == key && !v.is_empty()).map(|(_, v)| v.as_str())
     }
 
     /// Every value given for `key`, in order (`?x=a&x=b`), like `Query[key]` in C#.
     fn all(&self, key: &str) -> Vec<String> {
-        self.0
-            .iter()
-            .filter(|(k, v)| k == key && !v.is_empty())
-            .map(|(_, v)| v.clone())
-            .collect()
+        self.0.iter().filter(|(k, v)| k == key && !v.is_empty()).map(|(_, v)| v.clone()).collect()
     }
 
     fn req_str(&self, key: &str) -> Result<&str> {
-        self.opt(key)
-            .ok_or_else(|| ToolError::invalid_argument(format!("missing required argument '{key}'")))
+        self.opt(key).ok_or_else(|| {
+            ToolError::invalid_argument(format!("missing required argument '{key}'"))
+        })
     }
 
     fn str_or(&self, key: &str, default: &'static str) -> &str {
@@ -274,16 +267,16 @@ impl Q {
     fn int_or(&self, key: &str, default: i64) -> Result<i64> {
         match self.opt(key) {
             None => Ok(default),
-            Some(v) => v
-                .parse::<i64>()
-                .map_err(|_| ToolError::invalid_argument(format!("argument '{key}' must be an integer"))),
+            Some(v) => v.parse::<i64>().map_err(|_| {
+                ToolError::invalid_argument(format!("argument '{key}' must be an integer"))
+            }),
         }
     }
 
     fn req_int(&self, key: &str) -> Result<i64> {
-        self.req_str(key)?
-            .parse::<i64>()
-            .map_err(|_| ToolError::invalid_argument(format!("argument '{key}' must be an integer")))
+        self.req_str(key)?.parse::<i64>().map_err(|_| {
+            ToolError::invalid_argument(format!("argument '{key}' must be an integer"))
+        })
     }
 
     fn bool_or(&self, key: &str, default: bool) -> Result<bool> {
@@ -292,9 +285,9 @@ impl Q {
             Some(v) => match v.to_ascii_lowercase().as_str() {
                 "true" | "1" => Ok(true),
                 "false" | "0" => Ok(false),
-                _ => Err(ToolError::invalid_argument(format!(
-                    "argument '{key}' must be a boolean"
-                ))),
+                _ => {
+                    Err(ToolError::invalid_argument(format!("argument '{key}' must be a boolean")))
+                }
             },
         }
     }
@@ -302,10 +295,9 @@ impl Q {
     fn num_opt(&self, key: &str) -> Result<Option<f64>> {
         match self.opt(key) {
             None => Ok(None),
-            Some(v) => v
-                .parse::<f64>()
-                .map(Some)
-                .map_err(|_| ToolError::invalid_argument(format!("argument '{key}' must be a number"))),
+            Some(v) => v.parse::<f64>().map(Some).map_err(|_| {
+                ToolError::invalid_argument(format!("argument '{key}' must be a number"))
+            }),
         }
     }
 }
@@ -332,10 +324,8 @@ async fn roots(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     match state.admin.list_projects_for(&person).await {
         Err(e) => error_response(&e),
         Ok(projects) => {
-            let roots: Vec<Value> = projects
-                .iter()
-                .map(|p| json!({"mount_id": p.id, "owner": p.owner}))
-                .collect();
+            let roots: Vec<Value> =
+                projects.iter().map(|p| json!({"mount_id": p.id, "owner": p.owner})).collect();
             Json(json!({"person": person, "roots": roots})).into_response()
         }
     }
@@ -415,7 +405,8 @@ async fn delete(
         // delete takes every file underneath, and afterwards there is no tree
         // left to enumerate. The hooks are the helpers the MCP door calls, so a
         // file deleted here leaves the index exactly as one deleted there.
-        let indexed = crate::search::indexer::paths_under(&r.state, &r.mount, &norm, &r.client).await;
+        let indexed =
+            crate::search::indexer::paths_under(&r.state, &r.mount, &norm, &r.client).await;
         let out = fs_ops::delete_path(
             &r.client,
             r.safety(),
@@ -446,7 +437,8 @@ async fn move_path(
         // Same reasoning as delete: the engine owns the no clobber rule and the audit
         // entry, so the REST and MCP doors cannot drift apart. The index hooks are the
         // same helpers `fs.move` calls, for the same reason.
-        let indexed = crate::search::indexer::paths_under(&r.state, &r.mount, &src, &r.client).await;
+        let indexed =
+            crate::search::indexer::paths_under(&r.state, &r.mount, &src, &r.client).await;
         let out = fs_ops::move_path(
             &r.client,
             r.safety(),
@@ -767,7 +759,8 @@ async fn head(
     let q = Q(q);
     guarded_json(state, headers, mount, |r| async move {
         let norm = r.norm(q.req_str("path")?)?;
-        fs_ops::head(&r.client, r.safety(), &r.person, &r.mount, &norm, q.int_or("lines", 20)?).await
+        fs_ops::head(&r.client, r.safety(), &r.person, &r.mount, &norm, q.int_or("lines", 20)?)
+            .await
     })
     .await
 }
@@ -781,7 +774,8 @@ async fn tail(
     let q = Q(q);
     guarded_json(state, headers, mount, |r| async move {
         let norm = r.norm(q.req_str("path")?)?;
-        fs_ops::tail(&r.client, r.safety(), &r.person, &r.mount, &norm, q.int_or("lines", 20)?).await
+        fs_ops::tail(&r.client, r.safety(), &r.person, &r.mount, &norm, q.int_or("lines", 20)?)
+            .await
     })
     .await
 }
@@ -1107,7 +1101,9 @@ async fn multi_edit(
         let norm = r.norm(&a.str("path")?)?;
         let edits = match a.raw("edits") {
             Some(Value::Array(items)) => items.clone(),
-            Some(_) => return Err(ToolError::invalid_argument("argument 'edits' must be an array")),
+            Some(_) => {
+                return Err(ToolError::invalid_argument("argument 'edits' must be an array"));
+            }
             None => return Err(ToolError::invalid_argument("missing required argument 'edits'")),
         };
         fs_ops::multi_edit(
@@ -1182,8 +1178,7 @@ async fn apply_patch(
 ) -> Response {
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
-        fs_ops::apply_patch(&r.client, r.safety(), &r.person, &r.mount, &a.str("patch_text")?)
-            .await
+        fs_ops::apply_patch(&r.client, r.safety(), &r.person, &r.mount, &a.str("patch_text")?).await
     })
     .await
 }
@@ -1326,9 +1321,7 @@ mod tests {
         /// Same, with a document service handed straight to the state. The real
         /// one is built from config at boot; a test injects a stub here instead,
         /// so the REST documentation surfaces run without a converter binary.
-        async fn with_doc_service(
-            doc_service: Option<Arc<dyn crate::docs::DocService>>,
-        ) -> Self {
+        async fn with_doc_service(doc_service: Option<Arc<dyn crate::docs::DocService>>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let (key_path, pub_path) = keys::write_keypair(root.join("keys")).unwrap();
@@ -1351,32 +1344,29 @@ mod tests {
             let config = Arc::new(config);
 
             let registry = crate::storage::RelationalRegistry::new();
-            let admin =
-                crate::storage::build_admin_store(&config, &registry).await.unwrap();
+            let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
             admin.connect().await.unwrap();
             admin.create_project(MOUNT, OWNER).await.unwrap();
 
             let state = Arc::new(AppState {
                 config: config.clone(),
                 admin,
-                stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+                stores: Arc::new(crate::storage::StoreManager::new(
+                    config.clone(),
+                    crate::storage::test_registry(),
+                )),
                 safety: Arc::new(SafetyManager::new(
-                config.safety.clone(),
-                crate::storage::meta::max_path_len(&config.infra.meta.backend),
-            )),
+                    config.safety.clone(),
+                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
+                )),
                 identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
                 doc_service,
-            search: None,
+                search: None,
             });
 
-            Self {
-                _dir: dir,
-                state,
-                owner_token: mint(OWNER),
-                stranger_token: mint(STRANGER),
-            }
+            Self { _dir: dir, state, owner_token: mint(OWNER), stranger_token: mint(STRANGER) }
         }
 
         fn app(&self) -> Router {
@@ -1452,9 +1442,8 @@ mod tests {
     async fn without_a_token_every_route_is_401_json() {
         let h = Harness::new().await;
         for uri in ["/api/fs/roots", &u("read?path=/a.txt"), &u("stat?path=/a.txt")] {
-            let (status, body) = h
-                .send(Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap())
-                .await;
+            let (status, body) =
+                h.send(Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "uri {uri}");
             let v: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(v["error"], code::UNAUTHENTICATED);
@@ -1566,7 +1555,8 @@ mod tests {
     async fn writing_over_a_file_without_overwrite_is_409() {
         let h = Harness::new().await;
         h.seed("/clash.txt", "first").await;
-        let (status, v) = h.post(&u("write"), json!({"path": "/clash.txt", "content": "second"})).await;
+        let (status, v) =
+            h.post(&u("write"), json!({"path": "/clash.txt", "content": "second"})).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(v["error"], code::NO_CLOBBER);
     }
@@ -1638,7 +1628,8 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_round_trip() {
         let h = Harness::new().await;
-        let (status, v) = h.post(&u("write"), json!({"path": "/rest.txt", "content": "via rest"})).await;
+        let (status, v) =
+            h.post(&u("write"), json!({"path": "/rest.txt", "content": "via rest"})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["path"], "/rest.txt");
         assert_eq!(v["bytes_written"], 8);
@@ -1694,9 +1685,8 @@ mod tests {
     async fn read_many_isolates_per_file_errors() {
         let h = Harness::new().await;
         h.seed("/a.txt", "one").await;
-        let (status, v) = h
-            .post(&u("read-many"), json!({"paths": ["/a.txt", "/missing.txt"]}))
-            .await;
+        let (status, v) =
+            h.post(&u("read-many"), json!({"paths": ["/a.txt", "/missing.txt"]})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["files"][0]["path"], "/a.txt");
         assert!(v["files"][1]["error"].is_string());
@@ -1841,7 +1831,8 @@ mod tests {
     #[tokio::test]
     async fn append_create_empty_copy_move_and_delete() {
         let h = Harness::new().await;
-        let (status, v) = h.post(&u("append"), json!({"path": "/log.txt", "content": "a", "create": true})).await;
+        let (status, v) =
+            h.post(&u("append"), json!({"path": "/log.txt", "content": "a", "create": true})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["bytes_appended"], 1);
 
@@ -1849,11 +1840,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["created"], true);
 
-        let (status, v) = h.post(&u("copy"), json!({"source": "/log.txt", "destination": "/log2.txt"})).await;
+        let (status, v) =
+            h.post(&u("copy"), json!({"source": "/log.txt", "destination": "/log2.txt"})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["destination"], "/log2.txt");
 
-        let (status, v) = h.post(&u("move"), json!({"source": "/log2.txt", "destination": "/moved.txt"})).await;
+        let (status, v) =
+            h.post(&u("move"), json!({"source": "/log2.txt", "destination": "/moved.txt"})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["source"], "/log2.txt");
         assert_eq!(v["destination"], "/moved.txt");
@@ -1881,9 +1874,8 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(v["error"], code::NOT_FOUND);
 
-        let (status, v) = h
-            .post(&u("move"), json!({"source": "/nope.txt", "destination": "/x.txt"}))
-            .await;
+        let (status, v) =
+            h.post(&u("move"), json!({"source": "/nope.txt", "destination": "/x.txt"})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(v["error"], code::NOT_FOUND);
     }
@@ -1909,9 +1901,8 @@ mod tests {
         let h = Harness::new().await;
         h.seed("/from.txt", "a").await;
         h.seed("/onto.txt", "b").await;
-        let (status, _) = h
-            .post(&u("move"), json!({"source": "/from.txt", "destination": "/onto.txt"}))
-            .await;
+        let (status, _) =
+            h.post(&u("move"), json!({"source": "/from.txt", "destination": "/onto.txt"})).await;
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = h
@@ -1940,8 +1931,7 @@ mod tests {
     async fn delete_removes_a_directory_recursively() {
         let h = Harness::new().await;
         h.seed("/d/inner/f.txt", "x").await;
-        let (status, v) =
-            h.post(&u("delete"), json!({"path": "/d", "recursive": true})).await;
+        let (status, v) = h.post(&u("delete"), json!({"path": "/d", "recursive": true})).await;
         assert_eq!(status, StatusCode::OK, "body: {v}");
         assert_eq!(v["path"], "/d");
         let (_, v) = h.get(&u("exists?path=/d/inner/f.txt")).await;
@@ -2033,9 +2023,8 @@ mod tests {
     #[tokio::test]
     async fn write_docx_rejects_another_extension() {
         let h = Harness::new().await;
-        let (status, v) = h
-            .post(&u("write-docx"), json!({"path": "/report.txt", "markdown": "x"}))
-            .await;
+        let (status, v) =
+            h.post(&u("write-docx"), json!({"path": "/report.txt", "markdown": "x"})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], code::INVALID_ARGUMENT);
     }
@@ -2088,10 +2077,7 @@ mod tests {
     async fn apply_patch_rejects_a_malformed_envelope() {
         let h = Harness::new().await;
         let (status, v) = h.post(&u("apply-patch"), json!({"patch_text": "not a patch"})).await;
-        assert!(
-            (400..500).contains(&status.as_u16()),
-            "expected a 4xx, got {status} with {v}"
-        );
+        assert!((400..500).contains(&status.as_u16()), "expected a 4xx, got {status} with {v}");
     }
 
     // ── bytes plane ──────────────────────────────────────────────────────────
@@ -2256,19 +2242,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/zip");
         assert!(
-            response.headers()[header::CONTENT_DISPOSITION]
-                .to_str()
-                .unwrap()
-                .contains("src.zip")
+            response.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().contains("src.zip")
         );
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..2], b"PK");
 
         // The archive holds both files, named relative to the requested root.
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
-        let mut names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
-            .collect();
+        let mut names: Vec<String> =
+            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
         names.sort();
         assert_eq!(names, vec!["a.txt", "inner/b.txt"]);
     }
@@ -2297,7 +2279,8 @@ mod tests {
     async fn a_body_larger_than_the_axum_default_is_accepted() {
         let h = Harness::new().await;
         let content = "x".repeat(3 * 1024 * 1024);
-        let (status, v) = h.post(&u("write"), json!({"path": "/big.txt", "content": content})).await;
+        let (status, v) =
+            h.post(&u("write"), json!({"path": "/big.txt", "content": content})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["bytes_written"], 3 * 1024 * 1024);
     }
@@ -2343,7 +2326,12 @@ mod tests {
                     .unwrap(),
             )
             .await;
-        assert_eq!(status, StatusCode::OK, "zero-byte upload must succeed, body: {}", String::from_utf8_lossy(&raw));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "zero-byte upload must succeed, body: {}",
+            String::from_utf8_lossy(&raw)
+        );
         let v: Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["count"], 1, "expected one file written");
 
@@ -2377,8 +2365,7 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..2], b"PK", "must be a valid zip file");
 
-        let mut archive =
-            zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
         assert_eq!(archive.len(), 1, "zip must contain exactly one entry");
         let entry = archive.by_index(0).unwrap();
         assert_eq!(entry.name(), "only.txt");
@@ -2436,7 +2423,10 @@ mod tests {
     async fn write_bytes_stores_the_decoded_payload() {
         let h = Harness::new().await;
         let (status, v) = h
-            .post(&u("write-bytes"), json!({"path": "/raw/blob.bin", "base64": b64(&[0, 1, 2, 255])}))
+            .post(
+                &u("write-bytes"),
+                json!({"path": "/raw/blob.bin", "base64": b64(&[0, 1, 2, 255])}),
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["bytes_written"], 4);
@@ -2528,8 +2518,7 @@ mod tests {
     async fn upload_with_the_flag_documents_every_file() {
         let h = Harness::with_doc_service(stubbed()).await;
         let boundary = "DOC-BOUNDARY";
-        let body =
-            upload_body(boundary, &[("a.pptx", "PK-a"), ("b.pdf", "%PDF-b")], Some("true"));
+        let body = upload_body(boundary, &[("a.pptx", "PK-a"), ("b.pdf", "%PDF-b")], Some("true"));
         let (status, v) = upload(&h, body, boundary).await;
 
         assert_eq!(status, StatusCode::OK);
@@ -2564,8 +2553,7 @@ mod tests {
     async fn upload_with_the_flag_fails_a_mixed_batch_with_nothing_written() {
         let h = Harness::with_doc_service(stubbed()).await;
         let boundary = "MIX-BOUNDARY";
-        let body =
-            upload_body(boundary, &[("deck.pptx", "PK"), ("notes.txt", "plain")], Some("1"));
+        let body = upload_body(boundary, &[("deck.pptx", "PK"), ("notes.txt", "plain")], Some("1"));
         let (status, v) = upload(&h, body, boundary).await;
 
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);

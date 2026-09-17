@@ -88,8 +88,7 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("config file not found: {}", path.display()))?;
-        serde_yaml::from_str(&text)
-            .with_context(|| format!("invalid YAML in {}", path.display()))
+        serde_yaml::from_str(&text).with_context(|| format!("invalid YAML in {}", path.display()))
     }
 
     /// The API key, preferring the environment so the YAML can stay committable.

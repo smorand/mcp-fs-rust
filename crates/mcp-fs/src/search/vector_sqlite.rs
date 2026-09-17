@@ -115,17 +115,20 @@ impl SearchBackend for SqliteVecBackend {
         }
 
         tokio::task::spawn_blocking(move || {
-            let guard = vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
+            let guard =
+                vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
 
             // Idempotent: remove any existing rows for this path before re-inserting.
-            guard.conn
+            guard
+                .conn
                 .execute(
                     "DELETE FROM search_vec WHERE rowid IN \
                      (SELECT rowid FROM search_vec_meta WHERE volume_id=?1 AND path=?2)",
                     params![vol, path_owned],
                 )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: delete vec: {e}")))?;
-            guard.conn
+            guard
+                .conn
                 .execute(
                     "DELETE FROM search_vec_meta WHERE volume_id=?1 AND path=?2",
                     params![vol, path_owned],
@@ -135,7 +138,8 @@ impl SearchBackend for SqliteVecBackend {
             for (idx, (chunk_text, embedding)) in chunks.iter().zip(embeddings.iter()).enumerate() {
                 // Insert metadata row first; its auto-increment rowid is used
                 // to link the vec0 table row.
-                guard.conn
+                guard
+                    .conn
                     .execute(
                         "INSERT INTO search_vec_meta (volume_id, path, chunk_idx, chunk_text) \
                          VALUES (?1, ?2, ?3, ?4)",
@@ -156,7 +160,8 @@ impl SearchBackend for SqliteVecBackend {
                     )
                 };
 
-                guard.conn
+                guard
+                    .conn
                     .execute(
                         "INSERT INTO search_vec (rowid, embedding) VALUES (?1, ?2)",
                         params![meta_rowid, bytes],
@@ -175,22 +180,26 @@ impl SearchBackend for SqliteVecBackend {
         let path_owned = path.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let guard = vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
-            let count: usize = guard.conn
+            let guard =
+                vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
+            let count: usize = guard
+                .conn
                 .query_row(
                     "SELECT COUNT(*) FROM search_vec_meta WHERE volume_id=?1 AND path=?2",
                     params![vol, path_owned],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
-            guard.conn
+            guard
+                .conn
                 .execute(
                     "DELETE FROM search_vec WHERE rowid IN \
                      (SELECT rowid FROM search_vec_meta WHERE volume_id=?1 AND path=?2)",
                     params![vol, path_owned],
                 )
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: delete vec: {e}")))?;
-            guard.conn
+            guard
+                .conn
                 .execute(
                     "DELETE FROM search_vec_meta WHERE volume_id=?1 AND path=?2",
                     params![vol, path_owned],
@@ -261,7 +270,8 @@ impl SearchBackend for SqliteVecBackend {
         let vol = volume_id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let guard = vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
+            let guard =
+                vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
 
             // Convert embedding to raw bytes for the vec0 MATCH operator.
             //
@@ -274,7 +284,8 @@ impl SearchBackend for SqliteVecBackend {
                 .to_vec()
             };
 
-            let mut stmt = guard.conn
+            let mut stmt = guard
+                .conn
                 .prepare(
                     "SELECT m.path, m.chunk_text, v.distance \
                      FROM search_vec v \
@@ -287,16 +298,9 @@ impl SearchBackend for SqliteVecBackend {
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: prepare: {e}")))?;
 
             let rows: Vec<SearchResult> = stmt
-                .query_map(
-                    params![vol, rusqlite::types::Value::Blob(bytes), top_k as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, f64>(2)?,
-                        ))
-                    },
-                )
+                .query_map(params![vol, rusqlite::types::Value::Blob(bytes), top_k as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?))
+                })
                 .map_err(|e| ToolError::internal(format!("sqlite-vec: query: {e}")))?
                 .enumerate()
                 .filter_map(|(i, r)| {
@@ -322,8 +326,10 @@ impl SearchBackend for SqliteVecBackend {
         let tantivy_dir = self.tantivy_dir.join(volume_id);
 
         let count = tokio::task::spawn_blocking(move || {
-            let guard = vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
-            let c: i64 = guard.conn
+            let guard =
+                vc.lock().map_err(|_| ToolError::internal("sqlite-vec conn mutex poisoned"))?;
+            let c: i64 = guard
+                .conn
                 .query_row(
                     "SELECT COUNT(*) FROM search_vec_meta WHERE volume_id=?1",
                     params![vol],

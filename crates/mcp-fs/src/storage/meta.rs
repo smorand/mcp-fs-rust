@@ -57,7 +57,16 @@ const SELECT_COLS: &str = "path, parent, name, kind, size, mode, mtime, ctime, a
 
 /// Every column of `nodes`, in the order the upserts bind them.
 const NODE_COLS: [&str; 11] = [
-    "volume_id", "path", "parent", "name", "kind", "size", "mode", "mtime", "ctime", "atime",
+    "volume_id",
+    "path",
+    "parent",
+    "name",
+    "kind",
+    "size",
+    "mode",
+    "mtime",
+    "ctime",
+    "atime",
     "sha256",
 ];
 
@@ -284,11 +293,7 @@ async fn tx_incref(
 }
 
 /// Drop one reference. Returns true when it reached zero, so the caller GCs.
-async fn tx_decref(
-    tx: &mut dyn RelationalTx,
-    volume: &str,
-    sha: Option<&str>,
-) -> Result<bool> {
+async fn tx_decref(tx: &mut dyn RelationalTx, volume: &str, sha: Option<&str>) -> Result<bool> {
     let Some(sha) = sha else { return Ok(false) };
     let row = tx
         .query_opt(
@@ -664,11 +669,9 @@ impl MetaBackend for RelationalMetaStore {
     async fn rmdir(&self, path: &str) -> Result<()> {
         self.db
             .execute(
-                &Query::new(
-                    "DELETE FROM nodes WHERE volume_id=?1 AND path=?2 AND kind='dir'",
-                )
-                .bind(&self.volume_id)
-                .bind(path),
+                &Query::new("DELETE FROM nodes WHERE volume_id=?1 AND path=?2 AND kind='dir'")
+                    .bind(&self.volume_id)
+                    .bind(path),
             )
             .await?;
         Ok(())
@@ -706,8 +709,7 @@ impl MetaBackend for RelationalMetaStore {
                         .bind(&pattern),
                     )
                     .await?;
-                let paths: Vec<String> =
-                    rows.iter().map(|r| r.text(0)).collect::<Result<_>>()?;
+                let paths: Vec<String> = rows.iter().map(|r| r.text(0)).collect::<Result<_>>()?;
 
                 for old in paths {
                     let new = if old == src {
@@ -1053,10 +1055,7 @@ mod tests {
         s.put_file("/a.txt", Some("1"), 1, MODE_FILE).await.unwrap();
         s.put_file("/b.txt", Some("2"), 1, MODE_FILE).await.unwrap();
 
-        assert_eq!(
-            s.rename("/nope", "/x").await.unwrap_err().code,
-            crate::errors::code::NOT_FOUND
-        );
+        assert_eq!(s.rename("/nope", "/x").await.unwrap_err().code, crate::errors::code::NOT_FOUND);
         assert_eq!(
             s.rename("/a.txt", "/b.txt").await.unwrap_err().code,
             crate::errors::code::NO_CLOBBER
@@ -1066,10 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn delete_file_errors_are_typed() {
         let s = store().await;
-        assert_eq!(
-            s.delete_file("/nope").await.unwrap_err().code,
-            crate::errors::code::NOT_FOUND
-        );
+        assert_eq!(s.delete_file("/nope").await.unwrap_err().code, crate::errors::code::NOT_FOUND);
         s.mkdir("/d").await.unwrap();
         assert_eq!(
             s.delete_file("/d").await.unwrap_err().code,
@@ -1097,11 +1093,7 @@ mod tests {
         assert_eq!(gc1, None, "refcount was 2; blob must survive first delete");
 
         let gc2 = s.delete_file("/b.txt").await.unwrap();
-        assert_eq!(
-            gc2.as_deref(),
-            Some(sha),
-            "refcount hit 0; blob must be returned for GC"
-        );
+        assert_eq!(gc2.as_deref(), Some(sha), "refcount hit 0; blob must be returned for GC");
     }
 
     #[tokio::test]

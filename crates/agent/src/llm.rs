@@ -39,7 +39,10 @@ pub enum Message {
     /// An assistant turn that asked for tools.
     ToolCalls(Vec<ToolCall>),
     /// One tool's answer, tied back by call id.
-    ToolResult { call_id: String, content: String },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
 }
 
 /// A tool invocation requested by the model.
@@ -215,8 +218,7 @@ impl LlmClient {
                         return Err(e);
                     }
                     attempt += 1;
-                    let delay_ms =
-                        (RETRY_BASE_MS * (1u64 << attempt.min(5))).min(RETRY_CAP_MS);
+                    let delay_ms = (RETRY_BASE_MS * (1u64 << attempt.min(5))).min(RETRY_CAP_MS);
                     on_retry(attempt, &msg);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
@@ -232,7 +234,11 @@ impl LlmClient {
     ///
     /// Returns the original slice unchanged if there is nothing to compact (empty or
     /// a single system message with no history).
-    pub async fn compact_context(&self, messages: &[Message], _tools: &[Value]) -> Result<Vec<Message>> {
+    pub async fn compact_context(
+        &self,
+        messages: &[Message],
+        _tools: &[Value],
+    ) -> Result<Vec<Message>> {
         let Some((Message::System(system_prompt), rest)) = messages.split_first() else {
             return Ok(messages.to_vec());
         };
@@ -516,10 +522,7 @@ mod tests {
 
     #[test]
     fn a_tool_result_message_ties_back_by_id() {
-        let w = wire_message(&Message::ToolResult {
-            call_id: "c1".into(),
-            content: "ok".into(),
-        });
+        let w = wire_message(&Message::ToolResult { call_id: "c1".into(), content: "ok".into() });
         assert_eq!(w["role"], "tool");
         assert_eq!(w["tool_call_id"], "c1");
         assert_eq!(w["content"], "ok");
@@ -577,8 +580,8 @@ mod tests {
     fn estimate_tokens_counts_tool_call_name_and_args() {
         let call = ToolCall {
             id: "1".into(),
-            name: "fs.read".into(),   // 7 chars
-            arguments: "{}".into(),   // 2 chars
+            name: "fs.read".into(), // 7 chars
+            arguments: "{}".into(), // 2 chars
         };
         let msgs = vec![Message::ToolCalls(vec![call])];
         // 9 chars / 4 = 2 (integer division)

@@ -199,8 +199,7 @@ mod tests {
     #[test]
     fn no_param_tool_omits_required() {
         let s = ToolSchema::new("admin.list_projects", "List projects the caller can access.");
-        let expected: Value =
-            serde_json::from_str(r#"{"type":"object","properties":{}}"#).unwrap();
+        let expected: Value = serde_json::from_str(r#"{"type":"object","properties":{}}"#).unwrap();
         assert_eq!(s.input_schema(), expected);
     }
 
@@ -209,7 +208,10 @@ mod tests {
     fn nullable_number_renders_type_array() {
         let s = ToolSchema::new("fs.audit_log", "Recent mutations performed in this session.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .opt_nullable_num("since", "Only return entries at or after this Unix timestamp (seconds).")
+            .opt_nullable_num(
+                "since",
+                "Only return entries at or after this Unix timestamp (seconds).",
+            )
             .opt_int("limit", 20, "Maximum number of recent entries to return.");
         let v = s.input_schema();
         assert_eq!(v["properties"]["since"]["type"], json!(["number", "null"]));
@@ -237,10 +239,13 @@ mod tests {
 
     #[test]
     fn str_array_has_items() {
-        let s = ToolSchema::new("fs.read_many", "Batch read several files with per-file error isolation.")
-            .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str_array("paths", "Absolute POSIX paths to read, one entry per file.")
-            .opt_int("per_file_cap_lines", 500, "Maximum number of lines returned per file.");
+        let s = ToolSchema::new(
+            "fs.read_many",
+            "Batch read several files with per-file error isolation.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str_array("paths", "Absolute POSIX paths to read, one entry per file.")
+        .opt_int("per_file_cap_lines", 500, "Maximum number of lines returned per file.");
         let v = s.input_schema();
         assert_eq!(v["properties"]["paths"]["type"], json!("array"));
         assert_eq!(v["properties"]["paths"]["items"], json!({"type":"string"}));

@@ -218,10 +218,8 @@ impl RelationalDb for SqliteRelationalDb {
         // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the guard is a probe: the
         // alternative, swallowing a "duplicate column name" error, would also
         // swallow a genuinely broken migration.
-        for (m, statement) in schema
-            .column_migrations
-            .iter()
-            .zip(schema.render_column_migrations(Dialect::Sqlite))
+        for (m, statement) in
+            schema.column_migrations.iter().zip(schema.render_column_migrations(Dialect::Sqlite))
         {
             let present = self
                 .query_opt(
@@ -277,10 +275,7 @@ mod tests {
         let db = db().await;
         // Every store calls migrate on open, so a second apply must be a no op.
         db.migrate(&schema()).await.unwrap();
-        let names = db
-            .query(&Query::new(Dialect::Sqlite.table_names_query()))
-            .await
-            .unwrap();
+        let names = db.query(&Query::new(Dialect::Sqlite.table_names_query())).await.unwrap();
         let names: Vec<String> = names.iter().map(|r| r.text(0).unwrap()).collect();
         assert_eq!(names, vec!["t"]);
     }
@@ -333,10 +328,8 @@ mod tests {
     #[tokio::test]
     async fn query_opt_is_none_on_no_rows() {
         let db = db().await;
-        let row = db
-            .query_opt(&Query::new("SELECT k FROM t WHERE k=?1").bind("missing"))
-            .await
-            .unwrap();
+        let row =
+            db.query_opt(&Query::new("SELECT k FROM t WHERE k=?1").bind("missing")).await.unwrap();
         assert!(row.is_none());
     }
 

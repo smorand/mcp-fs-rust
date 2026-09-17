@@ -125,7 +125,10 @@ pub fn register_with(
     reg.add(
         ToolSchema::new("git.log", "List commits. ref_name defaults to HEAD.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .opt_str_null("ref_name", "Ref, branch, tag, or commit to start from; defaults to HEAD.")
+            .opt_str_null(
+                "ref_name",
+                "Ref, branch, tag, or commit to start from; defaults to HEAD.",
+            )
             .opt_int("limit", 20, "Maximum number of commits to return.")
             .opt_str_null("path", "Optional path filter; only commits touching it are returned."),
         handler(move |ctx: ToolCtx, a| {
@@ -192,7 +195,10 @@ pub fn register_with(
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("message", "Commit message.")
             .opt_str_null("author_name", "Optional author name; defaults to the caller.")
-            .opt_str_null("author_email", "Optional author email; defaults to the caller person id."),
+            .opt_str_null(
+                "author_email",
+                "Optional author email; defaults to the caller person id.",
+            ),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -262,9 +268,9 @@ pub fn register_with(
                 let ref_name = a.opt_str("ref_name");
                 let entry = open(&ctx, &mount_id, g).await?;
                 let norm = ctx.state.safety.normalize_path(&path)?;
-                on_git_thread(move || async move {
-                    blame(&entry, &norm, ref_name.as_deref()).await
-                })
+                on_git_thread(
+                    move || async move { blame(&entry, &norm, ref_name.as_deref()).await },
+                )
                 .await
             }
         }),
@@ -544,9 +550,8 @@ async fn commit(
     let tree_oid = build_tree_from_volume(&repo, client).await?;
     let tree = repo.find_tree(tree_oid).map_err(|e| git_err("find tree", e))?;
 
-    let name = author_name.unwrap_or_else(|| {
-        person.split('@').next().unwrap_or(person).to_string()
-    });
+    let name =
+        author_name.unwrap_or_else(|| person.split('@').next().unwrap_or(person).to_string());
     let email = author_email.unwrap_or_else(|| person.to_string());
     let now = Utc::now().timestamp();
     let sig = git2::Signature::new(&name, &email, &git2::Time::new(now, 0))
@@ -608,13 +613,13 @@ async fn read_from_commit(entry: &GitRepoEntry, commit_sha: &str, norm: &str) ->
         .map_err(|_| ToolError::not_found(format!("commit '{commit_sha}' not found")))?;
     let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
     let rel = norm.trim_start_matches('/');
-    let te = tree
-        .get_path(Path::new(rel))
-        .map_err(|_| ToolError::not_found(format!("'{norm}' not found in commit '{commit_sha}'")))?;
+    let te = tree.get_path(Path::new(rel)).map_err(|_| {
+        ToolError::not_found(format!("'{norm}' not found in commit '{commit_sha}'"))
+    })?;
     let object = te.to_object(&repo).map_err(|e| git_err("read object", e))?;
-    let blob = object
-        .as_blob()
-        .ok_or_else(|| ToolError::invalid_argument(format!("'{norm}' is not a file in that commit")))?;
+    let blob = object.as_blob().ok_or_else(|| {
+        ToolError::invalid_argument(format!("'{norm}' is not a file in that commit"))
+    })?;
     Ok(blob.content().to_vec())
 }
 
@@ -689,11 +694,10 @@ async fn remote_clone(
         Some(p) => {
             let store = match tokens {
                 Some(t) => t,
-                None => super::git_auth::token_store(
-                    &ctx.state.config,
-                    ctx.state.stores.relational(),
-                )
-                .await?,
+                None => {
+                    super::git_auth::token_store(&ctx.state.config, ctx.state.stores.relational())
+                        .await?
+                }
             };
             store.get_token(&ctx.person, p).map(|s| s.access_token)
         }
@@ -951,15 +955,11 @@ async fn build_tree_from_volume(repo: &Repository, client: &VolumeClient) -> Res
 fn write_tree(repo: &Repository, node: &DirNode) -> Result<Oid> {
     let mut builder = repo.treebuilder(None).map_err(|e| git_err("treebuilder", e))?;
     for (name, oid) in &node.files {
-        builder
-            .insert(name.as_str(), *oid, MODE_FILE)
-            .map_err(|e| git_err("tree insert", e))?;
+        builder.insert(name.as_str(), *oid, MODE_FILE).map_err(|e| git_err("tree insert", e))?;
     }
     for (name, sub) in &node.dirs {
         let sub_oid = write_tree(repo, sub)?;
-        builder
-            .insert(name.as_str(), sub_oid, MODE_DIR)
-            .map_err(|e| git_err("tree insert", e))?;
+        builder.insert(name.as_str(), sub_oid, MODE_DIR).map_err(|e| git_err("tree insert", e))?;
     }
     builder.write().map_err(|e| git_err("tree write", e))
 }
@@ -988,12 +988,7 @@ fn collect_blobs(
     Ok(())
 }
 
-async fn write_one(
-    repo: &Repository,
-    client: &VolumeClient,
-    path: &str,
-    oid: Oid,
-) -> Result<()> {
+async fn write_one(repo: &Repository, client: &VolumeClient, path: &str, oid: Oid) -> Result<()> {
     let blob = repo.find_blob(oid).map_err(|e| git_err("read blob", e))?;
     if let Some(parent) = crate::util::PosixPath::parent_of(path)
         && parent != "/"
@@ -1015,9 +1010,8 @@ fn clone_to_temp(
     if let Some(t) = token {
         // The provider expects the token as the password; "oauth2" is the
         // conventional username for both GitHub and GitLab.
-        callbacks.credentials(move |_url, _user, _types| {
-            git2::Cred::userpass_plaintext("oauth2", &t)
-        });
+        callbacks
+            .credentials(move |_url, _user, _types| git2::Cred::userpass_plaintext("oauth2", &t));
     }
     let mut fetch = git2::FetchOptions::new();
     fetch.remote_callbacks(callbacks);
@@ -1044,8 +1038,8 @@ struct TempClone {
 
 impl TempClone {
     fn new() -> Result<Self> {
-        let path = std::env::temp_dir()
-            .join(format!("mcpfs-clone-{}", uuid::Uuid::new_v4().simple()));
+        let path =
+            std::env::temp_dir().join(format!("mcpfs-clone-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
@@ -1115,7 +1109,10 @@ mod tests {
         async fn build(tweak: impl FnOnce(&mut crate::config::ServerConfig)) -> Env {
             let f = Fixture::with_config(tweak).await;
             f.seed_project(MOUNT, OWNER).await;
-            let git = Arc::new(GitRepoStore::new(f.state.config.clone(), crate::storage::test_registry()));
+            let git = Arc::new(GitRepoStore::new(
+                f.state.config.clone(),
+                crate::storage::test_registry(),
+            ));
             let tokens = Arc::new(OAuthTokenStore::new());
             let mut reg = ToolRegistry::new();
             register_with(&mut reg, Some(git.clone()), Some(tokens.clone()));
@@ -1202,7 +1199,9 @@ mod tests {
             "Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. \
              Uses the OAuth token stored by git.auth "
         ));
-        assert!(s.description.ends_with("Use depth=1 for a shallow clone (faster on large repos)."));
+        assert!(
+            s.description.ends_with("Use depth=1 for a shallow clone (faster on large repos).")
+        );
         let expected: Value = serde_json::from_str(
             r#"{"type":"object","properties":{
                  "mount_id":{"description":"Project/volume id the clone is imported into.","type":"string"},
@@ -1274,8 +1273,10 @@ mod tests {
         assert_eq!(co.description, "Restore a file from a commit into the volume.");
         assert_eq!(co.input_schema()["required"], json!(["mount_id", "commit_sha", "path"]));
         let sh = &r.resolve("git.show").unwrap().schema;
-        assert_eq!(sh.input_schema()["properties"]["commit_sha"]["description"],
-                   "Commit SHA to show details and diff for.");
+        assert_eq!(
+            sh.input_schema()["properties"]["commit_sha"]["description"],
+            "Commit SHA to show details and diff for."
+        );
     }
 
     // ── authorization ───────────────────────────────────────────────────────
@@ -1309,15 +1310,15 @@ mod tests {
     #[tokio::test]
     async fn a_non_member_is_forbidden_and_a_member_is_allowed() {
         let e = Env::new().await;
-        let err = e.as_person("stranger@test.com", "git.init", json!({"mount_id": MOUNT}))
+        let err = e
+            .as_person("stranger@test.com", "git.init", json!({"mount_id": MOUNT}))
             .await
             .unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);
 
         e.f.state.admin.add_member(MOUNT, "member@test.com", OWNER).await.unwrap();
-        let out = e.as_person("member@test.com", "git.init", json!({"mount_id": MOUNT}))
-            .await
-            .unwrap();
+        let out =
+            e.as_person("member@test.com", "git.init", json!({"mount_id": MOUNT})).await.unwrap();
         assert_eq!(out["initialized"], true);
     }
 
@@ -1363,7 +1364,8 @@ mod tests {
             let err = e.call(name, args).await.unwrap_err();
             assert_eq!(err.code, code::NOT_FOUND, "{name}");
             assert!(
-                err.message.contains("git not initialized for mount 'gitproj' (call git.init first)"),
+                err.message
+                    .contains("git not initialized for mount 'gitproj' (call git.init first)"),
                 "{name}: {}",
                 err.message
             );
@@ -1426,7 +1428,8 @@ mod tests {
         assert_eq!(c["date"].as_str().unwrap().len(), 19, "yyyy-MM-dd HH:mm:ss");
 
         // show renders the whole tree as additions
-        let shown = e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": sha})).await.unwrap();
+        let shown =
+            e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": sha})).await.unwrap();
         assert_eq!(shown["commit"]["sha"], sha);
         let diff = shown["diff"].as_str().unwrap();
         assert!(diff.contains("+++ b/a.txt"), "got {diff}");
@@ -1496,20 +1499,22 @@ mod tests {
         e.write("/b.txt", "b\n").await;
         let second = e.commit("touch b").await;
 
-        let only_b = e
-            .call("git.log", json!({"mount_id": MOUNT, "path": "/b.txt"}))
-            .await
-            .unwrap();
-        let shas: Vec<&str> =
-            only_b["commits"].as_array().unwrap().iter().map(|c| c["sha"].as_str().unwrap()).collect();
+        let only_b = e.call("git.log", json!({"mount_id": MOUNT, "path": "/b.txt"})).await.unwrap();
+        let shas: Vec<&str> = only_b["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["sha"].as_str().unwrap())
+            .collect();
         assert_eq!(shas, vec![second.as_str()], "only the commit adding b.txt");
 
-        let only_a = e
-            .call("git.log", json!({"mount_id": MOUNT, "path": "/a.txt"}))
-            .await
-            .unwrap();
-        let shas: Vec<&str> =
-            only_a["commits"].as_array().unwrap().iter().map(|c| c["sha"].as_str().unwrap()).collect();
+        let only_a = e.call("git.log", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
+        let shas: Vec<&str> = only_a["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["sha"].as_str().unwrap())
+            .collect();
         assert_eq!(shas, vec![first.as_str()]);
     }
 
@@ -1521,10 +1526,8 @@ mod tests {
         let sha = e.commit("one").await;
 
         for start in ["HEAD", "refs/heads/main", "main", sha.as_str()] {
-            let out = e
-                .call("git.log", json!({"mount_id": MOUNT, "ref_name": start}))
-                .await
-                .unwrap();
+            let out =
+                e.call("git.log", json!({"mount_id": MOUNT, "ref_name": start})).await.unwrap();
             assert_eq!(out["commits"][0]["sha"], sha, "starting from {start}");
         }
 
@@ -1541,10 +1544,8 @@ mod tests {
         e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
         let absent = "0".repeat(40);
 
-        let err = e
-            .call("git.show", json!({"mount_id": MOUNT, "commit_sha": absent}))
-            .await
-            .unwrap_err();
+        let err =
+            e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": absent})).await.unwrap_err();
         assert_eq!(err.code, code::NOT_FOUND);
         assert!(err.message.contains(&format!("commit '{absent}' not found")));
 
@@ -1566,7 +1567,11 @@ mod tests {
 
         let err = e.call("git.log", json!({"mount_id": MOUNT})).await.unwrap_err();
         assert_eq!(err.code, code::NOT_FOUND);
-        assert!(err.message.contains("is not present in the git object store"), "got {}", err.message);
+        assert!(
+            err.message.contains("is not present in the git object store"),
+            "got {}",
+            err.message
+        );
         assert!(err.message.contains("Re-run git.remote_clone"));
     }
 
@@ -1666,7 +1671,10 @@ mod tests {
         let sha = e.commit("one").await;
 
         let err = e
-            .call("git.checkout_file", json!({"mount_id": MOUNT, "commit_sha": sha, "path": "/src"}))
+            .call(
+                "git.checkout_file",
+                json!({"mount_id": MOUNT, "commit_sha": sha, "path": "/src"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
@@ -1736,10 +1744,8 @@ mod tests {
         let e = Env::with_quota(8).await;
         let url = seed_origin(&e.f.dir.path().join("origin"), "0123456789");
 
-        let err = e
-            .call("git.remote_clone", json!({"mount_id": MOUNT, "url": url}))
-            .await
-            .unwrap_err();
+        let err =
+            e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap_err();
         assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
 
         let client = e.f.state.stores.client(MOUNT).await.unwrap();
@@ -1758,10 +1764,8 @@ mod tests {
 
         assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 10);
         let log = e.f.state.safety.audit(OWNER, MOUNT);
-        let entry = log
-            .iter()
-            .find(|x| x.op == "git.remote_clone")
-            .expect("an audit entry for the clone");
+        let entry =
+            log.iter().find(|x| x.op == "git.remote_clone").expect("an audit entry for the clone");
         assert!(entry.detail.contains("1 files, 10 bytes"), "got {}", entry.detail);
     }
 
@@ -1797,15 +1801,13 @@ mod tests {
         index.add_path(Path::new("docs/guide.md")).unwrap();
         index.write().unwrap();
         let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-        let sig = git2::Signature::new("Origin", "origin@test.com", &git2::Time::new(1_700_000_000, 0))
-            .unwrap();
+        let sig =
+            git2::Signature::new("Origin", "origin@test.com", &git2::Time::new(1_700_000_000, 0))
+                .unwrap();
         let tip = repo.commit(Some("HEAD"), &sig, &sig, "initial\n", &tree, &[]).unwrap();
 
         let url = format!("file://{}", src_dir.display());
-        let out = e
-            .call("git.remote_clone", json!({"mount_id": MOUNT, "url": url}))
-            .await
-            .unwrap();
+        let out = e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap();
 
         assert_eq!(out["mount_id"], MOUNT);
         assert_eq!(out["files_imported"], 2);
@@ -1845,8 +1847,15 @@ mod tests {
     async fn remote_clone_surfaces_a_failure_without_leaking_the_token() {
         let e = Env::new().await;
         e.tokens
-            .store_token(OWNER, "github", "gho_supersecret", vec!["repo".into()],
-                         Utc::now() + chrono::Duration::hours(1), None).await
+            .store_token(
+                OWNER,
+                "github",
+                "gho_supersecret",
+                vec!["repo".into()],
+                Utc::now() + chrono::Duration::hours(1),
+                None,
+            )
+            .await
             .unwrap();
         let err = e
             .call(
@@ -1864,8 +1873,11 @@ mod tests {
     async fn remote_clone_needs_membership() {
         let e = Env::new().await;
         let err = e
-            .as_person("stranger@test.com", "git.remote_clone",
-                       json!({"mount_id": MOUNT, "url": "https://example.test/x.git"}))
+            .as_person(
+                "stranger@test.com",
+                "git.remote_clone",
+                json!({"mount_id": MOUNT, "url": "https://example.test/x.git"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);

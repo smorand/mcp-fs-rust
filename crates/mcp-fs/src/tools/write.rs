@@ -19,7 +19,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
             .req_str("content", "Full text content to write to the file.")
-            .opt_bool("overwrite", false, "Allow overwriting an existing file (default no-clobber).")
+            .opt_bool(
+                "overwrite",
+                false,
+                "Allow overwriting an existing file (default no-clobber).",
+            )
             .opt_bool("create_parents", true, "Create missing parent directories."),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
@@ -92,7 +96,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_str("base64", "File content, base64 encoded.")
-            .opt_bool("overwrite", false, "Allow overwriting an existing file (default no-clobber).")
+            .opt_bool(
+                "overwrite",
+                false,
+                "Allow overwriting an existing file (default no-clobber).",
+            )
             .opt_bool("create_parents", true, "Create missing parent directories.")
             .opt_bool(
                 "trigger_documentation_service",
@@ -209,7 +217,10 @@ mod tests {
     async fn write_reports_bytes_and_no_clobber() {
         let h = harness().await;
         let r = h
-            .call("fs.write", json!({"mount_id": MOUNT, "path": "/a.txt", "content": "hello world\n"}))
+            .call(
+                "fs.write",
+                json!({"mount_id": MOUNT, "path": "/a.txt", "content": "hello world\n"}),
+            )
             .await
             .unwrap();
         assert_eq!(r["path"], "/a.txt");
@@ -246,7 +257,8 @@ mod tests {
     #[tokio::test]
     async fn create_empty_is_idempotent_only_with_exist_ok() {
         let h = harness().await;
-        let r = h.call("fs.create_empty", json!({"mount_id": MOUNT, "path": "/e.txt"})).await.unwrap();
+        let r =
+            h.call("fs.create_empty", json!({"mount_id": MOUNT, "path": "/e.txt"})).await.unwrap();
         assert_eq!(r["created"], true);
 
         let err = h
@@ -269,7 +281,10 @@ mod tests {
         let h = harness().await;
         h.seed("/exists.txt", "old content").await;
         let err = h
-            .call("fs.write", json!({"mount_id": MOUNT, "path": "/exists.txt", "content": "new content"}))
+            .call(
+                "fs.write",
+                json!({"mount_id": MOUNT, "path": "/exists.txt", "content": "new content"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::NO_CLOBBER);
@@ -279,7 +294,10 @@ mod tests {
     async fn write_creates_nested_parents_automatically() {
         let h = harness().await;
         let r = h
-            .call("fs.write", json!({"mount_id": MOUNT, "path": "/a/b/c/deep.txt", "content": "hello"}))
+            .call(
+                "fs.write",
+                json!({"mount_id": MOUNT, "path": "/a/b/c/deep.txt", "content": "hello"}),
+            )
             .await
             .unwrap();
         assert_eq!(r["path"], "/a/b/c/deep.txt");
@@ -296,10 +314,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r["bytes_written"], 0);
-        let stat = h
-            .call("fs.stat", json!({"mount_id": MOUNT, "path": "/empty.txt"}))
-            .await
-            .unwrap();
+        let stat =
+            h.call("fs.stat", json!({"mount_id": MOUNT, "path": "/empty.txt"})).await.unwrap();
         assert_eq!(stat["size"], 0);
     }
 
@@ -308,9 +324,13 @@ mod tests {
         use crate::tools::testkit::harness_with;
         let h = harness_with(|cfg| {
             cfg.safety.write_quota_bytes = 10;
-        }).await;
+        })
+        .await;
         let err = h
-            .call("fs.write", json!({"mount_id": MOUNT, "path": "/big.txt", "content": "x".repeat(100)}))
+            .call(
+                "fs.write",
+                json!({"mount_id": MOUNT, "path": "/big.txt", "content": "x".repeat(100)}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);

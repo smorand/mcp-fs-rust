@@ -7,8 +7,8 @@
 //! very path `fs.extract_text` reads, so the two never produce two files.
 
 use crate::core::fs_ops;
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::mcp::ToolSchema;
+use crate::mcp::registry::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 
 /// The C# description is one concatenated string; it is the LLM facing doc for
@@ -59,7 +59,11 @@ pub fn register(reg: &mut ToolRegistry) {
         .req_str("path", "Absolute POSIX path of the .docx file to write.")
         .req_str("markdown", "Markdown source rendered into the Word document.")
         .opt_str_null("title", "Optional document title.")
-        .opt_bool("overwrite", false, "Allow overwriting an existing file (default no-clobber)."),
+        .opt_bool(
+            "overwrite",
+            false,
+            "Allow overwriting an existing file (default no-clobber).",
+        ),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -83,21 +87,18 @@ pub fn register(reg: &mut ToolRegistry) {
     );
 
     reg.add(
-        ToolSchema::new(
-            "fs.documentize",
-            "Generate the Markdown companion of a stored document.",
-        )
-        .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str(
-            "path",
-            "Absolute POSIX path of the stored document to convert. PowerPoint, Word, \
+        ToolSchema::new("fs.documentize", "Generate the Markdown companion of a stored document.")
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .req_str(
+                "path",
+                "Absolute POSIX path of the stored document to convert. PowerPoint, Word, \
              PDF, audio and video only.",
-        )
-        .opt_bool(
-            "overwrite",
-            false,
-            "Allow overwriting an existing companion .md (default no-clobber).",
-        ),
+            )
+            .opt_bool(
+                "overwrite",
+                false,
+                "Allow overwriting an existing companion .md (default no-clobber).",
+            ),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -118,13 +119,13 @@ pub fn register(reg: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
     use crate::docs::service::StubDocService;
     use crate::errors::code;
     use crate::tools::testkit::{
         MOUNT, PERSON, assert_description, assert_family, assert_schema, harness,
         harness_with_doc_service,
     };
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     const NAMES: &[&str] = &["fs.extract_text", "fs.write_docx", "fs.documentize"];
@@ -190,7 +191,10 @@ mod tests {
     async fn extract_text_writes_a_companion_and_audits_it() {
         let h = harness().await;
         h.seed("/data.csv", "a,b\n1,2\n").await;
-        let r = h.call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/data.csv"})).await.unwrap();
+        let r = h
+            .call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/data.csv"}))
+            .await
+            .unwrap();
         assert_eq!(r["md_path"], "/data.md");
         assert_eq!(r["format"], "csv");
         assert_eq!(r["cached"], false);
@@ -211,7 +215,10 @@ mod tests {
         h.call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/data.csv"})).await.unwrap();
         let charged = h.state.safety.bytes_written(PERSON, MOUNT);
 
-        let again = h.call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/data.csv"})).await.unwrap();
+        let again = h
+            .call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/data.csv"}))
+            .await
+            .unwrap();
         assert_eq!(again["cached"], true);
         assert_eq!(again["format"], "md");
         // A cache hit writes nothing, so nothing is charged.
@@ -224,7 +231,10 @@ mod tests {
     async fn extract_text_on_a_text_file_has_no_companion() {
         let h = harness().await;
         h.seed("/notes.txt", "hello\n").await;
-        let r = h.call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/notes.txt"})).await.unwrap();
+        let r = h
+            .call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/notes.txt"}))
+            .await
+            .unwrap();
         assert_eq!(r["md_path"], Value::Null);
         assert_eq!(r["format"], "text");
         assert_eq!(h.state.safety.bytes_written(PERSON, MOUNT), 0);
@@ -234,11 +244,17 @@ mod tests {
     async fn extract_text_rejects_audio_and_a_directory() {
         let h = harness().await;
         h.seed("/talk.mp3", "not really audio\n").await;
-        let err = h.call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/talk.mp3"})).await.unwrap_err();
+        let err = h
+            .call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/talk.mp3"}))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, code::NOT_SUPPORTED);
 
         h.client().await.makedirs("/dir", true).await.unwrap();
-        let err = h.call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/dir"})).await.unwrap_err();
+        let err = h
+            .call("fs.extract_text", json!({"mount_id": MOUNT, "path": "/dir"}))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, code::NOT_FOUND);
     }
 

@@ -74,19 +74,16 @@ pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &str) -> Result<Vec<u8>> {
 /// or a truncated one.
 pub fn decrypt(key: &[u8; KEY_SIZE], blob: &[u8]) -> Result<String> {
     if blob.len() < NONCE_SIZE + TAG_SIZE {
-        return Err(ToolError::internal(
-            "OAuth token blob is too short / corrupt.",
-        ));
+        return Err(ToolError::internal("OAuth token blob is too short / corrupt."));
     }
     let nonce: [u8; NONCE_SIZE] = blob[..NONCE_SIZE].try_into().expect("checked length");
-    let tag: [u8; TAG_SIZE] = blob[NONCE_SIZE..NONCE_SIZE + TAG_SIZE]
-        .try_into()
-        .expect("checked length");
+    let tag: [u8; TAG_SIZE] =
+        blob[NONCE_SIZE..NONCE_SIZE + TAG_SIZE].try_into().expect("checked length");
     let mut buffer = blob[NONCE_SIZE + TAG_SIZE..].to_vec();
 
-    cipher(key)
-        .decrypt_in_place_detached(&nonce.into(), b"", &mut buffer, &tag.into())
-        .map_err(|_| ToolError::internal("OAuth token decryption failed (wrong key or tampered)"))?;
+    cipher(key).decrypt_in_place_detached(&nonce.into(), b"", &mut buffer, &tag.into()).map_err(
+        |_| ToolError::internal("OAuth token decryption failed (wrong key or tampered)"),
+    )?;
     String::from_utf8(buffer)
         .map_err(|_| ToolError::internal("decrypted OAuth token is not valid UTF-8"))
 }

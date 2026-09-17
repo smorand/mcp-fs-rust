@@ -50,9 +50,7 @@ pub fn object_type_name(kind: ObjectType) -> Result<&'static str> {
         ObjectType::Tree => Ok("tree"),
         ObjectType::Commit => Ok("commit"),
         ObjectType::Tag => Ok("tag"),
-        other => Err(ToolError::invalid_argument(format!(
-            "unknown object type {other:?}"
-        ))),
+        other => Err(ToolError::invalid_argument(format!("unknown object type {other:?}"))),
     }
 }
 
@@ -63,9 +61,7 @@ pub fn parse_object_type(s: &str) -> Result<ObjectType> {
         "tree" => Ok(ObjectType::Tree),
         "commit" => Ok(ObjectType::Commit),
         "tag" => Ok(ObjectType::Tag),
-        other => Err(ToolError::invalid_argument(format!(
-            "unknown object type string '{other}'"
-        ))),
+        other => Err(ToolError::invalid_argument(format!("unknown object type string '{other}'"))),
     }
 }
 
@@ -126,25 +122,16 @@ impl BlobObjectDb {
         let sha = object_id(kind, payload)?;
         let raw = serialize(kind, payload)?;
         self.blobs.put(&blob_key(&sha), &raw).await?;
-        self.index
-            .record_object(&sha, object_type_name(kind)?, payload.len() as i64)
-            .await?;
+        self.index.record_object(&sha, object_type_name(kind)?, payload.len() as i64).await?;
         Ok(sha)
     }
 
     /// Store an object whose sha is already known (an object copied in from
     /// libgit2), skipping the rehash.
-    pub async fn write_with_sha(
-        &self,
-        sha: &str,
-        kind: ObjectType,
-        payload: &[u8],
-    ) -> Result<()> {
+    pub async fn write_with_sha(&self, sha: &str, kind: ObjectType, payload: &[u8]) -> Result<()> {
         let raw = serialize(kind, payload)?;
         self.blobs.put(&blob_key(sha), &raw).await?;
-        self.index
-            .record_object(sha, object_type_name(kind)?, payload.len() as i64)
-            .await
+        self.index.record_object(sha, object_type_name(kind)?, payload.len() as i64).await
     }
 
     /// `ERR_NOT_FOUND` when the object is absent.
@@ -172,13 +159,9 @@ impl BlobObjectDb {
     pub async fn resolve_prefix(&self, prefix: &str) -> Result<String> {
         let matches = self.index.find_objects_by_prefix(prefix).await?;
         match matches.len() {
-            0 => Err(ToolError::not_found(format!(
-                "no git object matches '{prefix}'"
-            ))),
+            0 => Err(ToolError::not_found(format!("no git object matches '{prefix}'"))),
             1 => Ok(matches.into_iter().next().unwrap()),
-            n => Err(ToolError::ambiguous_match(format!(
-                "'{prefix}' matches {n} git objects"
-            ))),
+            n => Err(ToolError::ambiguous_match(format!("'{prefix}' matches {n} git objects"))),
         }
     }
 
@@ -205,9 +188,8 @@ impl BlobObjectDb {
     pub async fn import_from_repo(&self, repo: &git2::Repository) -> Result<usize> {
         // Collect first: the git2 Odb borrow cannot be held across an await.
         let pending: Vec<(String, ObjectType, Vec<u8>)> = {
-            let odb = repo
-                .odb()
-                .map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
+            let odb =
+                repo.odb().map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
             let mut oids = Vec::new();
             odb.foreach(|oid| {
                 oids.push(*oid);
@@ -260,9 +242,8 @@ impl BlobObjectDb {
                 Err(_) => continue, // a malformed index row must not break a fetch
             };
             {
-                let odb = repo
-                    .odb()
-                    .map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
+                let odb =
+                    repo.odb().map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
                 if odb.exists(oid) {
                     continue;
                 }
@@ -274,9 +255,7 @@ impl BlobObjectDb {
             }
         }
 
-        let odb = repo
-            .odb()
-            .map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
+        let odb = repo.odb().map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
         let mut written = 0usize;
         for (kind, payload) in payloads {
             odb.write(kind, &payload)
@@ -299,9 +278,10 @@ pub async fn seed_commit(
     // tree entry: "100644 {name}\0{20 raw sha bytes}"
     let mut tree = Vec::new();
     tree.extend_from_slice(format!("100644 {file_name}\0").as_bytes());
-    tree.extend_from_slice(&hex::decode(&blob_sha).map_err(|e| {
-        ToolError::internal(format!("blob sha is not hex: {e}"))
-    })?);
+    tree.extend_from_slice(
+        &hex::decode(&blob_sha)
+            .map_err(|e| ToolError::internal(format!("blob sha is not hex: {e}")))?,
+    );
     let tree_sha = objects.write(ObjectType::Tree, &tree).await?;
 
     let body = format!(
@@ -319,8 +299,7 @@ mod tests {
 
     async fn odb() -> (tempfile::TempDir, BlobObjectDb) {
         let d = tempfile::tempdir().unwrap();
-        let blobs: Arc<dyn BlobBackend> =
-            Arc::new(LocalBlobStore::new(d.path(), "mcpfs-git-test"));
+        let blobs: Arc<dyn BlobBackend> = Arc::new(LocalBlobStore::new(d.path(), "mcpfs-git-test"));
         let index = Arc::new(RelationalGitDb::open_in_memory().await.unwrap());
         (d, BlobObjectDb::new(blobs, index))
     }
@@ -358,12 +337,7 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_round_trip_for_each_type() {
-        for kind in [
-            ObjectType::Blob,
-            ObjectType::Tree,
-            ObjectType::Commit,
-            ObjectType::Tag,
-        ] {
+        for kind in [ObjectType::Blob, ObjectType::Tree, ObjectType::Commit, ObjectType::Tag] {
             let payload = b"payload\0with\x01binary\xffbytes".to_vec();
             let raw = serialize(kind, &payload).unwrap();
             let (k2, p2) = deserialize(&raw).unwrap();
@@ -421,10 +395,7 @@ mod tests {
             o.blobs().exists(&format!("git:{sha}")).await.unwrap(),
             "the blob must live under git:{{sha}}"
         );
-        assert!(
-            !o.blobs().exists(&sha).await.unwrap(),
-            "and never under the bare sha"
-        );
+        assert!(!o.blobs().exists(&sha).await.unwrap(), "and never under the bare sha");
     }
 
     #[tokio::test]
@@ -497,9 +468,8 @@ mod tests {
     #[tokio::test]
     async fn seed_commit_writes_objects_libgit2_can_parse() {
         let (_d, o) = odb().await;
-        let (commit, tree, blob) = seed_commit(&o, "readme.txt", b"file content\n", "init")
-            .await
-            .unwrap();
+        let (commit, tree, blob) =
+            seed_commit(&o, "readme.txt", b"file content\n", "init").await.unwrap();
 
         let repo_dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();

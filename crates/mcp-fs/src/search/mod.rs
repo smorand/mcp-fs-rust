@@ -14,22 +14,22 @@ use crate::errors::{Result, ToolError};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-pub mod bm25_sqlite;
 #[cfg(feature = "postgres")]
 pub mod bm25_pg;
+pub mod bm25_sqlite;
 pub mod chunker;
+#[cfg(test)]
+pub mod e2e;
+#[cfg(feature = "rag")]
+pub mod embedding;
 pub mod fusion;
 pub mod indexer;
 #[cfg(feature = "rag")]
-pub mod embedding;
-#[cfg(feature = "rag")]
 pub mod rerank;
 #[cfg(feature = "rag")]
-pub mod vector_sqlite;
-#[cfg(feature = "rag")]
 pub mod vector_pg;
-#[cfg(test)]
-pub mod e2e;
+#[cfg(feature = "rag")]
+pub mod vector_sqlite;
 
 /// One ranked result chunk returned by a search query.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -152,9 +152,7 @@ pub async fn build_backend(
                 ));
             }
         }
-        ("bm25", _) => {
-            Arc::new(bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir))
-        }
+        ("bm25", _) => Arc::new(bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir)),
         #[cfg(feature = "rag")]
         ("rag", "postgres") => {
             let pool = get_pg_pool(config, relational).await?;
@@ -169,14 +167,12 @@ pub async fn build_backend(
             )
         }
         #[cfg(feature = "rag")]
-        ("rag", _) => {
-            Arc::new(vector_sqlite::SqliteVecBackend::new(
-                config.search.embedding.dimensions,
-                &config.search.tantivy_dir,
-                http_client,
-                config.search.embedding.clone(),
-            ))
-        }
+        ("rag", _) => Arc::new(vector_sqlite::SqliteVecBackend::new(
+            config.search.embedding.dimensions,
+            &config.search.tantivy_dir,
+            http_client,
+            config.search.embedding.clone(),
+        )),
         #[cfg(feature = "rag")]
         ("both", "postgres") => {
             let pool = get_pg_pool(config, relational).await?;
@@ -195,17 +191,14 @@ pub async fn build_backend(
         }
         #[cfg(feature = "rag")]
         ("both", _) => {
-            let bm25: Arc<dyn SearchBackend> = Arc::new(
-                bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir),
-            );
-            let vector: Arc<dyn SearchBackend> = Arc::new(
-                vector_sqlite::SqliteVecBackend::new(
-                    config.search.embedding.dimensions,
-                    &config.search.tantivy_dir,
-                    http_client,
-                    config.search.embedding.clone(),
-                ),
-            );
+            let bm25: Arc<dyn SearchBackend> =
+                Arc::new(bm25_sqlite::TantivyBm25Backend::new(&config.search.tantivy_dir));
+            let vector: Arc<dyn SearchBackend> = Arc::new(vector_sqlite::SqliteVecBackend::new(
+                config.search.embedding.dimensions,
+                &config.search.tantivy_dir,
+                http_client,
+                config.search.embedding.clone(),
+            ));
             Arc::new(CombinedBackend { bm25, vector, mode: "both".into() })
         }
         (other, _) => {
@@ -284,11 +277,21 @@ impl SearchBackend for CombinedBackend {
         Ok(n1 + n2)
     }
 
-    async fn query_bm25(&self, volume_id: &str, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    async fn query_bm25(
+        &self,
+        volume_id: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<SearchResult>> {
         self.bm25.query_bm25(volume_id, query, top_k).await
     }
 
-    async fn query_vector(&self, volume_id: &str, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    async fn query_vector(
+        &self,
+        volume_id: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<SearchResult>> {
         self.vector.query_vector(volume_id, query, top_k).await
     }
 

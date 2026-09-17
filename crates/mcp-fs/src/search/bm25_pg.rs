@@ -65,14 +65,12 @@ impl SearchBackend for PostgresBm25Backend {
         let n = chunks.len();
 
         // Idempotent: remove any existing rows for this (volume, path) pair.
-        sqlx::query(AssertSqlSafe(
-            "DELETE FROM search_fts WHERE volume_id = $1 AND path = $2",
-        ))
-        .bind(volume_id)
-        .bind(path)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| ToolError::internal(format!("bm25_pg: delete: {e}")))?;
+        sqlx::query(AssertSqlSafe("DELETE FROM search_fts WHERE volume_id = $1 AND path = $2"))
+            .bind(volume_id)
+            .bind(path)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ToolError::internal(format!("bm25_pg: delete: {e}")))?;
 
         for (idx, chunk_text) in chunks.iter().enumerate() {
             sqlx::query(AssertSqlSafe(
@@ -104,7 +102,8 @@ impl SearchBackend for PostgresBm25Backend {
         .await
         .map_err(|e| ToolError::internal(format!("bm25_pg: delete: {e}")))?;
 
-        let cnt: i64 = row.try_get("cnt")
+        let cnt: i64 = row
+            .try_get("cnt")
             .map_err(|e| ToolError::internal(format!("bm25_pg: read count: {e}")))?;
         Ok(cnt as usize)
     }

@@ -74,7 +74,12 @@ impl SafetyManager {
         )))
     }
 
-    fn with_session<T>(&self, person: &str, project: &str, f: impl FnOnce(&mut SessionState) -> T) -> T {
+    fn with_session<T>(
+        &self,
+        person: &str,
+        project: &str,
+        f: impl FnOnce(&mut SessionState) -> T,
+    ) -> T {
         let mut guard = self.sessions.lock().expect("safety mutex poisoned");
         let s = guard.entry((person.to_string(), project.to_string())).or_default();
         f(s)
@@ -85,8 +90,7 @@ impl SafetyManager {
         if path.contains('\0') {
             return Err(ToolError::path_out_of_bounds("path contains a NUL byte"));
         }
-        let candidate =
-            if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
+        let candidate = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
         let normalized = PosixPath::normpath(&candidate);
         if !normalized.starts_with('/') || normalized.starts_with("/..") {
             return Err(ToolError::path_out_of_bounds(format!(

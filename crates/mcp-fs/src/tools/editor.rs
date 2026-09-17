@@ -17,12 +17,12 @@
 //! automatically after the server is ready, except during tests.
 
 use crate::errors::{Result, ToolError};
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::mcp::ToolSchema;
+use crate::mcp::registry::{ToolRegistry, handler};
 use crate::storage::VolumeClient;
 use axum::Router;
+use axum::extract::State as AxumState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{State as AxumState};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde_json::json;
@@ -54,23 +54,33 @@ struct EditorSlot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EditorMode { Doc, Slides }
+pub enum EditorMode {
+    Doc,
+    Slides,
+}
 
 impl EditorMode {
-    fn as_str(&self) -> &'static str { match self { Self::Doc => "doc", Self::Slides => "slides" } }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Doc => "doc",
+            Self::Slides => "slides",
+        }
+    }
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "doc" => Ok(Self::Doc),
             "slides" => Ok(Self::Slides),
-            other => Err(ToolError::invalid_argument(
-                format!("mode must be 'doc' or 'slides', got '{other}'"),
-            )),
+            other => Err(ToolError::invalid_argument(format!(
+                "mode must be 'doc' or 'slides', got '{other}'"
+            ))),
         }
     }
 }
 
 impl Default for EditorRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EditorRegistry {
@@ -101,13 +111,23 @@ pub fn register(reg: &mut ToolRegistry) {
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("path", "Absolute POSIX path of the HTML file to edit.")
-        .req_str("mode", "Editor mode: 'doc' for a document (CMS-like) or 'slides' for a slide deck."),
+        .req_str(
+            "mode",
+            "Editor mode: 'doc' for a document (CMS-like) or 'slides' for a slide deck.",
+        ),
         handler(|ctx, a| async move {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;
             let path = ctx.state.safety.normalize_path(&a.str("path")?)?;
             let mode = EditorMode::from_str(&a.str("mode")?)?;
-            open_editor(&ctx.state.editors, &ctx.state.stores.client(&mount).await?, &mount, &path, mode).await
+            open_editor(
+                &ctx.state.editors,
+                &ctx.state.stores.client(&mount).await?,
+                &mount,
+                &path,
+                mode,
+            )
+            .await
         }),
     );
 
@@ -130,18 +150,20 @@ pub fn register(reg: &mut ToolRegistry) {
     );
 
     reg.add(
-        ToolSchema::new(
-            "doc.list_editors",
-            "List all active HTML editors and their URLs.",
-        ),
+        ToolSchema::new("doc.list_editors", "List all active HTML editors and their URLs."),
         handler(|ctx, _a| async move {
             let map = ctx.state.editors.editors.lock().await;
-            let editors: Vec<_> = map.values().map(|s| json!({
-                "editor_id": s.editor_id,
-                "url": format!("http://127.0.0.1:{}", s.port),
-                "path": s.path,
-                "mode": s.mode.as_str(),
-            })).collect();
+            let editors: Vec<_> = map
+                .values()
+                .map(|s| {
+                    json!({
+                        "editor_id": s.editor_id,
+                        "url": format!("http://127.0.0.1:{}", s.port),
+                        "path": s.path,
+                        "mode": s.mode.as_str(),
+                    })
+                })
+                .collect();
             Ok(json!({ "editors": editors }))
         }),
     );
@@ -176,14 +198,18 @@ async fn open_editor(
     let created = !client.exists(path).await.unwrap_or(false);
     if created {
         let html = starter_html(mode, path);
-        client.write_text_atomic(path, &html).await
+        client
+            .write_text_atomic(path, &html)
+            .await
             .map_err(|e| ToolError::internal(format!("cannot create file: {e}")))?;
     }
 
     // Bind on an OS-assigned port.
-    let listener = TcpListener::bind("127.0.0.1:0").await
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
         .map_err(|e| ToolError::internal(format!("cannot bind port: {e}")))?;
-    let port = listener.local_addr()
+    let port = listener
+        .local_addr()
         .map_err(|e| ToolError::internal(format!("cannot get port: {e}")))?
         .port();
 
@@ -208,7 +234,9 @@ async fn open_editor(
     // Spawn the server task.
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async move { let _ = shutdown_rx.await; })
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
             .await;
     });
 
@@ -221,9 +249,12 @@ async fn open_editor(
         let mut last_mtime = 0f64;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if !watcher_alive.load(Ordering::Relaxed) { break; }
+            if !watcher_alive.load(Ordering::Relaxed) {
+                break;
+            }
             if let Ok(stat) = watcher_client.stat(&watcher_path).await {
-                if stat.mtime > last_mtime && last_mtime > 0.0
+                if stat.mtime > last_mtime
+                    && last_mtime > 0.0
                     && let Ok(bytes) = watcher_client.read_bytes(&watcher_path).await
                 {
                     let full_html = String::from_utf8_lossy(&bytes).to_string();
@@ -244,16 +275,19 @@ async fn open_editor(
     // Store the slot.
     {
         let mut map = registry.editors.lock().await;
-        map.insert(editor_id.clone(), EditorSlot {
-            editor_id: editor_id.clone(),
-            mount: mount.to_string(),
-            path: path.to_string(),
-            mode,
-            port,
-            _shutdown_tx: shutdown_tx,
-            _reload_tx: reload_tx,
-            alive,
-        });
+        map.insert(
+            editor_id.clone(),
+            EditorSlot {
+                editor_id: editor_id.clone(),
+                mount: mount.to_string(),
+                path: path.to_string(),
+                mode,
+                port,
+                _shutdown_tx: shutdown_tx,
+                _reload_tx: reload_tx,
+                alive,
+            },
+        );
     }
 
     let url = format!("http://127.0.0.1:{port}");
@@ -280,9 +314,7 @@ struct MiniServerState {
     reload_tx: broadcast::Sender<String>,
 }
 
-async fn serve_editor_page(
-    AxumState(s): AxumState<Arc<MiniServerState>>,
-) -> impl IntoResponse {
+async fn serve_editor_page(AxumState(s): AxumState<Arc<MiniServerState>>) -> impl IntoResponse {
     let content = match s.client.read_text(&s.path).await {
         Ok(html) => extract_content(&html).unwrap_or_else(|| "<p></p>".to_string()),
         Err(_) => "<p></p>".to_string(),
@@ -329,12 +361,20 @@ async fn handle_ws(mut socket: WebSocket, s: Arc<MiniServerState>) {
 }
 
 async fn handle_ws_message(s: &MiniServerState, text: &str) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return; };
-    if v["type"].as_str() != Some("save") { return; }
-    let Some(new_content) = v["html"].as_str() else { return; };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if v["type"].as_str() != Some("save") {
+        return;
+    }
+    let Some(new_content) = v["html"].as_str() else {
+        return;
+    };
 
     // Read current file, replace #content, write back.
-    let Ok(current) = s.client.read_text(&s.path).await else { return; };
+    let Ok(current) = s.client.read_text(&s.path).await else {
+        return;
+    };
     let updated = inject_content(&current, new_content);
     let _ = s.client.write_text_atomic(&s.path, &updated).await;
 }
@@ -374,7 +414,9 @@ pub fn extract_content(html: &str) -> Option<String> {
 ///
 /// If the markers are not found the document is returned unchanged.
 pub fn inject_content(html: &str, new_content: &str) -> String {
-    let Some(old_content) = extract_content(html) else { return html.to_string(); };
+    let Some(old_content) = extract_content(html) else {
+        return html.to_string();
+    };
     let open_tag = "<div id=\"content\">";
     let start = html.find(open_tag).unwrap() + open_tag.len();
     let before = &html[..start];
@@ -384,12 +426,8 @@ pub fn inject_content(html: &str, new_content: &str) -> String {
 
 fn starter_html(mode: EditorMode, _path: &str) -> String {
     let content = match mode {
-        EditorMode::Doc => {
-            "    <h1>Title</h1>\n    <p>Start writing here.</p>"
-        }
-        EditorMode::Slides => {
-            "    <section><h1>Slide 1</h1><p>Content.</p></section>"
-        }
+        EditorMode::Doc => "    <h1>Title</h1>\n    <p>Start writing here.</p>",
+        EditorMode::Slides => "    <section><h1>Slide 1</h1><p>Content.</p></section>",
     };
     format!(
         "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>Document</title></head>\n\
@@ -414,7 +452,9 @@ fn build_editor_shell(content: &str, mode: EditorMode) -> String {
     };
 
     let body_style = match mode {
-        EditorMode::Doc => "margin:40px auto;max-width:780px;font-family:Georgia,serif;line-height:1.7;padding:0 24px",
+        EditorMode::Doc => {
+            "margin:40px auto;max-width:780px;font-family:Georgia,serif;line-height:1.7;padding:0 24px"
+        }
         EditorMode::Slides => "margin:0;overflow:hidden",
     };
 
@@ -423,7 +463,8 @@ fn build_editor_shell(content: &str, mode: EditorMode) -> String {
         EditorMode::Slides => "height:calc(100vh - 36px);overflow:hidden",
     };
 
-    let slide_js = if mode == EditorMode::Slides { r#"
+    let slide_js = if mode == EditorMode::Slides {
+        r#"
     // Slide navigation
     let currentSlide = 0;
     function slides() { return Array.from(content.querySelectorAll('section')); }
@@ -438,9 +479,13 @@ fn build_editor_shell(content: &str, mode: EditorMode) -> String {
     document.getElementById('next').addEventListener('click', () => showSlide(currentSlide + 1));
     showSlide(0);
     function refreshSlideNav() { showSlide(currentSlide); }
-"#} else { "" };
+"#
+    } else {
+        ""
+    };
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -496,7 +541,11 @@ body {{ {body_style} }}
 </body>
 </html>
 "#,
-        slide_js_refresh = if mode == EditorMode::Slides { "if(typeof refreshSlideNav==='function') refreshSlideNav();" } else { "" },
+        slide_js_refresh = if mode == EditorMode::Slides {
+            "if(typeof refreshSlideNav==='function') refreshSlideNav();"
+        } else {
+            ""
+        },
     )
 }
 
@@ -532,10 +581,7 @@ mod tests {
 
     #[test]
     fn family_registers_three_editor_tools() {
-        assert_family(
-            register,
-            &["doc.open_editor", "doc.close_editor", "doc.list_editors"],
-        );
+        assert_family(register, &["doc.open_editor", "doc.close_editor", "doc.list_editors"]);
     }
 
     #[test]
@@ -564,11 +610,7 @@ mod tests {
 
     #[test]
     fn doc_list_editors_schema() {
-        assert_schema(
-            register,
-            "doc.list_editors",
-            r#"{"type":"object","properties":{}}"#,
-        );
+        assert_schema(register, "doc.list_editors", r#"{"type":"object","properties":{}}"#);
     }
 
     // ── open / close / list ────────────────────────────────────────────────────
@@ -576,9 +618,15 @@ mod tests {
     #[tokio::test]
     async fn editor_creates_file_if_missing_doc() {
         let h = harness_with_extra(register_editor).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/new.html", "mode": "doc"
-        })).await.unwrap();
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/new.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         assert_eq!(r["created"], true);
         assert!(r["url"].as_str().unwrap().starts_with("http://127.0.0.1:"));
         let html = h.client().await.read_text("/new.html").await.unwrap();
@@ -591,9 +639,15 @@ mod tests {
     #[tokio::test]
     async fn editor_creates_file_if_missing_slides() {
         let h = harness_with_extra(register_editor).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/deck.html", "mode": "slides"
-        })).await.unwrap();
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/deck.html", "mode": "slides"
+                }),
+            )
+            .await
+            .unwrap();
         assert_eq!(r["created"], true);
         let html = h.client().await.read_text("/deck.html").await.unwrap();
         assert!(html.contains("<section>"));
@@ -604,10 +658,20 @@ mod tests {
     #[tokio::test]
     async fn editor_open_returns_url_and_id() {
         let h = harness_with_extra(register_editor).await;
-        h.seed("/doc.html", r#"<!DOCTYPE html><html><body><div id="content"><p>hi</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/doc.html", "mode": "doc"
-        })).await.unwrap();
+        h.seed(
+            "/doc.html",
+            r#"<!DOCTYPE html><html><body><div id="content"><p>hi</p></div></body></html>"#,
+        )
+        .await;
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/doc.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         assert_eq!(r["created"], false);
         assert!(!r["editor_id"].as_str().unwrap().is_empty());
         assert!(r["url"].as_str().unwrap().starts_with("http://127.0.0.1:"));
@@ -619,9 +683,15 @@ mod tests {
     async fn editor_list_shows_open_editor() {
         let h = harness_with_extra(register_editor).await;
         h.seed("/a.html", r#"<html><body><div id="content"><p>x</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/a.html", "mode": "doc"
-        })).await.unwrap();
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/a.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let id = r["editor_id"].as_str().unwrap().to_string();
         let list = h.call("doc.list_editors", json!({})).await.unwrap();
         let editors = list["editors"].as_array().unwrap();
@@ -633,9 +703,15 @@ mod tests {
     async fn editor_close_removes_from_list() {
         let h = harness_with_extra(register_editor).await;
         h.seed("/b.html", r#"<html><body><div id="content"><p>x</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/b.html", "mode": "doc"
-        })).await.unwrap();
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/b.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let id = r["editor_id"].as_str().unwrap().to_string();
         h.call("doc.close_editor", json!({"editor_id": id.clone()})).await.unwrap();
         let list = h.call("doc.list_editors", json!({})).await.unwrap();
@@ -647,12 +723,24 @@ mod tests {
     async fn editor_second_open_same_path_returns_existing() {
         let h = harness_with_extra(register_editor).await;
         h.seed("/c.html", r#"<html><body><div id="content"><p>x</p></div></body></html>"#).await;
-        let r1 = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/c.html", "mode": "doc"
-        })).await.unwrap();
-        let r2 = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/c.html", "mode": "doc"
-        })).await.unwrap();
+        let r1 = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/c.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
+        let r2 = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/c.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         assert_eq!(r1["editor_id"], r2["editor_id"], "second open must return same id");
         assert_eq!(r2["created"], false);
         let id = r1["editor_id"].as_str().unwrap().to_string();
@@ -664,10 +752,20 @@ mod tests {
     #[tokio::test]
     async fn editor_get_serves_html() {
         let h = harness_with_extra(register_editor).await;
-        h.seed("/page.html", r#"<!DOCTYPE html><html><body><div id="content"><p>hello</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/page.html", "mode": "doc"
-        })).await.unwrap();
+        h.seed(
+            "/page.html",
+            r#"<!DOCTYPE html><html><body><div id="content"><p>hello</p></div></body></html>"#,
+        )
+        .await;
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/page.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let url = r["url"].as_str().unwrap().to_string();
         let id = r["editor_id"].as_str().unwrap().to_string();
 
@@ -683,15 +781,25 @@ mod tests {
 
     #[tokio::test]
     async fn editor_ws_save_writes_to_volume() {
+        use futures::SinkExt;
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::Message as TMsg;
-        use futures::SinkExt;
 
         let h = harness_with_extra(register_editor).await;
-        h.seed("/ws_test.html", r#"<!DOCTYPE html><html><body><div id="content"><p>original</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/ws_test.html", "mode": "doc"
-        })).await.unwrap();
+        h.seed(
+            "/ws_test.html",
+            r#"<!DOCTYPE html><html><body><div id="content"><p>original</p></div></body></html>"#,
+        )
+        .await;
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/ws_test.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let port = {
             let url = r["url"].as_str().unwrap();
             url.split(':').next_back().unwrap().parse::<u16>().unwrap()
@@ -718,15 +826,25 @@ mod tests {
 
     #[tokio::test]
     async fn editor_watcher_pushes_reload() {
+        use futures::StreamExt;
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::Message as TMsg;
-        use futures::StreamExt;
 
         let h = harness_with_extra(register_editor).await;
-        h.seed("/watch_test.html", r#"<!DOCTYPE html><html><body><div id="content"><p>v1</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/watch_test.html", "mode": "doc"
-        })).await.unwrap();
+        h.seed(
+            "/watch_test.html",
+            r#"<!DOCTYPE html><html><body><div id="content"><p>v1</p></div></body></html>"#,
+        )
+        .await;
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/watch_test.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let port = {
             let url = r["url"].as_str().unwrap();
             url.split(':').next_back().unwrap().parse::<u16>().unwrap()
@@ -742,26 +860,32 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
         // Modify the file externally (simulating fs.write).
-        h.client().await
-            .write_text_atomic("/watch_test.html",
-                r#"<!DOCTYPE html><html><body><div id="content"><p>v2</p></div></body></html>"#)
-            .await.unwrap();
+        h.client()
+            .await
+            .write_text_atomic(
+                "/watch_test.html",
+                r#"<!DOCTYPE html><html><body><div id="content"><p>v2</p></div></body></html>"#,
+            )
+            .await
+            .unwrap();
 
         // Wait up to 1.5 s for the reload message.
-        let reload_msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
-                loop {
-                    match ws.next().await {
-                        Some(Ok(TMsg::Text(t))) => {
-                            let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
-                            if v["type"] == "reload" { return v; }
+        let reload_msg = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(TMsg::Text(t))) => {
+                        let v: serde_json::Value =
+                            serde_json::from_str(t.as_str()).unwrap_or_default();
+                        if v["type"] == "reload" {
+                            return v;
                         }
-                        _ => continue,
                     }
+                    _ => continue,
                 }
             }
-        ).await.expect("expected a reload message within 2s");
+        })
+        .await
+        .expect("expected a reload message within 2s");
 
         assert_eq!(reload_msg["type"], "reload");
         assert!(reload_msg["html"].as_str().unwrap().contains("v2"));
@@ -804,9 +928,15 @@ mod tests {
     #[tokio::test]
     async fn open_editor_invalid_mode_returns_err_invalid_argument() {
         let h = harness_with_extra(register_editor).await;
-        let err = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/doc.html", "mode": "pdf"
-        })).await.unwrap_err();
+        let err = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/doc.html", "mode": "pdf"
+                }),
+            )
+            .await
+            .unwrap_err();
         assert!(err.message.contains("mode must be"), "expected mode error, got: {}", err.message);
     }
 
@@ -827,15 +957,25 @@ mod tests {
 
     #[tokio::test]
     async fn ws_unknown_message_type_is_silently_ignored() {
+        use futures::SinkExt;
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::Message as TMsg;
-        use futures::SinkExt;
 
         let h = harness_with_extra(register_editor).await;
-        h.seed("/ping_test.html", r#"<!DOCTYPE html><html><body><div id="content"><p>original</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/ping_test.html", "mode": "doc"
-        })).await.unwrap();
+        h.seed(
+            "/ping_test.html",
+            r#"<!DOCTYPE html><html><body><div id="content"><p>original</p></div></body></html>"#,
+        )
+        .await;
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/ping_test.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let port = {
             let url = r["url"].as_str().unwrap();
             url.split(':').next_back().unwrap().parse::<u16>().unwrap()
@@ -862,16 +1002,22 @@ mod tests {
 
     #[tokio::test]
     async fn ws_save_without_content_marker_is_a_noop() {
+        use futures::SinkExt;
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::Message as TMsg;
-        use futures::SinkExt;
 
         let h = harness_with_extra(register_editor).await;
         // File has no <div id="content"> marker.
         h.seed("/no_marker.html", "<html><body><p>no marker here</p></body></html>").await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/no_marker.html", "mode": "doc"
-        })).await.unwrap();
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/no_marker.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let port = {
             let url = r["url"].as_str().unwrap();
             url.split(':').next_back().unwrap().parse::<u16>().unwrap()
@@ -899,15 +1045,25 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_ws_clients_all_receive_reload() {
+        use futures::StreamExt;
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::Message as TMsg;
-        use futures::StreamExt;
 
         let h = harness_with_extra(register_editor).await;
-        h.seed("/multi_ws.html", r#"<!DOCTYPE html><html><body><div id="content"><p>v1</p></div></body></html>"#).await;
-        let r = h.call("doc.open_editor", json!({
-            "mount_id": MOUNT, "path": "/multi_ws.html", "mode": "doc"
-        })).await.unwrap();
+        h.seed(
+            "/multi_ws.html",
+            r#"<!DOCTYPE html><html><body><div id="content"><p>v1</p></div></body></html>"#,
+        )
+        .await;
+        let r = h
+            .call(
+                "doc.open_editor",
+                json!({
+                    "mount_id": MOUNT, "path": "/multi_ws.html", "mode": "doc"
+                }),
+            )
+            .await
+            .unwrap();
         let port = {
             let url = r["url"].as_str().unwrap();
             url.split(':').next_back().unwrap().parse::<u16>().unwrap()
@@ -924,27 +1080,33 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
         // External write to trigger the watcher.
-        h.client().await
-            .write_text_atomic("/multi_ws.html",
-                r#"<!DOCTYPE html><html><body><div id="content"><p>v2</p></div></body></html>"#)
-            .await.unwrap();
+        h.client()
+            .await
+            .write_text_atomic(
+                "/multi_ws.html",
+                r#"<!DOCTYPE html><html><body><div id="content"><p>v2</p></div></body></html>"#,
+            )
+            .await
+            .unwrap();
 
         // Both clients should get a reload message within 2 s.
         let recv_reload = |mut ws: tokio_tungstenite::WebSocketStream<_>| async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                async move {
-                    loop {
-                        match ws.next().await {
-                            Some(Ok(TMsg::Text(t))) => {
-                                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
-                                if v["type"] == "reload" { return v; }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(TMsg::Text(t))) => {
+                            let v: serde_json::Value =
+                                serde_json::from_str(t.as_str()).unwrap_or_default();
+                            if v["type"] == "reload" {
+                                return v;
                             }
-                            _ => continue,
                         }
+                        _ => continue,
                     }
                 }
-            ).await.expect("expected reload message within 2s")
+            })
+            .await
+            .expect("expected reload message within 2s")
         };
 
         let (m1, m2) = tokio::join!(recv_reload(ws1), recv_reload(ws2));
@@ -961,6 +1123,10 @@ mod tests {
         let html = r#"<html><body><div id="content"><p>original</p></div></body></html>"#;
         let result = inject_content(html, "");
         let extracted = extract_content(&result);
-        assert_eq!(extracted, Some("".to_string()), "extract after inject-empty must return Some empty string");
+        assert_eq!(
+            extracted,
+            Some("".to_string()),
+            "extract after inject-empty must return Some empty string"
+        );
     }
 }

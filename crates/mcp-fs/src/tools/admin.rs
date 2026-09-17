@@ -196,10 +196,7 @@ async fn delete_project(
     // and a project recreated under the same id inherited stale refs. Purge it.
     if ctx.state.config.git.enabled {
         let store = git.unwrap_or_else(|| {
-            GitRepoStore::shared(
-                ctx.state.config.clone(),
-                ctx.state.stores.relational().clone(),
-            )
+            GitRepoStore::shared(ctx.state.config.clone(), ctx.state.stores.relational().clone())
         });
         store.purge_repo(project_id).await?;
     }
@@ -409,18 +406,21 @@ pub(crate) mod test_support {
             let state = Arc::new(AppState {
                 config: config.clone(),
                 admin,
-                stores: Arc::new(StoreManager::new(config.clone(), crate::storage::test_registry())),
+                stores: Arc::new(StoreManager::new(
+                    config.clone(),
+                    crate::storage::test_registry(),
+                )),
                 safety: Arc::new(SafetyManager::new(
-                config.safety.clone(),
-                crate::storage::meta::max_path_len(&config.infra.meta.backend),
-            )),
+                    config.safety.clone(),
+                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
+                )),
                 identity: Arc::new(IdentityResolver::new(&config.auth)),
                 // The tools never dispatch through the registry, so an empty one
                 // is enough here; tests keep their own registry to call into.
                 registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
-            doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
-            search,
+                doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
+                search,
             });
             Self { dir, state }
         }
@@ -580,7 +580,12 @@ mod tests {
         let f = Fixture::new().await;
         let r = registry();
         let e = f
-            .call(&r, "nobody@test.com", "admin.create_project", json!({"project_id":"proj","owner":"nobody@test.com"}))
+            .call(
+                &r,
+                "nobody@test.com",
+                "admin.create_project",
+                json!({"project_id":"proj","owner":"nobody@test.com"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(e.code, code::FORBIDDEN);
@@ -626,7 +631,8 @@ mod tests {
         let f = Fixture::new().await;
         f.seed_project("proj", "owner@test.com").await;
         let r = registry();
-        let out = f.call(&r, ADMIN, "admin.list_members", json!({"project_id":"proj"})).await.unwrap();
+        let out =
+            f.call(&r, ADMIN, "admin.list_members", json!({"project_id":"proj"})).await.unwrap();
         assert_eq!(out["project_id"], "proj");
         assert_eq!(out["members"][0]["person"], "owner@test.com");
         assert_eq!(out["members"][0]["role"], "owner");
@@ -655,7 +661,12 @@ mod tests {
 
         for name in ["admin.add_member", "admin.remove_member"] {
             let e = f
-                .call(&r, "member@test.com", name, json!({"project_id":"proj","person":"x@test.com"}))
+                .call(
+                    &r,
+                    "member@test.com",
+                    name,
+                    json!({"project_id":"proj","person":"x@test.com"}),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(e.code, code::FORBIDDEN, "{name} needs owner or admin");
@@ -674,7 +685,12 @@ mod tests {
         let r = registry();
 
         let out = f
-            .call(&r, "owner@test.com", "admin.add_member", json!({"project_id":"proj","person":"Bob@Test.COM"}))
+            .call(
+                &r,
+                "owner@test.com",
+                "admin.add_member",
+                json!({"project_id":"proj","person":"Bob@Test.COM"}),
+            )
             .await
             .unwrap();
         assert_eq!(out["project_id"], "proj");
@@ -682,13 +698,23 @@ mod tests {
         assert_eq!(out["role"], "member");
 
         let out = f
-            .call(&r, ADMIN, "admin.add_member", json!({"project_id":"proj","person":"carol@test.com"}))
+            .call(
+                &r,
+                ADMIN,
+                "admin.add_member",
+                json!({"project_id":"proj","person":"carol@test.com"}),
+            )
             .await
             .unwrap();
         assert_eq!(out["person"], "carol@test.com");
 
         let out = f
-            .call(&r, ADMIN, "admin.remove_member", json!({"project_id":"proj","person":"carol@test.com"}))
+            .call(
+                &r,
+                ADMIN,
+                "admin.remove_member",
+                json!({"project_id":"proj","person":"carol@test.com"}),
+            )
             .await
             .unwrap();
         assert_eq!(out, json!({"project_id":"proj","person":"carol@test.com","removed":true}));
@@ -718,16 +744,33 @@ mod tests {
         // 3 chars ok, 32 chars ok
         for id in ["abc".to_string(), "a".repeat(32)] {
             let out = f
-                .call(&r, ADMIN, "admin.create_project", json!({"project_id":id,"owner":"o@test.com"}))
+                .call(
+                    &r,
+                    ADMIN,
+                    "admin.create_project",
+                    json!({"project_id":id,"owner":"o@test.com"}),
+                )
                 .await
                 .unwrap();
             assert_eq!(out["project_id"], id);
         }
 
         // 2 chars, 33 chars, leading hyphen, trailing hyphen, uppercase, underscore
-        for bad in ["ab".to_string(), "a".repeat(33), "-abc".into(), "abc-".into(), "Abc".into(), "a_c".into()] {
+        for bad in [
+            "ab".to_string(),
+            "a".repeat(33),
+            "-abc".into(),
+            "abc-".into(),
+            "Abc".into(),
+            "a_c".into(),
+        ] {
             let e = f
-                .call(&r, ADMIN, "admin.create_project", json!({"project_id":bad,"owner":"o@test.com"}))
+                .call(
+                    &r,
+                    ADMIN,
+                    "admin.create_project",
+                    json!({"project_id":bad,"owner":"o@test.com"}),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(e.code, code::INVALID_ARGUMENT, "'{bad}' must be rejected");
@@ -752,7 +795,8 @@ mod tests {
     async fn a_missing_argument_is_an_invalid_argument() {
         let f = Fixture::new().await;
         let r = registry();
-        let e = f.call(&r, ADMIN, "admin.create_project", json!({"owner":"o@t.c"})).await.unwrap_err();
+        let e =
+            f.call(&r, ADMIN, "admin.create_project", json!({"owner":"o@t.c"})).await.unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
         assert!(e.message.contains("missing required argument 'project_id'"));
     }
@@ -775,7 +819,12 @@ mod tests {
         let r = registry();
 
         let created = f
-            .call(&r, ADMIN, "admin.create_project", json!({"project_id":"round-trip","owner":"Owner@Test.COM"}))
+            .call(
+                &r,
+                ADMIN,
+                "admin.create_project",
+                json!({"project_id":"round-trip","owner":"Owner@Test.COM"}),
+            )
             .await
             .unwrap();
         assert_eq!(created["project_id"], "round-trip");
@@ -790,7 +839,8 @@ mod tests {
         assert_eq!(mine["projects"][0]["is_owner"], true);
 
         // a stranger sees nothing
-        let theirs = f.call(&r, "stranger@test.com", "admin.list_projects", json!({})).await.unwrap();
+        let theirs =
+            f.call(&r, "stranger@test.com", "admin.list_projects", json!({})).await.unwrap();
         assert_eq!(theirs["projects"].as_array().unwrap().len(), 0);
 
         // the platform admin sees every project, without is_owner
@@ -815,7 +865,8 @@ mod tests {
         let f = Fixture::with_config(|c| c.git.enabled = true).await;
         f.seed_project("gitproj", "owner@test.com").await;
 
-        let git = Arc::new(GitRepoStore::new(f.state.config.clone(), crate::storage::test_registry()));
+        let git =
+            Arc::new(GitRepoStore::new(f.state.config.clone(), crate::storage::test_registry()));
         git.init_repo("gitproj").await.unwrap();
         assert!(f.state.config.git_db_path("gitproj").exists());
 
@@ -906,7 +957,12 @@ mod tests {
         let r = registry();
 
         let out = f
-            .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .call(
+                &r,
+                "owner@test.com",
+                "admin.set_index_mode",
+                json!({"project_id":"proj","mode":"bm25"}),
+            )
             .await
             .unwrap();
         assert_eq!(out["project_id"], "proj");
@@ -928,8 +984,7 @@ mod tests {
         let r = registry();
         let args = json!({"project_id":"proj","mode":"bm25"});
         f.call(&r, "owner@test.com", "admin.set_index_mode", args.clone()).await.unwrap();
-        let again =
-            f.call(&r, "owner@test.com", "admin.set_index_mode", args).await.unwrap();
+        let again = f.call(&r, "owner@test.com", "admin.set_index_mode", args).await.unwrap();
         assert_eq!(again["previous_mode"], "bm25");
         assert_eq!(again["reindex_started"], false);
     }
@@ -940,15 +995,17 @@ mod tests {
         f.state.admin.add_member("proj", "member@test.com", "owner@test.com").await.unwrap();
         let r = registry();
         let e = f
-            .call(&r, "member@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .call(
+                &r,
+                "member@test.com",
+                "admin.set_index_mode",
+                json!({"project_id":"proj","mode":"bm25"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(e.code, code::FORBIDDEN);
         // And nothing was changed.
-        assert_eq!(
-            f.state.admin.get_index_mode("proj").await.unwrap(),
-            IndexMode::None
-        );
+        assert_eq!(f.state.admin.get_index_mode("proj").await.unwrap(), IndexMode::None);
     }
 
     #[tokio::test]
@@ -979,7 +1036,12 @@ mod tests {
         let f = index_mode_fixture().await;
         let r = registry();
         let e = f
-            .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"fancy"}))
+            .call(
+                &r,
+                "owner@test.com",
+                "admin.set_index_mode",
+                json!({"project_id":"proj","mode":"fancy"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
@@ -992,7 +1054,12 @@ mod tests {
         let r = registry();
         for mode in ["rag", "both"] {
             let e = f
-                .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":mode}))
+                .call(
+                    &r,
+                    "owner@test.com",
+                    "admin.set_index_mode",
+                    json!({"project_id":"proj","mode":mode}),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(e.code, code::INVALID_ARGUMENT, "{mode} needs an endpoint");
@@ -1007,7 +1074,12 @@ mod tests {
         f.seed_project("proj", "owner@test.com").await;
         let r = registry();
         let e = f
-            .call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
+            .call(
+                &r,
+                "owner@test.com",
+                "admin.set_index_mode",
+                json!({"project_id":"proj","mode":"bm25"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(e.code, code::NOT_SUPPORTED);
@@ -1030,12 +1102,16 @@ mod tests {
     async fn the_project_listings_carry_the_index_mode() {
         let f = index_mode_fixture().await;
         let r = registry();
-        f.call(&r, "owner@test.com", "admin.set_index_mode", json!({"project_id":"proj","mode":"bm25"}))
-            .await
-            .unwrap();
+        f.call(
+            &r,
+            "owner@test.com",
+            "admin.set_index_mode",
+            json!({"project_id":"proj","mode":"bm25"}),
+        )
+        .await
+        .unwrap();
 
-        let mine =
-            f.call(&r, "owner@test.com", "admin.list_projects", json!({})).await.unwrap();
+        let mine = f.call(&r, "owner@test.com", "admin.list_projects", json!({})).await.unwrap();
         assert_eq!(mine["projects"][0]["index_mode"], "bm25");
 
         let all = f.call(&r, ADMIN, "admin.list_all_projects", json!({})).await.unwrap();

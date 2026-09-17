@@ -390,10 +390,11 @@ mod shared {
             api_key_env: String::new(),
             dimensions: dims,
         };
-        let backend =
-            Arc::new(PostgresVectorBackend::new(pool.clone(), dims, client, cfg).await.expect(
-                "PostgresVectorBackend::new failed — check that pgvector is installed",
-            )) as Arc<dyn crate::search::SearchBackend>;
+        let backend = Arc::new(
+            PostgresVectorBackend::new(pool.clone(), dims, client, cfg)
+                .await
+                .expect("PostgresVectorBackend::new failed — check that pgvector is installed"),
+        ) as Arc<dyn crate::search::SearchBackend>;
 
         let endpoint_for_config = format!("{embedding_url}/v1/embeddings");
         let keys = jwt_keys();
@@ -425,11 +426,8 @@ mod shared {
                     .build()
                     .expect("cleanup runtime");
                 rt.block_on(async move {
-                    let sql =
-                        format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
-                    let _ = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                        .execute(&pool)
-                        .await;
+                    let sql = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&pool).await;
                 });
             })
             .join()
@@ -500,7 +498,6 @@ mod shared {
         })
     }
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auto indexing scenarios, written once and run against every backend
@@ -767,11 +764,7 @@ mod scenarios {
             .inner
             .state
             .registry
-            .call(
-                "admin.get_index_mode",
-                ctx,
-                crate::mcp::Args::new(json!({"project_id": MOUNT})),
-            )
+            .call("admin.get_index_mode", ctx, crate::mcp::Args::new(json!({"project_id": MOUNT})))
             .await
             .expect("the tool must be registered")
             .expect("a member may read the mode");
@@ -788,11 +781,7 @@ mod scenarios {
             .inner
             .state
             .registry
-            .call(
-                "admin.get_index_mode",
-                ctx,
-                crate::mcp::Args::new(json!({"project_id": MOUNT})),
-            )
+            .call("admin.get_index_mode", ctx, crate::mcp::Args::new(json!({"project_id": MOUNT})))
             .await
             .expect("the tool must be registered")
             .expect_err("a non member must be forbidden");
@@ -1051,9 +1040,8 @@ mod scenarios {
         h.write_file(MOUNT, "/tree/deep/b.md", "beta about the quoll").await;
         h.await_chunks(MOUNT, 2).await;
 
-        let (status, body) = h
-            .rest_post(MOUNT, "delete", json!({"path": "/tree", "recursive": true}), PERSON)
-            .await;
+        let (status, body) =
+            h.rest_post(MOUNT, "delete", json!({"path": "/tree", "recursive": true}), PERSON).await;
         assert_eq!(status, axum::http::StatusCode::OK, "REST recursive delete failed: {body}");
 
         for path in ["/tree/a.md", "/tree/deep/b.md"] {
@@ -1069,7 +1057,12 @@ mod scenarios {
         h.await_chunks(MOUNT, 1).await;
 
         let (status, body) = h
-            .rest_post(MOUNT, "move", json!({"source": "/from.md", "destination": "/to.md"}), PERSON)
+            .rest_post(
+                MOUNT,
+                "move",
+                json!({"source": "/from.md", "destination": "/to.md"}),
+                PERSON,
+            )
             .await;
         assert_eq!(status, axum::http::StatusCode::OK, "REST move failed: {body}");
 
@@ -1085,7 +1078,12 @@ mod scenarios {
         h.await_chunks(MOUNT, 1).await;
 
         let (status, body) = h
-            .rest_post(MOUNT, "copy", json!({"source": "/orig.md", "destination": "/dup.md"}), PERSON)
+            .rest_post(
+                MOUNT,
+                "copy",
+                json!({"source": "/orig.md", "destination": "/dup.md"}),
+                PERSON,
+            )
             .await;
         assert_eq!(status, axum::http::StatusCode::OK, "REST copy failed: {body}");
 
@@ -1211,10 +1209,7 @@ mod sqlite_rag {
             .await
             .expect("search.index must succeed");
 
-        assert!(
-            resp["indexed"].as_u64().unwrap_or(0) > 0,
-            "indexed must be > 0, got {resp}"
-        );
+        assert!(resp["indexed"].as_u64().unwrap_or(0) > 0, "indexed must be > 0, got {resp}");
         assert_eq!(resp["skipped"], 0, "skipped must be 0, got {resp}");
 
         let status = h
@@ -1250,10 +1245,7 @@ mod sqlite_rag {
         assert!(!results.is_empty(), "results must be non-empty");
         assert_eq!(results[0]["path"], "/a.md", "top result must be /a.md");
         assert_eq!(results[0]["rank"], 1, "top result must have rank 1");
-        assert!(
-            results[0]["score"].as_f64().unwrap_or(0.0) > 0.0,
-            "score must be positive"
-        );
+        assert!(results[0]["score"].as_f64().unwrap_or(0.0) > 0.0, "score must be positive");
         assert_eq!(resp["mode_used"], "rag", "mode_used must be rag");
     }
 
@@ -1272,10 +1264,7 @@ mod sqlite_rag {
             .call("search.delete", json!({"mount_id": MOUNT, "path": "/a.md"}))
             .await
             .expect("search.delete must succeed");
-        assert!(
-            del["deleted"].as_u64().unwrap_or(0) > 0,
-            "deleted must be > 0, got {del}"
-        );
+        assert!(del["deleted"].as_u64().unwrap_or(0) > 0, "deleted must be > 0, got {del}");
 
         let resp = h
             .call(
@@ -1287,10 +1276,8 @@ mod sqlite_rag {
         let results = resp["results"].as_array().expect("results must be array");
         assert!(results.is_empty(), "results must be empty after delete, got {resp}");
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert_eq!(
             status["vector_chunks"].as_u64().unwrap_or(99),
             0,
@@ -1315,10 +1302,8 @@ mod sqlite_rag {
             .await
             .expect("second index must succeed");
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert_eq!(
             status["vector_chunks"].as_u64().unwrap_or(99),
             1,
@@ -1343,10 +1328,8 @@ mod sqlite_rag {
                 .expect("index must succeed");
         }
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert_eq!(
             status["vector_chunks"].as_u64().unwrap_or(0),
             3,
@@ -1364,21 +1347,13 @@ mod sqlite_rag {
         h.inner.seed("/docs/b.md", "documentation about beta features").await;
 
         let resp = h
-            .call(
-                "search.index",
-                json!({"mount_id": MOUNT, "path": "/docs", "recursive": true}),
-            )
+            .call("search.index", json!({"mount_id": MOUNT, "path": "/docs", "recursive": true}))
             .await
             .expect("recursive index must succeed");
-        assert!(
-            resp["indexed"].as_u64().unwrap_or(0) >= 2,
-            "indexed must be >= 2, got {resp}"
-        );
+        assert!(resp["indexed"].as_u64().unwrap_or(0) >= 2, "indexed must be >= 2, got {resp}");
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert!(
             status["vector_chunks"].as_u64().unwrap_or(0) >= 2,
             "vector_chunks must be >= 2 after recursive index, got {status}"
@@ -1400,10 +1375,7 @@ mod sqlite_rag {
             .expect("query on empty index must succeed (no error)");
 
         let results = resp["results"].as_array().expect("results must be array");
-        assert!(
-            results.is_empty(),
-            "results must be empty on an unindexed volume, got {resp}"
-        );
+        assert!(results.is_empty(), "results must be empty on an unindexed volume, got {resp}");
     }
 
     /// `top_k` is respected: results.len() <= top_k.
@@ -1429,11 +1401,7 @@ mod sqlite_rag {
             .expect("query must succeed");
 
         let results = resp["results"].as_array().expect("results must be array");
-        assert!(
-            results.len() <= 2,
-            "results.len() must be <= top_k=2, got {}",
-            results.len()
-        );
+        assert!(results.len() <= 2, "results.len() must be <= top_k=2, got {}", results.len());
     }
 
     /// A non-member is forbidden before any storage access.
@@ -1459,11 +1427,7 @@ mod sqlite_rag {
             .expect("tool must be registered")
             .expect_err("non-member must be forbidden");
 
-        assert_eq!(
-            err.code,
-            crate::errors::code::FORBIDDEN,
-            "expected ERR_FORBIDDEN, got {err}"
-        );
+        assert_eq!(err.code, crate::errors::code::FORBIDDEN, "expected ERR_FORBIDDEN, got {err}");
     }
 
     /// Indexing a binary (non-UTF-8) file does not return an error.
@@ -1610,7 +1574,6 @@ mod sqlite_rag {
         scenarios::a_binary_write_is_skipped(&h().await, "rag").await;
     }
 
-
     #[tokio::test]
     async fn e2e_sqlite_move_a_file_moves_its_index_entry() {
         scenarios::move_a_file_moves_its_index_entry(&h().await, "rag").await;
@@ -1737,7 +1700,6 @@ mod sqlite_bm25 {
         scenarios::recursive_delete_clears_the_whole_subtree(&h().await, "bm25").await;
     }
 
-
     #[tokio::test]
     async fn e2e_sqlite_bm25_move_a_file_moves_its_index_entry() {
         scenarios::move_a_file_moves_its_index_entry(&h().await, "bm25").await;
@@ -1841,10 +1803,7 @@ mod pg_rag {
             .await
             .expect("search.index must succeed");
 
-        assert!(
-            resp["indexed"].as_u64().unwrap_or(0) > 0,
-            "indexed must be > 0, got {resp}"
-        );
+        assert!(resp["indexed"].as_u64().unwrap_or(0) > 0, "indexed must be > 0, got {resp}");
         assert_eq!(resp["skipped"], 0);
 
         let status = h
@@ -1913,10 +1872,8 @@ mod pg_rag {
         let results = resp["results"].as_array().expect("results must be array");
         assert!(results.is_empty(), "results must be empty after delete, got {resp}");
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert_eq!(
             status["vector_chunks"].as_u64().unwrap_or(99),
             0,
@@ -1941,10 +1898,8 @@ mod pg_rag {
             .await
             .expect("second index must succeed");
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert_eq!(
             status["vector_chunks"].as_u64().unwrap_or(99),
             1,
@@ -1970,10 +1925,8 @@ mod pg_rag {
                 .expect("index must succeed");
         }
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert_eq!(
             status["vector_chunks"].as_u64().unwrap_or(0),
             3,
@@ -1992,21 +1945,13 @@ mod pg_rag {
         h.inner.seed("/docs/b.md", "documentation about beta features").await;
 
         let resp = h
-            .call(
-                "search.index",
-                json!({"mount_id": MOUNT, "path": "/docs", "recursive": true}),
-            )
+            .call("search.index", json!({"mount_id": MOUNT, "path": "/docs", "recursive": true}))
             .await
             .expect("recursive index must succeed");
-        assert!(
-            resp["indexed"].as_u64().unwrap_or(0) >= 2,
-            "indexed must be >= 2, got {resp}"
-        );
+        assert!(resp["indexed"].as_u64().unwrap_or(0) >= 2, "indexed must be >= 2, got {resp}");
 
-        let status = h
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status must succeed");
+        let status =
+            h.call("search.status", json!({"mount_id": MOUNT})).await.expect("status must succeed");
         assert!(
             status["vector_chunks"].as_u64().unwrap_or(0) >= 2,
             "vector_chunks must be >= 2, got {status}"
@@ -2029,10 +1974,7 @@ mod pg_rag {
             .expect("query on empty index must succeed (no error)");
 
         let results = resp["results"].as_array().expect("results must be array");
-        assert!(
-            results.is_empty(),
-            "results must be empty on an unindexed volume, got {resp}"
-        );
+        assert!(results.is_empty(), "results must be empty on an unindexed volume, got {resp}");
     }
 
     #[tokio::test]
@@ -2059,11 +2001,7 @@ mod pg_rag {
             .expect("query must succeed");
 
         let results = resp["results"].as_array().expect("results must be array");
-        assert!(
-            results.len() <= 2,
-            "results.len() must be <= top_k=2, got {}",
-            results.len()
-        );
+        assert!(results.len() <= 2, "results.len() must be <= top_k=2, got {}", results.len());
     }
 
     #[tokio::test]
@@ -2090,11 +2028,7 @@ mod pg_rag {
             .expect("tool must be registered")
             .expect_err("non-member must be forbidden");
 
-        assert_eq!(
-            err.code,
-            crate::errors::code::FORBIDDEN,
-            "expected ERR_FORBIDDEN, got {err}"
-        );
+        assert_eq!(err.code, crate::errors::code::FORBIDDEN, "expected ERR_FORBIDDEN, got {err}");
     }
 
     #[tokio::test]
@@ -2173,14 +2107,8 @@ mod pg_rag {
             .expect("index in B must succeed");
 
         // Volume A must report exactly 1 chunk; Volume B must independently report 1.
-        let sa = ha
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status in A");
-        let sb = hb
-            .call("search.status", json!({"mount_id": MOUNT}))
-            .await
-            .expect("status in B");
+        let sa = ha.call("search.status", json!({"mount_id": MOUNT})).await.expect("status in A");
+        let sb = hb.call("search.status", json!({"mount_id": MOUNT})).await.expect("status in B");
 
         assert_eq!(sa["vector_chunks"], 1, "A must have exactly 1 chunk, got {sa}");
         assert_eq!(sb["vector_chunks"], 1, "B must have exactly 1 chunk, got {sb}");
@@ -2286,7 +2214,6 @@ mod pg_rag {
         let Some(h) = h().await else { return };
         scenarios::a_binary_write_is_skipped(&h, "rag").await;
     }
-
 
     #[tokio::test]
     async fn e2e_pg_move_a_file_moves_its_index_entry() {
@@ -2444,7 +2371,6 @@ mod pg_bm25 {
         let Some(h) = h().await else { return };
         scenarios::recursive_delete_clears_the_whole_subtree(&h, "bm25").await;
     }
-
 
     #[tokio::test]
     async fn e2e_pg_bm25_move_a_file_moves_its_index_entry() {

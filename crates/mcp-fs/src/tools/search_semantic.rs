@@ -38,11 +38,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
             let chunk_size = a.int_or("chunk_size", 1000) as usize;
             let chunk_overlap = a.int_or("chunk_overlap", 100) as usize;
 
-            let backend = ctx
-                .state
-                .search
-                .as_ref()
-                .ok_or_else(|| ToolError::not_supported("search is not enabled; set search.enabled: true in config"))?;
+            let backend = ctx.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
 
             let client = ctx.state.stores.client(&mount).await?;
 
@@ -65,7 +65,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
                 // Try to read text content; skip binary or unreadable files.
                 match client.read_text(file_path).await {
                     Ok(text) => {
-                        match backend.index_path(&mount, file_path, &text, chunk_size, chunk_overlap).await {
+                        match backend
+                            .index_path(&mount, file_path, &text, chunk_size, chunk_overlap)
+                            .await
+                        {
                             Ok(n) => indexed += n,
                             Err(_) => skipped += 1,
                         }
@@ -106,11 +109,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
             let config_mode = &ctx.state.config.search.mode;
             let mode = a.opt_str("mode").unwrap_or_else(|| config_mode.clone());
 
-            let backend = ctx
-                .state
-                .search
-                .as_ref()
-                .ok_or_else(|| ToolError::not_supported("search is not enabled; set search.enabled: true in config"))?;
+            let backend = ctx.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
 
             // Validate that the requested mode is supported.
             if matches!(mode.as_str(), "rag" | "both") {
@@ -162,12 +165,14 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
 
             let result_values: Vec<Value> = results
                 .iter()
-                .map(|r| json!({
-                    "path": r.path,
-                    "score": r.score,
-                    "chunk": r.chunk,
-                    "rank": r.rank,
-                }))
+                .map(|r| {
+                    json!({
+                        "path": r.path,
+                        "score": r.score,
+                        "chunk": r.chunk,
+                        "rank": r.rank,
+                    })
+                })
                 .collect();
 
             Ok(json!({
@@ -190,11 +195,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
             let path = ctx.state.safety.normalize_path(&a.str("path")?)?;
             let _recursive = a.bool_or("recursive", false);
 
-            let backend = ctx
-                .state
-                .search
-                .as_ref()
-                .ok_or_else(|| ToolError::not_supported("search is not enabled; set search.enabled: true in config"))?;
+            let backend = ctx.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
 
             let deleted = backend.delete_path(&mount, &path).await?;
 
@@ -209,11 +214,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;
 
-            let backend = ctx
-                .state
-                .search
-                .as_ref()
-                .ok_or_else(|| ToolError::not_supported("search is not enabled; set search.enabled: true in config"))?;
+            let backend = ctx.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
 
             let stats = backend.stats(&mount).await?;
 
@@ -255,7 +260,9 @@ mod tests {
         let search_dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(TantivyBm25Backend::new(search_dir.path().to_str().unwrap()));
         let h = crate::tools::testkit::harness_with_search(
-            |c| { c.search.enabled = true; },
+            |c| {
+                c.search.enabled = true;
+            },
             Some(backend as Arc<dyn crate::search::SearchBackend>),
         )
         .await;
@@ -279,14 +286,7 @@ mod tests {
             .unwrap();
         assert!(n > 0, "expected at least one chunk indexed");
 
-        let results = h
-            .state
-            .search
-            .as_ref()
-            .unwrap()
-            .query_bm25(MOUNT, "fox", 10)
-            .await
-            .unwrap();
+        let results = h.state.search.as_ref().unwrap().query_bm25(MOUNT, "fox", 10).await.unwrap();
         assert!(!results.is_empty(), "expected at least one result");
         assert_eq!(results[0].path, "/doc.md");
     }
@@ -301,21 +301,9 @@ mod tests {
             .index_path(MOUNT, "/a.md", "hello world search test", 200, 0)
             .await
             .unwrap();
-        h.state
-            .search
-            .as_ref()
-            .unwrap()
-            .delete_path(MOUNT, "/a.md")
-            .await
-            .unwrap();
-        let results = h
-            .state
-            .search
-            .as_ref()
-            .unwrap()
-            .query_bm25(MOUNT, "hello", 10)
-            .await
-            .unwrap();
+        h.state.search.as_ref().unwrap().delete_path(MOUNT, "/a.md").await.unwrap();
+        let results =
+            h.state.search.as_ref().unwrap().query_bm25(MOUNT, "hello", 10).await.unwrap();
         assert!(results.is_empty(), "deleted doc must not appear in results");
     }
 

@@ -92,7 +92,10 @@ impl Session {
 }
 
 /// The most recently touched sessions, newest first: `(id, modified, message count)`.
-pub fn list_sessions(history_dir: &Path, limit: usize) -> Vec<(String, std::time::SystemTime, usize)> {
+pub fn list_sessions(
+    history_dir: &Path,
+    limit: usize,
+) -> Vec<(String, std::time::SystemTime, usize)> {
     let Ok(rd) = std::fs::read_dir(history_dir) else {
         return Vec::new();
     };

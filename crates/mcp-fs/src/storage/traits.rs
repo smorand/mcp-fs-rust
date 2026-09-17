@@ -26,8 +26,12 @@ pub struct NodeRow {
 }
 
 impl NodeRow {
-    pub fn is_dir(&self) -> bool { self.kind == "dir" }
-    pub fn is_file(&self) -> bool { self.kind == "file" }
+    pub fn is_dir(&self) -> bool {
+        self.kind == "dir"
+    }
+    pub fn is_file(&self) -> bool {
+        self.kind == "file"
+    }
 }
 
 /// Default POSIX modes, matching the C# implementation.

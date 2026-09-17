@@ -79,15 +79,10 @@ impl OAuthTokenStore {
     }
 
     /// Store backed by encrypted persistence, preloaded from it.
-    pub async fn with_persistence(
-        persistence: Arc<RelationalOAuthPersistence>,
-    ) -> Result<Self> {
+    pub async fn with_persistence(persistence: Arc<RelationalOAuthPersistence>) -> Result<Self> {
         let mut sessions = HashMap::new();
         for (person, provider, session) in persistence.load_all().await? {
-            sessions.insert(
-                key(&person, &provider),
-                Entry { person, provider, session },
-            );
+            sessions.insert(key(&person, &provider), Entry { person, provider, session });
         }
         Ok(Self { sessions: RwLock::new(sessions), persistence: Some(persistence) })
     }
@@ -172,17 +167,14 @@ impl OAuthTokenStore {
 
     /// A stored token that has not expired yet.
     pub fn has_valid_token(&self, person: &str, provider: &str) -> bool {
-        self.get_token(person, provider)
-            .is_some_and(|s| s.is_valid_at(Utc::now()))
+        self.get_token(person, provider).is_some_and(|s| s.is_valid_at(Utc::now()))
     }
 
     /// Every `(person, provider)` currently held, original casing. Diagnostics.
     pub fn list_ids(&self) -> Vec<(String, String)> {
         let guard = self.sessions.read().expect("token store lock poisoned");
-        let mut out: Vec<(String, String)> = guard
-            .values()
-            .map(|e| (e.person.clone(), e.provider.clone()))
-            .collect();
+        let mut out: Vec<(String, String)> =
+            guard.values().map(|e| (e.person.clone(), e.provider.clone())).collect();
         out.sort();
         out
     }
@@ -207,15 +199,9 @@ mod tests {
     #[tokio::test]
     async fn store_then_get() {
         let s = store();
-        s.store_token(
-            "alice@test.com",
-            "github",
-            "gho_1",
-            vec!["repo".into()],
-            future(),
-            None,
-        ).await
-        .unwrap();
+        s.store_token("alice@test.com", "github", "gho_1", vec!["repo".into()], future(), None)
+            .await
+            .unwrap();
         let got = s.get_token("alice@test.com", "github").unwrap();
         assert_eq!(got.access_token, "gho_1");
         assert_eq!(got.provider, "github");
@@ -255,15 +241,19 @@ mod tests {
             vec!["api".into()],
             future(),
             Some("https://gitlab.example.test".into()),
-        ).await
+        )
+        .await
         .unwrap();
         assert_eq!(s.get_token("a@t.c", "github").unwrap().access_token, "gh");
         let gl = s.get_token("a@t.c", "gitlab").unwrap();
         assert_eq!(gl.instance_url.as_deref(), Some("https://gitlab.example.test"));
-        assert_eq!(s.list_ids(), vec![
-            ("a@t.c".to_string(), "github".to_string()),
-            ("a@t.c".to_string(), "gitlab".to_string()),
-        ]);
+        assert_eq!(
+            s.list_ids(),
+            vec![
+                ("a@t.c".to_string(), "github".to_string()),
+                ("a@t.c".to_string(), "gitlab".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -331,7 +321,8 @@ mod tests {
                 vec!["repo".into()],
                 future(),
                 None,
-            ).await
+            )
+            .await
             .unwrap();
         }
 

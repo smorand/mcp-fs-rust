@@ -71,13 +71,13 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     // is on, so a server with them disabled advertises exactly the tools it can serve.
     let mut registry = ToolRegistry::new();
     let features = crate::tools::all::EnabledFeatures {
-        git:      config.git.enabled,
-        web:      config.web.enabled,
+        git: config.git.enabled,
+        web: config.web.enabled,
         context7: config.context7.enabled,
-        sqlite:   config.sqlite.enabled,
-        db:       config.db.enabled,
-        doc:      config.doc.enabled,
-        search:   config.search.enabled,
+        sqlite: config.sqlite.enabled,
+        db: config.db.enabled,
+        doc: config.doc.enabled,
+        search: config.search.enabled,
     };
     crate::tools::register_all(&mut registry, &features, &config);
 
@@ -128,8 +128,10 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
     if state.config.git.enabled {
         // Same registry as the metadata and ACL stores, so enabling git does not
         // silently double the connection count.
-        let git_store =
-            crate::git::GitRepoStore::shared(state.config.clone(), state.stores.relational().clone());
+        let git_store = crate::git::GitRepoStore::shared(
+            state.config.clone(),
+            state.stores.relational().clone(),
+        );
         router = router.merge(crate::git::http::router(state.clone(), git_store));
     }
 
@@ -143,9 +145,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
 }
 
@@ -185,7 +185,11 @@ async fn health() -> Json<Value> {
 }
 
 /// The MCP streamable HTTP endpoint (POST only, like the stateless C# transport).
-async fn mcp_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn mcp_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     // Identity first: a bad bearer never reaches dispatch, and the 401 is plain
     // JSON (not SSE), matching the C# IdentityMiddleware.
     let person = match resolve_person(&state.identity, &headers) {
@@ -246,11 +250,9 @@ async fn call_tool(state: &Arc<AppState>, person: String, id: Value, params: &Va
     let ctx = ToolCtx { person, state: state.clone() };
 
     match state.registry.call(&name, ctx, args).await {
-        None => rpc_error(
-            id,
-            crate::mcp::rpc_error::INVALID_PARAMS,
-            format!("Unknown tool: '{name}'"),
-        ),
+        None => {
+            rpc_error(id, crate::mcp::rpc_error::INVALID_PARAMS, format!("Unknown tool: '{name}'"))
+        }
         Some(Ok(v)) => rpc_result(id, tool_ok(&v)),
         Some(Err(e)) => {
             logging::log_tool_failure(&name, &e);
@@ -261,12 +263,7 @@ async fn call_tool(state: &Arc<AppState>, person: String, id: Value, params: &Va
 
 /// Verify the bearer using the axum header map.
 fn resolve_person(resolver: &IdentityResolver, headers: &HeaderMap) -> crate::Result<String> {
-    resolver.resolve(|name| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    })
+    resolver.resolve(|name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string))
 }
 
 /// The C# 401 body: `{"error":"ERR_UNAUTHENTICATED","detail":"<message>"}`.
@@ -284,10 +281,7 @@ fn unauthorized(err: &ToolError) -> Response {
 fn sse(payload: &Value) -> Response {
     (
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache,no-store"),
-        ],
+        [(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache,no-store")],
         sse_frame(payload),
     )
         .into_response()
@@ -475,10 +469,7 @@ mod tests {
         let app = build(c).await.unwrap();
         let r = app.oneshot(rpc(Some(&t), "{not json")).await.unwrap();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            r.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/json"
-        );
+        assert_eq!(r.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
         let body = body_string(r).await;
         let v: Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(v["error"], crate::errors::code::INVALID_ARGUMENT);
@@ -495,9 +486,7 @@ mod tests {
             .method("POST")
             .uri("/rpc")
             .header("X-Forwarded-Authorization", format!("Bearer {t}"))
-            .body(axum::body::Body::from(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            ))
+            .body(axum::body::Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
             .unwrap();
         let r = app.oneshot(req).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);

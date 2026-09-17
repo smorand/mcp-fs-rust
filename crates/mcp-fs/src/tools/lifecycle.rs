@@ -6,9 +6,9 @@
 
 use crate::core::fs_ops;
 use crate::errors::Result;
+use crate::mcp::Args;
 use crate::mcp::ToolSchema;
 use crate::mcp::registry::{ToolCtx, ToolRegistry, handler};
-use crate::mcp::Args;
 use crate::tools::{authorize_only, norm, volume};
 use serde_json::{Value, json};
 
@@ -46,7 +46,8 @@ pub fn register(reg: &mut ToolRegistry) {
             let path = norm(&ctx, &a, "path")?;
             // Collected first: a recursive delete takes every file underneath,
             // and afterwards there is no tree left to enumerate.
-            let indexed = crate::search::indexer::paths_under(&ctx.state, &mount, &path, &client).await;
+            let indexed =
+                crate::search::indexer::paths_under(&ctx.state, &mount, &path, &client).await;
             let out = fs_ops::delete_path(
                 &client,
                 &ctx.state.safety,
@@ -78,7 +79,8 @@ pub fn register(reg: &mut ToolRegistry) {
             let dst = norm(&ctx, &a, "destination")?;
             // Enumerated first, like the delete above: the rename takes the whole
             // subtree with it, and afterwards there is no source tree left to list.
-            let indexed = crate::search::indexer::paths_under(&ctx.state, &mount, &src, &client).await;
+            let indexed =
+                crate::search::indexer::paths_under(&ctx.state, &mount, &src, &client).await;
             let out = fs_ops::move_path(
                 &client,
                 &ctx.state.safety,
@@ -153,10 +155,8 @@ pub fn register(reg: &mut ToolRegistry) {
 /// "where am I allowed to work", which is why it takes a mount only to authorize.
 async fn list_allowed_roots(ctx: &ToolCtx) -> Result<Value> {
     let projects = ctx.state.admin.list_projects_for(&ctx.person).await?;
-    let roots: Vec<Value> = projects
-        .iter()
-        .map(|p| json!({"mount_id": p.id, "root": "/", "owner": p.owner}))
-        .collect();
+    let roots: Vec<Value> =
+        projects.iter().map(|p| json!({"mount_id": p.id, "root": "/", "owner": p.owner})).collect();
     Ok(json!({"person": ctx.person, "roots": roots}))
 }
 
@@ -172,12 +172,14 @@ fn audit_log(ctx: &ToolCtx, a: &Args, mount: &str) -> Value {
     let recent: Vec<Value> = entries
         .iter()
         .skip(skip)
-        .map(|e| json!({
-            "timestamp": e.timestamp,
-            "op": e.op,
-            "path": e.path,
-            "detail": e.detail,
-        }))
+        .map(|e| {
+            json!({
+                "timestamp": e.timestamp,
+                "op": e.op,
+                "path": e.path,
+                "detail": e.detail,
+            })
+        })
         .collect();
     json!({"entries": recent})
 }
@@ -190,14 +192,8 @@ mod tests {
         MOUNT, PERSON, assert_description, assert_family, assert_schema, harness, harness_with,
     };
 
-    const NAMES: &[&str] = &[
-        "fs.mkdir",
-        "fs.delete",
-        "fs.move",
-        "fs.copy",
-        "fs.list_allowed_roots",
-        "fs.audit_log",
-    ];
+    const NAMES: &[&str] =
+        &["fs.mkdir", "fs.delete", "fs.move", "fs.copy", "fs.list_allowed_roots", "fs.audit_log"];
 
     #[test]
     fn family_registers_every_tool() {
@@ -268,7 +264,10 @@ mod tests {
         let h = harness().await;
         h.call("fs.mkdir", json!({"mount_id": MOUNT, "path": "/d"})).await.unwrap();
         let err = h
-            .call("fs.mkdir", json!({"mount_id": MOUNT, "path": "/d", "parents": false, "exist_ok": false}))
+            .call(
+                "fs.mkdir",
+                json!({"mount_id": MOUNT, "path": "/d", "parents": false, "exist_ok": false}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::NO_CLOBBER);
@@ -309,7 +308,8 @@ mod tests {
     async fn delete_a_directory_needs_recursive() {
         let h = harness().await;
         h.seed("/dir/a.txt", "x\n").await;
-        let err = h.call("fs.delete", json!({"mount_id": MOUNT, "path": "/dir"})).await.unwrap_err();
+        let err =
+            h.call("fs.delete", json!({"mount_id": MOUNT, "path": "/dir"})).await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
         let ok = h
             .call("fs.delete", json!({"mount_id": MOUNT, "path": "/dir", "recursive": true}))
@@ -323,19 +323,28 @@ mod tests {
         let h = harness().await;
         h.seed("/a.txt", "x\n").await;
         let copied = h
-            .call("fs.copy", json!({"mount_id": MOUNT, "source": "/a.txt", "destination": "/b.txt"}))
+            .call(
+                "fs.copy",
+                json!({"mount_id": MOUNT, "source": "/a.txt", "destination": "/b.txt"}),
+            )
             .await
             .unwrap();
         assert_eq!(copied, json!({"source": "/a.txt", "destination": "/b.txt"}));
 
         let err = h
-            .call("fs.copy", json!({"mount_id": MOUNT, "source": "/a.txt", "destination": "/b.txt"}))
+            .call(
+                "fs.copy",
+                json!({"mount_id": MOUNT, "source": "/a.txt", "destination": "/b.txt"}),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::NO_CLOBBER);
 
         let moved = h
-            .call("fs.move", json!({"mount_id": MOUNT, "source": "/b.txt", "destination": "/c.txt"}))
+            .call(
+                "fs.move",
+                json!({"mount_id": MOUNT, "source": "/b.txt", "destination": "/c.txt"}),
+            )
             .await
             .unwrap();
         assert_eq!(moved["destination"], "/c.txt");

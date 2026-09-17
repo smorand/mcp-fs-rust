@@ -18,9 +18,9 @@
 
 pub mod admin;
 pub mod all;
+pub mod context7;
 #[cfg(test)]
 pub(crate) mod contract_golden;
-pub mod context7;
 pub mod db;
 pub mod doc;
 pub mod document;
@@ -99,8 +99,8 @@ pub(crate) mod testkit {
     use crate::mcp::registry::ToolCtx;
     use crate::mcp::{Args, ToolRegistry};
     use crate::state::AppState;
-    use crate::storage::traits::AdminBackend;
     use crate::storage::VolumeClient;
+    use crate::storage::traits::AdminBackend;
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -163,7 +163,8 @@ pub(crate) mod testkit {
         tweak(&mut config);
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
+        let admin =
+            Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 
@@ -173,7 +174,10 @@ pub(crate) mod testkit {
         let state = Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
             safety: Arc::new(crate::safety::SafetyManager::new(
                 config.safety.clone(),
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
@@ -198,7 +202,8 @@ pub(crate) mod testkit {
         config.auth.jwt.public_key_path = String::new();
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
+        let admin =
+            Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 
@@ -209,7 +214,10 @@ pub(crate) mod testkit {
         let state = Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
             safety: Arc::new(crate::safety::SafetyManager::new(
                 config.safety.clone(),
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
@@ -236,7 +244,8 @@ pub(crate) mod testkit {
         tweak(&mut config);
         let config = Arc::new(config);
 
-        let admin = Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
+        let admin =
+            Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(MOUNT, PERSON).await.unwrap();
 
@@ -253,7 +262,10 @@ pub(crate) mod testkit {
         let state = Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
             safety: Arc::new(crate::safety::SafetyManager::new(
                 config.safety.clone(),
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
@@ -374,10 +386,8 @@ mod tests {
     #[tokio::test]
     async fn a_non_member_is_forbidden_before_anything_else() {
         let h = harness().await;
-        let ctx = crate::mcp::registry::ToolCtx {
-            person: "stranger@x.y".into(),
-            state: h.state.clone(),
-        };
+        let ctx =
+            crate::mcp::registry::ToolCtx { person: "stranger@x.y".into(), state: h.state.clone() };
         let err = h
             .state
             .registry

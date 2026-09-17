@@ -36,7 +36,8 @@ const FENCED_EXTS: &[&str] = &[".json", ".yaml", ".yml", ".xml", ".toml", ".ini"
 const IMAGE_EXTS: &[&str] = &[".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"];
 /// Audio and video: out of scope.
 const AV_EXTS: &[&str] = &[
-    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".mp4", ".mkv", ".mov", ".avi", ".webm", ".wmv",
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".mp4", ".mkv", ".mov", ".avi", ".webm",
+    ".wmv",
 ];
 /// Extensions that get a companion `.md` written next to the source. A `.txt` is
 /// already readable with `fs.read`, so it gets no companion.
@@ -108,7 +109,9 @@ impl<'a> Extractor<'a> {
             ".csv" => Ok(csv(data)),
             e if IMAGE_EXTS.contains(&e) => self.image(data, e, ocr_enabled).await,
             e if FENCED_EXTS.contains(&e) => Ok(fenced(data, e)),
-            e if TEXT_EXTS.contains(&e) || e.is_empty() => Ok(ExtractResult::of("text", decode(data))),
+            e if TEXT_EXTS.contains(&e) || e.is_empty() => {
+                Ok(ExtractResult::of("text", decode(data)))
+            }
             e => Ok(ExtractResult::of("text", decode(data))
                 .with_note(format!("unknown extension {e}; decoded as text"))),
         }?;
@@ -219,7 +222,8 @@ pub async fn extract_text(
         }
     }
 
-    let mut payload = doc_payload(path, md_path.as_deref(), &result.fmt, &result.text, preview_chars, false);
+    let mut payload =
+        doc_payload(path, md_path.as_deref(), &result.fmt, &result.text, preview_chars, false);
     if let Value::Object(map) = &mut payload {
         map.insert("truncated".into(), Value::Bool(result.truncated));
         map.insert("meta".into(), Value::Object(result.meta));
@@ -284,7 +288,9 @@ fn take_chars(text: &str, max: usize) -> String {
 fn md_table(rows: &[Vec<String>]) -> String {
     let mut cleaned: Vec<Vec<String>> = rows
         .iter()
-        .map(|r| r.iter().map(|c| c.replace('\n', " ").replace('|', "\\|").trim().to_string()).collect())
+        .map(|r| {
+            r.iter().map(|c| c.replace('\n', " ").replace('|', "\\|").trim().to_string()).collect()
+        })
         .collect();
     if cleaned.is_empty() {
         return String::new();
@@ -324,8 +330,9 @@ fn pdf(data: &[u8]) -> Result<ExtractResult> {
         result = result.with_meta("title", json!(title));
     }
     if result.text.is_empty() {
-        result = result
-            .with_note("no extractable text layer (scanned PDF?); enable a multimodal OCR provider");
+        result = result.with_note(
+            "no extractable text layer (scanned PDF?); enable a multimodal OCR provider",
+        );
     }
     Ok(result)
 }
@@ -416,7 +423,10 @@ fn local_name_end(e: &quick_xml::events::BytesEnd<'_>) -> String {
 fn attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.local_name().as_ref() == name.as_bytes() {
-            return a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|c| c.into_owned());
+            return a
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|c| c.into_owned());
         }
     }
     None
@@ -842,7 +852,8 @@ fn xlsx_shared_strings(zip: &mut Zip) -> Vec<String> {
 /// `(sheet name, part path)` in workbook order.
 fn xlsx_sheets(zip: &mut Zip) -> Vec<(String, String)> {
     let Some(workbook) = entry_text(zip, "xl/workbook.xml") else { return Vec::new() };
-    let rels = entry_text(zip, "xl/_rels/workbook.xml.rels").map(|x| parse_rels(&x)).unwrap_or_default();
+    let rels =
+        entry_text(zip, "xl/_rels/workbook.xml.rels").map(|x| parse_rels(&x)).unwrap_or_default();
     let mut reader = quick_xml::Reader::from_str(&workbook);
     let mut out = Vec::new();
     loop {
@@ -999,13 +1010,14 @@ fn unescape_html(text: &str) -> String {
             continue;
         };
         let body = &rest[1..semi];
-        let replacement = if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
-            u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
-        } else if let Some(dec) = body.strip_prefix('#') {
-            dec.parse::<u32>().ok().and_then(char::from_u32)
-        } else {
-            NAMED.iter().find(|(n, _)| *n == body).map(|(_, c)| *c)
-        };
+        let replacement =
+            if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = body.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                NAMED.iter().find(|(n, _)| *n == body).map(|(_, c)| *c)
+            };
         match replacement {
             Some(c) => {
                 out.push(c);
@@ -1143,15 +1155,9 @@ mod tests {
 
     #[test]
     fn md_table_pads_escapes_and_flattens() {
-        let rows = vec![
-            vec!["a".into(), "b|c".into(), "d\ne".into()],
-            vec!["1".into()],
-        ];
+        let rows = vec![vec!["a".into(), "b|c".into(), "d\ne".into()], vec!["1".into()]];
         let table = md_table(&rows);
-        assert_eq!(
-            table,
-            "| a | b\\|c | d e |\n| --- | --- | --- |\n| 1 |  |  |"
-        );
+        assert_eq!(table, "| a | b\\|c | d e |\n| --- | --- | --- |\n| 1 |  |  |");
         assert_eq!(md_table(&[]), "");
     }
 
@@ -1168,7 +1174,10 @@ mod tests {
     #[test]
     fn resolve_target_collapses_dot_dot() {
         assert_eq!(resolve_target("ppt", "slides/slide1.xml"), "ppt/slides/slide1.xml");
-        assert_eq!(resolve_target("ppt/slides", "../notesSlides/notesSlide1.xml"), "ppt/notesSlides/notesSlide1.xml");
+        assert_eq!(
+            resolve_target("ppt/slides", "../notesSlides/notesSlide1.xml"),
+            "ppt/notesSlides/notesSlide1.xml"
+        );
         assert_eq!(resolve_target("xl", "/xl/worksheets/sheet1.xml"), "xl/worksheets/sheet1.xml");
     }
 
@@ -1270,7 +1279,11 @@ mod tests {
         for name in ["/a/song.mp3", "/a/clip.mp4", "/a/x.mkv", "/a/x.flac"] {
             let err = e.extract(b"binary", name, 1000, true).await.unwrap_err();
             assert_eq!(err.code, crate::errors::code::NOT_SUPPORTED, "{name}");
-            assert!(err.message.starts_with("audio/video is out of scope for extraction: ."), "{}", err.message);
+            assert!(
+                err.message.starts_with("audio/video is out of scope for extraction: ."),
+                "{}",
+                err.message
+            );
         }
     }
 
@@ -1390,9 +1403,11 @@ mod tests {
     fn pptx_uses_presentation_order_and_notes() {
         let presentation = r#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId id="256" r:id="rId9"/><p:sldId id="257" r:id="rId8"/></p:sldIdLst></p:presentation>"#;
         let rels = r#"<Relationships xmlns="x"><Relationship Id="rId9" Type="http://x/slide" Target="slides/slide2.xml"/><Relationship Id="rId8" Type="http://x/slide" Target="slides/slide1.xml"/></Relationships>"#;
-        let slide = |t: &str| format!(r#"<p:sld xmlns:a="a"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#);
+        let slide =
+            |t: &str| format!(r#"<p:sld xmlns:a="a"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#);
         let slide_rels = r#"<Relationships xmlns="x"><Relationship Id="rId1" Type="http://x/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#;
-        let notes = r#"<p:notes xmlns:a="a"><a:p><a:r><a:t>speaker hint</a:t></a:r></a:p></p:notes>"#;
+        let notes =
+            r#"<p:notes xmlns:a="a"><a:p><a:r><a:t>speaker hint</a:t></a:r></a:p></p:notes>"#;
         let bytes = make_zip(&[
             ("ppt/presentation.xml", presentation),
             ("ppt/_rels/presentation.xml.rels", rels),
@@ -1411,14 +1426,16 @@ mod tests {
 
     #[test]
     fn pptx_resolves_entities_in_slide_text() {
-        let slide = r#"<p:sld xmlns:a="a"><a:p><a:r><a:t>Q&amp;A &#8212; done</a:t></a:r></a:p></p:sld>"#;
+        let slide =
+            r#"<p:sld xmlns:a="a"><a:p><a:r><a:t>Q&amp;A &#8212; done</a:t></a:r></a:p></p:sld>"#;
         let r = pptx(&make_zip(&[("ppt/slides/slide1.xml", slide)])).unwrap();
         assert!(r.text.contains("Q&A \u{2014} done"), "{}", r.text);
     }
 
     #[test]
     fn pptx_falls_back_to_numeric_slide_order() {
-        let slide = |t: &str| format!(r#"<p:sld xmlns:a="a"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#);
+        let slide =
+            |t: &str| format!(r#"<p:sld xmlns:a="a"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#);
         let bytes = make_zip(&[
             ("ppt/slides/slide10.xml", &slide("ten")),
             ("ppt/slides/slide2.xml", &slide("two")),
@@ -1432,7 +1449,8 @@ mod tests {
     fn xlsx_resolves_shared_strings_and_sheet_names() {
         let workbook = r#"<workbook xmlns:r="r"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
         let rels = r#"<Relationships xmlns="x"><Relationship Id="rId1" Type="http://x/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
-        let shared = r#"<sst><si><t>Header</t></si><si><r><t>Rich </t></r><r><t>Text</t></r></si></sst>"#;
+        let shared =
+            r#"<sst><si><t>Header</t></si><si><r><t>Rich </t></r><r><t>Text</t></r></si></sst>"#;
         let sheet = r#"<worksheet><sheetData>
 <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
 <row r="2"><c r="A2"><v>42</v></c><c r="B2" t="inlineStr"><is><t>inline</t></is></c></row>
@@ -1517,7 +1535,9 @@ mod tests {
         );
         push(&mut pdf, &mut offsets, "6 0 obj\n<< /Title (Unit Test Doc) >>\nendobj\n".into());
         let xref = pdf.len();
-        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+        );
         for off in &offsets {
             pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
         }

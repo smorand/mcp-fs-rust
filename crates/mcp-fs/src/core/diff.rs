@@ -53,12 +53,7 @@ pub fn unified(old_text: &str, new_text: &str, path: &str) -> String {
 
 /// Unified diff with an explicit context size. Returns an empty string when the
 /// two texts are identical, exactly like the C# version.
-pub fn unified_with_context(
-    old_text: &str,
-    new_text: &str,
-    path: &str,
-    context: usize,
-) -> String {
+pub fn unified_with_context(old_text: &str, new_text: &str, path: &str, context: usize) -> String {
     let a = split_lines_keep_ends(old_text);
     let b = split_lines_keep_ends(new_text);
     let ops = capture_diff_slices(Algorithm::Myers, &a, &b);
@@ -121,11 +116,7 @@ fn push_line(out: &mut String, prefix: char, line: &str) {
 fn format_range(start: usize, stop: usize) -> String {
     let length = stop - start;
     let begin = if length == 0 { start } else { start + 1 };
-    if length == 1 {
-        begin.to_string()
-    } else {
-        format!("{begin},{length}")
-    }
+    if length == 1 { begin.to_string() } else { format!("{begin},{length}") }
 }
 
 #[cfg(test)]
@@ -156,10 +147,7 @@ mod tests {
     #[test]
     fn single_line_change_produces_one_hunk() {
         let d = unified("a\nb\nc\n", "a\nB\nc\n", "/f.txt");
-        assert_eq!(
-            d,
-            "--- /f.txt\n+++ /f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
-        );
+        assert_eq!(d, "--- /f.txt\n+++ /f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n");
     }
 
     #[test]

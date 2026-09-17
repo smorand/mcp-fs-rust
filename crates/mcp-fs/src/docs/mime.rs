@@ -37,18 +37,9 @@ const TABLE: &[(&str, &str)] = &[
     (".tiff", "image/tiff"),
     (".zip", "application/zip"),
     (".gz", "application/gzip"),
-    (
-        ".docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ),
-    (
-        ".xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ),
-    (
-        ".pptx",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ),
+    (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    (".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
 ];
 
 /// Guess the MIME type from the path extension, or `None` when unknown.

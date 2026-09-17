@@ -18,15 +18,10 @@ use serde_json::Value;
 ///
 /// `client` is the shared `reqwest::Client`; build it once at boot.
 pub async fn embed(client: &Client, config: &EmbeddingConfig, text: &str) -> Result<Vec<f32>> {
-    let api_key = if config.api_key_env.is_empty() {
-        None
-    } else {
-        std::env::var(&config.api_key_env).ok()
-    };
+    let api_key =
+        if config.api_key_env.is_empty() { None } else { std::env::var(&config.api_key_env).ok() };
 
-    let mut req = client
-        .post(&config.endpoint)
-        .header("Content-Type", "application/json");
+    let mut req = client.post(&config.endpoint).header("Content-Type", "application/json");
 
     if let Some(key) = &api_key {
         req = req.header("Authorization", format!("Bearer {key}"));
@@ -45,9 +40,7 @@ pub async fn embed(client: &Client, config: &EmbeddingConfig, text: &str) -> Res
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        return Err(ToolError::internal(format!(
-            "embedding endpoint returned HTTP {status}"
-        )));
+        return Err(ToolError::internal(format!("embedding endpoint returned HTTP {status}")));
     }
 
     let json: Value = resp
@@ -60,14 +53,9 @@ pub async fn embed(client: &Client, config: &EmbeddingConfig, text: &str) -> Res
         .and_then(|d| d.get(0))
         .and_then(|e| e.get("embedding"))
         .and_then(|e| e.as_array())
-        .ok_or_else(|| {
-            ToolError::internal("embedding response missing data[0].embedding array")
-        })?;
+        .ok_or_else(|| ToolError::internal("embedding response missing data[0].embedding array"))?;
 
-    let floats: Vec<f32> = embedding
-        .iter()
-        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-        .collect();
+    let floats: Vec<f32> = embedding.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
 
     Ok(floats)
 }

@@ -1,0 +1,11 @@
+# The house style is wider than rustfmt's defaults: calls, chains and struct
+# literals stay on one line up to the full width instead of exploding into one
+# argument per line. `use_small_heuristics = "Max"` is what encodes that, and it
+# already implies fn_call_width, chain_width, struct_lit_width and the rest, so
+# setting those individually changes nothing.
+#
+# The repo is kept rustfmt clean against exactly this file: `cargo fmt --all`
+# is safe to run and `--check` is part of the quality gate. It was NOT clean
+# before this file existed, which cost more than one contributor a full revert.
+max_width = 100
+use_small_heuristics = "Max"

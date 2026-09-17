@@ -64,9 +64,9 @@ impl BlobBackend for LocalBlobStore {
     async fn get(&self, sha256: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let path = self.path_for(sha256);
-        let mut f = tokio::fs::File::open(&path).await.map_err(|_| {
-            ToolError::not_found(format!("blob '{sha256}' not found"))
-        })?;
+        let mut f = tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| ToolError::not_found(format!("blob '{sha256}' not found")))?;
         if offset > 0 {
             f.seek(std::io::SeekFrom::Start(offset)).await?;
         }

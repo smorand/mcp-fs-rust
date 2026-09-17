@@ -24,9 +24,9 @@ pub mod dialect;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod schema;
+pub mod sqlite;
 #[cfg(feature = "sqlserver")]
 pub mod sqlserver;
-pub mod sqlite;
 
 pub use dialect::{Assign, AssignValue, ColumnType, Dialect, Upsert, UpsertAction};
 pub use schema::{Column, ColumnMigration, ForeignKey, Index, SchemaSet, Table};
@@ -89,23 +89,35 @@ impl SqlValue {
 }
 
 impl From<i64> for SqlValue {
-    fn from(v: i64) -> Self { Self::Int(v) }
+    fn from(v: i64) -> Self {
+        Self::Int(v)
+    }
 }
 impl From<f64> for SqlValue {
-    fn from(v: f64) -> Self { Self::Real(v) }
+    fn from(v: f64) -> Self {
+        Self::Real(v)
+    }
 }
 impl From<String> for SqlValue {
-    fn from(v: String) -> Self { Self::Text(v) }
+    fn from(v: String) -> Self {
+        Self::Text(v)
+    }
 }
 impl From<&str> for SqlValue {
-    fn from(v: &str) -> Self { Self::Text(v.to_string()) }
+    fn from(v: &str) -> Self {
+        Self::Text(v.to_string())
+    }
 }
 /// Borrowed, so a store binds an owned field without cloning it at every call.
 impl From<&String> for SqlValue {
-    fn from(v: &String) -> Self { Self::Text(v.clone()) }
+    fn from(v: &String) -> Self {
+        Self::Text(v.clone())
+    }
 }
 impl From<Vec<u8>> for SqlValue {
-    fn from(v: Vec<u8>) -> Self { Self::Blob(v) }
+    fn from(v: Vec<u8>) -> Self {
+        Self::Blob(v)
+    }
 }
 /// `None` binds SQL NULL, so a nullable column needs no special case.
 impl<T: Into<SqlValue>> From<Option<T>> for SqlValue {
@@ -193,9 +205,7 @@ impl RowValues {
 
     fn mismatch<T>(&self, index: usize, want: &str) -> Result<T> {
         let got = self.value(index).map(SqlValue::type_name).unwrap_or("missing");
-        Err(ToolError::internal(format!(
-            "column {index} is {got}, expected {want}"
-        )))
+        Err(ToolError::internal(format!("column {index} is {got}, expected {want}")))
     }
 
     pub fn i64(&self, index: usize) -> Result<i64> {
@@ -390,9 +400,7 @@ mod tests {
             self.begins.fetch_add(1, Ordering::SeqCst);
             let fail_commit = self
                 .failing_commits
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    Some(n.saturating_sub(1))
-                })
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
                 .is_ok_and(|remaining| remaining > 0);
             Ok(Box::new(CountingTx { fail_commit }))
         }
@@ -474,7 +482,11 @@ mod tests {
         .expect("the second attempt commits");
 
         assert_eq!(value, 7);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "the body ran again after the failed commit");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the body ran again after the failed commit"
+        );
     }
 
     fn row() -> RowValues {

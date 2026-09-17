@@ -210,14 +210,8 @@ async fn build_postgres(
 pub fn build_blob_store(config: &ServerConfig, project_id: &str) -> Result<Arc<dyn BlobBackend>> {
     let bucket = config.volume_bucket(project_id);
     match config.infra.blob.backend.as_str() {
-        "local" => Ok(Arc::new(blob::local::LocalBlobStore::new(
-            &config.infra.blob.dir,
-            &bucket,
-        ))),
-        "minio" | "s3" => Ok(Arc::new(blob::s3::S3BlobStore::new(
-            &config.infra.blob,
-            bucket,
-        )?)),
+        "local" => Ok(Arc::new(blob::local::LocalBlobStore::new(&config.infra.blob.dir, &bucket))),
+        "minio" | "s3" => Ok(Arc::new(blob::s3::S3BlobStore::new(&config.infra.blob, bucket)?)),
         other => Err(crate::errors::ToolError::invalid_argument(format!(
             "unknown blob backend '{other}' (expected local, minio or s3)"
         ))),
@@ -384,9 +378,7 @@ pub async fn build_oauth_persistence(
         || config.oauth_db_path(),
     )
     .await?;
-    Ok(Arc::new(
-        crate::git::oauth::persistence::RelationalOAuthPersistence::open(db, key).await?,
-    ))
+    Ok(Arc::new(crate::git::oauth::persistence::RelationalOAuthPersistence::open(db, key).await?))
 }
 
 /// Caches one `VolumeClient` per project and provisions / tears down volumes.
@@ -508,10 +500,7 @@ mod tests {
 
         // Exactly how the composition root wires them: one registry, cloned.
         let stores = StoreManager::new(config.clone(), relational.clone());
-        let git = crate::git::repo::GitRepoStore::new(
-            config.clone(),
-            stores.relational().clone(),
-        );
+        let git = crate::git::repo::GitRepoStore::new(config.clone(), stores.relational().clone());
 
         assert!(
             Arc::ptr_eq(&relational, stores.relational()),
@@ -580,11 +569,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut c = (*cfg(d.path())).clone();
         // One DSN behind all three stores, which is the deployment this protects.
-        for store in [
-            &mut c.infra.meta.backend,
-            &mut c.infra.admin.backend,
-            &mut c.infra.git.backend,
-        ] {
+        for store in
+            [&mut c.infra.meta.backend, &mut c.infra.admin.backend, &mut c.infra.git.backend]
+        {
             *store = backend::POSTGRES.to_string();
         }
         c.infra.meta.dsn = Dsn::new(dsn.clone());
@@ -637,10 +624,7 @@ mod tests {
 
         m.teardown_volume("proj").await.unwrap();
         assert!(!config.volume_meta_path("proj").exists(), "metadata db removed");
-        assert!(
-            !d.path().join("blobs").join("mcpfs-proj").exists(),
-            "blob bucket removed"
-        );
+        assert!(!d.path().join("blobs").join("mcpfs-proj").exists(), "blob bucket removed");
     }
 
     #[tokio::test]
@@ -654,10 +638,7 @@ mod tests {
         let mut c2 = (*cfg(d.path())).clone();
         c2.infra.meta.backend = "punchcards".into();
         let reg = RelationalRegistry::new();
-        let e = build_meta_store(&c2, &reg, "p")
-            .await
-            .err()
-            .expect("an unknown backend must fail");
+        let e = build_meta_store(&c2, &reg, "p").await.err().expect("an unknown backend must fail");
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
         assert!(e.message.contains("expected one of"), "{}", e.message);
     }
@@ -721,9 +702,7 @@ mod tests {
         let reg = RelationalRegistry::new();
         let a = build_meta_store(&config, &reg, "vol-a").await.unwrap();
         let b = build_meta_store(&config, &reg, "vol-b").await.unwrap();
-        a.put_file("/x.txt", Some("s"), 1, crate::storage::traits::MODE_FILE)
-            .await
-            .unwrap();
+        a.put_file("/x.txt", Some("s"), 1, crate::storage::traits::MODE_FILE).await.unwrap();
         assert!(b.get("/x.txt").await.unwrap().is_none(), "separate files stay separate");
     }
 

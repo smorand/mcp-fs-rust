@@ -195,27 +195,18 @@ fn is_table_row(line: &str) -> bool {
 
 fn is_table_separator(line: &str) -> bool {
     let t = line.trim();
-    !t.is_empty()
-        && t.contains('-')
-        && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+    !t.is_empty() && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
 }
 
 fn split_row(line: &str) -> Vec<String> {
-    line.trim()
-        .trim_matches('|')
-        .split('|')
-        .map(|c| c.trim().to_string())
-        .collect()
+    line.trim().trim_matches('|').split('|').map(|c| c.trim().to_string()).collect()
 }
 
 // ── WordprocessingML fragments ───────────────────────────────────────────────
 
 fn heading_paragraph(text: &str, level: usize) -> String {
     let style = if level == 0 { "Title".to_string() } else { format!("Heading{}", level.min(6)) };
-    format!(
-        r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr>{}</w:p>"#,
-        inline_runs(text)
-    )
+    format!(r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr>{}</w:p>"#, inline_runs(text))
 }
 
 fn list_paragraph(text: &str, prefix: &str) -> String {
@@ -346,10 +337,7 @@ fn run(text: &str, bold: bool, italic: bool) -> String {
         }
         props.push_str("</w:rPr>");
     }
-    format!(
-        r#"<w:r>{props}<w:t xml:space="preserve">{}</w:t></w:r>"#,
-        escape(text)
-    )
+    format!(r#"<w:r>{props}<w:t xml:space="preserve">{}</w:t></w:r>"#, escape(text))
 }
 
 /// XML text escaping. `>` is escaped too: it is not strictly required in content,
@@ -450,8 +438,12 @@ mod tests {
     fn all_six_heading_levels_map_to_styles() {
         for level in 1..=6usize {
             let md = format!("{} Level {level}\n", "#".repeat(level));
-            let doc = parts(&render_markdown_to_docx(&md, None).unwrap())["word/document.xml"].clone();
-            assert!(doc.contains(&format!(r#"<w:pStyle w:val="Heading{level}"/>"#)), "level {level}");
+            let doc =
+                parts(&render_markdown_to_docx(&md, None).unwrap())["word/document.xml"].clone();
+            assert!(
+                doc.contains(&format!(r#"<w:pStyle w:val="Heading{level}"/>"#)),
+                "level {level}"
+            );
         }
     }
 
@@ -475,14 +467,16 @@ mod tests {
 
     #[test]
     fn empty_title_is_ignored() {
-        let doc = parts(&render_markdown_to_docx("para\n", Some("")).unwrap())["word/document.xml"].clone();
+        let doc = parts(&render_markdown_to_docx("para\n", Some("")).unwrap())["word/document.xml"]
+            .clone();
         assert!(!doc.contains("Title"));
     }
 
     #[test]
     fn bold_and_italic_become_run_properties() {
-        let doc = parts(&render_markdown_to_docx("a **strong** and *slanted* end\n", None).unwrap())
-            ["word/document.xml"]
+        let doc = parts(
+            &render_markdown_to_docx("a **strong** and *slanted* end\n", None).unwrap(),
+        )["word/document.xml"]
             .clone();
         assert!(doc.contains("<w:rPr><w:b/></w:rPr>"), "{doc}");
         assert!(doc.contains("<w:rPr><w:i/></w:rPr>"), "{doc}");
@@ -492,7 +486,9 @@ mod tests {
 
     #[test]
     fn unpaired_star_stays_literal() {
-        let doc = parts(&render_markdown_to_docx("2 * 3 = 6\n", None).unwrap())["word/document.xml"].clone();
+        let doc =
+            parts(&render_markdown_to_docx("2 * 3 = 6\n", None).unwrap())["word/document.xml"]
+                .clone();
         assert!(doc.contains("2 * 3 = 6"), "{doc}");
         assert!(!doc.contains("<w:i/>"));
     }
@@ -530,14 +526,18 @@ mod tests {
 
     #[test]
     fn tilde_fences_work_too() {
-        let doc = parts(&render_markdown_to_docx("~~~\nraw\n~~~\n", None).unwrap())["word/document.xml"].clone();
+        let doc =
+            parts(&render_markdown_to_docx("~~~\nraw\n~~~\n", None).unwrap())["word/document.xml"]
+                .clone();
         assert!(!doc.contains("~~~"));
         assert!(doc.contains(">raw<"));
     }
 
     #[test]
     fn unclosed_fence_consumes_the_rest() {
-        let doc = parts(&render_markdown_to_docx("```\nline\n", None).unwrap())["word/document.xml"].clone();
+        let doc =
+            parts(&render_markdown_to_docx("```\nline\n", None).unwrap())["word/document.xml"]
+                .clone();
         assert!(doc.contains(">line<"));
         assert!(!doc.contains("```"));
         assert_well_formed(&doc);
@@ -600,8 +600,9 @@ mod tests {
 
     #[test]
     fn unicode_survives_the_round_trip() {
-        let doc = parts(&render_markdown_to_docx("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}\n", None).unwrap())
-            ["word/document.xml"]
+        let doc = parts(
+            &render_markdown_to_docx("caf\u{e9} \u{4e2d}\u{6587} \u{1f600}\n", None).unwrap(),
+        )["word/document.xml"]
             .clone();
         assert!(doc.contains("caf\u{e9}"));
         assert!(doc.contains("\u{4e2d}\u{6587}"));

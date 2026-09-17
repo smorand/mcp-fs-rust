@@ -177,9 +177,7 @@ pub fn register(reg: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::testkit::{
-        MOUNT, assert_description, assert_family, assert_schema, harness,
-    };
+    use crate::tools::testkit::{MOUNT, assert_description, assert_family, assert_schema, harness};
     use serde_json::json;
 
     const NAMES: &[&str] = &[
@@ -213,7 +211,11 @@ mod tests {
                  "line_numbered":{"description":"Prefix each line with its 1-based line number.","type":"boolean","default":true}},
                "required":["mount_id","path"]}"#,
         );
-        assert_description(register, "fs.read", "Read a text file with line-numbered, paged output.");
+        assert_description(
+            register,
+            "fs.read",
+            "Read a text file with line-numbered, paged output.",
+        );
     }
 
     #[test]
@@ -257,7 +259,8 @@ mod tests {
     async fn read_bytes_returns_base64_and_mime() {
         let h = harness().await;
         h.seed("/a.txt", "hello\nworld\n").await;
-        let r = h.call("fs.read_bytes", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
+        let r =
+            h.call("fs.read_bytes", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
         assert_eq!(r["base64"], "aGVsbG8Kd29ybGQK");
         assert_eq!(r["mime_type"], "text/plain");
         assert_eq!(r["length"], 12);
@@ -290,7 +293,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tail["content"], "3\tthree");
-        let count = h.call("fs.count_lines", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
+        let count =
+            h.call("fs.count_lines", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
         assert_eq!(count["total_lines"], 3);
     }
 
@@ -299,7 +303,10 @@ mod tests {
         let h = harness().await;
         h.seed("/src/app.py", "def hello(name):\n    total = 1\n    return total\n").await;
         let section = h
-            .call("fs.read_section", json!({"mount_id": MOUNT, "path": "/src/app.py", "anchor_line": 2}))
+            .call(
+                "fs.read_section",
+                json!({"mount_id": MOUNT, "path": "/src/app.py", "anchor_line": 2}),
+            )
             .await
             .unwrap();
         assert_eq!(section["start_line"], 1);
@@ -327,7 +334,10 @@ mod tests {
     #[tokio::test]
     async fn a_missing_required_argument_is_rejected() {
         let h = harness().await;
-        let err = h.call("fs.read_lines", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap_err();
+        let err = h
+            .call("fs.read_lines", json!({"mount_id": MOUNT, "path": "/a.txt"}))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, crate::errors::code::INVALID_ARGUMENT);
     }
 
@@ -337,20 +347,15 @@ mod tests {
     async fn read_bytes_on_a_directory_is_invalid_argument() {
         let h = harness().await;
         h.call("fs.mkdir", json!({"mount_id": MOUNT, "path": "/d"})).await.unwrap();
-        let err = h
-            .call("fs.read_bytes", json!({"mount_id": MOUNT, "path": "/d"}))
-            .await
-            .unwrap_err();
+        let err =
+            h.call("fs.read_bytes", json!({"mount_id": MOUNT, "path": "/d"})).await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::INVALID_ARGUMENT);
     }
 
     #[tokio::test]
     async fn read_many_empty_paths_array_returns_empty_results() {
         let h = harness().await;
-        let r = h
-            .call("fs.read_many", json!({"mount_id": MOUNT, "paths": []}))
-            .await
-            .unwrap();
+        let r = h.call("fs.read_many", json!({"mount_id": MOUNT, "paths": []})).await.unwrap();
         let files = r["files"].as_array().unwrap();
         assert!(files.is_empty(), "expected empty results for empty paths array");
     }

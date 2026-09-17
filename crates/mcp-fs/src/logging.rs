@@ -27,8 +27,8 @@ pub const DEFAULT_FILTER: &str = "info";
 /// Logs go to stderr on purpose: stdout stays clean so `mcp-fs token` can be
 /// piped straight into a file.
 pub fn init() {
-    let filter = EnvFilter::try_from_env(FILTER_ENV)
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    let filter =
+        EnvFilter::try_from_env(FILTER_ENV).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

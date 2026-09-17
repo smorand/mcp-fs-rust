@@ -312,7 +312,8 @@ fn body_schema(schema: &Schema, catalog: &HashMap<String, ToolDoc>) -> Value {
 /// The git HTTP routes, documented without descriptions like the C# does (they
 /// are wire protocol endpoints for the git CLI, not for a human or an LLM).
 fn git_paths() -> Vec<(String, Value)> {
-    let mount = json!({"name": "mount_id", "in": "path", "required": true, "schema": {"type": "string"}});
+    let mount =
+        json!({"name": "mount_id", "in": "path", "required": true, "schema": {"type": "string"}});
     let service = json!({"name": "service", "in": "query", "schema": {"type": "string"}});
     vec![
         (
@@ -431,11 +432,7 @@ const REST_ONLY: &[(&str, &str)] = &[
 const REST_ONLY_PARAMS: &[(&str, &str, &str)] = &[
     ("upload", "mount_id", "Project/volume id the operation targets."),
     ("upload", "files", "The files to store. Any part carrying a filename is one."),
-    (
-        "upload",
-        "directory",
-        "Absolute POSIX destination directory (defaults to the volume root).",
-    ),
+    ("upload", "directory", "Absolute POSIX destination directory (defaults to the volume root)."),
     (
         "upload",
         "paths",
@@ -453,11 +450,7 @@ const REST_ONLY_PARAMS: &[(&str, &str, &str)] = &[
     ("download", "mount_id", "Project/volume id the operation targets."),
     ("download", "path", "Absolute POSIX path of the file to download."),
     ("download-zip", "mount_id", "Project/volume id the operation targets."),
-    (
-        "download-zip",
-        "path",
-        "Absolute POSIX directory to archive (defaults to the volume root).",
-    ),
+    ("download-zip", "path", "Absolute POSIX directory to archive (defaults to the volume root)."),
 ];
 
 const NO_PARAMS: &[Param] = &[];
@@ -646,7 +639,13 @@ const OPERATIONS: &[Op] = &[
         path: "/api/fs/{mount_id}/glob",
         tool: "fs.glob",
         params: &[
-            Param { name: "pattern", required: true, ty: "string", format: "", default: Def::Absent },
+            Param {
+                name: "pattern",
+                required: true,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
             Param {
                 name: "root",
                 required: false,
@@ -663,7 +662,13 @@ const OPERATIONS: &[Op] = &[
         path: "/api/fs/{mount_id}/grep",
         tool: "fs.grep",
         params: &[
-            Param { name: "pattern", required: true, ty: "string", format: "", default: Def::Absent },
+            Param {
+                name: "pattern",
+                required: true,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
             Param {
                 name: "root",
                 required: false,
@@ -1034,7 +1039,14 @@ const fn plain(name: &'static str, ty: &'static str) -> Prop {
 }
 
 const fn flag(name: &'static str, default: bool) -> Prop {
-    Prop { name, ty: "boolean", format: "", default: Def::Bool(default), items: "", nullable: false }
+    Prop {
+        name,
+        ty: "boolean",
+        format: "",
+        default: Def::Bool(default),
+        items: "",
+        nullable: false,
+    }
 }
 
 const fn counter(name: &'static str, default: i64) -> Prop {
@@ -1307,8 +1319,7 @@ mod tests {
         let config = Arc::new(config);
 
         let registry = crate::storage::RelationalRegistry::new();
-            let admin =
-                crate::storage::build_admin_store(&config, &registry).await.unwrap();
+        let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
 
         let mut registry = ToolRegistry::new();
@@ -1319,16 +1330,31 @@ mod tests {
                     .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
                     .opt_int("offset_lines", 0, "0-based line offset to start reading from.")
                     .opt_int("limit_lines", 2000, "Maximum number of lines to return.")
-                    .opt_bool("line_numbered", true, "Prefix each line with its 1-based line number."),
+                    .opt_bool(
+                        "line_numbered",
+                        true,
+                        "Prefix each line with its 1-based line number.",
+                    ),
                 handler(|_c, _a| async move { Ok(json!({})) }),
             );
             registry.add(
-                ToolSchema::new("fs.write", "Create or overwrite a file (no-clobber by default, atomic).")
-                    .req_str("mount_id", "Project/volume id the operation targets.")
-                    .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
-                    .req_str("content", "Full text content to write to the file.")
-                    .opt_bool("overwrite", false, "Allow overwriting an existing file (default no-clobber).")
-                    .opt_bool("create_parents", true, "Create missing parent directories."),
+                ToolSchema::new(
+                    "fs.write",
+                    "Create or overwrite a file (no-clobber by default, atomic).",
+                )
+                .req_str("mount_id", "Project/volume id the operation targets.")
+                .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
+                .req_str("content", "Full text content to write to the file.")
+                .opt_bool(
+                    "overwrite",
+                    false,
+                    "Allow overwriting an existing file (default no-clobber).",
+                )
+                .opt_bool(
+                    "create_parents",
+                    true,
+                    "Create missing parent directories.",
+                ),
                 handler(|_c, _a| async move { Ok(json!({})) }),
             );
         }
@@ -1336,7 +1362,10 @@ mod tests {
         Arc::new(AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
             safety: Arc::new(SafetyManager::new(
                 config.safety.clone(),
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
@@ -1451,11 +1480,14 @@ mod tests {
         let schema = &v["components"]["schemas"]["WriteBody"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"], json!(["path", "content"]));
-        assert_eq!(schema["properties"]["content"]["description"], "Full text content to write to the file.");
+        assert_eq!(
+            schema["properties"]["content"]["description"],
+            "Full text content to write to the file."
+        );
         assert_eq!(schema["properties"]["create_parents"]["default"], true);
         assert_eq!(
-            v["paths"]["/api/fs/{mount_id}/write"]["post"]["requestBody"]["content"]
-                ["application/json"]["schema"]["$ref"],
+            v["paths"]["/api/fs/{mount_id}/write"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
             "#/components/schemas/WriteBody"
         );
     }
@@ -1479,11 +1511,17 @@ mod tests {
         let v = doc(false, false).await;
         let download = &v["paths"]["/api/fs/{mount_id}/download"]["get"];
         assert_eq!(download["summary"], "Download a single file's raw bytes as an attachment.");
-        assert_eq!(download["parameters"][1]["description"], "Absolute POSIX path of the file to download.");
+        assert_eq!(
+            download["parameters"][1]["description"],
+            "Absolute POSIX path of the file to download."
+        );
         let zip = &v["paths"]["/api/fs/{mount_id}/download-zip"]["get"];
         assert_eq!(zip["summary"], "Download a directory subtree as a zip archive.");
         let upload = &v["paths"]["/api/fs/{mount_id}/upload"]["post"];
-        assert_eq!(upload["summary"], "Upload one or more files (multipart form) into a directory.");
+        assert_eq!(
+            upload["summary"],
+            "Upload one or more files (multipart form) into a directory."
+        );
         assert!(
             upload["requestBody"]["content"].get("application/json").is_none(),
             "the upload body is a form, never json"
@@ -1495,8 +1533,8 @@ mod tests {
     #[tokio::test]
     async fn the_upload_form_documents_its_fields_and_the_documentation_flag() {
         let v = doc(false, false).await;
-        let form = &v["paths"]["/api/fs/{mount_id}/upload"]["post"]["requestBody"]["content"]
-            ["multipart/form-data"]["schema"];
+        let form = &v["paths"]["/api/fs/{mount_id}/upload"]["post"]["requestBody"]["content"]["multipart/form-data"]
+            ["schema"];
         assert_eq!(form["type"], "object");
         assert_eq!(form["properties"]["files"]["items"]["format"], "binary");
         assert!(
@@ -1525,8 +1563,7 @@ mod tests {
             ("/api/fs/{mount_id}/documentize", "DocumentizeBody"),
         ] {
             assert_eq!(
-                v["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
-                    ["$ref"],
+                v["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
                 format!("#/components/schemas/{schema}"),
                 "{path} is not documented"
             );
@@ -1554,7 +1591,8 @@ mod tests {
     async fn nullable_and_absent_defaults_render_as_the_csharp_does() {
         let v = doc(false, false).await;
         let grep = &v["paths"]["/api/fs/{mount_id}/grep"]["get"]["parameters"];
-        let include = grep.as_array().unwrap().iter().find(|p| p["name"] == "include_glob").unwrap();
+        let include =
+            grep.as_array().unwrap().iter().find(|p| p["name"] == "include_glob").unwrap();
         assert!(include["schema"]["default"].is_null());
         assert!(include["schema"].as_object().unwrap().contains_key("default"));
 
@@ -1684,4 +1722,3 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 }
-

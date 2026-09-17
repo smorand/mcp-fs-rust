@@ -65,11 +65,8 @@ pub async fn read_window(
     let cap = limit_lines.min(safety.config().max_read_lines as i64);
     let window = slice(&lines, offset_lines, offset_lines.saturating_add(cap));
     let truncated = offset_lines.saturating_add(cap) < total;
-    let content = if line_numbered {
-        number_lines(window, offset_lines + 1)
-    } else {
-        window.join("\n")
-    };
+    let content =
+        if line_numbered { number_lines(window, offset_lines + 1) } else { window.join("\n") };
     Ok(json!({
         "content": content,
         "total_lines": total,
@@ -89,9 +86,7 @@ pub async fn read_bytes_b64(
     offset: i64,
     length: i64,
 ) -> Result<Value> {
-    let data = client
-        .read_range(path, offset.max(0) as u64, length.max(0) as u64)
-        .await?;
+    let data = client.read_range(path, offset.max(0) as u64, length.max(0) as u64).await?;
     safety.record_read(person, mount_id, path);
     Ok(json!({
         "base64": base64::engine::general_purpose::STANDARD.encode(&data),
@@ -296,10 +291,9 @@ pub async fn iter_files(
     let mut files: Vec<(String, f64)> = Vec::new();
     for (dirpath, _, filenames) in client.walk(root).await? {
         let with_slash = format!("{dirpath}/");
-        if excludes
-            .iter()
-            .any(|seg| with_slash.contains(&format!("/{seg}")) || dirpath.ends_with(&format!("/{seg}")))
-        {
+        if excludes.iter().any(|seg| {
+            with_slash.contains(&format!("/{seg}")) || dirpath.ends_with(&format!("/{seg}"))
+        }) {
             continue;
         }
         for filename in filenames {
@@ -327,7 +321,8 @@ pub async fn glob_files(
     extra_excludes: &[String],
 ) -> Result<Value> {
     let matcher = crate::util::text::Fnmatch::new(pattern);
-    let exclude_matchers: Vec<crate::util::text::Fnmatch> = extra_excludes.iter().map(|g| crate::util::text::Fnmatch::new(g)).collect();
+    let exclude_matchers: Vec<crate::util::text::Fnmatch> =
+        extra_excludes.iter().map(|g| crate::util::text::Fnmatch::new(g)).collect();
     let mut matched: Vec<(String, f64)> = Vec::new();
     for (path, mtime) in iter_files(client, root, DEFAULT_EXCLUDES).await? {
         let name = match path.rfind('/') {
@@ -455,16 +450,9 @@ pub async fn tree(
     // cap". Deriving it from the counter alone made a tree of exactly TREE_CAP
     // entries report itself as incomplete when nothing had been dropped.
     let hit_cap = AtomicBool::new(false);
-    let nodes = build_tree(
-        client,
-        root.to_string(),
-        max_depth,
-        &excludes,
-        with_sizes,
-        &counter,
-        &hit_cap,
-    )
-    .await?;
+    let nodes =
+        build_tree(client, root.to_string(), max_depth, &excludes, with_sizes, &counter, &hit_cap)
+            .await?;
     Ok(json!({
         "path": root,
         "tree": nodes,
@@ -512,16 +500,9 @@ fn build_tree<'a>(
             }
             if entry.kind == "dir" && depth > 0 {
                 let child = format!("{}/{}", path.trim_end_matches('/'), entry.name);
-                let kids = build_tree(
-                    client,
-                    child,
-                    depth - 1,
-                    excludes,
-                    with_sizes,
-                    counter,
-                    hit_cap,
-                )
-                .await?;
+                let kids =
+                    build_tree(client, child, depth - 1, excludes, with_sizes, counter, hit_cap)
+                        .await?;
                 node.insert("children".into(), Value::Array(kids));
             }
             nodes.push(Value::Object(node));
@@ -656,7 +637,8 @@ pub async fn write_bytes_documented(
     };
 
     let mut result =
-        write_bytes(client, safety, person, mount_id, norm, data, overwrite, create_parents).await?;
+        write_bytes(client, safety, person, mount_id, norm, data, overwrite, create_parents)
+            .await?;
 
     let report = match service {
         None => Value::Null,
@@ -1250,11 +1232,7 @@ fn fuzzy_replace(
     };
     let bi = best_index as usize;
     let tail_start = (bi + span).min(lines.len());
-    Ok(format!(
-        "{}{block}{}",
-        lines[..bi].concat(),
-        lines[tail_start..].concat()
-    ))
+    Ok(format!("{}{block}{}", lines[..bi].concat(), lines[tail_start..].concat()))
 }
 
 /// LCS-based similarity in `0.0..=1.0`, the C# `Similarity.Ratio` (an
@@ -1270,11 +1248,7 @@ fn similarity_ratio(a: &str, b: &str) -> f64 {
     let mut cur = vec![0usize; bv.len() + 1];
     for i in 1..=av.len() {
         for j in 1..=bv.len() {
-            cur[j] = if av[i - 1] == bv[j - 1] {
-                prev[j - 1] + 1
-            } else {
-                prev[j].max(cur[j - 1])
-            };
+            cur[j] = if av[i - 1] == bv[j - 1] { prev[j - 1] + 1 } else { prev[j].max(cur[j - 1]) };
         }
         std::mem::swap(&mut prev, &mut cur);
         cur.iter_mut().for_each(|v| *v = 0);
@@ -1359,7 +1333,6 @@ mod hashing {
         h.update(data);
         hex::encode(h.finalize())
     }
-
 
     #[cfg(test)]
     mod tests {
@@ -1710,7 +1683,10 @@ fn is_marker(line: &str) -> bool {
 }
 
 fn is_file_marker(line: &str) -> bool {
-    line.starts_with(ADD) || line.starts_with(UPDATE) || line.starts_with(DELETE) || line.trim() == END
+    line.starts_with(ADD)
+        || line.starts_with(UPDATE)
+        || line.starts_with(DELETE)
+        || line.trim() == END
 }
 
 /// Rebuild the old block (context + removed) and swap in the new one. An empty
@@ -1721,10 +1697,7 @@ fn apply_update(original: &str, op: &FileOp) -> Result<String> {
         let old_block = join_block(&hunk.context_before, &hunk.removed, &hunk.context_after);
         let new_block = join_block(&hunk.context_before, &hunk.added, &hunk.context_after);
         if !old_block.is_empty() && !content.contains(&old_block) {
-            return Err(ToolError::no_match(format!(
-                "hunk context not found in '{}'",
-                op.path
-            )));
+            return Err(ToolError::no_match(format!("hunk context not found in '{}'", op.path)));
         }
         content = if old_block.is_empty() {
             new_block
@@ -1742,7 +1715,6 @@ fn join_block(before: &[String], middle: &[String], after: &[String]) -> String 
     all.extend(after.iter().map(String::as_str));
     all.join("\n")
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1765,14 +1737,11 @@ mod tests {
     }
 
     async fn fixture_with(cfg: SafetyConfig) -> Fix {
-        let meta = Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
+        let meta =
+            Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
         let d = tempfile::tempdir().unwrap();
         let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
-        Fix {
-            _dir: d,
-            v: VolumeClient::new("p", meta, blob),
-            s: SafetyManager::new(cfg, None),
-        }
+        Fix { _dir: d, v: VolumeClient::new("p", meta, blob), s: SafetyManager::new(cfg, None) }
     }
 
     /// Seed a file and mark it read, the usual precondition for the edit family.
@@ -1876,9 +1845,7 @@ mod tests {
         let f = fixture().await;
         seed(&f, "/blob.bin", "0123456789").await;
         let r = read_bytes_b64(&f.v, &f.s, P, M, "/blob.bin", 4, 3).await.unwrap();
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(s(&r, "base64"))
-            .unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.decode(s(&r, "base64")).unwrap();
         assert_eq!(raw, b"456");
         assert_eq!(s(&r, "mime_type"), "application/octet-stream");
         assert_eq!(r["length"], 3);
@@ -2117,7 +2084,8 @@ mod tests {
         f.v.write_text_atomic("/src/b.txt", "2").await.unwrap();
         f.v.write_text_atomic("/c.rs", "3").await.unwrap();
         let r = glob_files(&f.v, "/", "*.rs", &[]).await.unwrap();
-        let matches: Vec<&str> = r["matches"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let matches: Vec<&str> =
+            r["matches"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(matches.len(), 2, "got {matches:?}");
         assert!(matches.contains(&"/src/a.rs"));
         assert!(matches.contains(&"/c.rs"));
@@ -2131,7 +2099,8 @@ mod tests {
         f.v.write_text_atomic("/target/gen.rs", "2").await.unwrap();
         f.v.write_text_atomic("/vendor/dep.rs", "3").await.unwrap();
         let r = glob_files(&f.v, "/", "*.rs", &["*/vendor/*".to_string()]).await.unwrap();
-        let matches: Vec<&str> = r["matches"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let matches: Vec<&str> =
+            r["matches"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(matches, vec!["/keep.rs"]);
     }
 
@@ -2188,16 +2157,14 @@ mod tests {
         let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "hit\nhit\n").await.unwrap();
         f.v.write_text_atomic("/b.txt", "nope\n").await.unwrap();
-        let files = grep_files(&f.v, "/", "hit", None, None, true, true, "files", 0, 100)
-            .await
-            .unwrap();
+        let files =
+            grep_files(&f.v, "/", "hit", None, None, true, true, "files", 0, 100).await.unwrap();
         assert_eq!(files["files"].as_array().unwrap().len(), 1);
         assert_eq!(files["files"][0], "/a.txt");
         assert!(files.get("matches").is_none());
 
-        let count = grep_files(&f.v, "/", "hit", None, None, true, true, "count", 0, 100)
-            .await
-            .unwrap();
+        let count =
+            grep_files(&f.v, "/", "hit", None, None, true, true, "count", 0, 100).await.unwrap();
         assert_eq!(count["count"], 2);
         assert_eq!(count["files"], 1);
     }
@@ -2206,15 +2173,13 @@ mod tests {
     async fn grep_literal_mode_does_not_treat_the_pattern_as_regex() {
         let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "a.c\nabc\n").await.unwrap();
-        let lit = grep_files(&f.v, "/", "a.c", None, None, false, true, "content", 0, 100)
-            .await
-            .unwrap();
+        let lit =
+            grep_files(&f.v, "/", "a.c", None, None, false, true, "content", 0, 100).await.unwrap();
         assert_eq!(lit["matches"].as_array().unwrap().len(), 1);
         assert_eq!(s(&lit["matches"][0], "text"), "a.c");
 
-        let re = grep_files(&f.v, "/", "a.c", None, None, true, true, "content", 0, 100)
-            .await
-            .unwrap();
+        let re =
+            grep_files(&f.v, "/", "a.c", None, None, true, true, "content", 0, 100).await.unwrap();
         assert_eq!(re["matches"].as_array().unwrap().len(), 2);
     }
 
@@ -2223,9 +2188,8 @@ mod tests {
         let f = fixture().await;
         f.v.write_text_atomic("/a.rs", "Needle\n").await.unwrap();
         f.v.write_text_atomic("/b.txt", "needle\n").await.unwrap();
-        let sensitive = grep_files(&f.v, "/", "needle", None, None, true, true, "files", 0, 100)
-            .await
-            .unwrap();
+        let sensitive =
+            grep_files(&f.v, "/", "needle", None, None, true, true, "files", 0, 100).await.unwrap();
         assert_eq!(sensitive["files"].as_array().unwrap().len(), 1);
 
         let insensitive = grep_files(&f.v, "/", "needle", None, None, true, false, "files", 0, 100)
@@ -2233,14 +2197,16 @@ mod tests {
             .unwrap();
         assert_eq!(insensitive["files"].as_array().unwrap().len(), 2);
 
-        let only_rs = grep_files(&f.v, "/", "needle", Some("*.rs"), None, true, false, "files", 0, 100)
-            .await
-            .unwrap();
+        let only_rs =
+            grep_files(&f.v, "/", "needle", Some("*.rs"), None, true, false, "files", 0, 100)
+                .await
+                .unwrap();
         assert_eq!(only_rs["files"][0], "/a.rs");
 
-        let not_rs = grep_files(&f.v, "/", "needle", None, Some("*.rs"), true, false, "files", 0, 100)
-            .await
-            .unwrap();
+        let not_rs =
+            grep_files(&f.v, "/", "needle", None, Some("*.rs"), true, false, "files", 0, 100)
+                .await
+                .unwrap();
         assert_eq!(not_rs["files"][0], "/b.txt");
     }
 
@@ -2249,9 +2215,8 @@ mod tests {
         let f = fixture().await;
         let body: String = (0..10).map(|_| "hit\n".to_string()).collect();
         f.v.write_text_atomic("/a.txt", &body).await.unwrap();
-        let r = grep_files(&f.v, "/", "hit", None, None, true, true, "content", 0, 4)
-            .await
-            .unwrap();
+        let r =
+            grep_files(&f.v, "/", "hit", None, None, true, true, "content", 0, 4).await.unwrap();
         assert_eq!(r["matches"].as_array().unwrap().len(), 4);
         assert_eq!(r["truncated"], true);
     }
@@ -2275,12 +2240,8 @@ mod tests {
         f.v.write_text_atomic("/d/a.txt", "1").await.unwrap();
         f.v.write_text_atomic("/d/.hidden", "x").await.unwrap();
         let r = list_dir(&f.v, "/d", false, "name", false).await.unwrap();
-        let names: Vec<&str> = r["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> =
+            r["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["a.txt", "b.txt"]);
         assert_eq!(r["total"], 2);
         assert_eq!(s(&r, "path"), "/d");
@@ -2346,7 +2307,8 @@ mod tests {
         f.v.write_text_atomic("/keep.txt", "1").await.unwrap();
         f.v.mkdir("/skipme").await.unwrap();
         let r = tree(&f.v, "/", 2, &["skipme".to_string()], false).await.unwrap();
-        let names: Vec<&str> = r["tree"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> =
+            r["tree"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["keep.txt"]);
     }
 
@@ -2472,7 +2434,8 @@ mod tests {
     async fn edit_replaces_a_unique_occurrence() {
         let f = fixture().await;
         seed(&f, "/a.txt", "alpha\nbeta\n").await;
-        let r = edit_unique(&f.v, &f.s, P, M, "/a.txt", "beta", "gamma", false, false).await.unwrap();
+        let r =
+            edit_unique(&f.v, &f.s, P, M, "/a.txt", "beta", "gamma", false, false).await.unwrap();
         assert_eq!(r["applied"], true);
         assert!(s(&r, "diff").contains("-beta\n+gamma\n"));
         assert_eq!(f.v.read_text("/a.txt").await.unwrap(), "alpha\ngamma\n");
@@ -2501,7 +2464,8 @@ mod tests {
     async fn edit_no_match_is_an_error() {
         let f = fixture().await;
         seed(&f, "/a.txt", "alpha\n").await;
-        let e = edit_unique(&f.v, &f.s, P, M, "/a.txt", "zeta", "y", false, false).await.unwrap_err();
+        let e =
+            edit_unique(&f.v, &f.s, P, M, "/a.txt", "zeta", "y", false, false).await.unwrap_err();
         assert_eq!(e.code, code::NO_MATCH);
         assert!(e.message.contains("old_string not found"));
     }
@@ -2510,7 +2474,8 @@ mod tests {
     async fn edit_dry_run_returns_the_diff_without_writing() {
         let f = fixture().await;
         seed(&f, "/a.txt", "alpha\n").await;
-        let r = edit_unique(&f.v, &f.s, P, M, "/a.txt", "alpha", "beta", false, true).await.unwrap();
+        let r =
+            edit_unique(&f.v, &f.s, P, M, "/a.txt", "alpha", "beta", false, true).await.unwrap();
         assert_eq!(r["applied"], false);
         assert!(s(&r, "diff").contains("+beta"));
         assert_eq!(f.v.read_text("/a.txt").await.unwrap(), "alpha\n", "untouched");
@@ -2611,18 +2576,10 @@ mod tests {
     async fn search_replace_fuzzy_still_refuses_a_hopeless_block() {
         let f = fixture().await;
         seed(&f, "/a.txt", "aaaa\nbbbb\n").await;
-        let e = search_replace(
-            &f.v,
-            &f.s,
-            P,
-            M,
-            "/a.txt",
-            "zzzzzzzzzzzzzzzzzzzzzzzz\n",
-            "new\n",
-            true,
-        )
-        .await
-        .unwrap_err();
+        let e =
+            search_replace(&f.v, &f.s, P, M, "/a.txt", "zzzzzzzzzzzzzzzzzzzzzzzz\n", "new\n", true)
+                .await
+                .unwrap_err();
         assert_eq!(e.code, code::NO_MATCH);
         assert!(e.message.contains("no fuzzy match"));
     }
@@ -2783,7 +2740,8 @@ mod tests {
         let f = fixture().await;
         f.v.write_text_atomic("/a.txt", "1").await.unwrap();
         f.v.write_text_atomic("/b.txt", "2").await.unwrap();
-        let clobber = copy_path(&f.v, &f.s, P, M, "/a.txt", "/b.txt", false, false).await.unwrap_err();
+        let clobber =
+            copy_path(&f.v, &f.s, P, M, "/a.txt", "/b.txt", false, false).await.unwrap_err();
         assert_eq!(clobber.code, code::NO_CLOBBER);
 
         let missing = copy_path(&f.v, &f.s, P, M, "/nope", "/x", false, false).await.unwrap_err();
@@ -2976,9 +2934,7 @@ mod tests {
         f.v.write_text_atomic("/from.txt", "new").await.unwrap();
         f.v.write_text_atomic("/onto.txt", "old").await.unwrap();
 
-        let e = move_path(&f.v, &f.s, P, M, "/from.txt", "/onto.txt", false)
-            .await
-            .unwrap_err();
+        let e = move_path(&f.v, &f.s, P, M, "/from.txt", "/onto.txt", false).await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::NO_CLOBBER);
 
         move_path(&f.v, &f.s, P, M, "/from.txt", "/onto.txt", true).await.unwrap();
@@ -3015,9 +2971,8 @@ mod tests {
     #[tokio::test]
     async fn write_bytes_refuses_to_exceed_the_quota() {
         let f = fixture_with(SafetyConfig { write_quota_bytes: 10, ..Default::default() }).await;
-        let e = write_bytes(&f.v, &f.s, P, M, "/big.bin", &[0u8; 11], false, true)
-            .await
-            .unwrap_err();
+        let e =
+            write_bytes(&f.v, &f.s, P, M, "/big.bin", &[0u8; 11], false, true).await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::WRITE_QUOTA_EXCEEDED);
         assert!(!f.v.exists("/big.bin").await.unwrap(), "nothing written");
     }
@@ -3056,9 +3011,19 @@ mod tests {
         let stub = StubDocService::ok(MD);
         let payload = vec![7u8; 64];
 
-        let plain = write_bytes(&f.v, &f.s, P, M, "/plain.pptx", &payload, false, true).await.unwrap();
+        let plain =
+            write_bytes(&f.v, &f.s, P, M, "/plain.pptx", &payload, false, true).await.unwrap();
         let r = write_bytes_documented(
-            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", &payload, false, true, false,
+            &f.v,
+            &f.s,
+            Some(&stub),
+            P,
+            M,
+            "/deck.pptx",
+            &payload,
+            false,
+            true,
+            false,
         )
         .await
         .unwrap();
@@ -3077,7 +3042,16 @@ mod tests {
         let payload = vec![7u8; 64];
 
         let r = write_bytes_documented(
-            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", &payload, false, true, true,
+            &f.v,
+            &f.s,
+            Some(&stub),
+            P,
+            M,
+            "/deck.pptx",
+            &payload,
+            false,
+            true,
+            true,
         )
         .await
         .unwrap();
@@ -3106,7 +3080,16 @@ mod tests {
             let f = fixture().await;
             let stub = StubDocService::ok(MD);
             let e = write_bytes_documented(
-                &f.v, &f.s, Some(&stub), P, M, path, b"body", false, true, true,
+                &f.v,
+                &f.s,
+                Some(&stub),
+                P,
+                M,
+                path,
+                b"body",
+                false,
+                true,
+                true,
             )
             .await
             .unwrap_err();
@@ -3122,9 +3105,20 @@ mod tests {
     #[tokio::test]
     async fn documented_write_without_a_service_writes_nothing() {
         let f = fixture().await;
-        let e = write_bytes_documented(&f.v, &f.s, None, P, M, "/deck.pptx", b"body", false, true, true)
-            .await
-            .unwrap_err();
+        let e = write_bytes_documented(
+            &f.v,
+            &f.s,
+            None,
+            P,
+            M,
+            "/deck.pptx",
+            b"body",
+            false,
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.code, code::NOT_SUPPORTED);
         assert!(e.message.contains("not configured"), "{}", e.message);
         assert!(!f.v.exists("/deck.pptx").await.unwrap(), "nothing written");
@@ -3137,7 +3131,16 @@ mod tests {
         let stub = StubDocService::failing(ToolError::internal("converter exploded"));
 
         let r = write_bytes_documented(
-            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", b"body", false, true, true,
+            &f.v,
+            &f.s,
+            Some(&stub),
+            P,
+            M,
+            "/deck.pptx",
+            b"body",
+            false,
+            true,
+            true,
         )
         .await
         .expect("a failed conversion is not a failed upload");
@@ -3153,7 +3156,16 @@ mod tests {
         let f = fixture().await;
         let stub = StubDocService::ok(MD).with_max_input_bytes(8);
         let e = write_bytes_documented(
-            &f.v, &f.s, Some(&stub), P, M, "/deck.pptx", &[0u8; 9], false, true, true,
+            &f.v,
+            &f.s,
+            Some(&stub),
+            P,
+            M,
+            "/deck.pptx",
+            &[0u8; 9],
+            false,
+            true,
+            true,
         )
         .await
         .unwrap_err();
@@ -3193,7 +3205,15 @@ mod tests {
         let f = fixture().await;
         let stub = StubDocService::ok(MD);
         write_bytes_documented(
-            &f.v, &f.s, Some(&stub), P, M, "/report.pdf", b"%PDF-1.4 not really a pdf", false, true,
+            &f.v,
+            &f.s,
+            Some(&stub),
+            P,
+            M,
+            "/report.pdf",
+            b"%PDF-1.4 not really a pdf",
+            false,
+            true,
             true,
         )
         .await
@@ -3266,7 +3286,8 @@ mod tests {
     /// CRLF input parses like LF: the parser trims trailing carriage returns.
     #[test]
     fn parse_patch_tolerates_crlf() {
-        let ops = parse_patch("*** Begin Patch\r\n*** Delete File: /a.txt\r\n*** End Patch\r\n").unwrap();
+        let ops =
+            parse_patch("*** Begin Patch\r\n*** Delete File: /a.txt\r\n*** End Patch\r\n").unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].kind, OpKind::Delete);
         assert_eq!(ops[0].path, "/a.txt");
@@ -3311,7 +3332,10 @@ mod tests {
         delete_path(&f.v, &f.s, P, M, "/src.txt", false, true).await.unwrap();
         // dst.txt still readable and blob not GC'd.
         let content = f.v.read_text("/dst.txt").await.unwrap();
-        assert_eq!(content, "shared content", "copy target must be readable after original deleted");
+        assert_eq!(
+            content, "shared content",
+            "copy target must be readable after original deleted"
+        );
         assert!(
             f.v.blob.exists(&sha).await.unwrap(),
             "blob must not be GC'd while dst.txt still references it"

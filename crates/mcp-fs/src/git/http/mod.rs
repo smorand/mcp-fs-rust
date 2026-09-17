@@ -44,12 +44,12 @@ use crate::errors::{Result, ToolError};
 use crate::git::db::GitRefRow;
 use crate::git::repo::{GitRepoEntry, GitRepoStore};
 use crate::state::AppState;
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
 use git2::Oid;
 use pktline::{PacketType, PktReader};
 use serde::Deserialize;
@@ -274,10 +274,7 @@ async fn gate(
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
 // ── responses ───────────────────────────────────────────────────────────────
@@ -291,8 +288,7 @@ fn text(status: StatusCode, body: &str) -> Response {
 }
 
 fn error_response(e: &ToolError) -> Response {
-    let status =
-        StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     text(status, &e.to_string())
 }
 
@@ -467,9 +463,8 @@ fn build_pack(repo: &git2::Repository, wants: &[String]) -> Result<Vec<u8>> {
             .packbuilder()
             .map_err(|e| ToolError::internal(format!("packbuilder failed: {e}")))?;
 
-        let mut walk = repo
-            .revwalk()
-            .map_err(|e| ToolError::internal(format!("revwalk failed: {e}")))?;
+        let mut walk =
+            repo.revwalk().map_err(|e| ToolError::internal(format!("revwalk failed: {e}")))?;
         let mut pushed_any = false;
         for want in wants {
             // Unknown or unreachable wants are skipped, like the reference does.
@@ -620,18 +615,11 @@ pub async fn handle_receive_pack(entry: &GitRepoEntry, body: &[u8]) -> Result<Ve
 
 fn index_pack(repo: &git2::Repository, pack: &[u8]) -> Result<()> {
     use std::io::Write;
-    let odb = repo
-        .odb()
-        .map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
-    let mut writer = odb
-        .packwriter()
-        .map_err(|e| ToolError::internal(format!("packwriter failed: {e}")))?;
-    writer
-        .write_all(pack)
-        .map_err(|e| ToolError::internal(format!("pack write failed: {e}")))?;
-    writer
-        .commit()
-        .map_err(|e| ToolError::internal(format!("pack index failed: {e}")))?;
+    let odb = repo.odb().map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
+    let mut writer =
+        odb.packwriter().map_err(|e| ToolError::internal(format!("packwriter failed: {e}")))?;
+    writer.write_all(pack).map_err(|e| ToolError::internal(format!("pack write failed: {e}")))?;
+    writer.commit().map_err(|e| ToolError::internal(format!("pack index failed: {e}")))?;
     Ok(())
 }
 
@@ -675,9 +663,9 @@ mod tests {
     use super::*;
     use crate::config::ServerConfig;
     use crate::git::odb::seed_commit;
-    use git2::ObjectType;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use git2::ObjectType;
     use tower::ServiceExt;
 
     fn config(root: &std::path::Path) -> Arc<ServerConfig> {
@@ -802,12 +790,8 @@ mod tests {
         body.extend_from_slice(&pktline::encode(
             "want 1111111111111111111111111111111111111111 multi_ack side-band-64k\n",
         ));
-        body.extend_from_slice(&pktline::encode(
-            "want 2222222222222222222222222222222222222222\n",
-        ));
-        body.extend_from_slice(&pktline::encode(
-            "have 3333333333333333333333333333333333333333\n",
-        ));
+        body.extend_from_slice(&pktline::encode("want 2222222222222222222222222222222222222222\n"));
+        body.extend_from_slice(&pktline::encode("have 3333333333333333333333333333333333333333\n"));
         body.extend_from_slice(&pktline::flush());
         body.extend_from_slice(&pktline::encode("done\n"));
 
@@ -876,9 +860,7 @@ mod tests {
         body.extend_from_slice(&pktline::encode_raw(
             format!("{old} {new} refs/heads/main\0report-status side-band-64k\n").as_bytes(),
         ));
-        body.extend_from_slice(&pktline::encode(&format!(
-            "{new} {old} refs/heads/gone\n"
-        )));
+        body.extend_from_slice(&pktline::encode(&format!("{new} {old} refs/heads/gone\n")));
         body.extend_from_slice(&pktline::flush());
         body.extend_from_slice(b"PACKpayload");
 
@@ -968,10 +950,7 @@ mod tests {
         // report-status starts with the unpack status, then one line per ref.
         assert_eq!(lines[0].as_deref(), Some("unpack ok"));
         assert_eq!(lines[1].as_deref(), Some("ok refs/heads/main"));
-        assert_eq!(
-            e.db.get_ref("refs/heads/main").await.unwrap().unwrap().target,
-            commit
-        );
+        assert_eq!(e.db.get_ref("refs/heads/main").await.unwrap().unwrap().target, commit);
     }
 
     #[tokio::test]
@@ -982,9 +961,7 @@ mod tests {
         // unknown object
         let ghost = "b".repeat(40);
         let mut body = Vec::new();
-        body.extend_from_slice(&pktline::encode(&format!(
-            "{ZERO_ID} {ghost} refs/heads/main\n"
-        )));
+        body.extend_from_slice(&pktline::encode(&format!("{ZERO_ID} {ghost} refs/heads/main\n")));
         body.extend_from_slice(&pktline::flush());
         let out = handle_receive_pack(&e, &body).await.unwrap();
         let lines = read_pkt_lines(&out);
@@ -998,9 +975,7 @@ mod tests {
         e.db.set_ref("refs/heads/main", &c1, false).await.unwrap();
         let wrong_old = "c".repeat(40);
         let mut body2 = Vec::new();
-        body2.extend_from_slice(&pktline::encode(&format!(
-            "{wrong_old} {c2} refs/heads/main\n"
-        )));
+        body2.extend_from_slice(&pktline::encode(&format!("{wrong_old} {c2} refs/heads/main\n")));
         body2.extend_from_slice(&pktline::flush());
         let out2 = handle_receive_pack(&e, &body2).await.unwrap();
         let lines2 = read_pkt_lines(&out2);
@@ -1021,9 +996,7 @@ mod tests {
         e.db.set_ref("refs/heads/doomed", &c1, false).await.unwrap();
 
         let mut body = Vec::new();
-        body.extend_from_slice(&pktline::encode(&format!(
-            "{c1} {ZERO_ID} refs/heads/doomed\n"
-        )));
+        body.extend_from_slice(&pktline::encode(&format!("{c1} {ZERO_ID} refs/heads/doomed\n")));
         body.extend_from_slice(&pktline::flush());
         let out = handle_receive_pack(&e, &body).await.unwrap();
         let lines = read_pkt_lines(&out);
@@ -1044,11 +1017,10 @@ mod tests {
         let mut tb = src.treebuilder(None).unwrap();
         tb.insert("f.txt", blob, 0o100644).unwrap();
         let tree = tb.write().unwrap();
-        let sig = git2::Signature::new("t", "t@example.test", &git2::Time::new(1700000000, 0))
-            .unwrap();
-        let commit = src
-            .commit(None, &sig, &sig, "pushed", &src.find_tree(tree).unwrap(), &[])
-            .unwrap();
+        let sig =
+            git2::Signature::new("t", "t@example.test", &git2::Time::new(1700000000, 0)).unwrap();
+        let commit =
+            src.commit(None, &sig, &sig, "pushed", &src.find_tree(tree).unwrap(), &[]).unwrap();
         let mut buf = git2::Buf::new();
         {
             let mut pb = src.packbuilder().unwrap();
@@ -1089,10 +1061,8 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let pub_pem = priv_key
-            .to_public_key()
-            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-            .unwrap();
+        let pub_pem =
+            priv_key.to_public_key().to_public_key_pem(rsa::pkcs8::LineEnding::LF).unwrap();
         let priv_pem = priv_key.to_pkcs1_pem(rsa::pkcs8::LineEnding::LF).unwrap();
 
         let pub_path = root.join("jwt-public.pem");
@@ -1129,15 +1099,17 @@ mod tests {
         let config = Arc::new(c);
 
         let registry = crate::storage::RelationalRegistry::new();
-            let admin =
-                crate::storage::build_admin_store(&config, &registry).await.unwrap();
+        let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "owner@test.com").await.unwrap();
 
         let app = Arc::new(crate::state::AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
             safety: Arc::new(crate::safety::SafetyManager::new(
                 config.safety.clone(),
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
@@ -1237,14 +1209,16 @@ mod tests {
         let config = Arc::new(c);
 
         let registry = crate::storage::RelationalRegistry::new();
-            let admin =
-                crate::storage::build_admin_store(&config, &registry).await.unwrap();
+        let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "owner@test.com").await.unwrap();
         let app = Arc::new(crate::state::AppState {
             config: config.clone(),
             admin,
-            stores: Arc::new(crate::storage::StoreManager::new(config.clone(), crate::storage::test_registry())),
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
             safety: Arc::new(crate::safety::SafetyManager::new(
                 config.safety.clone(),
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
@@ -1304,10 +1278,7 @@ mod tests {
         );
         assert_eq!(r.headers()[header::EXPIRES], "Fri, 01 Jan 1980 00:00:00 GMT");
         assert_eq!(r.headers()[header::PRAGMA], "no-cache");
-        assert_eq!(
-            r.headers()[header::CACHE_CONTROL],
-            "no-cache, max-age=0, must-revalidate"
-        );
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache, max-age=0, must-revalidate");
         let body = String::from_utf8(body_bytes(r).await).unwrap();
         assert!(body.starts_with("001e# service=git-upload-pack\n0000"));
 
@@ -1332,10 +1303,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(
-            r.headers()[header::CONTENT_TYPE],
-            "application/x-git-upload-pack-result"
-        );
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/x-git-upload-pack-result");
         assert_eq!(body_bytes(r).await, b"0000", "no wants means a bare flush");
 
         let r = app
@@ -1343,10 +1311,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(
-            r.headers()[header::CONTENT_TYPE],
-            "application/x-git-receive-pack-result"
-        );
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/x-git-receive-pack-result");
     }
 
     #[tokio::test]
@@ -1355,10 +1320,7 @@ mod tests {
         // 1 MB cap, 2 MB body
         let (app, token) = harness(d.path(), false, true, 1).await;
         let big = vec![b'x'; 2 * 1024 * 1024];
-        let r = app
-            .oneshot(post("/git/proj/git-receive-pack", Some(&token), big))
-            .await
-            .unwrap();
+        let r = app.oneshot(post("/git/proj/git-receive-pack", Some(&token), big)).await.unwrap();
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -1378,7 +1340,8 @@ mod tests {
     async fn a_push_then_a_fetch_round_trips_the_same_objects() {
         let d = tempfile::tempdir().unwrap();
         let (_s, e) = entry(d.path()).await;
-        let (commit, _t, blob) = seed_commit(&e.objects, "a.txt", b"round trip", "c1").await.unwrap();
+        let (commit, _t, blob) =
+            seed_commit(&e.objects, "a.txt", b"round trip", "c1").await.unwrap();
         e.db.set_ref("refs/heads/main", &commit, false).await.unwrap();
 
         let mut req = Vec::new();
@@ -1407,4 +1370,3 @@ mod tests {
         assert!(client.odb().unwrap().exists(Oid::from_str(&blob).unwrap()));
     }
 }
-

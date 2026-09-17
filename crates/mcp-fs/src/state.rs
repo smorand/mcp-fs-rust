@@ -9,8 +9,8 @@ use crate::identity::IdentityResolver;
 use crate::mcp::ToolRegistry;
 use crate::safety::SafetyManager;
 use crate::search::SearchBackend;
-use crate::storage::traits::AdminBackend;
 use crate::storage::StoreManager;
+use crate::storage::traits::AdminBackend;
 use crate::tools::editor::EditorRegistry;
 use std::sync::Arc;
 

@@ -103,10 +103,15 @@ impl OcrProvider for MultimodalOcrProvider {
             .await
             // Only the transport class of failure is surfaced: the request body
             // carries the prompt, so it must never reach the caller.
-            .map_err(|e| ToolError::internal(format!("ocr request failed: {}", transport_kind(&e))))?;
+            .map_err(|e| {
+                ToolError::internal(format!("ocr request failed: {}", transport_kind(&e)))
+            })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(ToolError::internal(format!("ocr provider returned HTTP {}", status.as_u16())));
+            return Err(ToolError::internal(format!(
+                "ocr provider returned HTTP {}",
+                status.as_u16()
+            )));
         }
         let body: serde_json::Value = response
             .json()

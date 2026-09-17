@@ -49,10 +49,7 @@ impl ToolRegistry {
     /// Register one tool. Panics on a duplicate name: that is a build-time bug.
     pub fn add(&mut self, schema: ToolSchema, handler: ToolHandler) {
         let name = schema.name;
-        assert!(
-            !self.tools.contains_key(name),
-            "duplicate tool registration: {name}"
-        );
+        assert!(!self.tools.contains_key(name), "duplicate tool registration: {name}");
         self.order.push(name);
         self.tools.insert(name, RegisteredTool { schema, handler });
     }
@@ -83,11 +80,8 @@ impl ToolRegistry {
 
     /// The `tools/list` payload, in registration order.
     pub fn list_payload(&self) -> Value {
-        let tools: Vec<Value> = self
-            .order
-            .iter()
-            .map(|n| self.tools[n].schema.to_list_entry())
-            .collect();
+        let tools: Vec<Value> =
+            self.order.iter().map(|n| self.tools[n].schema.to_list_entry()).collect();
         serde_json::json!({"tools": tools})
     }
 
@@ -130,9 +124,7 @@ mod tests {
         for n in names {
             r.add(
                 dummy_schema(n),
-                handler(|_ctx, a: Args| async move {
-                    Ok(json!({"echo": a.str("mount_id")?}))
-                }),
+                handler(|_ctx, a: Args| async move { Ok(json!({"echo": a.str("mount_id")?})) }),
             );
         }
         r

@@ -14,9 +14,9 @@ use crate::mcp::registry::handler;
 use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::tools::{norm, volume};
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray, TimestampNanosecondArray,
-    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampNanosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -174,11 +174,12 @@ fn arrow_value_to_json(col: &dyn Array, row: usize) -> Value {
             json!(col.as_any().downcast_ref::<Date64Array>().unwrap().value(row))
         }
         DataType::Timestamp(_, _) => {
-            json!(col
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .map(|a| a.value(row).to_string())
-                .unwrap_or_else(|| "?".to_string()))
+            json!(
+                col.as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .map(|a| a.value(row).to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )
         }
         other => json!(format!("<{other}>")),
     }
@@ -190,13 +191,9 @@ fn batches_to_csv(batches: &[RecordBatch], delimiter: u8) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     let mut buf = Vec::new();
-    let mut writer = arrow::csv::WriterBuilder::new()
-        .with_delimiter(delimiter)
-        .build(&mut buf);
+    let mut writer = arrow::csv::WriterBuilder::new().with_delimiter(delimiter).build(&mut buf);
     for batch in batches {
-        writer
-            .write(batch)
-            .map_err(|e| ToolError::internal(format!("csv write: {e}")))?;
+        writer.write(batch).map_err(|e| ToolError::internal(format!("csv write: {e}")))?;
     }
     drop(writer);
     Ok(buf)
@@ -212,9 +209,7 @@ fn batches_to_parquet(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None)
         .map_err(|e| ToolError::internal(format!("parquet writer: {e}")))?;
     for batch in batches {
-        writer
-            .write(batch)
-            .map_err(|e| ToolError::internal(format!("parquet write: {e}")))?;
+        writer.write(batch).map_err(|e| ToolError::internal(format!("parquet write: {e}")))?;
     }
     writer.close().map_err(|e| ToolError::internal(format!("parquet close: {e}")))?;
     Ok(buf)
@@ -487,7 +482,10 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("src_path", "Source file path.")
-        .req_str("dst_path", "Destination path; format inferred from extension (.csv, .parquet, .json, .ndjson)."),
+        .req_str(
+            "dst_path",
+            "Destination path; format inferred from extension (.csv, .parquet, .json, .ndjson).",
+        ),
         handler(move |ctx, a| async move {
             let src_raw = a.str("src_path")?;
             let dst_raw = a.str("dst_path")?;
@@ -572,7 +570,10 @@ mod tests {
     #[test]
     fn five_db_tools_register() {
         assert_eq!(reg().len(), 5);
-        assert_eq!(reg().names(), ["db.query", "db.schema", "db.profile", "db.sample", "db.convert"]);
+        assert_eq!(
+            reg().names(),
+            ["db.query", "db.schema", "db.profile", "db.sample", "db.convert"]
+        );
     }
 
     #[test]

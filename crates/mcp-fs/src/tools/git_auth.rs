@@ -43,9 +43,7 @@ pub async fn token_store(
     registry: &crate::storage::RelationalRegistry,
 ) -> Result<Arc<OAuthTokenStore>> {
     TOKENS
-        .get_or_init(|| async {
-            OAuthTokenStore::from_env(config, registry).await.map(Arc::new)
-        })
+        .get_or_init(|| async { OAuthTokenStore::from_env(config, registry).await.map(Arc::new) })
         .await
         .clone()
 }
@@ -77,7 +75,10 @@ pub fn register_with(
             "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
         )
         .req_str("provider", "OAuth provider: github or gitlab.")
-        .opt_str_null("instance_url", "Optional self-hosted instance URL (e.g. GitLab Enterprise)."),
+        .opt_str_null(
+            "instance_url",
+            "Optional self-hosted instance URL (e.g. GitLab Enterprise).",
+        ),
         handler(move |ctx: ToolCtx, a| {
             let (t, f) = (t.clone(), f.clone());
             async move {
@@ -99,7 +100,10 @@ pub fn register_with(
             "git.auth_status",
             "Check authentication status for a provider (or all providers).",
         )
-        .opt_str_null("provider", "Provider to check: github or gitlab; omit to report all providers."),
+        .opt_str_null(
+            "provider",
+            "Provider to check: github or gitlab; omit to report all providers.",
+        ),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
             async move {
@@ -159,8 +163,7 @@ async fn auth(
     let person = require_identity(ctx)?;
     let code = flow.request_device_code(provider, instance_url.as_deref()).await?;
 
-    let message =
-        format!("Open {} and enter code {}", code.verification_uri, code.user_code);
+    let message = format!("Open {} and enter code {}", code.verification_uri, code.user_code);
     let result = json!({
         "status": "pending",
         "provider": provider,
@@ -185,8 +188,7 @@ fn spawn_poller(
     instance_url: Option<String>,
     code: DeviceCode,
 ) {
-    let interval =
-        Duration::from_secs(code.interval.max(0) as u64).max(MIN_POLL_INTERVAL);
+    let interval = Duration::from_secs(code.interval.max(0) as u64).max(MIN_POLL_INTERVAL);
     let lifetime = Duration::from_secs(code.expires_in.max(0) as u64);
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + lifetime;
@@ -243,20 +245,14 @@ fn status_for(person: &str, provider: &str, tokens: &OAuthTokenStore, single: bo
         out.insert("provider".into(), json!(provider));
         out.insert("authenticated".into(), json!(authenticated));
     }
-    if authenticated
-        && let Some(s) = tokens.get_token(person, provider)
-    {
+    if authenticated && let Some(s) = tokens.get_token(person, provider) {
         out.insert("scopes".into(), json!(s.scopes));
         out.insert("expires_at".into(), json!(round_trip_iso(s.expires_at)));
     }
     Value::Object(out)
 }
 
-async fn auth_revoke(
-    ctx: &ToolCtx,
-    provider: &str,
-    tokens: &OAuthTokenStore,
-) -> Result<Value> {
+async fn auth_revoke(ctx: &ToolCtx, provider: &str, tokens: &OAuthTokenStore) -> Result<Value> {
     let person = require_identity(ctx)?;
     tokens.revoke_token(&person, provider).await?;
     Ok(json!({"provider": provider, "revoked": true}))
@@ -265,11 +261,7 @@ async fn auth_revoke(
 /// The C# `DateTimeOffset.ToString("O")`: seven fractional digits (100ns ticks)
 /// plus an explicit offset, which is always UTC here.
 fn round_trip_iso(dt: DateTime<Utc>) -> String {
-    format!(
-        "{}{:07}+00:00",
-        dt.format("%Y-%m-%dT%H:%M:%S."),
-        dt.timestamp_subsec_nanos() / 100
-    )
+    format!("{}{:07}+00:00", dt.format("%Y-%m-%dT%H:%M:%S."), dt.timestamp_subsec_nanos() / 100)
 }
 
 #[cfg(test)]
@@ -343,7 +335,9 @@ mod tests {
     }
 
     /// Fixture plus an isolated token store and a fake flow.
-    async fn setup(script: Vec<TokenPoll>) -> (Fixture, ToolRegistry, Arc<OAuthTokenStore>, Arc<FakeFlow>) {
+    async fn setup(
+        script: Vec<TokenPoll>,
+    ) -> (Fixture, ToolRegistry, Arc<OAuthTokenStore>, Arc<FakeFlow>) {
         let f = Fixture::with_config(|c| c.git.enabled = true).await;
         let tokens = Arc::new(OAuthTokenStore::new());
         let flow = FakeFlow::new(script);
@@ -419,10 +413,7 @@ mod tests {
         assert_eq!(out["user_code"], "WXYZ-9876");
         assert_eq!(out["verification_uri"], "https://github.com/login/device");
         assert_eq!(out["expires_in"], 5);
-        assert_eq!(
-            out["message"],
-            "Open https://github.com/login/device and enter code WXYZ-9876"
-        );
+        assert_eq!(out["message"], "Open https://github.com/login/device and enter code WXYZ-9876");
         assert_eq!(flow.requests.lock().unwrap()[0], ("github".to_string(), None));
     }
 
@@ -495,19 +486,16 @@ mod tests {
     #[tokio::test]
     async fn auth_status_reports_one_provider() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
-        let out = f
-            .call(&r, PERSON, "git.auth_status", json!({"provider":"github"}))
-            .await
-            .unwrap();
+        let out =
+            f.call(&r, PERSON, "git.auth_status", json!({"provider":"github"})).await.unwrap();
         assert_eq!(out, json!({"authenticated": false, "provider": "github"}));
 
         tokens
-            .store_token(PERSON, "github", "tok", vec!["repo".into()], future(), None).await
-            .unwrap();
-        let out = f
-            .call(&r, PERSON, "git.auth_status", json!({"provider":"github"}))
+            .store_token(PERSON, "github", "tok", vec!["repo".into()], future(), None)
             .await
             .unwrap();
+        let out =
+            f.call(&r, PERSON, "git.auth_status", json!({"provider":"github"})).await.unwrap();
         assert_eq!(out["authenticated"], true);
         assert_eq!(out["scopes"], json!(["repo"]));
         let expires = out["expires_at"].as_str().unwrap();
@@ -519,7 +507,8 @@ mod tests {
     async fn auth_status_reports_all_providers_when_none_is_given() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
         tokens
-            .store_token(PERSON, "gitlab", "tok", vec!["api".into()], future(), None).await
+            .store_token(PERSON, "gitlab", "tok", vec!["api".into()], future(), None)
+            .await
             .unwrap();
 
         let out = f.call(&r, PERSON, "git.auth_status", json!({})).await.unwrap();
@@ -544,12 +533,11 @@ mod tests {
                 vec![],
                 Utc::now() - chrono::Duration::minutes(1),
                 None,
-            ).await
-            .unwrap();
-        let out = f
-            .call(&r, PERSON, "git.auth_status", json!({"provider":"github"}))
+            )
             .await
             .unwrap();
+        let out =
+            f.call(&r, PERSON, "git.auth_status", json!({"provider":"github"})).await.unwrap();
         assert_eq!(out["authenticated"], false);
     }
 
@@ -558,10 +546,8 @@ mod tests {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
         tokens.store_token(PERSON, "github", "tok", vec![], future(), None).await.unwrap();
 
-        let out = f
-            .call(&r, PERSON, "git.auth_revoke", json!({"provider":"github"}))
-            .await
-            .unwrap();
+        let out =
+            f.call(&r, PERSON, "git.auth_revoke", json!({"provider":"github"})).await.unwrap();
         assert_eq!(out, json!({"provider":"github","revoked":true}));
         assert!(tokens.get_token(PERSON, "github").is_none());
 

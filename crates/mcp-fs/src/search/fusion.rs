@@ -50,7 +50,9 @@ pub fn rrf_merge(bm25: &[SearchResult], vector: &[SearchResult]) -> Vec<SearchRe
 
     // Sort by fused score descending, then by path for determinism.
     let mut entries: Vec<(String, f32)> = scores.into_iter().collect();
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    entries.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+    });
 
     entries
         .into_iter()
@@ -86,14 +88,8 @@ mod tests {
     #[test]
     fn rrf_merge_prefers_appearing_in_both_lists() {
         // /shared.md appears in both lists at rank 2; /only_bm25.md only in bm25 at rank 1.
-        let bm25 = vec![
-            r("/only_bm25.md", 1.0, "x", 1),
-            r("/shared.md", 0.5, "y", 2),
-        ];
-        let vec_ = vec![
-            r("/only_vec.md", 1.0, "z", 1),
-            r("/shared.md", 0.5, "y", 2),
-        ];
+        let bm25 = vec![r("/only_bm25.md", 1.0, "x", 1), r("/shared.md", 0.5, "y", 2)];
+        let vec_ = vec![r("/only_vec.md", 1.0, "z", 1), r("/shared.md", 0.5, "y", 2)];
         let out = rrf_merge(&bm25, &vec_);
         let paths: Vec<&str> = out.iter().map(|r| r.path.as_str()).collect();
         let shared_pos = paths.iter().position(|p| *p == "/shared.md").unwrap();

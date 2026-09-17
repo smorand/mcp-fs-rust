@@ -100,12 +100,7 @@ impl RelationalOAuthPersistence {
         Ok(out)
     }
 
-    pub async fn upsert(
-        &self,
-        person: &str,
-        provider: &str,
-        session: &OAuthSession,
-    ) -> Result<()> {
+    pub async fn upsert(&self, person: &str, provider: &str, session: &OAuthSession) -> Result<()> {
         let enc = cipher::encrypt(&self.key, &session.access_token)?;
         let sql = self.db.dialect().render_upsert(&Upsert::update(
             "oauth_tokens",
@@ -158,11 +153,9 @@ impl RelationalOAuthPersistence {
         let row = self
             .db
             .query_opt(
-                &Query::new(
-                    "SELECT token_enc FROM oauth_tokens WHERE person=?1 AND provider=?2",
-                )
-                .bind(person)
-                .bind(provider),
+                &Query::new("SELECT token_enc FROM oauth_tokens WHERE person=?1 AND provider=?2")
+                    .bind(person)
+                    .bind(provider),
             )
             .await?
             .expect("row present");
@@ -198,10 +191,7 @@ impl RelationalOAuthPersistence {
 
 /// Comma separated, empty entries dropped.
 fn split_scopes(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    raw.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
 }
 
 #[cfg(test)]
@@ -267,10 +257,7 @@ mod tests {
         let all = p.load_all().await.unwrap();
         assert_eq!(all[0].2.access_token, "second");
         assert_eq!(all[0].2.scopes, vec!["api"]);
-        assert_eq!(
-            all[0].2.instance_url.as_deref(),
-            Some("https://gitlab.example.test")
-        );
+        assert_eq!(all[0].2.instance_url.as_deref(), Some("https://gitlab.example.test"));
     }
 
     #[tokio::test]
@@ -342,9 +329,7 @@ mod tests {
     async fn corrupt_blobs_and_bad_timestamps_are_skipped() {
         let p = mem(key(8)).await;
         p.upsert("good@t.c", "github", &session("ok")).await.unwrap();
-        p.insert_raw("corrupt@t.c", "github", vec![0u8; 40], "2030-01-01T00:00:00Z")
-            .await
-            .unwrap();
+        p.insert_raw("corrupt@t.c", "github", vec![0u8; 40], "2030-01-01T00:00:00Z").await.unwrap();
         p.insert_raw(
             "badtime@t.c",
             "github",

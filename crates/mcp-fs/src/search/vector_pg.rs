@@ -102,14 +102,12 @@ impl SearchBackend for PostgresVectorBackend {
         }
 
         // Idempotent: remove existing rows for this (volume, path) pair.
-        sqlx::query(AssertSqlSafe(
-            "DELETE FROM search_chunks WHERE volume_id = $1 AND path = $2",
-        ))
-        .bind(volume_id)
-        .bind(path)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| ToolError::internal(format!("vector_pg: delete: {e}")))?;
+        sqlx::query(AssertSqlSafe("DELETE FROM search_chunks WHERE volume_id = $1 AND path = $2"))
+            .bind(volume_id)
+            .bind(path)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ToolError::internal(format!("vector_pg: delete: {e}")))?;
 
         for (idx, (chunk_text, vec_str)) in chunks.iter().zip(embeddings.iter()).enumerate() {
             // The embedding is passed as a TEXT parameter and cast to VECTOR with
@@ -268,7 +266,11 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    async fn live_backend(schema: &str, dims: u32, endpoint: &str) -> Option<PostgresVectorBackend> {
+    async fn live_backend(
+        schema: &str,
+        dims: u32,
+        endpoint: &str,
+    ) -> Option<PostgresVectorBackend> {
         let dsn = std::env::var("MCPFS_TEST_PG_DSN").ok().filter(|v| !v.trim().is_empty())?;
         use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
         let db = PostgresRelationalDb::connect(&dsn, schema, PoolSettings::default())
@@ -323,8 +325,7 @@ mod tests {
     #[tokio::test]
     async fn live_stats_counts_chunks_after_index() {
         let base = spawn_fake_embedding_server(3).await;
-        let Some(b) =
-            live_backend("mcpfs_vecpg_stats2", 3, &format!("{base}/v1/embeddings")).await
+        let Some(b) = live_backend("mcpfs_vecpg_stats2", 3, &format!("{base}/v1/embeddings")).await
         else {
             return;
         };
@@ -337,14 +338,11 @@ mod tests {
     #[tokio::test]
     async fn live_index_and_query() {
         let base = spawn_fake_embedding_server(3).await;
-        let Some(b) =
-            live_backend("mcpfs_vecpg_query", 3, &format!("{base}/v1/embeddings")).await
+        let Some(b) = live_backend("mcpfs_vecpg_query", 3, &format!("{base}/v1/embeddings")).await
         else {
             return;
         };
-        b.index_path("v1", "/doc.md", "rust is a systems language", 200, 0)
-            .await
-            .unwrap();
+        b.index_path("v1", "/doc.md", "rust is a systems language", 200, 0).await.unwrap();
         let r = b.query_vector("v1", "systems programming", 10).await.unwrap();
         // The fake embedding server returns the same vector for every input, so
         // the query finds the document (cosine distance 0 = identical vectors).
@@ -357,8 +355,7 @@ mod tests {
     #[tokio::test]
     async fn live_delete_removes_chunks() {
         let base = spawn_fake_embedding_server(3).await;
-        let Some(b) =
-            live_backend("mcpfs_vecpg_del", 3, &format!("{base}/v1/embeddings")).await
+        let Some(b) = live_backend("mcpfs_vecpg_del", 3, &format!("{base}/v1/embeddings")).await
         else {
             return;
         };
@@ -372,8 +369,7 @@ mod tests {
     #[tokio::test]
     async fn live_idempotent_reindex() {
         let base = spawn_fake_embedding_server(3).await;
-        let Some(b) =
-            live_backend("mcpfs_vecpg_idem", 3, &format!("{base}/v1/embeddings")).await
+        let Some(b) = live_backend("mcpfs_vecpg_idem", 3, &format!("{base}/v1/embeddings")).await
         else {
             return;
         };
@@ -401,8 +397,7 @@ mod tests {
     #[tokio::test]
     async fn live_delete_all_removes_every_chunk_of_the_volume() {
         let base = spawn_fake_embedding_server(3).await;
-        let Some(b) =
-            live_backend("mcpfs_vecpg_delall", 3, &format!("{base}/v1/embeddings")).await
+        let Some(b) = live_backend("mcpfs_vecpg_delall", 3, &format!("{base}/v1/embeddings")).await
         else {
             return;
         };
@@ -446,8 +441,7 @@ mod tests {
     #[tokio::test]
     async fn live_query_bm25_returns_not_supported() {
         let base = spawn_fake_embedding_server(3).await;
-        let Some(b) =
-            live_backend("mcpfs_vecpg_norag", 3, &format!("{base}/v1/embeddings")).await
+        let Some(b) = live_backend("mcpfs_vecpg_norag", 3, &format!("{base}/v1/embeddings")).await
         else {
             return;
         };

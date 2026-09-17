@@ -115,7 +115,8 @@ mod tests {
         h.seed("/a.txt", "x\n").await;
         let file = h.call("fs.exists", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
         assert_eq!(file, json!({"exists": true, "kind": "file"}));
-        let missing = h.call("fs.exists", json!({"mount_id": MOUNT, "path": "/nope"})).await.unwrap();
+        let missing =
+            h.call("fs.exists", json!({"mount_id": MOUNT, "path": "/nope"})).await.unwrap();
         assert_eq!(missing, json!({"exists": false, "kind": null}));
     }
 
@@ -126,10 +127,7 @@ mod tests {
         let r = h.call("fs.hash", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.unwrap();
         assert_eq!(r["algo"], "sha256");
         // sha256 of "hello world\n", the same value `shasum -a 256` reports.
-        assert_eq!(
-            r["hash"],
-            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
-        );
+        assert_eq!(r["hash"], "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447");
         assert_eq!(r["size"], 12);
 
         let md5 = h

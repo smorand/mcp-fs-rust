@@ -136,9 +136,9 @@ async fn run() -> Result<()> {
     let client = mcp::McpClient::new(&cfg.mcp.url, &cfg.mcp.auth_header, &token)?;
     let tools = client.list_tools().await.context("MCP connection failed")?;
 
-    let api_key = cfg.api_key().ok_or_else(|| {
-        anyhow::anyhow!("LLM API key not set, export ${}", cfg.llm.api_key_env)
-    })?;
+    let api_key = cfg
+        .api_key()
+        .ok_or_else(|| anyhow::anyhow!("LLM API key not set, export ${}", cfg.llm.api_key_env))?;
     let llm = LlmClient::new(&cfg.llm.base_url, &cfg.llm.model, &api_key, cfg.llm.timeout_seconds)?;
 
     println!(
@@ -243,7 +243,10 @@ async fn run() -> Result<()> {
                 }
                 Err(e) => {
                     stop_if_running(&mut compact).await;
-                    eprintln!("{RED}[warn]{RESET} compaction failed (continuing without): {}", error_chain(&e));
+                    eprintln!(
+                        "{RED}[warn]{RESET} compaction failed (continuing without): {}",
+                        error_chain(&e)
+                    );
                 }
             }
         }
@@ -283,8 +286,10 @@ async fn run() -> Result<()> {
                         // puts us at column 0 and \x1b[2K clears the line, so whichever
                         // frame the task drew last is gone before we paint the message.
                         let delay_s = (1u64 << attempt.min(5)).min(30);
-                        print!("\r\x1b[2K  {DIM}retrying ({attempt}/{}) in {delay_s}s…{RESET}",
-                            llm::MAX_RETRIES);
+                        print!(
+                            "\r\x1b[2K  {DIM}retrying ({attempt}/{}) in {delay_s}s…{RESET}",
+                            llm::MAX_RETRIES
+                        );
                         let _ = std::io::stdout().flush();
                     },
                 )
@@ -420,11 +425,8 @@ fn resolve_token(cfg: &AgentConfig, user: Option<&str>) -> Result<String> {
         return Ok(cfg.mcp.token.clone());
     };
     let dir = Path::new(&cfg.mcp.tokens_dir);
-    let dir = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(dir)
-    };
+    let dir =
+        if dir.is_absolute() { dir.to_path_buf() } else { std::env::current_dir()?.join(dir) };
     let file = dir.join(user);
     if !file.exists() {
         bail!(

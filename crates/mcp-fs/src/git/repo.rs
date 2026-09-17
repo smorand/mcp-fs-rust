@@ -305,10 +305,7 @@ mod tests {
         let store2 = GitRepoStore::new(cfg.clone(), crate::storage::test_registry());
         assert!(store2.is_initialized("proj").await);
         let db = store2.get_db("proj").await.unwrap();
-        assert_eq!(
-            db.get_ref("refs/heads/main").await.unwrap().unwrap().target,
-            "a".repeat(40)
-        );
+        assert_eq!(db.get_ref("refs/heads/main").await.unwrap().unwrap().target, "a".repeat(40));
         let objects = store2.get_objects("proj").await.unwrap();
         assert_eq!(objects.read(&sha).await.unwrap().1, b"persisted");
     }

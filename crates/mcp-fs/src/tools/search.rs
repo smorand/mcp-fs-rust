@@ -73,7 +73,8 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;
-            fs_ops::find_definitions(&client, &root, &a.str("name")?, a.opt_str("kind").as_deref()).await
+            fs_ops::find_definitions(&client, &root, &a.str("name")?, a.opt_str("kind").as_deref())
+                .await
         }),
     );
 
@@ -90,16 +91,13 @@ pub fn register(reg: &mut ToolRegistry) {
     );
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::testkit::{MOUNT, assert_description, assert_family, assert_schema, harness};
     use serde_json::json;
 
-    const NAMES: &[&str] =
-        &["fs.glob", "fs.grep", "fs.find_definition", "fs.find_references"];
+    const NAMES: &[&str] = &["fs.glob", "fs.grep", "fs.find_definition", "fs.find_references"];
 
     #[test]
     fn family_registers_every_tool() {
@@ -120,7 +118,11 @@ mod tests {
                  "exclude_patterns":{"description":"Glob patterns whose matches are excluded from results.","default":null}},
                "required":["mount_id","pattern"]}"#,
         );
-        assert_description(register, "fs.glob", "Find files by glob pattern, newest first (cap 100).");
+        assert_description(
+            register,
+            "fs.glob",
+            "Find files by glob pattern, newest first (cap 100).",
+        );
     }
 
     #[test]
@@ -187,7 +189,8 @@ mod tests {
     async fn grep_supports_the_three_output_modes() {
         let h = harness().await;
         h.seed("/src/app.py", "def hello(name):\n    total = 1\n    return total\n").await;
-        let content = h.call("fs.grep", json!({"mount_id": MOUNT, "pattern": "total"})).await.unwrap();
+        let content =
+            h.call("fs.grep", json!({"mount_id": MOUNT, "pattern": "total"})).await.unwrap();
         assert_eq!(content["matches"].as_array().unwrap().len(), 2);
 
         let files = h
@@ -241,10 +244,8 @@ mod tests {
     #[tokio::test]
     async fn find_references_requires_a_name() {
         let h = harness().await;
-        let err = h
-            .call("fs.find_references", json!({"mount_id": MOUNT, "name": ""}))
-            .await
-            .unwrap_err();
+        let err =
+            h.call("fs.find_references", json!({"mount_id": MOUNT, "name": ""})).await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::INVALID_ARGUMENT);
         assert_eq!(err.message, "name is required");
     }
@@ -267,10 +268,7 @@ mod tests {
     #[tokio::test]
     async fn glob_on_empty_volume_returns_empty_array() {
         let h = harness().await;
-        let r = h
-            .call("fs.glob", json!({"mount_id": MOUNT, "pattern": "*"}))
-            .await
-            .unwrap();
+        let r = h.call("fs.glob", json!({"mount_id": MOUNT, "pattern": "*"})).await.unwrap();
         let matches = r["matches"].as_array().unwrap();
         assert!(matches.is_empty(), "expected no matches on empty volume");
         assert_eq!(r["truncated"], false);
@@ -283,11 +281,14 @@ mod tests {
         let h = harness().await;
         h.seed("/data.txt", "needle\nneedle\nneedle\n").await;
         let r = h
-            .call("fs.grep", json!({
-                "mount_id": MOUNT,
-                "pattern": "needle",
-                "max_matches": 0
-            }))
+            .call(
+                "fs.grep",
+                json!({
+                    "mount_id": MOUNT,
+                    "pattern": "needle",
+                    "max_matches": 0
+                }),
+            )
             .await
             .unwrap();
         let matches = r["matches"].as_array().unwrap();

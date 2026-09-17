@@ -229,7 +229,14 @@ impl InputReader {
                         hist_idx -= 1;
                         let entry = self.history[hist_idx].clone();
                         let from_row = row_of(prompt_cols, &buf, cursor);
-                        replace_buffer(prompt, prompt_cols, &mut buf, &mut cursor, &entry, from_row);
+                        replace_buffer(
+                            prompt,
+                            prompt_cols,
+                            &mut buf,
+                            &mut cursor,
+                            &entry,
+                            from_row,
+                        );
                     }
                 }
                 KeyCode::Down => {
@@ -241,7 +248,14 @@ impl InputReader {
                             self.history[hist_idx].clone()
                         };
                         let from_row = row_of(prompt_cols, &buf, cursor);
-                        replace_buffer(prompt, prompt_cols, &mut buf, &mut cursor, &entry, from_row);
+                        replace_buffer(
+                            prompt,
+                            prompt_cols,
+                            &mut buf,
+                            &mut cursor,
+                            &entry,
+                            from_row,
+                        );
                     }
                 }
                 KeyCode::Char(c) if !ctrl && !modifiers.contains(KeyModifiers::ALT) => {

@@ -89,11 +89,7 @@ impl Secret {
 /// worth reporting when diagnosing a boot failure, its contents never are.
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_empty() {
-            f.write_str("Secret(unset)")
-        } else {
-            f.write_str("Secret(redacted)")
-        }
+        if self.is_empty() { f.write_str("Secret(unset)") } else { f.write_str("Secret(redacted)") }
     }
 }
 
@@ -103,9 +99,15 @@ impl fmt::Display for Secret {
     }
 }
 
-fn d_pool_max_connections() -> u32 { 10 }
-fn d_pool_acquire_timeout() -> u64 { 30 }
-fn d_pg_schema() -> String { "public".into() }
+fn d_pool_max_connections() -> u32 {
+    10
+}
+fn d_pool_acquire_timeout() -> u64 {
+    30
+}
+fn d_pg_schema() -> String {
+    "public".into()
+}
 
 /// Connection pool sizing. Ignored by the SQLite backend, which keeps one
 /// serialized connection by design.
@@ -124,9 +126,15 @@ impl Default for PoolConfig {
     }
 }
 
-fn d_host() -> String { "0.0.0.0".into() }
-fn d_port() -> u16 { 5002 }
-fn d_mcp_path() -> String { "/mcp".into() }
+fn d_host() -> String {
+    "0.0.0.0".into()
+}
+fn d_port() -> u16 {
+    5002
+}
+fn d_mcp_path() -> String {
+    "/mcp".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -141,10 +149,18 @@ impl Default for HttpConfig {
     }
 }
 
-fn d_header() -> String { "X-Forwarded-Authorization".into() }
-fn d_algorithms() -> Vec<String> { vec!["RS256".into()] }
-fn d_issuer() -> Option<String> { Some("web-a2a".into()) }
-fn d_username_claim() -> String { "email".into() }
+fn d_header() -> String {
+    "X-Forwarded-Authorization".into()
+}
+fn d_algorithms() -> Vec<String> {
+    vec!["RS256".into()]
+}
+fn d_issuer() -> Option<String> {
+    Some("web-a2a".into())
+}
+fn d_username_claim() -> String {
+    "email".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -177,8 +193,12 @@ pub struct AuthConfig {
     pub admins: Vec<String>,
 }
 
-fn d_meta_backend() -> String { "sqlite".into() }
-fn d_meta_dir() -> String { "state/volumes".into() }
+fn d_meta_backend() -> String {
+    "sqlite".into()
+}
+fn d_meta_dir() -> String {
+    "state/volumes".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -204,10 +224,18 @@ impl Default for MetaConfig {
     }
 }
 
-fn d_blob_backend() -> String { "local".into() }
-fn d_blob_dir() -> String { "state/blobs".into() }
-fn d_bucket_prefix() -> String { "mcpfs-".into() }
-fn d_region() -> String { "us-east-1".into() }
+fn d_blob_backend() -> String {
+    "local".into()
+}
+fn d_blob_dir() -> String {
+    "state/blobs".into()
+}
+fn d_bucket_prefix() -> String {
+    "mcpfs-".into()
+}
+fn d_region() -> String {
+    "us-east-1".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -235,8 +263,12 @@ impl Default for BlobConfig {
     }
 }
 
-fn d_admin_backend() -> String { "sqlite".into() }
-fn d_admin_path() -> String { "state/admin.db".into() }
+fn d_admin_backend() -> String {
+    "sqlite".into()
+}
+fn d_admin_path() -> String {
+    "state/admin.db".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -315,9 +347,15 @@ pub struct InfraConfig {
     pub oauth: OauthStoreConfig,
 }
 
-fn d_write_quota() -> i64 { 50 * 1024 * 1024 }
-fn d_trash_dir() -> String { ".mcp_trash".into() }
-fn d_max_read_lines() -> usize { 2000 }
+fn d_write_quota() -> i64 {
+    50 * 1024 * 1024
+}
+fn d_trash_dir() -> String {
+    ".mcp_trash".into()
+}
+fn d_max_read_lines() -> usize {
+    2000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -340,8 +378,12 @@ impl Default for SafetyConfig {
     }
 }
 
-fn d_ocr_provider() -> String { "none".into() }
-fn d_ocr_key_env() -> String { "MCP_FS_OCR_KEY".into() }
+fn d_ocr_provider() -> String {
+    "none".into()
+}
+fn d_ocr_key_env() -> String {
+    "MCP_FS_OCR_KEY".into()
+}
 fn d_ocr_prompt() -> String {
     "Transcribe this document faithfully into Markdown.".into()
 }
@@ -384,11 +426,21 @@ impl Default for ApiConfig {
     }
 }
 
-fn d_object_format() -> String { "sha1".into() }
-fn d_max_pack_mb() -> u32 { 512 }
-fn d_github_secret_env() -> String { "MCPFS_GITHUB_CLIENT_SECRET".into() }
-fn d_gitlab_secret_env() -> String { "GITLAB_CLIENT_SECRET".into() }
-fn d_gitlab_url() -> String { "https://gitlab.com".into() }
+fn d_object_format() -> String {
+    "sha1".into()
+}
+fn d_max_pack_mb() -> u32 {
+    512
+}
+fn d_github_secret_env() -> String {
+    "MCPFS_GITHUB_CLIENT_SECRET".into()
+}
+fn d_gitlab_secret_env() -> String {
+    "GITLAB_CLIENT_SECRET".into()
+}
+fn d_gitlab_url() -> String {
+    "https://gitlab.com".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -419,9 +471,15 @@ impl Default for GitConfig {
     }
 }
 
-fn d_web_safe_search() -> String { "moderate".to_string() }
-fn d_web_max_results() -> usize { 10 }
-fn d_web_request_timeout() -> u64 { 10 }
+fn d_web_safe_search() -> String {
+    "moderate".to_string()
+}
+fn d_web_max_results() -> usize {
+    10
+}
+fn d_web_request_timeout() -> u64 {
+    10
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -443,8 +501,12 @@ impl Default for WebConfig {
     }
 }
 
-fn d_context7_api_url() -> String { "https://context7.com/api".to_string() }
-fn d_context7_request_timeout() -> u64 { 30 }
+fn d_context7_api_url() -> String {
+    "https://context7.com/api".to_string()
+}
+fn d_context7_request_timeout() -> u64 {
+    30
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -496,11 +558,21 @@ impl Default for DbConfig {
     }
 }
 
-fn d_search_mode() -> String { "bm25".into() }
-fn d_search_tantivy_dir() -> String { "state/search".into() }
-fn d_embedding_dimensions() -> u32 { 1536 }
-fn d_rerank_top_n() -> usize { 10 }
-fn d_pandoc_timeout() -> u64 { 30 }
+fn d_search_mode() -> String {
+    "bm25".into()
+}
+fn d_search_tantivy_dir() -> String {
+    "state/search".into()
+}
+fn d_embedding_dimensions() -> u32 {
+    1536
+}
+fn d_rerank_top_n() -> usize {
+    10
+}
+fn d_pandoc_timeout() -> u64 {
+    30
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -572,8 +644,6 @@ impl Default for SearchConfig {
     }
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DocConfig {
@@ -602,14 +672,24 @@ pub mod doc_service_mode {
 /// converter must read. There is no `{output}`: the contract is stdout.
 pub const DOC_PLACEHOLDER: &str = "{document}";
 
-fn d_doc_service_mode() -> String { doc_service_mode::CLI.into() }
-fn d_doc_service_max_input_bytes() -> u64 { 512 * 1024 * 1024 }
-fn d_doc_service_timeout() -> u64 { 900 }
+fn d_doc_service_mode() -> String {
+    doc_service_mode::CLI.into()
+}
+fn d_doc_service_max_input_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+fn d_doc_service_timeout() -> u64 {
+    900
+}
 fn d_doc_service_command() -> Vec<String> {
     vec!["doc-convert".into(), "--stdout".into(), "--quiet".into(), DOC_PLACEHOLDER.into()]
 }
-fn d_doc_service_auth_header() -> String { "Authorization".into() }
-fn d_doc_service_file_field() -> String { "file".into() }
+fn d_doc_service_auth_header() -> String {
+    "Authorization".into()
+}
+fn d_doc_service_file_field() -> String {
+    "file".into()
+}
 
 /// CLI mode: an argv list, never a shell string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -928,29 +1008,30 @@ pub fn expand_env(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{'
-            && let Some(end) = text[i + 2..].find('}') {
-                let inner = &text[i + 2..i + 2 + end];
-                let (name, default) = match inner.find(":-") {
-                    Some(p) => (&inner[..p], Some(&inner[p + 2..])),
-                    None => (inner, None),
-                };
-                let valid = !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && !name.starts_with(|c: char| c.is_ascii_digit());
-                if valid {
-                    let val = std::env::var(name).ok().filter(|v| !v.is_empty());
-                    match (val, default) {
-                        (Some(v), _) => out.push_str(&v),
-                        (None, Some(d)) => out.push_str(d),
-                        (None, None) => {}
-                    }
-                    i = i + 2 + end + 1;
-                    continue;
+        if bytes[i] == b'$'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'{'
+            && let Some(end) = text[i + 2..].find('}')
+        {
+            let inner = &text[i + 2..i + 2 + end];
+            let (name, default) = match inner.find(":-") {
+                Some(p) => (&inner[..p], Some(&inner[p + 2..])),
+                None => (inner, None),
+            };
+            let valid = !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit());
+            if valid {
+                let val = std::env::var(name).ok().filter(|v| !v.is_empty());
+                match (val, default) {
+                    (Some(v), _) => out.push_str(&v),
+                    (None, Some(d)) => out.push_str(d),
+                    (None, None) => {}
                 }
+                i = i + 2 + end + 1;
+                continue;
             }
+        }
         // push the raw byte sequence for this char
         let ch = text[i..].chars().next().unwrap();
         out.push(ch);

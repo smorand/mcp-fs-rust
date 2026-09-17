@@ -31,8 +31,6 @@ use tiberius::{ColumnData, ColumnType, Row, ToSql};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-
-
 /// The tiberius client over a tokio socket, plus the poison flag the pool reads.
 pub struct MssqlConnection {
     client: tiberius::Client<Compat<TcpStream>>,
@@ -53,16 +51,11 @@ impl bb8::ManageConnection for TiberiusManager {
     async fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
         let tcp = TcpStream::connect(self.config.get_addr())
             .await
-            .map_err(|e| tiberius::error::Error::Io {
-                kind: e.kind(),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| tiberius::error::Error::Io { kind: e.kind(), message: e.to_string() })?;
         // TDS is request/response, so Nagle would add a round trip of latency to
         // every statement for no benefit.
-        tcp.set_nodelay(true).map_err(|e| tiberius::error::Error::Io {
-            kind: e.kind(),
-            message: e.to_string(),
-        })?;
+        tcp.set_nodelay(true)
+            .map_err(|e| tiberius::error::Error::Io { kind: e.kind(), message: e.to_string() })?;
         let client = tiberius::Client::connect(self.config.clone(), tcp.compat_write()).await?;
         Ok(MssqlConnection { client, poisoned: false })
     }
@@ -106,7 +99,14 @@ impl SqlServerRelationalDb {
         // Prove the credentials now: `build` only tries one connection and a bad
         // password would otherwise surface on the first request.
         let mut probe = built.get().await.map_err(map_pool_error)?;
-        probe.client.simple_query("SELECT 1").await.map_err(map_error)?.into_results().await.map_err(map_error)?;
+        probe
+            .client
+            .simple_query("SELECT 1")
+            .await
+            .map_err(map_error)?
+            .into_results()
+            .await
+            .map_err(map_error)?;
         drop(probe);
 
         Ok(Self { pool: built })
@@ -170,8 +170,7 @@ fn map_error(e: tiberius::error::Error) -> ToolError {
         }
         tiberius::error::Error::Server(token) => {
             let number = token.code();
-            let mapped =
-                ToolError::internal(format!("sqlserver: {} [{number}]", token.message()));
+            let mapped = ToolError::internal(format!("sqlserver: {} [{number}]", token.message()));
             if is_retryable_error_number(number) { mapped.mark_retryable() } else { mapped }
         }
         // A TLS handshake failure is a configuration problem, not a transient one.
@@ -233,9 +232,7 @@ fn decode_variable_int(row: &Row, index: usize) -> Result<SqlValue> {
     if let Ok(Some(v)) = row.try_get::<u8, _>(index) {
         return Ok(SqlValue::Int(i64::from(v)));
     }
-    Err(ToolError::internal(format!(
-        "sqlserver: column {index} is not a readable integer"
-    )))
+    Err(ToolError::internal(format!("sqlserver: column {index} is not a readable integer")))
 }
 
 fn decode_variable_float(row: &Row, index: usize) -> Result<SqlValue> {
@@ -245,18 +242,14 @@ fn decode_variable_float(row: &Row, index: usize) -> Result<SqlValue> {
     if let Ok(Some(v)) = row.try_get::<f32, _>(index) {
         return Ok(SqlValue::Real(f64::from(v)));
     }
-    Err(ToolError::internal(format!(
-        "sqlserver: column {index} is not a readable float"
-    )))
+    Err(ToolError::internal(format!("sqlserver: column {index} is not a readable float")))
 }
 
 /// Decode one column into the portable value model, dispatching on the column's
 /// own type so a value is never guessed.
 fn decode(row: &Row, index: usize) -> Result<SqlValue> {
     let Some(column) = row.columns().get(index) else {
-        return Err(ToolError::internal(format!(
-            "sqlserver: column index {index} out of range"
-        )));
+        return Err(ToolError::internal(format!("sqlserver: column index {index} out of range")));
     };
 
     // A NULL is indistinguishable from an absent value at the typed accessors, so
@@ -371,11 +364,7 @@ fn rendered(query: &Query) -> Result<String> {
 
 async fn execute_on(conn: &mut MssqlConnection, query: &Query) -> Result<u64> {
     let sql = rendered(query)?;
-    let done = conn
-        .client
-        .execute(sql, &params_of(query))
-        .await
-        .map_err(map_error)?;
+    let done = conn.client.execute(sql, &params_of(query)).await.map_err(map_error)?;
     // One statement, so the per statement counts collapse to their sum.
     Ok(done.rows_affected().iter().sum())
 }
@@ -622,9 +611,7 @@ mod tests {
         db.execute(&Query::new(format!("DELETE FROM {T}"))).await.unwrap();
         let affected = db
             .execute(
-                &Query::new(format!(
-                    "INSERT INTO {T} (k, n, r, b, t) VALUES (?1, ?2, ?3, ?4, ?5)"
-                ))
+                &Query::new(format!("INSERT INTO {T} (k, n, r, b, t) VALUES (?1, ?2, ?3, ?4, ?5)"))
                     .bind("a")
                     .bind(42i64)
                     .bind(1.5f64)
@@ -685,9 +672,7 @@ mod tests {
 
         let mut tx = db.begin().await.unwrap();
         tx.execute(
-            &Query::new(format!("INSERT INTO {T} (k, n) VALUES (?1, ?2)"))
-                .bind("kept")
-                .bind(2i64),
+            &Query::new(format!("INSERT INTO {T} (k, n) VALUES (?1, ?2)")).bind("kept").bind(2i64),
         )
         .await
         .unwrap();
@@ -771,9 +756,7 @@ mod tests {
 
         // The pool still works after discarding those sessions.
         db.execute(
-            &Query::new(format!("INSERT INTO {T} (k, n) VALUES (?1, ?2)"))
-                .bind("after")
-                .bind(1i64),
+            &Query::new(format!("INSERT INTO {T} (k, n) VALUES (?1, ?2)")).bind("after").bind(1i64),
         )
         .await
         .unwrap();

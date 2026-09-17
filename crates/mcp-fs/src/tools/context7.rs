@@ -81,12 +81,8 @@ async fn resolve_library_id(
     let url = format!("{}/v1/search?query={encoded}", config.api_url);
 
     let client = build_client(config.request_timeout_secs)?;
-    let resp = client
-        .get(&url)
-        .header("X-Context7-Source", "mcp-fs")
-        .send()
-        .await
-        .map_err(|e| {
+    let resp =
+        client.get(&url).header("X-Context7-Source", "mcp-fs").send().await.map_err(|e| {
             if e.is_timeout() {
                 ToolError::internal("request timed out")
             } else {
@@ -102,13 +98,12 @@ async fn resolve_library_id(
     let results = body.get("results").and_then(|r| r.as_array());
     match results {
         None => Err(ToolError::internal(format!("no library found for '{name}'"))),
-        Some(arr) if arr.is_empty() => Err(ToolError::internal(format!("no library found for '{name}'"))),
-        Some(arr) => {
-            Ok(Value::String(
-                serde_json::to_string_pretty(&Value::Array(arr.clone()))
-                    .unwrap_or_default(),
-            ))
+        Some(arr) if arr.is_empty() => {
+            Err(ToolError::internal(format!("no library found for '{name}'")))
         }
+        Some(arr) => Ok(Value::String(
+            serde_json::to_string_pretty(&Value::Array(arr.clone())).unwrap_or_default(),
+        )),
     }
 }
 
@@ -124,12 +119,8 @@ async fn get_library_docs(
     }
 
     let client = build_client(config.request_timeout_secs)?;
-    let resp = client
-        .get(&url)
-        .header("X-Context7-Source", "mcp-fs")
-        .send()
-        .await
-        .map_err(|e| {
+    let resp =
+        client.get(&url).header("X-Context7-Source", "mcp-fs").send().await.map_err(|e| {
             if e.is_timeout() {
                 ToolError::internal("request timed out")
             } else {
@@ -145,7 +136,8 @@ async fn get_library_docs(
         return Err(ToolError::internal(format!("context7 error: {status}")));
     }
 
-    let text = resp.text().await.map_err(|e| ToolError::internal(format!("read docs response: {e}")))?;
+    let text =
+        resp.text().await.map_err(|e| ToolError::internal(format!("read docs response: {e}")))?;
     Ok(Value::String(text))
 }
 
@@ -154,8 +146,9 @@ fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             b' ' => out.push('+'),
             b => out.push_str(&format!("%{b:02X}")),
         }

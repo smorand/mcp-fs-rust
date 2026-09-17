@@ -85,7 +85,8 @@ mod tests {
         let chunks = chunk(text, 8, 3);
         assert!(chunks.len() >= 2, "need at least two chunks to check overlap");
         for pair in chunks.windows(2) {
-            let prev_tail: String = pair[0].chars().rev().take(3).collect::<String>().chars().rev().collect();
+            let prev_tail: String =
+                pair[0].chars().rev().take(3).collect::<String>().chars().rev().collect();
             let next_head: String = pair[1].chars().take(3).collect();
             assert_eq!(
                 prev_tail, next_head,

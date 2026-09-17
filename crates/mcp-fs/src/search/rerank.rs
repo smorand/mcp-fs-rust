@@ -29,18 +29,13 @@ pub async fn rerank(
         return Ok(results);
     }
 
-    let api_key = if config.api_key_env.is_empty() {
-        None
-    } else {
-        std::env::var(&config.api_key_env).ok()
-    };
+    let api_key =
+        if config.api_key_env.is_empty() { None } else { std::env::var(&config.api_key_env).ok() };
 
     let n = if top_n == 0 { config.top_n } else { top_n };
     let documents: Vec<&str> = results.iter().map(|r| r.chunk.as_str()).collect();
 
-    let mut req = client
-        .post(&config.endpoint)
-        .header("Content-Type", "application/json");
+    let mut req = client.post(&config.endpoint).header("Content-Type", "application/json");
 
     if let Some(key) = &api_key {
         req = req.header("Authorization", format!("Bearer {key}"));

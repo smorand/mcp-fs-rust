@@ -25,7 +25,7 @@ use crate::git::db::RelationalGitDb;
 use crate::git::oauth::cipher;
 use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use crate::git::oauth::store::OAuthSession;
-use crate::storage::admin::{RelationalAdminStore, ROLE_OWNER};
+use crate::storage::admin::{ROLE_OWNER, RelationalAdminStore};
 use crate::storage::meta::RelationalMetaStore;
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
 use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend};
@@ -141,8 +141,7 @@ async fn meta_tree_basics(engine: &Engine, tag: &str) -> Result<()> {
     for p in ["/z.txt", "/x.txt", "/y.txt"] {
         m.put_file(p, Some(p), 1, MODE_FILE).await?;
     }
-    let names: Vec<String> =
-        m.list_children("/").await?.into_iter().map(|n| n.name).collect();
+    let names: Vec<String> = m.list_children("/").await?.into_iter().map(|n| n.name).collect();
     let mut sorted = names.clone();
     sorted.sort();
     assert_eq!(names, sorted, "{who}: children come back sorted by name");
@@ -193,8 +192,7 @@ async fn meta_like_escaping(engine: &Engine, tag: &str) -> Result<()> {
     m.put_file("/50%/in.txt", Some("in2"), 1, MODE_FILE).await?;
     m.put_file("/50off/out.txt", Some("out2"), 1, MODE_FILE).await?;
 
-    let under: Vec<String> =
-        m.subtree("/a_b").await?.into_iter().map(|n| n.path).collect();
+    let under: Vec<String> = m.subtree("/a_b").await?.into_iter().map(|n| n.path).collect();
     assert!(under.contains(&"/a_b/in.txt".to_string()), "{who}: own child is listed");
     assert!(
         !under.contains(&"/axb/out.txt".to_string()),
@@ -267,11 +265,7 @@ async fn meta_concurrent_writes(engine: &Engine, tag: &str) -> Result<()> {
 
     // Every writer landed: no attempt was silently dropped.
     let children = store.list_children("/race").await?;
-    assert_eq!(
-        children.len(),
-        WRITERS as usize,
-        "{who}: every concurrent write must be visible"
-    );
+    assert_eq!(children.len(), WRITERS as usize, "{who}: every concurrent write must be visible");
 
     // This delete sequence IS the refcount assertion, and it needs no accessor on
     // the store. A lost update would leave the count below 25, so one of the first
@@ -317,10 +311,7 @@ async fn meta_volume_isolation(engine: &Engine, tag: &str) -> Result<()> {
     a.put_file("/d/x.txt", Some("ax"), 1, MODE_FILE).await?;
     b.put_file("/d/x.txt", Some("bx"), 1, MODE_FILE).await?;
     a.remove_subtree("/d").await?;
-    assert!(
-        b.get("/d/x.txt").await?.is_some(),
-        "{who}: a subtree removal must not cross volumes"
-    );
+    assert!(b.get("/d/x.txt").await?.is_some(), "{who}: a subtree removal must not cross volumes");
     Ok(())
 }
 
@@ -533,10 +524,7 @@ async fn git_objects_refs_remotes(engine: &Engine, tag: &str) -> Result<()> {
 
     // A second project in the same database must not see the first one's index.
     let other = RelationalGitDb::open(db, format!("{tag}-git-other")).await?;
-    assert!(
-        !other.object_exists("abcd01").await?,
-        "{who}: the git index is scoped to its project"
-    );
+    assert!(!other.object_exists("abcd01").await?, "{who}: the git index is scoped to its project");
     assert_eq!(other.count_objects().await?, 0, "{who}: a fresh project starts empty");
     assert_eq!(g.count_objects().await?, 3, "{who}: the original still has its objects");
     Ok(())
@@ -552,10 +540,7 @@ async fn oauth_round_trip(engine: &Engine, tag: &str) -> Result<()> {
 
     p.upsert(&person, "github", &session("gho_secret")).await?;
     let all = p.load_all().await?;
-    let mine = all
-        .iter()
-        .find(|(who_, _, _)| who_ == &person)
-        .expect("the row we just wrote");
+    let mine = all.iter().find(|(who_, _, _)| who_ == &person).expect("the row we just wrote");
     assert_eq!(mine.2.access_token, "gho_secret", "{who}: the token decrypts");
     assert_eq!(mine.2.scopes, vec!["repo"], "{who}: scopes round trip");
     assert_eq!(
@@ -574,10 +559,7 @@ async fn oauth_round_trip(engine: &Engine, tag: &str) -> Result<()> {
 
     p.delete(&person, "github").await?;
     let all = p.load_all().await?;
-    assert!(
-        !all.iter().any(|(w, _, _)| w == &person),
-        "{who}: the row is deleted"
-    );
+    assert!(!all.iter().any(|(w, _, _)| w == &person), "{who}: the row is deleted");
     p.delete(&person, "github").await?;
     Ok(())
 }

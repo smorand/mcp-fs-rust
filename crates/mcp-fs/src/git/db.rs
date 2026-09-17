@@ -110,9 +110,7 @@ impl RelationalGitDb {
     }
 
     fn upsert_sql(&self, table: &'static str, columns: Vec<&'static str>) -> String {
-        self.db
-            .dialect()
-            .render_upsert(&Upsert::replace(table, columns, vec!["volume_id", "name"]))
+        self.db.dialect().render_upsert(&Upsert::replace(table, columns, vec!["volume_id", "name"]))
     }
 
     // ── objects ─────────────────────────────────────────────────────────────
@@ -155,11 +153,9 @@ impl RelationalGitDb {
             )
             .await?;
         match row {
-            Some(r) => Ok(Some(GitObjectRow {
-                hash: r.text(0)?,
-                kind: r.text(1)?,
-                size: r.i64(2)?,
-            })),
+            Some(r) => {
+                Ok(Some(GitObjectRow { hash: r.text(0)?, kind: r.text(1)?, size: r.i64(2)? }))
+            }
             None => Ok(None),
         }
     }
@@ -190,16 +186,12 @@ impl RelationalGitDb {
         let rows = self
             .db
             .query(
-                &Query::new(
-                    "SELECT hash, type, size FROM git_objects WHERE volume_id=?1",
-                )
-                .bind(&self.volume_id),
+                &Query::new("SELECT hash, type, size FROM git_objects WHERE volume_id=?1")
+                    .bind(&self.volume_id),
             )
             .await?;
         rows.iter()
-            .map(|r| {
-                Ok(GitObjectRow { hash: r.text(0)?, kind: r.text(1)?, size: r.i64(2)? })
-            })
+            .map(|r| Ok(GitObjectRow { hash: r.text(0)?, kind: r.text(1)?, size: r.i64(2)? }))
             .collect()
     }
 
@@ -223,11 +215,9 @@ impl RelationalGitDb {
         let row = self
             .db
             .query_opt(
-                &Query::new(
-                    "SELECT target, symbolic FROM git_refs WHERE volume_id=?1 AND name=?2",
-                )
-                .bind(&self.volume_id)
-                .bind(name),
+                &Query::new("SELECT target, symbolic FROM git_refs WHERE volume_id=?1 AND name=?2")
+                    .bind(&self.volume_id)
+                    .bind(name),
             )
             .await?;
         match row {
@@ -281,11 +271,7 @@ impl RelationalGitDb {
             .await?;
         rows.iter()
             .map(|r| {
-                Ok(GitRefRow {
-                    name: r.text(0)?,
-                    target: r.text(1)?,
-                    symbolic: r.i64(2)? != 0,
-                })
+                Ok(GitRefRow { name: r.text(0)?, target: r.text(1)?, symbolic: r.i64(2)? != 0 })
             })
             .collect()
     }
@@ -294,9 +280,7 @@ impl RelationalGitDb {
 
     pub async fn add_remote(&self, name: &str, url: &str) -> Result<()> {
         let sql = self.upsert_sql("git_remotes", vec!["volume_id", "name", "url"]);
-        self.db
-            .execute(&Query::new(sql).bind(&self.volume_id).bind(name).bind(url))
-            .await?;
+        self.db.execute(&Query::new(sql).bind(&self.volume_id).bind(name).bind(url)).await?;
         Ok(())
     }
 
@@ -315,10 +299,8 @@ impl RelationalGitDb {
         let rows = self
             .db
             .query(
-                &Query::new(
-                    "SELECT name, url FROM git_remotes WHERE volume_id=?1 ORDER BY name",
-                )
-                .bind(&self.volume_id),
+                &Query::new("SELECT name, url FROM git_remotes WHERE volume_id=?1 ORDER BY name")
+                    .bind(&self.volume_id),
             )
             .await?;
         rows.iter().map(|r| Ok((r.text(0)?, r.text(1)?))).collect()
@@ -338,10 +320,7 @@ mod tests {
     #[tokio::test]
     async fn schema_has_the_three_tables() {
         let d = db().await;
-        assert_eq!(
-            d.table_names().await.unwrap(),
-            vec!["git_objects", "git_refs", "git_remotes"]
-        );
+        assert_eq!(d.table_names().await.unwrap(), vec!["git_objects", "git_refs", "git_remotes"]);
     }
 
     #[tokio::test]
@@ -374,10 +353,7 @@ mod tests {
         for h in ["abcd01", "abcd02", "abce03", "ffff04"] {
             d.record_object(h, "blob", 1).await.unwrap();
         }
-        assert_eq!(
-            d.find_objects_by_prefix("abcd").await.unwrap(),
-            vec!["abcd01", "abcd02"]
-        );
+        assert_eq!(d.find_objects_by_prefix("abcd").await.unwrap(), vec!["abcd01", "abcd02"]);
         assert_eq!(d.find_objects_by_prefix("abc").await.unwrap().len(), 3);
         assert_eq!(d.find_objects_by_prefix("ffff04").await.unwrap(), vec!["ffff04"]);
         assert!(d.find_objects_by_prefix("zz").await.unwrap().is_empty());
@@ -435,8 +411,7 @@ mod tests {
         d.set_ref("refs/tags/v1", "t1", false).await.unwrap();
         d.set_ref("HEAD", "refs/heads/main", true).await.unwrap();
         d.set_ref("refs/heads/main", "m1", false).await.unwrap();
-        let names: Vec<String> =
-            d.list_refs().await.unwrap().into_iter().map(|r| r.name).collect();
+        let names: Vec<String> = d.list_refs().await.unwrap().into_iter().map(|r| r.name).collect();
         assert_eq!(names, vec!["HEAD", "refs/heads/main", "refs/tags/v1"]);
     }
 

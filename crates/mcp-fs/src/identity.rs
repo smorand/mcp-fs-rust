@@ -119,26 +119,23 @@ impl IdentityResolver {
         for name in [self.header.as_str(), "Authorization"] {
             if let Some(raw) = get(name) {
                 let t = raw.trim();
-                if let Some(rest) = t
-                    .strip_prefix("Bearer ")
-                    .or_else(|| t.strip_prefix("bearer "))
+                if let Some(rest) = t.strip_prefix("Bearer ").or_else(|| t.strip_prefix("bearer "))
                 {
                     return Some(rest.trim().to_string());
                 }
-                if let Some(b64) = t
-                    .strip_prefix("Basic ")
-                    .or_else(|| t.strip_prefix("basic "))
-                {
+                if let Some(b64) = t.strip_prefix("Basic ").or_else(|| t.strip_prefix("basic ")) {
                     use base64::Engine;
                     if let Ok(decoded) =
                         base64::engine::general_purpose::STANDARD.decode(b64.trim())
-                        && let Ok(s) = String::from_utf8(decoded) {
-                            // "user:token" -> the password is the bearer
-                            if let Some((_, pass)) = s.split_once(':')
-                                && !pass.is_empty() {
-                                    return Some(pass.to_string());
-                                }
+                        && let Ok(s) = String::from_utf8(decoded)
+                    {
+                        // "user:token" -> the password is the bearer
+                        if let Some((_, pass)) = s.split_once(':')
+                            && !pass.is_empty()
+                        {
+                            return Some(pass.to_string());
                         }
+                    }
                 }
                 // A bare token with no scheme is accepted too.
                 if !t.is_empty() && !t.contains(' ') {
@@ -177,15 +174,9 @@ impl IdentityResolver {
         let data = jsonwebtoken::decode::<Value>(token, key, &v)
             .map_err(|e| ToolError::unauthenticated(format!("invalid token: {e}")))?;
 
-        let person = data
-            .claims
-            .get(&self.username_claim)
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ToolError::unauthenticated(format!(
-                    "token has no '{}' claim",
-                    self.username_claim
-                ))
+        let person =
+            data.claims.get(&self.username_claim).and_then(Value::as_str).ok_or_else(|| {
+                ToolError::unauthenticated(format!("token has no '{}' claim", self.username_claim))
             })?;
         if person.trim().is_empty() {
             return Err(ToolError::unauthenticated("token identity claim is empty"));
@@ -371,10 +362,7 @@ mod tests {
     #[test]
     fn a_token_signed_with_an_unaccepted_algorithm_is_rejected() {
         let (pk, pubk) = keypair();
-        let t = mint(
-            &pk,
-            json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() + 3600}),
-        );
+        let t = mint(&pk, json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() + 3600}));
 
         let mut r = IdentityResolver::from_pem(&pubk, Some("web-a2a"), "email").unwrap();
         assert_eq!(r.verify(&t).unwrap(), "a@b.c", "RS256 accepted by default");
@@ -404,10 +392,7 @@ mod tests {
             &pk,
             json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() - 29, "nbf": now() - 60}),
         );
-        assert!(
-            r.verify(&t).is_ok(),
-            "token expiring 29s ago must be accepted within 30s skew"
-        );
+        assert!(r.verify(&t).is_ok(), "token expiring 29s ago must be accepted within 30s skew");
     }
 
     /// A token whose exp is just beyond the skew boundary (now - 31) must be rejected.
@@ -420,10 +405,7 @@ mod tests {
             &pk,
             json!({"email": "a@b.c", "iss": "web-a2a", "exp": now() - 31, "nbf": now() - 60}),
         );
-        assert!(
-            r.verify(&t).is_err(),
-            "token expiring 31s ago must be rejected (beyond 30s skew)"
-        );
+        assert!(r.verify(&t).is_err(), "token expiring 31s ago must be rejected (beyond 30s skew)");
     }
 
     /// A token with no `exp` claim must be rejected; we require expiry.

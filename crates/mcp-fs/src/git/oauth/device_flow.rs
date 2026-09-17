@@ -165,7 +165,11 @@ impl HttpDeviceFlowClient {
 
     /// Point the GitHub endpoints somewhere else, so the parsing and the form
     /// encoding can be tested against a local server instead of github.com.
-    pub fn with_github_urls(mut self, device_url: impl Into<String>, token_url: impl Into<String>) -> Self {
+    pub fn with_github_urls(
+        mut self,
+        device_url: impl Into<String>,
+        token_url: impl Into<String>,
+    ) -> Self {
         self.github_device_url = device_url.into();
         self.github_token_url = token_url.into();
         self
@@ -388,7 +392,9 @@ impl TokenBody {
                 TokenPoll::granted(token, scopes, expires_at)
             }
             // No token yet: the provider tells us why, defaulting to "keep polling".
-            None => TokenPoll::pending(self.error.unwrap_or_else(|| "authorization_pending".into())),
+            None => {
+                TokenPoll::pending(self.error.unwrap_or_else(|| "authorization_pending".into()))
+            }
         }
     }
 }

@@ -173,10 +173,7 @@ impl VolumeClient {
         if n.is_dir() {
             return Err(ToolError::invalid_argument(format!("'{src}' is a directory")));
         }
-        let gc = self
-            .meta
-            .put_file(dst, n.sha256.as_deref(), n.size, n.mode)
-            .await?;
+        let gc = self.meta.put_file(dst, n.sha256.as_deref(), n.size, n.mode).await?;
         if let Some(dead) = gc {
             self.blob.delete(&dead).await?;
         }
@@ -193,9 +190,10 @@ impl VolumeClient {
                 self.meta.mkdirs(&target, true).await?;
             } else {
                 if let Some(parent) = PosixPath::parent_of(&target)
-                    && parent != "/" {
-                        self.meta.mkdirs(&parent, true).await?;
-                    }
+                    && parent != "/"
+                {
+                    self.meta.mkdirs(&parent, true).await?;
+                }
                 if let Some(dead) =
                     self.meta.put_file(&target, n.sha256.as_deref(), n.size, n.mode).await?
                 {

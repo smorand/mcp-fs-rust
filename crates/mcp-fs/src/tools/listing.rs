@@ -126,10 +126,8 @@ mod tests {
     async fn list_dir_with_sizes_adds_size_and_mtime() {
         let h = harness().await;
         h.seed("/a.txt", "hello\n").await;
-        let r = h
-            .call("fs.list_dir", json!({"mount_id": MOUNT, "with_sizes": true}))
-            .await
-            .unwrap();
+        let r =
+            h.call("fs.list_dir", json!({"mount_id": MOUNT, "with_sizes": true})).await.unwrap();
         assert_eq!(r["entries"][0]["size"], 6);
         assert!(r["entries"][0]["mtime"].is_number());
     }
@@ -165,7 +163,8 @@ mod tests {
     #[tokio::test]
     async fn listing_a_missing_directory_is_not_found() {
         let h = harness().await;
-        let err = h.call("fs.list_dir", json!({"mount_id": MOUNT, "path": "/nope"})).await.unwrap_err();
+        let err =
+            h.call("fs.list_dir", json!({"mount_id": MOUNT, "path": "/nope"})).await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::NOT_FOUND);
     }
 }

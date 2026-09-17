@@ -51,28 +51,48 @@ impl ToolError {
     }
 
     // ── constructors, one per code (keeps call sites terse and consistent) ────
-    pub fn unauthenticated(m: impl Into<String>) -> Self { Self::new(code::UNAUTHENTICATED, m) }
-    pub fn forbidden(m: impl Into<String>) -> Self { Self::new(code::FORBIDDEN, m) }
+    pub fn unauthenticated(m: impl Into<String>) -> Self {
+        Self::new(code::UNAUTHENTICATED, m)
+    }
+    pub fn forbidden(m: impl Into<String>) -> Self {
+        Self::new(code::FORBIDDEN, m)
+    }
     pub fn project_not_found(id: &str) -> Self {
         Self::new(code::PROJECT_NOT_FOUND, format!("project '{id}' not found"))
     }
     pub fn project_exists(id: &str) -> Self {
         Self::new(code::PROJECT_EXISTS, format!("project '{id}' already exists"))
     }
-    pub fn path_out_of_bounds(m: impl Into<String>) -> Self { Self::new(code::PATH_OUT_OF_BOUNDS, m) }
+    pub fn path_out_of_bounds(m: impl Into<String>) -> Self {
+        Self::new(code::PATH_OUT_OF_BOUNDS, m)
+    }
     pub fn edit_without_prior_read(m: impl Into<String>) -> Self {
         Self::new(code::EDIT_WITHOUT_PRIOR_READ, m)
     }
-    pub fn no_clobber(m: impl Into<String>) -> Self { Self::new(code::NO_CLOBBER, m) }
-    pub fn not_found(m: impl Into<String>) -> Self { Self::new(code::NOT_FOUND, m) }
-    pub fn ambiguous_match(m: impl Into<String>) -> Self { Self::new(code::AMBIGUOUS_MATCH, m) }
-    pub fn no_match(m: impl Into<String>) -> Self { Self::new(code::NO_MATCH, m) }
+    pub fn no_clobber(m: impl Into<String>) -> Self {
+        Self::new(code::NO_CLOBBER, m)
+    }
+    pub fn not_found(m: impl Into<String>) -> Self {
+        Self::new(code::NOT_FOUND, m)
+    }
+    pub fn ambiguous_match(m: impl Into<String>) -> Self {
+        Self::new(code::AMBIGUOUS_MATCH, m)
+    }
+    pub fn no_match(m: impl Into<String>) -> Self {
+        Self::new(code::NO_MATCH, m)
+    }
     pub fn write_quota_exceeded(m: impl Into<String>) -> Self {
         Self::new(code::WRITE_QUOTA_EXCEEDED, m)
     }
-    pub fn invalid_argument(m: impl Into<String>) -> Self { Self::new(code::INVALID_ARGUMENT, m) }
-    pub fn not_supported(m: impl Into<String>) -> Self { Self::new(code::NOT_SUPPORTED, m) }
-    pub fn internal(m: impl Into<String>) -> Self { Self::new(code::INTERNAL_ERROR, m) }
+    pub fn invalid_argument(m: impl Into<String>) -> Self {
+        Self::new(code::INVALID_ARGUMENT, m)
+    }
+    pub fn not_supported(m: impl Into<String>) -> Self {
+        Self::new(code::NOT_SUPPORTED, m)
+    }
+    pub fn internal(m: impl Into<String>) -> Self {
+        Self::new(code::INTERNAL_ERROR, m)
+    }
 
     /// HTTP status for the REST data plane.
     ///
@@ -124,16 +144,24 @@ impl std::error::Error for ToolError {}
 
 /// Anything unexpected becomes an internal error, preserving the cause text.
 impl From<anyhow::Error> for ToolError {
-    fn from(e: anyhow::Error) -> Self { Self::internal(e.to_string()) }
+    fn from(e: anyhow::Error) -> Self {
+        Self::internal(e.to_string())
+    }
 }
 impl From<std::io::Error> for ToolError {
-    fn from(e: std::io::Error) -> Self { Self::internal(e.to_string()) }
+    fn from(e: std::io::Error) -> Self {
+        Self::internal(e.to_string())
+    }
 }
 impl From<rusqlite::Error> for ToolError {
-    fn from(e: rusqlite::Error) -> Self { Self::internal(format!("sqlite: {e}")) }
+    fn from(e: rusqlite::Error) -> Self {
+        Self::internal(format!("sqlite: {e}"))
+    }
 }
 impl From<serde_json::Error> for ToolError {
-    fn from(e: serde_json::Error) -> Self { Self::invalid_argument(format!("json: {e}")) }
+    fn from(e: serde_json::Error) -> Self {
+        Self::invalid_argument(format!("json: {e}"))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ToolError>;
@@ -184,12 +212,7 @@ mod tests {
             ToolError::edit_without_prior_read("x"),
             ToolError::no_match("x"),
         ] {
-            assert!(
-                e.is_client_error(),
-                "{} must be a 4xx, got {}",
-                e.code,
-                e.http_status()
-            );
+            assert!(e.is_client_error(), "{} must be a 4xx, got {}", e.code, e.http_status());
         }
         // Genuinely server side: not implemented, and an unexpected failure.
         assert!(!ToolError::not_supported("x").is_client_error());

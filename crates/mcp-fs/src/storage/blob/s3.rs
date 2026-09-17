@@ -84,14 +84,7 @@ impl BlobBackend for S3BlobStore {
     }
 
     async fn exists(&self, sha256: &str) -> Result<bool> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(sha256)
-            .send()
-            .await
-        {
+        match self.client.head_object().bucket(&self.bucket).key(sha256).send().await {
             Ok(_) => Ok(true),
             Err(e) => {
                 let s = e.to_string();
@@ -116,14 +109,7 @@ impl BlobBackend for S3BlobStore {
     }
 
     async fn ensure_bucket(&self) -> Result<()> {
-        if self
-            .client
-            .head_bucket()
-            .bucket(&self.bucket)
-            .send()
-            .await
-            .is_ok()
-        {
+        if self.client.head_bucket().bucket(&self.bucket).send().await.is_ok() {
             return Ok(());
         }
         match self.client.create_bucket().bucket(&self.bucket).send().await {
@@ -134,10 +120,7 @@ impl BlobBackend for S3BlobStore {
                 if s.contains("BucketAlreadyOwnedByYou") || s.contains("BucketAlreadyExists") {
                     Ok(())
                 } else {
-                    Err(ToolError::internal(format!(
-                        "s3 create bucket '{}': {e}",
-                        self.bucket
-                    )))
+                    Err(ToolError::internal(format!("s3 create bucket '{}': {e}", self.bucket)))
                 }
             }
         }
@@ -158,13 +141,7 @@ impl BlobBackend for S3BlobStore {
             };
             for obj in out.contents() {
                 if let Some(k) = obj.key() {
-                    let _ = self
-                        .client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(k)
-                        .send()
-                        .await;
+                    let _ = self.client.delete_object().bucket(&self.bucket).key(k).send().await;
                 }
             }
             if out.is_truncated().unwrap_or(false) {

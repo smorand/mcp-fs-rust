@@ -136,7 +136,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn a(v: Value) -> Args { Args::new(v) }
+    fn a(v: Value) -> Args {
+        Args::new(v)
+    }
 
     #[test]
     fn required_string_present_and_missing() {

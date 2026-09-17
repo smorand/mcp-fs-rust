@@ -27,9 +27,9 @@ pub(crate) fn register_sqlite_vec() {
         // is the same pattern used in the sqlite-vec crate itself.
         unsafe {
             #[allow(clippy::missing_transmute_annotations)]
-            rusqlite::ffi::sqlite3_auto_extension(Some(
-                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ())
-            ));
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
         }
     });
 }
@@ -44,9 +44,10 @@ impl SqliteDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(dir) = path.parent()
-            && !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
+        }
         // Register sqlite-vec before the first connection is opened so the
         // auto-extension hook is in place when Connection::open runs.
         #[cfg(feature = "rag")]
@@ -72,10 +73,8 @@ impl SqliteDb {
     where
         F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     {
-        let mut guard = self
-            .conn
-            .lock()
-            .map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
+        let mut guard =
+            self.conn.lock().map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
         let tx = guard.transaction()?;
         match f(&tx) {
             Ok(v) => {
@@ -113,19 +112,14 @@ impl SqliteDb {
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut guard = self
-            .conn
-            .lock()
-            .map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
+        let mut guard =
+            self.conn.lock().map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
         f(&mut guard)
     }
 
     /// Execute DDL / statements without a transaction wrapper (schema setup).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
+        let guard = self.conn.lock().map_err(|_| ToolError::internal("sqlite mutex poisoned"))?;
         guard.execute_batch(sql)?;
         Ok(())
     }
@@ -137,8 +131,7 @@ mod tests {
 
     fn db() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY, v INTEGER NOT NULL);")
-            .unwrap();
+        db.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY, v INTEGER NOT NULL);").unwrap();
         db
     }
 

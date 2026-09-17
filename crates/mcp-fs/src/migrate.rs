@@ -97,21 +97,15 @@ async fn copy_table(
     columns: &[&'static str],
     volume: Option<&str>,
 ) -> Result<u64> {
-    let col_list = columns
-        .iter()
-        .map(|c| src.dialect().quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let col_list =
+        columns.iter().map(|c| src.dialect().quote_ident(c)).collect::<Vec<_>>().join(", ");
 
     let (select, clear) = match volume {
         Some(_) => (
             format!("SELECT {col_list} FROM {table} WHERE volume_id=?1"),
             format!("DELETE FROM {table} WHERE volume_id=?1"),
         ),
-        None => (
-            format!("SELECT {col_list} FROM {table}"),
-            format!("DELETE FROM {table}"),
-        ),
+        None => (format!("SELECT {col_list} FROM {table}"), format!("DELETE FROM {table}")),
     };
 
     let mut select_q = Query::new(select);
@@ -128,11 +122,8 @@ async fn copy_table(
     let mut tx = dst.begin().await?;
     tx.execute(&clear_q).await?;
 
-    let dst_cols = columns
-        .iter()
-        .map(|c| dst.dialect().quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let dst_cols =
+        columns.iter().map(|c| dst.dialect().quote_ident(c)).collect::<Vec<_>>().join(", ");
 
     let mut written = 0u64;
     for chunk in rows.chunks(BATCH_ROWS) {
@@ -148,10 +139,7 @@ async fn copy_table(
             }
             placeholders.push(format!("({})", group.join(", ")));
         }
-        let sql = format!(
-            "INSERT INTO {table} ({dst_cols}) VALUES {}",
-            placeholders.join(", ")
-        );
+        let sql = format!("INSERT INTO {table} ({dst_cols}) VALUES {}", placeholders.join(", "));
         let mut q = Query::new(sql);
         for p in params {
             q = q.bind(p);
@@ -243,8 +231,7 @@ pub async fn migrate(from: &ServerConfig, to: &ServerConfig) -> Result<Migration
         // `nodes` before `blob_refs` only for readability: they are independent.
         for table in ["nodes", "blob_refs"] {
             let cols = columns_of(&meta_schema, table)?;
-            let n =
-                copy_table(&*src_meta, &*dst_meta, table, &cols, Some(project_id)).await?;
+            let n = copy_table(&*src_meta, &*dst_meta, table, &cols, Some(project_id)).await?;
             report.record(table, n);
 
             let want = count_rows(&*src_meta, table, Some(project_id)).await?;
@@ -342,7 +329,10 @@ mod tests {
         admin.add_member("proj-a", "Member@Example.com", "owner@example.com").await.unwrap();
         admin.create_project("proj-b", "other@example.com").await.unwrap();
 
-        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry());
+        let stores = crate::storage::StoreManager::new(
+            Arc::new(from.clone()),
+            crate::storage::test_registry(),
+        );
         let a = stores.client("proj-a").await.unwrap();
         a.write_text_atomic("/dir/one.txt", "hello").await.unwrap();
         a.write_text_atomic("/dir/two.txt", "world").await.unwrap();
@@ -379,8 +369,7 @@ mod tests {
             "migration must not widen an ACL"
         );
 
-        let dst_meta =
-            crate::storage::build_meta_store(&to, &dst_reg, "proj-a").await.unwrap();
+        let dst_meta = crate::storage::build_meta_store(&to, &dst_reg, "proj-a").await.unwrap();
         let after_a = dst_meta.subtree("/").await.unwrap();
         assert_eq!(
             before_a, after_a,
@@ -408,7 +397,10 @@ mod tests {
         let admin = crate::storage::build_admin_store(&from, &reg).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "o@e.com").await.unwrap();
-        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry());
+        let stores = crate::storage::StoreManager::new(
+            Arc::new(from.clone()),
+            crate::storage::test_registry(),
+        );
         stores.client("proj").await.unwrap().write_text_atomic("/f.txt", "x").await.unwrap();
 
         let report = migrate(&from, &to).await.unwrap();
@@ -427,7 +419,10 @@ mod tests {
         let admin = crate::storage::build_admin_store(&from, &reg).await.unwrap();
         admin.connect().await.unwrap();
         admin.create_project("proj", "o@e.com").await.unwrap();
-        let stores = crate::storage::StoreManager::new(Arc::new(from.clone()), crate::storage::test_registry());
+        let stores = crate::storage::StoreManager::new(
+            Arc::new(from.clone()),
+            crate::storage::test_registry(),
+        );
         let c = stores.client("proj").await.unwrap();
         c.write_text_atomic("/a.txt", "a").await.unwrap();
         c.write_text_atomic("/b.txt", "b").await.unwrap();
@@ -437,8 +432,7 @@ mod tests {
         assert_eq!(first.total_rows(), second.total_rows(), "a re run copies the same rows");
 
         let dst_reg = RelationalRegistry::new();
-        let dst_meta =
-            crate::storage::build_meta_store(&to, &dst_reg, "proj").await.unwrap();
+        let dst_meta = crate::storage::build_meta_store(&to, &dst_reg, "proj").await.unwrap();
         let nodes = dst_meta.subtree("/").await.unwrap();
         let files = nodes.iter().filter(|n| n.is_file()).count();
         assert_eq!(files, 2, "no duplicate rows after a second run");
@@ -481,7 +475,10 @@ mod tests {
 
         migrate(&from, &to).await.unwrap();
 
-        let dst_stores = crate::storage::StoreManager::new(Arc::new(to.clone()), crate::storage::test_registry());
+        let dst_stores = crate::storage::StoreManager::new(
+            Arc::new(to.clone()),
+            crate::storage::test_registry(),
+        );
         let c = dst_stores.client("proj").await.unwrap();
         c.write_text_atomic("/new.txt", "new").await.unwrap();
         assert_eq!(c.read_text("/kept.txt").await.unwrap(), "kept");

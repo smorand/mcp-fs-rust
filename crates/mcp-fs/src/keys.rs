@@ -134,11 +134,14 @@ mod tests {
     #[test]
     fn minted_token_round_trips_through_the_identity_resolver() {
         let kp = generate_keypair().unwrap();
-        let token =
-            mint_token(&kp.private_pem, "Me@Test.COM", DEFAULT_ISSUER, DEFAULT_CLAIM, 3600).unwrap();
-        let resolver =
-            IdentityResolver::from_pem(kp.public_pem.as_bytes(), Some(DEFAULT_ISSUER), DEFAULT_CLAIM)
-                .unwrap();
+        let token = mint_token(&kp.private_pem, "Me@Test.COM", DEFAULT_ISSUER, DEFAULT_CLAIM, 3600)
+            .unwrap();
+        let resolver = IdentityResolver::from_pem(
+            kp.public_pem.as_bytes(),
+            Some(DEFAULT_ISSUER),
+            DEFAULT_CLAIM,
+        )
+        .unwrap();
         // The resolver normalizes the identity caselessly.
         assert_eq!(resolver.verify(&token).unwrap(), "me@test.com");
     }
@@ -149,9 +152,12 @@ mod tests {
         let b = generate_keypair().unwrap();
         let token =
             mint_token(&a.private_pem, "me@test.com", DEFAULT_ISSUER, DEFAULT_CLAIM, 3600).unwrap();
-        let resolver =
-            IdentityResolver::from_pem(b.public_pem.as_bytes(), Some(DEFAULT_ISSUER), DEFAULT_CLAIM)
-                .unwrap();
+        let resolver = IdentityResolver::from_pem(
+            b.public_pem.as_bytes(),
+            Some(DEFAULT_ISSUER),
+            DEFAULT_CLAIM,
+        )
+        .unwrap();
         assert!(resolver.verify(&token).is_err());
     }
 
@@ -159,11 +165,14 @@ mod tests {
     fn negative_ttl_produces_an_expired_token() {
         let kp = generate_keypair().unwrap();
         // Beyond the resolver's 30 second clock skew allowance.
-        let token =
-            mint_token(&kp.private_pem, "me@test.com", DEFAULT_ISSUER, DEFAULT_CLAIM, -600).unwrap();
-        let resolver =
-            IdentityResolver::from_pem(kp.public_pem.as_bytes(), Some(DEFAULT_ISSUER), DEFAULT_CLAIM)
-                .unwrap();
+        let token = mint_token(&kp.private_pem, "me@test.com", DEFAULT_ISSUER, DEFAULT_CLAIM, -600)
+            .unwrap();
+        let resolver = IdentityResolver::from_pem(
+            kp.public_pem.as_bytes(),
+            Some(DEFAULT_ISSUER),
+            DEFAULT_CLAIM,
+        )
+        .unwrap();
         assert!(resolver.verify(&token).is_err());
     }
 

@@ -29,8 +29,7 @@ pub const ENV_HOME: &str = "HOME";
 pub const XDG_APP_DIR: &str = "mcp-fs";
 pub const XDG_CONFIG_FILE: &str = "config.yaml";
 
-const ABOUT: &str =
-    "mcp-fs: filesystem MCP server (SQLite metadata, object store or local blobs)";
+const ABOUT: &str = "mcp-fs: filesystem MCP server (SQLite metadata, object store or local blobs)";
 const AFTER_HELP: &str = "Config resolution, highest priority first:\n\
      \x20 1. --config PATH (-c)\n\
      \x20 2. $MCP_FS_CONFIG\n\
@@ -126,7 +125,15 @@ pub async fn run() -> ExitCode {
 
 /// Run an already parsed CLI. Split out so tests can drive it without a process.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command.unwrap_or(Command::Serve { config: None, git: false, web: false, context7: false, sqlite: false, db: false, doc: false }) {
+    match cli.command.unwrap_or(Command::Serve {
+        config: None,
+        git: false,
+        web: false,
+        context7: false,
+        sqlite: false,
+        db: false,
+        doc: false,
+    }) {
         Command::Version => {
             println!("{}", crate::app::VERSION);
             Ok(())
@@ -135,7 +142,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Token { email, key, issuer, claim, ttl } => {
             cmd_token(&email, key.as_deref(), &issuer, &claim, ttl)
         }
-        Command::Serve { config, git, web, context7, sqlite, db, doc } => cmd_serve(config.as_deref(), git, web, context7, sqlite, db, doc).await,
+        Command::Serve { config, git, web, context7, sqlite, db, doc } => {
+            cmd_serve(config.as_deref(), git, web, context7, sqlite, db, doc).await
+        }
         Command::Migrate { from, to } => cmd_migrate(&from, &to).await,
     }
 }
@@ -167,24 +176,43 @@ fn cmd_token(
     claim: &str,
     ttl: i64,
 ) -> anyhow::Result<()> {
-    let key_path = key
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(keys::default_private_key_path);
+    let key_path =
+        key.map(std::path::Path::to_path_buf).unwrap_or_else(keys::default_private_key_path);
     let token = keys::mint_token_from_file(&key_path, email, issuer, claim, ttl)?;
     // Nothing else on stdout: `mcp-fs token me@x.com > token.txt` must be usable.
     println!("{token}");
     Ok(())
 }
 
-async fn cmd_serve(explicit: Option<&std::path::Path>, git: bool, web: bool, context7: bool, sqlite: bool, db: bool, doc: bool) -> anyhow::Result<()> {
+async fn cmd_serve(
+    explicit: Option<&std::path::Path>,
+    git: bool,
+    web: bool,
+    context7: bool,
+    sqlite: bool,
+    db: bool,
+    doc: bool,
+) -> anyhow::Result<()> {
     crate::logging::init();
     let (mut config, resolved) = load_config(explicit)?;
-    if git      { config.git.enabled = true; }
-    if web      { config.web.enabled = true; }
-    if context7 { config.context7.enabled = true; }
-    if sqlite   { config.sqlite.enabled = true; }
-    if db       { config.db.enabled = true; }
-    if doc      { config.doc.enabled = true; }
+    if git {
+        config.git.enabled = true;
+    }
+    if web {
+        config.web.enabled = true;
+    }
+    if context7 {
+        config.context7.enabled = true;
+    }
+    if sqlite {
+        config.sqlite.enabled = true;
+    }
+    if db {
+        config.db.enabled = true;
+    }
+    if doc {
+        config.doc.enabled = true;
+    }
     // The banner goes to stderr so it never pollutes a piped stdout.
     eprintln!(
         "Serving mcp-fs {} on {}:{} (config={})",
@@ -268,11 +296,7 @@ fn load_config(explicit: Option<&std::path::Path>) -> Result<(ServerConfig, Path
             Ok((config, path))
         }
         Err(tried) => {
-            let list = tried
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let list = tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
             Err(ToolError::invalid_argument(format!(
                 "no configuration file found, tried: {list}. \
                  Pass --config PATH, set MCP_FS_CONFIG, or create one of those files"
@@ -448,10 +472,9 @@ mod tests {
 
     #[test]
     fn serve_accepts_short_and_long_config_flags() {
-        for args in [
-            vec!["mcp-fs", "serve", "--config", "a.yaml"],
-            vec!["mcp-fs", "serve", "-c", "a.yaml"],
-        ] {
+        for args in
+            [vec!["mcp-fs", "serve", "--config", "a.yaml"], vec!["mcp-fs", "serve", "-c", "a.yaml"]]
+        {
             match Cli::parse_from(args).command {
                 Some(Command::Serve { config, .. }) => {
                     assert_eq!(config, Some(PathBuf::from("a.yaml")));
@@ -513,8 +536,17 @@ mod tests {
     #[test]
     fn token_accepts_every_flag() {
         match Cli::parse_from([
-            "mcp-fs", "token", "me@test.com", "--key", "/k/jwt.key", "--issuer", "other",
-            "--claim", "upn", "--ttl", "60",
+            "mcp-fs",
+            "token",
+            "me@test.com",
+            "--key",
+            "/k/jwt.key",
+            "--issuer",
+            "other",
+            "--claim",
+            "upn",
+            "--ttl",
+            "60",
         ])
         .command
         {
@@ -577,12 +609,9 @@ mod tests {
     #[tokio::test]
     async fn serve_with_a_missing_config_fails() {
         assert!(
-            dispatch(Cli::parse_from([
-                "mcp-fs",
-                "serve",
-                "--config",
-                "/definitely/not/here.yaml",
-            ]))
+            dispatch(Cli::parse_from(
+                ["mcp-fs", "serve", "--config", "/definitely/not/here.yaml",]
+            ))
             .await
             .is_err()
         );

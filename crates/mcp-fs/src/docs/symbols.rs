@@ -56,12 +56,7 @@ const DEFINITION_KINDS: &[(&str, &[&str])] = &[
     ("python", &["function_definition", "class_definition"]),
     (
         "javascript",
-        &[
-            "function_declaration",
-            "class_declaration",
-            "method_definition",
-            "variable_declarator",
-        ],
+        &["function_declaration", "class_declaration", "method_definition", "variable_declarator"],
     ),
     (
         "typescript",
@@ -83,10 +78,7 @@ const DEFINITION_KINDS: &[(&str, &[&str])] = &[
     ),
     ("go", &["function_declaration", "method_declaration", "type_spec"]),
     ("rust", &["function_item", "struct_item", "enum_item", "trait_item"]),
-    (
-        "java",
-        &["method_declaration", "class_declaration", "interface_declaration"],
-    ),
+    ("java", &["method_declaration", "class_declaration", "interface_declaration"]),
     ("c", &["function_definition", "struct_specifier"]),
     ("cpp", &["function_definition", "class_specifier", "struct_specifier"]),
     ("ruby", &["method", "class", "module"]),
@@ -136,7 +128,12 @@ fn definition_kinds(language: &str) -> Option<&'static [&'static str]> {
 ///
 /// Falls back to the lexical matcher when the file has no grammar or when the
 /// parser cannot produce a tree.
-pub fn find_definitions(path: &str, source: &str, name: &str, kind: Option<&str>) -> Vec<Definition> {
+pub fn find_definitions(
+    path: &str,
+    source: &str,
+    name: &str,
+    kind: Option<&str>,
+) -> Vec<Definition> {
     let Some(language) = language_for(path) else {
         return Vec::new();
     };
@@ -311,7 +308,9 @@ fn build_lex_patterns() -> Vec<(&'static str, Vec<LexPattern>)> {
                 p("interface_declaration", format!(r"^\s*(?:export\s+)?interface\s+{ID}\b")),
                 p(
                     "method_definition",
-                    format!(r"^\s*(?:public|private|protected|static|async|\s)*{ID}\s*\([^)]*\)\s*[:{{]"),
+                    format!(
+                        r"^\s*(?:public|private|protected|static|async|\s)*{ID}\s*\([^)]*\)\s*[:{{]"
+                    ),
                 ),
             ],
         ),
@@ -351,7 +350,9 @@ fn build_lex_patterns() -> Vec<(&'static str, Vec<LexPattern>)> {
             vec![
                 p(
                     "class_declaration",
-                    format!(r"^\s*(?:public|private|protected|static|final|abstract|\s)*class\s+{ID}\b"),
+                    format!(
+                        r"^\s*(?:public|private|protected|static|final|abstract|\s)*class\s+{ID}\b"
+                    ),
                 ),
                 p(
                     "interface_declaration",
@@ -368,7 +369,10 @@ fn build_lex_patterns() -> Vec<(&'static str, Vec<LexPattern>)> {
         (
             "c",
             vec![
-                p("function_definition", format!(r"^\s*[\w\*\s]+?\s+\*?{ID}\s*\([^;]*\)\s*\{{?\s*$")),
+                p(
+                    "function_definition",
+                    format!(r"^\s*[\w\*\s]+?\s+\*?{ID}\s*\([^;]*\)\s*\{{?\s*$"),
+                ),
                 p("struct_specifier", format!(r"^\s*struct\s+{ID}\b")),
             ],
         ),
@@ -396,12 +400,19 @@ fn build_lex_patterns() -> Vec<(&'static str, Vec<LexPattern>)> {
 
 fn identifier_rx() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
-    RX.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("identifier pattern must compile"))
+    RX.get_or_init(|| {
+        Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("identifier pattern must compile")
+    })
 }
 
 /// Line oriented definition search. Public so callers can force the fallback
 /// (the tests do, to prove the two paths agree on shape).
-pub fn lexical_definitions(path: &str, source: &str, name: &str, kind: Option<&str>) -> Vec<Definition> {
+pub fn lexical_definitions(
+    path: &str,
+    source: &str,
+    name: &str,
+    kind: Option<&str>,
+) -> Vec<Definition> {
     let Some(language) = language_for(path) else {
         return Vec::new();
     };
@@ -493,7 +504,8 @@ mod tests {
 
     #[test]
     fn python_definition_via_tree_sitter() {
-        let src = "class Store:\n    def put(self, k):\n        return k\n\ndef helper():\n    pass\n";
+        let src =
+            "class Store:\n    def put(self, k):\n        return k\n\ndef helper():\n    pass\n";
         let defs = find_definitions("/x.py", src, "helper", None);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].kind, "function_definition");

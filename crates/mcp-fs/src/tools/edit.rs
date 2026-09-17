@@ -93,7 +93,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_str("search_block", "Multi-line block of text to locate.")
             .req_str("replace_block", "Multi-line block that replaces search_block.")
-            .opt_bool("fuzzy", false, "Allow whitespace tolerant (fuzzy) matching of search_block."),
+            .opt_bool(
+                "fuzzy",
+                false,
+                "Allow whitespace tolerant (fuzzy) matching of search_block.",
+            ),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -143,9 +147,14 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("patch_text", "Multi-file V4A patch text to apply within the volume."),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
-            let out =
-                fs_ops::apply_patch(&client, &ctx.state.safety, &ctx.person, &mount, &a.str("patch_text")?)
-                    .await?;
+            let out = fs_ops::apply_patch(
+                &client,
+                &ctx.state.safety,
+                &ctx.person,
+                &mount,
+                &a.str("patch_text")?,
+            )
+            .await?;
             reindex_patched_files(&ctx, &mount, &client, &out).await;
             Ok(out)
         }),
@@ -196,13 +205,8 @@ mod tests {
     use crate::errors::code;
     use crate::tools::testkit::{MOUNT, assert_description, assert_family, assert_schema, harness};
 
-    const NAMES: &[&str] = &[
-        "fs.edit",
-        "fs.multi_edit",
-        "fs.search_replace",
-        "fs.insert_at_line",
-        "fs.apply_patch",
-    ];
+    const NAMES: &[&str] =
+        &["fs.edit", "fs.multi_edit", "fs.search_replace", "fs.insert_at_line", "fs.apply_patch"];
 
     #[test]
     fn family_registers_every_tool() {
@@ -223,7 +227,11 @@ mod tests {
                  "dry_run":{"description":"Return the diff without writing changes.","type":"boolean","default":false}},
                "required":["mount_id","path","old_string","new_string"]}"#,
         );
-        assert_description(register, "fs.edit", "Replace a unique string; dry_run returns the diff.");
+        assert_description(
+            register,
+            "fs.edit",
+            "Replace a unique string; dry_run returns the diff.",
+        );
     }
 
     /// The nested `edits` items schema is the part most likely to drift.
@@ -431,12 +439,15 @@ mod tests {
         // Record the dir path as read so the guard lets us through to the actual error.
         h.state.safety.record_read(crate::tools::testkit::PERSON, MOUNT, "/mydir");
         let err = h
-            .call("fs.edit", serde_json::json!({
-                "mount_id": MOUNT,
-                "path": "/mydir",
-                "old_string": "x",
-                "new_string": "y"
-            }))
+            .call(
+                "fs.edit",
+                serde_json::json!({
+                    "mount_id": MOUNT,
+                    "path": "/mydir",
+                    "old_string": "x",
+                    "new_string": "y"
+                }),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
@@ -448,35 +459,19 @@ mod tests {
         h.seed("/ins.txt", "first\n").await;
         // line=-5 clamps to 0, which inserts before the first line.
         let r = h
-            .call("fs.insert_at_line", serde_json::json!({
-                "mount_id": MOUNT,
-                "path": "/ins.txt",
-                "line": -5,
-                "content": "top"
-            }))
+            .call(
+                "fs.insert_at_line",
+                serde_json::json!({
+                    "mount_id": MOUNT,
+                    "path": "/ins.txt",
+                    "line": -5,
+                    "content": "top"
+                }),
+            )
             .await
             .unwrap();
         assert_eq!(r["applied"], true);
         let content = h.client().await.read_text("/ins.txt").await.unwrap();
         assert!(content.starts_with("top"), "expected 'top' at the start, got: {content}");
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }

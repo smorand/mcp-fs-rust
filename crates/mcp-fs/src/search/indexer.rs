@@ -81,7 +81,9 @@ impl<'a> ProjectIndexer<'a> {
         let vol = volume_id.to_string();
         tokio::task::spawn(async move {
             match full_index(&backend, &vol, &client).await {
-                Ok(n) => tracing::info!(volume_id = %vol, chunks = n, "initial full index finished"),
+                Ok(n) => {
+                    tracing::info!(volume_id = %vol, chunks = n, "initial full index finished")
+                }
                 Err(e) => {
                     tracing::warn!(volume_id = %vol, error = %e, "initial full index failed")
                 }
@@ -224,7 +226,12 @@ pub async fn after_delete_many(state: &AppState, volume_id: &str, paths: &[Strin
 /// A directory delete takes every file underneath it, and each one has its own
 /// index entries. Collected BEFORE the delete, because afterwards the tree is
 /// gone. Returns just `path` when it is a file or cannot be walked.
-pub async fn paths_under(state: &AppState, volume_id: &str, path: &str, client: &VolumeClient) -> Vec<String> {
+pub async fn paths_under(
+    state: &AppState,
+    volume_id: &str,
+    path: &str,
+    client: &VolumeClient,
+) -> Vec<String> {
     if active_backend(state, volume_id).await.is_none() {
         return Vec::new();
     }
@@ -256,7 +263,12 @@ pub async fn after_move(
 
 /// Index the destination of a copy. The source keeps the entries it had, which
 /// are still true: a copy leaves it untouched.
-pub async fn after_copy(state: &AppState, volume_id: &str, destination: &str, client: &VolumeClient) {
+pub async fn after_copy(
+    state: &AppState,
+    volume_id: &str,
+    destination: &str,
+    client: &VolumeClient,
+) {
     if let Some(backend) = active_backend(state, volume_id).await {
         index_tree(backend, volume_id, destination, client).await;
     }
@@ -329,9 +341,7 @@ mod tests {
             chunk_size: usize,
             chunk_overlap: usize,
         ) -> Result<usize> {
-            self.record(format!(
-                "index {volume_id} {path} '{text}' {chunk_size}/{chunk_overlap}"
-            ));
+            self.record(format!("index {volume_id} {path} '{text}' {chunk_size}/{chunk_overlap}"));
             if self.fail_index {
                 return Err(ToolError::internal("embedding endpoint is down"));
             }
@@ -357,12 +367,7 @@ mod tests {
         }
 
         async fn stats(&self, _volume_id: &str) -> Result<IndexStats> {
-            Ok(IndexStats {
-                bm25_docs: 0,
-                vector_chunks: 0,
-                bm25_warm: false,
-                mode: "bm25".into(),
-            })
+            Ok(IndexStats { bm25_docs: 0, vector_chunks: 0, bm25_warm: false, mode: "bm25".into() })
         }
 
         fn supported_modes(&self) -> Vec<&'static str> {
@@ -458,10 +463,7 @@ mod tests {
         let (backend, rec) = recording();
         let client = client().await;
         client.write_text_atomic("/good.md", "readable").await.expect("seed");
-        client
-            .write_bytes_atomic("/bad.bin", &[0xFF, 0xFE, 0x00])
-            .await
-            .expect("seed");
+        client.write_bytes_atomic("/bad.bin", &[0xFF, 0xFE, 0x00]).await.expect("seed");
 
         full_index(&backend, "proj", &client).await.expect("the pass must succeed");
         let calls = rec.calls();
