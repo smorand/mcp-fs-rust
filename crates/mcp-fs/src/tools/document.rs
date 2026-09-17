@@ -34,7 +34,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::extract_document(
+            let out = fs_ops::extract_document(
                 &client,
                 &ctx.state.safety,
                 &ctx.state.config.extract.ocr,
@@ -46,7 +46,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 a.bool_or("ocr", true),
                 a.bool_or("refresh", false),
             )
-            .await
+            .await?;
+            // The companion is the text worth indexing here; the source is a PDF
+            // or a .docx the reread would skip.
+            crate::search::indexer::after_companion(&ctx.state, &mount, &out, &client).await;
+            Ok(out)
         }),
     );
 
@@ -102,7 +106,7 @@ pub fn register(reg: &mut ToolRegistry) {
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            fs_ops::documentize(
+            let out = fs_ops::documentize(
                 &client,
                 &ctx.state.safety,
                 ctx.state.doc_service.as_deref(),
@@ -111,7 +115,9 @@ pub fn register(reg: &mut ToolRegistry) {
                 &path,
                 a.bool_or("overwrite", false),
             )
-            .await
+            .await?;
+            crate::search::indexer::after_companion(&ctx.state, &mount, &out, &client).await;
+            Ok(out)
         }),
     );
 }

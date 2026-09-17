@@ -560,6 +560,9 @@ async fn upload(
             if let Ok(text) = std::str::from_utf8(data) {
                 crate::search::indexer::after_write(&r.state, &r.mount, dest, text).await;
             }
+            // The Markdown companion, when the flag produced one, IS text, and
+            // nothing above covers it: the source hook indexes the source only.
+            crate::search::indexer::after_companion(&r.state, &r.mount, &result, &r.client).await;
             written.push(dest.clone());
         }
         Ok(json!({"written": written, "count": written.len(), "documentation": reports}))
@@ -980,17 +983,21 @@ async fn write(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::write_text(
+        let content = a.str("content")?;
+        let out = fs_ops::write_text(
             &r.client,
             r.safety(),
             &r.person,
             &r.mount,
             &norm,
-            &a.str("content")?,
+            &content,
             a.bool_or("overwrite", false),
             a.bool_or("create_parents", true),
         )
-        .await
+        .await?;
+        // The new text is already in hand, so no read back is needed.
+        crate::search::indexer::after_write(&r.state, &r.mount, &norm, &content).await;
+        Ok(out)
     })
     .await
 }
@@ -1004,7 +1011,7 @@ async fn append(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::append_text(
+        let out = fs_ops::append_text(
             &r.client,
             r.safety(),
             &r.person,
@@ -1013,7 +1020,10 @@ async fn append(
             &a.str("content")?,
             a.bool_or("create", false),
         )
-        .await
+        .await?;
+        // Only the appended fragment is in hand, so the whole file is re-read.
+        crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1076,7 +1086,8 @@ async fn edit(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::edit_unique(
+        let dry_run = a.bool_or("dry_run", false);
+        let out = fs_ops::edit_unique(
             &r.client,
             r.safety(),
             &r.person,
@@ -1085,9 +1096,13 @@ async fn edit(
             &a.str("old_string")?,
             &a.str("new_string")?,
             a.bool_or("replace_all", false),
-            a.bool_or("dry_run", false),
+            dry_run,
         )
-        .await
+        .await?;
+        if !dry_run {
+            crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        }
+        Ok(out)
     })
     .await
 }
@@ -1108,16 +1123,14 @@ async fn multi_edit(
             }
             None => return Err(ToolError::invalid_argument("missing required argument 'edits'")),
         };
-        fs_ops::multi_edit(
-            &r.client,
-            r.safety(),
-            &r.person,
-            &r.mount,
-            &norm,
-            &edits,
-            a.bool_or("dry_run", false),
-        )
-        .await
+        let dry_run = a.bool_or("dry_run", false);
+        let out =
+            fs_ops::multi_edit(&r.client, r.safety(), &r.person, &r.mount, &norm, &edits, dry_run)
+                .await?;
+        if !dry_run {
+            crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        }
+        Ok(out)
     })
     .await
 }
@@ -1131,7 +1144,7 @@ async fn search_replace(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::search_replace(
+        let out = fs_ops::search_replace(
             &r.client,
             r.safety(),
             &r.person,
@@ -1141,7 +1154,9 @@ async fn search_replace(
             &a.str("replace_block")?,
             a.bool_or("fuzzy", false),
         )
-        .await
+        .await?;
+        crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1155,7 +1170,7 @@ async fn insert_at_line(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::insert_at_line(
+        let out = fs_ops::insert_at_line(
             &r.client,
             r.safety(),
             &r.person,
@@ -1164,7 +1179,9 @@ async fn insert_at_line(
             a.int("line")?,
             &a.str("content")?,
         )
-        .await
+        .await?;
+        crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1180,7 +1197,11 @@ async fn apply_patch(
 ) -> Response {
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
-        fs_ops::apply_patch(&r.client, r.safety(), &r.person, &r.mount, &a.str("patch_text")?).await
+        let out =
+            fs_ops::apply_patch(&r.client, r.safety(), &r.person, &r.mount, &a.str("patch_text")?)
+                .await?;
+        crate::search::indexer::after_patch(&r.state, &r.mount, &out, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1194,7 +1215,7 @@ async fn extract_text(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::extract_document(
+        let out = fs_ops::extract_document(
             &r.client,
             r.safety(),
             &r.state.config.extract.ocr,
@@ -1206,7 +1227,9 @@ async fn extract_text(
             a.bool_or("ocr", true),
             a.bool_or("refresh", false),
         )
-        .await
+        .await?;
+        crate::search::indexer::after_companion(&r.state, &r.mount, &out, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1220,7 +1243,7 @@ async fn write_docx(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::write_docx(
+        let out = fs_ops::write_docx(
             &r.client,
             r.safety(),
             &r.person,
@@ -1230,7 +1253,11 @@ async fn write_docx(
             a.opt_str("title").as_deref(),
             a.bool_or("overwrite", false),
         )
-        .await
+        .await?;
+        // A .docx is a zip, so the reread skips it. The hook is here to mirror
+        // `fs.write_docx` exactly rather than leave a door with its own rule.
+        crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1250,7 +1277,7 @@ async fn write_bytes(
             .map_err(|e| {
                 ToolError::invalid_argument(format!("argument 'base64' is not valid base64: {e}"))
             })?;
-        fs_ops::write_bytes_documented(
+        let out = fs_ops::write_bytes_documented(
             &r.client,
             r.safety(),
             r.state.doc_service.as_deref(),
@@ -1262,7 +1289,12 @@ async fn write_bytes(
             a.bool_or("create_parents", true),
             a.bool_or("trigger_documentation_service", false),
         )
-        .await
+        .await?;
+        // A binary payload has no text to index and is skipped by the reread.
+        crate::search::indexer::after_write_reread(&r.state, &r.mount, &norm, &r.client).await;
+        // The Markdown companion, when the flag produced one, IS text.
+        crate::search::indexer::after_companion(&r.state, &r.mount, &out, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1277,7 +1309,7 @@ async fn documentize(
     guarded_json(state, headers, mount, |r| async move {
         let a = body_args(&body)?;
         let norm = r.norm(&a.str("path")?)?;
-        fs_ops::documentize(
+        let out = fs_ops::documentize(
             &r.client,
             r.safety(),
             r.state.doc_service.as_deref(),
@@ -1286,7 +1318,9 @@ async fn documentize(
             &norm,
             a.bool_or("overwrite", false),
         )
-        .await
+        .await?;
+        crate::search::indexer::after_companion(&r.state, &r.mount, &out, &r.client).await;
+        Ok(out)
     })
     .await
 }

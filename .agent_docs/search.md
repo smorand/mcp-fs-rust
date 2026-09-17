@@ -63,17 +63,31 @@ which is why it reports `reindex_started: false`.
 
 While a project's mode is active, every write reaches the index without a
 `search.index` call: `fs.write`, `fs.append`, `fs.write_bytes`, `fs.write_docx`,
-`fs.edit`, `fs.multi_edit`, `fs.search_replace`, `fs.insert_at_line`, `fs.apply_patch`
-and the REST `POST /api/fs/{mount}/upload`. `fs.delete` removes the deleted path, and
+`fs.edit`, `fs.multi_edit`, `fs.search_replace`, `fs.insert_at_line` and
+`fs.apply_patch`. `fs.delete` removes the deleted path, and
 every file underneath it for a recursive delete. `fs.move` and `fs.copy` follow the
 bytes (see below). A `dry_run` edit writes nothing and so
 indexes nothing. Files that are not valid UTF-8 are skipped silently, which covers
 binary uploads and the `.docx` that `fs.write_docx` produces.
 
+`fs.create_empty` runs no hook: an empty file has no content to index.
+
 The REST data plane is the same engine behind a second door, and it runs the same
-hooks: `POST /api/fs/{mount}/write`, `/delete`, `/move`, `/copy` and `/upload` index
-exactly what their `fs.*` twins index, recursive delete included. Write, delete, move,
-copy and upload behave identically through both doors.
+hooks: every `/api/fs/{mount}/` route that mutates content calls the very helper
+its `fs.*` twin calls, so the two doors index the same thing for write, append,
+edit, multi-edit, search-replace, insert-at-line, apply-patch, write-bytes,
+write-docx, extract-text, documentize, delete, move, copy and upload.
+
+#### The Markdown companion
+
+`fs.extract_text`, `fs.documentize` and a `trigger_documentation_service` write
+store a Markdown COMPANION next to the source, and that companion is the text
+RAG exists for: the source itself is a PDF or a zip the reread skips. It is
+indexed by `indexer::after_companion`, the one helper that decodes both payload
+shapes (a top level `md_path`, and the nested `documentation.md_path` a
+documented write returns). A null companion or a failed conversion indexes
+nothing. A documented upload indexes BOTH the source, when it is text, and the
+companion.
 
 The work is fire and forget (`search/indexer.rs`): the write returns as soon as the
 bytes are committed, and the index call runs on a detached task whose failures are a

@@ -17,6 +17,20 @@ mod shared {
     /// The mount / project id used across all e2e tests — same as `testkit::MOUNT`.
     pub const MOUNT: &str = "proj";
 
+    /// What the injected document service converts every document to. Carries a
+    /// marker word so a scenario can prove the COMPANION reached the index,
+    /// rather than the binary source that sits next to it.
+    pub const STUB_MD: &str = "# companion markdown about the ocelot\n";
+
+    /// The document service every e2e harness carries.
+    ///
+    /// The companion writing surfaces (`fs.documentize`, `fs.extract_text`, the
+    /// documented write) are unreachable without one, and a stub keeps the suite
+    /// offline and free of a converter binary.
+    pub fn stub_doc_service() -> std::sync::Arc<dyn crate::docs::DocService> {
+        std::sync::Arc::new(crate::docs::service::StubDocService::ok(STUB_MD))
+    }
+
     // ── fake embedding server ─────────────────────────────────────────────────
 
     /// Spawn an inline axum stub on an ephemeral port that returns a fixed
@@ -157,10 +171,44 @@ mod shared {
             content: &str,
             person: &str,
         ) -> (axum::http::StatusCode, serde_json::Value) {
+            self.upload(mount, directory, file_name, content, person, false).await
+        }
+
+        /// The same upload with `trigger_documentation_service` on, so the
+        /// handler writes the Markdown companion beside the source.
+        pub async fn rest_upload_documented(
+            &self,
+            mount: &str,
+            directory: &str,
+            file_name: &str,
+            content: &str,
+            person: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            self.upload(mount, directory, file_name, content, person, true).await
+        }
+
+        async fn upload(
+            &self,
+            mount: &str,
+            directory: &str,
+            file_name: &str,
+            content: &str,
+            person: &str,
+            documentation: bool,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
             const BOUNDARY: &str = "E2E-BOUNDARY";
+            let trigger = if documentation {
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; \
+                     name=\"trigger_documentation_service\"\r\n\r\ntrue\r\n"
+                )
+            } else {
+                String::new()
+            };
             let body = format!(
                 "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"directory\"\r\n\r\n\
                  {directory}\r\n\
+                 {trigger}\
                  --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"files\"; \
                  filename=\"{file_name}\"\r\n\r\n{content}\r\n\
                  --{BOUNDARY}--\r\n"
@@ -292,7 +340,7 @@ mod shared {
     pub async fn make_sqlite_rag_harness(embedding_url: &str, dims: u32) -> E2eHarness {
         use crate::config::EmbeddingConfig;
         use crate::search::vector_sqlite::SqliteVecBackend;
-        use crate::tools::testkit::harness_with_search;
+        use crate::tools::testkit::harness_with_search_and_doc_service;
         use std::sync::Arc;
 
         // Ensure sqlite-vec extension is loaded.
@@ -316,7 +364,7 @@ mod shared {
         let endpoint_for_config = format!("{embedding_url}/v1/embeddings");
         let keys = jwt_keys();
         let public_key_path = keys.public.clone();
-        let h = harness_with_search(
+        let h = harness_with_search_and_doc_service(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "rag".into();
@@ -325,6 +373,7 @@ mod shared {
                 c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
+            Some(stub_doc_service()),
         )
         .await;
 
@@ -336,7 +385,7 @@ mod shared {
     /// rejection case as well as for plain BM25 auto indexing.
     pub async fn make_sqlite_bm25_harness() -> E2eHarness {
         use crate::search::bm25_sqlite::TantivyBm25Backend;
-        use crate::tools::testkit::harness_with_search;
+        use crate::tools::testkit::harness_with_search_and_doc_service;
         use std::sync::Arc;
 
         let tantivy_dir = tempfile::tempdir().expect("failed to create tantivy temp dir");
@@ -346,13 +395,14 @@ mod shared {
 
         let keys = jwt_keys();
         let public_key_path = keys.public.clone();
-        let h = harness_with_search(
+        let h = harness_with_search_and_doc_service(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "bm25".into();
                 c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
+            Some(stub_doc_service()),
         )
         .await;
 
@@ -375,7 +425,7 @@ mod shared {
         use crate::config::EmbeddingConfig;
         use crate::search::vector_pg::PostgresVectorBackend;
         use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
-        use crate::tools::testkit::harness_with_search;
+        use crate::tools::testkit::harness_with_search_and_doc_service;
         use std::sync::Arc;
 
         let db = PostgresRelationalDb::connect(dsn, schema, PoolSettings::default())
@@ -399,7 +449,7 @@ mod shared {
         let endpoint_for_config = format!("{embedding_url}/v1/embeddings");
         let keys = jwt_keys();
         let public_key_path = keys.public.clone();
-        let h = harness_with_search(
+        let h = harness_with_search_and_doc_service(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "rag".into();
@@ -408,6 +458,7 @@ mod shared {
                 c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
+            Some(stub_doc_service()),
         )
         .await;
 
@@ -443,7 +494,7 @@ mod shared {
     pub async fn make_pg_bm25_harness(dsn: &str, schema: &str) -> E2eHarness {
         use crate::search::bm25_pg::PostgresBm25Backend;
         use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
-        use crate::tools::testkit::harness_with_search;
+        use crate::tools::testkit::harness_with_search_and_doc_service;
         use std::sync::Arc;
 
         let db = PostgresRelationalDb::connect(dsn, schema, PoolSettings::default())
@@ -456,13 +507,14 @@ mod shared {
 
         let keys = jwt_keys();
         let public_key_path = keys.public.clone();
-        let h = harness_with_search(
+        let h = harness_with_search_and_doc_service(
             |c| {
                 c.search.enabled = true;
                 c.search.mode = "bm25".into();
                 c.auth.jwt.public_key_path = public_key_path;
             },
             Some(backend),
+            Some(stub_doc_service()),
         )
         .await;
 
@@ -1230,6 +1282,163 @@ mod scenarios {
         h.await_chunks(MOUNT, 2).await;
     }
 
+    // ── the REST door onto the write routes ───────────────────────────────
+
+    /// The single most important REST case, kept separate and small so a failure
+    /// points at one thing: a plain REST write must become searchable.
+    pub async fn rest_write_then_query_finds_it(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+
+        let (status, body) = h
+            .rest_post(
+                MOUNT,
+                "write",
+                json!({"path": "/rest.md", "content": "content about the dhole"}),
+                PERSON,
+            )
+            .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST write failed: {body}");
+
+        h.await_chunks(MOUNT, 1).await;
+        await_query_hit(h, mode, "dhole", "/rest.md").await;
+    }
+
+    /// The REST twin of [`every_write_tool_feeds_the_index`]: every route that can
+    /// produce text must feed the index, so the two doors cannot drift.
+    pub async fn every_rest_write_route_feeds_the_index(h: &E2eHarness, mode: &str) {
+        use axum::http::StatusCode;
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+
+        let post = async |sub: &str, body: serde_json::Value| {
+            let (status, out) = h.rest_post(MOUNT, sub, body, PERSON).await;
+            assert_eq!(status, StatusCode::OK, "REST {sub} failed: {out}");
+        };
+
+        post("write", json!({"path": "/r.md", "content": "written through the rest door"})).await;
+        h.await_chunks(MOUNT, 1).await;
+
+        post("append", json!({"path": "/r.md", "content": "\nappended marker zebu"})).await;
+        await_query_hit(h, mode, "zebu", "/r.md").await;
+
+        post("edit", json!({"path": "/r.md", "old_string": "zebu", "new_string": "gaur"})).await;
+        await_chunk_contains(h, mode, "gaur", "/r.md", "gaur").await;
+
+        post(
+            "multi-edit",
+            json!({"path": "/r.md", "edits": [{"old_string": "gaur", "new_string": "kouprey"}]}),
+        )
+        .await;
+        await_chunk_contains(h, mode, "kouprey", "/r.md", "kouprey").await;
+
+        post(
+            "search-replace",
+            json!({"path": "/r.md", "search_block": "kouprey", "replace_block": "anoa"}),
+        )
+        .await;
+        await_chunk_contains(h, mode, "anoa", "/r.md", "anoa").await;
+
+        post("insert-at-line", json!({"path": "/r.md", "line": 1, "content": "markhola\n"})).await;
+        await_chunk_contains(h, mode, "markhola", "/r.md", "markhola").await;
+
+        post(
+            "apply-patch",
+            json!({"patch_text":
+                "*** Begin Patch\n*** Add File: /rpatched.md\n+patched marker takin\n*** End Patch"}),
+        )
+        .await;
+        await_query_hit(h, mode, "takin", "/rpatched.md").await;
+
+        // write-bytes carrying text: the reread decodes it, so it indexes.
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"bytes marker saola",
+        );
+        post("write-bytes", json!({"path": "/rbytes.md", "base64": b64})).await;
+        await_query_hit(h, mode, "saola", "/rbytes.md").await;
+    }
+
+    /// A refused REST write must leave the index exactly as it was: the volume
+    /// did not change, so neither may the entries describing it.
+    pub async fn a_failed_rest_write_does_not_index(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/keep.md", "original content about the kudu").await;
+        h.await_chunks(MOUNT, 1).await;
+
+        // No overwrite flag on an existing path: the no clobber guard refuses it.
+        let (status, body) = h
+            .rest_post(
+                MOUNT,
+                "write",
+                json!({"path": "/keep.md", "content": "replacement about the oryx"}),
+                PERSON,
+            )
+            .await;
+        assert_ne!(status, axum::http::StatusCode::OK, "a no clobber write must fail, got {body}");
+
+        // Nothing to wait for, so give a hook that must not exist the time to
+        // fire before concluding that it did not.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(h.chunk_count(MOUNT).await, 1, "a failed write must add no chunk");
+        await_chunk_contains(h, mode, "kudu", "/keep.md", "original").await;
+    }
+
+    // ── the Markdown companion ─────────────────────────────────────────
+
+    /// `fs.documentize` writes a companion `.md` that no write hook covers. It is
+    /// text in the volume, so it must be findable BY ITS CONTENT.
+    pub async fn the_markdown_companion_is_indexed(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        seed_binary_document(h, "/docs/deck.pptx").await;
+
+        let out = h
+            .call("fs.documentize", json!({"mount_id": MOUNT, "path": "/docs/deck.pptx"}))
+            .await
+            .expect("fs.documentize must succeed");
+        assert_eq!(out["md_path"], "/docs/deck.md", "the companion path moved: {out}");
+
+        await_chunk_contains(h, mode, "ocelot", "/docs/deck.md", "ocelot").await;
+    }
+
+    /// The same companion through the REST door.
+    pub async fn rest_documentize_indexes_the_companion(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        seed_binary_document(h, "/docs/report.pdf").await;
+
+        let (status, body) =
+            h.rest_post(MOUNT, "documentize", json!({"path": "/docs/report.pdf"}), PERSON).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST documentize failed: {body}");
+        assert_eq!(body["md_path"], "/docs/report.md", "the companion path moved: {body}");
+
+        await_chunk_contains(h, mode, "ocelot", "/docs/report.md", "ocelot").await;
+    }
+
+    /// A documented upload writes two files: the source and its companion. Both
+    /// are text here, so both must be searchable.
+    pub async fn a_documented_upload_indexes_source_and_companion(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+
+        let (status, body) = h
+            .rest_upload_documented(MOUNT, "/", "talk.pptx", "source text about the bongo", PERSON)
+            .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST documented upload failed: {body}");
+        assert_eq!(body["documentation"][0]["md_path"], "/talk.md", "no companion in {body}");
+
+        h.await_chunks(MOUNT, 2).await;
+        await_chunk_contains(h, mode, "bongo", "/talk.pptx", "bongo").await;
+        await_chunk_contains(h, mode, "ocelot", "/talk.md", "ocelot").await;
+    }
+
+    /// Store a file the document service accepts, without going through a write
+    /// hook: the point of the companion scenarios is what the CONVERSION indexes.
+    async fn seed_binary_document(h: &E2eHarness, path: &str) {
+        h.inner
+            .client()
+            .await
+            .write_text_atomic(path, "PK binary source, not indexable text")
+            .await
+            .unwrap_or_else(|e| panic!("seeding {path} must succeed: {e}"));
+    }
+
     /// Poll until `path`'s indexed chunk contains `needle`, or fail.
     ///
     /// Stronger than [`await_query_hit`]: it proves WHICH text is indexed, the
@@ -1778,6 +1987,30 @@ mod sqlite_rag {
     async fn e2e_sqlite_a_failed_rest_delete_leaves_the_index_alone() {
         scenarios::a_failed_rest_delete_leaves_the_index_alone(&h().await, "rag").await;
     }
+    #[tokio::test]
+    async fn e2e_sqlite_rest_write_then_query_finds_it() {
+        scenarios::rest_write_then_query_finds_it(&h().await, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_every_rest_write_route_feeds_the_index() {
+        scenarios::every_rest_write_route_feeds_the_index(&h().await, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_a_failed_rest_write_does_not_index() {
+        scenarios::a_failed_rest_write_does_not_index(&h().await, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_the_markdown_companion_is_indexed() {
+        scenarios::the_markdown_companion_is_indexed(&h().await, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_rest_documentize_indexes_the_companion() {
+        scenarios::rest_documentize_indexes_the_companion(&h().await, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_a_documented_upload_indexes_source_and_companion() {
+        scenarios::a_documented_upload_indexes_source_and_companion(&h().await, "rag").await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1918,6 +2151,30 @@ mod sqlite_bm25 {
     #[tokio::test]
     async fn e2e_sqlite_bm25_a_failed_rest_delete_leaves_the_index_alone() {
         scenarios::a_failed_rest_delete_leaves_the_index_alone(&h().await, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_write_then_query_finds_it() {
+        scenarios::rest_write_then_query_finds_it(&h().await, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_every_rest_write_route_feeds_the_index() {
+        scenarios::every_rest_write_route_feeds_the_index(&h().await, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_a_failed_rest_write_does_not_index() {
+        scenarios::a_failed_rest_write_does_not_index(&h().await, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_the_markdown_companion_is_indexed() {
+        scenarios::the_markdown_companion_is_indexed(&h().await, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_documentize_indexes_the_companion() {
+        scenarios::rest_documentize_indexes_the_companion(&h().await, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_a_documented_upload_indexes_source_and_companion() {
+        scenarios::a_documented_upload_indexes_source_and_companion(&h().await, "bm25").await;
     }
 }
 
@@ -2465,6 +2722,36 @@ mod pg_rag {
         let Some(h) = h().await else { return };
         scenarios::a_failed_rest_delete_leaves_the_index_alone(&h, "rag").await;
     }
+    #[tokio::test]
+    async fn e2e_pg_rest_write_then_query_finds_it() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_write_then_query_finds_it(&h, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_every_rest_write_route_feeds_the_index() {
+        let Some(h) = h().await else { return };
+        scenarios::every_rest_write_route_feeds_the_index(&h, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_a_failed_rest_write_does_not_index() {
+        let Some(h) = h().await else { return };
+        scenarios::a_failed_rest_write_does_not_index(&h, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_the_markdown_companion_is_indexed() {
+        let Some(h) = h().await else { return };
+        scenarios::the_markdown_companion_is_indexed(&h, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_rest_documentize_indexes_the_companion() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_documentize_indexes_the_companion(&h, "rag").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_a_documented_upload_indexes_source_and_companion() {
+        let Some(h) = h().await else { return };
+        scenarios::a_documented_upload_indexes_source_and_companion(&h, "rag").await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2639,5 +2926,35 @@ mod pg_bm25 {
     async fn e2e_pg_bm25_a_failed_rest_delete_leaves_the_index_alone() {
         let Some(h) = h().await else { return };
         scenarios::a_failed_rest_delete_leaves_the_index_alone(&h, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_write_then_query_finds_it() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_write_then_query_finds_it(&h, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_bm25_every_rest_write_route_feeds_the_index() {
+        let Some(h) = h().await else { return };
+        scenarios::every_rest_write_route_feeds_the_index(&h, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_bm25_a_failed_rest_write_does_not_index() {
+        let Some(h) = h().await else { return };
+        scenarios::a_failed_rest_write_does_not_index(&h, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_bm25_the_markdown_companion_is_indexed() {
+        let Some(h) = h().await else { return };
+        scenarios::the_markdown_companion_is_indexed(&h, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_documentize_indexes_the_companion() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_documentize_indexes_the_companion(&h, "bm25").await;
+    }
+    #[tokio::test]
+    async fn e2e_pg_bm25_a_documented_upload_indexes_source_and_companion() {
+        let Some(h) = h().await else { return };
+        scenarios::a_documented_upload_indexes_source_and_companion(&h, "bm25").await;
     }
 }

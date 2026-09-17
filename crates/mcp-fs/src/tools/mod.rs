@@ -236,6 +236,16 @@ pub(crate) mod testkit {
         tweak: impl FnOnce(&mut ServerConfig),
         search: Option<Arc<dyn crate::search::SearchBackend>>,
     ) -> Harness {
+        harness_with_search_and_doc_service(tweak, search, None).await
+    }
+
+    /// Same, plus a document service, so the auto index e2e suite can drive the
+    /// document surfaces that write a Markdown companion.
+    pub async fn harness_with_search_and_doc_service(
+        tweak: impl FnOnce(&mut ServerConfig),
+        search: Option<Arc<dyn crate::search::SearchBackend>>,
+        doc_service: Option<Arc<dyn crate::docs::DocService>>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut config = ServerConfig::default();
         config.infra.meta.dir = dir.path().join("volumes").display().to_string();
@@ -273,7 +283,7 @@ pub(crate) mod testkit {
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
-            doc_service: None,
+            doc_service,
             search,
         });
         Harness { _dir: dir, state }

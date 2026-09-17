@@ -155,37 +155,10 @@ pub fn register(reg: &mut ToolRegistry) {
                 &a.str("patch_text")?,
             )
             .await?;
-            reindex_patched_files(&ctx, &mount, &client, &out).await;
+            indexer::after_patch(&ctx.state, &mount, &out, &client).await;
             Ok(out)
         }),
     );
-}
-
-/// Reflect one patch in the search index: a patch touches several files and can
-/// add, update, delete and move in one call, so each entry of the report drives
-/// its own hook rather than assuming a single written path.
-async fn reindex_patched_files(
-    ctx: &crate::mcp::registry::ToolCtx,
-    mount: &str,
-    client: &crate::storage::VolumeClient,
-    report: &Value,
-) {
-    let Some(files) = report["files"].as_array() else { return };
-    for entry in files {
-        let Some(path) = entry["path"].as_str() else { continue };
-        match entry["op"].as_str() {
-            Some("delete") => indexer::after_delete(&ctx.state, mount, path).await,
-            Some("add" | "update") => match entry["moved_to"].as_str() {
-                // A move leaves nothing at the old path, so its chunks must go.
-                Some(moved_to) => {
-                    indexer::after_delete(&ctx.state, mount, path).await;
-                    indexer::after_write_reread(&ctx.state, mount, moved_to, client).await;
-                }
-                None => indexer::after_write_reread(&ctx.state, mount, path, client).await,
-            },
-            _ => {}
-        }
-    }
 }
 
 /// Take `edits` as raw JSON: the engine reads `old_string` / `new_string` /

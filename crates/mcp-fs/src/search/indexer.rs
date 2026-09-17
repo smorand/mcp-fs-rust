@@ -23,6 +23,7 @@ use crate::search::SearchBackend;
 use crate::state::AppState;
 use crate::storage::VolumeClient;
 use crate::storage::traits::IndexMode;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -198,6 +199,53 @@ pub async fn after_write_reread(
         && let Some(text) = read_utf8(client, path).await
     {
         drop(ProjectIndexer::new(backend).on_write(volume_id, path, &text));
+    }
+}
+
+/// Index the Markdown companion a document tool just wrote, if it wrote one.
+///
+/// The companion is real text in the volume and is what RAG is for, but the
+/// engine writes it rather than a write tool, so no write hook covers it.
+/// Accepts both payload shapes: a top level `md_path`, and the nested
+/// `documentation.md_path` that the documented write returns.
+pub async fn after_companion(
+    state: &AppState,
+    volume_id: &str,
+    payload: &Value,
+    client: &VolumeClient,
+) {
+    // A documented write nests its report and reports a failed conversion as an
+    // `error` key instead of a path: there is no companion to index then.
+    let report = match &payload["documentation"] {
+        Value::Object(map) if map.contains_key("error") => return,
+        report @ Value::Object(_) => report,
+        // No nested report at all, so the top level shape: `md_path` directly,
+        // which is null for a source that has no companion (a plain text file).
+        _ => payload,
+    };
+    let Some(md_path) = report["md_path"].as_str() else { return };
+    after_write_reread(state, volume_id, md_path, client).await;
+}
+
+/// Reflect one patch in the search index: a patch touches several files and can
+/// add, update, delete and move in one call, so each entry of the report drives
+/// its own hook rather than assuming a single written path.
+pub async fn after_patch(state: &AppState, volume_id: &str, report: &Value, client: &VolumeClient) {
+    let Some(files) = report["files"].as_array() else { return };
+    for entry in files {
+        let Some(path) = entry["path"].as_str() else { continue };
+        match entry["op"].as_str() {
+            Some("delete") => after_delete(state, volume_id, path).await,
+            Some("add" | "update") => match entry["moved_to"].as_str() {
+                // A move leaves nothing at the old path, so its chunks must go.
+                Some(moved_to) => {
+                    after_delete(state, volume_id, path).await;
+                    after_write_reread(state, volume_id, moved_to, client).await;
+                }
+                None => after_write_reread(state, volume_id, path, client).await,
+            },
+            _ => {}
+        }
     }
 }
 

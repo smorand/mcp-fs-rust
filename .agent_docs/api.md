@@ -113,6 +113,15 @@ tool is not registered. No logic is duplicated either way.
 
 The `admin.*` and `git.*` tools have no REST counterpart.
 
+### Search indexing
+
+Every route above that mutates content runs the same auto index hooks as its
+`fs.*` twin, from `search/indexer.rs`: one helper per operation, called from both
+doors, so the two cannot drift. `create-empty` runs none, because an empty file
+has nothing to index, and neither does `fs.create_empty`. Hooks run on the
+success path only, so a refused write leaves the index untouched. See
+`.agent_docs/search.md` for the per-project mode that gates them.
+
 ## Error mapping
 
 Body is always `{"error": "ERR_*", "detail": "ERR_*: message"}`, except the bytes

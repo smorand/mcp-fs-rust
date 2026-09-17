@@ -135,6 +135,8 @@ pub fn register(reg: &mut ToolRegistry) {
             .await?;
             // A binary payload has no text to index and is skipped by the reread.
             indexer::after_write_reread(&ctx.state, &mount, &path, &client).await;
+            // The Markdown companion, when the flag produced one, IS text.
+            indexer::after_companion(&ctx.state, &mount, &out, &client).await;
             Ok(out)
         }),
     );
