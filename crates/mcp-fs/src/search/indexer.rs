@@ -228,6 +228,43 @@ pub async fn paths_under(state: &AppState, volume_id: &str, path: &str, client: 
     if active_backend(state, volume_id).await.is_none() {
         return Vec::new();
     }
+    files_under(client, path).await
+}
+
+/// Follow a move in the index: forget the sources, index the destinations.
+///
+/// `sources` must have been collected with [`paths_under`] BEFORE the move, for
+/// the same reason a recursive delete collects first: once the rename has
+/// happened there is no source tree left to walk, so its entries would stay in
+/// the index forever with no path to enumerate them by. The destination side is
+/// walked here instead of derived from `sources`, so a tree move needs no prefix
+/// arithmetic to stay correct.
+pub async fn after_move(
+    state: &AppState,
+    volume_id: &str,
+    sources: &[String],
+    destination: &str,
+    client: &VolumeClient,
+) {
+    let Some(backend) = active_backend(state, volume_id).await else { return };
+    let indexer = ProjectIndexer::new(backend);
+    for path in sources {
+        drop(indexer.on_delete(volume_id, path));
+    }
+    index_tree(backend, volume_id, destination, client).await;
+}
+
+/// Index the destination of a copy. The source keeps the entries it had, which
+/// are still true: a copy leaves it untouched.
+pub async fn after_copy(state: &AppState, volume_id: &str, destination: &str, client: &VolumeClient) {
+    if let Some(backend) = active_backend(state, volume_id).await {
+        index_tree(backend, volume_id, destination, client).await;
+    }
+}
+
+/// Every file at or under `path`, or just `path` when it is a file or cannot be
+/// walked. Directories carry no index entries of their own.
+async fn files_under(client: &VolumeClient, path: &str) -> Vec<String> {
     if client.is_dir(path).await.unwrap_or(false) {
         return fs_ops::iter_files(client, path, &[])
             .await
@@ -237,6 +274,23 @@ pub async fn paths_under(state: &AppState, volume_id: &str, path: &str, client: 
             .collect();
     }
     vec![path.to_string()]
+}
+
+/// Index every file that has just arrived at `root`, by re-reading it.
+///
+/// The counterpart of [`paths_under`]: that one enumerates before a removal,
+/// this one after an arrival. Non UTF-8 files are skipped like everywhere else.
+async fn index_tree(
+    backend: &Arc<dyn SearchBackend>,
+    volume_id: &str,
+    root: &str,
+    client: &VolumeClient,
+) {
+    let indexer = ProjectIndexer::new(backend);
+    for path in files_under(client, root).await {
+        let Some(text) = read_utf8(client, &path).await else { continue };
+        drop(indexer.on_write(volume_id, &path, &text));
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +467,57 @@ mod tests {
         let calls = rec.calls();
         assert_eq!(calls.len(), 1, "only the readable file is indexed: {calls:?}");
         assert!(calls[0].contains("/good.md"), "{calls:?}");
+    }
+
+    /// A file move must index the destination, by reading the bytes back.
+    #[tokio::test]
+    async fn index_tree_indexes_a_single_file_from_the_volume() {
+        let (backend, rec) = recording();
+        let client = client().await;
+        client.write_text_atomic("/moved.md", "arrived").await.expect("seed");
+
+        index_tree(&backend, "proj", "/moved.md", &client).await;
+        let calls = wait_for(&rec, 1).await;
+        assert_eq!(calls, vec!["index proj /moved.md 'arrived' 1000/100"]);
+    }
+
+    /// A tree move or copy must reach every file at every depth, not just the root.
+    #[tokio::test]
+    async fn index_tree_indexes_every_file_of_a_subtree() {
+        let (backend, rec) = recording();
+        let client = client().await;
+        client.write_text_atomic("/dst/a.md", "alpha").await.expect("seed");
+        client.write_text_atomic("/dst/deep/b.md", "beta").await.expect("seed");
+
+        index_tree(&backend, "proj", "/dst", &client).await;
+        let calls = wait_for(&rec, 2).await;
+        assert!(calls.iter().any(|c| c.contains("index proj /dst/a.md 'alpha'")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("index proj /dst/deep/b.md 'beta'")), "{calls:?}");
+    }
+
+    /// A binary that lands at the destination is skipped, exactly as a written one is.
+    #[tokio::test]
+    async fn index_tree_skips_a_non_utf8_file() {
+        let (backend, rec) = recording();
+        let client = client().await;
+        client.write_text_atomic("/dst/good.md", "readable").await.expect("seed");
+        client.write_bytes_atomic("/dst/bad.bin", &[0xFF, 0xFE, 0x00]).await.expect("seed");
+
+        index_tree(&backend, "proj", "/dst", &client).await;
+        let calls = wait_for(&rec, 1).await;
+        assert_eq!(calls.len(), 1, "only the readable file is indexed: {calls:?}");
+        assert!(calls[0].contains("/dst/good.md"), "{calls:?}");
+    }
+
+    /// A path that does not exist yields no index call, which is what a failed
+    /// move or copy must leave behind.
+    #[tokio::test]
+    async fn index_tree_on_a_missing_path_indexes_nothing() {
+        let (backend, rec) = recording();
+        let client = client().await;
+        index_tree(&backend, "proj", "/nowhere.md", &client).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(rec.calls().is_empty(), "{:?}", rec.calls());
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────

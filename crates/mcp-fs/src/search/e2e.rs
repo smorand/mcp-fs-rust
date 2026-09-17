@@ -742,6 +742,135 @@ mod scenarios {
         h.await_chunks(MOUNT, 0).await;
     }
 
+    /// A move takes the index entry with it: the old path stops matching, the new
+    /// one starts, and nothing is added or lost on the way.
+    pub async fn move_a_file_moves_its_index_entry(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/from.md", "content about wandering albatross").await;
+        h.await_chunks(MOUNT, 1).await;
+
+        h.call(
+            "fs.move",
+            json!({"mount_id": MOUNT, "source": "/from.md", "destination": "/to.md"}),
+        )
+        .await
+        .expect("fs.move must succeed");
+
+        await_query_hit(h, mode, "albatross", "/to.md").await;
+        await_no_query_hit(h, mode, "albatross", "/from.md").await;
+        h.await_chunks(MOUNT, 1).await;
+    }
+
+    /// A copy leaves the source indexed and indexes the destination too.
+    pub async fn copy_a_file_indexes_the_destination(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/orig.md", "content about spotted salamander").await;
+        h.await_chunks(MOUNT, 1).await;
+
+        h.call(
+            "fs.copy",
+            json!({"mount_id": MOUNT, "source": "/orig.md", "destination": "/dup.md"}),
+        )
+        .await
+        .expect("fs.copy must succeed");
+
+        h.await_chunks(MOUNT, 2).await;
+        await_query_hit(h, mode, "salamander", "/dup.md").await;
+        await_query_hit(h, mode, "salamander", "/orig.md").await;
+    }
+
+    /// A tree move must follow every file of the subtree, at every depth, not
+    /// just the named root.
+    pub async fn move_a_tree_moves_every_entry(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        for (path, text) in [
+            ("/src/a.md", "alpha about pangolin"),
+            ("/src/b.md", "beta about pangolin"),
+            ("/src/deep/c.md", "gamma about pangolin"),
+        ] {
+            h.write_file(MOUNT, path, text).await;
+        }
+        h.await_chunks(MOUNT, 3).await;
+
+        h.call("fs.move", json!({"mount_id": MOUNT, "source": "/src", "destination": "/dst"}))
+            .await
+            .expect("a tree move must succeed");
+
+        for path in ["/dst/a.md", "/dst/b.md", "/dst/deep/c.md"] {
+            await_query_hit(h, mode, "pangolin", path).await;
+        }
+        for path in ["/src/a.md", "/src/b.md", "/src/deep/c.md"] {
+            await_no_query_hit(h, mode, "pangolin", path).await;
+        }
+        h.await_chunks(MOUNT, 3).await;
+    }
+
+    /// A recursive copy must index every destination file and keep every source one.
+    pub async fn copy_a_tree_indexes_every_destination(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        for (path, text) in [
+            ("/src/a.md", "alpha about axolotl"),
+            ("/src/b.md", "beta about axolotl"),
+            ("/src/deep/c.md", "gamma about axolotl"),
+        ] {
+            h.write_file(MOUNT, path, text).await;
+        }
+        h.await_chunks(MOUNT, 3).await;
+
+        h.call(
+            "fs.copy",
+            json!({"mount_id": MOUNT, "source": "/src", "destination": "/dst", "recursive": true}),
+        )
+        .await
+        .expect("a tree copy must succeed");
+
+        h.await_chunks(MOUNT, 6).await;
+        for path in
+            ["/src/a.md", "/src/b.md", "/src/deep/c.md", "/dst/a.md", "/dst/b.md", "/dst/deep/c.md"]
+        {
+            await_query_hit(h, mode, "axolotl", path).await;
+        }
+    }
+
+    /// Mode none means the move hook reads the project row and stops there.
+    pub async fn move_under_mode_none_indexes_nothing(h: &E2eHarness) {
+        h.write_file(MOUNT, "/from.md", "content that must not be indexed").await;
+        h.call(
+            "fs.move",
+            json!({"mount_id": MOUNT, "source": "/from.md", "destination": "/to.md"}),
+        )
+        .await
+        .expect("fs.move must succeed with the mode off");
+
+        // Nothing to wait for, so give a hook that should not exist the time to
+        // fire before concluding that it did not.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(h.chunk_count(MOUNT).await, 0, "mode none must index nothing on a move");
+    }
+
+    /// A refused move must not touch the index: the volume did not change, so
+    /// neither may the entries describing it.
+    pub async fn a_failed_move_leaves_the_index_alone(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/from.md", "content about numbat").await;
+        h.write_file(MOUNT, "/blocker.md", "more content about numbat").await;
+        h.await_chunks(MOUNT, 2).await;
+
+        let err = h
+            .call(
+                "fs.move",
+                json!({"mount_id": MOUNT, "source": "/from.md", "destination": "/blocker.md"}),
+            )
+            .await
+            .expect_err("a no clobber move onto an existing path must fail");
+        assert_eq!(err.code, crate::errors::code::NO_CLOBBER, "got {err}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(h.chunk_count(MOUNT).await, 2, "a failed move must add or drop nothing");
+        await_query_hit(h, mode, "numbat", "/from.md").await;
+        await_query_hit(h, mode, "numbat", "/blocker.md").await;
+    }
+
     /// A binary write has no text to index, and must not fail the write either.
     pub async fn a_binary_write_is_skipped(h: &E2eHarness, mode: &str) {
         use base64::Engine as _;
@@ -777,6 +906,29 @@ mod scenarios {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("timed out waiting for '{query}' to find {path}, last results: {last}");
+    }
+
+    /// The negative twin of `await_query_hit`: poll until `path` has left the
+    /// results, or fail. The removal is fire and forget like the write, so a
+    /// single immediate query would be racy in the passing direction.
+    async fn await_no_query_hit(h: &E2eHarness, mode: &str, query: &str, path: &str) {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(super::shared::AUTO_INDEX_TIMEOUT_SECS);
+        let mut last = serde_json::Value::Null;
+        while std::time::Instant::now() < deadline {
+            last = h
+                .call(
+                    "search.query",
+                    json!({"mount_id": MOUNT, "query": query, "mode": mode, "top_k": 50}),
+                )
+                .await
+                .expect("search.query must succeed");
+            if !last["results"].as_array().is_some_and(|r| r.iter().any(|x| x["path"] == path)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for '{query}' to stop finding {path}, last results: {last}");
     }
 }
 
@@ -1202,6 +1354,37 @@ mod sqlite_rag {
     async fn e2e_sqlite_a_binary_write_is_skipped() {
         scenarios::a_binary_write_is_skipped(&h().await, "rag").await;
     }
+
+
+    #[tokio::test]
+    async fn e2e_sqlite_move_a_file_moves_its_index_entry() {
+        scenarios::move_a_file_moves_its_index_entry(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_copy_a_file_indexes_the_destination() {
+        scenarios::copy_a_file_indexes_the_destination(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_move_a_tree_moves_every_entry() {
+        scenarios::move_a_tree_moves_every_entry(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_copy_a_tree_indexes_every_destination() {
+        scenarios::copy_a_tree_indexes_every_destination(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_move_under_mode_none_indexes_nothing() {
+        scenarios::move_under_mode_none_indexes_nothing(&h().await).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_a_failed_move_leaves_the_index_alone() {
+        scenarios::a_failed_move_leaves_the_index_alone(&h().await, "rag").await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1262,6 +1445,37 @@ mod sqlite_bm25 {
     #[tokio::test]
     async fn e2e_sqlite_bm25_recursive_delete_clears_the_whole_subtree() {
         scenarios::recursive_delete_clears_the_whole_subtree(&h().await, "bm25").await;
+    }
+
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_move_a_file_moves_its_index_entry() {
+        scenarios::move_a_file_moves_its_index_entry(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_copy_a_file_indexes_the_destination() {
+        scenarios::copy_a_file_indexes_the_destination(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_move_a_tree_moves_every_entry() {
+        scenarios::move_a_tree_moves_every_entry(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_copy_a_tree_indexes_every_destination() {
+        scenarios::copy_a_tree_indexes_every_destination(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_move_under_mode_none_indexes_nothing() {
+        scenarios::move_under_mode_none_indexes_nothing(&h().await).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_a_failed_move_leaves_the_index_alone() {
+        scenarios::a_failed_move_leaves_the_index_alone(&h().await, "bm25").await;
     }
 }
 
@@ -1747,6 +1961,43 @@ mod pg_rag {
         let Some(h) = h().await else { return };
         scenarios::a_binary_write_is_skipped(&h, "rag").await;
     }
+
+
+    #[tokio::test]
+    async fn e2e_pg_move_a_file_moves_its_index_entry() {
+        let Some(h) = h().await else { return };
+        scenarios::move_a_file_moves_its_index_entry(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_copy_a_file_indexes_the_destination() {
+        let Some(h) = h().await else { return };
+        scenarios::copy_a_file_indexes_the_destination(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_move_a_tree_moves_every_entry() {
+        let Some(h) = h().await else { return };
+        scenarios::move_a_tree_moves_every_entry(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_copy_a_tree_indexes_every_destination() {
+        let Some(h) = h().await else { return };
+        scenarios::copy_a_tree_indexes_every_destination(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_move_under_mode_none_indexes_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::move_under_mode_none_indexes_nothing(&h).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_a_failed_move_leaves_the_index_alone() {
+        let Some(h) = h().await else { return };
+        scenarios::a_failed_move_leaves_the_index_alone(&h, "rag").await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1825,5 +2076,42 @@ mod pg_bm25 {
     async fn e2e_pg_bm25_recursive_delete_clears_the_whole_subtree() {
         let Some(h) = h().await else { return };
         scenarios::recursive_delete_clears_the_whole_subtree(&h, "bm25").await;
+    }
+
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_move_a_file_moves_its_index_entry() {
+        let Some(h) = h().await else { return };
+        scenarios::move_a_file_moves_its_index_entry(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_copy_a_file_indexes_the_destination() {
+        let Some(h) = h().await else { return };
+        scenarios::copy_a_file_indexes_the_destination(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_move_a_tree_moves_every_entry() {
+        let Some(h) = h().await else { return };
+        scenarios::move_a_tree_moves_every_entry(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_copy_a_tree_indexes_every_destination() {
+        let Some(h) = h().await else { return };
+        scenarios::copy_a_tree_indexes_every_destination(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_move_under_mode_none_indexes_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::move_under_mode_none_indexes_nothing(&h).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_a_failed_move_leaves_the_index_alone() {
+        let Some(h) = h().await else { return };
+        scenarios::a_failed_move_leaves_the_index_alone(&h, "bm25").await;
     }
 }

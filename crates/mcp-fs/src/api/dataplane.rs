@@ -436,8 +436,10 @@ async fn move_path(
         let src = r.norm(&a.str("source")?)?;
         let dst = r.norm(&a.str("destination")?)?;
         // Same reasoning as delete: the engine owns the no clobber rule and the audit
-        // entry, so the REST and MCP doors cannot drift apart.
-        fs_ops::move_path(
+        // entry, so the REST and MCP doors cannot drift apart. The index hooks are the
+        // same helpers `fs.move` calls, for the same reason.
+        let indexed = crate::search::indexer::paths_under(&r.state, &r.mount, &src, &r.client).await;
+        let out = fs_ops::move_path(
             &r.client,
             r.safety(),
             &r.person,
@@ -446,7 +448,9 @@ async fn move_path(
             &dst,
             a.bool_or("overwrite", false),
         )
-        .await
+        .await?;
+        crate::search::indexer::after_move(&r.state, &r.mount, &indexed, &dst, &r.client).await;
+        Ok(out)
     })
     .await
 }
@@ -1042,7 +1046,7 @@ async fn copy(
         let a = body_args(&body)?;
         let src = r.norm(&a.str("source")?)?;
         let dst = r.norm(&a.str("destination")?)?;
-        fs_ops::copy_path(
+        let out = fs_ops::copy_path(
             &r.client,
             r.safety(),
             &r.person,
@@ -1052,7 +1056,9 @@ async fn copy(
             a.bool_or("overwrite", false),
             a.bool_or("recursive", false),
         )
-        .await
+        .await?;
+        crate::search::indexer::after_copy(&r.state, &r.mount, &dst, &r.client).await;
+        Ok(out)
     })
     .await
 }

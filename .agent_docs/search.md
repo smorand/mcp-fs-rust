@@ -65,7 +65,8 @@ While a project's mode is active, every write reaches the index without a
 `search.index` call: `fs.write`, `fs.append`, `fs.write_bytes`, `fs.write_docx`,
 `fs.edit`, `fs.multi_edit`, `fs.search_replace`, `fs.insert_at_line`, `fs.apply_patch`
 and the REST `POST /api/fs/{mount}/upload`. `fs.delete` removes the deleted path, and
-every file underneath it for a recursive delete. A `dry_run` edit writes nothing and so
+every file underneath it for a recursive delete. `fs.move` and `fs.copy` follow the
+bytes (see below). A `dry_run` edit writes nothing and so
 indexes nothing. Files that are not valid UTF-8 are skipped silently, which covers
 binary uploads and the `.docx` that `fs.write_docx` produces.
 
@@ -75,6 +76,25 @@ WARN log, never an error to the caller. **Trade-off**: an embedding round trip i
 50 to 300 ms, so a caller that writes and immediately queries can miss its own write.
 There is no read-your-write guarantee on the index. A caller that needs one must poll
 `search.status` or call `search.index` synchronously.
+
+#### Move and copy
+
+`fs.move` drops the index entries of the source and indexes the destination by reading
+it back from the volume; `fs.copy` indexes the destination and leaves the source's
+entries alone, because a copy leaves the source's bytes alone. Both follow the WHOLE
+subtree, not just the named path, so a recursive move or copy of a tree moves or
+duplicates every entry underneath it. The REST `POST /api/fs/{mount}/move` and
+`/copy` call the same two helpers (`search/indexer.rs`), so the two doors cannot drift.
+
+**Ordering matters on a move**: the source paths are enumerated BEFORE the rename and
+the destination is walked after it. Once the rename has happened there is no source
+tree left to walk, so entries collected too late would stay in the index forever with
+no path to enumerate them by. This is the same enumerate-first rule a recursive
+`fs.delete` follows, and the bug it was written to prevent.
+
+A move or copy that FAILS leaves the index untouched: the hooks run only on the success
+path, after the engine has returned. Non UTF-8 destinations are skipped silently, and
+directories carry no entries of their own.
 
 When the mode is `none`, a write costs one extra `project` row read and nothing else.
 Chunking uses the `search.index` defaults (1000 / 100); there is no per-project chunk
@@ -211,6 +231,7 @@ mode integration tests, use `scripts/search_embedding_fake.py` as a stub server.
    because the directory is always rebuildable. The cached open index is evicted with
    it, so the next write reopens a fresh one.
 
-5. **Auto indexing does not cover `fs.move` and `fs.copy`.** A moved or copied file
-   keeps the index entry of its old path and gains none at the new one until it is
-   written again. Re-run `search.index` after a large reorganisation.
+5. **A move or copy with `overwrite: true` onto an existing tree can leave stale
+   entries.** The destination's own files are re-indexed, but a file that existed only
+   under the old destination and is not in the new one keeps its entry. Re-run
+   `search.index` after an overwriting reorganisation.

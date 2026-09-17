@@ -76,7 +76,10 @@ pub fn register(reg: &mut ToolRegistry) {
             let (mount, client) = volume(&ctx, &a).await?;
             let src = norm(&ctx, &a, "source")?;
             let dst = norm(&ctx, &a, "destination")?;
-            fs_ops::move_path(
+            // Enumerated first, like the delete above: the rename takes the whole
+            // subtree with it, and afterwards there is no source tree left to list.
+            let indexed = crate::search::indexer::paths_under(&ctx.state, &mount, &src, &client).await;
+            let out = fs_ops::move_path(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -85,7 +88,9 @@ pub fn register(reg: &mut ToolRegistry) {
                 &dst,
                 a.bool_or("overwrite", false),
             )
-            .await
+            .await?;
+            crate::search::indexer::after_move(&ctx.state, &mount, &indexed, &dst, &client).await;
+            Ok(out)
         }),
     );
 
@@ -104,7 +109,7 @@ pub fn register(reg: &mut ToolRegistry) {
             let (mount, client) = volume(&ctx, &a).await?;
             let src = norm(&ctx, &a, "source")?;
             let dst = norm(&ctx, &a, "destination")?;
-            fs_ops::copy_path(
+            let out = fs_ops::copy_path(
                 &client,
                 &ctx.state.safety,
                 &ctx.person,
@@ -114,7 +119,9 @@ pub fn register(reg: &mut ToolRegistry) {
                 a.bool_or("overwrite", false),
                 a.bool_or("recursive", false),
             )
-            .await
+            .await?;
+            crate::search::indexer::after_copy(&ctx.state, &mount, &dst, &client).await;
+            Ok(out)
         }),
     );
 
