@@ -437,8 +437,10 @@ async fn move_path(
         // Same reasoning as delete: the engine owns the no clobber rule and the audit
         // entry, so the REST and MCP doors cannot drift apart. The index hooks are the
         // same helpers `fs.move` calls, for the same reason.
-        let indexed =
-            crate::search::indexer::paths_under(&r.state, &r.mount, &src, &r.client).await;
+        let indexed = crate::search::indexer::paths_displaced_by_move(
+            &r.state, &r.mount, &src, &dst, &r.client,
+        )
+        .await;
         let out = fs_ops::move_path(
             &r.client,
             r.safety(),

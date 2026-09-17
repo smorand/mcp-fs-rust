@@ -238,9 +238,39 @@ pub async fn paths_under(
     files_under(client, path).await
 }
 
-/// Follow a move in the index: forget the sources, index the destinations.
+/// Every indexed path a move is about to invalidate: the source tree, which
+/// moves away, and the destination tree, which `overwrite: true` destroys
+/// outright. Both are enumerated BEFORE the rename, because afterwards neither
+/// is there to list.
 ///
-/// `sources` must have been collected with [`paths_under`] BEFORE the move, for
+/// A file that lived only under the old destination has no counterpart in the
+/// source, so nothing re-indexes it afterwards: without this it would keep an
+/// index entry pointing at bytes the move deleted. Deduplicated, because a move
+/// within one tree can list the same path on both sides.
+pub async fn paths_displaced_by_move(
+    state: &AppState,
+    volume_id: &str,
+    src: &str,
+    dst: &str,
+    client: &VolumeClient,
+) -> Vec<String> {
+    if active_backend(state, volume_id).await.is_none() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for path in files_under(client, src).await.into_iter().chain(files_under(client, dst).await) {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Follow a move in the index: forget the displaced paths, index the destination.
+///
+/// `sources` must have been collected with [`paths_displaced_by_move`] BEFORE
+/// the move, for
 /// the same reason a recursive delete collects first: once the rename has
 /// happened there is no source tree left to walk, so its entries would stay in
 /// the index forever with no path to enumerate them by. The destination side is
@@ -255,9 +285,23 @@ pub async fn after_move(
 ) {
     let Some(backend) = active_backend(state, volume_id).await else { return };
     let indexer = ProjectIndexer::new(backend);
-    for path in sources {
-        drop(indexer.on_delete(volume_id, path));
+    let clears: Vec<JoinHandle<()>> =
+        sources.iter().map(|path| indexer.on_delete(volume_id, path)).collect();
+
+    // The barrier. The cleared set and the re-indexed set OVERLAP: a file present
+    // under both the source and the overwritten destination is cleared here and
+    // written again just below, at the SAME path. `on_delete` and `on_write` both
+    // detach, so without waiting the delete could land after the write and drop
+    // the fresh chunks of a file that does exist. Awaiting is cheap: a clear is a
+    // metadata-only backend delete, while the re-index below stays detached
+    // because it costs an embedding round trip per file and must not sit on the
+    // caller's write path.
+    for clear in clears {
+        if let Err(e) = clear.await {
+            tracing::warn!(volume_id, error = %e, "an index clear task failed during a move");
+        }
     }
+
     index_tree(backend, volume_id, destination, client).await;
 }
 
@@ -319,6 +363,11 @@ mod tests {
         calls: Mutex<Vec<String>>,
         /// When set, every index_path call fails, to prove errors stay contained.
         fail_index: bool,
+        /// Latency added to every delete, recorded on completion. A real backend
+        /// delete is a network round trip, so a test that needs the "delete lands
+        /// after the write" interleaving has to make it reachable rather than
+        /// hope the scheduler produces it.
+        delete_delay: std::time::Duration,
     }
 
     impl RecordingBackend {
@@ -349,6 +398,7 @@ mod tests {
         }
 
         async fn delete_path(&self, volume_id: &str, path: &str) -> Result<usize> {
+            tokio::time::sleep(self.delete_delay).await;
             self.record(format!("delete {volume_id} {path}"));
             Ok(1)
         }
@@ -376,7 +426,13 @@ mod tests {
     }
 
     fn recording() -> (Arc<dyn SearchBackend>, Arc<RecordingBackend>) {
-        let inner = Arc::new(RecordingBackend::default());
+        with_delete_delay(std::time::Duration::ZERO)
+    }
+
+    fn with_delete_delay(
+        delete_delay: std::time::Duration,
+    ) -> (Arc<dyn SearchBackend>, Arc<RecordingBackend>) {
+        let inner = Arc::new(RecordingBackend { delete_delay, ..Default::default() });
         (inner.clone() as Arc<dyn SearchBackend>, inner)
     }
 
@@ -522,7 +578,54 @@ mod tests {
         assert!(rec.calls().is_empty(), "{:?}", rec.calls());
     }
 
+    /// The barrier in `after_move`, pinned: a path that is both cleared and
+    /// re-indexed must see its delete STRICTLY before its index call. Both hooks
+    /// detach, so an unordered version can land the delete last and drop the
+    /// chunks of a file that still exists.
+    #[tokio::test]
+    async fn after_move_clears_a_path_before_reindexing_it() {
+        let (state, client, rec) = indexing_state().await;
+        client.write_text_atomic("/dst/a.md", "arrived").await.expect("seed");
+
+        let displaced = vec!["/dst/a.md".to_string(), "/dst/gone.md".to_string()];
+        after_move(&state, crate::tools::testkit::MOUNT, &displaced, "/dst", &client).await;
+
+        let calls = wait_for(&rec, 3).await;
+        let vol = crate::tools::testkit::MOUNT;
+        let deleted = calls
+            .iter()
+            .position(|c| c == &format!("delete {vol} /dst/a.md"))
+            .unwrap_or_else(|| panic!("the clear must have run: {calls:?}"));
+        let indexed = calls
+            .iter()
+            .position(|c| c.starts_with(&format!("index {vol} /dst/a.md")))
+            .unwrap_or_else(|| panic!("the re-index must have run: {calls:?}"));
+        assert!(deleted < indexed, "the clear must precede the re-index: {calls:?}");
+        assert!(
+            calls.contains(&format!("delete {vol} /dst/gone.md")),
+            "a path with no counterpart must still be cleared: {calls:?}"
+        );
+    }
+
     // ── fixtures ────────────────────────────────────────────────────────────
+
+    /// An `AppState` whose search backend is the recorder and whose project has
+    /// an active mode, so the `after_*` hooks actually fire.
+    async fn indexing_state() -> (Arc<AppState>, Arc<VolumeClient>, Arc<RecordingBackend>) {
+        let (backend, rec) = with_delete_delay(std::time::Duration::from_millis(150));
+        let h = crate::tools::testkit::harness_with_search(|_| {}, Some(backend)).await;
+        let state = h.state.clone();
+        let client = h.client().await;
+        state
+            .admin
+            .set_index_mode(crate::tools::testkit::MOUNT, IndexMode::Bm25)
+            .await
+            .expect("the mode must be settable");
+        // The harness owns the temp dir; leaking it keeps the volume alive for the
+        // length of the test, which is what a fixture is for.
+        std::mem::forget(h);
+        (state, client, rec)
+    }
 
     /// A volume client over a temp dir, to drive `full_index` against real files.
     async fn client() -> Arc<VolumeClient> {

@@ -91,11 +91,15 @@ subtree, not just the named path, so a recursive move or copy of a tree moves or
 duplicates every entry underneath it. The REST `POST /api/fs/{mount}/move` and
 `/copy` call the same two helpers (`search/indexer.rs`), so the two doors cannot drift.
 
-**Ordering matters on a move**: the source paths are enumerated BEFORE the rename and
-the destination is walked after it. Once the rename has happened there is no source
-tree left to walk, so entries collected too late would stay in the index forever with
-no path to enumerate them by. This is the same enumerate-first rule a recursive
-`fs.delete` follows, and the bug it was written to prevent.
+**Ordering matters on a move**: both the source tree AND the destination tree are
+enumerated BEFORE the rename (`paths_displaced_by_move`), and the destination is walked
+again after it. With `overwrite: true` the engine deletes the destination outright, so a
+file that lived only there is gone from the volume and must be dropped from the index
+too; after the rename neither tree is left to enumerate. Every clear is then AWAITED
+before the re-index starts, because the two sets overlap on a file present under both
+trees and both hooks are detached: a delete landing after the write would drop the fresh
+chunks of a file that does exist. `fs.copy` needs none of this, because `copy_tree`
+merges into the destination and deletes nothing there.
 
 A move or copy that FAILS leaves the index untouched: the hooks run only on the success
 path, after the engine has returned. Non UTF-8 destinations are skipped silently, and
@@ -236,7 +240,3 @@ mode integration tests, use `scripts/search_embedding_fake.py` as a stub server.
    because the directory is always rebuildable. The cached open index is evicted with
    it, so the next write reopens a fresh one.
 
-5. **A move or copy with `overwrite: true` onto an existing tree can leave stale
-   entries.** The destination's own files are re-indexed, but a file that existed only
-   under the old destination and is not in the new one keeps its entry. Re-run
-   `search.index` after an overwriting reorganisation.

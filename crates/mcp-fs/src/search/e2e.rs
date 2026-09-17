@@ -931,6 +931,64 @@ mod scenarios {
         h.await_chunks(MOUNT, 3).await;
     }
 
+    /// `overwrite: true` onto an existing tree DESTROYS that tree: the engine
+    /// deletes the destination before the rename. A file that lived only under
+    /// the old destination is therefore gone from the volume, and must be gone
+    /// from the index too instead of staying searchable at a dead path.
+    ///
+    /// The content assertions matter as much as the counts: a file present on
+    /// both sides is cleared AND re-indexed by the same hook, so a chunk still
+    /// carrying the destination's old text, or no chunk at all, is the
+    /// clear-after-reindex race rather than a stale read.
+    pub async fn move_onto_an_existing_tree_strands_nothing(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        for (path, text) in [
+            ("/d/a.md", "destination alpha about okapi"),
+            ("/d/b.md", "destination beta about okapi"),
+            ("/d/c.md", "destination gamma about okapi"),
+            ("/s/a.md", "source alpha about okapi"),
+            ("/s/b.md", "source beta about okapi"),
+        ] {
+            h.write_file(MOUNT, path, text).await;
+        }
+        h.await_chunks(MOUNT, 5).await;
+
+        h.call(
+            "fs.move",
+            json!({"mount_id": MOUNT, "source": "/s", "destination": "/d", "overwrite": true}),
+        )
+        .await
+        .expect("an overwriting tree move must succeed");
+
+        // The file that existed only under the old destination went with it.
+        await_no_query_hit(h, mode, "okapi", "/d/c.md").await;
+        for path in ["/d/a.md", "/d/b.md"] {
+            await_chunk_contains(h, mode, "okapi", path, "source").await;
+        }
+        h.await_chunks(MOUNT, 2).await;
+    }
+
+    /// The single file case of the same rule: the destination's entry must end
+    /// up carrying the source's text, with nothing added and nothing lost.
+    pub async fn move_a_file_onto_an_existing_file_reindexes_it(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        h.write_file(MOUNT, "/dst.md", "destination text about tapir").await;
+        h.write_file(MOUNT, "/src.md", "source text about tapir").await;
+        h.await_chunks(MOUNT, 2).await;
+
+        h.call(
+            "fs.move",
+            json!({"mount_id": MOUNT, "source": "/src.md", "destination": "/dst.md",
+                   "overwrite": true}),
+        )
+        .await
+        .expect("an overwriting file move must succeed");
+
+        await_no_query_hit(h, mode, "tapir", "/src.md").await;
+        await_chunk_contains(h, mode, "tapir", "/dst.md", "source").await;
+        h.await_chunks(MOUNT, 1).await;
+    }
+
     /// A recursive copy must index every destination file and keep every source one.
     pub async fn copy_a_tree_indexes_every_destination(h: &E2eHarness, mode: &str) {
         h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
@@ -1138,6 +1196,73 @@ mod scenarios {
         for path in ["/tree/a.md", "/tree/deep/b.md"] {
             await_query_hit(h, mode, "vaquita", path).await;
         }
+    }
+
+    /// The REST door onto the same rule: an overwriting tree move through
+    /// `POST /api/fs/{mount}/move` must strand nothing either.
+    pub async fn rest_move_onto_an_existing_tree_strands_nothing(h: &E2eHarness, mode: &str) {
+        h.set_mode(MOUNT, mode).await.expect("set_index_mode must succeed");
+        for (path, text) in [
+            ("/d/a.md", "destination alpha about markhor"),
+            ("/d/b.md", "destination beta about markhor"),
+            ("/d/c.md", "destination gamma about markhor"),
+            ("/s/a.md", "source alpha about markhor"),
+            ("/s/b.md", "source beta about markhor"),
+        ] {
+            h.write_file(MOUNT, path, text).await;
+        }
+        h.await_chunks(MOUNT, 5).await;
+
+        let (status, body) = h
+            .rest_post(
+                MOUNT,
+                "move",
+                json!({"source": "/s", "destination": "/d", "overwrite": true}),
+                PERSON,
+            )
+            .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "REST overwriting move failed: {body}");
+
+        await_no_query_hit(h, mode, "markhor", "/d/c.md").await;
+        for path in ["/d/a.md", "/d/b.md"] {
+            await_chunk_contains(h, mode, "markhor", path, "source").await;
+        }
+        h.await_chunks(MOUNT, 2).await;
+    }
+
+    /// Poll until `path`'s indexed chunk contains `needle`, or fail.
+    ///
+    /// Stronger than [`await_query_hit`]: it proves WHICH text is indexed, the
+    /// only way to tell a real re-index from a leftover entry when the path is
+    /// the same on both sides of a move.
+    async fn await_chunk_contains(
+        h: &E2eHarness,
+        mode: &str,
+        query: &str,
+        path: &str,
+        needle: &str,
+    ) {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(super::shared::AUTO_INDEX_TIMEOUT_SECS);
+        let mut last = serde_json::Value::Null;
+        while std::time::Instant::now() < deadline {
+            last = h
+                .call(
+                    "search.query",
+                    json!({"mount_id": MOUNT, "query": query, "mode": mode, "top_k": 50}),
+                )
+                .await
+                .expect("search.query must succeed");
+            let hit = last["results"]
+                .as_array()
+                .and_then(|r| r.iter().find(|x| x["path"] == path))
+                .and_then(|x| x["chunk"].as_str());
+            if hit.is_some_and(|c| c.contains(needle)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {path} to be indexed with '{needle}', last: {last}");
     }
 
     /// Poll until `query` finds `path`, or fail: the index lags the write.
@@ -1590,6 +1715,21 @@ mod sqlite_rag {
     }
 
     #[tokio::test]
+    async fn e2e_sqlite_move_onto_an_existing_tree_strands_nothing() {
+        scenarios::move_onto_an_existing_tree_strands_nothing(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_move_a_file_onto_an_existing_file_reindexes_it() {
+        scenarios::move_a_file_onto_an_existing_file_reindexes_it(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_rest_move_onto_an_existing_tree_strands_nothing() {
+        scenarios::rest_move_onto_an_existing_tree_strands_nothing(&h().await, "rag").await;
+    }
+
+    #[tokio::test]
     async fn e2e_sqlite_copy_a_tree_indexes_every_destination() {
         scenarios::copy_a_tree_indexes_every_destination(&h().await, "rag").await;
     }
@@ -1713,6 +1853,21 @@ mod sqlite_bm25 {
     #[tokio::test]
     async fn e2e_sqlite_bm25_move_a_tree_moves_every_entry() {
         scenarios::move_a_tree_moves_every_entry(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_move_onto_an_existing_tree_strands_nothing() {
+        scenarios::move_onto_an_existing_tree_strands_nothing(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_move_a_file_onto_an_existing_file_reindexes_it() {
+        scenarios::move_a_file_onto_an_existing_file_reindexes_it(&h().await, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_sqlite_bm25_rest_move_onto_an_existing_tree_strands_nothing() {
+        scenarios::rest_move_onto_an_existing_tree_strands_nothing(&h().await, "bm25").await;
     }
 
     #[tokio::test]
@@ -2234,6 +2389,24 @@ mod pg_rag {
     }
 
     #[tokio::test]
+    async fn e2e_pg_move_onto_an_existing_tree_strands_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::move_onto_an_existing_tree_strands_nothing(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_move_a_file_onto_an_existing_file_reindexes_it() {
+        let Some(h) = h().await else { return };
+        scenarios::move_a_file_onto_an_existing_file_reindexes_it(&h, "rag").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_rest_move_onto_an_existing_tree_strands_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_move_onto_an_existing_tree_strands_nothing(&h, "rag").await;
+    }
+
+    #[tokio::test]
     async fn e2e_pg_copy_a_tree_indexes_every_destination() {
         let Some(h) = h().await else { return };
         scenarios::copy_a_tree_indexes_every_destination(&h, "rag").await;
@@ -2388,6 +2561,24 @@ mod pg_bm25 {
     async fn e2e_pg_bm25_move_a_tree_moves_every_entry() {
         let Some(h) = h().await else { return };
         scenarios::move_a_tree_moves_every_entry(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_move_onto_an_existing_tree_strands_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::move_onto_an_existing_tree_strands_nothing(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_move_a_file_onto_an_existing_file_reindexes_it() {
+        let Some(h) = h().await else { return };
+        scenarios::move_a_file_onto_an_existing_file_reindexes_it(&h, "bm25").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_pg_bm25_rest_move_onto_an_existing_tree_strands_nothing() {
+        let Some(h) = h().await else { return };
+        scenarios::rest_move_onto_an_existing_tree_strands_nothing(&h, "bm25").await;
     }
 
     #[tokio::test]

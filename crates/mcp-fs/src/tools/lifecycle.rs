@@ -78,9 +78,12 @@ pub fn register(reg: &mut ToolRegistry) {
             let src = norm(&ctx, &a, "source")?;
             let dst = norm(&ctx, &a, "destination")?;
             // Enumerated first, like the delete above: the rename takes the whole
-            // subtree with it, and afterwards there is no source tree left to list.
-            let indexed =
-                crate::search::indexer::paths_under(&ctx.state, &mount, &src, &client).await;
+            // subtree with it, and an overwritten destination is deleted outright,
+            // so afterwards neither tree is left to list.
+            let indexed = crate::search::indexer::paths_displaced_by_move(
+                &ctx.state, &mount, &src, &dst, &client,
+            )
+            .await;
             let out = fs_ops::move_path(
                 &client,
                 &ctx.state.safety,
