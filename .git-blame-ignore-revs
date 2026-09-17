@@ -1,0 +1,7 @@
+# Bulk reformats. Skipped by `git blame` so they do not mask real authorship.
+# Enable locally once with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub honours this file automatically.
+
+# style: add rustfmt.toml and normalize the tree against it
+58c6eaba8479220efcd658e41d75f48fa60134de

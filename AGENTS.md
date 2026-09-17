@@ -129,9 +129,15 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
   `literal_separator`, it would silently narrow `fs.glob` and `fs.grep`.
 
 ## Quality gate
-`cargo test --workspace` and `cargo clippy --all-targets --all-features -- -D warnings`
-must both be clean before any commit. `--all-features` matters: without it the two
-optional drivers are never compiled.
+`cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings` and
+`cargo fmt --all -- --check` must all be clean before any commit. `--all-features` matters:
+without it the two optional drivers are never compiled.
+
+`cargo fmt --all` is SAFE to run: the tree is kept clean against `rustfmt.toml`, which sets
+`use_small_heuristics = "Max"` to encode the wide house style (calls and chains stay on one
+line rather than exploding into one argument per line). Before that file existed the repo
+was not fmt clean and running fmt rewrote 84 files, so do not reintroduce hand formatting
+that fights it.
 
 ## Behaviour worth knowing
 Each is documented at its call site and recorded in `.agent_docs/lineage.md`: `unpack ok`
