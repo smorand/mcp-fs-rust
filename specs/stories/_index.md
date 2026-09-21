@@ -20,8 +20,8 @@
 
 | Order | ID | Epic | Title | FRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
 |-------|----|----|-------|-----|-----------|-------|-------|------------|----------|--------|
-| 1 | US-001 | n/a | The git.hosts map, its boot validation, and its single owner | 6 | 001, 006 | 17 | 5 | none | 1 | in-progress |
-| 2 | US-002 | n/a | Resolve a remote URL to a provider by parsing and exact match | 4 | 001, 004, 005, 009, 011 | 16 | 2 | US-001 | 1 | todo |
+| 1 | US-001 | n/a | The git.hosts map, its boot validation, and its single owner | 6 | 001, 006 | 17 | 5 | none | 1 | done |
+| 2 | US-002 | n/a | Resolve a remote URL to a provider by parsing and exact match | 4 | 001, 004, 005, 009, 011 | 16 | 2 | US-001 | 1 | done |
 | 3 | US-003 | n/a | Token identity becomes (person, host), in memory, on disk, and across backends | 4 | 002, 006, 008, 008, 009 | 13 | 6 | US-001 | 1 | todo |
 | 4 | US-004 | n/a | git.token_set: seed a token the caller already holds | 7 | 002, 003 | 20 | 2 | US-002, US-003 | 1 | todo |
 | 5 | US-005 | n/a | An expired token fails the operation before any socket opens | 3 | 004, 014 | 10 | 3 | US-002, US-003 | 1 | todo |

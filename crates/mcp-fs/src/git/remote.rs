@@ -3,10 +3,9 @@
 //!
 //! `config.rs` declares the `hosts` field on [`crate::config::GitConfig`] and
 //! calls [`validate_hosts`] once from `ServerConfig::validate`. Every other read
-//! of an entry's value, including resolution, lives here. This module does not
-//! resolve a git remote URL to a hostname yet (that lands with the URL parsing
-//! this module already exposes via the `url` crate for its own key validation);
-//! wiring a clone's URL through to [`resolve_host`] is a later story.
+//! of an entry's value, including resolution, lives here. `tools/git.rs` is the
+//! sole caller of [`resolve_host`] for an actual clone URL: it parses the URL
+//! with the `url` crate, lowercases the extracted host, and resolves it here.
 //!
 //! Host matching is exact only (DEC-015): no wildcard, no substring, no prefix
 //! fallback. A host absent from the map is not a `Provider::Anonymous`, it is a
