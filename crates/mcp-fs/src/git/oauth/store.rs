@@ -599,6 +599,34 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
     }
 
+    /// E2E-NEW-154: the redaction survives the common ways a session is
+    /// wrapped before being handed back to a caller (`get_token` returns
+    /// `Option<OAuthSession>`, `list_for_person` returns `(String,
+    /// OAuthSession)` pairs): `Option`, tuple and `Vec` `Debug` impls just
+    /// delegate to the wrapped type's own impl, so the redaction this story
+    /// extends stays in force through every one of them, not only the bare
+    /// struct.
+    #[test]
+    fn e2e_new_154_debug_redaction_survives_common_wrapping() {
+        let session = OAuthSession {
+            provider: "github".into(),
+            access_token: "gho_wrappedsecret".into(),
+            scopes: vec!["repo".into()],
+            expires_at: Some(future()),
+            instance_url: None,
+        };
+        let wrapped_opt = Some(session.clone());
+        let wrapped_tuple = ("github.ibm.com".to_string(), session.clone());
+        let wrapped_list = vec![session];
+
+        for text in
+            [format!("{wrapped_opt:?}"), format!("{wrapped_tuple:?}"), format!("{wrapped_list:?}")]
+        {
+            assert!(!text.contains("gho_wrappedsecret"), "token leaked through wrapping: {text}");
+            assert!(text.contains("<redacted>"), "got {text}");
+        }
+    }
+
     /// SQLite backed persistence at a real path, so a restart can be simulated.
     async fn open_persistence(
         path: &std::path::Path,

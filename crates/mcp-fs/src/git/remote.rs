@@ -30,10 +30,12 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer, Serialize};
+use tracing::Instrument;
 
 use crate::config::GitConfig;
 use crate::errors::{Result, ToolError};
 use crate::git::repo::GitRepoStore;
+use crate::safety::SafetyManager;
 
 /// The raw `git.hosts` YAML shape: hostname to provider-name pairs, in the order
 /// the operator wrote them, keeping every duplicate rather than collapsing it.
@@ -184,6 +186,22 @@ pub fn resolve_host(host: &str) -> Result<Provider> {
         .ok_or_else(|| ToolError::not_found(format!("host '{host}' is not declared in git.hosts")))
 }
 
+/// The `provider` field a `git.remote` tracing span and audit entry record
+/// for this host (FR-NEW-072): the same lookup [`resolve_host`] performs,
+/// reduced to its four string labels plus `"unknown"` for a host absent from
+/// `git.hosts` (or unknowable yet, before a network capable pre-flight
+/// check even resolved one). Read only, for labeling: it never gates a
+/// credential decision, [`resolve_host`] still owns that.
+pub fn provider_label(host: &str) -> &'static str {
+    match resolve_host(host) {
+        Ok(Provider::Github) => "github",
+        Ok(Provider::Gitlab) => "gitlab",
+        Ok(Provider::Generic) => "generic",
+        Ok(Provider::Anonymous) => "anonymous",
+        Err(_) => "unknown",
+    }
+}
+
 /// Every declared host whose provider is not `anonymous`, sorted by host
 /// ascending. The token screen's host selector (FR-NEW-038) reads `git.hosts`
 /// only through this function, never `GitConfig` directly, so host resolution
@@ -263,6 +281,96 @@ pub fn validate_remote_url(raw: &str) -> Result<url::Url> {
 /// abort by returning `false`. This is best-effort, secondary enforcement
 /// only: `transfer_progress` does not fire during connect or the TLS
 /// handshake, so the outer timeout is what actually bounds a hang there.
+/// Defensive second layer for FR-NEW-043: never actually observed in
+/// practice, since every URL this pipeline hands to `git2` is already
+/// userinfo free ([`validate_remote_url`]) and the token itself only ever
+/// reaches libgit2 through `Cred::userpass_plaintext` inside a callback, not
+/// as literal text libgit2 could echo back into an error string. Kept as a
+/// cheap safety net rather than trusting that the absence of a known leak
+/// path means no leak can ever occur: every libgit2 error message this
+/// module wraps is passed through this first.
+fn redact(message: String, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() && message.contains(t) => message.replace(t, "<redacted>"),
+        _ => message,
+    }
+}
+
+/// Everything one remote operation's tracing span and audit entry need to
+/// know before it runs (FR-NEW-057, FR-NEW-072): which tool, which host,
+/// which credential policy, which branch (when the operation names one), and
+/// where to write the audit entry.
+///
+/// Built at exactly one of two places for a given call, never both: the
+/// pre-flight guards in `tools/git.rs` (a failure resolved before any
+/// network call, FR-NEW-007/049/070, reported through
+/// [`tools::git::early_remote_failure`](crate::tools::git)) when one of them
+/// fails, or the operation function itself
+/// (`clone_and_import`/`push_branch`/`fetch_branch`/`pull_branch`) once every
+/// guard has passed. That mutual exclusion is what keeps the span and audit
+/// count at exactly one per call (FR-NEW-072), without either site needing
+/// to know whether the other one already reported.
+pub struct RemoteOpContext<'a> {
+    pub operation: &'static str,
+    pub host: &'a str,
+    pub provider: &'a str,
+    pub branch: Option<&'a str>,
+    pub mount_id: &'a str,
+    pub person: &'a str,
+    pub safety: &'a SafetyManager,
+}
+
+/// Run one remote operation's future inside exactly one `git.remote` tracing
+/// span, then record exactly one `safety.record_audit` entry from its
+/// outcome (FR-NEW-057, FR-NEW-072). The single call site both properties
+/// rest on.
+///
+/// `describe` builds the audit detail from a successful result; a failed
+/// result's detail is the error's own message. Neither a token nor a
+/// credentialed URL ever reaches either: every [`ToolError`] this pipeline
+/// raises already excludes both (FR-NEW-041, FR-NEW-042), and `describe` is
+/// supplied by each call site from response data that was never
+/// token-bearing to begin with (FR-NEW-043).
+pub async fn run_remote_operation<T, F>(
+    op: RemoteOpContext<'_>,
+    future: F,
+    describe: impl FnOnce(&T) -> String,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let span = tracing::info_span!(
+        "git.remote",
+        operation = op.operation,
+        host = op.host,
+        provider = op.provider,
+        branch = op.branch.unwrap_or(""),
+        outcome = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
+    );
+    let start = Instant::now();
+    let result = future.instrument(span.clone()).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    span.record("outcome", outcome);
+    span.record("duration_ms", duration_ms);
+
+    let detail = match &result {
+        Ok(v) => describe(v),
+        Err(e) => e.message.clone(),
+    };
+    let branch_part = op.branch.map(|b| format!(" branch '{b}'")).unwrap_or_default();
+    op.safety.record_audit(
+        op.person,
+        op.mount_id,
+        op.operation,
+        "/",
+        &format!("host '{}'{branch_part} outcome {outcome}: {detail}", op.host),
+    );
+
+    result
+}
+
 fn credential_callbacks(
     token: Option<String>,
     deadline: Option<Instant>,
@@ -296,6 +404,7 @@ pub fn clone_to_temp(
     token: Option<String>,
     deadline: Option<Instant>,
 ) -> Result<git2::Repository> {
+    let token_for_redaction = token.clone();
     let callbacks = credential_callbacks(token, deadline);
     let mut fetch = git2::FetchOptions::new();
     fetch.remote_callbacks(callbacks);
@@ -310,8 +419,12 @@ pub fn clone_to_temp(
     }
     builder.clone(url, into).map_err(|e| {
         // The message may name the URL but never the token: git2 does not echo
-        // credentials, and the token never appears in the URL we pass.
-        ToolError::internal(format!("clone failed: {e} (see server logs for details)"))
+        // credentials, and the token never appears in the URL we pass. Redacted
+        // defensively regardless (FR-NEW-043).
+        ToolError::internal(redact(
+            format!("clone failed: {e} (see server logs for details)"),
+            token_for_redaction.as_deref(),
+        ))
     })
 }
 
@@ -373,9 +486,13 @@ pub fn push_to_remote(
     token: Option<String>,
     deadline: Option<Instant>,
 ) -> Result<PushOutcome> {
-    let mut remote = repo
-        .remote_anonymous(origin_url)
-        .map_err(|e| ToolError::internal(format!("push failed to open remote: {e}")))?;
+    let token_for_redaction = token.clone();
+    let mut remote = repo.remote_anonymous(origin_url).map_err(|e| {
+        ToolError::internal(redact(
+            format!("push failed to open remote: {e}"),
+            token_for_redaction.as_deref(),
+        ))
+    })?;
 
     let refname = format!("refs/heads/{branch}");
     let dst_for_negotiation = refname.clone();
@@ -413,7 +530,10 @@ pub fn push_to_remote(
         if e.code() == git2::ErrorCode::NotFastForward {
             return Err(non_fast_forward_error(branch));
         }
-        return Err(ToolError::internal(format!("push of branch '{branch}' failed: {e}")));
+        return Err(ToolError::internal(redact(
+            format!("push of branch '{branch}' failed: {e}"),
+            token_for_redaction.as_deref(),
+        )));
     }
 
     if let Some(msg) = rejected.borrow().clone() {
@@ -506,8 +626,10 @@ pub fn fetch_from_remote(
     token: Option<String>,
     deadline: Option<Instant>,
 ) -> Result<FetchOutcome> {
-    let mut remote =
-        repo.remote_anonymous(origin_url).map_err(|e| connection_error(origin_url, &e))?;
+    let token_for_redaction = token.clone();
+    let mut remote = repo
+        .remote_anonymous(origin_url)
+        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
 
     // The remote's own advertisement, read before the fetch itself runs
     // (DEC-037): the caller diffs this against its prior
@@ -516,9 +638,9 @@ pub fn fetch_from_remote(
         let list_callbacks = credential_callbacks(token.clone(), deadline);
         let conn = remote
             .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
-            .map_err(|e| connection_error(origin_url, &e))?;
+            .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
         conn.list()
-            .map_err(|e| connection_error(origin_url, &e))?
+            .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?
             .iter()
             .filter_map(|h| h.name().strip_prefix("refs/heads/").map(str::to_string))
             .collect()
@@ -546,7 +668,7 @@ pub fn fetch_from_remote(
 
     remote
         .fetch(&[FETCH_REFSPEC], Some(&mut opts), None)
-        .map_err(|e| connection_error(origin_url, &e))?;
+        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
 
     let objects_fetched = remote.stats().received_objects() as i64;
     let refs_updated = updates.borrow().clone();
@@ -559,9 +681,9 @@ pub fn fetch_from_remote(
 /// `ERR_UNAUTHENTICATED`, raised earlier, before any network call, by
 /// `require_valid_credential`. This is always `ERR_INTERNAL_ERROR`, so the two
 /// are machine-distinguishable by code alone.
-fn connection_error(origin_url: &str, e: &git2::Error) -> ToolError {
+fn connection_error(origin_url: &str, e: &git2::Error, token: Option<&str>) -> ToolError {
     let host = extract_host(origin_url);
-    ToolError::internal(format!("fetch from host '{host}' failed: {e}"))
+    ToolError::internal(redact(format!("fetch from host '{host}' failed: {e}"), token))
 }
 
 /// The bare hostname of a URL, or the URL itself when it does not parse: the

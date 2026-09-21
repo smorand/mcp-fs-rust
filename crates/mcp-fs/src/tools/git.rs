@@ -431,6 +431,44 @@ fn git_err(what: &str, e: git2::Error) -> ToolError {
     ToolError::internal(format!("{what}: {e}"))
 }
 
+/// Report a remote operation's `git.remote` span and audit entry for a
+/// failure resolved before host resolution ever produced anything to label
+/// it with, or before an operation function
+/// (`clone_and_import`/`push_branch`/`fetch_branch`/`pull_branch`) was ever
+/// reached (FR-NEW-057, FR-NEW-072): `resolve_clone_credential` itself, and
+/// every pre-flight guard ahead of it (`require_origin`,
+/// `require_checked_out_branch`, the no-origin check), report through this.
+/// Once an operation function IS reached, it reports through
+/// [`crate::git::remote::run_remote_operation`] itself instead, never both
+/// for the same call: the two call sites are mutually exclusive, which is
+/// what keeps the span and audit count at exactly one per call.
+#[allow(clippy::too_many_arguments)]
+async fn early_remote_failure(
+    operation: &'static str,
+    mount_id: &str,
+    person: &str,
+    safety: &SafetyManager,
+    branch: Option<&str>,
+    host: &str,
+    provider: &str,
+    err: ToolError,
+) -> Result<Value> {
+    crate::git::remote::run_remote_operation(
+        crate::git::remote::RemoteOpContext {
+            operation,
+            host,
+            provider,
+            branch,
+            mount_id,
+            person,
+            safety,
+        },
+        async move { Err(err) },
+        |_: &Value| String::new(),
+    )
+    .await
+}
+
 /// First 8 characters, the short sha the C# prints.
 fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
@@ -815,8 +853,26 @@ async fn remote_clone(
     branch: Option<String>,
     depth: i64,
 ) -> Result<Value> {
-    let (token, auth) = resolve_clone_credential(ctx, &tokens, url).await?;
-    clone_and_import(ctx, store, mount_id, url, branch, depth, token, auth).await
+    match resolve_clone_credential(ctx, &tokens, url).await {
+        Ok((token, auth)) => {
+            clone_and_import(ctx, store, mount_id, url, branch, depth, token, auth).await
+        }
+        Err(e) => {
+            let host = crate::git::remote::extract_host(url);
+            let provider = crate::git::remote::provider_label(&host);
+            early_remote_failure(
+                "git.remote_clone",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                branch.as_deref(),
+                &host,
+                provider,
+                e,
+            )
+            .await
+        }
+    }
 }
 
 /// Everything that happens after the URL is validated and a credential (or
@@ -830,6 +886,45 @@ async fn remote_clone(
 /// what happens once import starts has to call it directly.
 #[allow(clippy::too_many_arguments)]
 async fn clone_and_import(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    url: &str,
+    branch: Option<String>,
+    depth: i64,
+    token: Option<String>,
+    auth: String,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(url);
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    let mount_for_ctx = mount_id.to_string();
+    let branch_for_ctx = branch.clone();
+    let auth_for_ctx = auth.clone();
+
+    crate::git::remote::run_remote_operation(
+        crate::git::remote::RemoteOpContext {
+            operation: "git.remote_clone",
+            host: &host,
+            provider: &auth_for_ctx,
+            branch: branch_for_ctx.as_deref(),
+            mount_id: &mount_for_ctx,
+            person: &person,
+            safety: &safety,
+        },
+        clone_and_import_inner(ctx, store, mount_id, url, branch, depth, token, auth),
+        |v: &Value| {
+            let files = v.get("files_imported").and_then(Value::as_u64).unwrap_or(0);
+            let bytes = v.get("bytes_imported").and_then(Value::as_u64).unwrap_or(0);
+            let src = v.get("url").and_then(Value::as_str).unwrap_or("");
+            format!("{files} files, {bytes} bytes from {src}")
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn clone_and_import_inner(
     ctx: &ToolCtx,
     store: Arc<GitRepoStore>,
     mount_id: &str,
@@ -904,6 +999,7 @@ async fn clone_and_import(
                         "mount_id": mount_owned,
                         "url": url_owned,
                         "files_imported": 0,
+                        "bytes_imported": 0,
                         "message": "Repository is empty",
                     }));
                 }
@@ -950,14 +1046,6 @@ async fn clone_and_import(
                 }
             }
 
-            state.safety.record_audit(
-                &person_owned,
-                &mount_owned,
-                "git.remote_clone",
-                "/",
-                &format!("{imported} files, {total_bytes} bytes from {url_owned}"),
-            );
-
             // FR-NEW-020: record the clone URL as `origin`. Push, fetch and pull
             // (US-009 to US-011) have no other source for it; re-cloning replaces
             // the row, since `add_remote` upserts by name.
@@ -987,6 +1075,7 @@ async fn clone_and_import(
             out.insert("commit".into(), json!(short(&tip_sha)));
             out.insert("commit_message".into(), json!(tip.message().unwrap_or_default().trim()));
             out.insert("files_imported".into(), json!(imported));
+            out.insert("bytes_imported".into(), json!(total_bytes));
             out.insert("commits_imported".into(), json!(commits_imported));
             out.insert("depth".into(), if depth > 0 { json!(depth) } else { json!("full") });
             out.insert("auth".into(), json!(auth));
@@ -1011,9 +1100,44 @@ async fn remote_push(
     mount_id: &str,
     branch: &str,
 ) -> Result<Value> {
-    let origin_url = crate::git::remote::require_origin(&store, mount_id).await?;
-    let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
-    push_branch(store, mount_id, branch, &origin_url, token, auth).await
+    let origin_url = match crate::git::remote::require_origin(&store, mount_id).await {
+        Ok(u) => u,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_push",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                "",
+                "unknown",
+                e,
+            )
+            .await;
+        }
+    };
+    match resolve_clone_credential(ctx, &tokens, &origin_url).await {
+        Ok((token, auth)) => {
+            let safety = ctx.state.safety.clone();
+            push_branch(store, mount_id, branch, &origin_url, token, auth, &ctx.person, safety)
+                .await
+        }
+        Err(e) => {
+            let host = crate::git::remote::extract_host(&origin_url);
+            let provider = crate::git::remote::provider_label(&host);
+            early_remote_failure(
+                "git.remote_push",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                &host,
+                provider,
+                e,
+            )
+            .await
+        }
+    }
 }
 
 /// Everything that happens after the origin URL is known and a credential (or
@@ -1031,7 +1155,44 @@ async fn remote_push(
 /// unlike [`clone_and_import`] this charges no write quota and writes no
 /// audit entry, matching `git.commit`: a git-internal ref update is not a
 /// write to the abstract filesystem.
+#[allow(clippy::too_many_arguments)]
 async fn push_branch(
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    branch: &str,
+    origin_url: &str,
+    token: Option<String>,
+    auth: String,
+    person: &str,
+    safety: Arc<SafetyManager>,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(origin_url);
+    let auth_for_ctx = auth.clone();
+
+    crate::git::remote::run_remote_operation(
+        crate::git::remote::RemoteOpContext {
+            operation: "git.remote_push",
+            host: &host,
+            provider: &auth_for_ctx,
+            branch: Some(branch),
+            mount_id,
+            person,
+            safety: &safety,
+        },
+        push_branch_inner(store, mount_id, branch, origin_url, token, auth),
+        |v: &Value| {
+            format!(
+                "created {}, up_to_date {}, remote_sha {}",
+                v.get("created").and_then(Value::as_bool).unwrap_or(false),
+                v.get("up_to_date").and_then(Value::as_bool).unwrap_or(false),
+                v.get("remote_sha").and_then(Value::as_str).unwrap_or(""),
+            )
+        },
+    )
+    .await
+}
+
+async fn push_branch_inner(
     store: Arc<GitRepoStore>,
     mount_id: &str,
     branch: &str,
@@ -1118,9 +1279,43 @@ async fn remote_fetch(
     tokens: Option<Arc<crate::git::OAuthTokenStore>>,
     mount_id: &str,
 ) -> Result<Value> {
-    let origin_url = crate::git::remote::require_origin(&store, mount_id).await?;
-    let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
-    fetch_branch(store, mount_id, &origin_url, token, auth).await
+    let origin_url = match crate::git::remote::require_origin(&store, mount_id).await {
+        Ok(u) => u,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_fetch",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                None,
+                "",
+                "unknown",
+                e,
+            )
+            .await;
+        }
+    };
+    match resolve_clone_credential(ctx, &tokens, &origin_url).await {
+        Ok((token, auth)) => {
+            let safety = ctx.state.safety.clone();
+            fetch_branch(store, mount_id, &origin_url, token, auth, &ctx.person, safety).await
+        }
+        Err(e) => {
+            let host = crate::git::remote::extract_host(&origin_url);
+            let provider = crate::git::remote::provider_label(&host);
+            early_remote_failure(
+                "git.remote_fetch",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                None,
+                &host,
+                provider,
+                e,
+            )
+            .await
+        }
+    }
 }
 
 /// Everything that happens after the origin URL is known and a credential (or
@@ -1138,6 +1333,40 @@ async fn remote_fetch(
 /// only ever moves `refs/remotes/origin/*`, so unlike [`clone_and_import`] this
 /// charges no write quota and writes no audit entry, matching [`push_branch`].
 async fn fetch_branch(
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    origin_url: &str,
+    token: Option<String>,
+    auth: String,
+    person: &str,
+    safety: Arc<SafetyManager>,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(origin_url);
+    let auth_for_ctx = auth.clone();
+
+    crate::git::remote::run_remote_operation(
+        crate::git::remote::RemoteOpContext {
+            operation: "git.remote_fetch",
+            host: &host,
+            provider: &auth_for_ctx,
+            branch: None,
+            mount_id,
+            person,
+            safety: &safety,
+        },
+        fetch_branch_inner(store, mount_id, origin_url, token, auth),
+        |v: &Value| {
+            format!(
+                "refs_updated {}, objects_fetched {}",
+                v.get("refs_updated").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                v.get("objects_fetched").and_then(Value::as_i64).unwrap_or(0),
+            )
+        },
+    )
+    .await
+}
+
+async fn fetch_branch_inner(
     store: Arc<GitRepoStore>,
     mount_id: &str,
     origin_url: &str,
@@ -1305,17 +1534,104 @@ async fn remote_pull(
     on_conflict: Option<String>,
 ) -> Result<Value> {
     if !store.is_initialized(mount_id).await {
-        return Err(ToolError::invalid_argument(format!(
-            "volume '{mount_id}' has no origin remote: it was never initialized as a git \
-             repository"
-        )));
+        return early_remote_failure(
+            "git.remote_pull",
+            mount_id,
+            &ctx.person,
+            &ctx.state.safety,
+            Some(branch),
+            "",
+            "unknown",
+            ToolError::invalid_argument(format!(
+                "volume '{mount_id}' has no origin remote: it was never initialized as a git \
+                 repository"
+            )),
+        )
+        .await;
     }
-    let entry = store.get_or_open_repo(mount_id).await?;
-    let local_sha = require_checked_out_branch(&entry, branch).await?;
+    let entry = match store.get_or_open_repo(mount_id).await {
+        Ok(e) => e,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_pull",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                "",
+                "unknown",
+                e,
+            )
+            .await;
+        }
+    };
+    let local_sha = match require_checked_out_branch(&entry, branch).await {
+        Ok(s) => s,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_pull",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                "",
+                "unknown",
+                e,
+            )
+            .await;
+        }
+    };
 
-    let origin_url = crate::git::remote::require_origin(&store, mount_id).await?;
-    let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
-    let client = ctx.state.stores.client(mount_id).await?;
+    let origin_url = match crate::git::remote::require_origin(&store, mount_id).await {
+        Ok(u) => u,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_pull",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                "",
+                "unknown",
+                e,
+            )
+            .await;
+        }
+    };
+    let host = crate::git::remote::extract_host(&origin_url);
+    let provider = crate::git::remote::provider_label(&host);
+    let (token, auth) = match resolve_clone_credential(ctx, &tokens, &origin_url).await {
+        Ok(v) => v,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_pull",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                &host,
+                provider,
+                e,
+            )
+            .await;
+        }
+    };
+    let client = match ctx.state.stores.client(mount_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            return early_remote_failure(
+                "git.remote_pull",
+                mount_id,
+                &ctx.person,
+                &ctx.state.safety,
+                Some(branch),
+                &host,
+                provider,
+                e,
+            )
+            .await;
+        }
+    };
 
     pull_branch(
         entry,
@@ -1366,6 +1682,67 @@ async fn remote_pull(
 /// [`resolve_clone_credential`] rejects it first (FR-NEW-041).
 #[allow(clippy::too_many_arguments)]
 async fn pull_branch(
+    entry: Arc<GitRepoEntry>,
+    branch: &str,
+    local_sha: &str,
+    origin_url: &str,
+    token: Option<String>,
+    auth: String,
+    client: Arc<VolumeClient>,
+    person: &str,
+    safety: Arc<SafetyManager>,
+    on_conflict: Option<String>,
+    timeout_secs: u64,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(origin_url);
+    let auth_for_ctx = auth.clone();
+    let safety_for_ctx = safety.clone();
+    let mount_id = entry.project_id.clone();
+
+    crate::git::remote::run_remote_operation(
+        crate::git::remote::RemoteOpContext {
+            operation: "git.remote_pull",
+            host: &host,
+            provider: &auth_for_ctx,
+            branch: Some(branch),
+            mount_id: &mount_id,
+            person,
+            safety: &safety_for_ctx,
+        },
+        pull_branch_inner(
+            entry,
+            branch,
+            local_sha,
+            origin_url,
+            token,
+            auth,
+            client,
+            person,
+            safety,
+            on_conflict,
+            timeout_secs,
+        ),
+        |v: &Value| {
+            if v.get("merged").and_then(Value::as_bool).unwrap_or(false) {
+                format!(
+                    "merged via {} strategy, conflicts_resolved {}",
+                    v.get("strategy").and_then(Value::as_str).unwrap_or(""),
+                    v.get("conflicts_resolved").and_then(Value::as_u64).unwrap_or(0),
+                )
+            } else {
+                format!(
+                    "fast-forward to {}, files_changed {}",
+                    v.get("new_sha").and_then(Value::as_str).unwrap_or(""),
+                    v.get("files_changed").and_then(Value::as_u64).unwrap_or(0),
+                )
+            }
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_branch_inner(
     entry: Arc<GitRepoEntry>,
     branch: &str,
     local_sha: &str,
@@ -3819,7 +4196,17 @@ mod tests {
         branch: &str,
         auth: &str,
     ) -> Result<Value> {
-        push_branch(e.git.clone(), MOUNT, branch, origin_url, None, auth.to_string()).await
+        push_branch(
+            e.git.clone(),
+            MOUNT,
+            branch,
+            origin_url,
+            None,
+            auth.to_string(),
+            OWNER,
+            e.f.state.safety.clone(),
+        )
+        .await
     }
 
     /// E2E-NEW-071: pushing a new local commit updates the remote's existing
@@ -4020,8 +4407,26 @@ mod tests {
         let sha = e.commit("second").await;
 
         let (r1, r2) = tokio::join!(
-            push_branch(e.git.clone(), MOUNT, "main", &url, None, "anonymous".to_string()),
-            push_branch(e.git.clone(), MOUNT, "main", &url, None, "anonymous".to_string()),
+            push_branch(
+                e.git.clone(),
+                MOUNT,
+                "main",
+                &url,
+                None,
+                "anonymous".to_string(),
+                OWNER,
+                e.f.state.safety.clone(),
+            ),
+            push_branch(
+                e.git.clone(),
+                MOUNT,
+                "main",
+                &url,
+                None,
+                "anonymous".to_string(),
+                OWNER,
+                e.f.state.safety.clone(),
+            ),
         );
         let r1 = r1.unwrap();
         let r2 = r2.unwrap();
@@ -4162,7 +4567,16 @@ mod tests {
     /// real, local, no-network fetch calls `fetch_branch` directly, exactly
     /// like `call_push_branch` does for push.
     async fn call_fetch_branch(e: &Env, origin_url: &str, auth: &str) -> Result<Value> {
-        fetch_branch(e.git.clone(), MOUNT, origin_url, None, auth.to_string()).await
+        fetch_branch(
+            e.git.clone(),
+            MOUNT,
+            origin_url,
+            None,
+            auth.to_string(),
+            OWNER,
+            e.f.state.safety.clone(),
+        )
+        .await
     }
 
     /// E2E-NEW-086 / E2E-NEW-087: a fetch against a remote two commits ahead
@@ -5572,5 +5986,474 @@ mod tests {
         let src = include_str!("../errors.rs");
         let count = src.matches("pub const ").count();
         assert_eq!(count, 14, "the ERR_* set must stay exactly 14 constants");
+    }
+
+    // ── US-018: audit, tracing and total token redaction ────────────────────
+
+    /// Whether `haystack` contains any contiguous substring of `token` at
+    /// least `min_len` characters long (E2E-NEW-151): a token that never
+    /// appears whole could still leak a fragment long enough to be useful to
+    /// an attacker, so the check slides a window across the token rather than
+    /// only checking full containment.
+    fn contains_token_fragment(haystack: &str, token: &str, min_len: usize) -> bool {
+        if token.len() <= min_len {
+            return haystack.contains(token);
+        }
+        token.as_bytes().windows(min_len).any(|w| {
+            let frag = std::str::from_utf8(w).expect("token is ascii");
+            haystack.contains(frag)
+        })
+    }
+
+    /// E2E-NEW-056: a clone succeeding with a stored, resolved token records
+    /// exactly one audit entry naming the operation and the URL, and the
+    /// entry contains no substring of the token, even though the real token
+    /// flowed all the way through `clone_to_temp`'s credential callback.
+    #[test]
+    fn e2e_new_056_clone_audit_records_the_operation_without_the_credential() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+            e.tokens
+                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .await
+                .unwrap();
+            let ctx = e.f.ctx(OWNER);
+            let (resolved_token, auth) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/org/repo.git",
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved_token.as_deref(), Some(token));
+
+            let remote_dir = e.f.dir.path().join("remote-e2e-056");
+            let url = seed_bare_remote(&remote_dir, "hello\n");
+            let out =
+                clone_and_import(&ctx, e.git.clone(), MOUNT, &url, None, 0, resolved_token, auth)
+                    .await
+                    .unwrap();
+            assert_eq!(out["files_imported"], 1);
+
+            let log = e.f.state.safety.audit(OWNER, MOUNT);
+            let entries: Vec<_> = log.iter().filter(|x| x.op == "git.remote_clone").collect();
+            assert_eq!(entries.len(), 1, "exactly one audit entry for the clone");
+            assert!(!entries[0].detail.contains(token), "got {}", entries[0].detail);
+            assert!(entries[0].detail.contains(&url), "must name the url: {}", entries[0].detail);
+        });
+    }
+
+    /// E2E-NEW-151: no tracing span or event captured while clone, push,
+    /// fetch and pull each run successfully with a stored token contains any
+    /// substring of that token 8 characters or longer.
+    ///
+    /// `lock_for_test`'s guard is intentionally held across every `.await`
+    /// below, mirroring the established `git::remote::tests::lock_for_test`
+    /// pattern: it serializes this test against every other test touching the
+    /// process global capture buffers, on a dedicated single test runtime
+    /// (`with_git_hosts_lock`), never nested with another lock in a
+    /// conflicting order, so there is no deadlock risk to the lint's concern.
+    #[allow(clippy::await_holding_lock)]
+    #[test]
+    fn e2e_new_151_tracing_output_never_contains_a_token() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+            e.tokens
+                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .await
+                .unwrap();
+            let ctx = e.f.ctx(OWNER);
+            let remote_dir = e.f.dir.path().join("remote-e2e-151");
+            let url = seed_bare_remote(&remote_dir, "hello\n");
+
+            let _cap = crate::logging::capture::lock_for_test();
+
+            let (t1, a1) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            clone_and_import(&ctx, e.git.clone(), MOUNT, &url, None, 0, t1, a1).await.unwrap();
+
+            e.write("/a.txt", "v\n").await;
+            e.commit("second").await;
+            let (t2, a2) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            push_branch(
+                e.git.clone(),
+                MOUNT,
+                "main",
+                &url,
+                t2,
+                a2,
+                OWNER,
+                e.f.state.safety.clone(),
+            )
+            .await
+            .unwrap();
+
+            advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+            let (t3, a3) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            fetch_branch(e.git.clone(), MOUNT, &url, t3, a3, OWNER, e.f.state.safety.clone())
+                .await
+                .unwrap();
+
+            advance_bare_remote(&remote_dir, "refs/heads/main", "c2\n");
+            let (t4, a4) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            let local_sha = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+            let client = e.f.state.stores.client(MOUNT).await.unwrap();
+            pull_branch(
+                entry,
+                "main",
+                &local_sha,
+                &url,
+                t4,
+                a4,
+                client,
+                OWNER,
+                e.f.state.safety.clone(),
+                None,
+                e.git.config().git.remote_timeout_secs,
+            )
+            .await
+            .unwrap();
+
+            for ev in crate::logging::capture::events() {
+                for v in ev.fields.values() {
+                    assert!(
+                        !contains_token_fragment(v, token, 8),
+                        "event field leaked a token fragment: {v}"
+                    );
+                }
+            }
+            for sp in crate::logging::capture::spans() {
+                for v in sp.fields.values() {
+                    assert!(
+                        !contains_token_fragment(v, token, 8),
+                        "span field leaked a token fragment: {v}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// E2E-NEW-152: an error message never contains a token, including one
+    /// originating in a real libgit2 failure (a broken local remote path),
+    /// with the actual token still flowing into the credential callback.
+    #[test]
+    fn e2e_new_152_error_messages_never_contain_a_token() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+            e.tokens
+                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .await
+                .unwrap();
+            let ctx = e.f.ctx(OWNER);
+
+            let undeclared = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://git.unknown.test/o/r.git",
+            )
+            .await
+            .unwrap_err();
+            assert!(!undeclared.message.contains(token));
+
+            let (resolved_token, auth) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved_token.as_deref(), Some(token));
+
+            let bogus_url = format!("file://{}/does-not-exist.git", e.f.dir.path().display());
+
+            // clone against a nonexistent local path: a real git2 failure.
+            let clone_err = clone_and_import(
+                &ctx,
+                e.git.clone(),
+                MOUNT,
+                &bogus_url,
+                None,
+                0,
+                resolved_token.clone(),
+                auth.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(!clone_err.message.contains(token), "got {}", clone_err.message);
+
+            // push and fetch against a nonexistent local remote: real git2
+            // failures too, exercised against a real local commit history.
+            let remote_dir = e.f.dir.path().join("remote-e2e-152");
+            let real_url = seed_bare_remote(&remote_dir, "hi\n");
+            call_clone_and_import(&e, &real_url, "anonymous").await.unwrap();
+            e.write("/a.txt", "v\n").await;
+            e.commit("second").await;
+
+            let push_err = push_branch(
+                e.git.clone(),
+                MOUNT,
+                "main",
+                &bogus_url,
+                resolved_token.clone(),
+                auth.clone(),
+                OWNER,
+                e.f.state.safety.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(!push_err.message.contains(token), "got {}", push_err.message);
+
+            let fetch_err = fetch_branch(
+                e.git.clone(),
+                MOUNT,
+                &bogus_url,
+                resolved_token,
+                auth,
+                OWNER,
+                e.f.state.safety.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(!fetch_err.message.contains(token), "got {}", fetch_err.message);
+        });
+    }
+
+    /// E2E-NEW-153: every remote operation's audit entry, across a
+    /// successful clone, push and fetch run with a real, stored token,
+    /// contains no substring of that token.
+    #[test]
+    fn e2e_new_153_audit_entries_never_contain_a_token() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+            e.tokens
+                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .await
+                .unwrap();
+            let ctx = e.f.ctx(OWNER);
+            let remote_dir = e.f.dir.path().join("remote-e2e-153");
+            let url = seed_bare_remote(&remote_dir, "hi\n");
+
+            let (t1, a1) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            clone_and_import(&ctx, e.git.clone(), MOUNT, &url, None, 0, t1, a1).await.unwrap();
+
+            e.write("/a.txt", "v\n").await;
+            e.commit("second").await;
+            let (t2, a2) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            push_branch(
+                e.git.clone(),
+                MOUNT,
+                "main",
+                &url,
+                t2,
+                a2,
+                OWNER,
+                e.f.state.safety.clone(),
+            )
+            .await
+            .unwrap();
+
+            advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+            let (t3, a3) = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/o/r.git",
+            )
+            .await
+            .unwrap();
+            fetch_branch(e.git.clone(), MOUNT, &url, t3, a3, OWNER, e.f.state.safety.clone())
+                .await
+                .unwrap();
+
+            let log = e.f.state.safety.audit(OWNER, MOUNT);
+            assert!(!log.is_empty());
+            for entry in &log {
+                assert!(!entry.detail.contains(token), "detail leaked token: {}", entry.detail);
+                assert!(!entry.path.contains(token));
+            }
+        });
+    }
+
+    /// E2E-NEW-200: a push of `main` that succeeds, then a second push
+    /// refused as non-fast-forward, records exactly two `git.remote_push`
+    /// audit entries, each naming the branch, the second recording the
+    /// refusal.
+    #[tokio::test]
+    async fn e2e_new_200_each_push_records_one_audit_entry() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-e2e-200");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
+        let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        let entries: Vec<_> = log.iter().filter(|x| x.op == "git.remote_push").collect();
+        assert_eq!(entries.len(), 2, "one entry per push call, success and refusal");
+        assert!(entries[0].detail.contains("outcome ok"), "got {}", entries[0].detail);
+        assert!(entries[1].detail.contains("outcome error"), "got {}", entries[1].detail);
+        assert!(entries[0].detail.contains("branch 'main'"), "got {}", entries[0].detail);
+        assert!(entries[1].detail.contains("branch 'main'"), "got {}", entries[1].detail);
+    }
+
+    /// E2E-NEW-201: a fetch that succeeds, then a pull refused as dirty, are
+    /// both recorded, the refusal included.
+    #[tokio::test]
+    async fn e2e_new_201_fetch_and_pull_record_audit_entries_too() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-e2e-201");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/dirty.txt", "uncommitted\n").await;
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("uncommitted changes"), "got {}", err.message);
+
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        assert!(log.iter().any(|x| x.op == "git.remote_fetch"), "fetch must be audited");
+        let pull_entries: Vec<_> = log.iter().filter(|x| x.op == "git.remote_pull").collect();
+        assert_eq!(pull_entries.len(), 1, "exactly one audit entry for the refused pull");
+        assert!(pull_entries[0].detail.contains("outcome error"), "got {}", pull_entries[0].detail);
+    }
+
+    /// E2E-NEW-202: no audit entry carries a credential: a clone refused for
+    /// embedding one in the URL still records exactly one audit entry, and
+    /// neither the credential nor the raw URL appears in it.
+    #[tokio::test]
+    async fn e2e_new_202_no_audit_entry_carries_a_credential() {
+        let e = Env::new().await;
+        let ctx = e.f.ctx(OWNER);
+        let bad_url = "https://alice:ghp_secret_credential@example.test/o/r.git";
+        let err =
+            remote_clone(&ctx, e.git.clone(), Some(e.tokens.clone()), MOUNT, bad_url, None, 0)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        let entries: Vec<_> = log.iter().filter(|x| x.op == "git.remote_clone").collect();
+        assert_eq!(entries.len(), 1, "exactly one audit entry for the refused clone");
+        assert!(!entries[0].detail.contains("ghp_secret_credential"), "got {}", entries[0].detail);
+        assert!(
+            !entries[0].detail.contains("alice:ghp_secret_credential"),
+            "got {}",
+            entries[0].detail
+        );
+        assert!(!entries[0].detail.contains(bad_url), "got {}", entries[0].detail);
+    }
+
+    /// E2E-NEW-247: a push that succeeds and a clone refused for an
+    /// undeclared host together emit exactly two `git.remote` spans, the
+    /// second with `outcome=error`, every required field present, and
+    /// neither containing a token, an `Authorization` value or URL userinfo.
+    ///
+    /// See [`e2e_new_151_tracing_output_never_contains_a_token`] for why
+    /// holding `lock_for_test`'s guard across `.await` here is safe.
+    #[allow(clippy::await_holding_lock)]
+    #[test]
+    fn e2e_new_247_every_remote_operation_emits_exactly_one_span() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let remote_dir = e.f.dir.path().join("remote-e2e-247");
+            let url = seed_bare_remote(&remote_dir, "hi\n");
+            call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+            let _cap = crate::logging::capture::lock_for_test();
+
+            call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+            let ctx = e.f.ctx(OWNER);
+            let clone_err = remote_clone(
+                &ctx,
+                e.git.clone(),
+                Some(e.tokens.clone()),
+                MOUNT,
+                "https://git.unknown.test/o/r.git",
+                None,
+                0,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(clone_err.code, code::INVALID_ARGUMENT);
+
+            let spans: Vec<_> = crate::logging::capture::spans()
+                .into_iter()
+                .filter(|s| s.name == "git.remote")
+                .collect();
+            assert_eq!(spans.len(), 2, "{spans:?}");
+
+            let push_span = spans
+                .iter()
+                .find(|s| s.fields.get("operation").map(String::as_str) == Some("git.remote_push"))
+                .expect("a push span");
+            assert_eq!(push_span.fields.get("outcome").map(String::as_str), Some("ok"));
+            for key in ["operation", "host", "provider", "branch", "outcome", "duration_ms"] {
+                assert!(push_span.fields.contains_key(key), "missing {key}: {push_span:?}");
+            }
+
+            let clone_span = spans
+                .iter()
+                .find(|s| s.fields.get("operation").map(String::as_str) == Some("git.remote_clone"))
+                .expect("a clone span");
+            assert_eq!(clone_span.fields.get("outcome").map(String::as_str), Some("error"));
+            for key in ["operation", "host", "provider", "outcome", "duration_ms"] {
+                assert!(clone_span.fields.contains_key(key), "missing {key}: {clone_span:?}");
+            }
+
+            for s in &spans {
+                for v in s.fields.values() {
+                    assert!(
+                        !v.to_ascii_lowercase().contains("authorization"),
+                        "span field carries an Authorization value: {v}"
+                    );
+                    assert!(!v.contains('@'), "span field carries URL userinfo: {v}");
+                }
+            }
+        });
     }
 }
