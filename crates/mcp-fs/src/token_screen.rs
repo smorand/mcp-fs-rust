@@ -12,9 +12,11 @@
 //! Seeding and revocation delegate to the exact functions the `git.token_set`
 //! and `git.auth_revoke` tool handlers call
 //! (`crate::tools::git_auth::{token_set, auth_revoke}`), never a second
-//! implementation. Listing token content is US-016's job; CSRF protection is
-//! US-017's. This story ships the routes, identity resolution and a bare page
-//! shell only.
+//! implementation. Listing reuses `git_auth::auth_status` directly, the exact
+//! per-person, host-ascending enumeration `git.auth_status` returns
+//! (FR-NEW-038, FR-NEW-067, DRIFT-010): a second adapter over one operation,
+//! never a second implementation. No token value is ever rendered. CSRF
+//! protection is US-017's.
 
 use crate::errors::{Result, ToolError};
 use crate::identity::IdentityResolver;
@@ -54,8 +56,43 @@ async fn show(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
         Ok(p) => p,
         Err(e) => return unauthorized(&e),
     };
-    let body = page_shell(&person);
-    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+    match list_tokens(&state, person.clone()).await {
+        Ok(rows) => {
+            let hosts = crate::git::remote::credentialed_hosts();
+            let body = page_shell(&person, &rows, &hosts);
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+                .into_response()
+        }
+        Err(e) => error_response(&e),
+    }
+}
+
+/// One row rendered on the screen: host, provider and validity only, never a
+/// token value (FR-NEW-038).
+struct TokenRow {
+    host: String,
+    provider: String,
+    validity: String,
+}
+
+/// The exact per-person enumeration `git.auth_status` reads
+/// (`git_auth::auth_status`), already ordered by host ascending: never a
+/// second sort, never a second implementation (FR-NEW-067, DRIFT-010). No
+/// argument here ever names a person other than the caller resolved from
+/// identity: there is no parameter through which one could (FR-NEW-040).
+async fn list_tokens(state: &Arc<AppState>, person: String) -> Result<Vec<TokenRow>> {
+    let tokens = git_auth::token_store(&state.config, state.stores.relational()).await?;
+    let ctx = ToolCtx { person, state: state.clone() };
+    let result = git_auth::auth_status(&ctx, None, None, &tokens)?;
+    let statuses = result["statuses"].as_array().cloned().unwrap_or_default();
+    Ok(statuses
+        .into_iter()
+        .map(|s| TokenRow {
+            host: s["host"].as_str().unwrap_or_default().to_string(),
+            provider: s["provider"].as_str().unwrap_or_default().to_string(),
+            validity: s["validity"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect())
 }
 
 async fn seed(
@@ -151,15 +188,39 @@ fn redirect_to_tokens() -> Response {
     (StatusCode::SEE_OTHER, [(header::LOCATION, "/app/tokens")]).into_response()
 }
 
-/// A bare page shell. Listing actual token content is US-016's job.
-fn page_shell(person: &str) -> String {
+/// The page shell: the person's own held hosts (FR-NEW-038, never a token
+/// value) and a host selector limited to declared, non-anonymous hosts
+/// (E2E-NEW-103). `data-host`/`data-validity` attributes on each row are for
+/// this module's own tests only; no client script depends on them.
+fn page_shell(person: &str, rows: &[TokenRow], hosts: &[String]) -> String {
+    let person = escape_html(person);
+    let table_rows: String = rows
+        .iter()
+        .map(|r| {
+            let host = escape_html(&r.host);
+            let provider = escape_html(&r.provider);
+            let validity = escape_html(&r.validity);
+            format!(
+                "<tr data-host=\"{host}\" data-validity=\"{validity}\"><td>{host}</td><td>{provider}</td><td>{validity}</td></tr>\n"
+            )
+        })
+        .collect();
+    let options: String = hosts
+        .iter()
+        .map(|h| {
+            let host = escape_html(h);
+            format!("<option value=\"{host}\">{host}</option>\n")
+        })
+        .collect();
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>Git tokens</title></head>\n\
-         <body>\n<h1>Git tokens</h1>\n<p>Signed in as {}</p>\n\
+         <body>\n<h1>Git tokens</h1>\n<p>Signed in as {person}</p>\n\
+         <table>\n<thead><tr><th>Host</th><th>Provider</th><th>Validity</th></tr></thead>\n\
+         <tbody>\n{table_rows}</tbody>\n</table>\n\
          <form method=\"post\" action=\"/app/tokens\">\n\
-         <input name=\"host\"><input name=\"token\" type=\"password\"><button type=\"submit\">Save</button>\n\
-         </form>\n</body>\n</html>\n",
-        escape_html(person)
+         <select name=\"host\">\n{options}</select>\n\
+         <input name=\"token\" type=\"password\"><button type=\"submit\">Save</button>\n\
+         </form>\n</body>\n</html>\n"
     )
 }
 
@@ -239,6 +300,29 @@ mod tests {
     async fn body_string(r: Response) -> String {
         let b = to_bytes(r.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(b.to_vec()).unwrap()
+    }
+
+    /// The `data-host` attribute of every rendered row, in document order:
+    /// the screen's own view of row order, read the same way for every test
+    /// that asserts on it (E2E-NEW-230, E2E-NEW-231, E2E-NEW-232).
+    fn extract_hosts_in_order(body: &str) -> Vec<String> {
+        body.split("data-host=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// No substring of `token` at least `min_len` characters long may appear
+    /// in `body` (E2E-NEW-104, FR-NEW-038).
+    fn assert_no_token_substring(body: &str, token: &str, min_len: usize) {
+        let chars: Vec<char> = token.chars().collect();
+        if chars.len() < min_len {
+            return;
+        }
+        for window in chars.windows(min_len) {
+            let s: String = window.iter().collect();
+            assert!(!body.contains(&s), "response leaked token substring: {s}");
+        }
     }
 
     fn get_req(
@@ -689,6 +773,319 @@ mod tests {
                 .await
                 .unwrap();
             assert!(mcp.headers().get(header::SET_COOKIE).is_none());
+        });
+    }
+
+    // ── E2E-NEW-100 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_100_the_screen_lists_held_hosts() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let alice = "e2e-new-100-alice@test.com";
+            let token = mint(&key_path, alice, 3600);
+
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.com","token":GHP}),
+            )
+            .await;
+            let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP,"expires_at":past}),
+            )
+            .await;
+
+            let r = app.oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            assert_eq!(
+                extract_hosts_in_order(&body),
+                vec!["github.com".to_string(), "github.ibm.com".to_string()]
+            );
+            assert!(body.contains("data-host=\"github.com\" data-validity=\"valid\""), "{body}");
+            assert!(
+                body.contains("data-host=\"github.ibm.com\" data-validity=\"expired\""),
+                "{body}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-103 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_103_the_screen_offers_only_declared_hosts() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-103@test.com", 3600);
+
+            let r = app.oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            for host in ["github.com", "github.ibm.com", "gitlab.acme.corp", "git.acme.internal"] {
+                assert!(
+                    body.contains(&format!("value=\"{host}\"")),
+                    "selector must offer {host}: {body}"
+                );
+            }
+            assert!(
+                !body.contains("public.example.org"),
+                "the anonymous host must never be offered: {body}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-104 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_104_no_token_value_reaches_the_browser() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-104@test.com", 3600);
+
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.com","token":GHP}),
+            )
+            .await;
+
+            let r = app.oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            assert_no_token_substring(&body, GHP, 8);
+        });
+    }
+
+    // ── E2E-NEW-107 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_107_one_person_cannot_read_anothers_tokens() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let alice = "e2e-new-107-alice@test.com";
+            let bob = "e2e-new-107-bob@test.com";
+            let alice_token = mint(&key_path, alice, 3600);
+            let bob_token = mint(&key_path, bob, 3600);
+
+            call_tool(
+                app.clone(),
+                &alice_token,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP}),
+            )
+            .await;
+
+            // Bob's own request, decorated with a query parameter naming alice: the
+            // route accepts no such parameter (FR-NEW-040), so it is never even
+            // read by the handler and has no effect.
+            let query_alice = alice.replace('@', "%40");
+            let r = app
+                .oneshot(bearer_get(&format!("/app/tokens?person={query_alice}"), &bob_token))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            assert!(body.contains(bob), "must show bob's own identity: {body}");
+            // The host selector legitimately lists github.ibm.com (a declared host,
+            // independent of who holds a token for it): what must never leak is a
+            // *row*, which only ever comes from the caller's own held hosts.
+            assert!(
+                extract_hosts_in_order(&body).is_empty(),
+                "bob holds no tokens of his own, so no row for alice's host may appear: {body}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-108 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_108_a_platform_admin_cannot_read_another_persons_tokens() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (mut c, key_path) = test_setup(d.path());
+            let bob = "e2e-new-108-bob@test.com";
+            c.auth.admins = vec![bob.to_string()];
+            let app = crate::app::build(c).await.unwrap();
+            let alice = "e2e-new-108-alice@test.com";
+            let alice_token = mint(&key_path, alice, 3600);
+            let bob_token = mint(&key_path, bob, 3600);
+
+            call_tool(
+                app.clone(),
+                &alice_token,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP}),
+            )
+            .await;
+
+            // Bob, a platform admin, has no code path to view alice's tokens:
+            // identity resolution always yields the requesting person, never a
+            // named target (FR-NEW-040). His own screen never shows her host.
+            let r = app.clone().oneshot(bearer_get("/app/tokens", &bob_token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            // The host selector legitimately lists github.ibm.com (a declared host,
+            // independent of who holds a token for it): what must never leak is a
+            // *row*, which only ever comes from the caller's own held hosts.
+            assert!(
+                extract_hosts_in_order(&body).is_empty(),
+                "bob holds no tokens of his own, so no row for alice's host may appear: {body}"
+            );
+
+            // An admin "attempt" to revoke that host operates only on bob's own
+            // (nonexistent) record: an ordinary, idempotent no-op for him, and
+            // alice's actual token is left untouched.
+            let r = app
+                .clone()
+                .oneshot(form_post("/app/tokens/revoke", Some(&bob_token), "host=github.ibm.com"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            let result =
+                call_tool(app, &alice_token, "git.auth_status", json!({"host":"github.ibm.com"}))
+                    .await;
+            let statuses = result["statuses"].as_array().unwrap();
+            assert!(
+                statuses.iter().any(|s| s["host"] == "github.ibm.com" && s["validity"] == "valid"),
+                "alice's token must be untouched by bob's admin claim: {statuses:?}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-109 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_109_seeding_an_undeclared_host_through_the_screen_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-109@test.com", 3600);
+
+            // The selector would never offer this host (E2E-NEW-103); this request
+            // bypasses it entirely, proving git.token_set's own validation still
+            // runs server-side (US-004), reached through the screen route.
+            let r = app
+                .oneshot(form_post(
+                    "/app/tokens",
+                    Some(&token),
+                    &format!("host=git.unknown.test&token={GHP}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+            assert_eq!(v["error"], crate::errors::code::INVALID_ARGUMENT);
+            assert!(v["detail"].as_str().unwrap().contains("git.unknown.test"), "{v}");
+        });
+    }
+
+    // ── E2E-NEW-230 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_230_the_screen_orders_rows_by_host() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-230@test.com", 3600);
+
+            // Seed out of order, so ordering cannot pass by accident.
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP}),
+            )
+            .await;
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.com","token":GHP}),
+            )
+            .await;
+
+            let r = app.oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            let body = body_string(r).await;
+            assert_eq!(
+                extract_hosts_in_order(&body),
+                vec!["github.com".to_string(), "github.ibm.com".to_string()]
+            );
+        });
+    }
+
+    // ── E2E-NEW-231 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_231_the_screen_and_the_tool_agree_on_order() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-231@test.com", 3600);
+
+            for host in ["git.acme.internal", "gitlab.acme.corp", "github.ibm.com", "github.com"] {
+                call_tool(app.clone(), &token, "git.token_set", json!({"host":host,"token":GHP}))
+                    .await;
+            }
+
+            let r = app.clone().oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            let body = body_string(r).await;
+            let screen_order = extract_hosts_in_order(&body);
+
+            let result = call_tool(app, &token, "git.auth_status", json!({})).await;
+            let tool_order: Vec<String> = result["statuses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["host"].as_str().unwrap().to_string())
+                .collect();
+
+            assert_eq!(screen_order, tool_order);
+            assert_eq!(screen_order.len(), 4);
+        });
+    }
+
+    // ── E2E-NEW-232 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_232_an_empty_token_list_renders_without_error() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-232@test.com", 3600);
+
+            let r = app.oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            assert!(extract_hosts_in_order(&body).is_empty(), "{body}");
         });
     }
 }

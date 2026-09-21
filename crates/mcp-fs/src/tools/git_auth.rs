@@ -373,7 +373,7 @@ fn spawn_poller(
 /// store keyed to this person, never from `list_ids` (every person,
 /// unfiltered) followed by per-id lookups: that shape would both leak across
 /// people (FR-NEW-040) and do redundant work.
-fn auth_status(
+pub(crate) fn auth_status(
     ctx: &ToolCtx,
     provider: Option<&str>,
     host: Option<&str>,

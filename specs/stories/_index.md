@@ -35,7 +35,7 @@
 | 13 | US-013 | n/a | A diverged pull: refuse, or merge under one global strategy | 5 | 013, 015 | 11 | 2 | US-011 | 1 | done |
 | 14 | US-014 | n/a | Remote timeout, lock release, and the frozen failure messages | 2 | 010, 012 | 7 | 4 | US-009, US-010, US-011, US-013 | 1 | done |
 | 15 | US-015 | n/a | The token screen: routes, and identity from three sources | 3 | 006 | 14 | 3 | US-004, US-007 | 1 | in-progress |
-| 16 | US-016 | n/a | The screen lists held hosts, ordered, and never another person's | 3 | 006 | 9 | 2 | US-015, US-006 | 1 | todo |
+| 16 | US-016 | n/a | The screen lists held hosts, ordered, and never another person's | 3 | 006 | 9 | 2 | US-015, US-006 | 1 | done |
 | 17 | US-017 | n/a | The screen seeds and revokes, protected by a single-use csrf_token | 4 | 006 | 16 | 2 | US-015, US-016, US-004, US-007 | 1 | todo |
 | 18 | US-018 | n/a | Every remote operation is audited and traced, and no token is ever emitted | 3 | 004 | 9 | 2 | US-008, US-009, US-010, US-011 | 1 | todo |
 | 19 | US-019 | n/a | Regenerate the frozen tool contract at 63 tools | 2 | 002, 009, 012 | 6 | 4 | US-004, US-006, US-007, US-008, US-009, US-010, US-011, US-013, US-014 | 1 | todo |

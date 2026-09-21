@@ -184,6 +184,19 @@ pub fn resolve_host(host: &str) -> Result<Provider> {
         .ok_or_else(|| ToolError::not_found(format!("host '{host}' is not declared in git.hosts")))
 }
 
+/// Every declared host whose provider is not `anonymous`, sorted by host
+/// ascending. The token screen's host selector (FR-NEW-038) reads `git.hosts`
+/// only through this function, never `GitConfig` directly, so host resolution
+/// still lives in exactly one file (the self-review checklist's "one
+/// implementation" rule).
+pub fn credentialed_hosts() -> Vec<String> {
+    let map = store().read().expect("git host map lock poisoned");
+    let mut hosts: Vec<String> =
+        map.iter().filter(|(_, p)| **p != Provider::Anonymous).map(|(h, _)| h.clone()).collect();
+    hosts.sort();
+    hosts
+}
+
 /// Reject anything that is not a bare `git@host:path` style shorthand: no
 /// `://` anywhere, and a colon that comes after a host-shaped prefix (no `/`
 /// before it). This is what `url::Url::parse` would otherwise turn into some
