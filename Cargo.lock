@@ -3622,6 +3622,7 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",

@@ -1,7 +1,7 @@
 # mcp-fs (Rust)
 
 A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem**:
-55 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
+63 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
@@ -281,7 +281,7 @@ store behaves identically on all three. See
 
 ## Interactive CLI agent
 
-`crates/agent` builds an `agent` binary that drives the 59 tools through an LLM. It is a
+`crates/agent` builds an `agent` binary that drives the 63 tools through an LLM. It is a
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash
@@ -317,7 +317,7 @@ cargo build -p agent -p mcp-fs && python3 scripts/pty_check.py
 
 ## The tool contract is frozen
 
-The 59 tool names, descriptions and `inputSchema` values are a client and an LLM facing
+The 63 tool names, descriptions and `inputSchema` values are a client and an LLM facing
 contract, so they are snapshotted in `tool-contract-golden.json` and compared on every test
 run, serialized form included, which means even a reordered schema key fails the build.
 `TOOL_CONTRACT.txt` is the human readable companion.

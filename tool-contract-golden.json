@@ -1,5 +1,5 @@
 {
-  "_note": "Frozen MCP tool contract: the 59 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
+  "_note": "Frozen MCP tool contract: the 63 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
   "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
   "tools": [
     {
@@ -1271,6 +1271,11 @@
             "description": "OAuth provider: github or gitlab.",
             "type": "string"
           },
+          "host": {
+            "description": "Host declared in git.hosts to authorize against; omit to use the provider's canonical public host (github.com or gitlab.com).",
+            "type": "string",
+            "default": null
+          },
           "instance_url": {
             "description": "Optional self-hosted instance URL (e.g. GitLab Enterprise).",
             "type": "string",
@@ -1290,12 +1295,15 @@
         "properties": {
           "provider": {
             "description": "Provider whose stored token is revoked: github or gitlab.",
-            "type": "string"
+            "type": "string",
+            "default": null
+          },
+          "host": {
+            "description": "Host whose stored token is revoked.",
+            "type": "string",
+            "default": null
           }
-        },
-        "required": [
-          "provider"
-        ]
+        }
       }
     },
     {
@@ -1306,6 +1314,11 @@
         "properties": {
           "provider": {
             "description": "Provider to check: github or gitlab; omit to report all providers.",
+            "type": "string",
+            "default": null
+          },
+          "host": {
+            "description": "Host to check; omit to report every host the caller holds a token for.",
             "type": "string",
             "default": null
           }
@@ -1521,6 +1534,69 @@
       }
     },
     {
+      "name": "git.remote_fetch",
+      "description": "Fetch objects and update refs/remotes/origin/* from origin. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.remote_pull",
+      "description": "Fetch from origin, then advance the checked-out branch to the remote tip and update the volume's files to match. A fast-forward applies directly. A diverged history is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way merge resolves every conflicting file by that strategy and creates a merge commit. Refuses a dirty volume (commit or discard first) and refuses any branch other than the one currently checked out.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "branch": {
+            "description": "Branch to pull; must be the branch currently checked out.",
+            "type": "string"
+          },
+          "on_conflict": {
+            "description": "For a diverged (non fast-forward) history: 'ours' or 'theirs' to resolve every conflicting file by that strategy and create a merge commit; omit to refuse the pull instead. Ignored whenever the pull is a fast-forward.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id",
+          "branch"
+        ]
+      }
+    },
+    {
+      "name": "git.remote_push",
+      "description": "Push a local branch to origin under the same name. Creates the branch on the remote when it is absent there. Fails if the push is not a fast-forward; force is not supported.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "branch": {
+            "description": "Local branch to push to origin under the same name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "branch"
+        ]
+      }
+    },
+    {
       "name": "git.show",
       "description": "Show details and diff of a commit.",
       "inputSchema": {
@@ -1570,6 +1646,32 @@
         },
         "required": [
           "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.token_set",
+      "description": "Seed a personal access token you already hold for a host declared in git.hosts, without the interactive device flow. The token is never echoed back.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "description": "Hostname declared in git.hosts to store the token for.",
+            "type": "string"
+          },
+          "token": {
+            "description": "The personal access token value. Never echoed back; 1 to 8192 characters.",
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "RFC 3339 timestamp the token expires at; omit or null for a token that never expires.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "host",
+          "token"
         ]
       }
     }

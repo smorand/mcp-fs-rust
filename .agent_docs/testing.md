@@ -85,6 +85,37 @@ Largest single modules: `core::fs_ops` 125, `api::dataplane` 64, `docs::extract`
 placeholder rendering, upsert and DDL per dialect, `LIKE` escaping and the retry helper
 with no database at all.
 
+## Capturing spans and events in a test (`logging::capture`, US-018, 2026-09-21)
+
+`tools::git::tests::e2e_new_151` and `e2e_new_247` need to inspect exactly what a
+`git.remote` tracing span or an event carried. `logging::capture::CaptureLayer` is a
+`#[cfg(test)]`-only `tracing_subscriber::Layer` installed process wide by
+`logging::init`, backed by two process global `Vec`s (`SPANS`, `EVENTS`): the tracing
+dispatcher is process wide, `cargo test` runs the whole crate in one binary, so there is
+only ever one subscriber to record into regardless of which test installs it first.
+
+A process global buffer with no gating is a trap: `cargo test` runs hundreds of other
+tests in parallel, and several hundred of them also exercise clone/push/fetch/pull
+(without ever calling the capture API), so their `git.remote` spans landed in the same
+buffer and inflated `e2e_new_247`'s count on a full `cargo test --workspace` run while
+passing every time in isolation. `CAPTURE_LOCK` only ever serialized capturing tests
+against EACH OTHER; it never stopped an unrelated, non-capturing test running
+concurrently on another OS thread from polluting the shared `Vec` during the exact
+window between `clear()` and the read.
+
+The fix is a `thread_local!` `CAPTURING` flag, not a process wide atomic bool: a process
+wide flag would still be `true` on every OTHER thread for as long as the capturing
+test's guard is held, so an unrelated concurrent test's spans would still pass the gate.
+What actually isolates the two is that every capturing test runs its whole async body on
+a dedicated, freshly built **single threaded** runtime (`with_git_hosts_lock` in
+`tools/git.rs`), so every span and event it causes, including ones from a
+`spawn_blocking` closure awaited from that same task, opens and closes its lifecycle on
+that one OS thread. `lock_for_test()` sets the flag on ITS calling thread only; every
+other test's spans fire on their own OS thread, where the flag was never set, and
+`CaptureLayer` drops them instead of recording them. Read `crates/mcp-fs/src/logging.rs`
+before adding a third capturing test: the isolation only holds if that test also runs on
+a dedicated single threaded runtime, the same way the first two do.
+
 ## Relational conformance: PostgreSQL and SQL Server
 
 The per store test modules cover their own logic against SQLite. `storage/conformance.rs`
@@ -100,7 +131,7 @@ SQLite always runs. The server engines run only when their dsn is in the environ
 | `MCPFS_TEST_MSSQL_DSN` | the SQL Server cases |
 
 ```bash
-docker compose -f docker-compose.test.yml up -d      # postgres:16 on 55432, mssql 2022 on 51433
+docker compose -f docker-compose.test.yml up -d      # pgvector/pgvector:pg16 on 55432, mssql 2022 on 51433
 
 MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
 MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
@@ -215,7 +246,7 @@ What replaced it, and why nothing was lost that mattered:
 
 | Was covered by the harness | Now covered by |
 |---|---|
-| the 59 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
+| the 63 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
 | the MCP wire framing and JSON-RPC behaviour | `app.rs` router tests driven with `oneshot` |
 | the REST plane, every route | `api/dataplane.rs` and `api/openapi.rs` tests |
 | every error path and `ERR_*` code | per module tests next to each error |

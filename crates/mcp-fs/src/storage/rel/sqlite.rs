@@ -206,6 +206,10 @@ impl RelationalDb for SqliteRelationalDb {
     }
 
     async fn migrate(&self, schema: &SchemaSet) -> Result<()> {
+        // DRIFT-005: drop any table whose live shape predates a key change,
+        // before the CREATE TABLE below rebuilds it on the new shape.
+        super::apply_table_recreations(self, schema).await?;
+
         let statements = schema.render(Dialect::Sqlite);
         if !statements.is_empty() {
             let sql = format!("{};", statements.join(";\n"));

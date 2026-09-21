@@ -180,15 +180,15 @@ fs.write_docx
   required: ['mount_id', 'path', 'markdown']
 git.auth
   desc: Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.
-  params: provider:string, instance_url:string=null
+  params: provider:string, host:string=null, instance_url:string=null
   required: ['provider']
 git.auth_revoke
   desc: Revoke the stored token for a provider.
-  params: provider:string
-  required: ['provider']
+  params: provider:string=null, host:string=null
+  required: []
 git.auth_status
   desc: Check authentication status for a provider (or all providers).
-  params: provider:string=null
+  params: provider:string=null, host:string=null
   required: []
 git.blame
   desc: Show who last modified each line of a file.
@@ -222,6 +222,18 @@ git.remote_clone
   desc: Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. Uses the OAuth token stored by git.auth 
   params: mount_id:string, url:string, branch:string=null, depth:integer=0
   required: ['mount_id', 'url']
+git.remote_fetch
+  desc: Fetch objects and update refs/remotes/origin/* from origin. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.
+  params: mount_id:string
+  required: ['mount_id']
+git.remote_pull
+  desc: Fetch from origin, then advance the checked-out branch to the remote tip and update the volume's files to match. A fast-forward applies directly. A diverged history is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way merge resolves every conflicting file by that strategy and creates a merge commit. Refuses a dirty volume (commit or discard first) and refuses any branch other than the one currently checked out.
+  params: mount_id:string, branch:string, on_conflict:string=null
+  required: ['mount_id', 'branch']
+git.remote_push
+  desc: Push a local branch to origin under the same name. Creates the branch on the remote when it is absent there. Fails if the push is not a fast-forward; force is not supported.
+  params: mount_id:string, branch:string
+  required: ['mount_id', 'branch']
 git.show
   desc: Show details and diff of a commit.
   params: mount_id:string, commit_sha:string
@@ -234,6 +246,10 @@ git.tags
   desc: List all tags.
   params: mount_id:string
   required: ['mount_id']
+git.token_set
+  desc: Seed a personal access token you already hold for a host declared in git.hosts, without the interactive device flow. The token is never echoed back.
+  params: host:string, token:string, expires_at:string=null
+  required: ['host', 'token']
 
 search.delete
   desc: Remove a path from the search index.

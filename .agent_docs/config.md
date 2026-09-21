@@ -263,7 +263,7 @@ doc_service:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | registers the 14 git tools and the git HTTP routes |
+| `enabled` | bool | `false` | registers the 18 git tools and the git HTTP routes |
 | `object_format` | string | `sha1` | `sha256` is accepted and ignored (the bundled libgit2 is sha1 only) |
 | `anonymous_read` | bool | `false` | allow unauthenticated clone and fetch |
 | `max_pack_size_mb` | int | `512` | push body ceiling, enforced (413) |
@@ -272,6 +272,7 @@ doc_service:
 | `gitlab_client_id` | string | `""` | GitLab application id |
 | `gitlab_client_secret_env` | string | `GITLAB_CLIENT_SECRET` | name of the env var holding the GitLab secret |
 | `gitlab_instance_url` | string | `https://gitlab.com` | base URL for a self hosted GitLab |
+| `remote_timeout_secs` | int | `120` | deadline for one clone/push/fetch/pull; expiry releases the per-repository write lock (DEC-032) |
 
 Details in [`.agent_docs/git.md`](git.md).
 

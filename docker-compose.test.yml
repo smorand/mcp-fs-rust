@@ -11,7 +11,15 @@
 # collides with a real PostgreSQL on 5432 or SQL Server on 1433.
 services:
   postgres:
-    image: postgres:16
+    # pgvector, not vanilla postgres: `--all-features` compiles the `rag` feature,
+    # whose Postgres pool runs `CREATE EXTENSION IF NOT EXISTS vector` on every
+    # new connection (crates/mcp-fs/src/storage/rel/postgres.rs). Against a plain
+    # postgres:16 image that extension is never available, so every connection
+    # attempt fails after_connect and the pool can never hand one out; every
+    # caller then times out waiting for a pooled connection with no server-side
+    # trace of the attempt. pgvector/pgvector:pg16 is a drop-in Postgres 16 image
+    # that also ships the extension, so the same after_connect hook succeeds.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: mcpfs
       POSTGRES_PASSWORD: mcpfs

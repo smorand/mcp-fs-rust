@@ -1,7 +1,13 @@
 //! OAuth bearer token store.
 //!
 //! Port of the C# `Git/OAuth/OAuthTokenStore.cs`. In memory by default, keyed
-//! `"{person}:{provider}"` lowercased so identity casing never splits a session.
+//! `"{person}:{host}"` lowercased so identity casing never splits a session.
+//! The key is `(person, host)`, not `(person, provider)`: one person may hold
+//! distinct tokens for `github.com` and `github.ibm.com`, both provider
+//! `github`, which a provider-only key could never tell apart (DEC-003,
+//! DEC-004). `provider` is retained as a non-key attribute of the stored
+//! session.
+//!
 //! When `MCPFS_TOKEN_KEY` is set the store is backed by
 //! [`SqliteOAuthPersistence`]: sessions are loaded at startup and every mutation
 //! is written through, encrypted, so authentication survives a restart.
@@ -9,7 +15,7 @@
 //! Tokens are never logged and never included in `Debug` output.
 
 use crate::config::ServerConfig;
-use crate::errors::Result;
+use crate::errors::{Result, ToolError};
 use crate::git::oauth::cipher;
 use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use chrono::{DateTime, Utc};
@@ -19,20 +25,25 @@ use std::sync::{Arc, RwLock};
 /// The environment variable holding the base64 AES-256 key.
 pub const TOKEN_KEY_ENV: &str = "MCPFS_TOKEN_KEY";
 
-/// An active OAuth session for one person plus provider.
+/// An active OAuth session for one person plus host.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OAuthSession {
+    /// The credential policy this host resolved to when the token was seeded.
+    /// Not part of the session's identity: see the module docs.
     pub provider: String,
     pub access_token: String,
     pub scopes: Vec<String>,
-    pub expires_at: DateTime<Utc>,
+    /// `None` means the token never expires (the Implementer Decision on this
+    /// representation: a relaxed nullable column rather than a far-future
+    /// sentinel).
+    pub expires_at: Option<DateTime<Utc>>,
     /// Self hosted GitLab base URL, `None` for github.com.
     pub instance_url: Option<String>,
 }
 
 impl OAuthSession {
     pub fn is_valid_at(&self, now: DateTime<Utc>) -> bool {
-        self.expires_at > now
+        self.expires_at.is_none_or(|e| e > now)
     }
 }
 
@@ -50,10 +61,11 @@ impl std::fmt::Debug for OAuthSession {
 }
 
 /// Sessions plus the original casing of the ids, needed to write through to
-/// persistence with the same person/provider strings the caller used.
+/// persistence with the same person/host strings the caller used.
+#[derive(Clone)]
 struct Entry {
     person: String,
-    provider: String,
+    host: String,
     session: OAuthSession,
 }
 
@@ -62,8 +74,8 @@ pub struct OAuthTokenStore {
     persistence: Option<Arc<RelationalOAuthPersistence>>,
 }
 
-fn key(person: &str, provider: &str) -> String {
-    format!("{}:{}", person.to_lowercase(), provider.to_lowercase())
+fn key(person: &str, host: &str) -> String {
+    format!("{}:{}", person.to_lowercase(), host.to_lowercase())
 }
 
 impl Default for OAuthTokenStore {
@@ -81,8 +93,8 @@ impl OAuthTokenStore {
     /// Store backed by encrypted persistence, preloaded from it.
     pub async fn with_persistence(persistence: Arc<RelationalOAuthPersistence>) -> Result<Self> {
         let mut sessions = HashMap::new();
-        for (person, provider, session) in persistence.load_all().await? {
-            sessions.insert(key(&person, &provider), Entry { person, provider, session });
+        for (person, host, session) in persistence.load_all().await? {
+            sessions.insert(key(&person, &host), Entry { person, host, session });
         }
         Ok(Self { sessions: RwLock::new(sessions), persistence: Some(persistence) })
     }
@@ -112,13 +124,21 @@ impl OAuthTokenStore {
         self.persistence.is_some()
     }
 
+    /// Writes memory first, then persistence when configured. A persistence
+    /// failure rolls the in-memory entry back to whatever was there before
+    /// this call (removed if there was none, restored otherwise), so a
+    /// reported failure never leaves a live credential behind (FR-NEW-064).
+    /// Both callers, `git.token_set` and the device-flow poller, share this
+    /// one rollback path rather than each reimplementing it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_token(
         &self,
         person: &str,
+        host: &str,
         provider: &str,
         access_token: &str,
         scopes: Vec<String>,
-        expires_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
         instance_url: Option<String>,
     ) -> Result<()> {
         let session = OAuthSession {
@@ -128,55 +148,130 @@ impl OAuthTokenStore {
             expires_at,
             instance_url,
         };
-        {
+        let k = key(person, host);
+        let previous = {
             let mut guard = self.sessions.write().expect("token store lock poisoned");
+            let previous = guard.get(&k).cloned();
             guard.insert(
-                key(person, provider),
+                k.clone(),
                 Entry {
                     person: person.to_string(),
-                    provider: provider.to_string(),
+                    host: host.to_string(),
                     session: session.clone(),
                 },
             );
-        }
-        if let Some(p) = &self.persistence {
-            p.upsert(person, provider, &session).await?;
+            previous
+        };
+        if let Some(p) = &self.persistence
+            && let Err(e) = p.upsert(person, host, &session).await
+        {
+            let mut guard = self.sessions.write().expect("token store lock poisoned");
+            match previous {
+                Some(prev) => {
+                    guard.insert(k, prev);
+                }
+                None => {
+                    guard.remove(&k);
+                }
+            }
+            return Err(e);
         }
         Ok(())
     }
 
-    pub fn get_token(&self, person: &str, provider: &str) -> Option<OAuthSession> {
+    pub fn get_token(&self, person: &str, host: &str) -> Option<OAuthSession> {
         let guard = self.sessions.read().expect("token store lock poisoned");
-        guard.get(&key(person, provider)).map(|e| e.session.clone())
+        guard.get(&key(person, host)).map(|e| e.session.clone())
     }
 
-    pub async fn revoke_token(&self, person: &str, provider: &str) -> Result<()> {
+    pub async fn revoke_token(&self, person: &str, host: &str) -> Result<()> {
         let removed = {
             let mut guard = self.sessions.write().expect("token store lock poisoned");
-            guard.remove(&key(person, provider))
+            guard.remove(&key(person, host))
         };
         if let Some(p) = &self.persistence {
             // Delete with the stored casing when known, so the row really goes.
             match &removed {
-                Some(e) => p.delete(&e.person, &e.provider).await?,
-                None => p.delete(person, provider).await?,
+                Some(e) => p.delete(&e.person, &e.host).await?,
+                None => p.delete(person, host).await?,
             }
         }
         Ok(())
     }
 
     /// A stored token that has not expired yet.
-    pub fn has_valid_token(&self, person: &str, provider: &str) -> bool {
-        self.get_token(person, provider).is_some_and(|s| s.is_valid_at(Utc::now()))
+    pub fn has_valid_token(&self, person: &str, host: &str) -> bool {
+        self.get_token(person, host).is_some_and(|s| s.is_valid_at(Utc::now()))
     }
 
-    /// Every `(person, provider)` currently held, original casing. Diagnostics.
+    /// The shared "a live credential must be resolved before any network call"
+    /// gate (FR-NEW-018, FR-NEW-019, FR-NEW-070). Resolves to the stored access
+    /// token when one is present and unexpired; otherwise fails loud with
+    /// `ERR_UNAUTHENTICATED`, naming `host` and instructing re-authentication,
+    /// with a fixed, distinct message prefix for each of the two failure
+    /// shapes: `no token for host <host>` when nothing is stored, `token
+    /// expired for host <host>` when a session is stored but its `expires_at`
+    /// is not strictly in the future (`OAuthSession::is_valid_at`'s existing
+    /// boundary: `expires_at` equal to now is expired, not valid). The two
+    /// prefixes let a caller decide whether to seed a token or to
+    /// re-authenticate. Never mutates the store (DEC-020): an expired session
+    /// is read, not removed, so a status surface can still report it as
+    /// `expired` rather than absent.
+    ///
+    /// `token_key` is whatever identifies the stored session in this store.
+    /// Every caller passes the real host here (`git.remote_clone` included,
+    /// since T-CONVERGE-001 fixed the one call site that used to pass the
+    /// resolved provider name instead), so `token_key` and `host` are always
+    /// the same value today; the parameter stays separate from `host` only
+    /// because `host` is also used for the message independently of how the
+    /// lookup key is derived.
+    ///
+    /// This is the one function every remote tool that resolves a credential
+    /// before opening a connection is meant to call: `git.remote_clone` today,
+    /// `git.remote_push`/`git.remote_fetch`/`git.remote_pull` once later
+    /// stories add them, so the gate is implemented and tested exactly once.
+    pub fn require_valid_credential(
+        &self,
+        person: &str,
+        token_key: &str,
+        host: &str,
+    ) -> Result<String> {
+        let instruction = format!("authenticate with git.auth or git.token_set for host {host}");
+        match self.get_token(person, token_key) {
+            None => {
+                Err(ToolError::unauthenticated(format!("no token for host {host}; {instruction}")))
+            }
+            Some(session) if !session.is_valid_at(Utc::now()) => Err(ToolError::unauthenticated(
+                format!("token expired for host {host}; {instruction}"),
+            )),
+            Some(session) => Ok(session.access_token),
+        }
+    }
+
+    /// Every `(person, host)` currently held, original casing. Diagnostics.
     pub fn list_ids(&self) -> Vec<(String, String)> {
         let guard = self.sessions.read().expect("token store lock poisoned");
         let mut out: Vec<(String, String)> =
-            guard.values().map(|e| (e.person.clone(), e.provider.clone())).collect();
+            guard.values().map(|e| (e.person.clone(), e.host.clone())).collect();
         out.sort();
         out
+    }
+
+    /// Every `(host, session)` held by one person, original host casing.
+    ///
+    /// The single source `git.auth_status` (DRIFT-010, FR-MOD-003) builds its
+    /// response from: one filtered scan of the whole map, matching on the
+    /// lowercased person part of the key, never `list_ids` (which returns
+    /// pairs for every person unfiltered and would leak across people,
+    /// violating FR-NEW-040) followed by per-id lookups.
+    pub fn list_for_person(&self, person: &str) -> Vec<(String, OAuthSession)> {
+        let person_lower = person.to_lowercase();
+        let guard = self.sessions.read().expect("token store lock poisoned");
+        guard
+            .values()
+            .filter(|e| e.person.to_lowercase() == person_lower)
+            .map(|e| (e.host.clone(), e.session.clone()))
+            .collect()
     }
 }
 
@@ -199,10 +294,18 @@ mod tests {
     #[tokio::test]
     async fn store_then_get() {
         let s = store();
-        s.store_token("alice@test.com", "github", "gho_1", vec!["repo".into()], future(), None)
-            .await
-            .unwrap();
-        let got = s.get_token("alice@test.com", "github").unwrap();
+        s.store_token(
+            "alice@test.com",
+            "github.com",
+            "github",
+            "gho_1",
+            vec!["repo".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        let got = s.get_token("alice@test.com", "github.com").unwrap();
         assert_eq!(got.access_token, "gho_1");
         assert_eq!(got.provider, "github");
         assert_eq!(got.scopes, vec!["repo"]);
@@ -213,72 +316,275 @@ mod tests {
     #[tokio::test]
     async fn keying_is_caseless_on_both_parts() {
         let s = store();
-        s.store_token("Alice@Test.COM", "GitHub", "tok", vec![], future(), None).await.unwrap();
-        assert!(s.get_token("alice@test.com", "github").is_some());
-        assert!(s.get_token("ALICE@TEST.COM", "GITHUB").is_some());
-        assert!(s.get_token("alice@test.com", "gitlab").is_none());
-        assert!(s.get_token("bob@test.com", "github").is_none());
-        assert_eq!(key("A@B.C", "GitHub"), "a@b.c:github");
+        s.store_token(
+            "Alice@Test.COM",
+            "GitHub.com",
+            "github",
+            "tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(s.get_token("alice@test.com", "github.com").is_some());
+        assert!(s.get_token("ALICE@TEST.COM", "GITHUB.COM").is_some());
+        assert!(s.get_token("alice@test.com", "gitlab.com").is_none());
+        assert!(s.get_token("bob@test.com", "github.com").is_none());
+        assert_eq!(key("A@B.C", "GitHub.com"), "a@b.c:github.com");
     }
 
     #[tokio::test]
     async fn store_overwrites_the_same_key_regardless_of_casing() {
         let s = store();
-        s.store_token("a@t.c", "github", "first", vec![], future(), None).await.unwrap();
-        s.store_token("A@T.C", "GITHUB", "second", vec![], future(), None).await.unwrap();
-        assert_eq!(s.get_token("a@t.c", "github").unwrap().access_token, "second");
+        s.store_token("a@t.c", "github.com", "github", "first", vec![], Some(future()), None)
+            .await
+            .unwrap();
+        s.store_token("A@T.C", "GITHUB.COM", "github", "second", vec![], Some(future()), None)
+            .await
+            .unwrap();
+        assert_eq!(s.get_token("a@t.c", "github.com").unwrap().access_token, "second");
         assert_eq!(s.list_ids().len(), 1);
     }
 
+    /// Renamed from `providers_are_independent` (E2E-MOD-001): also proves
+    /// E2E-NEW-032, the collision the old `(person, provider)` key made
+    /// impossible: two hosts of the SAME provider hold independent tokens.
     #[tokio::test]
-    async fn providers_are_independent() {
+    async fn hosts_are_independent() {
         let s = store();
-        s.store_token("a@t.c", "github", "gh", vec![], future(), None).await.unwrap();
+        s.store_token("a@t.c", "github.com", "github", "gh-public", vec![], Some(future()), None)
+            .await
+            .unwrap();
         s.store_token(
             "a@t.c",
-            "gitlab",
-            "gl",
+            "github.ibm.com",
+            "github",
+            "gh-enterprise",
             vec!["api".into()],
-            future(),
-            Some("https://gitlab.example.test".into()),
+            Some(future()),
+            Some("https://github.ibm.com".into()),
         )
         .await
         .unwrap();
-        assert_eq!(s.get_token("a@t.c", "github").unwrap().access_token, "gh");
-        let gl = s.get_token("a@t.c", "gitlab").unwrap();
-        assert_eq!(gl.instance_url.as_deref(), Some("https://gitlab.example.test"));
+        assert_eq!(s.get_token("a@t.c", "github.com").unwrap().access_token, "gh-public");
+        let ent = s.get_token("a@t.c", "github.ibm.com").unwrap();
+        assert_eq!(ent.access_token, "gh-enterprise");
+        assert_eq!(ent.provider, "github", "both hosts share the same provider");
+        assert_eq!(ent.instance_url.as_deref(), Some("https://github.ibm.com"));
         assert_eq!(
             s.list_ids(),
             vec![
-                ("a@t.c".to_string(), "github".to_string()),
-                ("a@t.c".to_string(), "gitlab".to_string()),
+                ("a@t.c".to_string(), "github.com".to_string()),
+                ("a@t.c".to_string(), "github.ibm.com".to_string()),
             ]
+        );
+    }
+
+    /// E2E-NEW-033: a token seeded for `GitHub.IBM.com` is retrievable under any
+    /// casing of that host.
+    #[tokio::test]
+    async fn e2e_new_033_host_matched_case_insensitively_on_seeding() {
+        let s = store();
+        s.store_token("a@t.c", "GitHub.IBM.com", "github", "tok", vec![], Some(future()), None)
+            .await
+            .unwrap();
+        assert!(s.get_token("a@t.c", "github.ibm.com").is_some());
+        assert!(s.get_token("a@t.c", "GITHUB.IBM.COM").is_some());
+        assert_eq!(
+            s.list_ids(),
+            vec![("a@t.c".to_string(), "GitHub.IBM.com".to_string())],
+            "the original casing is preserved for diagnostics"
         );
     }
 
     #[tokio::test]
     async fn has_valid_token_respects_expiry() {
         let s = store();
-        s.store_token("a@t.c", "github", "fresh", vec![], future(), None).await.unwrap();
-        assert!(s.has_valid_token("a@t.c", "github"));
-        assert!(s.has_valid_token("A@T.C", "GitHub"), "expiry check is caseless too");
+        s.store_token("a@t.c", "github.com", "github", "fresh", vec![], Some(future()), None)
+            .await
+            .unwrap();
+        assert!(s.has_valid_token("a@t.c", "github.com"));
+        assert!(s.has_valid_token("A@T.C", "GitHub.com"), "expiry check is caseless too");
 
-        s.store_token("b@t.c", "github", "stale", vec![], past(), None).await.unwrap();
-        assert!(!s.has_valid_token("b@t.c", "github"));
+        s.store_token("b@t.c", "github.com", "github", "stale", vec![], Some(past()), None)
+            .await
+            .unwrap();
+        assert!(!s.has_valid_token("b@t.c", "github.com"));
         // an expired session is still retrievable, only "valid" is false
-        assert_eq!(s.get_token("b@t.c", "github").unwrap().access_token, "stale");
-        assert!(!s.has_valid_token("nobody@t.c", "github"));
+        assert_eq!(s.get_token("b@t.c", "github.com").unwrap().access_token, "stale");
+        assert!(!s.has_valid_token("nobody@t.c", "github.com"));
+
+        // a `None` expiry (the Implementer Decision's representation) never expires
+        s.store_token("c@t.c", "github.com", "github", "forever", vec![], None, None)
+            .await
+            .unwrap();
+        assert!(s.has_valid_token("c@t.c", "github.com"));
+    }
+
+    /// DRIFT-010's store level half: enumerating one person's held hosts must
+    /// never include another person's rows. `git.auth_status` builds its
+    /// response from this, never from `list_ids`, which returns pairs for
+    /// every person unfiltered.
+    #[tokio::test]
+    async fn list_for_person_never_leaks_another_persons_hosts() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.com",
+            "github",
+            "alice-tok",
+            vec!["repo".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "alice-ent",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_token(
+            "bob@test.com",
+            "github.com",
+            "github",
+            "bob-tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let alice: std::collections::HashSet<String> =
+            s.list_for_person("alice@test.com").into_iter().map(|(h, _)| h).collect();
+        assert_eq!(
+            alice,
+            ["github.com".to_string(), "github.ibm.com".to_string()].into_iter().collect()
+        );
+
+        let bob = s.list_for_person("bob@test.com");
+        assert_eq!(bob.len(), 1, "bob must never see alice's hosts");
+        assert_eq!(bob[0].0, "github.com");
+        assert_eq!(bob[0].1.access_token, "bob-tok");
+
+        assert!(s.list_for_person("nobody@test.com").is_empty());
+    }
+
+    /// The person part of the filter is caseless, matching the store's key.
+    #[tokio::test]
+    async fn list_for_person_is_caseless_on_the_person_part() {
+        let s = store();
+        s.store_token(
+            "Alice@Test.COM",
+            "github.com",
+            "github",
+            "tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.list_for_person("alice@test.com").len(), 1);
+        assert_eq!(s.list_for_person("ALICE@TEST.COM").len(), 1);
+        assert!(s.list_for_person("bob@test.com").is_empty());
     }
 
     #[tokio::test]
     async fn revoke_removes_the_session() {
         let s = store();
-        s.store_token("a@t.c", "github", "tok", vec![], future(), None).await.unwrap();
-        s.revoke_token("A@T.C", "GITHUB").await.unwrap();
-        assert!(s.get_token("a@t.c", "github").is_none());
-        assert!(!s.has_valid_token("a@t.c", "github"));
+        s.store_token("a@t.c", "github.com", "github", "tok", vec![], Some(future()), None)
+            .await
+            .unwrap();
+        s.revoke_token("A@T.C", "GITHUB.COM").await.unwrap();
+        assert!(s.get_token("a@t.c", "github.com").is_none());
+        assert!(!s.has_valid_token("a@t.c", "github.com"));
         // revoking twice is a no-op
-        s.revoke_token("a@t.c", "github").await.unwrap();
+        s.revoke_token("a@t.c", "github.com").await.unwrap();
+    }
+
+    /// E2E-NEW-082 / E2E-NEW-162: two people each hold their own token for the
+    /// SAME host, and a lookup for one never returns the other's. This is the
+    /// store level guarantee that credential resolution for a push or a clone
+    /// (later stories) rests on: the pusher's own token, never the cloner's.
+    #[tokio::test]
+    async fn two_people_hold_independent_tokens_for_one_host() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "alice-tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_token(
+            "bob@test.com",
+            "github.ibm.com",
+            "github",
+            "bob-tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            s.get_token("alice@test.com", "github.ibm.com").unwrap().access_token,
+            "alice-tok"
+        );
+        assert_eq!(s.get_token("bob@test.com", "github.ibm.com").unwrap().access_token, "bob-tok");
+        assert_ne!(
+            s.get_token("alice@test.com", "github.ibm.com").unwrap().access_token,
+            s.get_token("bob@test.com", "github.ibm.com").unwrap().access_token,
+            "the credential supplied for one person must never be the other's"
+        );
+    }
+
+    /// E2E-NEW-163: revocation by one person never touches another's token for
+    /// the same host.
+    #[tokio::test]
+    async fn revocation_by_one_person_does_not_affect_another() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "alice-tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_token(
+            "bob@test.com",
+            "github.ibm.com",
+            "github",
+            "bob-tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        s.revoke_token("alice@test.com", "github.ibm.com").await.unwrap();
+        assert!(s.get_token("alice@test.com", "github.ibm.com").is_none());
+        assert_eq!(s.get_token("bob@test.com", "github.ibm.com").unwrap().access_token, "bob-tok");
+        assert!(s.has_valid_token("bob@test.com", "github.ibm.com"), "bob still authenticates");
     }
 
     #[test]
@@ -287,12 +593,40 @@ mod tests {
             provider: "github".into(),
             access_token: "gho_verysecret".into(),
             scopes: vec!["repo".into()],
-            expires_at: future(),
+            expires_at: Some(future()),
             instance_url: None,
         };
         let dbg = format!("{session:?}");
         assert!(!dbg.contains("gho_verysecret"), "tokens must never be logged");
         assert!(dbg.contains("<redacted>"));
+    }
+
+    /// E2E-NEW-154: the redaction survives the common ways a session is
+    /// wrapped before being handed back to a caller (`get_token` returns
+    /// `Option<OAuthSession>`, `list_for_person` returns `(String,
+    /// OAuthSession)` pairs): `Option`, tuple and `Vec` `Debug` impls just
+    /// delegate to the wrapped type's own impl, so the redaction this story
+    /// extends stays in force through every one of them, not only the bare
+    /// struct.
+    #[test]
+    fn e2e_new_154_debug_redaction_survives_common_wrapping() {
+        let session = OAuthSession {
+            provider: "github".into(),
+            access_token: "gho_wrappedsecret".into(),
+            scopes: vec!["repo".into()],
+            expires_at: Some(future()),
+            instance_url: None,
+        };
+        let wrapped_opt = Some(session.clone());
+        let wrapped_tuple = ("github.ibm.com".to_string(), session.clone());
+        let wrapped_list = vec![session];
+
+        for text in
+            [format!("{wrapped_opt:?}"), format!("{wrapped_tuple:?}"), format!("{wrapped_list:?}")]
+        {
+            assert!(!text.contains("gho_wrappedsecret"), "token leaked through wrapping: {text}");
+            assert!(text.contains("<redacted>"), "got {text}");
+        }
     }
 
     /// SQLite backed persistence at a real path, so a restart can be simulated.
@@ -316,10 +650,11 @@ mod tests {
             assert!(s.is_persistent());
             s.store_token(
                 "Alice@Test.com",
+                "GitHub.com",
                 "github",
                 "gho_persisted",
                 vec!["repo".into()],
-                future(),
+                Some(future()),
                 None,
             )
             .await
@@ -329,20 +664,20 @@ mod tests {
         // a restart must find the session again, keyed caselessly
         let p2 = open_persistence(&path, k).await;
         let s2 = OAuthTokenStore::with_persistence(p2.clone()).await.unwrap();
-        let got = s2.get_token("alice@test.com", "GITHUB").unwrap();
+        let got = s2.get_token("alice@test.com", "GITHUB.COM").unwrap();
         assert_eq!(got.access_token, "gho_persisted");
-        assert!(s2.has_valid_token("alice@test.com", "github"));
+        assert!(s2.has_valid_token("alice@test.com", "github.com"));
         assert_eq!(
             s2.list_ids(),
-            vec![("Alice@Test.com".to_string(), "github".to_string())],
+            vec![("Alice@Test.com".to_string(), "GitHub.com".to_string())],
             "the original casing is preserved for write through"
         );
 
         // revoke must clear the row too
-        s2.revoke_token("alice@test.com", "github").await.unwrap();
+        s2.revoke_token("alice@test.com", "github.com").await.unwrap();
         assert_eq!(p2.count().await.unwrap(), 0);
         let s3 = OAuthTokenStore::with_persistence(p2).await.unwrap();
-        assert!(s3.get_token("alice@test.com", "github").is_none());
+        assert!(s3.get_token("alice@test.com", "github.com").is_none());
     }
 
     #[tokio::test]
@@ -357,5 +692,272 @@ mod tests {
             assert!(!s.is_persistent());
             assert!(!dir.path().join("state/oauth.db").exists());
         }
+    }
+
+    // ── FR-NEW-064: a failed persistence write rolls the memory write back ────
+
+    /// A `RelationalDb` wrapping a real in-memory SQLite database: `migrate`
+    /// and `query` delegate untouched (so `RelationalOAuthPersistence::open`
+    /// succeeds normally), but `execute` fails once armed via [`Self::arm`].
+    /// `upsert` is the only caller of `execute` on this trait, so arming it
+    /// fails exactly the persistence write `store_token` performs, without
+    /// touching the schema migration that already ran during `open`.
+    struct FailingDb {
+        inner: crate::storage::rel::SqliteRelationalDb,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingDb {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage::rel::SqliteRelationalDb::open_in_memory().unwrap(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::rel::RelationalDb for FailingDb {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+
+        async fn execute(&self, query: &crate::storage::rel::Query) -> Result<u64> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::errors::ToolError::internal(
+                    "failingdb: persistence unavailable",
+                ));
+            }
+            self.inner.execute(query).await
+        }
+
+        async fn query(
+            &self,
+            query: &crate::storage::rel::Query,
+        ) -> Result<Vec<crate::storage::rel::RowValues>> {
+            self.inner.query(query).await
+        }
+
+        async fn begin(&self) -> Result<Box<dyn crate::storage::rel::RelationalTx>> {
+            self.inner.begin().await
+        }
+
+        async fn migrate(&self, schema: &crate::storage::rel::SchemaSet) -> Result<()> {
+            self.inner.migrate(schema).await
+        }
+    }
+
+    async fn failing_persistent_store() -> (Arc<FailingDb>, OAuthTokenStore) {
+        let db = Arc::new(FailingDb::new());
+        let persistence = Arc::new(
+            RelationalOAuthPersistence::open(db.clone(), [20u8; cipher::KEY_SIZE]).await.unwrap(),
+        );
+        let store = OAuthTokenStore::with_persistence(persistence).await.unwrap();
+        (db, store)
+    }
+
+    /// A failed persistence write on an empty store leaves no in-memory entry:
+    /// the store level half of E2E-NEW-221/030.
+    #[tokio::test]
+    async fn store_token_rolls_back_to_nothing_when_persistence_fails_from_empty() {
+        let (db, s) = failing_persistent_store().await;
+        db.arm();
+
+        let e = s
+            .store_token(
+                "alice@test.com",
+                "github.ibm.com",
+                "github",
+                "ghp_new",
+                vec![],
+                Some(future()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(
+            e.code,
+            crate::errors::code::INVALID_ARGUMENT,
+            "distinct from a validation error"
+        );
+        assert!(
+            s.get_token("alice@test.com", "github.ibm.com").is_none(),
+            "the memory write must not survive a persistence failure"
+        );
+    }
+
+    // ── require_valid_credential: FR-NEW-018/019/070 (US-005) ─────────────────
+    //
+    // `git.remote_push`, `git.remote_fetch` and `git.remote_pull` do not exist in
+    // this codebase yet (US-009/010/011). These tests exercise the shared gate
+    // function directly with fabricated person/host/store state, which is exactly
+    // what those later tools will call once they exist, so the contract is proven
+    // here rather than invented against tools that are out of this story's scope.
+
+    /// E2E-NEW-241: a missing token yields `ERR_UNAUTHENTICATED` with the fixed
+    /// `no token for host` prefix, and names the two remedies.
+    #[test]
+    fn e2e_new_241_a_missing_token_yields_the_fixed_code_and_prefix() {
+        let s = store();
+        let err = s
+            .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        assert!(err.message.starts_with("no token for host github.ibm.com"), "got {}", err.message);
+        assert!(err.message.contains("git.auth"), "got {}", err.message);
+        assert!(err.message.contains("git.token_set"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-242: an expired token yields its own fixed prefix.
+    #[tokio::test]
+    async fn e2e_new_242_an_expired_token_yields_its_own_fixed_prefix() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_x",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = s
+            .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        assert!(
+            err.message.starts_with("token expired for host github.ibm.com"),
+            "got {}",
+            err.message
+        );
+    }
+
+    /// E2E-NEW-243: absence and expiry are machine-distinguishable, same code,
+    /// different prefix.
+    #[tokio::test]
+    async fn e2e_new_243_absence_and_expiry_are_machine_distinguishable() {
+        let s = store();
+        let absent = s
+            .require_valid_credential("alice@test.com", "git.unknown.test", "git.unknown.test")
+            .unwrap_err();
+        s.store_token(
+            "bob@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_y",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let expired = s
+            .require_valid_credential("bob@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(absent.code, crate::errors::code::UNAUTHENTICATED);
+        assert_eq!(expired.code, crate::errors::code::UNAUTHENTICATED);
+        assert_ne!(absent.message, expired.message);
+        assert!(absent.message.starts_with("no token for host"), "got {}", absent.message);
+        assert!(expired.message.starts_with("token expired for host"), "got {}", expired.message);
+    }
+
+    /// E2E-NEW-096: push, fetch and pull all enforce expiry. Those tools do not
+    /// exist yet; calling the shared gate three times against the same expired
+    /// session proves the identical outcome every future caller of this exact
+    /// function gets for free.
+    #[tokio::test]
+    async fn e2e_new_096_the_gate_rejects_the_same_expired_token_identically_every_call() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_z",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            let err = s
+                .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+                .unwrap_err();
+            assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+            assert!(
+                err.message.starts_with("token expired for host github.ibm.com"),
+                "got {}",
+                err.message
+            );
+        }
+        // still present: none of the three calls deleted it (DEC-020)
+        assert!(s.get_token("alice@test.com", "github.ibm.com").is_some());
+    }
+
+    /// E2E-NEW-119: pull with an expired token fails before any fetch. The gate
+    /// returns before any network-capable code could run, and the store is left
+    /// untouched, so nothing a fetch would have mutated (a remote-tracking ref)
+    /// could possibly have changed as a side effect of the check itself.
+    #[tokio::test]
+    async fn e2e_new_119_the_gate_rejects_before_any_network_capable_call_with_no_mutation() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_w",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = s
+            .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        let after = s.get_token("alice@test.com", "github.ibm.com").unwrap();
+        assert_eq!(after.access_token, "ghp_w", "the gate must not mutate the store");
+    }
+
+    /// A failed persistence write restores the entry that was present before
+    /// the call: the store level half of E2E-NEW-222.
+    #[tokio::test]
+    async fn store_token_restores_the_previous_entry_when_persistence_fails() {
+        let (db, s) = failing_persistent_store().await;
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_old",
+            vec!["repo".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.arm();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_new",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let got = s.get_token("alice@test.com", "github.ibm.com").unwrap();
+        assert_eq!(got.access_token, "ghp_old", "the prior token must still be in place");
+        assert_eq!(got.scopes, vec!["repo"]);
     }
 }

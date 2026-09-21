@@ -38,7 +38,7 @@ an LLM facing contract regardless of where it came from. It is frozen in two pla
 
 | File | Role |
 |---|---|
-| `TOOL_CONTRACT.txt` | human readable reference for the 59 tools, their parameters and return shapes |
+| `TOOL_CONTRACT.txt` | human readable reference for the 63 tools, their parameters and return shapes |
 | `tool-contract-golden.json` | machine checked snapshot: names, descriptions and `inputSchema`, compared on every test run |
 
 Three tests enforce it (`tools/mod.rs`, `tools/all.rs`, `tools/contract_golden.rs`),

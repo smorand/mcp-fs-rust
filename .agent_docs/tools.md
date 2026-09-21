@@ -1,4 +1,4 @@
-# Tool reference (59 tools)
+# Tool reference (63 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -154,7 +154,7 @@ rolls the ACL row back if provisioning fails. Deletion also purges
 `state/git/{id}.db` and the bare repo directory when git is enabled, so a
 recreated id never inherits stale refs.
 
-## git (11, registered only when `git.enabled`)
+## git (14, registered only when `git.enabled`)
 
 | Tool | Purpose | Parameters | Returns | Auth |
 |---|---|---|---|---|
@@ -169,23 +169,31 @@ recreated id never inherits stale refs.
 | `git.checkout_file` | restore a file from a commit | `commit_sha`, `path` | `path`, `commit`, `size` | member |
 | `git.blame` | last change per line | `path`, `ref_name=null` | `path`, `lines[{line, commit, author, email, date}]` | member |
 | `git.remote_clone` | clone a remote into the volume | `url`, `branch=null`, `depth:int=0` | `mount_id`, `url`, `branch`, `commit`, `commit_message`, `files_imported`, `commits_imported`, `depth`, `auth`, `skipped?` | member |
+| `git.remote_push` | push a local branch to `origin`, fast-forward only, no force | `branch` | push outcome: remote sha, `created`, `up_to_date` | member |
+| `git.remote_fetch` | fetch objects, update `refs/remotes/origin/*` only, never a working file | (`mount_id`) | updated refs, `refs_stale[]`, objects downloaded | member |
+| `git.remote_pull` | fetch, then fast-forward or (with `on_conflict`) three-way merge the checked-out branch | `branch`, `on_conflict=null` (`ours`\|`theirs`) | fast-forward or merge outcome | member |
 
 A commit object is `{sha, short_sha, message, author, author_email, timestamp,
-date, parents[]}`. `git.remote_clone` uses the OAuth token stored by `git.auth`
-for the detected provider when there is one; an empty remote returns
-`{mount_id, url, files_imported: 0, message}`.
+date, parents[]}`. `git.remote_clone` uses the OAuth token stored for the
+detected provider/host when there is one; an empty remote returns
+`{mount_id, url, files_imported: 0, message}`. `git.remote_push`,
+`git.remote_fetch` and `git.remote_pull` take no `url`: they resolve the
+volume's stored `origin`. See [`git.md`](git.md) for the full remote pipeline,
+the `git.hosts` host map and the `on_conflict` merge semantics.
 
-## git.auth (3, registered only when `git.enabled`)
+## git.auth (4, registered only when `git.enabled`)
 
 | Tool | Purpose | Parameters | Returns | Auth |
 |---|---|---|---|---|
-| `git.auth` | start the OAuth device flow | `provider` (`github` or `gitlab`), `instance_url=null` | `status` (`pending`), `provider`, `user_code`, `verification_uri`, `expires_in`, `message` | auth |
-| `git.auth_status` | authentication status | `provider=null` | one provider: `authenticated`, `provider`, plus `scopes`, `expires_at` when authenticated; omitted provider: `statuses[]` | auth |
-| `git.auth_revoke` | drop the stored token | `provider` | `provider`, `revoked` | auth |
+| `git.auth` | start the OAuth device flow | `provider` (`github` or `gitlab`), `host=null`, `instance_url=null` | `status` (`pending`), `provider`, `user_code`, `verification_uri`, `expires_in`, `message` | auth |
+| `git.auth_status` | authentication status | `provider=null`, `host=null` | one host: `authenticated`, `provider`, plus `scopes`, `expires_at` when authenticated; omitted: `statuses[]` | auth |
+| `git.auth_revoke` | drop the stored token | `provider=null`, `host=null` | `provider`, `revoked` | auth |
+| `git.token_set` | seed a PAT already held for a declared host, skipping the device flow | `host`, `token`, `expires_at=null` | confirmation, never echoes the token | auth |
 
 `git.auth` returns as soon as the provider issues a user code; a detached task
 polls the token endpoint, so the client waits by calling `git.auth_status`. A
-token belongs to a person, not to a mount, hence no `mount_id`.
+token belongs to a person plus host (not provider alone, and not a mount): see
+[`git.md`](git.md#token-identity-is-per-person-host).
 
 ## Authorization model
 
