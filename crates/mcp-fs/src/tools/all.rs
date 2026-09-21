@@ -66,12 +66,12 @@ mod tests {
     }
 
     #[test]
-    fn the_git_families_add_fifteen_tools() {
+    fn the_git_families_add_sixteen_tools() {
         let mut reg = ToolRegistry::new();
         super::super::admin::register(&mut reg);
         super::super::git::register(&mut reg);
         super::super::git_auth::register(&mut reg);
-        assert_eq!(reg.len(), 10 + 11 + 4);
+        assert_eq!(reg.len(), 10 + 12 + 4);
         assert!(reg.resolve("git.remote_clone").is_some());
         assert!(reg.resolve("git.auth_revoke").is_some());
         assert!(reg.resolve("git.token_set").is_some());
@@ -111,11 +111,11 @@ mod tests {
         };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 35 fs + 10 admin + 15 git + 5 web + 2 context7 + 8 sqlite + 5 db = 80
+        // 35 fs + 10 admin + 16 git + 5 web + 2 context7 + 8 sqlite + 5 db = 81
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 80 + doc_count + 3);
+        assert_eq!(reg.len(), 81 + doc_count + 3);
     }
 
     #[test]
@@ -133,15 +133,15 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        // Base 80 + doc + 3 editor + 4 search.*
-        assert_eq!(reg.len(), 80 + doc_count + 3 + 4);
+        // Base 81 + doc + 3 editor + 4 search.*
+        assert_eq!(reg.len(), 81 + doc_count + 3 + 4);
         assert!(reg.resolve("search.index").is_some());
         assert!(reg.resolve("search.query").is_some());
         assert!(reg.resolve("search.delete").is_some());
         assert!(reg.resolve("search.status").is_some());
     }
 
-    /// Whole surface gate for the 24 tools of this agent: every `admin.*`,
+    /// Whole surface gate for the 25 tools of this agent: every `admin.*`,
     /// `git.*` and `git.auth*` schema and description is compared to the frozen
     /// contract, the serialized string included, so a property key ORDER change
     /// fails too.
@@ -149,6 +149,11 @@ mod tests {
     /// The contract lives at the repo root, outside the crate, so the check is
     /// skipped with a message when it is absent; the per family tests still pin
     /// every schema inline.
+    ///
+    /// `git.remote_push` (US-009) is not yet in the frozen contract on disk
+    /// (regenerated once, last, in US-019, per this story's own constraints),
+    /// so this test is expected to fail until then: it is one of the two
+    /// pre-authorized red tests for this story.
     #[test]
     fn every_admin_and_git_schema_matches_the_frozen_tool_contract() {
         let mut reg = ToolRegistry::new();
@@ -158,7 +163,7 @@ mod tests {
         super::super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("admin.") || name.starts_with("git."),
-            24,
+            25,
             "admin.* and git.* tools",
         );
     }

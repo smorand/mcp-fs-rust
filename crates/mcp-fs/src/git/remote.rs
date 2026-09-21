@@ -21,9 +21,11 @@
 //! three tools take a `url` argument (DEC-021): their only source for one is
 //! the `origin` row [`crate::tools::git`]'s clone records via `git::db`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -235,17 +237,12 @@ pub fn validate_remote_url(raw: &str) -> Result<url::Url> {
     Ok(parsed)
 }
 
-/// Clone into a real directory: libgit2 needs a filesystem to clone into. The
+/// Build the credential-supplying callbacks every remote operation shares. The
 /// sole `git2::RemoteCallbacks` construction in the tree (FR-NEW-054,
-/// E2E-NEW-197): credential supply for every remote operation goes through
-/// this one closure.
-pub fn clone_to_temp(
-    url: &str,
-    into: &Path,
-    branch: Option<&str>,
-    depth: i64,
-    token: Option<String>,
-) -> Result<git2::Repository> {
+/// E2E-NEW-197): clone and push both call this one function rather than each
+/// constructing their own, so the credential-supply property this proves rests
+/// on one implementation, not two.
+fn credential_callbacks(token: Option<String>) -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
     if let Some(t) = token {
         // The provider expects the token as the password; "oauth2" is the
@@ -253,6 +250,18 @@ pub fn clone_to_temp(
         callbacks
             .credentials(move |_url, _user, _types| git2::Cred::userpass_plaintext("oauth2", &t));
     }
+    callbacks
+}
+
+/// Clone into a real directory: libgit2 needs a filesystem to clone into.
+pub fn clone_to_temp(
+    url: &str,
+    into: &Path,
+    branch: Option<&str>,
+    depth: i64,
+    token: Option<String>,
+) -> Result<git2::Repository> {
+    let callbacks = credential_callbacks(token);
     let mut fetch = git2::FetchOptions::new();
     fetch.remote_callbacks(callbacks);
     if depth > 0 {
@@ -272,9 +281,10 @@ pub fn clone_to_temp(
 }
 
 /// FR-NEW-021: push, fetch and pull take no `url`; they resolve the stored
-/// `origin`. Neither tool exists yet (US-009 to US-011), so this is the shared
-/// guard those stories call before ever reaching a network operation, rather
-/// than each reimplementing "does this volume have an origin". A volume never
+/// `origin`. `git.remote_push` (US-009) is the first of the three to call this;
+/// fetch and pull (US-010, US-011) don't exist yet. This is the shared guard
+/// each calls before ever reaching a network operation, rather than each
+/// reimplementing "does this volume have an origin". A volume never
 /// initialized as a repository and one initialized but never cloned into both
 /// fail the same way: there is no `origin` row to resolve.
 pub async fn require_origin(store: &GitRepoStore, volume_id: &str) -> Result<String> {
@@ -289,6 +299,136 @@ pub async fn require_origin(store: &GitRepoStore, volume_id: &str) -> Result<Str
     remotes.into_iter().find(|(name, _)| name == "origin").map(|(_, url)| url).ok_or_else(|| {
         ToolError::invalid_argument(format!("volume '{volume_id}' has no origin remote"))
     })
+}
+
+/// The outcome of a successful push (FR-NEW-060): the branch's new sha on the
+/// remote, whether the branch was created there, and whether nothing actually
+/// changed (the remote already held this sha). `created` and `up_to_date` are
+/// never both true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushOutcome {
+    pub remote_sha: String,
+    pub created: bool,
+    pub up_to_date: bool,
+}
+
+/// Push `refs/heads/{branch}` to the same name on `origin_url`, from a bare
+/// repository already hydrated with every local object (FR-NEW-022). Shares
+/// [`credential_callbacks`] rather than building its own (FR-NEW-054): the sole
+/// `git2::RemoteCallbacks` construction in the tree stays in that one
+/// function, this one only calls it.
+///
+/// `origin_url`'s scheme is not re-validated here: it was already checked by
+/// [`validate_remote_url`] when it was recorded, at clone time. This makes the
+/// function callable directly, with a `file://` origin, by a test proving real
+/// push mechanics against a local bare repository with no network involved,
+/// exactly like [`clone_to_temp`] is callable directly with one.
+///
+/// `created` and `up_to_date` come from `push_negotiation`'s pre-push view of
+/// the remote's current ref value, the same advertisement the transport itself
+/// negotiates against, never from a local guess. The remote is authoritative
+/// on fast-forwardness (FR-NEW-024): no local pre-flight check runs here, a
+/// rejection is only ever recognized from `push_update_reference`'s own status
+/// message, classified by [`classify_push_rejection`].
+pub fn push_to_remote(
+    repo: &git2::Repository,
+    origin_url: &str,
+    branch: &str,
+    local_sha: &str,
+    token: Option<String>,
+) -> Result<PushOutcome> {
+    let mut remote = repo
+        .remote_anonymous(origin_url)
+        .map_err(|e| ToolError::internal(format!("push failed to open remote: {e}")))?;
+
+    let refname = format!("refs/heads/{branch}");
+    let dst_for_negotiation = refname.clone();
+    let remote_before: Rc<RefCell<Option<git2::Oid>>> = Rc::new(RefCell::new(None));
+    let before_cell = remote_before.clone();
+    let rejected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let rejected_cell = rejected.clone();
+
+    let mut callbacks = credential_callbacks(token);
+    callbacks.push_negotiation(move |updates| {
+        for u in updates {
+            if u.dst_refname() == Some(dst_for_negotiation.as_str()) {
+                *before_cell.borrow_mut() = Some(u.src());
+            }
+        }
+        Ok(())
+    });
+    callbacks.push_update_reference(move |_refname, status| {
+        if let Some(msg) = status {
+            *rejected_cell.borrow_mut() = Some(msg.to_string());
+        }
+        Ok(())
+    });
+
+    let mut opts = git2::PushOptions::new();
+    opts.remote_callbacks(callbacks);
+    let refspec = format!("{refname}:{refname}");
+    if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut opts)) {
+        // The local transport (used by every test, and by a same-host push in
+        // production) raises a non-fast-forward as a hard error from `push`
+        // itself, before `push_update_reference` ever runs; a remote smart-HTTP
+        // server instead reports it per-ref through that callback. Both paths
+        // are classified the same way (FR-NEW-024): the remote's own signal is
+        // authoritative regardless of which shape it arrives in.
+        if e.code() == git2::ErrorCode::NotFastForward {
+            return Err(non_fast_forward_error(branch));
+        }
+        return Err(ToolError::internal(format!("push of branch '{branch}' failed: {e}")));
+    }
+
+    if let Some(msg) = rejected.borrow().clone() {
+        return Err(classify_push_rejection(&msg, branch));
+    }
+
+    let before = *remote_before.borrow();
+    let existed = before.is_some_and(|oid| !oid.is_zero());
+    let previous_remote_sha = if existed { before.map(|o| o.to_string()) } else { None };
+    Ok(PushOutcome {
+        remote_sha: local_sha.to_string(),
+        created: !existed,
+        up_to_date: previous_remote_sha.as_deref() == Some(local_sha),
+    })
+}
+
+/// Classify a rejection reported by the remote through `push_update_reference`
+/// (FR-NEW-024): a non-fast-forward rejection gets a dedicated, distinct error
+/// (`ERR_NO_CLOBBER`, since the remote is refusing to let this push clobber
+/// commits it holds that the volume does not); any other rejection (a
+/// protected-branch message, or anything else the remote sends) surfaces the
+/// remote's own text verbatim, naming the branch, under `ERR_INTERNAL_ERROR`.
+/// The two are machine-distinguishable by code alone, and both are distinct
+/// from the `ERR_UNAUTHENTICATED` a missing or expired credential already
+/// produces before this function is ever called.
+fn classify_push_rejection(status_msg: &str, branch: &str) -> ToolError {
+    let lower = status_msg.to_ascii_lowercase();
+    if lower.contains("non-fast-forward") || lower.contains("non fast-forward") {
+        non_fast_forward_error(branch)
+    } else {
+        ToolError::internal(format!(
+            "push of branch '{branch}' was rejected by the remote: {status_msg}"
+        ))
+    }
+}
+
+/// The dedicated, distinct identity for a non-fast-forward refusal
+/// (FR-NEW-024): named, distinguishable (`ERR_NO_CLOBBER`) from both a
+/// credential failure (`ERR_UNAUTHENTICATED`, raised earlier by
+/// `require_valid_credential`, before this function is ever called) and a
+/// generic rejection ([`classify_push_rejection`]'s `ERR_INTERNAL_ERROR`
+/// branch). Shared by both places a local transport push can surface this: a
+/// hard `git2::Error` with `ErrorCode::NotFastForward` from `remote.push`
+/// itself (what every test in this tree observes, local transport being the
+/// only kind reachable without a real server), and a per-ref rejection
+/// reported through `push_update_reference`'s status message (what a real
+/// smart-HTTP remote sends).
+fn non_fast_forward_error(branch: &str) -> ToolError {
+    ToolError::no_clobber(format!(
+        "push of branch '{branch}' was refused: non-fast-forward, and force is not supported"
+    ))
 }
 
 #[cfg(test)]
@@ -694,5 +834,40 @@ pub(crate) mod tests {
             0,
             "tools/git.rs must not construct a RemoteCallbacks of its own"
         );
+    }
+
+    // ── FR-NEW-024: push rejections are classified into distinct identities ──
+
+    /// E2E-NEW-076 (unit half): a status message containing "non-fast-forward"
+    /// is classified with a dedicated identity, naming the branch and stating
+    /// force is not supported.
+    #[test]
+    fn a_non_fast_forward_status_gets_a_dedicated_identity() {
+        let err = classify_push_rejection("non-fast-forward", "main");
+        assert_eq!(err.code, crate::errors::code::NO_CLOBBER);
+        assert!(err.message.contains("main"), "got {}", err.message);
+        assert!(err.message.to_ascii_lowercase().contains("force"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-079: a protected-branch style rejection surfaces the remote's own
+    /// message verbatim, naming the branch, and is NOT classified as
+    /// non-fast-forward.
+    #[test]
+    fn e2e_new_079_a_protected_branch_rejection_surfaces_the_remotes_reason() {
+        let msg = "GH006: Protected branch update failed for refs/heads/main.";
+        let err = classify_push_rejection(msg, "main");
+        assert_ne!(err.code, crate::errors::code::NO_CLOBBER);
+        assert!(err.message.contains("main"), "must name the branch: {}", err.message);
+        assert!(err.message.contains(msg), "must surface the remote's own text: {}", err.message);
+    }
+
+    /// E2E-NEW-077 (unit half): the non-fast-forward identity and a generic
+    /// remote rejection are machine-distinguishable from each other.
+    #[test]
+    fn non_fast_forward_and_any_other_rejection_are_distinguishable() {
+        let ff = classify_push_rejection("non-fast-forward", "main");
+        let other = classify_push_rejection("GH006: Protected branch update failed.", "main");
+        assert_eq!(ff.code, crate::errors::code::NO_CLOBBER);
+        assert_ne!(ff.code, other.code);
     }
 }

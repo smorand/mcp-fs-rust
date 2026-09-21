@@ -1,5 +1,5 @@
 //! `git.*` tools: init, status, branches, tags, log, show, diff, commit,
-//! checkout_file, blame, remote_clone.
+//! checkout_file, blame, remote_clone, remote_push.
 //!
 //! Port of the C# `Tools/GitTools.cs`. Registered only when `git.enabled`.
 //!
@@ -43,8 +43,8 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the eleven `git.*` tools (the three `git.auth*` ones live in
-/// [`super::git_auth`]).
+/// Register the twelve `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// live in [`super::git_auth`]).
 pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
 }
@@ -276,7 +276,8 @@ pub fn register_with(
         }),
     );
 
-    let g = git;
+    let g = git.clone();
+    let t = tokens.clone();
     reg.add(
         ToolSchema::new(
             "git.remote_clone",
@@ -290,7 +291,7 @@ pub fn register_with(
         .opt_str_null("branch", "Branch to clone; omit to use the remote default branch.")
         .opt_int("depth", 0, "Shallow clone depth; 0 clones the full history."),
         handler(move |ctx: ToolCtx, a| {
-            let (g, t) = (g.clone(), tokens.clone());
+            let (g, t) = (g.clone(), t.clone());
             async move {
                 let mount_id = a.str("mount_id")?;
                 let url = a.str("url")?;
@@ -298,6 +299,27 @@ pub fn register_with(
                 let depth = a.int_or("depth", 0);
                 let store = authorize(&ctx, &mount_id, g).await?;
                 remote_clone(&ctx, store, t, &mount_id, &url, branch, depth).await
+            }
+        }),
+    );
+
+    let g = git;
+    reg.add(
+        ToolSchema::new(
+            "git.remote_push",
+            "Push a local branch to origin under the same name. Creates the branch on the \
+             remote when it is absent there. Fails if the push is not a fast-forward; force \
+             is not supported.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("branch", "Local branch to push to origin under the same name."),
+        handler(move |ctx: ToolCtx, a| {
+            let (g, t) = (g.clone(), tokens.clone());
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let branch = a.str("branch")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                remote_push(&ctx, store, t, &mount_id, &branch).await
             }
         }),
     );
@@ -911,6 +933,95 @@ async fn clone_and_import(
     // `tmp` is dropped here, removing the temporary clone whatever happened.
 }
 
+/// Resolve the stored `origin`, then push through the same credential pipeline
+/// clone uses (FR-NEW-022): [`resolve_clone_credential`] is called unchanged,
+/// so host resolution, URL scheme validation and the token expiry gate are
+/// proved once, not twice.
+async fn remote_push(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    tokens: Option<Arc<crate::git::OAuthTokenStore>>,
+    mount_id: &str,
+    branch: &str,
+) -> Result<Value> {
+    let origin_url = crate::git::remote::require_origin(&store, mount_id).await?;
+    let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
+    push_branch(store, mount_id, branch, &origin_url, token, auth).await
+}
+
+/// Everything that happens after the origin URL is known and a credential (or
+/// none) is resolved: the branch-exists check (FR-NEW-022, before any network
+/// call), the actual push through [`crate::git::remote::push_to_remote`] (the
+/// sole caller of that function), and the remote-tracking ref update
+/// (FR-NEW-061). Split out from [`remote_push`] exactly like
+/// [`clone_and_import`] is split from [`remote_clone`], so a test can exercise
+/// real push mechanics against a local bare repository with a `file://` origin:
+/// that scheme cannot reach this function through the registered
+/// `git.remote_push` tool, since [`resolve_clone_credential`] rejects it first
+/// (FR-NEW-041).
+///
+/// No volume byte is written and no volume file changes (FR-NEW-061), so
+/// unlike [`clone_and_import`] this charges no write quota and writes no
+/// audit entry, matching `git.commit`: a git-internal ref update is not a
+/// write to the abstract filesystem.
+async fn push_branch(
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    branch: &str,
+    origin_url: &str,
+    token: Option<String>,
+    auth: String,
+) -> Result<Value> {
+    let entry = store.get_or_open_repo(mount_id).await?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let Some(local_ref) = entry.db.get_ref(&branch_ref).await? else {
+        return Err(ToolError::invalid_argument(format!(
+            "branch '{branch}' does not exist locally; git.remote_push can only push a branch \
+             that already exists"
+        )));
+    };
+    let local_sha = local_ref.target;
+
+    let (branch_owned, origin_owned, local_sha_owned) =
+        (branch.to_string(), origin_url.to_string(), local_sha.clone());
+    // Held for the whole hydrate-plus-push, so two concurrent pushes to the
+    // same branch cannot interleave (E2E-NEW-084): the same lock `git.commit`
+    // holds for the whole of a commit.
+    let entry_for_thread = entry.clone();
+    let outcome = on_git_thread(move || async move {
+        let _write = entry_for_thread.write_lock.lock().await;
+        let repo = entry_for_thread.repo.lock().await;
+        hydrate(&entry_for_thread, &repo).await?;
+        // `hydrate` only exports blob-store objects into the on-disk ODB; the
+        // db-tracked branch sha (the authoritative value) still needs to be
+        // the on-disk ref libgit2 resolves as the push's source side, since
+        // `push_to_remote` names the branch by ref, not by oid.
+        let oid = parse_oid(&local_sha_owned)?;
+        repo.reference(&format!("refs/heads/{branch_owned}"), oid, true, "mcp-fs git.remote_push")
+            .map_err(|e| git_err("sync local branch ref", e))?;
+        crate::git::remote::push_to_remote(
+            &repo,
+            &origin_owned,
+            &branch_owned,
+            &local_sha_owned,
+            token,
+        )
+    })
+    .await?;
+
+    // A refused push returns above via `?`, before this line: nothing here
+    // advances the tracking ref for a rejection (FR-NEW-061).
+    entry.db.set_ref(&format!("refs/remotes/origin/{branch}"), &outcome.remote_sha, false).await?;
+
+    Ok(json!({
+        "branch": branch,
+        "created": outcome.created,
+        "up_to_date": outcome.up_to_date,
+        "remote_sha": outcome.remote_sha,
+        "auth": auth,
+    }))
+}
+
 // ── libgit2 helpers ─────────────────────────────────────────────────────────
 
 fn commit_json(c: &git2::Commit<'_>) -> Value {
@@ -1205,7 +1316,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 11] = [
+    const ALL_GIT_TOOLS: [&str; 12] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -1217,13 +1328,14 @@ mod tests {
         "git.checkout_file",
         "git.blame",
         "git.remote_clone",
+        "git.remote_push",
     ];
 
     #[test]
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 11);
+        assert_eq!(r.len(), 12);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -2706,6 +2818,378 @@ mod tests {
             assert_eq!(auth, "github");
             assert_eq!(token.as_deref(), Some("idn-token"));
         });
+    }
+
+    // ── FR-NEW-022/023/024/025/060/061: git.remote_push ─────────────────────
+
+    /// A bare local repository to push into, with one commit on `main`, playing
+    /// the role of `origin` in every push test: real git2 push mechanics, no
+    /// network involved. Bare, unlike `seed_origin`: pushing into a non-bare
+    /// repository's checked-out branch is refused by git itself, which would
+    /// test that refusal instead of the one this story owns.
+    fn seed_bare_remote(dir: &std::path::Path, payload: &str) -> String {
+        let repo = git2::Repository::init_bare(dir).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        let blob = repo.blob(payload.as_bytes()).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("README.md", blob, MODE_FILE).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("refs/heads/main"), &sig, &sig, "initial\n", &tree, &[]).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        format!("file://{}", dir.display())
+    }
+
+    /// One more commit directly on the bare "remote", simulating another writer
+    /// having pushed there since the volume last synced: the setup every
+    /// non-fast-forward test needs, with no mock, just a second real commit on
+    /// the same real repository.
+    fn advance_bare_remote(dir: &std::path::Path, branch_ref: &str, payload: &str) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_100, 0)).unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        let blob = repo.blob(payload.as_bytes()).unwrap();
+        builder.insert("EXTRA.md", blob, MODE_FILE).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let oid =
+            repo.commit(Some(branch_ref), &sig, &sig, "advance\n", &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    /// The current sha of one ref in the bare "remote" repository, read directly
+    /// off disk rather than through anything this story's code touches.
+    fn bare_ref_sha(dir: &std::path::Path, name: &str) -> Option<String> {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        repo.find_reference(name).ok().and_then(|r| r.target()).map(|oid| oid.to_string())
+    }
+
+    /// `file://` cannot reach `push_branch` through the registered
+    /// `git.remote_push` tool (`resolve_clone_credential` rejects it first, just
+    /// like it does for clone), so every test below that needs a real, local,
+    /// no-network push calls `push_branch` directly, exactly like
+    /// `call_clone_and_import` does for clone.
+    async fn call_push_branch(
+        e: &Env,
+        origin_url: &str,
+        branch: &str,
+        auth: &str,
+    ) -> Result<Value> {
+        push_branch(e.git.clone(), MOUNT, branch, origin_url, None, auth.to_string()).await
+    }
+
+    /// E2E-NEW-071: pushing a new local commit updates the remote's existing
+    /// branch under the same name, reporting the pushed sha.
+    #[tokio::test]
+    async fn e2e_new_071_push_updates_an_existing_remote_branch() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-071");
+        let url = seed_bare_remote(&remote_dir, "hello\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/a.txt", "new content\n").await;
+        let local_sha = e.commit("second").await;
+
+        let out = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["branch"], "main");
+        assert_eq!(out["created"], false);
+        assert_eq!(out["remote_sha"], local_sha.clone());
+        assert_eq!(out["auth"], "anonymous");
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(local_sha));
+    }
+
+    /// E2E-NEW-072: pushing a branch the remote does not have creates it there,
+    /// reporting `created: true`.
+    #[tokio::test]
+    async fn e2e_new_072_push_creates_a_branch_absent_on_the_remote() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-072");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let main_sha = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        entry.db.set_ref("refs/heads/feature/x", &main_sha, false).await.unwrap();
+
+        let out = call_push_branch(&e, &url, "feature/x", "anonymous").await.unwrap();
+        assert_eq!(out["created"], true);
+        assert_eq!(out["up_to_date"], false);
+        assert_eq!(out["remote_sha"], main_sha.clone());
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/feature/x"), Some(main_sha));
+    }
+
+    /// E2E-NEW-073: a successful push leaves every volume file, and the local
+    /// branch itself, byte-for-byte and sha-for-sha unchanged.
+    #[tokio::test]
+    async fn e2e_new_073_push_leaves_the_volume_unchanged() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-073");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        e.write("/a.txt", "content\n").await;
+        e.commit("second").await;
+
+        let before_readme = e.read("/README.md").await;
+        let before_a = e.read("/a.txt").await;
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(e.read("/README.md").await, before_readme);
+        assert_eq!(e.read("/a.txt").await, before_a);
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must be unchanged by a push");
+    }
+
+    /// E2E-NEW-074 / E2E-NEW-209 / E2E-NEW-210: a push that sends a real update
+    /// carries all five response keys correctly valued; pushed again with no
+    /// intervening commit, it succeeds idempotently, reporting `up_to_date`.
+    #[tokio::test]
+    async fn e2e_new_074_209_210_response_shape_and_idempotency() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-074");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        e.write("/a.txt", "v1\n").await;
+        let sha = e.commit("second").await;
+
+        let updated = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(
+            updated,
+            json!({
+                "branch": "main", "created": false, "up_to_date": false,
+                "remote_sha": sha, "auth": "anonymous",
+            })
+        );
+
+        let repeated = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(
+            repeated,
+            json!({
+                "branch": "main", "created": false, "up_to_date": true,
+                "remote_sha": sha, "auth": "anonymous",
+            })
+        );
+    }
+
+    /// E2E-NEW-076: a non-fast-forward push is refused with a distinct error
+    /// naming the branch and stating force is not supported, and the remote's
+    /// branch is unchanged.
+    #[tokio::test]
+    async fn e2e_new_076_a_non_fast_forward_push_is_refused_with_a_distinct_error() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-076");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let advanced_sha = advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
+
+        let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert!(
+            err.message.to_ascii_lowercase().contains("non-fast-forward"),
+            "got {}",
+            err.message
+        );
+        assert!(err.message.to_ascii_lowercase().contains("force"), "got {}", err.message);
+        assert!(err.message.contains("main"), "got {}", err.message);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(advanced_sha));
+    }
+
+    /// E2E-NEW-077: a non-fast-forward rejection and a credential rejection
+    /// carry different, machine-distinguishable error identities. The
+    /// non-fast-forward half is proven directly against a real push in
+    /// `e2e_new_076`; this proves the credential half never even reaches
+    /// `push_to_remote`, failing instead with a code that is never `NO_CLOBBER`.
+    #[test]
+    fn e2e_new_077_the_non_fast_forward_error_is_distinguishable_from_an_auth_error() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            e.git.init_repo(MOUNT).await.unwrap();
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            entry.db.add_remote("origin", "https://github.ibm.com/org/repo.git").await.unwrap();
+            entry.db.set_ref("refs/heads/main", &"a".repeat(40), false).await.unwrap();
+            entry.db.set_ref("HEAD", "refs/heads/main", true).await.unwrap();
+
+            // No token stored for github.ibm.com: credential resolution fails
+            // first, before any push is attempted.
+            let err = e
+                .call("git.remote_push", json!({"mount_id": MOUNT, "branch": "main"}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert_ne!(err.code, code::NO_CLOBBER);
+        });
+    }
+
+    /// E2E-NEW-078: a branch absent locally is rejected, naming it, before any
+    /// network call. The origin host is declared anonymous so this test needs
+    /// no stored token to reach the branch check.
+    #[test]
+    fn e2e_new_078_a_branch_absent_locally_is_rejected() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(&[("public.example.org", "anonymous")]).await;
+            e.git.init_repo(MOUNT).await.unwrap();
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            entry.db.add_remote("origin", "https://public.example.org/org/repo.git").await.unwrap();
+
+            let err = e
+                .call("git.remote_push", json!({"mount_id": MOUNT, "branch": "no-such-branch"}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT);
+            assert!(err.message.contains("no-such-branch"), "got {}", err.message);
+        });
+    }
+
+    /// E2E-NEW-081: a non-member is refused with `ERR_FORBIDDEN` before host
+    /// resolution or any token lookup: `authorize` is the very first call
+    /// `git.remote_push` makes. The volume is never even initialized here, so a
+    /// forbidden result proves `authorize` ran ahead of `require_origin` too
+    /// (which would otherwise fail with `ERR_INVALID_ARGUMENT`).
+    #[test]
+    fn e2e_new_081_a_non_member_cannot_push() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let err = e
+                .as_person(
+                    "bob@test.com",
+                    "git.remote_push",
+                    json!({"mount_id": MOUNT, "branch": "main"}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN);
+        });
+    }
+
+    /// E2E-NEW-084: two concurrent pushes to the same branch serialize on the
+    /// per-repository write lock (`FR-609`): neither corrupts state, and
+    /// exactly one of the two observes the update it raced the other for while
+    /// the other finds it already applied.
+    #[tokio::test]
+    async fn e2e_new_084_concurrent_pushes_serialize() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-084");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        e.write("/a.txt", "v\n").await;
+        let sha = e.commit("second").await;
+
+        let (r1, r2) = tokio::join!(
+            push_branch(e.git.clone(), MOUNT, "main", &url, None, "anonymous".to_string()),
+            push_branch(e.git.clone(), MOUNT, "main", &url, None, "anonymous".to_string()),
+        );
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        for out in [&r1, &r2] {
+            assert_eq!(out["remote_sha"], sha.clone());
+        }
+        let up_to_date_count = [&r1, &r2].iter().filter(|o| o["up_to_date"] == true).count();
+        assert_eq!(up_to_date_count, 1, "exactly one of the two racers must see up_to_date");
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha));
+    }
+
+    /// E2E-NEW-085: the remote advancing between the pipeline reading `origin`
+    /// and the actual push (the exact race window `remote_push` leaves open
+    /// between `require_origin`/`resolve_clone_credential` and `push_branch`)
+    /// produces the same non-fast-forward error as a non-racing rejection: the
+    /// remote's state at push time is authoritative either way.
+    #[tokio::test]
+    async fn e2e_new_085_a_push_racing_a_remote_update_fails_cleanly() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-085");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "raced\n");
+
+        let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER, "the same identity as a non-racing rejection");
+    }
+
+    /// E2E-NEW-211: `created` and `up_to_date` are never both true: a branch
+    /// created on the remote reports `created: true, up_to_date: false`, and
+    /// pushed again unchanged reports `created: false, up_to_date: true`.
+    #[tokio::test]
+    async fn e2e_new_211_created_and_up_to_date_are_never_both_true() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-211");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let main_sha = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        entry.db.set_ref("refs/heads/feature/y", &main_sha, false).await.unwrap();
+
+        let first = call_push_branch(&e, &url, "feature/y", "anonymous").await.unwrap();
+        assert_eq!(first["created"], true);
+        assert_eq!(first["up_to_date"], false);
+
+        let second = call_push_branch(&e, &url, "feature/y", "anonymous").await.unwrap();
+        assert_eq!(second["created"], false);
+        assert_eq!(second["up_to_date"], true);
+    }
+
+    /// E2E-NEW-212 / E2E-NEW-213: a successful push advances
+    /// `refs/remotes/origin/{branch}` to the pushed sha, creating it since
+    /// cloning alone never does; `git.status` lists it unfiltered, and
+    /// `refs/heads/main` (the local branch itself) is untouched.
+    #[tokio::test]
+    async fn e2e_new_212_213_a_successful_push_advances_the_remote_tracking_ref() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-212");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+
+        assert!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none(),
+            "a clone alone must not create a remote-tracking ref"
+        );
+
+        e.write("/a.txt", "v1\n").await;
+        let sha = e.commit("second").await;
+        let out = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["remote_sha"], sha.clone());
+
+        let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap();
+        assert_eq!(tracking.target, sha, "refs/remotes/origin/main must now hold the pushed sha");
+
+        let st = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        let refs = st["refs"].as_array().unwrap();
+        assert!(
+            refs.iter().any(|r| r["name"] == "refs/remotes/origin/main" && r["sha"] == sha.clone()),
+            "git.status must list the remote-tracking ref: {refs:?}"
+        );
+
+        let heads_sha = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(heads_sha, sha, "refs/heads/main is set by git.commit, not moved by the push");
+    }
+
+    /// E2E-NEW-214: a refused push advances nothing: `refs/remotes/origin/main`
+    /// stays exactly where a prior successful push left it.
+    #[tokio::test]
+    async fn e2e_new_214_a_refused_push_advances_nothing() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-214");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let first = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        let baseline_sha = first["remote_sha"].as_str().unwrap().to_string();
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
+        let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap();
+        assert_eq!(tracking.target, baseline_sha, "a refused push must not move the tracking ref");
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
