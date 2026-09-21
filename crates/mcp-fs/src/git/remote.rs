@@ -414,6 +414,122 @@ fn classify_push_rejection(status_msg: &str, branch: &str) -> ToolError {
     }
 }
 
+/// The single explicit fetch refspec (FR-NEW-062): destination side names only
+/// `refs/remotes/origin/*`, so an update reported by libgit2's `update_tips`
+/// callback can never name anything else. `git.remote_pull` (US-011) reuses
+/// this constant rather than writing its own copy, since its first step is
+/// exactly this fetch (DEC-012).
+pub const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+
+/// One remote-tracking ref [`fetch_from_remote`] updated: `old_sha` is `None`
+/// when the ref was newly created (FR-NEW-050).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRefUpdate {
+    pub ref_name: String,
+    pub old_sha: Option<String>,
+    pub new_sha: String,
+}
+
+/// The outcome of a successful fetch: every `refs/remotes/origin/*` ref that
+/// changed, the branch names ([`RemoteHead`](git2::RemoteHead) short names
+/// under `refs/heads/`) the remote currently advertises, and how many objects
+/// were downloaded. `advertised_branches` is read before the fetch itself runs
+/// (DEC-037): comparing it against what a caller already has under
+/// `refs/remotes/origin/*` is what lets `git.remote_fetch` tell a branch
+/// deleted upstream (absent from this list) from one merely unchanged (still
+/// listed, `update_tips` just never fired for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchOutcome {
+    pub refs_updated: Vec<FetchRefUpdate>,
+    pub advertised_branches: Vec<String>,
+    pub objects_fetched: i64,
+}
+
+/// Fetch objects and update `refs/remotes/origin/*` from `origin_url`
+/// (FR-NEW-026), using [`FETCH_REFSPEC`], the single explicit refspec
+/// (FR-NEW-062). Tag following is disabled and pruning is forced off, so the
+/// only refs this can ever create or move are under `refs/remotes/origin/`,
+/// and a branch removed upstream is left exactly where it was rather than
+/// deleted (FR-NEW-056, DEC-037). Shares [`credential_callbacks`] rather than
+/// building its own (FR-NEW-054): the sole `git2::RemoteCallbacks`
+/// construction in the tree stays in that one function, this one calls it
+/// twice, once to list the remote's advertisement, once for the fetch itself.
+///
+/// `refs/heads/*` and every volume file are untouched (FR-NEW-027): this
+/// function never writes either, and the bare repository it runs against has
+/// no working tree to begin with.
+///
+/// `origin_url`'s scheme is not re-validated here, exactly like
+/// [`push_to_remote`]: it was already checked by [`validate_remote_url`] when
+/// it was recorded, at clone time. This makes the function callable directly,
+/// with a `file://` origin, by a test proving real fetch mechanics against a
+/// local bare repository with no network involved.
+pub fn fetch_from_remote(
+    repo: &git2::Repository,
+    origin_url: &str,
+    token: Option<String>,
+) -> Result<FetchOutcome> {
+    let mut remote =
+        repo.remote_anonymous(origin_url).map_err(|e| connection_error(origin_url, &e))?;
+
+    // The remote's own advertisement, read before the fetch itself runs
+    // (DEC-037): the caller diffs this against its prior
+    // `refs/remotes/origin/*` view to find what went stale.
+    let advertised_branches: Vec<String> = {
+        let list_callbacks = credential_callbacks(token.clone());
+        let conn = remote
+            .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
+            .map_err(|e| connection_error(origin_url, &e))?;
+        conn.list()
+            .map_err(|e| connection_error(origin_url, &e))?
+            .iter()
+            .filter_map(|h| h.name().strip_prefix("refs/heads/").map(str::to_string))
+            .collect()
+        // `conn` drops here, disconnecting before the real fetch reconnects.
+    };
+
+    let updates: Rc<RefCell<Vec<FetchRefUpdate>>> = Rc::new(RefCell::new(Vec::new()));
+    let updates_cell = updates.clone();
+    let mut callbacks = credential_callbacks(token);
+    callbacks.update_tips(move |refname, old, new| {
+        updates_cell.borrow_mut().push(FetchRefUpdate {
+            ref_name: refname.to_string(),
+            old_sha: if old.is_zero() { None } else { Some(old.to_string()) },
+            new_sha: new.to_string(),
+        });
+        true
+    });
+
+    let mut opts = git2::FetchOptions::new();
+    opts.remote_callbacks(callbacks);
+    // FR-NEW-062: no tag ever follows this fetch, and pruning stays off so a
+    // ref absent from `advertised_branches` is reported, never deleted here.
+    opts.download_tags(git2::AutotagOption::None);
+    opts.prune(git2::FetchPrune::Off);
+
+    remote
+        .fetch(&[FETCH_REFSPEC], Some(&mut opts), None)
+        .map_err(|e| connection_error(origin_url, &e))?;
+
+    let objects_fetched = remote.stats().received_objects() as i64;
+    let refs_updated = updates.borrow().clone();
+
+    Ok(FetchOutcome { refs_updated, advertised_branches, objects_fetched })
+}
+
+/// Wrap a git2 failure reaching the network with the host named explicitly
+/// (E2E-NEW-091), distinct from a credential failure: that one is always
+/// `ERR_UNAUTHENTICATED`, raised earlier, before any network call, by
+/// `require_valid_credential`. This is always `ERR_INTERNAL_ERROR`, so the two
+/// are machine-distinguishable by code alone.
+fn connection_error(origin_url: &str, e: &git2::Error) -> ToolError {
+    let host = url::Url::parse(origin_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| origin_url.to_string());
+    ToolError::internal(format!("fetch from host '{host}' failed: {e}"))
+}
+
 /// The dedicated, distinct identity for a non-fast-forward refusal
 /// (FR-NEW-024): named, distinguishable (`ERR_NO_CLOBBER`) from both a
 /// credential failure (`ERR_UNAUTHENTICATED`, raised earlier by

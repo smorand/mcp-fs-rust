@@ -1,5 +1,5 @@
 //! `git.*` tools: init, status, branches, tags, log, show, diff, commit,
-//! checkout_file, blame, remote_clone, remote_push.
+//! checkout_file, blame, remote_clone, remote_push, remote_fetch.
 //!
 //! Port of the C# `Tools/GitTools.cs`. Registered only when `git.enabled`.
 //!
@@ -43,7 +43,7 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the twelve `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// Register the thirteen `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
 pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
@@ -303,7 +303,8 @@ pub fn register_with(
         }),
     );
 
-    let g = git;
+    let g = git.clone();
+    let t = tokens.clone();
     reg.add(
         ToolSchema::new(
             "git.remote_push",
@@ -314,12 +315,31 @@ pub fn register_with(
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("branch", "Local branch to push to origin under the same name."),
         handler(move |ctx: ToolCtx, a| {
-            let (g, t) = (g.clone(), tokens.clone());
+            let (g, t) = (g.clone(), t.clone());
             async move {
                 let mount_id = a.str("mount_id")?;
                 let branch = a.str("branch")?;
                 let store = authorize(&ctx, &mount_id, g).await?;
                 remote_push(&ctx, store, t, &mount_id, &branch).await
+            }
+        }),
+    );
+
+    let g = git;
+    reg.add(
+        ToolSchema::new(
+            "git.remote_fetch",
+            "Fetch objects and update refs/remotes/origin/* from origin. Never advances a \
+             local branch and never touches a working tree file. A branch removed on the \
+             remote is reported in refs_stale, not pruned locally.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let (g, t) = (g.clone(), tokens.clone());
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                remote_fetch(&ctx, store, t, &mount_id).await
             }
         }),
     );
@@ -1022,6 +1042,97 @@ async fn push_branch(
     }))
 }
 
+/// Resolve the stored `origin`, then fetch through the same credential
+/// pipeline clone and push use (FR-NEW-026): [`resolve_clone_credential`] is
+/// called unchanged, so host resolution, URL scheme validation and the token
+/// expiry gate are proved once, not three times. `authorize` in the tool
+/// registration handler already ran before this is ever reached, so a non
+/// member is refused before `require_origin` even looks for a stored remote.
+async fn remote_fetch(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    tokens: Option<Arc<crate::git::OAuthTokenStore>>,
+    mount_id: &str,
+) -> Result<Value> {
+    let origin_url = crate::git::remote::require_origin(&store, mount_id).await?;
+    let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
+    fetch_branch(store, mount_id, &origin_url, token, auth).await
+}
+
+/// Everything that happens after the origin URL is known and a credential (or
+/// none) is resolved: the actual fetch through
+/// [`crate::git::remote::fetch_from_remote`] (the sole caller of that
+/// function), importing the newly downloaded objects into the blob store, and
+/// the `refs/remotes/origin/*` update (FR-NEW-026, FR-NEW-050). Split out from
+/// [`remote_fetch`] exactly like [`push_branch`] is split from [`remote_push`],
+/// so a test can exercise real fetch mechanics against a local bare repository
+/// with a `file://` origin: that scheme cannot reach this function through the
+/// registered `git.remote_fetch` tool, since [`resolve_clone_credential`]
+/// rejects it first (FR-NEW-041).
+///
+/// No volume byte is written and no volume file changes (FR-NEW-027): a fetch
+/// only ever moves `refs/remotes/origin/*`, so unlike [`clone_and_import`] this
+/// charges no write quota and writes no audit entry, matching [`push_branch`].
+async fn fetch_branch(
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    origin_url: &str,
+    token: Option<String>,
+    auth: String,
+) -> Result<Value> {
+    let entry = store.get_or_open_repo(mount_id).await?;
+
+    // The db-tracked view of `refs/remotes/origin/*` before this fetch runs, so
+    // a branch present here but absent from the remote's advertisement can be
+    // reported as stale rather than silently pruned (DEC-037, FR-NEW-056).
+    let before: BTreeMap<String, String> = entry
+        .db
+        .list_refs()
+        .await?
+        .into_iter()
+        .filter(|r| !r.symbolic && r.name.starts_with("refs/remotes/origin/"))
+        .map(|r| (r.name, r.target))
+        .collect();
+
+    let origin_owned = origin_url.to_string();
+    // Held for the whole hydrate-plus-fetch, the same lock `push_branch` and
+    // `git.commit` hold, so a concurrent write to this repository's on disk
+    // state cannot interleave with this one.
+    let entry_for_thread = entry.clone();
+    let outcome = on_git_thread(move || async move {
+        let _write = entry_for_thread.write_lock.lock().await;
+        let repo = entry_for_thread.repo.lock().await;
+        hydrate(&entry_for_thread, &repo).await?;
+        let outcome = crate::git::remote::fetch_from_remote(&repo, &origin_owned, token)?;
+        entry_for_thread.objects.import_from_repo(&repo).await?;
+        Ok(outcome)
+    })
+    .await?;
+
+    let mut refs_updated = Vec::with_capacity(outcome.refs_updated.len());
+    for u in &outcome.refs_updated {
+        entry.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
+        refs_updated.push(json!({
+            "ref": u.ref_name,
+            "old_sha": u.old_sha,
+            "new_sha": u.new_sha,
+        }));
+    }
+
+    let advertised: std::collections::HashSet<String> =
+        outcome.advertised_branches.iter().map(|b| format!("refs/remotes/origin/{b}")).collect();
+    let refs_stale: Vec<String> =
+        before.keys().filter(|name| !advertised.contains(name.as_str())).cloned().collect();
+
+    Ok(json!({
+        "refs_updated": refs_updated,
+        "refs_stale": refs_stale,
+        "objects_fetched": outcome.objects_fetched,
+        "up_to_date": refs_updated.is_empty(),
+        "auth": auth,
+    }))
+}
+
 // ── libgit2 helpers ─────────────────────────────────────────────────────────
 
 fn commit_json(c: &git2::Commit<'_>) -> Value {
@@ -1316,7 +1427,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 12] = [
+    const ALL_GIT_TOOLS: [&str; 13] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -1329,13 +1440,14 @@ mod tests {
         "git.blame",
         "git.remote_clone",
         "git.remote_push",
+        "git.remote_fetch",
     ];
 
     #[test]
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 12);
+        assert_eq!(r.len(), 13);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -1378,6 +1490,20 @@ mod tests {
                  "branch":{"description":"Branch to clone; omit to use the remote default branch.","type":"string","default":null},
                  "depth":{"description":"Shallow clone depth; 0 clones the full history.","type":"integer","default":0}},
                "required":["mount_id","url"]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.input_schema(), expected);
+    }
+
+    #[test]
+    fn git_remote_fetch_schema_matches_the_contract() {
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+        let s = &r.resolve("git.remote_fetch").unwrap().schema;
+        let expected: Value = serde_json::from_str(
+            r#"{"type":"object","properties":{
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"}},
+               "required":["mount_id"]}"#,
         )
         .unwrap();
         assert_eq!(s.input_schema(), expected);
@@ -3190,6 +3316,303 @@ mod tests {
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap();
         assert_eq!(tracking.target, baseline_sha, "a refused push must not move the tracking ref");
+    }
+
+    // ── FR-NEW-026/027/050/056/062: git.remote_fetch ────────────────────────
+
+    /// Create a new ref on the bare "remote" pointing at the same target as
+    /// `from_ref`, simulating the remote having gained a branch, with no mock:
+    /// a real ref on a real repository.
+    fn create_branch_on_bare_remote(dir: &std::path::Path, branch_ref: &str, from_ref: &str) {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let target = repo.find_reference(from_ref).unwrap().target().unwrap();
+        repo.reference(branch_ref, target, true, "test branch").unwrap();
+    }
+
+    /// Delete a ref on the bare "remote", simulating a branch removed upstream.
+    fn delete_ref_on_bare_remote(dir: &std::path::Path, ref_name: &str) {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        repo.find_reference(ref_name).unwrap().delete().unwrap();
+    }
+
+    /// An annotated tag on the bare "remote", pointing at `target_ref`, to prove
+    /// a fetch takes no tags (FR-NEW-062).
+    fn tag_bare_remote(dir: &std::path::Path, tag: &str, target_ref: &str) {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let target = repo.find_reference(target_ref).unwrap().peel_to_commit().unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_200, 0)).unwrap();
+        repo.tag(tag, target.as_object(), &sig, "v1", false).unwrap();
+    }
+
+    /// `file://` cannot reach `fetch_branch` through the registered
+    /// `git.remote_fetch` tool (`resolve_clone_credential` rejects it first,
+    /// just like it does for clone and push), so every test below that needs a
+    /// real, local, no-network fetch calls `fetch_branch` directly, exactly
+    /// like `call_push_branch` does for push.
+    async fn call_fetch_branch(e: &Env, origin_url: &str, auth: &str) -> Result<Value> {
+        fetch_branch(e.git.clone(), MOUNT, origin_url, None, auth.to_string()).await
+    }
+
+    /// E2E-NEW-086 / E2E-NEW-087: a fetch against a remote two commits ahead
+    /// updates `refs/remotes/origin/main` to the remote tip, reports that ref
+    /// and a non-zero object count, and the fetched commit (and its tree and
+    /// blobs) are importable through `git.show`.
+    #[tokio::test]
+    async fn e2e_new_086_087_fetch_updates_refs_and_downloads_objects() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-086");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+        let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c2\n");
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        let updates = out["refs_updated"].as_array().unwrap();
+        assert!(
+            updates.iter().any(|u| u["ref"] == "refs/remotes/origin/main" && u["new_sha"] == tip),
+            "got {updates:?}"
+        );
+        assert!(out["objects_fetched"].as_i64().unwrap() > 0);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert_eq!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap().target,
+            tip
+        );
+
+        let shown =
+            e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": tip})).await.unwrap();
+        assert_eq!(shown["commit"]["sha"], tip, "git.show must read the fetched commit");
+    }
+
+    /// E2E-NEW-088: a fetch against a remote that is ahead leaves every volume
+    /// file byte-for-byte identical, and `refs/heads/main` unchanged.
+    #[tokio::test]
+    async fn e2e_new_088_fetch_leaves_local_refs_and_files_untouched() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-088");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let before_readme = e.read("/README.md").await;
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c2\n");
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(e.read("/README.md").await, before_readme);
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must be unchanged by a fetch");
+    }
+
+    /// E2E-NEW-091: an unreachable remote fails naming the host, and the
+    /// failure code is never `ERR_UNAUTHENTICATED`, the code a credential
+    /// failure always carries: the two are machine-distinguishable.
+    #[tokio::test]
+    async fn e2e_new_091_an_unreachable_remote_fails_naming_the_host() {
+        let e = Env::new().await;
+        e.git.init_repo(MOUNT).await.unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+
+        let err = crate::git::remote::fetch_from_remote(
+            &repo,
+            "https://mcp-fs-fetch-unreachable-test.invalid/o/r.git",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert_ne!(err.code, code::UNAUTHENTICATED, "distinguishable from a credential failure");
+        assert!(
+            err.message.contains("mcp-fs-fetch-unreachable-test.invalid"),
+            "the host must be named: got {}",
+            err.message
+        );
+    }
+
+    /// E2E-NEW-092 / E2E-NEW-187: a fetch that brings nothing new succeeds,
+    /// reports zero refs updated, and `up_to_date` is exactly true.
+    #[tokio::test]
+    async fn e2e_new_092_187_a_fetch_with_nothing_new_is_idempotent() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-092");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(out["refs_updated"], json!([]));
+        assert_eq!(out["up_to_date"], true);
+    }
+
+    /// E2E-NEW-093 / E2E-NEW-199: a branch deleted upstream is reported in
+    /// `refs_stale`, its remote-tracking ref stays at its previous sha, and no
+    /// local ref or file changes.
+    #[tokio::test]
+    async fn e2e_new_093_199_a_deleted_upstream_branch_is_reported_not_pruned() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-093");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        create_branch_on_bare_remote(&remote_dir, "refs/heads/feature-x", "refs/heads/main");
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let baseline =
+            entry.db.get_ref("refs/remotes/origin/feature-x").await.unwrap().unwrap().target;
+        let before_readme = e.read("/README.md").await;
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        delete_ref_on_bare_remote(&remote_dir, "refs/heads/feature-x");
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["refs_stale"], json!(["refs/remotes/origin/feature-x"]));
+        let tracking =
+            entry.db.get_ref("refs/remotes/origin/feature-x").await.unwrap().unwrap().target;
+        assert_eq!(tracking, baseline, "a stale tracking ref must not move");
+        assert_eq!(e.read("/README.md").await, before_readme);
+        assert_eq!(entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target, before_head);
+    }
+
+    /// E2E-NEW-094 / E2E-NEW-186: a branch new on the remote creates only
+    /// `refs/remotes/origin/{branch}`, with `old_sha` null since it never
+    /// existed before; no `refs/heads/{branch}` and no new volume file appear.
+    #[tokio::test]
+    async fn e2e_new_094_186_a_new_remote_branch_creates_only_a_tracking_ref() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-094");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        let before_listing = client.list_dir("/").await.unwrap();
+
+        create_branch_on_bare_remote(&remote_dir, "refs/heads/feature-y", "refs/heads/main");
+        let tip = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        let updates = out["refs_updated"].as_array().unwrap();
+        let fy = updates.iter().find(|u| u["ref"] == "refs/remotes/origin/feature-y").unwrap();
+        assert_eq!(fy["old_sha"], Value::Null);
+        assert_eq!(fy["new_sha"], tip);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert_eq!(
+            entry.db.get_ref("refs/remotes/origin/feature-y").await.unwrap().unwrap().target,
+            tip
+        );
+        assert!(
+            entry.db.get_ref("refs/heads/feature-y").await.unwrap().is_none(),
+            "no local branch must be created by a fetch"
+        );
+        let after_listing = client.list_dir("/").await.unwrap();
+        assert_eq!(after_listing.len(), before_listing.len(), "no file must appear in the volume");
+    }
+
+    /// E2E-NEW-185: the fetch response carries exactly the five declared
+    /// fields, valued as the contract requires.
+    #[tokio::test]
+    async fn e2e_new_185_the_fetch_response_carries_every_declared_field() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-185");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+        let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c2\n");
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(
+            out["refs_updated"],
+            json!([{"ref": "refs/remotes/origin/main", "old_sha": Value::Null, "new_sha": tip}])
+        );
+        assert_eq!(out["refs_stale"], json!([]));
+        assert_eq!(out["up_to_date"], false);
+        assert_eq!(out["auth"], "anonymous");
+        assert!(out["objects_fetched"].as_i64().unwrap() > 0);
+        let obj = out.as_object().unwrap();
+        assert_eq!(obj.len(), 5, "exactly the five declared fields: {obj:?}");
+    }
+
+    /// E2E-NEW-215 / E2E-NEW-216: a fetch against a remote holding a branch and
+    /// a tag updates and reports only the branch's remote-tracking ref; the
+    /// tag is never imported, and `git.tags` is unchanged.
+    #[tokio::test]
+    async fn e2e_new_215_216_fetch_brings_branches_and_takes_no_tags() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-215");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let tip = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        tag_bare_remote(&remote_dir, "v1", "refs/heads/main");
+        let before_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        let updates = out["refs_updated"].as_array().unwrap();
+        assert!(
+            updates.iter().any(|u| u["ref"] == "refs/remotes/origin/main" && u["new_sha"] == tip),
+            "got {updates:?}"
+        );
+        assert!(
+            !updates.iter().any(|u| u["ref"].as_str().unwrap_or_default().contains("tags")),
+            "no tag ref may appear in refs_updated: {updates:?}"
+        );
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(entry.db.get_ref("refs/tags/v1").await.unwrap().is_none(), "no tag imported");
+        let after_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(after_tags, before_tags, "git.tags must be unchanged by a fetch");
+    }
+
+    /// E2E-NEW-217: `git.remote_pull` (US-011) does not exist yet, and this
+    /// story's scope boundary forbids building it here. But FR-NEW-062 states
+    /// pull inherits the fetch refspec because its first step IS this fetch,
+    /// so the way to prove that now, without building pull, is to call the
+    /// exact shared primitive pull will call, `fetch_from_remote`, directly,
+    /// exactly as US-011 will: any future caller of this function gets
+    /// no-tags-taken behaviour for free, by construction, not by a second
+    /// implementation.
+    #[tokio::test]
+    async fn e2e_new_217_pull_will_inherit_the_fetch_refspec() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-217");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        tag_bare_remote(&remote_dir, "v1", "refs/heads/main");
+        let before_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        {
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let outcome = crate::git::remote::fetch_from_remote(&repo, &url, None).unwrap();
+            assert!(
+                outcome.refs_updated.iter().all(|u| !u.ref_name.contains("tags")),
+                "got {:?}",
+                outcome.refs_updated
+            );
+        }
+        assert!(entry.db.get_ref("refs/tags/v1").await.unwrap().is_none());
+        let after_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(after_tags, before_tags);
+    }
+
+    /// Not one of this story's 14 owned tests, but a required implementation
+    /// property ("Authorization first, before host resolution or token
+    /// lookup"): the volume is never even initialized here, so a forbidden
+    /// result proves `authorize` ran ahead of `require_origin`, exactly like
+    /// `e2e_new_081_a_non_member_cannot_push` proves it for push.
+    #[test]
+    fn a_non_member_cannot_fetch() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let err = e
+                .as_person("bob@test.com", "git.remote_fetch", json!({"mount_id": MOUNT}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN);
+        });
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
