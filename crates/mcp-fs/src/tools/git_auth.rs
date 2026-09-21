@@ -407,7 +407,7 @@ fn auth_status(
 /// through the unqualified pre-existing calling convention still finds what
 /// it stored. `provider` in the response is resolved from `git.hosts` for
 /// the given host, `null` when the host is undeclared (E2E-NEW-190).
-async fn auth_revoke(
+pub(crate) async fn auth_revoke(
     ctx: &ToolCtx,
     provider: Option<&str>,
     host: Option<&str>,
@@ -449,7 +449,7 @@ async fn auth_revoke(
 /// instead of forcing the interactive device flow for a credential the caller
 /// already possesses. The provider is resolved from `git.hosts`
 /// (`crate::git::remote::resolve_host`), never supplied by the caller.
-async fn token_set(
+pub(crate) async fn token_set(
     ctx: &ToolCtx,
     host: &str,
     token: &str,

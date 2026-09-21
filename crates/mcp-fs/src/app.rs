@@ -133,6 +133,10 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
             state.stores.relational().clone(),
         );
         router = router.merge(crate::git::http::router(state.clone(), git_store));
+
+        // The token screen (FR-NEW-046): registered only when git is enabled, so a
+        // server without the subsystem does not expose a screen for it.
+        router = router.merge(crate::token_screen::router(state.clone()));
     }
 
     Ok(router)

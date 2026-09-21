@@ -58,7 +58,7 @@ Quoted verbatim from the specification's decisions log (Section 17). These are s
 - **Resolution during implementation:** Resolve identity inline at the top of each token screen handler using `state.identity.resolve`, exactly as `dataplane.rs:177-178` does, returning the 401 body shape documented at `app.rs:10-11`. Do not introduce a tower layer for this feature alone. FR-NEW-047's three-source resolution is implemented in that inline call.
 - **Detected by:** E2E-NEW-172 and E2E-NEW-173 fail if a handler omits the inline check, since no layer would have performed it.
 - **Blocks which requirement:** FR-NEW-037, FR-NEW-047, FR-NEW-048.
-- **Status:** open
+- **Status:** resolved (E2E-NEW-172, E2E-NEW-173, E2E-NEW-171, this commit)
 
 ## Functional Requirements
 
