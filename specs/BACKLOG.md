@@ -40,7 +40,14 @@ with the seven remaining server specs.
 
 **Suggested by.** The eight-spec split, DEC-001.
 
-## BL-003: Shared session state across replicas
+## Theme: Horizontal scaling
+
+Everything needed for a deployment to safely run more than one `mcp-fs` process behind a
+load balancer. Both items below are in-memory, per-process state with no cross-replica
+coordination: BL-003 is the session/write-quota map, BL-014 is the wider picture including
+the git write lock, which has the exact same shape.
+
+### BL-003: Shared session state across replicas
 
 **Description.** Make the write quota and the read-before-write guard shared rather than
 per process, so that horizontal scaling does not silently change their semantics.
@@ -56,7 +63,41 @@ platform foundation spec rather than solved there.
 
 **Suggested by.** `2026-09-18_17-37-46-platform-foundation.md`, §15 TBD-001.
 
-## BL-004: Force push on `git.remote_push`
+### BL-014: Horizontal scaling readiness (multiple server replicas)
+
+**Description.** The full set of coordination gaps that block running more than one
+`mcp-fs` replica: shared session/quota state (BL-003), a shared git write lock, and a
+relational backend suited to multi-writer access.
+
+**Current state.** Nothing in the codebase assumes more than one replica. The per-project
+git write lock that serializes commits, pushes and pulls is an in-memory `tokio::sync::Mutex`
+per process (`crates/mcp-fs/src/git/repo.rs:44`), so two replicas can each acquire their own
+lock for the same repository and interleave writes to it, corrupting its history. SQLite, the
+default relational backend, is a single file with one writer; PostgreSQL and SQL Server
+already support concurrent writers.
+
+**Risk analysis.** With more than one replica and no fix: a caller's write quota is
+effectively multiplied by the replica count (BL-003); two replicas racing the git write lock
+can corrupt a repository's history; a SQLite deployment cannot scale past one writer
+regardless of any fix here.
+
+**Rationale for deferral.** No current deployment runs more than one replica. Solving this
+without a concrete need means guessing at the coordination primitive (distributed lock,
+leader election, sticky routing) instead of building for the topology actually in use.
+
+**Suggested by.** User request, 2026-09-21, grouping the horizontal-scaling gaps as one theme
+alongside BL-003.
+
+## Theme: Git full support
+
+BL-004 through BL-013 are the pieces still missing between the current git surface and what
+"full git support" would mean: force push, pull request creation, squash merge, real conflict
+resolution, remote management beyond `origin`, refspec flexibility, discarding changes,
+pluggable credentials, Azure DevOps, and the consolidated divergence register (BL-013) that
+ties the set together. Grouped here so they get reviewed together rather than picked up
+piecemeal; none is a commitment.
+
+### BL-004: Force push on `git.remote_push`
 
 **Description.** Add `force: bool` to `git.remote_push`, allowing a non-fast-forward push to
 overwrite the remote ref.
@@ -78,7 +119,7 @@ paths that make force safe are themselves a body of work.
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-013.
 
-## BL-005: Pull request creation
+### BL-005: Pull request creation
 
 **Description.** A tool creating a pull or merge request on the provider, after a push.
 
@@ -91,7 +132,7 @@ interview.
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014 discussion.
 
-## BL-006: Squash merge
+### BL-006: Squash merge
 
 **Description.** Collapse a branch's commits into one before or during merge.
 
@@ -103,7 +144,7 @@ usually a property of how a pull request is merged rather than of a local operat
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014 discussion.
 
-## BL-007: Real merge conflict resolution
+### BL-007: Real merge conflict resolution
 
 **Description.** Per-file or interactive conflict resolution, rather than one global `ours` or
 `theirs` applied to every conflicting file.
@@ -118,7 +159,7 @@ an unresolved conflict requires deciding what a half-merged simulated filesystem
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-024.
 
-## BL-008: Remote management tools
+### BL-008: Remote management tools
 
 **Description.** `git.remote_add`, `git.remote_remove`, `git.remote_list`, exposing the existing
 storage API, plus support for remotes other than `origin`.
@@ -137,7 +178,7 @@ unambiguous target.
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-021.
 
-## BL-009: Remote branch name distinct from the local branch
+### BL-009: Remote branch name distinct from the local branch
 
 **Description.** A `remote_branch` parameter on `git.remote_push`, allowing `local:remote`
 refspecs.
@@ -148,7 +189,7 @@ refspecs.
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014.
 
-## BL-010: `git.discard_changes`
+### BL-010: `git.discard_changes`
 
 **Description.** Reset a volume's files to its current branch tip: overwrite modified files,
 restore deleted ones, remove added ones.
@@ -164,7 +205,7 @@ working escape, so discard stopped being the only way out of a dirty volume. Sti
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-025.
 
-## BL-011: Pluggable credential providers
+### BL-011: Pluggable credential providers
 
 **Description.** A `CredentialProvider` trait so a provider can supply a credential shape other
 than `oauth2:<token>`.
@@ -180,7 +221,7 @@ moment BL-012 becomes relevant.
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-034.
 
-## BL-012: Azure DevOps support
+### BL-012: Azure DevOps support
 
 **Description.** Support Azure DevOps as a provider.
 
@@ -193,7 +234,7 @@ empty username, not the literal `oauth2`. Supporting it properly means BL-011 fi
 
 **Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-002.
 
-## BL-013: Divergences from standard git, for review
+### BL-013: Divergences from standard git, for review
 
 **Description.** A consolidated register of every way this server's git behaviour differs from
 ordinary git. Each was a deliberate trade, but nobody has reviewed them as a set, and together
