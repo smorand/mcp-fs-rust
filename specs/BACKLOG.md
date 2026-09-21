@@ -55,3 +55,175 @@ topology, not a defect in the current single-process design. Recorded as TBD-001
 platform foundation spec rather than solved there.
 
 **Suggested by.** `2026-09-18_17-37-46-platform-foundation.md`, §15 TBD-001.
+
+## BL-004: Force push on `git.remote_push`
+
+**Description.** Add `force: bool` to `git.remote_push`, allowing a non-fast-forward push to
+overwrite the remote ref.
+
+**Current state.** Push is fast-forward only (FR-NEW-024). A non-fast-forward is refused with a
+distinct error stating force is not supported.
+
+**Risk analysis.** A force push destroys commits on the remote irreversibly. The pusher here is
+frequently an autonomous agent, authenticating with a person's personal token, against a
+repository the person did not necessarily choose. A mistaken force push is attributed to the
+person and is not recoverable from the server side. If implemented, the recommendation is:
+`force` defaults to false; it is rejected outright for any ref matching a configured
+protected-branch pattern; every forced push records an audit entry naming the overwritten sha
+so the prior tip can be recovered from the reflog; and it is gated by a server-level config
+flag that is off by default, so a deployment must opt in before any caller can use it.
+
+**Rationale for deferral.** Deliberate scope exclusion at interview (DEC-013). The recovery
+paths that make force safe are themselves a body of work.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-013.
+
+## BL-005: Pull request creation
+
+**Description.** A tool creating a pull or merge request on the provider, after a push.
+
+**Current state.** Not implemented. The provider REST APIs are not called at all; the only
+outbound traffic is the git transport.
+
+**Rationale for deferral.** Requires per-provider REST clients, a token scope beyond repository
+read/write, and a result model that differs between GitHub and GitLab. Out of scope at
+interview.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014 discussion.
+
+## BL-006: Squash merge
+
+**Description.** Collapse a branch's commits into one before or during merge.
+
+**Current state.** Not implemented. The merge path creates an ordinary merge commit with two
+parents (FR-NEW-034).
+
+**Rationale for deferral.** Out of scope at interview. Interacts with BL-005, since squash is
+usually a property of how a pull request is merged rather than of a local operation.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014 discussion.
+
+## BL-007: Real merge conflict resolution
+
+**Description.** Per-file or interactive conflict resolution, rather than one global `ours` or
+`theirs` applied to every conflicting file.
+
+**Current state.** `git.remote_pull` accepts `on_conflict` of `ours` or `theirs` and applies it
+to every conflict (FR-NEW-031). Conflict markers are prohibited from entering the volume
+(FR-NEW-032).
+
+**Rationale for deferral.** The volume is the working tree and there is no index, so representing
+an unresolved conflict requires deciding what a half-merged simulated filesystem looks like to
+`fs.read`, `fs.write` and `git.status`. That is a subsystem, not a parameter.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-024.
+
+## BL-008: Remote management tools
+
+**Description.** `git.remote_add`, `git.remote_remove`, `git.remote_list`, exposing the existing
+storage API, plus support for remotes other than `origin`.
+
+**Current state.** `git_remotes` holds `(volume_id, name, url)` and `add_remote`,
+`remove_remote` and `list_remotes` are implemented and tested
+(`crates/mcp-fs/src/git/db.rs:69-75`, `:281-305`, `:429-442`). After FR-NEW-020 the only writer
+is `git.remote_clone`, which records exactly one remote named `origin`. Push, fetch and pull
+resolve `origin` and take no `url`.
+
+**Consequence today.** A volume created by `git.init` has no `origin` and therefore cannot push,
+fetch or pull at all. Its only route to a remote is to be cloned instead.
+
+**Rationale for deferral.** Excluded at interview (DEC-021) to keep the remote surface to one
+unambiguous target.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-021.
+
+## BL-009: Remote branch name distinct from the local branch
+
+**Description.** A `remote_branch` parameter on `git.remote_push`, allowing `local:remote`
+refspecs.
+
+**Current state.** The remote branch name always equals the local one (FR-NEW-022).
+
+**Rationale for deferral.** Deferred at interview as a later refinement.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014.
+
+## BL-010: `git.discard_changes`
+
+**Description.** Reset a volume's files to its current branch tip: overwrite modified files,
+restore deleted ones, remove added ones.
+
+**Current state.** `git.remote_pull` refuses a dirty volume and instructs the caller to commit or
+discard (FR-NEW-029). Committing works, because divergence is then resolvable by merge. Discarding
+has no single-call implementation: the nearest tool is `git.checkout_file`
+(`crates/mcp-fs/src/tools/git.rs:222`), which restores one file per call and cannot remove a file
+the volume added.
+
+**Rationale for deferral.** Once `on_conflict` merge existed (DEC-024), committing became a
+working escape, so discard stopped being the only way out of a dirty volume. Still worth having.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-025.
+
+## BL-011: Pluggable credential providers
+
+**Description.** A `CredentialProvider` trait so a provider can supply a credential shape other
+than `oauth2:<token>`.
+
+**Current state.** Every provider uses `git2::Cred::userpass_plaintext("oauth2", &t)`
+(`crates/mcp-fs/src/tools/git.rs:1011-1013`), which works for read and write on both GitHub and
+GitLab, and on their enterprise deployments.
+
+**Rationale for deferral.** Rejected as approach C at interview: a trait with four
+implementations that all return the identical credential is indirection with no current payer.
+It becomes worthwhile the moment a second credential shape genuinely exists, which is the same
+moment BL-012 becomes relevant.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-034.
+
+## BL-012: Azure DevOps support
+
+**Description.** Support Azure DevOps as a provider.
+
+**Current state.** Excluded. The provider set is `github`, `gitlab`, `generic`, `anonymous`
+(FR-NEW-001). Azure DevOps suffers the same substring-detection defect this specification fixes,
+and would work today as a `generic` host if its credential convention matched.
+
+**Rationale for deferral.** Azure DevOps expects the PAT as the password with an arbitrary or
+empty username, not the literal `oauth2`. Supporting it properly means BL-011 first.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-002.
+
+## BL-013: Divergences from standard git, for review
+
+**Description.** A consolidated register of every way this server's git behaviour differs from
+ordinary git. Each was a deliberate trade, but nobody has reviewed them as a set, and together
+they define what "git support" means here.
+
+**The divergences, as of this specification:**
+
+| Area | Standard git | Here | Where decided |
+|---|---|---|---|
+| Working tree | Index plus working tree plus HEAD | No index. The volume **is** the working tree. | Pre-existing |
+| Staging | `git add` selects what to commit | `git.commit` commits the whole volume state | Pre-existing, `git.rs:194` |
+| Dirty tree | Many operations warn or stash | Pull refuses; no stash exists | FR-NEW-029 |
+| Discarding changes | `git checkout -- .`, `git restore` | No single-call equivalent; see BL-010 | DEC-025 |
+| Merge conflicts | Conflict markers, manual resolution, `git mergetool` | One global `ours`/`theirs`; markers prohibited | DEC-024, FR-NEW-032 |
+| Rebase, cherry-pick, revert | Available | Not implemented | Never specified |
+| Stash | Available | Not implemented | Never specified |
+| Push refspecs | Arbitrary `local:remote`, multiple refs, tags | One branch, same name both sides, no tags | DEC-014, BL-009 |
+| Force push | `--force`, `--force-with-lease` | Refused outright | DEC-013, BL-004 |
+| Remotes | Many, freely managed | Exactly one, named `origin`, created only by clone | DEC-021, BL-008 |
+| Transport | HTTPS, SSH, git, file, local paths | HTTPS only | DEC-009, FR-NEW-041 |
+| Credentials in URLs | Accepted by git | Rejected | FR-NEW-042 |
+| Unknown host | Just tries, anonymously | Error unless declared | DEC-010, FR-NEW-007 |
+| Credential helpers | Pluggable, per host | One shape, `oauth2:<token>` | DEC-009, BL-011 |
+| Token lifetime | Helper's concern | No refresh or rotation | DEC-009 |
+| Submodules | Supported | Not supported | Never specified |
+| Partial apply | `git checkout` is atomic | Clone tolerates per-file failure and reports `skipped`; pull is atomic | FR-NEW-035 vs `git.rs:790-795` |
+
+**Rationale for deferral.** Each divergence is individually justified. The review question is
+whether the set is coherent, and which gaps matter enough to close. That is a product
+conversation, not a defect.
+
+**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, user request during
+Round 2b.
