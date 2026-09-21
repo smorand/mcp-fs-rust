@@ -263,7 +263,7 @@ doc_service:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | registers the 14 git tools and the git HTTP routes |
+| `enabled` | bool | `false` | registers the 18 git tools and the git HTTP routes |
 | `object_format` | string | `sha1` | `sha256` is accepted and ignored (the bundled libgit2 is sha1 only) |
 | `anonymous_read` | bool | `false` | allow unauthenticated clone and fetch |
 | `max_pack_size_mb` | int | `512` | push body ceiling, enforced (413) |

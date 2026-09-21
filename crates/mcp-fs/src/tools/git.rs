@@ -2537,6 +2537,61 @@ mod tests {
         assert_eq!(s.input_schema(), expected);
     }
 
+    /// E2E-NEW-159/160: `git.remote_push` and `git.remote_pull` are new
+    /// tools (US-009, US-011); their `inputSchema` is pinned inline, ahead of
+    /// the whole-surface golden comparison in
+    /// `every_admin_and_git_schema_matches_the_frozen_tool_contract`, so a
+    /// drift on either shows up here with a tool-specific message too.
+    #[test]
+    fn git_remote_push_and_pull_schemas_match_the_contract() {
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+
+        let push = &r.resolve("git.remote_push").unwrap().schema;
+        assert_eq!(
+            push.description,
+            "Push a local branch to origin under the same name. Creates the branch on the \
+             remote when it is absent there. Fails if the push is not a fast-forward; force \
+             is not supported."
+        );
+        let expected_push: Value = serde_json::from_str(
+            r#"{"type":"object","properties":{
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
+                 "branch":{"description":"Local branch to push to origin under the same name.","type":"string"}},
+               "required":["mount_id","branch"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            push.input_schema(),
+            expected_push,
+            "branch must stay required, with no default"
+        );
+
+        let pull = &r.resolve("git.remote_pull").unwrap().schema;
+        assert_eq!(
+            pull.description,
+            "Fetch from origin, then advance the checked-out branch to the remote tip and update \
+             the volume's files to match. A fast-forward applies directly. A diverged history \
+             is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way \
+             merge resolves every conflicting file by that strategy and creates a merge \
+             commit. Refuses a dirty volume (commit or discard first) and refuses any branch \
+             other than the one currently checked out."
+        );
+        let expected_pull: Value = serde_json::from_str(
+            r#"{"type":"object","properties":{
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
+                 "branch":{"description":"Branch to pull; must be the branch currently checked out.","type":"string"},
+                 "on_conflict":{"description":"For a diverged (non fast-forward) history: 'ours' or 'theirs' to resolve every conflicting file by that strategy and create a merge commit; omit to refuse the pull instead. Ignored whenever the pull is a fast-forward.","type":"string","default":null}},
+               "required":["mount_id","branch"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pull.input_schema(),
+            expected_pull,
+            "branch must stay required, on_conflict optional and nullable"
+        );
+    }
+
     #[test]
     fn git_diff_and_blame_schemas_match_the_contract() {
         let mut r = ToolRegistry::new();
@@ -4372,6 +4427,29 @@ mod tests {
         });
     }
 
+    /// E2E-NEW-244 / FR-NEW-071: `branch` is a required argument with no
+    /// fallback to the checked-out branch. The handler extracts it via
+    /// `a.str("branch")?` before `authorize` ever runs (`git.rs:311-326`), so
+    /// this fails on the missing argument regardless of membership or volume
+    /// state, and needs no `git.hosts` setup.
+    #[tokio::test]
+    async fn e2e_new_244_a_push_without_branch_is_rejected() {
+        let e = Env::new().await;
+        let err = e.call("git.remote_push", json!({"mount_id": MOUNT})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("branch"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-245 / FR-NEW-071: same guarantee as
+    /// `e2e_new_244_a_push_without_branch_is_rejected`, for `git.remote_pull`.
+    #[tokio::test]
+    async fn e2e_new_245_a_pull_without_branch_is_rejected() {
+        let e = Env::new().await;
+        let err = e.call("git.remote_pull", json!({"mount_id": MOUNT})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("branch"), "got {}", err.message);
+    }
+
     /// E2E-NEW-081: a non-member is refused with `ERR_FORBIDDEN` before host
     /// resolution or any token lookup: `authorize` is the very first call
     /// `git.remote_push` makes. The volume is never even initialized here, so a
@@ -4828,6 +4906,29 @@ mod tests {
     /// property ("Authorization first, before host resolution or token
     /// lookup"): the volume is never even initialized here, so a forbidden
     /// result proves `authorize` ran ahead of `require_origin`, exactly like
+    /// E2E-NEW-246 / FR-NEW-071: `mount_id` is the only required argument on
+    /// `git.remote_fetch`. A call supplying only `mount_id` is never rejected
+    /// for a missing argument (there is no `branch` on this schema to omit):
+    /// it reaches `require_origin`, which fails naming 'origin', not naming a
+    /// missing parameter, proving the schema's required list is exactly
+    /// `["mount_id"]`. A genuine network round trip cannot run in this test
+    /// environment (only `https` origins are accepted, and the suite reaches
+    /// no real network, see `e2e_new_194` above), so "succeeds" here is
+    /// argument-layer success: no `ERR_INVALID_ARGUMENT` naming a missing
+    /// required parameter, exactly the FR-NEW-071 property under test.
+    #[tokio::test]
+    async fn e2e_new_246_fetch_with_only_mount_id_is_never_rejected_for_a_missing_argument() {
+        let e = Env::new().await;
+        e.git.init_repo(MOUNT).await.unwrap();
+        let err = e.call("git.remote_fetch", json!({"mount_id": MOUNT})).await.unwrap_err();
+        assert!(
+            !err.message.to_ascii_lowercase().contains("missing required argument"),
+            "got {}",
+            err.message
+        );
+        assert!(err.message.to_ascii_lowercase().contains("origin"), "got {}", err.message);
+    }
+
     /// `e2e_new_081_a_non_member_cannot_push` proves it for push.
     #[test]
     fn a_non_member_cannot_fetch() {

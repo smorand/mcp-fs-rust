@@ -246,7 +246,7 @@ What replaced it, and why nothing was lost that mattered:
 
 | Was covered by the harness | Now covered by |
 |---|---|
-| the 59 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
+| the 63 tool schemas and descriptions | `tool-contract-golden.json` plus the three contract tests |
 | the MCP wire framing and JSON-RPC behaviour | `app.rs` router tests driven with `oneshot` |
 | the REST plane, every route | `api/dataplane.rs` and `api/openapi.rs` tests |
 | every error path and `ERR_*` code | per module tests next to each error |

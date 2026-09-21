@@ -55,7 +55,8 @@ mod tests {
     use super::EnabledFeatures;
 
     /// With git disabled the git families must be absent, not merely unreachable:
-    /// an LLM must not see a tool it cannot call.
+    /// an LLM must not see a tool it cannot call. E2E-NEW-158 covers the four
+    /// new tools explicitly, not just the pre-existing ones.
     #[test]
     fn admin_tools_register_without_git() {
         let mut reg = ToolRegistry::new();
@@ -63,6 +64,9 @@ mod tests {
         assert_eq!(reg.len(), 10);
         assert!(reg.resolve("git.init").is_none());
         assert!(reg.resolve("git.auth").is_none());
+        for name in ["git.token_set", "git.remote_push", "git.remote_fetch", "git.remote_pull"] {
+            assert!(reg.resolve(name).is_none(), "{name} must be absent when git is disabled");
+        }
     }
 
     #[test]
@@ -141,7 +145,7 @@ mod tests {
         assert!(reg.resolve("search.status").is_some());
     }
 
-    /// Whole surface gate for the 25 tools of this agent: every `admin.*`,
+    /// Whole surface gate for the 28 tools of this agent: every `admin.*`,
     /// `git.*` and `git.auth*` schema and description is compared to the frozen
     /// contract, the serialized string included, so a property key ORDER change
     /// fails too.
@@ -149,11 +153,6 @@ mod tests {
     /// The contract lives at the repo root, outside the crate, so the check is
     /// skipped with a message when it is absent; the per family tests still pin
     /// every schema inline.
-    ///
-    /// `git.remote_push` (US-009) is not yet in the frozen contract on disk
-    /// (regenerated once, last, in US-019, per this story's own constraints),
-    /// so this test is expected to fail until then: it is one of the two
-    /// pre-authorized red tests for this story.
     #[test]
     fn every_admin_and_git_schema_matches_the_frozen_tool_contract() {
         let mut reg = ToolRegistry::new();
@@ -163,7 +162,7 @@ mod tests {
         super::super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("admin.") || name.starts_with("git."),
-            25,
+            28,
             "admin.* and git.* tools",
         );
     }

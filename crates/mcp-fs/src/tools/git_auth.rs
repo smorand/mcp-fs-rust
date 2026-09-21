@@ -1625,6 +1625,50 @@ mod tests {
         assert_eq!(schema["required"], json!(["host", "token"]));
     }
 
+    /// E2E-NEW-159/160 / FR-NEW-071: `git.token_set` is a new tool (US-004);
+    /// its full `inputSchema` is pinned inline, ahead of the whole-surface
+    /// golden comparison, so a drift shows up here with a tool-specific
+    /// message too. `host` and `token` required, `expires_at` optional and
+    /// nullable.
+    #[tokio::test]
+    async fn git_token_set_schema_matches_the_contract() {
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+        let s = &r.resolve("git.token_set").unwrap().schema;
+        assert_eq!(
+            s.description,
+            "Seed a personal access token you already hold for a host declared in git.hosts, \
+             without the interactive device flow. The token is never echoed back."
+        );
+        let expected: Value = serde_json::from_str(
+            r#"{"type":"object","properties":{
+                 "host":{"description":"Hostname declared in git.hosts to store the token for.","type":"string"},
+                 "token":{"description":"The personal access token value. Never echoed back; 1 to 8192 characters.","type":"string"},
+                 "expires_at":{"description":"RFC 3339 timestamp the token expires at; omit or null for a token that never expires.","type":"string","default":null}},
+               "required":["host","token"]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.input_schema(), expected);
+    }
+
+    /// E2E-NEW-246 / FR-NEW-071: `expires_at` is genuinely optional, not just
+    /// declared so: a call omitting it succeeds outright.
+    #[test]
+    fn e2e_new_246_token_set_without_expires_at_succeeds() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let out = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap();
+            assert_eq!(out["stored"], true);
+            assert!(tokens.has_valid_token(PERSON, "github.ibm.com"));
+        });
+    }
+
     #[test]
     fn e2e_new_020_seeding_stores_a_token_for_a_declared_host() {
         with_git_hosts_lock(async {

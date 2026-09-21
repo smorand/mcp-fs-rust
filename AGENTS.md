@@ -2,7 +2,7 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (59 tools: 35 `fs.*`, 10 `admin.*`, 11 `git.*`, 3 `git.auth*`;
+multi-project filesystem** (63 tools: 35 `fs.*`, 10 `admin.*`, 14 `git.*`, 4 `git.auth*`;
 + 4 `search.*` when search enabled),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/`. Ships with
@@ -83,7 +83,7 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 59 tool schemas and return shapes, human readable. **This is
+- `TOOL_CONTRACT.txt` : the 63 tool schemas and return shapes, human readable. **This is
   the authoritative contract.**
 - `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
   every name, description and `inputSchema` against it, serialized, so a reordered schema
@@ -150,7 +150,7 @@ keyed text has a length ceiling there).
 
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
-- `.agent_docs/tools.md` : the 59 tool reference (families, parameters, authorization).
+- `.agent_docs/tools.md` : the 63 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, OAuth, the remote pipeline (host resolution, URL validation, credential supply, origin).
 - `.agent_docs/config.md` : full YAML schema, backends and dsn, resolution order, secrets.
