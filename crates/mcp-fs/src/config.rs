@@ -454,6 +454,10 @@ pub struct GitConfig {
     pub gitlab_client_id: String,
     pub gitlab_client_secret_env: String,
     pub gitlab_instance_url: String,
+    /// Host to credential-policy map. Declared here; validated and resolved
+    /// exclusively by `git::remote` (FR-NEW-065), which is also the only place
+    /// that reads an entry's value.
+    pub hosts: crate::git::remote::HostMap,
 }
 impl Default for GitConfig {
     fn default() -> Self {
@@ -467,6 +471,7 @@ impl Default for GitConfig {
             gitlab_client_id: String::new(),
             gitlab_client_secret_env: d_gitlab_secret_env(),
             gitlab_instance_url: d_gitlab_url(),
+            hosts: crate::git::remote::HostMap::default(),
         }
     }
 }
@@ -817,6 +822,7 @@ impl ServerConfig {
         validate_store("oauth", &self.infra.oauth.backend, &self.infra.oauth.dsn)?;
         validate_doc_service(&self.doc_service)?;
         validate_search(&self.search)?;
+        crate::git::remote::validate_hosts(&self.git)?;
         Ok(())
     }
 
@@ -1278,6 +1284,48 @@ infra:
         )
         .expect("a complete postgres section is valid");
         assert_eq!(c.infra.meta.backend, backend::POSTGRES);
+    }
+
+    // ── git hosts (boot validation, full YAML path) ────────────────────────────
+
+    /// A reference `git.hosts` map, written as an operator would, boots and
+    /// carries through to the parsed `GitConfig` exactly as written.
+    #[test]
+    fn a_reference_git_hosts_map_boots_via_yaml() {
+        let _guard = crate::git::remote::tests::lock_for_test();
+        let c = ServerConfig::from_yaml(
+            "git:\n  hosts:\n    github.com: github\n    github.ibm.com: github\n    \
+             gitlab.acme.corp: gitlab\n    git.acme.internal: generic\n    \
+             public.example.org: anonymous\n",
+        )
+        .expect("the reference map is valid");
+        assert_eq!(c.git.hosts.0.len(), 5);
+        assert_eq!(
+            crate::git::remote::resolve_host("gitlab.acme.corp").unwrap(),
+            crate::git::remote::Provider::Gitlab
+        );
+    }
+
+    /// A `git.hosts` key repeated in the YAML source fails boot naming the host,
+    /// proving `from_yaml`'s custom `Deserialize` keeps the duplicate instead of
+    /// silently folding it away the way a plain `HashMap<String, String>` would.
+    #[test]
+    fn a_duplicate_git_hosts_key_in_yaml_fails_boot() {
+        let e = ServerConfig::from_yaml(
+            "git:\n  hosts:\n    github.com: github\n    github.com: anonymous\n",
+        )
+        .expect_err("github.com appears twice");
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("github.com"), "{}", e.message);
+        assert!(e.message.contains("duplicate"), "{}", e.message);
+    }
+
+    /// No `git.hosts` key at all still boots: an absent map is not a boot
+    /// failure, only an empty one (EXC-001d).
+    #[test]
+    fn a_config_with_no_git_hosts_key_still_boots() {
+        let c = ServerConfig::from_yaml("git:\n  enabled: true\n").expect("no hosts key is valid");
+        assert!(c.git.hosts.0.is_empty());
     }
 
     // ── secret handling ─────────────────────────────────────────────────────────

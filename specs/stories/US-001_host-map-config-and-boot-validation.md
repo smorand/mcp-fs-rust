@@ -59,7 +59,7 @@ Quoted verbatim from the specification's decisions log (Section 17). These are s
 - **Resolution during implementation:** Add `url = "2.5"` to `[workspace.dependencies]` and `url = { workspace = true }` to `crates/mcp-fs/Cargo.toml`. Section 9.5 has already been corrected to state one new direct dependency.
 - **Detected by:** `cargo build` fails with `error[E0432]: unresolved import url`.
 - **Blocks which requirement:** FR-NEW-006, and through it FR-NEW-007, FR-NEW-041, FR-NEW-042.
-- **Status:** open
+- **Status:** resolved (`git::remote::validate_host_key` uses `url::Host::parse`; RED confirmed via `error[E0433]: cannot find module or crate \`url\`` with the dependency lines removed, then GREEN restored, this commit)
 
 ## Functional Requirements
 

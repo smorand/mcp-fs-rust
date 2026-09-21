@@ -65,6 +65,10 @@ rand = "0.8"
 
 # ── git ────────────────────────────────────────────────────────────────────────
 git2 = "0.20"
+# Host key validation and, later, remote URL parsing (git::remote). Was already
+# a transitive dependency of several other crates; promoted to direct because
+# the crate reads it by name (DRIFT-003).
+url = "2.5"
 
 # ── documents / search ─────────────────────────────────────────────────────────
 regex = "1"
