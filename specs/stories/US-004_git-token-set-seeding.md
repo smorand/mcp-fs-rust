@@ -41,6 +41,32 @@ Quoted verbatim from the specification's decisions log (Section 17). These are s
 - **DEC-017:** `git.token_set` takes an optional `expires_at`; absent means non-expiring. **Rationale:** a PAT may genuinely never expire, and a fabricated expiry would wrongly trigger the expiry failure path. **Implemented by:** FR-NEW-014. **Round:** 2b. **Code evidence:** `crates/mcp-fs/src/git/oauth/store.rs:115-123`
 - **DEC-033:** Seeded tokens longer than 8192 characters are rejected. **Rationale:** a denial-of-service bound; the codebase already uses bounded `TextKey` columns because SQL Server cannot index unbounded text. **Implemented by:** FR-NEW-015. **Round:** 4. **Code evidence:** `crates/mcp-fs/src/git/oauth/persistence.rs:33-34`
 
+### Implementer Decision: the `expires_at` representation
+
+Section 15.1 of the specification leaves this open: *"Whether the implementation relaxes the column
+or adopts a far-future sentinel is the implementer's choice; the observable requirement is that
+`git.auth_status` reports such a token `valid` indefinitely and FR-NEW-018 never fires for it."*
+
+**Decided: relax the column to nullable. `None` means non-expiring.** Settled by the user during
+partitioning, so it is not re-litigated during implementation.
+
+- `crates/mcp-fs/src/git/oauth/persistence.rs:39` becomes `Column::new("expires_at", ColumnType::Text)`.
+  `Column::new` is already the nullable constructor and `instance_url` in the same column list already
+  uses it.
+- The load path reads `r.opt_text(4)?` instead of `r.text(4)?`. That accessor
+  (`crates/mcp-fs/src/storage/rel/mod.rs:235`) is already used on the next line for `instance_url`, and
+  `option_binds_null_or_the_inner_value` (`crates/mcp-fs/src/storage/rel/mod.rs:573`) proves an `Option`
+  binds as NULL on every engine.
+- `OAuthSession.expires_at` becomes `Option<DateTime<Utc>>`
+  (`crates/mcp-fs/src/git/oauth/store.rs:28`), and `is_valid_at` becomes
+  `self.expires_at.is_none_or(|e| e > now)` (`:34-36`), which states FR-NEW-014 directly rather than
+  encoding it in a magic constant.
+- FR-NEW-051's `expires_at: String|null` is then a direct serialization of that `Option`, with no
+  sentinel-to-null mapping to forget in `git.auth_status` or on the token screen.
+
+The schema change costs nothing extra because US-003 drops and recreates `oauth_tokens` anyway
+(DRIFT-005, FR-NEW-011).
+
 ### Applicable NFRs
 - **Bounded token size** (§7.2): FR-NEW-015, 8192 characters, a denial-of-service bound on `git.token_set`.
 - **No token on any observable surface** (§7.2): the response contains no substring of the token.

@@ -45,6 +45,32 @@ Quoted verbatim from the specification's decisions log (Section 17). These are s
 - **DEC-004:** The key is `(person, host)`; provider is an attribute of the row. **Alternatives considered:** `(person, provider, host)`, which permits two tokens per host with no known use. **Implemented by:** FR-NEW-009. **Round:** 1. **Code evidence:** n/a
 - **DEC-005:** Pre-existing `oauth_tokens` rows are dropped at upgrade, not migrated. **Rationale:** the old rows carry no host, and inferring one from `provider` writes a guess into a primary key. **Alternatives considered:** inferring `github.com`/`gitlab.com`; reading the existing `instance_url` column. **Implemented by:** FR-NEW-011. **Round:** 1. **Code evidence:** `crates/mcp-fs/src/git/oauth/persistence.rs:42`
 
+### Implementer Decision: the `expires_at` representation
+
+Section 15.1 of the specification leaves this open: *"Whether the implementation relaxes the column
+or adopts a far-future sentinel is the implementer's choice; the observable requirement is that
+`git.auth_status` reports such a token `valid` indefinitely and FR-NEW-018 never fires for it."*
+
+**Decided: relax the column to nullable. `None` means non-expiring.** Settled by the user during
+partitioning, so it is not re-litigated during implementation.
+
+- `crates/mcp-fs/src/git/oauth/persistence.rs:39` becomes `Column::new("expires_at", ColumnType::Text)`.
+  `Column::new` is already the nullable constructor and `instance_url` in the same column list already
+  uses it.
+- The load path reads `r.opt_text(4)?` instead of `r.text(4)?`. That accessor
+  (`crates/mcp-fs/src/storage/rel/mod.rs:235`) is already used on the next line for `instance_url`, and
+  `option_binds_null_or_the_inner_value` (`crates/mcp-fs/src/storage/rel/mod.rs:573`) proves an `Option`
+  binds as NULL on every engine.
+- `OAuthSession.expires_at` becomes `Option<DateTime<Utc>>`
+  (`crates/mcp-fs/src/git/oauth/store.rs:28`), and `is_valid_at` becomes
+  `self.expires_at.is_none_or(|e| e > now)` (`:34-36`), which states FR-NEW-014 directly rather than
+  encoding it in a magic constant.
+- FR-NEW-051's `expires_at: String|null` is then a direct serialization of that `Option`, with no
+  sentinel-to-null mapping to forget in `git.auth_status` or on the token screen.
+
+The schema change costs nothing extra because US-003 drops and recreates `oauth_tokens` anyway
+(DRIFT-005, FR-NEW-011).
+
 ### Applicable NFRs
 - **Backend parity** (§7.4): FR-NEW-010 and FR-NEW-012 behave identically on SQLite, PostgreSQL and SQL Server, exercised by the single conformance suite.
 - **Encryption unchanged** (§7.2): only the bearer token is encrypted (`crates/mcp-fs/src/git/oauth/persistence.rs:3`). Re-keying changes no encryption behaviour.
