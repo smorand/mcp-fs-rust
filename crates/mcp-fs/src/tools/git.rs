@@ -27,6 +27,7 @@ use crate::git::db::RelationalGitDb;
 use crate::git::{GitRepoEntry, GitRepoStore};
 use crate::mcp::registry::{ToolCtx, handler};
 use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
 use chrono::{DateTime, FixedOffset, Utc};
 use git2::{DiffFormat, DiffOptions, Oid, Repository, Tree};
@@ -1218,7 +1219,19 @@ async fn remote_pull(
     let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
     let client = ctx.state.stores.client(mount_id).await?;
 
-    pull_branch(entry, branch, &local_sha, &origin_url, token, auth, client, on_conflict).await
+    pull_branch(
+        entry,
+        branch,
+        &local_sha,
+        &origin_url,
+        token,
+        auth,
+        client,
+        &ctx.person,
+        ctx.state.safety.clone(),
+        on_conflict,
+    )
+    .await
 }
 
 /// Everything a pull does once the branch guard has passed and a credential
@@ -1254,10 +1267,12 @@ async fn pull_branch(
     token: Option<String>,
     auth: String,
     client: Arc<VolumeClient>,
+    person: &str,
+    safety: Arc<SafetyManager>,
     _on_conflict: Option<String>,
 ) -> Result<Value> {
-    let (branch_owned, origin_owned, local_sha_owned) =
-        (branch.to_string(), origin_url.to_string(), local_sha.to_string());
+    let (branch_owned, origin_owned, local_sha_owned, person_owned) =
+        (branch.to_string(), origin_url.to_string(), local_sha.to_string(), person.to_string());
     let entry_for_thread = entry.clone();
 
     let (old_sha, new_sha, files_changed) = on_git_thread(move || async move {
@@ -1308,6 +1323,23 @@ async fn pull_branch(
         let new_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
 
         let changes = diff_tree_changes(&repo, &old_tree, &new_tree)?;
+
+        // FR-NEW-069: the single authority on the basis of the pull quota charge.
+        // Reuses the delta `diff_tree_changes` already computed above rather than
+        // walking the tree a second time; a deleted path never adds bytes. This
+        // charge runs before `apply_pull_changes_atomically`'s first write, so an
+        // insufficient quota refuses the pull without writing anything and
+        // without advancing the ref below (DEC-036, unlike clone's whole-tree
+        // charge at `clone_and_import`, `tools/git.rs:778-782`).
+        let charge_bytes: i64 = changes
+            .iter()
+            .filter_map(|c| match c {
+                TreeChange::Write { oid, .. } => repo.find_blob(*oid).ok().map(|b| b.size() as i64),
+                TreeChange::Delete { .. } => None,
+            })
+            .sum();
+        safety.charge_write(&person_owned, &client.project_id, charge_bytes)?;
+
         apply_pull_changes_atomically(&client, &repo, &changes).await?;
 
         let branch_ref_name = format!("refs/heads/{branch_owned}");
@@ -4149,6 +4181,8 @@ mod tests {
             None,
             auth.to_string(),
             client,
+            OWNER,
+            e.f.state.safety.clone(),
             on_conflict.map(str::to_string),
         )
         .await
@@ -4391,6 +4425,142 @@ mod tests {
         let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
         assert_eq!(out["new_sha"], tip);
         assert_eq!(out["merged"], false, "a fast-forward is applied, never a merge");
+    }
+
+    // ── FR-NEW-036/055/069: pull's write-quota charge is the delta ──────────
+
+    /// One more commit directly on the bare "remote" whose tree is byte for
+    /// byte identical to its parent's: same tree oid, new commit oid, so the
+    /// ref advances while `diff_tree_to_tree` reports no delta at all. Used by
+    /// E2E-NEW-240 to prove an unchanged path is charged nothing.
+    fn advance_bare_remote_same_tree(dir: &std::path::Path, branch_ref: &str) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+        let tree = parent.tree().unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_900, 0)).unwrap();
+        let oid = repo.commit(Some(branch_ref), &sig, &sig, "no-op\n", &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    /// E2E-NEW-133: a quota that fits the initial clone but not the pull's own
+    /// delta refuses the pull, leaves the incoming file unwritten, and leaves
+    /// `refs/heads/main` unchanged. The clone's README.md (790 bytes) exactly
+    /// exhausts a quota of 800, leaving 10 bytes of headroom; the pull's
+    /// EXTRA.md is 11 bytes, one over what remains.
+    #[tokio::test]
+    async fn e2e_new_133_pull_charges_the_write_quota_before_writing() {
+        let e = Env::with_quota(800).await;
+        let remote_dir = e.f.dir.path().join("remote-133");
+        let url = seed_bare_remote(&remote_dir, &"A".repeat(790));
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "01234567890");
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        assert!(
+            !client.exists("/EXTRA.md").await.unwrap(),
+            "the pull must be refused before any file is written"
+        );
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must not be advanced");
+    }
+
+    /// E2E-NEW-198 (FR-NEW-055): a pull charges only the bytes of the file
+    /// that actually changed, not the whole incoming tree. The clone's
+    /// README.md (790 bytes) leaves exactly 10 bytes of quota headroom; the
+    /// pull's EXTRA.md is 10 bytes. Charging the whole target tree
+    /// (790 + 10 = 800 new bytes against a 10-byte remaining budget) would
+    /// refuse this pull; charging only the 10-byte delta lets it succeed.
+    #[tokio::test]
+    async fn e2e_new_198_a_pull_charges_only_the_changed_bytes() {
+        let e = Env::with_quota(800).await;
+        let remote_dir = e.f.dir.path().join("remote-198");
+        let url = seed_bare_remote(&remote_dir, &"A".repeat(790));
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 790);
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "0123456789");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(out["files_changed"], 1);
+        assert_eq!(
+            e.f.state.safety.bytes_written(OWNER, MOUNT),
+            800,
+            "only the 10 changed bytes were charged on top of the clone's 790, not the tree total"
+        );
+    }
+
+    /// E2E-NEW-238 (FR-NEW-069): a pull charges only the blobs it actually
+    /// writes. Same shape as E2E-NEW-198, asserting the same single authority
+    /// (FR-NEW-069) that FR-NEW-055 is subsumed by.
+    #[tokio::test]
+    async fn e2e_new_238_a_pull_charges_only_the_blobs_it_writes() {
+        let e = Env::with_quota(800).await;
+        let remote_dir = e.f.dir.path().join("remote-238");
+        let url = seed_bare_remote(&remote_dir, &"A".repeat(790));
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        advance_bare_remote(&remote_dir, "refs/heads/main", "0123456789");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(out["files_changed"], 1);
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 800, "charged 790 + 10, not more");
+        assert_eq!(e.read("/EXTRA.md").await, "0123456789");
+    }
+
+    /// E2E-NEW-141 — A merge exceeding the quota is refused.
+    /// > Given the merged tree's changed blobs exceed the write quota. When
+    /// > the pull runs. Then it fails before writing, creates no merge
+    /// > commit, and leaves the ref unchanged.
+    /// Merge application is US-013's job, out of this story's scope boundary:
+    /// there is no merge engine yet to compute a merged tree's changed blobs
+    /// against. Placeholder for US-013.
+    #[tokio::test]
+    #[ignore = "merge engine not implemented until US-013"]
+    async fn e2e_new_141_a_merge_exceeding_the_quota_is_refused() {
+        unimplemented!("merge engine: US-013")
+    }
+
+    /// E2E-NEW-239 — A merge charges only its changed blobs.
+    /// > Given a merged tree whose changed blobs sum to 4 MB and a quota of
+    /// > 1 MB. When the pull runs with `on_conflict`. Then it is refused, no
+    /// > merge commit is created and `refs/heads/main` is unchanged.
+    /// Merge application is US-013's job, out of this story's scope boundary.
+    /// Placeholder for US-013.
+    #[tokio::test]
+    #[ignore = "merge engine not implemented until US-013"]
+    async fn e2e_new_239_a_merge_charges_only_its_changed_blobs() {
+        unimplemented!("merge engine: US-013")
+    }
+
+    /// E2E-NEW-240 (FR-NEW-069): a fast-forward whose incoming tree is byte
+    /// for byte identical to the volume's current tree charges nothing, even
+    /// with a quota of 0: the new commit's tree oid equals the old one, so
+    /// `diff_tree_to_tree` reports zero deltas and there is nothing to sum.
+    #[tokio::test]
+    async fn e2e_new_240_an_unchanged_tree_is_charged_nothing() {
+        let e = Env::with_quota(0).await;
+        let remote_dir = e.f.dir.path().join("remote-240");
+        let url = seed_bare_remote(&remote_dir, "");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let tip = advance_bare_remote_same_tree(&remote_dir, "refs/heads/main");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(out["new_sha"], tip);
+        assert_eq!(out["files_changed"], 0, "an identical tree diffs to no changes");
+        assert_eq!(
+            e.f.state.safety.bytes_written(OWNER, MOUNT),
+            0,
+            "nothing was charged for an unchanged tree"
+        );
     }
 
     /// E2E-NEW-137 — Merge is atomic when a write fails.
