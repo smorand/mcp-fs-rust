@@ -15,7 +15,7 @@
 //! Tokens are never logged and never included in `Debug` output.
 
 use crate::config::ServerConfig;
-use crate::errors::Result;
+use crate::errors::{Result, ToolError};
 use crate::git::oauth::cipher;
 use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use chrono::{DateTime, Utc};
@@ -202,6 +202,48 @@ impl OAuthTokenStore {
     /// A stored token that has not expired yet.
     pub fn has_valid_token(&self, person: &str, host: &str) -> bool {
         self.get_token(person, host).is_some_and(|s| s.is_valid_at(Utc::now()))
+    }
+
+    /// The shared "a live credential must be resolved before any network call"
+    /// gate (FR-NEW-018, FR-NEW-019, FR-NEW-070). Resolves to the stored access
+    /// token when one is present and unexpired; otherwise fails loud with
+    /// `ERR_UNAUTHENTICATED`, naming `host` and instructing re-authentication,
+    /// with a fixed, distinct message prefix for each of the two failure
+    /// shapes: `no token for host <host>` when nothing is stored, `token
+    /// expired for host <host>` when a session is stored but its `expires_at`
+    /// is not strictly in the future (`OAuthSession::is_valid_at`'s existing
+    /// boundary: `expires_at` equal to now is expired, not valid). The two
+    /// prefixes let a caller decide whether to seed a token or to
+    /// re-authenticate. Never mutates the store (DEC-020): an expired session
+    /// is read, not removed, so a status surface can still report it as
+    /// `expired` rather than absent.
+    ///
+    /// `token_key` is whatever identifies the stored session in this store; it
+    /// is not necessarily `host` (today `git.remote_clone` still looks a token
+    /// up by resolved provider name rather than the real host, a gap this
+    /// story does not close). `host` is used only for the message, so the
+    /// caller always reports the real hostname regardless of the lookup key.
+    ///
+    /// This is the one function every remote tool that resolves a credential
+    /// before opening a connection is meant to call: `git.remote_clone` today,
+    /// `git.remote_push`/`git.remote_fetch`/`git.remote_pull` once later
+    /// stories add them, so the gate is implemented and tested exactly once.
+    pub fn require_valid_credential(
+        &self,
+        person: &str,
+        token_key: &str,
+        host: &str,
+    ) -> Result<String> {
+        let instruction = format!("authenticate with git.auth or git.token_set for host {host}");
+        match self.get_token(person, token_key) {
+            None => {
+                Err(ToolError::unauthenticated(format!("no token for host {host}; {instruction}")))
+            }
+            Some(session) if !session.is_valid_at(Utc::now()) => Err(ToolError::unauthenticated(
+                format!("token expired for host {host}; {instruction}"),
+            )),
+            Some(session) => Ok(session.access_token),
+        }
     }
 
     /// Every `(person, host)` currently held, original casing. Diagnostics.
@@ -623,6 +665,142 @@ mod tests {
             s.get_token("alice@test.com", "github.ibm.com").is_none(),
             "the memory write must not survive a persistence failure"
         );
+    }
+
+    // ── require_valid_credential: FR-NEW-018/019/070 (US-005) ─────────────────
+    //
+    // `git.remote_push`, `git.remote_fetch` and `git.remote_pull` do not exist in
+    // this codebase yet (US-009/010/011). These tests exercise the shared gate
+    // function directly with fabricated person/host/store state, which is exactly
+    // what those later tools will call once they exist, so the contract is proven
+    // here rather than invented against tools that are out of this story's scope.
+
+    /// E2E-NEW-241: a missing token yields `ERR_UNAUTHENTICATED` with the fixed
+    /// `no token for host` prefix, and names the two remedies.
+    #[test]
+    fn e2e_new_241_a_missing_token_yields_the_fixed_code_and_prefix() {
+        let s = store();
+        let err = s
+            .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        assert!(err.message.starts_with("no token for host github.ibm.com"), "got {}", err.message);
+        assert!(err.message.contains("git.auth"), "got {}", err.message);
+        assert!(err.message.contains("git.token_set"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-242: an expired token yields its own fixed prefix.
+    #[tokio::test]
+    async fn e2e_new_242_an_expired_token_yields_its_own_fixed_prefix() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_x",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = s
+            .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        assert!(
+            err.message.starts_with("token expired for host github.ibm.com"),
+            "got {}",
+            err.message
+        );
+    }
+
+    /// E2E-NEW-243: absence and expiry are machine-distinguishable, same code,
+    /// different prefix.
+    #[tokio::test]
+    async fn e2e_new_243_absence_and_expiry_are_machine_distinguishable() {
+        let s = store();
+        let absent = s
+            .require_valid_credential("alice@test.com", "git.unknown.test", "git.unknown.test")
+            .unwrap_err();
+        s.store_token(
+            "bob@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_y",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let expired = s
+            .require_valid_credential("bob@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(absent.code, crate::errors::code::UNAUTHENTICATED);
+        assert_eq!(expired.code, crate::errors::code::UNAUTHENTICATED);
+        assert_ne!(absent.message, expired.message);
+        assert!(absent.message.starts_with("no token for host"), "got {}", absent.message);
+        assert!(expired.message.starts_with("token expired for host"), "got {}", expired.message);
+    }
+
+    /// E2E-NEW-096: push, fetch and pull all enforce expiry. Those tools do not
+    /// exist yet; calling the shared gate three times against the same expired
+    /// session proves the identical outcome every future caller of this exact
+    /// function gets for free.
+    #[tokio::test]
+    async fn e2e_new_096_the_gate_rejects_the_same_expired_token_identically_every_call() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_z",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            let err = s
+                .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+                .unwrap_err();
+            assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+            assert!(
+                err.message.starts_with("token expired for host github.ibm.com"),
+                "got {}",
+                err.message
+            );
+        }
+        // still present: none of the three calls deleted it (DEC-020)
+        assert!(s.get_token("alice@test.com", "github.ibm.com").is_some());
+    }
+
+    /// E2E-NEW-119: pull with an expired token fails before any fetch. The gate
+    /// returns before any network-capable code could run, and the store is left
+    /// untouched, so nothing a fetch would have mutated (a remote-tracking ref)
+    /// could possibly have changed as a side effect of the check itself.
+    #[tokio::test]
+    async fn e2e_new_119_the_gate_rejects_before_any_network_capable_call_with_no_mutation() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_w",
+            vec![],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = s
+            .require_valid_credential("alice@test.com", "github.ibm.com", "github.ibm.com")
+            .unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        let after = s.get_token("alice@test.com", "github.ibm.com").unwrap();
+        assert_eq!(after.access_token, "ghp_w", "the gate must not mutate the store");
     }
 
     /// A failed persistence write restores the entry that was present before

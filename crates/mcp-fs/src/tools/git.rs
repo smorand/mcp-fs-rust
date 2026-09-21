@@ -681,9 +681,11 @@ async fn blame(entry: &GitRepoEntry, norm: &str, ref_name: Option<&str>) -> Resu
 /// exactly like a host explicitly declared `anonymous`.
 ///
 /// A host present in `git.hosts` under provider `anonymous` never triggers a
-/// token lookup (FR-NEW-008). Any other resolved provider must have a stored
-/// token for the caller; a lookup miss fails loud rather than silently
-/// degrading to anonymous (DEC-010, the defect this story removes).
+/// token lookup (FR-NEW-008). Any other resolved provider must have a stored,
+/// unexpired token for the caller: both a missing token and an expired one
+/// fail loud through [`crate::git::OAuthTokenStore::require_valid_credential`]
+/// (FR-NEW-018, FR-NEW-019, FR-NEW-070, DEC-019, DEC-020) rather than silently
+/// degrading to anonymous (DEC-010, the defect US-002 removed).
 async fn resolve_clone_credential(
     ctx: &ToolCtx,
     tokens: &Option<Arc<crate::git::OAuthTokenStore>>,
@@ -720,14 +722,7 @@ async fn resolve_clone_credential(
             super::git_auth::token_store(&ctx.state.config, ctx.state.stores.relational()).await?
         }
     };
-    let token =
-        store.get_token(&ctx.person, provider_name).map(|s| s.access_token).ok_or_else(|| {
-            ToolError::invalid_argument(format!(
-                "host '{host}' requires a {provider_name} credential and none is stored for \
-                 '{}'; run git.auth for provider '{provider_name}' first",
-                ctx.person
-            ))
-        })?;
+    let token = store.require_valid_credential(&ctx.person, provider_name, &host)?;
     Ok((Some(token), provider_name.to_string()))
 }
 
@@ -1893,6 +1888,9 @@ mod tests {
         assert_eq!(out["message"], "Repository is empty");
     }
 
+    /// Also proves E2E-NEW-054: a credential rejected by the remote itself (a
+    /// transport-level auth failure, not a local expiry check) does not delete
+    /// the token either.
     #[test]
     fn remote_clone_surfaces_a_failure_without_leaking_the_token() {
         // github.com must be declared (US-002, DEC-010): an undeclared host is now
@@ -1922,6 +1920,10 @@ mod tests {
             assert_eq!(err.code, code::INTERNAL_ERROR);
             assert!(err.message.starts_with("clone failed:"), "got {}", err.message);
             assert!(!err.message.contains("gho_supersecret"), "a token must never surface");
+
+            // E2E-NEW-054: a remote-side rejection never deletes the token.
+            let still = e.tokens.get_token(OWNER, "github").unwrap();
+            assert_eq!(still.access_token, "gho_supersecret");
         });
     }
 
@@ -1972,6 +1974,10 @@ mod tests {
 
     fn future_expiry() -> DateTime<Utc> {
         Utc::now() + chrono::Duration::hours(1)
+    }
+
+    fn past_expiry() -> DateTime<Utc> {
+        Utc::now() - chrono::Duration::hours(1)
     }
 
     /// Serialize a test against every other test touching the global
@@ -2162,6 +2168,8 @@ mod tests {
     }
 
     /// E2E-NEW-053: a missing token fails, and never falls back to anonymous.
+    /// FR-NEW-070: the fixed `no token for host` prefix and `ERR_UNAUTHENTICATED`
+    /// code (US-005 tightened this from the earlier `ERR_INVALID_ARGUMENT`).
     #[test]
     fn e2e_new_053_a_missing_token_fails_and_does_not_fall_back_to_anonymous() {
         with_git_hosts_lock(async {
@@ -2173,15 +2181,172 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(err.code, code::INVALID_ARGUMENT);
-            assert!(err.message.contains("github.ibm.com"), "got {}", err.message);
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert!(
+                err.message.starts_with("no token for host github.ibm.com"),
+                "got {}",
+                err.message
+            );
             assert!(
                 err.message.to_ascii_lowercase().contains("git.auth")
-                    || err.message.to_ascii_lowercase().contains("credential"),
+                    || err.message.to_ascii_lowercase().contains("git.token_set"),
                 "must instruct authentication: got {}",
                 err.message
             );
             assert!(!err.message.to_ascii_lowercase().contains("anonymous"), "got {}", err.message);
+        });
+    }
+
+    /// E2E-NEW-095: a clone with an expired token fails before the network,
+    /// naming the host and instructing re-authentication.
+    ///
+    /// *Before US-005, the clone path used `get_token`, which ignores expiry.*
+    #[test]
+    fn e2e_new_095_clone_with_an_expired_token_fails_before_the_network() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = e
+                .call(
+                    "git.remote_clone",
+                    json!({"mount_id": MOUNT, "url": "https://github.ibm.com/org/repo.git"}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert!(
+                err.message.starts_with("token expired for host github.ibm.com"),
+                "got {}",
+                err.message
+            );
+            assert!(
+                err.message.to_ascii_lowercase().contains("git.auth")
+                    || err.message.to_ascii_lowercase().contains("git.token_set"),
+                "must instruct authentication: got {}",
+                err.message
+            );
+        });
+    }
+
+    /// E2E-NEW-097: an expired token survives the failure: it is still stored,
+    /// exactly as seeded, and reads as invalid (never deleted, DEC-020). The
+    /// `git.auth_status` half of "reports expired" is US-006's job (the
+    /// `expired` label on that surface), out of this story's scope.
+    #[test]
+    fn e2e_new_097_an_expired_token_survives_the_failure() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            e.call(
+                "git.remote_clone",
+                json!({"mount_id": MOUNT, "url": "https://github.ibm.com/org/repo.git"}),
+            )
+            .await
+            .unwrap_err();
+
+            let still = e.tokens.get_token(OWNER, "github").unwrap();
+            assert_eq!(still.access_token, "ghp_expired", "the token must survive the failure");
+            assert!(!e.tokens.has_valid_token(OWNER, "github"), "still expired, not valid");
+        });
+    }
+
+    /// E2E-NEW-098: the expiry error and the missing-token error are
+    /// machine-distinguishable: same `ERR_UNAUTHENTICATED` code, different
+    /// fixed prefix.
+    #[test]
+    fn e2e_new_098_the_expiry_error_differs_from_the_missing_token_error() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let missing = e
+                .call(
+                    "git.remote_clone",
+                    json!({"mount_id": MOUNT, "url": "https://github.ibm.com/org/repo.git"}),
+                )
+                .await
+                .unwrap_err();
+
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let expired = e
+                .call(
+                    "git.remote_clone",
+                    json!({"mount_id": MOUNT, "url": "https://github.ibm.com/org/repo.git"}),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(missing.code, code::UNAUTHENTICATED);
+            assert_eq!(expired.code, code::UNAUTHENTICATED);
+            assert_ne!(missing.message, expired.message);
+            assert!(missing.message.starts_with("no token for host"), "got {}", missing.message);
+            assert!(
+                expired.message.starts_with("token expired for host"),
+                "got {}",
+                expired.message
+            );
+        });
+    }
+
+    /// E2E-NEW-099: a token whose `expires_at` equals the current instant is
+    /// treated as expired, per `OAuthSession::is_valid_at`'s existing strict
+    /// `>` boundary (equal is not valid). By the time the gate re-reads
+    /// `Utc::now()` a little later than the moment this test seeded
+    /// `expires_at`, the stored instant is provably not in the future, so the
+    /// outcome is deterministic rather than a coin flip on clock resolution.
+    #[test]
+    fn e2e_new_099_a_token_expiring_exactly_now_is_treated_as_expired() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let now = Utc::now();
+            e.tokens
+                .store_token(OWNER, "github", "github", "ghp_boundary", vec![], Some(now), None)
+                .await
+                .unwrap();
+            let err = e
+                .call(
+                    "git.remote_clone",
+                    json!({"mount_id": MOUNT, "url": "https://github.ibm.com/org/repo.git"}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert!(
+                err.message.starts_with("token expired for host github.ibm.com"),
+                "got {}",
+                err.message
+            );
         });
     }
 
