@@ -15,10 +15,18 @@
 //! implementation. Listing reuses `git_auth::auth_status` directly, the exact
 //! per-person, host-ascending enumeration `git.auth_status` returns
 //! (FR-NEW-038, FR-NEW-067, DRIFT-010): a second adapter over one operation,
-//! never a second implementation. No token value is ever rendered. CSRF
-//! protection is US-017's.
+//! never a second implementation. No token value is ever rendered.
+//!
+//! CSRF (FR-NEW-048, FR-NEW-058, DEC-038): `GET /app/tokens` issues a fresh,
+//! single-use `csrf_token` bound to the requesting person, held only in this
+//! router's own in-memory [`CsrfStore`] (never persisted, never part of the
+//! broader [`AppState`]: the mechanism is specific to this browser-facing
+//! screen). Both `POST` routes require it, but only when the request was
+//! authenticated through the ambient `mcpfs_token` cookie: a request carrying
+//! a bearer header instead has no ambient credential to forge, so it is
+//! exempt.
 
-use crate::errors::{Result, ToolError};
+use crate::errors::{Result, ToolError, code};
 use crate::identity::IdentityResolver;
 use crate::mcp::registry::ToolCtx;
 use crate::state::AppState;
@@ -30,36 +38,101 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// The token screen router. Merge only when `git.enabled` (FR-NEW-046).
+///
+/// Builds its own [`CsrfStore`], scoped to this router alone: the mechanism
+/// belongs to the browser-facing screen, not to the wider [`AppState`] every
+/// other route shares.
 pub fn router(state: Arc<AppState>) -> Router {
+    let screen_state = ScreenState { app: state, csrf: Arc::new(CsrfStore::default()) };
     Router::new()
         .route("/app/tokens", get(show).post(seed))
         .route("/app/tokens/revoke", post(revoke))
-        .with_state(state)
+        .with_state(screen_state)
+}
+
+/// Extractor state for this router: the shared server state plus this
+/// screen's own anti-forgery store.
+#[derive(Clone)]
+struct ScreenState {
+    app: Arc<AppState>,
+    csrf: Arc<CsrfStore>,
+}
+
+/// In-memory anti-forgery tokens (FR-NEW-058): UUIDv4 string -> the person it
+/// was issued to. Never persisted. A token is removed from the map the moment
+/// it is redeemed by the person it was issued to, so it cannot be replayed;
+/// an attempt by a different person, or with an unknown value, leaves the map
+/// untouched.
+#[derive(Default)]
+struct CsrfStore(Mutex<HashMap<String, String>>);
+
+impl CsrfStore {
+    /// Mint a fresh token bound to `person`.
+    fn issue(&self, person: &str) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(token.clone(), person.to_string());
+        token
+    }
+
+    /// Consume `token` iff it is unconsumed and was issued to `person`.
+    /// Returns whether the match succeeded. A wrong-person or unknown token is
+    /// left in the map untouched, so it never burns someone else's chance to
+    /// use their own valid token (FR-NEW-048).
+    fn consume(&self, token: &str, person: &str) -> bool {
+        let mut map = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get(token) {
+            Some(p) if p == person => {
+                map.remove(token);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Which of the three identity sources authenticated a request (FR-NEW-047).
+/// Only [`IdentitySource::Cookie`] carries an ambient credential a third party
+/// page could trigger, so only it is subject to the `csrf_token` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    Header,
+    Cookie,
 }
 
 #[derive(Deserialize)]
 struct SeedForm {
     host: String,
     token: String,
+    #[serde(default)]
+    csrf_token: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct RevokeForm {
     host: String,
+    #[serde(default)]
+    csrf_token: Option<String>,
 }
 
-async fn show(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let person = match resolve_person(&state.identity, &headers) {
+async fn show(State(state): State<ScreenState>, headers: HeaderMap) -> Response {
+    let (person, _source) = match resolve_person(&state.app.identity, &headers) {
         Ok(p) => p,
         Err(e) => return unauthorized(&e),
     };
-    match list_tokens(&state, person.clone()).await {
+    match list_tokens(&state.app, person.clone()).await {
         Ok(rows) => {
             let hosts = crate::git::remote::credentialed_hosts();
-            let body = page_shell(&person, &rows, &hosts);
+            // Issued only once the page is actually about to render, so a failed
+            // render never leaves an unusable token sitting in the store.
+            let csrf_token = state.csrf.issue(&person);
+            let body = page_shell(&person, &rows, &hosts, &csrf_token);
             (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
                 .into_response()
         }
@@ -96,33 +169,67 @@ async fn list_tokens(state: &Arc<AppState>, person: String) -> Result<Vec<TokenR
 }
 
 async fn seed(
-    State(state): State<Arc<AppState>>,
+    State(state): State<ScreenState>,
     headers: HeaderMap,
     Form(form): Form<SeedForm>,
 ) -> Response {
-    let person = match resolve_person(&state.identity, &headers) {
+    let (person, source) = match resolve_person(&state.app.identity, &headers) {
         Ok(p) => p,
         Err(e) => return unauthorized(&e),
     };
-    match seed_token(&state, person, &form.host, &form.token).await {
+    if let Some(resp) = check_csrf(&state.csrf, source, &person, form.csrf_token.as_deref()) {
+        return resp;
+    }
+    match seed_token(&state.app, person, &form.host, &form.token).await {
         Ok(()) => redirect_to_tokens(),
         Err(e) => error_response(&e),
     }
 }
 
 async fn revoke(
-    State(state): State<Arc<AppState>>,
+    State(state): State<ScreenState>,
     headers: HeaderMap,
     Form(form): Form<RevokeForm>,
 ) -> Response {
-    let person = match resolve_person(&state.identity, &headers) {
+    let (person, source) = match resolve_person(&state.app.identity, &headers) {
         Ok(p) => p,
         Err(e) => return unauthorized(&e),
     };
-    match revoke_token(&state, person, &form.host).await {
+    if let Some(resp) = check_csrf(&state.csrf, source, &person, form.csrf_token.as_deref()) {
+        return resp;
+    }
+    match revoke_token(&state.app, person, &form.host).await {
         Ok(()) => redirect_to_tokens(),
         Err(e) => error_response(&e),
     }
+}
+
+/// Enforce FR-NEW-048/FR-NEW-058: a cookie-authenticated request needs a
+/// valid, unconsumed `csrf_token` issued to the same person; a
+/// header-authenticated request carries no ambient credential and is exempt.
+/// `Some` is the rejection response to return as-is; `None` means proceed.
+fn check_csrf(
+    store: &CsrfStore,
+    source: IdentitySource,
+    person: &str,
+    token: Option<&str>,
+) -> Option<Response> {
+    if source == IdentitySource::Header {
+        return None;
+    }
+    let matched = token.is_some_and(|t| store.consume(t, person));
+    if matched { None } else { Some(forbidden_csrf()) }
+}
+
+/// The exact `403 application/json {"error":"ERR_FORBIDDEN","detail":"..."}`
+/// body FR-NEW-058 requires for a missing, unknown, already-consumed or
+/// wrong-person `csrf_token`.
+fn forbidden_csrf() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": code::FORBIDDEN, "detail": "missing or invalid csrf_token"})),
+    )
+        .into_response()
 }
 
 /// Delegates to the exact function `git.token_set` calls; never a second
@@ -144,18 +251,24 @@ async fn revoke_token(state: &Arc<AppState>, person: String, host: &str) -> Resu
 }
 
 /// Resolve the caller from the forwarded header, then `Authorization`, then the
-/// read-only `mcpfs_token` cookie (FR-NEW-047). The cookie's JWT is handed to the
-/// exact same [`IdentityResolver::verify`] a header bearer token goes through: no
-/// second verification path.
-fn resolve_person(identity: &IdentityResolver, headers: &HeaderMap) -> Result<String> {
+/// read-only `mcpfs_token` cookie (FR-NEW-047), also reporting which source
+/// authenticated the request so a `POST` handler knows whether an ambient
+/// credential was used and `csrf_token` must therefore be checked
+/// (FR-NEW-048). The cookie's JWT is handed to the exact same
+/// [`IdentityResolver::verify`] a header bearer token goes through: no second
+/// verification path.
+fn resolve_person(
+    identity: &IdentityResolver,
+    headers: &HeaderMap,
+) -> Result<(String, IdentitySource)> {
     let header_err = match identity
         .resolve(|name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string))
     {
-        Ok(person) => return Ok(person),
+        Ok(person) => return Ok((person, IdentitySource::Header)),
         Err(e) => e,
     };
     match cookie_value(headers, "mcpfs_token") {
-        Some(jwt) => identity.verify(&jwt),
+        Some(jwt) => identity.verify(&jwt).map(|p| (p, IdentitySource::Cookie)),
         None => Err(header_err),
     }
 }
@@ -192,8 +305,9 @@ fn redirect_to_tokens() -> Response {
 /// value) and a host selector limited to declared, non-anonymous hosts
 /// (E2E-NEW-103). `data-host`/`data-validity` attributes on each row are for
 /// this module's own tests only; no client script depends on them.
-fn page_shell(person: &str, rows: &[TokenRow], hosts: &[String]) -> String {
+fn page_shell(person: &str, rows: &[TokenRow], hosts: &[String], csrf_token: &str) -> String {
     let person = escape_html(person);
+    let csrf_token = escape_html(csrf_token);
     let table_rows: String = rows
         .iter()
         .map(|r| {
@@ -218,6 +332,7 @@ fn page_shell(person: &str, rows: &[TokenRow], hosts: &[String]) -> String {
          <table>\n<thead><tr><th>Host</th><th>Provider</th><th>Validity</th></tr></thead>\n\
          <tbody>\n{table_rows}</tbody>\n</table>\n\
          <form method=\"post\" action=\"/app/tokens\">\n\
+         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">\n\
          <select name=\"host\">\n{options}</select>\n\
          <input name=\"token\" type=\"password\"><button type=\"submit\">Save</button>\n\
          </form>\n</body>\n</html>\n"
@@ -358,6 +473,44 @@ mod tests {
             b = b.header("Authorization", format!("Bearer {t}"));
         }
         b.body(Body::from(form_body.to_string())).unwrap()
+    }
+
+    /// A `POST` authenticated by the `mcpfs_token` cookie alone, carrying no
+    /// bearer header: the shape a cross-origin form submission would take.
+    fn cookie_form_post(uri: &str, jwt: &str, form_body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Cookie", format!("mcpfs_token={jwt}"))
+            .body(Body::from(form_body.to_string()))
+            .unwrap()
+    }
+
+    /// The `csrf_token` value rendered by `GET /app/tokens`
+    /// (`<input type="hidden" name="csrf_token" value="...">`), extracted the
+    /// same way every test that needs a valid anti-forgery token reads it.
+    fn extract_csrf_token(body: &str) -> String {
+        body.split("name=\"csrf_token\" value=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("a rendered csrf_token")
+            .to_string()
+    }
+
+    /// Percent-encode a value for an `application/x-www-form-urlencoded` body.
+    fn form_encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for byte in s.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                b' ' => out.push('+'),
+                b => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
     }
 
     /// One JSON-RPC `tools/call`, decoded from the SSE frame the way `app.rs`'s
@@ -1086,6 +1239,668 @@ mod tests {
             assert_eq!(r.status(), StatusCode::OK);
             let body = body_string(r).await;
             assert!(extract_hosts_in_order(&body).is_empty(), "{body}");
+        });
+    }
+
+    // ── US-017: seeding, revocation and CSRF (FR-NEW-039, FR-NEW-048, FR-NEW-058, FR-NEW-059) ──
+
+    const GLPAT: &str = "glpat_1111222233334444555566667777";
+
+    // ── E2E-NEW-101 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_101_the_screen_seeds_a_token() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let alice = "e2e-new-101-alice@test.com";
+            let token = mint(&key_path, alice, 3600);
+
+            let r = app
+                .clone()
+                .oneshot(form_post(
+                    "/app/tokens",
+                    Some(&token),
+                    &format!("host=gitlab.acme.corp&token={GLPAT}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            let result =
+                call_tool(app, &token, "git.auth_status", json!({"host":"gitlab.acme.corp"})).await;
+            let statuses = result["statuses"].as_array().unwrap();
+            assert!(
+                statuses
+                    .iter()
+                    .any(|s| s["host"] == "gitlab.acme.corp" && s["validity"] == "valid"),
+                "gitlab.acme.corp must be valid after seeding through the screen: {statuses:?}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-102 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_102_the_screen_revokes_a_token() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let alice = "e2e-new-102-alice@test.com";
+            let token = mint(&key_path, alice, 3600);
+
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.com","token":GHP}),
+            )
+            .await;
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP}),
+            )
+            .await;
+
+            let r = app
+                .clone()
+                .oneshot(form_post("/app/tokens/revoke", Some(&token), "host=github.ibm.com"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            let result = call_tool(app, &token, "git.auth_status", json!({})).await;
+            let statuses = result["statuses"].as_array().unwrap();
+            assert!(
+                !statuses.iter().any(|s| s["host"] == "github.ibm.com"),
+                "github.ibm.com must be gone: {statuses:?}"
+            );
+            assert!(
+                statuses.iter().any(|s| s["host"] == "github.com" && s["validity"] == "valid"),
+                "github.com must remain: {statuses:?}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-110 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_110_an_empty_token_submitted_through_the_screen_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-110@test.com", 3600);
+
+            let r = app
+                .clone()
+                .oneshot(form_post("/app/tokens", Some(&token), "host=github.com&token="))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+            assert_eq!(v["error"], crate::errors::code::INVALID_ARGUMENT);
+
+            let result =
+                call_tool(app, &token, "git.auth_status", json!({"host":"github.com"})).await;
+            assert!(
+                !result["statuses"].as_array().unwrap().iter().any(|s| s["host"] == "github.com"),
+                "nothing must be stored under the same rule git.token_set enforces"
+            );
+        });
+    }
+
+    // ── E2E-NEW-112 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_112_the_screen_and_the_tools_agree() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-112@test.com", 3600);
+
+            let r = app
+                .clone()
+                .oneshot(form_post(
+                    "/app/tokens",
+                    Some(&token),
+                    &format!("host=github.com&token={GHP}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            call_tool(
+                app.clone(),
+                &token,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP}),
+            )
+            .await;
+
+            let result = call_tool(app, &token, "git.auth_status", json!({})).await;
+            let statuses = result["statuses"].as_array().unwrap();
+            for host in ["github.com", "github.ibm.com"] {
+                assert!(
+                    statuses.iter().any(|s| s["host"] == host && s["validity"] == "valid"),
+                    "{host} must be reported identically regardless of adapter: {statuses:?}"
+                );
+            }
+        });
+    }
+
+    // ── E2E-NEW-113 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_113_injection_in_a_submitted_value_is_neutralised() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-113@test.com", 3600);
+
+            let script_payload = "<script>alert(1)</script>ABCDEFGH01234567";
+            let sql_payload = "'; DROP TABLE oauth_tokens; --ABCDEFGH01234567";
+
+            let r = app
+                .clone()
+                .oneshot(form_post(
+                    "/app/tokens",
+                    Some(&token),
+                    &format!("host=github.com&token={}", form_encode(script_payload)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            let r = app
+                .clone()
+                .oneshot(form_post(
+                    "/app/tokens",
+                    Some(&token),
+                    &format!("host=github.ibm.com&token={}", form_encode(sql_payload)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            // Neither payload is reflected unescaped, and the screen still renders.
+            let r = app.clone().oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            assert!(!body.contains("<script>alert(1)</script>"), "{body}");
+            assert!(!body.contains("DROP TABLE"), "{body}");
+
+            // The store is intact: both hosts round trip as valid, proving the
+            // underlying table was never dropped and normal reads still work.
+            let result = call_tool(app, &token, "git.auth_status", json!({})).await;
+            let statuses = result["statuses"].as_array().unwrap();
+            for host in ["github.com", "github.ibm.com"] {
+                assert!(
+                    statuses.iter().any(|s| s["host"] == host && s["validity"] == "valid"),
+                    "{host} must survive the injection attempt intact: {statuses:?}"
+                );
+            }
+        });
+    }
+
+    // ── E2E-NEW-176 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_176_a_cookie_authenticated_post_without_the_anti_forgery_token_is_refused() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-176@test.com", 3600);
+
+            let r = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.com&token={GHP}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+            let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+            assert_eq!(v["error"], crate::errors::code::FORBIDDEN);
+
+            let result =
+                call_tool(app, &token, "git.auth_status", json!({"host":"github.com"})).await;
+            assert!(
+                !result["statuses"].as_array().unwrap().iter().any(|s| s["host"] == "github.com"),
+                "no credential must be stored"
+            );
+        });
+    }
+
+    // ── E2E-NEW-177 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_177_a_post_carrying_the_issued_anti_forgery_token_succeeds() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-177@test.com", 3600);
+
+            let shown = app.clone().oneshot(cookie_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(shown.status(), StatusCode::OK);
+            let csrf = extract_csrf_token(&body_string(shown).await);
+
+            let r = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.com&token={GHP}&csrf_token={csrf}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        });
+    }
+
+    // ── E2E-NEW-178 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_178_another_persons_anti_forgery_token_is_refused() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let alice = "e2e-new-178-alice@test.com";
+            let bob = "e2e-new-178-bob@test.com";
+            let alice_token = mint(&key_path, alice, 3600);
+            let bob_token = mint(&key_path, bob, 3600);
+
+            let shown = app.clone().oneshot(cookie_get("/app/tokens", &bob_token)).await.unwrap();
+            let bob_csrf = extract_csrf_token(&body_string(shown).await);
+
+            let r = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &alice_token,
+                    &format!("host=github.com&token={GHP}&csrf_token={bob_csrf}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+            let result =
+                call_tool(app, &alice_token, "git.auth_status", json!({"host":"github.com"})).await;
+            assert!(
+                !result["statuses"].as_array().unwrap().iter().any(|s| s["host"] == "github.com")
+            );
+        });
+    }
+
+    // ── E2E-NEW-179 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_179_an_anti_forgery_token_is_single_use() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-179@test.com", 3600);
+
+            let shown = app.clone().oneshot(cookie_get("/app/tokens", &token)).await.unwrap();
+            let csrf = extract_csrf_token(&body_string(shown).await);
+
+            let first = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.com&token={GHP}&csrf_token={csrf}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(first.status(), StatusCode::SEE_OTHER);
+
+            let second = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.ibm.com&token={GHP}&csrf_token={csrf}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                second.status(),
+                StatusCode::FORBIDDEN,
+                "a replayed csrf_token must be refused"
+            );
+
+            let result = call_tool(app, &token, "git.auth_status", json!({})).await;
+            let statuses = result["statuses"].as_array().unwrap();
+            assert!(statuses.iter().any(|s| s["host"] == "github.com"));
+            assert!(
+                !statuses.iter().any(|s| s["host"] == "github.ibm.com"),
+                "the replay must have stored nothing"
+            );
+        });
+    }
+
+    // ── E2E-NEW-180 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_180_a_header_authenticated_post_is_exempt() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-180@test.com", 3600);
+
+            let r = app
+                .oneshot(form_post(
+                    "/app/tokens",
+                    Some(&token),
+                    &format!("host=github.com&token={GHP}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::SEE_OTHER,
+                "no ambient credential, so no csrf_token is required"
+            );
+        });
+    }
+
+    // ── E2E-NEW-203 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_203_the_anti_forgery_field_is_rendered_with_its_exact_name() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-203@test.com", 3600);
+
+            let r = app.oneshot(bearer_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = body_string(r).await;
+            let csrf = extract_csrf_token(&body);
+            assert!(
+                body.contains(&format!(
+                    "<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">"
+                )),
+                "{body}"
+            );
+        });
+    }
+
+    // ── E2E-NEW-204 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_204_a_post_carrying_csrf_token_succeeds() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-204@test.com", 3600);
+
+            let shown = app.clone().oneshot(cookie_get("/app/tokens", &token)).await.unwrap();
+            let csrf = extract_csrf_token(&body_string(shown).await);
+
+            let r = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.ibm.com&token={GHP}&csrf_token={csrf}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SEE_OTHER);
+
+            let result =
+                call_tool(app, &token, "git.auth_status", json!({"host":"github.ibm.com"})).await;
+            assert!(
+                result["statuses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["host"] == "github.ibm.com" && s["validity"] == "valid")
+            );
+        });
+    }
+
+    // ── E2E-NEW-205 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_205_a_missing_or_consumed_csrf_token_returns_the_exact_error_body() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-205@test.com", 3600);
+
+            // Missing field: refused, nothing stored.
+            let missing = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.com&token={GHP}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+            let v: Value = serde_json::from_str(&body_string(missing).await).unwrap();
+            assert_eq!(v["error"], crate::errors::code::FORBIDDEN);
+            assert!(v["detail"].is_string());
+            assert_eq!(v.as_object().unwrap().len(), 2, "body must be exactly {{error, detail}}");
+
+            let status_after_missing =
+                call_tool(app.clone(), &token, "git.auth_status", json!({"host":"github.com"}))
+                    .await;
+            assert!(
+                !status_after_missing["statuses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["host"] == "github.com"),
+                "the missing-field attempt must store nothing"
+            );
+
+            // Consumed: redeem once, then replay the same token for another host.
+            let shown = app.clone().oneshot(cookie_get("/app/tokens", &token)).await.unwrap();
+            let csrf = extract_csrf_token(&body_string(shown).await);
+            let form = format!("host=github.ibm.com&token={GHP}&csrf_token={csrf}");
+            let first =
+                app.clone().oneshot(cookie_form_post("/app/tokens", &token, &form)).await.unwrap();
+            assert_eq!(first.status(), StatusCode::SEE_OTHER);
+
+            let replay_form = format!("host=gitlab.acme.corp&token={GHP}&csrf_token={csrf}");
+            let replayed = app
+                .clone()
+                .oneshot(cookie_form_post("/app/tokens", &token, &replay_form))
+                .await
+                .unwrap();
+            assert_eq!(replayed.status(), StatusCode::FORBIDDEN);
+            let v2: Value = serde_json::from_str(&body_string(replayed).await).unwrap();
+            assert_eq!(v2["error"], crate::errors::code::FORBIDDEN);
+            assert!(v2["detail"].is_string());
+            assert_eq!(v2.as_object().unwrap().len(), 2, "body must be exactly {{error, detail}}");
+
+            let final_status = call_tool(app, &token, "git.auth_status", json!({})).await;
+            let statuses = final_status["statuses"].as_array().unwrap();
+            assert!(
+                statuses.iter().any(|s| s["host"] == "github.ibm.com"),
+                "the earlier valid redemption must stand"
+            );
+            assert!(
+                !statuses.iter().any(|s| s["host"] == "gitlab.acme.corp"),
+                "the replay must store nothing"
+            );
+        });
+    }
+
+    // ── E2E-NEW-206 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_206_no_response_across_the_server_ever_sets_the_session_cookie() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-206@test.com", 3600);
+
+            let mut responses = Vec::new();
+            responses.push(
+                app.clone()
+                    .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap(),
+            );
+            responses.push(app.clone().oneshot(bearer_get("/app/tokens", &token)).await.unwrap());
+            responses.push(app.clone().oneshot(cookie_get("/app/tokens", &token)).await.unwrap());
+            responses.push(
+                app.clone()
+                    .oneshot(form_post(
+                        "/app/tokens",
+                        Some(&token),
+                        &format!("host=github.com&token={GHP}"),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            responses.push(
+                app.clone()
+                    .oneshot(form_post("/app/tokens/revoke", Some(&token), "host=github.com"))
+                    .await
+                    .unwrap(),
+            );
+            responses.push(
+                app.clone()
+                    .oneshot(cookie_form_post(
+                        "/app/tokens",
+                        &token,
+                        &format!("host=github.com&token={GHP}"),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            responses.push(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/mcp")
+                            .header("Authorization", format!("Bearer {token}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            responses.push(app.clone().oneshot(bearer_get("/api/fs/roots", &token)).await.unwrap());
+            responses.push(app.clone().oneshot(cookie_get("/api/fs/roots", &token)).await.unwrap());
+            responses.push(
+                app.oneshot(Request::builder().uri("/app/tokens").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap(),
+            );
+
+            for r in &responses {
+                assert!(
+                    r.headers().get(header::SET_COOKIE).is_none(),
+                    "a response ({}) must never set mcpfs_token: {:?}",
+                    r.status(),
+                    r.headers()
+                );
+            }
+        });
+    }
+
+    // ── E2E-NEW-207 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_207_the_cross_origin_defence_does_not_depend_on_cookie_attributes() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-207@test.com", 3600);
+
+            // A cross-origin POST carries only whatever `Cookie` header the browser
+            // attaches; this server never sets `SameSite` (FR-NEW-059), so this
+            // request is indistinguishable, at the wire level, from one sent with
+            // no SameSite protection at all.
+            let r = app
+                .clone()
+                .oneshot(cookie_form_post(
+                    "/app/tokens",
+                    &token,
+                    &format!("host=github.com&token={GHP}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                "csrf_token alone must carry the defence"
+            );
+
+            let result =
+                call_tool(app, &token, "git.auth_status", json!({"host":"github.com"})).await;
+            assert!(
+                !result["statuses"].as_array().unwrap().iter().any(|s| s["host"] == "github.com")
+            );
+        });
+    }
+
+    // ── E2E-NEW-208 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_208_the_screen_works_behind_a_component_that_sets_the_cookie() {
+        with_git_hosts_lock(async {
+            declare_reference_hosts();
+            let d = tempfile::tempdir().unwrap();
+            let (c, key_path) = test_setup(d.path());
+            let app = crate::app::build(c).await.unwrap();
+            let token = mint(&key_path, "e2e-new-208@test.com", 3600);
+
+            // The token below simulates one an upstream component minted and
+            // attached as `mcpfs_token`; the server never mints or re-issues it.
+            let r = app.oneshot(cookie_get("/app/tokens", &token)).await.unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "the screen must render from the upstream-issued cookie alone"
+            );
+            assert!(
+                r.headers().get(header::SET_COOKIE).is_none(),
+                "the server must never re-issue the cookie"
+            );
         });
     }
 }
