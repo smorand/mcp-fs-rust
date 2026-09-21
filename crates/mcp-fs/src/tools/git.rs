@@ -839,7 +839,7 @@ async fn resolve_clone_credential(
             super::git_auth::token_store(&ctx.state.config, ctx.state.stores.relational()).await?
         }
     };
-    let token = store.require_valid_credential(&ctx.person, provider_name, &host)?;
+    let token = store.require_valid_credential(&ctx.person, &host, &host)?;
     Ok((Some(token), provider_name.to_string()))
 }
 
@@ -2412,6 +2412,28 @@ mod tests {
             .await
         }
 
+        /// Like [`Env::with_hosts`], but with a bounded remote deadline, and with
+        /// `git.token_set`/`git.auth*` also registered into the same registry,
+        /// sharing this env's token store. The one caller that needs this is the
+        /// T-CONVERGE-001 regression test, which must seed a credential through
+        /// the real `git.token_set` tool and then spend it through the real
+        /// `git.remote_clone` tool, exactly as `register_all` wires both in
+        /// production; every other test in this file only ever needs one side or
+        /// the other.
+        async fn with_hosts_and_timeout(pairs: &[(&str, &str)], secs: u64) -> Env {
+            let owned: Vec<(String, String)> =
+                pairs.iter().map(|(h, p)| (h.to_string(), p.to_string())).collect();
+            let mut e = Env::build(move |c| {
+                c.git.enabled = true;
+                c.git.hosts.0 = owned;
+                crate::git::remote::validate_hosts(&c.git).expect("a valid reference map");
+                c.git.remote_timeout_secs = secs;
+            })
+            .await;
+            super::super::git_auth::register_with(&mut e.reg, Some(e.tokens.clone()), None);
+            e
+        }
+
         async fn build(tweak: impl FnOnce(&mut crate::config::ServerConfig)) -> Env {
             let f = Fixture::with_config(tweak).await;
             f.seed_project(MOUNT, OWNER).await;
@@ -3249,7 +3271,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "github.com",
                     "github",
                     "gho_supersecret",
                     vec!["repo".into()],
@@ -3270,7 +3292,7 @@ mod tests {
             assert!(!err.message.contains("gho_supersecret"), "a token must never surface");
 
             // E2E-NEW-054: a remote-side rejection never deletes the token.
-            let still = e.tokens.get_token(OWNER, "github").unwrap();
+            let still = e.tokens.get_token(OWNER, "github.com").unwrap();
             assert_eq!(still.access_token, "gho_supersecret");
         });
     }
@@ -3524,7 +3546,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "github.ibm.com",
                     "github",
                     "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
                     vec![],
@@ -3546,6 +3568,54 @@ mod tests {
         });
     }
 
+    /// T-CONVERGE-001 regression: `git.token_set` and `git.remote_clone`, the
+    /// two real registered tools, share one token store exactly as
+    /// `register_all` wires them in production, proving the token
+    /// `git.token_set` stores for a real host is the exact credential
+    /// `resolve_clone_credential` (inside `git.remote_clone`) resolves for that
+    /// same real host. This closes the gap an independent traceability audit
+    /// found: no test previously seeded a credential through `git.token_set`
+    /// and then called a `git.remote_*` tool end to end; every existing test
+    /// either wrote the store directly or called `resolve_clone_credential`
+    /// directly, never both real tools together.
+    ///
+    /// The one boundary this test does not cross is a real network clone:
+    /// `silent_remote` accepts the TCP connection and then never speaks, so
+    /// libgit2's https transport blocks mid handshake and the 1s deadline
+    /// fires with `"remote timeout"`, exactly like `e2e_new_183`. That failure
+    /// only happens past credential resolution: `clone_and_import` (and the
+    /// real outbound connection it opens) is never reached at all until
+    /// `resolve_clone_credential` returns a token, so a *timeout* here (rather
+    /// than an immediate `ERR_UNAUTHENTICATED`) is itself the proof the seeded
+    /// token was found by its real host and handed to the transport. Before
+    /// the fix, `resolve_clone_credential` looked the token up by provider
+    /// name (`"generic"`) instead of the real host (`127.0.0.1`), so this test
+    /// would instead fail fast with `ERR_UNAUTHENTICATED: no token for host
+    /// 127.0.0.1`, never reaching the network step at all.
+    #[test]
+    fn e2e_new_defect_token_set_then_remote_clone_share_the_real_host() {
+        with_git_hosts_lock(async {
+            let (url, srv) = silent_remote().await;
+            let host = url::Url::parse(&url).unwrap().host_str().unwrap().to_string();
+            let host_for_cfg = host.clone();
+
+            let e = Env::with_hosts_and_timeout(&[(host_for_cfg.as_str(), "generic")], 1).await;
+
+            e.call("git.token_set", json!({"host": host, "token": "regression-seed-token"}))
+                .await
+                .unwrap();
+
+            let err = e
+                .call("git.remote_clone", json!({"mount_id": MOUNT, "url": url}))
+                .await
+                .unwrap_err();
+            srv.abort();
+
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert!(err.message.starts_with("remote timeout"), "got {}", err.message);
+        });
+    }
+
     /// E2E-NEW-012: a URL whose path merely contains "gitlab" does not resolve to
     /// gitlab, and an undeclared host (`exemple.test`) is rejected even though a
     /// token exists for a different, unrelated declared host
@@ -3559,7 +3629,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "gitlab",
+                    "gitlab.acme.corp",
                     "gitlab",
                     "glpat_1111222233334444555566667777",
                     vec![],
@@ -3581,7 +3651,7 @@ mod tests {
             assert!(!err.message.to_ascii_lowercase().contains("gitlab"), "got {}", err.message);
             // the gitlab.acme.corp token is untouched: still exactly what was stored
             assert_eq!(
-                e.tokens.get_token(OWNER, "gitlab").unwrap().access_token,
+                e.tokens.get_token(OWNER, "gitlab.acme.corp").unwrap().access_token,
                 "glpat_1111222233334444555566667777"
             );
         });
@@ -3595,7 +3665,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "github.ibm.com",
                     "github",
                     "ghp_case_insensitive",
                     vec![],
@@ -3733,7 +3803,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "github.ibm.com",
                     "github",
                     "ghp_expired",
                     vec![],
@@ -3775,7 +3845,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "github.ibm.com",
                     "github",
                     "ghp_expired",
                     vec![],
@@ -3791,9 +3861,9 @@ mod tests {
             .await
             .unwrap_err();
 
-            let still = e.tokens.get_token(OWNER, "github").unwrap();
+            let still = e.tokens.get_token(OWNER, "github.ibm.com").unwrap();
             assert_eq!(still.access_token, "ghp_expired", "the token must survive the failure");
-            assert!(!e.tokens.has_valid_token(OWNER, "github"), "still expired, not valid");
+            assert!(!e.tokens.has_valid_token(OWNER, "github.ibm.com"), "still expired, not valid");
         });
     }
 
@@ -3815,7 +3885,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "github.ibm.com",
                     "github",
                     "ghp_expired",
                     vec![],
@@ -3856,7 +3926,15 @@ mod tests {
             let e = Env::with_hosts(REFERENCE_HOSTS).await;
             let now = Utc::now();
             e.tokens
-                .store_token(OWNER, "github", "github", "ghp_boundary", vec![], Some(now), None)
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    "ghp_boundary",
+                    vec![],
+                    Some(now),
+                    None,
+                )
                 .await
                 .unwrap();
             let err = e
@@ -3907,7 +3985,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "generic",
+                    "git.acme.internal",
                     "generic",
                     "generic-secret-token",
                     vec![],
@@ -4007,7 +4085,7 @@ mod tests {
             e.tokens
                 .store_token(
                     OWNER,
-                    "github",
+                    "xn--gthub-cta.com",
                     "github",
                     "idn-token",
                     vec![],
@@ -6116,7 +6194,15 @@ mod tests {
             let e = Env::with_hosts(REFERENCE_HOSTS).await;
             let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
             e.tokens
-                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    token,
+                    vec![],
+                    Some(future_expiry()),
+                    None,
+                )
                 .await
                 .unwrap();
             let ctx = e.f.ctx(OWNER);
@@ -6162,7 +6248,15 @@ mod tests {
             let e = Env::with_hosts(REFERENCE_HOSTS).await;
             let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
             e.tokens
-                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    token,
+                    vec![],
+                    Some(future_expiry()),
+                    None,
+                )
                 .await
                 .unwrap();
             let ctx = e.f.ctx(OWNER);
@@ -6269,7 +6363,15 @@ mod tests {
             let e = Env::with_hosts(REFERENCE_HOSTS).await;
             let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
             e.tokens
-                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    token,
+                    vec![],
+                    Some(future_expiry()),
+                    None,
+                )
                 .await
                 .unwrap();
             let ctx = e.f.ctx(OWNER);
@@ -6355,7 +6457,15 @@ mod tests {
             let e = Env::with_hosts(REFERENCE_HOSTS).await;
             let token = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
             e.tokens
-                .store_token(OWNER, "github", "github", token, vec![], Some(future_expiry()), None)
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    token,
+                    vec![],
+                    Some(future_expiry()),
+                    None,
+                )
                 .await
                 .unwrap();
             let ctx = e.f.ctx(OWNER);

@@ -218,11 +218,13 @@ impl OAuthTokenStore {
     /// is read, not removed, so a status surface can still report it as
     /// `expired` rather than absent.
     ///
-    /// `token_key` is whatever identifies the stored session in this store; it
-    /// is not necessarily `host` (today `git.remote_clone` still looks a token
-    /// up by resolved provider name rather than the real host, a gap this
-    /// story does not close). `host` is used only for the message, so the
-    /// caller always reports the real hostname regardless of the lookup key.
+    /// `token_key` is whatever identifies the stored session in this store.
+    /// Every caller passes the real host here (`git.remote_clone` included,
+    /// since T-CONVERGE-001 fixed the one call site that used to pass the
+    /// resolved provider name instead), so `token_key` and `host` are always
+    /// the same value today; the parameter stays separate from `host` only
+    /// because `host` is also used for the message independently of how the
+    /// lookup key is derived.
     ///
     /// This is the one function every remote tool that resolves a credential
     /// before opening a connection is meant to call: `git.remote_clone` today,

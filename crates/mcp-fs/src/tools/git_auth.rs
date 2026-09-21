@@ -1510,15 +1510,15 @@ mod tests {
     // span) is what `with_git_hosts_lock`'s private `block_on` achieves without
     // tripping clippy's `await_holding_lock`.
     //
-    // E2E-NEW-022 is a partial, store level test: `resolve_clone_credential`
-    // (`crates/mcp-fs/src/tools/git.rs:687`) still resolves a stored token by
-    // provider name, not by the real host, because wiring `git.remote_clone`'s
-    // credential lookup onto `git.hosts` is US-006's job, and that function is
-    // private to `git.rs`, outside this story's two-file scope. This suite
-    // proves the store level contract that wiring will read from instead: the
-    // exact token `git.token_set` stores for `(person, host)` comes back
-    // unmodified, ready to be supplied to the remote as `oauth2:<token>`
-    // (`crates/mcp-fs/src/tools/git.rs:1046-1049`).
+    // E2E-NEW-022 is a store level test: it proves the contract
+    // `resolve_clone_credential` (`crates/mcp-fs/src/tools/git.rs`) actually
+    // reads, now by the real host (T-CONVERGE-001): the exact token
+    // `git.token_set` stores for `(person, host)` comes back unmodified, ready
+    // to be supplied to the remote as `oauth2:<token>`
+    // (`crates/mcp-fs/src/tools/git.rs:1046-1049`). The tool-layer proof that
+    // `git.token_set` and `git.remote_clone` share this exact lookup, both
+    // through their real registered tool names, lives in `tools/git.rs`'s
+    // `e2e_new_defect_token_set_then_remote_clone_share_the_real_host`.
 
     const GHP: &str = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
 
