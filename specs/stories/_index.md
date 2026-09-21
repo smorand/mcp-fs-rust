@@ -30,7 +30,7 @@
 | 8 | US-008 | n/a | Extract git/remote.rs, validate the URL, and record origin at clone | 6 | 004, 005, 009, 011, 012 | 19 | 3 | US-002, US-005 | 1 | done |
 | 9 | US-009 | n/a | git.remote_push: send one branch, fast-forward only | 6 | 009, 010 | 17 | 3 | US-008 | 1 | done |
 | 10 | US-010 | n/a | git.remote_fetch: objects and remote-tracking refs, nothing else | 5 | 011, 012 | 14 | 3 | US-008 | 1 | done |
-| 11 | US-011 | n/a | git.remote_pull: fast-forward, applied atomically | 4 | 012, 013, 015 | 16 | 2 | US-010 | 1 | todo |
+| 11 | US-011 | n/a | git.remote_pull: fast-forward, applied atomically | 4 | 012, 013, 015 | 16 | 2 | US-010 | 1 | done |
 | 12 | US-012 | n/a | A pull charges the write quota for the bytes it actually writes | 3 | 012, 015 | 6 | 2 | US-011 | 1 | todo |
 | 13 | US-013 | n/a | A diverged pull: refuse, or merge under one global strategy | 5 | 013, 015 | 11 | 2 | US-011 | 1 | todo |
 | 14 | US-014 | n/a | Remote timeout, lock release, and the frozen failure messages | 2 | 010, 012 | 7 | 4 | US-009, US-010, US-011, US-013 | 1 | todo |

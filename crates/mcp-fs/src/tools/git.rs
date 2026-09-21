@@ -1,5 +1,5 @@
 //! `git.*` tools: init, status, branches, tags, log, show, diff, commit,
-//! checkout_file, blame, remote_clone, remote_push, remote_fetch.
+//! checkout_file, blame, remote_clone, remote_push, remote_fetch, remote_pull.
 //!
 //! Port of the C# `Tools/GitTools.cs`. Registered only when `git.enabled`.
 //!
@@ -43,7 +43,7 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the thirteen `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// Register the fourteen `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
 pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
@@ -325,7 +325,8 @@ pub fn register_with(
         }),
     );
 
-    let g = git;
+    let g = git.clone();
+    let t = tokens.clone();
     reg.add(
         ToolSchema::new(
             "git.remote_fetch",
@@ -335,11 +336,39 @@ pub fn register_with(
         )
         .req_str("mount_id", "Project/volume id the operation targets."),
         handler(move |ctx: ToolCtx, a| {
-            let (g, t) = (g.clone(), tokens.clone());
+            let (g, t) = (g.clone(), t.clone());
             async move {
                 let mount_id = a.str("mount_id")?;
                 let store = authorize(&ctx, &mount_id, g).await?;
                 remote_fetch(&ctx, store, t, &mount_id).await
+            }
+        }),
+    );
+
+    let g = git;
+    reg.add(
+        ToolSchema::new(
+            "git.remote_pull",
+            "Fetch from origin, then fast-forward the checked-out branch to the remote tip and \
+             update the volume's files to match. Refuses a dirty volume (commit or discard \
+             first) and refuses any branch other than the one currently checked out. A \
+             diverged history is not yet supported.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("branch", "Branch to pull; must be the branch currently checked out.")
+        .opt_str_null(
+            "on_conflict",
+            "Reserved for a future divergence-resolution strategy; ignored whenever the pull \
+             is a fast-forward.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let (g, t) = (g.clone(), tokens.clone());
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let branch = a.str("branch")?;
+                let on_conflict = a.opt_str("on_conflict");
+                let store = authorize(&ctx, &mount_id, g).await?;
+                remote_pull(&ctx, store, t, &mount_id, &branch, on_conflict).await
             }
         }),
     );
@@ -1133,6 +1162,323 @@ async fn fetch_branch(
     }))
 }
 
+// ── git.remote_pull ─────────────────────────────────────────────────────────
+
+/// FR-NEW-063: `branch` must equal what `HEAD` currently points at. Pure
+/// `entry.db` reads only, no repository lock, no libgit2 call: this settles
+/// before [`require_origin`] or [`resolve_clone_credential`] ever run, and
+/// therefore strictly before any network attempt (E2E-NEW-218, E2E-NEW-220).
+/// Returns the checked-out branch's current local sha, so `remote_pull` does
+/// not look the ref up a second time once the check has passed.
+async fn require_checked_out_branch(entry: &GitRepoEntry, requested: &str) -> Result<String> {
+    let head = entry.db.get_ref("HEAD").await?;
+    let checked_out = match &head {
+        Some(h) if h.symbolic => {
+            h.target.strip_prefix("refs/heads/").unwrap_or(&h.target).to_string()
+        }
+        _ => {
+            return Err(ToolError::invalid_argument(
+                "the volume has no checked-out branch to pull into",
+            ));
+        }
+    };
+    if checked_out != requested {
+        return Err(ToolError::invalid_argument(format!(
+            "git.remote_pull was called for branch '{requested}' but the checked-out branch is \
+             '{checked_out}': pull only ever targets the checked-out branch"
+        )));
+    }
+    entry.db.get_ref(&format!("refs/heads/{checked_out}")).await?.map(|r| r.target).ok_or_else(
+        || ToolError::invalid_argument(format!("branch '{checked_out}' does not exist locally")),
+    )
+}
+
+/// Resolve the checked-out branch (FR-NEW-063), then the stored `origin`, then
+/// a credential through the same pipeline clone, push and fetch use
+/// (FR-NEW-026): [`resolve_clone_credential`] is called unchanged. `authorize`
+/// in the tool registration handler already ran before this is ever reached.
+async fn remote_pull(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    tokens: Option<Arc<crate::git::OAuthTokenStore>>,
+    mount_id: &str,
+    branch: &str,
+    on_conflict: Option<String>,
+) -> Result<Value> {
+    if !store.is_initialized(mount_id).await {
+        return Err(ToolError::invalid_argument(format!(
+            "volume '{mount_id}' has no origin remote: it was never initialized as a git \
+             repository"
+        )));
+    }
+    let entry = store.get_or_open_repo(mount_id).await?;
+    let local_sha = require_checked_out_branch(&entry, branch).await?;
+
+    let origin_url = crate::git::remote::require_origin(&store, mount_id).await?;
+    let (token, auth) = resolve_clone_credential(ctx, &tokens, &origin_url).await?;
+    let client = ctx.state.stores.client(mount_id).await?;
+
+    pull_branch(entry, branch, &local_sha, &origin_url, token, auth, client, on_conflict).await
+}
+
+/// Everything a pull does once the branch guard has passed and a credential
+/// (or none) is resolved: refusing a dirty volume (FR-NEW-029), the fetch
+/// through [`crate::git::remote::fetch_from_remote`] (DEC-012: pull's first
+/// step IS that fetch, the same primitive [`fetch_branch`] uses), the
+/// ancestry test (FR-NEW-028, `Repository::graph_descendant_of`), and the
+/// atomic apply of the resulting tree to the volume (FR-NEW-035). One
+/// `write_lock` plus one `repo` lock covers the whole of it, the same lock
+/// scope [`push_branch`] and [`fetch_branch`] each hold for their own
+/// operation, so the dirty check and everything after it observe one
+/// consistent snapshot: nothing else can commit or write to this repository
+/// between the check and the apply.
+///
+/// `on_conflict` is accepted but unused here: a divergence-resolution
+/// strategy is out of this story's scope (US-013). When the fetched history
+/// turns out to be a fast-forward regardless of whether `on_conflict` was
+/// supplied, it applies as one (E2E-NEW-134); when it is a genuine
+/// divergence, this returns `ERR_NOT_SUPPORTED` rather than guessing at a
+/// resolution.
+///
+/// Split out from [`remote_pull`] exactly like [`push_branch`] is split from
+/// [`remote_push`], so a test can exercise real pull mechanics against a
+/// local bare repository with a `file://` origin: that scheme cannot reach
+/// this function through the registered `git.remote_pull` tool, since
+/// [`resolve_clone_credential`] rejects it first (FR-NEW-041).
+#[allow(clippy::too_many_arguments)]
+async fn pull_branch(
+    entry: Arc<GitRepoEntry>,
+    branch: &str,
+    local_sha: &str,
+    origin_url: &str,
+    token: Option<String>,
+    auth: String,
+    client: Arc<VolumeClient>,
+    _on_conflict: Option<String>,
+) -> Result<Value> {
+    let (branch_owned, origin_owned, local_sha_owned) =
+        (branch.to_string(), origin_url.to_string(), local_sha.to_string());
+    let entry_for_thread = entry.clone();
+
+    let (old_sha, new_sha, files_changed) = on_git_thread(move || async move {
+        let _write = entry_for_thread.write_lock.lock().await;
+        let repo = entry_for_thread.repo.lock().await;
+        hydrate(&entry_for_thread, &repo).await?;
+
+        // FR-NEW-029: refused before any fetch.
+        require_clean_volume(&repo, &client, &local_sha_owned).await?;
+
+        let outcome = crate::git::remote::fetch_from_remote(&repo, &origin_owned, token)?;
+        entry_for_thread.objects.import_from_repo(&repo).await?;
+        for u in &outcome.refs_updated {
+            entry_for_thread.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
+        }
+
+        let local_oid = parse_oid(&local_sha_owned)?;
+        let remote_ref_name = format!("refs/remotes/origin/{branch_owned}");
+        let remote_oid =
+            match repo.find_reference(&remote_ref_name).and_then(|r| r.peel_to_commit()) {
+                Ok(c) => c.id(),
+                // The remote never advertised this branch: nothing to pull.
+                Err(_) => local_oid,
+            };
+
+        if remote_oid == local_oid {
+            return Ok((local_sha_owned.clone(), local_sha_owned.clone(), 0usize));
+        }
+
+        // FR-NEW-028: ancestry is tested with `graph_descendant_of`, never a
+        // local guess; a commit is not considered its own descendant, which is
+        // why the equal-sha case above is handled first.
+        let is_ff = repo
+            .graph_descendant_of(remote_oid, local_oid)
+            .map_err(|e| git_err("ancestry check", e))?;
+        if !is_ff {
+            return Err(ToolError::not_supported(
+                "git.remote_pull: the local and remote branches have diverged; merge \
+                 resolution is not supported yet",
+            ));
+        }
+
+        let local_commit =
+            repo.find_commit(local_oid).map_err(|e| git_err("find local commit", e))?;
+        let remote_commit =
+            repo.find_commit(remote_oid).map_err(|e| git_err("find remote commit", e))?;
+        let old_tree = local_commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let new_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
+
+        let changes = diff_tree_changes(&repo, &old_tree, &new_tree)?;
+        apply_pull_changes_atomically(&client, &repo, &changes).await?;
+
+        let branch_ref_name = format!("refs/heads/{branch_owned}");
+        entry_for_thread.db.set_ref(&branch_ref_name, &remote_oid.to_string(), false).await?;
+        let _ = repo.reference(&branch_ref_name, remote_oid, true, "mcp-fs git.remote_pull");
+
+        Ok((local_sha_owned.clone(), remote_oid.to_string(), changes.len()))
+    })
+    .await?;
+
+    Ok(json!({
+        "old_sha": old_sha,
+        "new_sha": new_sha,
+        "files_changed": files_changed,
+        "merged": false,
+        "auth": auth,
+    }))
+}
+
+/// FR-NEW-029: the volume's files must match the current branch tip's tree
+/// exactly; a modified, added, or deleted uncommitted file all count, because
+/// this compares the whole tree, not a per-path listing. Reuses
+/// [`build_tree_from_volume`], the same snapshot `git.commit` builds, rather
+/// than a second tree-diff implementation: comparing its resulting oid
+/// against the tip commit's tree oid IS the full volume tree walk the open
+/// §15.2 question describes, done once, not twice.
+async fn require_clean_volume(
+    repo: &Repository,
+    client: &VolumeClient,
+    local_sha: &str,
+) -> Result<()> {
+    let tip = repo
+        .find_commit(parse_oid(local_sha)?)
+        .map_err(|_| ToolError::not_found(format!("commit '{local_sha}' not found")))?;
+    let tip_tree_id = tip.tree().map_err(|e| git_err("commit tree", e))?.id();
+    let volume_tree_id = build_tree_from_volume(repo, client).await?;
+    if volume_tree_id != tip_tree_id {
+        return Err(ToolError::no_clobber(
+            "the volume has uncommitted changes: commit or discard them before pulling",
+        ));
+    }
+    Ok(())
+}
+
+/// One path a fast-forward's tree diff touches: written with new content, or
+/// removed. Renames are never reported here: `diff_tree_to_tree` without
+/// `find_similar` reports a rename as a delete plus an add, which is exactly
+/// how they end up represented as two separate [`TreeChange`] values.
+enum TreeChange {
+    Write { path: String, oid: Oid },
+    Delete { path: String },
+}
+
+/// The paths a fast-forward from `old_tree` to `new_tree` touches, without
+/// rename detection (`diff_tree_to_tree`'s default: a replaced file surfaces
+/// as a delete of the old path plus an add of the new one, which is exactly
+/// the shape [`apply_pull_changes_atomically`] needs).
+fn diff_tree_changes(
+    repo: &Repository,
+    old_tree: &Tree<'_>,
+    new_tree: &Tree<'_>,
+) -> Result<Vec<TreeChange>> {
+    let diff = repo
+        .diff_tree_to_tree(Some(old_tree), Some(new_tree), None)
+        .map_err(|e| git_err("diff", e))?;
+    let mut changes = Vec::new();
+    for delta in diff.deltas() {
+        match delta.status() {
+            git2::Delta::Deleted => {
+                if let Some(p) = delta.old_file().path() {
+                    changes.push(TreeChange::Delete { path: format!("/{}", p.to_string_lossy()) });
+                }
+            }
+            git2::Delta::Added | git2::Delta::Modified | git2::Delta::Typechange => {
+                if let Some(p) = delta.new_file().path() {
+                    changes.push(TreeChange::Write {
+                        path: format!("/{}", p.to_string_lossy()),
+                        oid: delta.new_file().id(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(changes)
+}
+
+/// Apply every change to the volume, or none of them (FR-NEW-035, DEC-023).
+/// Deliberately unlike [`clone_and_import`]'s per-file tolerance
+/// (`tools/git.rs:785-791`, the anti-pattern this story exists to avoid): a
+/// half-applied clone is recoverable by re-cloning into a fresh volume, but a
+/// branch ref advanced over a partially written tree would leave the volume
+/// silently inconsistent with its own `HEAD`. Every write target is checked
+/// for writability before any byte moves (pass 1), so a failure is caught
+/// pre-commit; only once every check passes does anything actually mutate
+/// (pass 2), and only after that does the caller advance the ref.
+async fn apply_pull_changes_atomically(
+    client: &VolumeClient,
+    repo: &Repository,
+    changes: &[TreeChange],
+) -> Result<()> {
+    let delete_paths: std::collections::HashSet<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            TreeChange::Delete { path } => Some(path.as_str()),
+            TreeChange::Write { .. } => None,
+        })
+        .collect();
+
+    // Pass 1: every write target must be provably writable before the first
+    // byte moves.
+    for change in changes {
+        if let TreeChange::Write { path, .. } = change {
+            check_path_writable(client, path, &delete_paths).await?;
+        }
+    }
+
+    // Pass 2: apply. Deletes first, so a path changing from a file to a
+    // directory of the same name (or the reverse, where the pre-check above
+    // already refused it) lands in the right final state.
+    for change in changes {
+        if let TreeChange::Delete { path } = change {
+            client.delete_file(path).await?;
+        }
+    }
+    for change in changes {
+        if let TreeChange::Write { path, oid } = change {
+            let blob = repo.find_blob(*oid).map_err(|e| git_err("read blob", e))?;
+            if let Some(parent) = crate::util::PosixPath::parent_of(path)
+                && parent != "/"
+            {
+                client.makedirs(&parent, true).await?;
+            }
+            client.write_bytes_atomic(path, blob.content()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `path` itself must not already be a directory (a directory-to-file
+/// typechange is not supported by this apply: it would need a whole-subtree
+/// delete, which this story's atomic apply deliberately does not attempt),
+/// and every ancestor directory of `path` must be absent, already a
+/// directory, or itself scheduled for deletion in this same pull (a
+/// file-to-directory typechange, which the delete side of the diff already
+/// clears out of the way).
+async fn check_path_writable(
+    client: &VolumeClient,
+    path: &str,
+    delete_paths: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    if client.is_dir(path).await? {
+        return Err(ToolError::invalid_argument(format!(
+            "git.remote_pull cannot write '{path}': it already exists as a directory in the \
+             volume"
+        )));
+    }
+    let Some(parent) = crate::util::PosixPath::parent_of(path) else { return Ok(()) };
+    let mut probe = String::new();
+    for seg in parent.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
+        probe.push('/');
+        probe.push_str(seg);
+        if !delete_paths.contains(probe.as_str()) && client.is_file(&probe).await? {
+            return Err(ToolError::invalid_argument(format!(
+                "git.remote_pull cannot write '{path}': '{probe}' already exists as a file"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ── libgit2 helpers ─────────────────────────────────────────────────────────
 
 fn commit_json(c: &git2::Commit<'_>) -> Value {
@@ -1427,7 +1773,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 13] = [
+    const ALL_GIT_TOOLS: [&str; 14] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -1441,13 +1787,14 @@ mod tests {
         "git.remote_clone",
         "git.remote_push",
         "git.remote_fetch",
+        "git.remote_pull",
     ];
 
     #[test]
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 13);
+        assert_eq!(r.len(), 14);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -2993,6 +3340,95 @@ mod tests {
         repo.find_reference(name).ok().and_then(|r| r.target()).map(|oid| oid.to_string())
     }
 
+    /// One commit on the bare "remote" that both modifies a root-level file
+    /// and adds a new one nested one directory deep, the setup a pull test
+    /// needs to prove `files_changed` counts both kinds of change together.
+    fn advance_bare_remote_add_and_modify(
+        dir: &std::path::Path,
+        branch_ref: &str,
+        modify_path: &str,
+        modify_content: &str,
+        add_dir: &str,
+        add_file: &str,
+        add_content: &str,
+    ) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+
+        let mod_blob = repo.blob(modify_content.as_bytes()).unwrap();
+        let add_blob = repo.blob(add_content.as_bytes()).unwrap();
+        let mut sub_builder = repo.treebuilder(None).unwrap();
+        sub_builder.insert(add_file, add_blob, MODE_FILE).unwrap();
+        let sub_oid = sub_builder.write().unwrap();
+
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        builder.insert(modify_path, mod_blob, MODE_FILE).unwrap();
+        builder.insert(add_dir, sub_oid, MODE_DIR).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_600, 0)).unwrap();
+        let oid = repo
+            .commit(Some(branch_ref), &sig, &sig, "add and modify\n", &tree, &[&parent])
+            .unwrap();
+        oid.to_string()
+    }
+
+    /// One commit on the bare "remote" that nests a new file a directory deep,
+    /// used to seed a tracked path the following commit then typechanges.
+    fn advance_bare_remote_nested(
+        dir: &std::path::Path,
+        branch_ref: &str,
+        nested_dir: &str,
+        nested_file: &str,
+        content: &str,
+    ) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+        let blob = repo.blob(content.as_bytes()).unwrap();
+        let mut sub_builder = repo.treebuilder(None).unwrap();
+        sub_builder.insert(nested_file, blob, MODE_FILE).unwrap();
+        let sub_oid = sub_builder.write().unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        builder.insert(nested_dir, sub_oid, MODE_DIR).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_700, 0)).unwrap();
+        let oid =
+            repo.commit(Some(branch_ref), &sig, &sig, "add nested\n", &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    /// One commit on the bare "remote" that both modifies a root-level file and
+    /// replaces another root-level tree entry with a plain file of the same
+    /// name: a directory-to-file typechange, which this story's atomic apply
+    /// deliberately refuses (see `check_path_writable`), the failure
+    /// E2E-NEW-132 exercises.
+    fn advance_bare_remote_typechange(
+        dir: &std::path::Path,
+        branch_ref: &str,
+        modify_path: &str,
+        modify_content: &str,
+        typechange_path: &str,
+        typechange_content: &str,
+    ) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+        let mod_blob = repo.blob(modify_content.as_bytes()).unwrap();
+        let tc_blob = repo.blob(typechange_content.as_bytes()).unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        builder.insert(modify_path, mod_blob, MODE_FILE).unwrap();
+        builder.insert(typechange_path, tc_blob, MODE_FILE).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_800, 0)).unwrap();
+        let oid =
+            repo.commit(Some(branch_ref), &sig, &sig, "typechange\n", &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
     /// `file://` cannot reach `push_branch` through the registered
     /// `git.remote_push` tool (`resolve_clone_credential` rejects it first, just
     /// like it does for clone), so every test below that needs a real, local,
@@ -3681,5 +4117,363 @@ mod tests {
             p
         };
         assert!(!path.exists(), "the temp clone must not outlive the call");
+    }
+
+    // ── FR-NEW-028/029/035/063: git.remote_pull ─────────────────────────────
+
+    /// `file://` cannot reach `pull_branch` through the registered
+    /// `git.remote_pull` tool (`resolve_clone_credential` rejects it first,
+    /// just like it does for clone, push and fetch), so every test below that
+    /// needs a real, local, no-network pull calls `pull_branch` directly,
+    /// exactly like `call_push_branch` and `call_fetch_branch` do for their
+    /// own operations. This bypass exercises the dirty guard and the
+    /// fast-forward/apply mechanics; the branch-vs-HEAD guard
+    /// (`require_checked_out_branch`) lives in `remote_pull` instead, one
+    /// layer up, and is tested separately (E2E-NEW-218/219/220).
+    async fn call_pull_branch(
+        e: &Env,
+        origin_url: &str,
+        branch: &str,
+        auth: &str,
+        on_conflict: Option<&str>,
+    ) -> Result<Value> {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let local_sha =
+            entry.db.get_ref(&format!("refs/heads/{branch}")).await.unwrap().unwrap().target;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        pull_branch(
+            entry,
+            branch,
+            &local_sha,
+            origin_url,
+            None,
+            auth.to_string(),
+            client,
+            on_conflict.map(str::to_string),
+        )
+        .await
+    }
+
+    /// E2E-NEW-114: a fast-forward pull advances `refs/heads/main` to the
+    /// remote tip and reports the old sha, the new sha and `merged: false`.
+    #[tokio::test]
+    async fn e2e_new_114_a_fast_forward_pull_advances_the_branch() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-114");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+        let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c2\n");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(out["old_sha"], before);
+        assert_eq!(out["new_sha"], tip);
+        assert_eq!(out["merged"], false);
+
+        let after = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after, tip, "refs/heads/main must equal the remote tip");
+    }
+
+    /// E2E-NEW-115: a fast-forward pull whose incoming commit adds
+    /// `/docs/new.md` and modifies `/README.md` updates both files in the
+    /// volume and reports `files_changed: 2`.
+    #[tokio::test]
+    async fn e2e_new_115_a_fast_forward_pull_updates_the_volumes_files() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-115");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        advance_bare_remote_add_and_modify(
+            &remote_dir,
+            "refs/heads/main",
+            "README.md",
+            "updated\n",
+            "docs",
+            "new.md",
+            "new doc\n",
+        );
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(out["files_changed"], 2);
+        assert_eq!(e.read("/docs/new.md").await, "new doc\n");
+        assert_eq!(e.read("/README.md").await, "updated\n");
+    }
+
+    /// E2E-NEW-116: a fast-forward pull creates no merge commit: the new tip
+    /// is the fetched remote commit itself, with its own original parent count
+    /// and sha, authored by the remote, never by the server.
+    #[tokio::test]
+    async fn e2e_new_116_a_fast_forward_pull_creates_no_merge_commit() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-116");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(out["new_sha"], tip, "the new tip IS the fetched commit, not a synthesized one");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let commit = repo.find_commit(git2::Oid::from_str(&tip).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 1, "the fetched commit's own parent count, unchanged");
+        assert_eq!(
+            commit.author().name().unwrap(),
+            "Origin",
+            "authored by the remote, not by mcp-fs"
+        );
+    }
+
+    /// E2E-NEW-120: a dirty volume (a modified tracked file) refuses the pull,
+    /// instructs the caller to commit or discard first, and no fetch occurs.
+    #[tokio::test]
+    async fn e2e_new_120_a_dirty_volume_refuses_the_pull() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-120");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+
+        e.write("/README.md", "dirty edit\n").await;
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+        let lower = err.message.to_ascii_lowercase();
+        assert!(lower.contains("commit"), "got {}", err.message);
+        assert!(lower.contains("discard"), "got {}", err.message);
+
+        assert_eq!(e.read("/README.md").await, "dirty edit\n", "the edit must survive untouched");
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none(),
+            "a fetch would have created this tracking ref: its absence proves none occurred"
+        );
+    }
+
+    /// E2E-NEW-121: a volume with an added, uncommitted file is dirty; the
+    /// file survives the refusal untouched.
+    #[tokio::test]
+    async fn e2e_new_121_an_added_uncommitted_file_is_dirty() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-121");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/scratch.txt", "temp\n").await;
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(e.read("/scratch.txt").await, "temp\n");
+    }
+
+    /// E2E-NEW-122: a volume with a deleted, uncommitted file is dirty too.
+    #[tokio::test]
+    async fn e2e_new_122_a_deleted_uncommitted_file_is_dirty() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-122");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/README.md").await.unwrap();
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+    }
+
+    /// E2E-NEW-123 — Committing then pulling succeeds via merge.
+    /// > Given a dirty volume and a remote that has advanced. When the caller
+    /// > commits, then pulls with `{"on_conflict": "ours"}`. Then the pull
+    /// > succeeds with a merge commit.
+    /// Divergence detection and merge application are US-013's job, explicitly
+    /// out of this story's scope boundary; this test is owned here only by
+    /// the "first FR quoted" rule (FR-NEW-029). Left as a discoverable
+    /// placeholder for US-013 to drop the `#[ignore]` from and implement.
+    #[tokio::test]
+    #[ignore = "merge engine not implemented until US-013"]
+    async fn e2e_new_123_committing_then_pulling_succeeds_via_merge() {
+        unimplemented!("merge engine: US-013")
+    }
+
+    /// E2E-NEW-127 — The diverged error differs from the dirty error.
+    /// > When one pull is refused as dirty and another as diverged. Then the
+    /// > two failures are machine-distinguishable.
+    /// Diverged-history detection is US-013's job (this story returns
+    /// `ERR_NOT_SUPPORTED` for a genuine divergence rather than classifying
+    /// it, since classifying implies a resolution strategy this story does
+    /// not implement). Placeholder for US-013.
+    #[tokio::test]
+    #[ignore = "merge engine not implemented until US-013"]
+    async fn e2e_new_127_the_diverged_error_differs_from_the_dirty_error() {
+        unimplemented!("merge engine: US-013")
+    }
+
+    /// E2E-NEW-131: a pull with nothing new is idempotent: it succeeds twice,
+    /// reporting `old_sha == new_sha` and `files_changed: 0` both times.
+    #[tokio::test]
+    async fn e2e_new_131_an_up_to_date_pull_is_idempotent() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-131");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let first = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(first["old_sha"], first["new_sha"], "nothing new since the clone");
+        assert_eq!(first["files_changed"], 0);
+
+        let second = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        assert_eq!(second["old_sha"], second["new_sha"]);
+        assert_eq!(second["files_changed"], 0);
+    }
+
+    /// E2E-NEW-132: a fast-forward whose tree contains one path the volume
+    /// cannot write (a directory-to-file typechange) fails naming that path,
+    /// leaves `refs/heads/main` unchanged, and every other file retains its
+    /// pre-pull content.
+    #[tokio::test]
+    async fn e2e_new_132_pull_is_atomic_when_a_file_write_fails() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-132");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        advance_bare_remote_nested(
+            &remote_dir,
+            "refs/heads/main",
+            "blocked",
+            "existing.txt",
+            "nested\n",
+        );
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let readme_before = e.read("/README.md").await;
+        let nested_before = e.read("/blocked/existing.txt").await;
+
+        advance_bare_remote_typechange(
+            &remote_dir,
+            "refs/heads/main",
+            "README.md",
+            "updated\n",
+            "blocked",
+            "now a file\n",
+        );
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert!(err.message.contains("blocked"), "must name the failing path: {}", err.message);
+
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must be unchanged");
+        assert_eq!(
+            e.read("/README.md").await,
+            readme_before,
+            "every other file retains its pre-pull content"
+        );
+        assert_eq!(e.read("/blocked/existing.txt").await, nested_before);
+    }
+
+    /// E2E-NEW-134: a pull that turns out, after fetching, to be a strict
+    /// fast-forward applies as one and creates no merge commit, even when the
+    /// caller supplied `on_conflict`: the degenerate case is never treated as
+    /// a divergence just because a strategy was offered.
+    #[tokio::test]
+    async fn e2e_new_134_a_degenerate_diverged_pull_is_a_fast_forward() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-134");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
+        assert_eq!(out["new_sha"], tip);
+        assert_eq!(out["merged"], false, "a fast-forward is applied, never a merge");
+    }
+
+    /// E2E-NEW-137 — Merge is atomic when a write fails.
+    /// > Given a merge whose tree contains one unwritable path. When the pull
+    /// > runs. Then no merge commit is created, the ref is not advanced, and
+    /// > every file retains its pre-merge content.
+    /// Merge application is US-013's job, out of this story's scope boundary.
+    /// Placeholder for US-013.
+    #[tokio::test]
+    #[ignore = "merge engine not implemented until US-013"]
+    async fn e2e_new_137_merge_is_atomic_when_a_write_fails() {
+        unimplemented!("merge engine: US-013")
+    }
+
+    /// E2E-NEW-138 — A dirty volume refuses the merge too.
+    /// > Given a dirty volume and a diverged remote, with `on_conflict`
+    /// > supplied. When the pull runs. Then it is refused as dirty before any
+    /// > merge is attempted.
+    /// Merge application is US-013's job; this story's dirty guard already
+    /// runs before any fast-forward OR divergence branch is even reached, so
+    /// once US-013 lands the guard needs no change, only this placeholder's
+    /// `#[ignore]` removed and a divergence set up to exercise it.
+    #[tokio::test]
+    #[ignore = "merge engine not implemented until US-013"]
+    async fn e2e_new_138_a_dirty_volume_refuses_the_merge_too() {
+        unimplemented!("merge engine: US-013")
+    }
+
+    /// E2E-NEW-218: pulling a branch other than the one `HEAD` points at is
+    /// refused with `ERR_INVALID_ARGUMENT`, naming both the requested and the
+    /// checked-out branch. No `git.remote_clone` ever ran for this volume, so
+    /// if execution had reached `require_origin`, the failure would name
+    /// "origin", not the two branch names: the message alone proves which
+    /// guard fired.
+    #[tokio::test]
+    async fn e2e_new_218_pulling_a_branch_other_than_head_is_refused() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.commit("first").await;
+
+        let err = e
+            .call("git.remote_pull", json!({"mount_id": MOUNT, "branch": "feature/x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("feature/x"), "got {}", err.message);
+        assert!(err.message.contains("main"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-219: pulling the checked-out branch itself is never blocked by
+    /// the FR-NEW-063 guard; it resolves to the branch's current local sha
+    /// instead of an error, which is exactly what lets `remote_pull` proceed
+    /// to `require_origin` next.
+    #[tokio::test]
+    async fn e2e_new_219_pulling_the_checked_out_branch_proceeds() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let sha = e.commit("first").await;
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let local_sha = require_checked_out_branch(&entry, "main").await.unwrap();
+        assert_eq!(local_sha, sha, "the guard proceeds, returning the branch's current sha");
+    }
+
+    /// E2E-NEW-220: the branch check runs before any network attempt. No
+    /// origin was ever recorded for this volume, so a network-path failure
+    /// would have named "origin"; the actual failure names the two branches
+    /// instead, proving the guard that fired never got that far.
+    #[tokio::test]
+    async fn e2e_new_220_the_branch_check_runs_before_the_network() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.commit("first").await;
+
+        let err = e
+            .call("git.remote_pull", json!({"mount_id": MOUNT, "branch": "feature/x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.to_ascii_lowercase().contains("origin"),
+            "a network attempt would have failed on the missing origin instead: {}",
+            err.message
+        );
+        assert!(err.message.contains("feature/x") && err.message.contains("main"));
     }
 }

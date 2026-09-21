@@ -17,7 +17,7 @@
 //! [`validate_remote_url`] and [`clone_to_temp`] (with the sole
 //! `git2::RemoteCallbacks` construction in the tree) complete the pipeline for
 //! clone; [`require_origin`] is the guard push, fetch and pull (US-009 to
-//! US-011) will call before ever reaching a network call, since none of those
+//! US-011) all call before ever reaching a network call, since none of those
 //! three tools take a `url` argument (DEC-021): their only source for one is
 //! the `origin` row [`crate::tools::git`]'s clone records via `git::db`.
 
@@ -281,12 +281,12 @@ pub fn clone_to_temp(
 }
 
 /// FR-NEW-021: push, fetch and pull take no `url`; they resolve the stored
-/// `origin`. `git.remote_push` (US-009) is the first of the three to call this;
-/// fetch and pull (US-010, US-011) don't exist yet. This is the shared guard
-/// each calls before ever reaching a network operation, rather than each
-/// reimplementing "does this volume have an origin". A volume never
-/// initialized as a repository and one initialized but never cloned into both
-/// fail the same way: there is no `origin` row to resolve.
+/// `origin`. `git.remote_push`, `git.remote_fetch` and `git.remote_pull`
+/// (US-009 to US-011) each call this before ever reaching a network
+/// operation, rather than each reimplementing "does this volume have an
+/// origin". A volume never initialized as a repository and one initialized
+/// but never cloned into both fail the same way: there is no `origin` row to
+/// resolve.
 pub async fn require_origin(store: &GitRepoStore, volume_id: &str) -> Result<String> {
     if !store.is_initialized(volume_id).await {
         return Err(ToolError::invalid_argument(format!(
@@ -417,8 +417,8 @@ fn classify_push_rejection(status_msg: &str, branch: &str) -> ToolError {
 /// The single explicit fetch refspec (FR-NEW-062): destination side names only
 /// `refs/remotes/origin/*`, so an update reported by libgit2's `update_tips`
 /// callback can never name anything else. `git.remote_pull` (US-011) reuses
-/// this constant rather than writing its own copy, since its first step is
-/// exactly this fetch (DEC-012).
+/// [`fetch_from_remote`] itself, and therefore this constant, rather than
+/// writing its own copy: pull's first step is exactly this fetch (DEC-012).
 pub const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 
 /// One remote-tracking ref [`fetch_from_remote`] updated: `old_sha` is `None`
