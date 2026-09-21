@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Mode bits used when a commit tree is built from the volume: every file is a
 /// non executable regular file, exactly like the C# `Mode.NonExecutableFile`.
@@ -852,136 +853,149 @@ async fn clone_and_import(
     let person_owned = ctx.person.clone();
     let state = ctx.state.clone();
 
-    on_git_thread(move || async move {
-        let cloned = crate::git::remote::clone_to_temp(
-            &url_owned,
-            &tmp_path,
-            branch_owned.as_deref(),
-            depth,
-            token,
-        )?;
+    // FR-NEW-020 is unconditional on "completes successfully", so the entry
+    // (and therefore its `write_lock`) has to exist before the network call
+    // even starts, whether or not the clone itself succeeds.
+    if !store.is_initialized(mount_id).await {
+        store.init_repo(mount_id).await?;
+    }
+    let entry = store.get_or_open_repo(mount_id).await?;
+    let entry_for_thread = entry.clone();
+    // Acquired here, in the async caller, never inside the blocking closure
+    // below (DRIFT-009): see `push_branch` for why this is what makes a
+    // deadline actually release the lock. Uniform across all four remote
+    // operations (FR-NEW-044): a clone writes this repository's state exactly
+    // like a push, fetch or pull, so it serializes on the same lock.
+    let _write = entry.write_lock.lock().await;
+    let timeout_secs = ctx.state.config.git.remote_timeout_secs;
+    let host = crate::git::remote::extract_host(url);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-        let head = cloned.head().ok();
-        let target_branch = head
-            .as_ref()
-            .and_then(|h| h.shorthand())
-            .filter(|n| !n.is_empty() && *n != "(no branch)")
-            .map(str::to_string)
-            .or_else(|| branch_owned.clone())
-            .unwrap_or_else(|| "main".to_string());
+    crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        &host,
+        on_git_thread(move || async move {
+            let entry = entry_for_thread;
+            let cloned = crate::git::remote::clone_to_temp(
+                &url_owned,
+                &tmp_path,
+                branch_owned.as_deref(),
+                depth,
+                token,
+                Some(deadline),
+            )?;
 
-        let tip = match head.as_ref().and_then(|h| h.peel_to_commit().ok()) {
-            Some(c) => c,
-            None => {
-                // FR-NEW-020 is unconditional on "completes successfully", and an
-                // empty remote is a successful clone, so the volume still gets a
-                // repository and an `origin` row even though there is nothing to
-                // import yet.
-                if !store.is_initialized(&mount_owned).await {
-                    store.init_repo(&mount_owned).await?;
+            let head = cloned.head().ok();
+            let target_branch = head
+                .as_ref()
+                .and_then(|h| h.shorthand())
+                .filter(|n| !n.is_empty() && *n != "(no branch)")
+                .map(str::to_string)
+                .or_else(|| branch_owned.clone())
+                .unwrap_or_else(|| "main".to_string());
+
+            let tip = match head.as_ref().and_then(|h| h.peel_to_commit().ok()) {
+                Some(c) => c,
+                None => {
+                    // An empty remote is still a successful clone, so the
+                    // volume gets an `origin` row even with nothing to import.
+                    entry.db.add_remote("origin", &url_owned).await?;
+                    return Ok(json!({
+                        "mount_id": mount_owned,
+                        "url": url_owned,
+                        "files_imported": 0,
+                        "message": "Repository is empty",
+                    }));
                 }
-                let entry = store.get_or_open_repo(&mount_owned).await?;
-                entry.db.add_remote("origin", &url_owned).await?;
-                return Ok(json!({
-                    "mount_id": mount_owned,
-                    "url": url_owned,
-                    "files_imported": 0,
-                    "message": "Repository is empty",
-                }));
+            };
+
+            // Import every object of the clone (packed included) into the blob store.
+            // The C# added the temp dir as a file:// remote and fetched from it so its
+            // custom ODB backend would see the objects; reading the source ODB directly
+            // is the same set of bytes with one less moving part.
+            let imported_objects = entry.objects.import_from_repo(&cloned).await?;
+            tracing::debug!(
+                "git.remote_clone imported {imported_objects} objects into '{mount_owned}'"
+            );
+
+            let tip_sha = tip.id().to_string();
+            entry.db.set_ref("HEAD", &format!("refs/heads/{target_branch}"), true).await?;
+            entry.db.set_ref(&format!("refs/heads/{target_branch}"), &tip_sha, false).await?;
+
+            // Working tree files into the volume, one by one, isolating failures so a
+            // single unwritable path does not abort the whole import.
+            let client = state.stores.client(&mount_owned).await?;
+            let tree = tip.tree().map_err(|e| git_err("clone tree", e))?;
+            let mut files = Vec::new();
+            collect_blobs(&cloned, &tree, "", &mut files)?;
+
+            // Charge the whole import against the session quota BEFORE writing anything.
+            // Writing first and charging per file would leave a half populated volume when
+            // the budget runs out; a clone either fits or is refused cleanly. Importing a
+            // large repository therefore needs safety.write_quota_bytes raised, which is
+            // the honest trade: a bulk write is still a write.
+            let total_bytes: i64 = files
+                .iter()
+                .filter_map(|(_, oid)| cloned.find_blob(*oid).ok().map(|b| b.size() as i64))
+                .sum();
+            state.safety.charge_write(&person_owned, &mount_owned, total_bytes)?;
+
+            let mut imported = 0usize;
+            let mut skipped: Vec<String> = Vec::new();
+            for (rel, oid) in files {
+                let path = format!("/{rel}");
+                match write_one(&cloned, &client, &path, oid).await {
+                    Ok(()) => imported += 1,
+                    Err(e) => skipped.push(format!("{path}: {}", e.message)),
+                }
             }
-        };
 
-        if !store.is_initialized(&mount_owned).await {
-            store.init_repo(&mount_owned).await?;
-        }
-        let entry = store.get_or_open_repo(&mount_owned).await?;
+            state.safety.record_audit(
+                &person_owned,
+                &mount_owned,
+                "git.remote_clone",
+                "/",
+                &format!("{imported} files, {total_bytes} bytes from {url_owned}"),
+            );
 
-        // Import every object of the clone (packed included) into the blob store.
-        // The C# added the temp dir as a file:// remote and fetched from it so its
-        // custom ODB backend would see the objects; reading the source ODB directly
-        // is the same set of bytes with one less moving part.
-        let imported_objects = entry.objects.import_from_repo(&cloned).await?;
-        tracing::debug!(
-            "git.remote_clone imported {imported_objects} objects into '{mount_owned}'"
-        );
+            // FR-NEW-020: record the clone URL as `origin`. Push, fetch and pull
+            // (US-009 to US-011) have no other source for it; re-cloning replaces
+            // the row, since `add_remote` upserts by name.
+            entry.db.add_remote("origin", &url_owned).await?;
 
-        let tip_sha = tip.id().to_string();
-        entry.db.set_ref("HEAD", &format!("refs/heads/{target_branch}"), true).await?;
-        entry.db.set_ref(&format!("refs/heads/{target_branch}"), &tip_sha, false).await?;
-
-        // Working tree files into the volume, one by one, isolating failures so a
-        // single unwritable path does not abort the whole import.
-        let client = state.stores.client(&mount_owned).await?;
-        let tree = tip.tree().map_err(|e| git_err("clone tree", e))?;
-        let mut files = Vec::new();
-        collect_blobs(&cloned, &tree, "", &mut files)?;
-
-        // Charge the whole import against the session quota BEFORE writing anything.
-        // Writing first and charging per file would leave a half populated volume when
-        // the budget runs out; a clone either fits or is refused cleanly. Importing a
-        // large repository therefore needs safety.write_quota_bytes raised, which is
-        // the honest trade: a bulk write is still a write.
-        let total_bytes: i64 = files
-            .iter()
-            .filter_map(|(_, oid)| cloned.find_blob(*oid).ok().map(|b| b.size() as i64))
-            .sum();
-        state.safety.charge_write(&person_owned, &mount_owned, total_bytes)?;
-
-        let mut imported = 0usize;
-        let mut skipped: Vec<String> = Vec::new();
-        for (rel, oid) in files {
-            let path = format!("/{rel}");
-            match write_one(&cloned, &client, &path, oid).await {
-                Ok(()) => imported += 1,
-                Err(e) => skipped.push(format!("{path}: {}", e.message)),
-            }
-        }
-
-        state.safety.record_audit(
-            &person_owned,
-            &mount_owned,
-            "git.remote_clone",
-            "/",
-            &format!("{imported} files, {total_bytes} bytes from {url_owned}"),
-        );
-
-        // FR-NEW-020: record the clone URL as `origin`. Push, fetch and pull
-        // (US-009 to US-011) have no other source for it; re-cloning replaces
-        // the row, since `add_remote` upserts by name.
-        entry.db.add_remote("origin", &url_owned).await?;
-
-        // Commit count for the summary: breadth first over the parent graph.
-        let mut seen = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        seen.insert(tip.id());
-        queue.push_back(tip.id());
-        let mut commits_imported = 0usize;
-        while let Some(id) = queue.pop_front() {
-            commits_imported += 1;
-            if let Ok(c) = cloned.find_commit(id) {
-                for p in c.parent_ids() {
-                    if seen.insert(p) {
-                        queue.push_back(p);
+            // Commit count for the summary: breadth first over the parent graph.
+            let mut seen = std::collections::HashSet::new();
+            let mut queue = std::collections::VecDeque::new();
+            seen.insert(tip.id());
+            queue.push_back(tip.id());
+            let mut commits_imported = 0usize;
+            while let Some(id) = queue.pop_front() {
+                commits_imported += 1;
+                if let Ok(c) = cloned.find_commit(id) {
+                    for p in c.parent_ids() {
+                        if seen.insert(p) {
+                            queue.push_back(p);
+                        }
                     }
                 }
             }
-        }
 
-        let mut out = serde_json::Map::new();
-        out.insert("mount_id".into(), json!(mount_owned));
-        out.insert("url".into(), json!(url_owned));
-        out.insert("branch".into(), json!(target_branch));
-        out.insert("commit".into(), json!(short(&tip_sha)));
-        out.insert("commit_message".into(), json!(tip.message().unwrap_or_default().trim()));
-        out.insert("files_imported".into(), json!(imported));
-        out.insert("commits_imported".into(), json!(commits_imported));
-        out.insert("depth".into(), if depth > 0 { json!(depth) } else { json!("full") });
-        out.insert("auth".into(), json!(auth));
-        if !skipped.is_empty() {
-            out.insert("skipped".into(), json!(skipped));
-        }
-        Ok(Value::Object(out))
-    })
+            let mut out = serde_json::Map::new();
+            out.insert("mount_id".into(), json!(mount_owned));
+            out.insert("url".into(), json!(url_owned));
+            out.insert("branch".into(), json!(target_branch));
+            out.insert("commit".into(), json!(short(&tip_sha)));
+            out.insert("commit_message".into(), json!(tip.message().unwrap_or_default().trim()));
+            out.insert("files_imported".into(), json!(imported));
+            out.insert("commits_imported".into(), json!(commits_imported));
+            out.insert("depth".into(), if depth > 0 { json!(depth) } else { json!("full") });
+            out.insert("auth".into(), json!(auth));
+            if !skipped.is_empty() {
+                out.insert("skipped".into(), json!(skipped));
+            }
+            Ok(Value::Object(out))
+        }),
+    )
     .await
     // `tmp` is dropped here, removing the temporary clone whatever happened.
 }
@@ -1037,29 +1051,46 @@ async fn push_branch(
 
     let (branch_owned, origin_owned, local_sha_owned) =
         (branch.to_string(), origin_url.to_string(), local_sha.clone());
+    let entry_for_thread = entry.clone();
     // Held for the whole hydrate-plus-push, so two concurrent pushes to the
     // same branch cannot interleave (E2E-NEW-084): the same lock `git.commit`
-    // holds for the whole of a commit.
-    let entry_for_thread = entry.clone();
-    let outcome = on_git_thread(move || async move {
-        let _write = entry_for_thread.write_lock.lock().await;
-        let repo = entry_for_thread.repo.lock().await;
-        hydrate(&entry_for_thread, &repo).await?;
-        // `hydrate` only exports blob-store objects into the on-disk ODB; the
-        // db-tracked branch sha (the authoritative value) still needs to be
-        // the on-disk ref libgit2 resolves as the push's source side, since
-        // `push_to_remote` names the branch by ref, not by oid.
-        let oid = parse_oid(&local_sha_owned)?;
-        repo.reference(&format!("refs/heads/{branch_owned}"), oid, true, "mcp-fs git.remote_push")
+    // holds for the whole of a commit. Acquired here, in the async caller,
+    // never inside the blocking closure below (DRIFT-009): a deadline firing
+    // drops `_write` when this function returns via `?`, which is what
+    // actually releases the lock, regardless of whether the orphaned blocking
+    // OS thread the push runs on is still alive.
+    let _write = entry.write_lock.lock().await;
+    let timeout_secs = store.config().git.remote_timeout_secs;
+    let host = crate::git::remote::extract_host(origin_url);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let outcome = crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        &host,
+        on_git_thread(move || async move {
+            let repo = entry_for_thread.repo.lock().await;
+            hydrate(&entry_for_thread, &repo).await?;
+            // `hydrate` only exports blob-store objects into the on-disk ODB;
+            // the db-tracked branch sha (the authoritative value) still needs
+            // to be the on-disk ref libgit2 resolves as the push's source
+            // side, since `push_to_remote` names the branch by ref, not oid.
+            let oid = parse_oid(&local_sha_owned)?;
+            repo.reference(
+                &format!("refs/heads/{branch_owned}"),
+                oid,
+                true,
+                "mcp-fs git.remote_push",
+            )
             .map_err(|e| git_err("sync local branch ref", e))?;
-        crate::git::remote::push_to_remote(
-            &repo,
-            &origin_owned,
-            &branch_owned,
-            &local_sha_owned,
-            token,
-        )
-    })
+            crate::git::remote::push_to_remote(
+                &repo,
+                &origin_owned,
+                &branch_owned,
+                &local_sha_owned,
+                token,
+                Some(deadline),
+            )
+        }),
+    )
     .await?;
 
     // A refused push returns above via `?`, before this line: nothing here
@@ -1128,18 +1159,29 @@ async fn fetch_branch(
         .collect();
 
     let origin_owned = origin_url.to_string();
+    let entry_for_thread = entry.clone();
     // Held for the whole hydrate-plus-fetch, the same lock `push_branch` and
     // `git.commit` hold, so a concurrent write to this repository's on disk
-    // state cannot interleave with this one.
-    let entry_for_thread = entry.clone();
-    let outcome = on_git_thread(move || async move {
-        let _write = entry_for_thread.write_lock.lock().await;
-        let repo = entry_for_thread.repo.lock().await;
-        hydrate(&entry_for_thread, &repo).await?;
-        let outcome = crate::git::remote::fetch_from_remote(&repo, &origin_owned, token)?;
-        entry_for_thread.objects.import_from_repo(&repo).await?;
-        Ok(outcome)
-    })
+    // state cannot interleave with this one. Acquired here, in the async
+    // caller, never inside the blocking closure below (DRIFT-009): see
+    // `push_branch` for why this is what makes a deadline actually release
+    // the lock.
+    let _write = entry.write_lock.lock().await;
+    let timeout_secs = store.config().git.remote_timeout_secs;
+    let host = crate::git::remote::extract_host(origin_url);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let outcome = crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        &host,
+        on_git_thread(move || async move {
+            let repo = entry_for_thread.repo.lock().await;
+            hydrate(&entry_for_thread, &repo).await?;
+            let outcome =
+                crate::git::remote::fetch_from_remote(&repo, &origin_owned, token, Some(deadline))?;
+            entry_for_thread.objects.import_from_repo(&repo).await?;
+            Ok(outcome)
+        }),
+    )
     .await?;
 
     let mut refs_updated = Vec::with_capacity(outcome.refs_updated.len());
@@ -1286,6 +1328,7 @@ async fn remote_pull(
         &ctx.person,
         ctx.state.safety.clone(),
         on_conflict,
+        ctx.state.config.git.remote_timeout_secs,
     )
     .await
 }
@@ -1333,6 +1376,7 @@ async fn pull_branch(
     person: &str,
     safety: Arc<SafetyManager>,
     on_conflict: Option<String>,
+    timeout_secs: u64,
 ) -> Result<Value> {
     // FR-NEW-033: validated before any lock is taken, any fetch runs, or the
     // ancestry branch is even reached.
@@ -1341,159 +1385,185 @@ async fn pull_branch(
     let (branch_owned, origin_owned, local_sha_owned, person_owned) =
         (branch.to_string(), origin_url.to_string(), local_sha.to_string(), person.to_string());
     let entry_for_thread = entry.clone();
+    // Acquired here, in the async caller, never inside the blocking closure
+    // below (DRIFT-009): see `push_branch` for why this is what makes a
+    // deadline actually release the lock. One `write_lock` plus one `repo`
+    // lock still covers the whole of the dirty check, the fetch and the
+    // apply, so they observe one consistent snapshot, exactly as before.
+    let _write = entry.write_lock.lock().await;
+    let host = crate::git::remote::extract_host(origin_url);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-    let outcome = on_git_thread(move || async move {
-        let _write = entry_for_thread.write_lock.lock().await;
-        let repo = entry_for_thread.repo.lock().await;
-        hydrate(&entry_for_thread, &repo).await?;
+    let outcome = crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        &host,
+        on_git_thread(move || async move {
+            let repo = entry_for_thread.repo.lock().await;
+            hydrate(&entry_for_thread, &repo).await?;
 
-        // FR-NEW-029: refused before any fetch.
-        require_clean_volume(&repo, &client, &local_sha_owned).await?;
+            // FR-NEW-029: refused before any fetch.
+            require_clean_volume(&repo, &client, &local_sha_owned).await?;
 
-        let outcome = crate::git::remote::fetch_from_remote(&repo, &origin_owned, token)?;
-        entry_for_thread.objects.import_from_repo(&repo).await?;
-        for u in &outcome.refs_updated {
-            entry_for_thread.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
-        }
-
-        let local_oid = parse_oid(&local_sha_owned)?;
-        let remote_ref_name = format!("refs/remotes/origin/{branch_owned}");
-        let remote_oid =
-            match repo.find_reference(&remote_ref_name).and_then(|r| r.peel_to_commit()) {
-                Ok(c) => c.id(),
-                // The remote never advertised this branch: nothing to pull.
-                Err(_) => local_oid,
-            };
-
-        if remote_oid == local_oid {
-            return Ok(PullOutcome::FastForward {
-                old_sha: local_sha_owned.clone(),
-                new_sha: local_sha_owned.clone(),
-                files_changed: 0,
-            });
-        }
-
-        // FR-NEW-028: ancestry is tested with `graph_descendant_of`, never a
-        // local guess; a commit is not considered its own descendant, which is
-        // why the equal-sha case above is handled first.
-        let is_ff = repo
-            .graph_descendant_of(remote_oid, local_oid)
-            .map_err(|e| git_err("ancestry check", e))?;
-
-        let local_commit =
-            repo.find_commit(local_oid).map_err(|e| git_err("find local commit", e))?;
-        let remote_commit =
-            repo.find_commit(remote_oid).map_err(|e| git_err("find remote commit", e))?;
-        let local_tree = local_commit.tree().map_err(|e| git_err("commit tree", e))?;
-        let remote_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
-
-        if !is_ff {
-            // FR-NEW-030: the fetch above already ran and its results are kept
-            // (`refs/remotes/origin/{branch}` was just advanced); only the
-            // apply below is refused. Divergence is never resolved implicitly.
-            let Some(strategy) = strategy else {
-                return Err(ToolError::not_supported(
-                    "git.remote_pull: local and remote have diverged (not a fast-forward); \
-                     supply on_conflict: 'ours' or 'theirs' to merge",
-                ));
-            };
-
-            // FR-NEW-031: resolved entirely by `file_favor`; this writes no
-            // merge algorithm of its own.
-            let mut merge_opts = MergeOptions::new();
-            merge_opts.file_favor(strategy.file_favor());
-            let mut index = repo
-                .merge_commits(&local_commit, &remote_commit, Some(&merge_opts))
-                .map_err(|e| git_err("merge commits", e))?;
-            // FR-NEW-032: `file_favor` resolves every conflicting region; an
-            // unresolved conflict here would be something the strategy cannot
-            // represent (a rename or type conflict), and this refuses rather
-            // than ever writing a conflict marker or index entry.
-            if index.has_conflicts() {
-                return Err(ToolError::internal(
-                    "git.remote_pull: the merge left unresolved conflicts that 'ours'/'theirs' \
-                     cannot represent",
-                ));
+            let outcome =
+                crate::git::remote::fetch_from_remote(&repo, &origin_owned, token, Some(deadline))?;
+            entry_for_thread.objects.import_from_repo(&repo).await?;
+            for u in &outcome.refs_updated {
+                entry_for_thread.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
             }
-            let merged_tree_oid =
-                index.write_tree_to(&repo).map_err(|e| git_err("write merged tree", e))?;
-            let merged_tree =
-                repo.find_tree(merged_tree_oid).map_err(|e| git_err("find merged tree", e))?;
 
-            // Only files with an actual conflicting change on both sides count
-            // (FR-NEW-031's `conflicts_resolved`), not every path either side
-            // touched: diff each side against their common ancestor and
-            // intersect the two path sets.
-            let merge_base_oid =
-                repo.merge_base(local_oid, remote_oid).map_err(|e| git_err("merge base", e))?;
-            let merge_base_commit = repo
-                .find_commit(merge_base_oid)
-                .map_err(|e| git_err("find merge base commit", e))?;
-            let merge_base_tree =
-                merge_base_commit.tree().map_err(|e| git_err("merge base tree", e))?;
-            let local_touched = changed_paths(&repo, &merge_base_tree, &local_tree)?;
-            let remote_touched = changed_paths(&repo, &merge_base_tree, &remote_tree)?;
-            let conflicts_resolved = local_touched.intersection(&remote_touched).count();
+            let local_oid = parse_oid(&local_sha_owned)?;
+            let remote_ref_name = format!("refs/remotes/origin/{branch_owned}");
+            let remote_oid =
+                match repo.find_reference(&remote_ref_name).and_then(|r| r.peel_to_commit()) {
+                    Ok(c) => c.id(),
+                    // The remote never advertised this branch: nothing to pull.
+                    Err(_) => local_oid,
+                };
 
-            // Reuses the same delta, quota charge and atomic apply the
-            // fast-forward path uses below: a merge only changes which tree is
-            // being applied, never how.
-            let changes = diff_tree_changes(&repo, &local_tree, &merged_tree)?;
+            if remote_oid == local_oid {
+                return Ok(PullOutcome::FastForward {
+                    old_sha: local_sha_owned.clone(),
+                    new_sha: local_sha_owned.clone(),
+                    files_changed: 0,
+                });
+            }
+
+            // FR-NEW-028: ancestry is tested with `graph_descendant_of`, never a
+            // local guess; a commit is not considered its own descendant, which is
+            // why the equal-sha case above is handled first.
+            let is_ff = repo
+                .graph_descendant_of(remote_oid, local_oid)
+                .map_err(|e| git_err("ancestry check", e))?;
+
+            let local_commit =
+                repo.find_commit(local_oid).map_err(|e| git_err("find local commit", e))?;
+            let remote_commit =
+                repo.find_commit(remote_oid).map_err(|e| git_err("find remote commit", e))?;
+            let local_tree = local_commit.tree().map_err(|e| git_err("commit tree", e))?;
+            let remote_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
+
+            if !is_ff {
+                // FR-NEW-030: the fetch above already ran and its results are kept
+                // (`refs/remotes/origin/{branch}` was just advanced); only the
+                // apply below is refused. Divergence is never resolved implicitly.
+                let Some(strategy) = strategy else {
+                    return Err(ToolError::invalid_argument(
+                        "pull refused: not a fast-forward: local and remote have diverged; supply \
+                     on_conflict: 'ours' or 'theirs' to merge",
+                    ));
+                };
+
+                // FR-NEW-031: resolved entirely by `file_favor`; this writes no
+                // merge algorithm of its own.
+                let mut merge_opts = MergeOptions::new();
+                merge_opts.file_favor(strategy.file_favor());
+                let mut index = repo
+                    .merge_commits(&local_commit, &remote_commit, Some(&merge_opts))
+                    .map_err(|e| git_err("merge commits", e))?;
+                // FR-NEW-032: `file_favor` resolves every conflicting region; an
+                // unresolved conflict here would be something the strategy cannot
+                // represent (a rename or type conflict), and this refuses rather
+                // than ever writing a conflict marker or index entry.
+                if index.has_conflicts() {
+                    return Err(ToolError::internal(
+                        "git.remote_pull: the merge left unresolved conflicts that 'ours'/'theirs' \
+                     cannot represent",
+                    ));
+                }
+                let merged_tree_oid =
+                    index.write_tree_to(&repo).map_err(|e| git_err("write merged tree", e))?;
+                let merged_tree =
+                    repo.find_tree(merged_tree_oid).map_err(|e| git_err("find merged tree", e))?;
+
+                // Only files with an actual conflicting change on both sides count
+                // (FR-NEW-031's `conflicts_resolved`), not every path either side
+                // touched: diff each side against their common ancestor and
+                // intersect the two path sets.
+                let merge_base_oid =
+                    repo.merge_base(local_oid, remote_oid).map_err(|e| git_err("merge base", e))?;
+                let merge_base_commit = repo
+                    .find_commit(merge_base_oid)
+                    .map_err(|e| git_err("find merge base commit", e))?;
+                let merge_base_tree =
+                    merge_base_commit.tree().map_err(|e| git_err("merge base tree", e))?;
+                let local_touched = changed_paths(&repo, &merge_base_tree, &local_tree)?;
+                let remote_touched = changed_paths(&repo, &merge_base_tree, &remote_tree)?;
+                let conflicts_resolved = local_touched.intersection(&remote_touched).count();
+
+                // Reuses the same delta, quota charge and atomic apply the
+                // fast-forward path uses below: a merge only changes which tree is
+                // being applied, never how.
+                let changes = diff_tree_changes(&repo, &local_tree, &merged_tree)?;
+                charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
+                apply_pull_changes_atomically(&client, &repo, &changes).await?;
+
+                // DEC-026: authored and committed by the authenticated person.
+                let name = person_owned.split('@').next().unwrap_or(&person_owned).to_string();
+                let now = Utc::now().timestamp();
+                let sig = git2::Signature::new(&name, &person_owned, &git2::Time::new(now, 0))
+                    .map_err(|e| git_err("signature", e))?;
+                // DEC-027: auto-generated, no caller-supplied override.
+                let message = format!(
+                    "Merge origin/{branch_owned} into {branch_owned} (conflicts resolved: {})",
+                    strategy.as_str()
+                );
+                let pretty =
+                    git2::message_prettify(&message, None).map_err(|e| git_err("message", e))?;
+                let merge_oid = repo
+                    .commit(
+                        None,
+                        &sig,
+                        &sig,
+                        &pretty,
+                        &merged_tree,
+                        &[&local_commit, &remote_commit],
+                    )
+                    .map_err(|e| git_err("create merge commit", e))?;
+                entry_for_thread.objects.import_from_repo(&repo).await?;
+
+                let branch_ref_name = format!("refs/heads/{branch_owned}");
+                entry_for_thread
+                    .db
+                    .set_ref(&branch_ref_name, &merge_oid.to_string(), false)
+                    .await?;
+                let _ = repo.reference(
+                    &branch_ref_name,
+                    merge_oid,
+                    true,
+                    "mcp-fs git.remote_pull merge",
+                );
+
+                return Ok(PullOutcome::Merged {
+                    strategy: strategy.as_str().to_string(),
+                    merge_commit: merge_oid.to_string(),
+                    conflicts_resolved,
+                });
+            }
+
+            let changes = diff_tree_changes(&repo, &local_tree, &remote_tree)?;
+
+            // FR-NEW-069: the single authority on the basis of the pull quota charge.
+            // Reuses the delta `diff_tree_changes` already computed above rather than
+            // walking the tree a second time; a deleted path never adds bytes. This
+            // charge runs before `apply_pull_changes_atomically`'s first write, so an
+            // insufficient quota refuses the pull without writing anything and
+            // without advancing the ref below (DEC-036, unlike clone's whole-tree
+            // charge at `clone_and_import`, `tools/git.rs:778-782`).
             charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
+
             apply_pull_changes_atomically(&client, &repo, &changes).await?;
 
-            // DEC-026: authored and committed by the authenticated person.
-            let name = person_owned.split('@').next().unwrap_or(&person_owned).to_string();
-            let now = Utc::now().timestamp();
-            let sig = git2::Signature::new(&name, &person_owned, &git2::Time::new(now, 0))
-                .map_err(|e| git_err("signature", e))?;
-            // DEC-027: auto-generated, no caller-supplied override.
-            let message = format!(
-                "Merge origin/{branch_owned} into {branch_owned} (conflicts resolved: {})",
-                strategy.as_str()
-            );
-            let pretty =
-                git2::message_prettify(&message, None).map_err(|e| git_err("message", e))?;
-            let merge_oid = repo
-                .commit(None, &sig, &sig, &pretty, &merged_tree, &[&local_commit, &remote_commit])
-                .map_err(|e| git_err("create merge commit", e))?;
-            entry_for_thread.objects.import_from_repo(&repo).await?;
-
             let branch_ref_name = format!("refs/heads/{branch_owned}");
-            entry_for_thread.db.set_ref(&branch_ref_name, &merge_oid.to_string(), false).await?;
-            let _ =
-                repo.reference(&branch_ref_name, merge_oid, true, "mcp-fs git.remote_pull merge");
+            entry_for_thread.db.set_ref(&branch_ref_name, &remote_oid.to_string(), false).await?;
+            let _ = repo.reference(&branch_ref_name, remote_oid, true, "mcp-fs git.remote_pull");
 
-            return Ok(PullOutcome::Merged {
-                strategy: strategy.as_str().to_string(),
-                merge_commit: merge_oid.to_string(),
-                conflicts_resolved,
-            });
-        }
-
-        let changes = diff_tree_changes(&repo, &local_tree, &remote_tree)?;
-
-        // FR-NEW-069: the single authority on the basis of the pull quota charge.
-        // Reuses the delta `diff_tree_changes` already computed above rather than
-        // walking the tree a second time; a deleted path never adds bytes. This
-        // charge runs before `apply_pull_changes_atomically`'s first write, so an
-        // insufficient quota refuses the pull without writing anything and
-        // without advancing the ref below (DEC-036, unlike clone's whole-tree
-        // charge at `clone_and_import`, `tools/git.rs:778-782`).
-        charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
-
-        apply_pull_changes_atomically(&client, &repo, &changes).await?;
-
-        let branch_ref_name = format!("refs/heads/{branch_owned}");
-        entry_for_thread.db.set_ref(&branch_ref_name, &remote_oid.to_string(), false).await?;
-        let _ = repo.reference(&branch_ref_name, remote_oid, true, "mcp-fs git.remote_pull");
-
-        Ok(PullOutcome::FastForward {
-            old_sha: local_sha_owned.clone(),
-            new_sha: remote_oid.to_string(),
-            files_changed: changes.len(),
-        })
-    })
+            Ok(PullOutcome::FastForward {
+                old_sha: local_sha_owned.clone(),
+                new_sha: remote_oid.to_string(),
+                files_changed: changes.len(),
+            })
+        }),
+    )
     .await?;
 
     Ok(match outcome {
@@ -1552,8 +1622,9 @@ async fn require_clean_volume(
     let tip_tree_id = tip.tree().map_err(|e| git_err("commit tree", e))?.id();
     let volume_tree_id = build_tree_from_volume(repo, client).await?;
     if volume_tree_id != tip_tree_id {
-        return Err(ToolError::no_clobber(
-            "the volume has uncommitted changes: commit or discard them before pulling",
+        return Err(ToolError::invalid_argument(
+            "pull refused: volume has uncommitted changes: commit or discard them before \
+             pulling",
         ));
     }
     Ok(())
@@ -1937,6 +2008,15 @@ mod tests {
             Env::build(move |c| {
                 c.git.enabled = true;
                 c.safety.write_quota_bytes = bytes;
+            })
+            .await
+        }
+
+        /// An environment with a short remote deadline (E2E-NEW-155/156/157).
+        async fn with_timeout(secs: u64) -> Env {
+            Env::build(move |c| {
+                c.git.enabled = true;
+                c.git.remote_timeout_secs = secs;
             })
             .await
         }
@@ -3538,6 +3618,26 @@ mod tests {
         format!("file://{}", dir.display())
     }
 
+    /// A TCP listener that accepts a connection and then goes silent: never
+    /// reads, never writes, never closes. Genuinely exercises a stuck remote
+    /// operation (E2E-NEW-155/156/183, DRIFT-009) without needing a real
+    /// unreachable host or a real multi-minute hang: `git2`'s https transport
+    /// blocks mid TLS-handshake against this, exactly like it would against a
+    /// remote that accepted the connection and then stopped responding.
+    /// Returns the URL to give the clone and the background task's handle,
+    /// which the caller must `abort()` once the test is done with it.
+    async fn silent_remote() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        (format!("https://127.0.0.1:{port}/x.git"), handle)
+    }
+
     /// One more commit directly on the bare "remote", simulating another writer
     /// having pushed there since the volume last synced: the setup every
     /// non-fast-forward test needs, with no mock, just a second real commit on
@@ -3831,12 +3931,8 @@ mod tests {
         let advanced_sha = advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
 
         let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER);
-        assert!(
-            err.message.to_ascii_lowercase().contains("non-fast-forward"),
-            "got {}",
-            err.message
-        );
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.starts_with("push refused: not a fast-forward"), "got {}", err.message);
         assert!(err.message.to_ascii_lowercase().contains("force"), "got {}", err.message);
         assert!(err.message.contains("main"), "got {}", err.message);
 
@@ -3847,7 +3943,7 @@ mod tests {
     /// carry different, machine-distinguishable error identities. The
     /// non-fast-forward half is proven directly against a real push in
     /// `e2e_new_076`; this proves the credential half never even reaches
-    /// `push_to_remote`, failing instead with a code that is never `NO_CLOBBER`.
+    /// `push_to_remote`, failing instead with `ERR_UNAUTHENTICATED`.
     #[test]
     fn e2e_new_077_the_non_fast_forward_error_is_distinguishable_from_an_auth_error() {
         with_git_hosts_lock(async {
@@ -3865,7 +3961,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.code, code::UNAUTHENTICATED);
-            assert_ne!(err.code, code::NO_CLOBBER);
+            assert_ne!(err.code, code::INVALID_ARGUMENT);
         });
     }
 
@@ -3952,7 +4048,7 @@ mod tests {
         advance_bare_remote(&remote_dir, "refs/heads/main", "raced\n");
 
         let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER, "the same identity as a non-racing rejection");
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "the same identity as a non-racing rejection");
     }
 
     /// E2E-NEW-211: `created` and `up_to_date` are never both true: a branch
@@ -4026,7 +4122,7 @@ mod tests {
 
         advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
         let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap();
@@ -4136,6 +4232,7 @@ mod tests {
         let err = crate::git::remote::fetch_from_remote(
             &repo,
             "https://mcp-fs-fetch-unreachable-test.invalid/o/r.git",
+            None,
             None,
         )
         .unwrap_err();
@@ -4301,7 +4398,7 @@ mod tests {
         {
             let repo = entry.repo.lock().await;
             hydrate(&entry, &repo).await.unwrap();
-            let outcome = crate::git::remote::fetch_from_remote(&repo, &url, None).unwrap();
+            let outcome = crate::git::remote::fetch_from_remote(&repo, &url, None, None).unwrap();
             assert!(
                 outcome.refs_updated.iter().all(|u| !u.ref_name.contains("tags")),
                 "got {:?}",
@@ -4431,6 +4528,7 @@ mod tests {
             OWNER,
             e.f.state.safety.clone(),
             on_conflict.map(str::to_string),
+            e.git.config().git.remote_timeout_secs,
         )
         .await
     }
@@ -4522,7 +4620,12 @@ mod tests {
         e.write("/README.md", "dirty edit\n").await;
 
         let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(
+            err.message.starts_with("pull refused: volume has uncommitted changes"),
+            "got {}",
+            err.message
+        );
         let lower = err.message.to_ascii_lowercase();
         assert!(lower.contains("commit"), "got {}", err.message);
         assert!(lower.contains("discard"), "got {}", err.message);
@@ -4547,7 +4650,7 @@ mod tests {
         e.write("/scratch.txt", "temp\n").await;
 
         let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
         assert_eq!(e.read("/scratch.txt").await, "temp\n");
     }
 
@@ -4563,7 +4666,7 @@ mod tests {
         client.delete_file("/README.md").await.unwrap();
 
         let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
     }
 
     /// E2E-NEW-123 — Committing then pulling succeeds via merge.
@@ -4597,6 +4700,9 @@ mod tests {
     /// E2E-NEW-127 — The diverged error differs from the dirty error.
     /// > When one pull is refused as dirty and another as diverged. Then the
     /// > two failures are machine-distinguishable.
+    ///
+    /// FR-NEW-049 freezes both under `ERR_INVALID_ARGUMENT`: distinguishing
+    /// them is the message prefix's job now, not the code's (E2E-NEW-182).
     #[tokio::test]
     async fn e2e_new_127_the_diverged_error_differs_from_the_dirty_error() {
         let e1 = Env::new().await;
@@ -4616,9 +4722,11 @@ mod tests {
         let diverged_err =
             call_pull_branch(&e2, &url2, "main", "anonymous", None).await.unwrap_err();
 
-        assert_eq!(dirty_err.code, code::NO_CLOBBER);
-        assert_eq!(diverged_err.code, code::NOT_SUPPORTED);
-        assert_ne!(dirty_err.code, diverged_err.code, "machine-distinguishable");
+        assert_eq!(dirty_err.code, code::INVALID_ARGUMENT);
+        assert_eq!(diverged_err.code, code::INVALID_ARGUMENT);
+        assert!(dirty_err.message.starts_with("pull refused: volume has uncommitted changes"));
+        assert!(diverged_err.message.starts_with("pull refused: not a fast-forward"));
+        assert_ne!(dirty_err.message, diverged_err.message, "machine-distinguishable by prefix");
     }
 
     /// E2E-NEW-131: a pull with nothing new is idempotent: it succeeds twice,
@@ -4723,7 +4831,8 @@ mod tests {
         let before_readme = e.read("/README.md").await;
 
         let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
-        assert_eq!(err.code, code::NOT_SUPPORTED);
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.starts_with("pull refused: not a fast-forward"), "got {}", err.message);
         let lower = err.message.to_ascii_lowercase();
         assert!(lower.contains("fast-forward"), "got {}", err.message);
         assert!(lower.contains("on_conflict"), "got {}", err.message);
@@ -5205,7 +5314,7 @@ mod tests {
         );
 
         let err = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap_err();
-        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
 
         assert!(
             entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none(),
@@ -5342,5 +5451,126 @@ mod tests {
             err.message
         );
         assert!(err.message.contains("feature/x") && err.message.contains("main"));
+    }
+
+    // ── US-014: FR-NEW-044/049, the remote deadline and the frozen prefixes ─
+
+    /// E2E-NEW-155: a remote operation times out within approximately the
+    /// configured deadline, naming the host.
+    #[tokio::test]
+    async fn e2e_new_155_a_remote_operation_times_out() {
+        let e = Env::with_timeout(2).await;
+        let (url, srv) = silent_remote().await;
+
+        let started = std::time::Instant::now();
+        let err = call_clone_and_import(&e, &url, "anonymous").await.unwrap_err();
+        let elapsed = started.elapsed();
+        srv.abort();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert!(err.message.starts_with("remote timeout"), "got {}", err.message);
+        assert!(err.message.contains("127.0.0.1"), "the host must be named: got {}", err.message);
+        assert!(elapsed < std::time::Duration::from_secs(10), "took {elapsed:?}");
+    }
+
+    /// E2E-NEW-156: after a timeout fires, another git operation on the same
+    /// volume proceeds without waiting, proving the per-repository write lock
+    /// was released (DRIFT-009). The second call is itself wrapped in a
+    /// bounded `tokio::time::timeout`: if the lock were still stuck, this
+    /// test fails cleanly within that bound instead of hanging forever.
+    #[tokio::test]
+    async fn e2e_new_156_a_timeout_releases_the_repository_lock() {
+        let e = Env::with_timeout(2).await;
+        let (bad_url, srv) = silent_remote().await;
+        call_clone_and_import(&e, &bad_url, "anonymous").await.unwrap_err();
+        srv.abort();
+
+        let remote_dir = e.f.dir.path().join("remote-156");
+        let good_url = seed_bare_remote(&remote_dir, "hi\n");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call_clone_and_import(&e, &good_url, "anonymous"),
+        )
+        .await
+        .expect("the second operation must not wait on a stuck write lock")
+        .unwrap();
+        assert_eq!(second["url"], good_url);
+    }
+
+    /// E2E-NEW-181: the non-fast-forward push message prefix is exact
+    /// (FR-NEW-049).
+    #[tokio::test]
+    async fn e2e_new_181_the_non_fast_forward_push_message_prefix_is_exact() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-181");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
+
+        let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.starts_with("push refused: not a fast-forward"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-182: the dirty-volume and diverged-pull prefixes are exact and
+    /// different (FR-NEW-049).
+    #[tokio::test]
+    async fn e2e_new_182_the_dirty_and_diverged_pull_prefixes_are_exact_and_different() {
+        let e1 = Env::new().await;
+        let remote_dir1 = e1.f.dir.path().join("remote-182-dirty");
+        let url1 = seed_bare_remote(&remote_dir1, "hi\n");
+        call_clone_and_import(&e1, &url1, "anonymous").await.unwrap();
+        e1.write("/README.md", "dirty\n").await;
+        let dirty_err = call_pull_branch(&e1, &url1, "main", "anonymous", None).await.unwrap_err();
+
+        let e2 = Env::new().await;
+        let remote_dir2 = e2.f.dir.path().join("remote-182-diverged");
+        let url2 = seed_bare_remote(&remote_dir2, "hi\n");
+        call_clone_and_import(&e2, &url2, "anonymous").await.unwrap();
+        e2.write("/README.md", "local\n").await;
+        e2.commit("local change").await;
+        advance_bare_remote_write(&remote_dir2, "refs/heads/main", "README.md", "remote\n");
+        let diverged_err =
+            call_pull_branch(&e2, &url2, "main", "anonymous", None).await.unwrap_err();
+
+        assert_eq!(dirty_err.code, code::INVALID_ARGUMENT);
+        assert_eq!(diverged_err.code, code::INVALID_ARGUMENT);
+        assert!(
+            dirty_err.message.starts_with("pull refused: volume has uncommitted changes"),
+            "got {}",
+            dirty_err.message
+        );
+        assert!(
+            diverged_err.message.starts_with("pull refused: not a fast-forward"),
+            "got {}",
+            diverged_err.message
+        );
+        assert_ne!(dirty_err.message, diverged_err.message);
+    }
+
+    /// E2E-NEW-183: the timeout code and message prefix are exact
+    /// (FR-NEW-049).
+    #[tokio::test]
+    async fn e2e_new_183_the_timeout_code_and_prefix_are_exact() {
+        let e = Env::with_timeout(1).await;
+        let (url, srv) = silent_remote().await;
+
+        let err = call_clone_and_import(&e, &url, "anonymous").await.unwrap_err();
+        srv.abort();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert!(err.message.starts_with("remote timeout"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-184: enumerating the error code set after implementation still
+    /// finds exactly the 14 constants of `errors.rs:9-22`; the timeout and the
+    /// frozen-prefix failures of FR-NEW-049 all reuse existing codes, adding
+    /// none.
+    #[test]
+    fn e2e_new_184_no_new_error_constant_is_introduced() {
+        let src = include_str!("../errors.rs");
+        let count = src.matches("pub const ").count();
+        assert_eq!(count, 14, "the ERR_* set must stay exactly 14 constants");
     }
 }

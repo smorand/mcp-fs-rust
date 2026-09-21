@@ -58,7 +58,7 @@ Quoted verbatim from the specification's decisions log (Section 17). These are s
 - **Resolution during implementation:** Acquire the write lock in the async caller rather than inside the blocking closure, so dropping the timed-out future releases it. Enforce the deadline twice: wrap the future in `tokio::time::timeout`, and return an abort from `RemoteCallbacks::transfer_progress` once the deadline has passed. Accept and document that an orphaned blocking thread can outlive the error until its socket times out.
 - **Detected by:** E2E-NEW-156 fails, because the second operation blocks on the still-held lock.
 - **Blocks which requirement:** FR-NEW-044.
-- **Status:** open
+- **Status:** resolved (e2e_new_156_a_timeout_releases_the_repository_lock, this commit)
 
 ## Functional Requirements
 

@@ -441,6 +441,9 @@ fn d_gitlab_secret_env() -> String {
 fn d_gitlab_url() -> String {
     "https://gitlab.com".into()
 }
+fn d_remote_timeout_secs() -> u64 {
+    120
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -458,6 +461,10 @@ pub struct GitConfig {
     /// exclusively by `git::remote` (FR-NEW-065), which is also the only place
     /// that reads an entry's value.
     pub hosts: crate::git::remote::HostMap,
+    /// Deadline for one clone, push, fetch or pull (FR-NEW-044, DEC-032).
+    /// Enforced by `git::remote::with_remote_deadline`, the single wrapper all
+    /// four operations share.
+    pub remote_timeout_secs: u64,
 }
 impl Default for GitConfig {
     fn default() -> Self {
@@ -472,6 +479,7 @@ impl Default for GitConfig {
             gitlab_client_secret_env: d_gitlab_secret_env(),
             gitlab_instance_url: d_gitlab_url(),
             hosts: crate::git::remote::HostMap::default(),
+            remote_timeout_secs: d_remote_timeout_secs(),
         }
     }
 }
@@ -1078,6 +1086,19 @@ mod tests {
         assert_eq!(c.git.max_pack_size_mb, 512);
         assert_eq!(c.git.github_client_secret_env, "MCPFS_GITHUB_CLIENT_SECRET");
         assert_eq!(c.git.gitlab_instance_url, "https://gitlab.com");
+        assert_eq!(c.git.remote_timeout_secs, 120);
+    }
+
+    /// E2E-NEW-157: the timeout default is 120 and is configurable
+    /// (FR-NEW-044, DEC-032).
+    #[test]
+    fn e2e_new_157_the_timeout_default_is_120_and_is_configurable() {
+        let parsed: ServerConfig = serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+        assert_eq!(parsed.git.remote_timeout_secs, 120);
+
+        let parsed: ServerConfig =
+            serde_yaml::from_str("git:\n  remote_timeout_secs: 5\n").unwrap();
+        assert_eq!(parsed.git.remote_timeout_secs, 5);
     }
 
     #[test]

@@ -272,6 +272,7 @@ doc_service:
 | `gitlab_client_id` | string | `""` | GitLab application id |
 | `gitlab_client_secret_env` | string | `GITLAB_CLIENT_SECRET` | name of the env var holding the GitLab secret |
 | `gitlab_instance_url` | string | `https://gitlab.com` | base URL for a self hosted GitLab |
+| `remote_timeout_secs` | int | `120` | deadline for one clone/push/fetch/pull; expiry releases the per-repository write lock (DEC-032) |
 
 Details in [`.agent_docs/git.md`](git.md).
 

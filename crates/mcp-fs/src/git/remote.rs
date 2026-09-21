@@ -27,6 +27,7 @@ use std::fmt;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -242,7 +243,17 @@ pub fn validate_remote_url(raw: &str) -> Result<url::Url> {
 /// E2E-NEW-197): clone and push both call this one function rather than each
 /// constructing their own, so the credential-supply property this proves rests
 /// on one implementation, not two.
-fn credential_callbacks(token: Option<String>) -> git2::RemoteCallbacks<'static> {
+///
+/// `deadline`, when set, is also wired into `transfer_progress` (FR-NEW-044,
+/// DRIFT-009): a transfer already under way can observe the same deadline the
+/// caller's `tokio::time::timeout` around the whole operation enforces, and
+/// abort by returning `false`. This is best-effort, secondary enforcement
+/// only: `transfer_progress` does not fire during connect or the TLS
+/// handshake, so the outer timeout is what actually bounds a hang there.
+fn credential_callbacks(
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
     if let Some(t) = token {
         // The provider expects the token as the password; "oauth2" is the
@@ -250,18 +261,29 @@ fn credential_callbacks(token: Option<String>) -> git2::RemoteCallbacks<'static>
         callbacks
             .credentials(move |_url, _user, _types| git2::Cred::userpass_plaintext("oauth2", &t));
     }
+    if let Some(deadline) = deadline {
+        callbacks.transfer_progress(move |_progress| Instant::now() < deadline);
+    }
     callbacks
 }
 
 /// Clone into a real directory: libgit2 needs a filesystem to clone into.
+///
+/// `deadline` is the same instant the caller's `tokio::time::timeout` around
+/// this whole call is racing (FR-NEW-044): wired into `transfer_progress` so a
+/// transfer already under way can also observe it (DRIFT-009). The blocking
+/// OS thread this runs on is not killed by either mechanism; it keeps running
+/// until its own socket or TLS operation errors out on its own, which is a
+/// known, accepted limitation, not a defect this hides.
 pub fn clone_to_temp(
     url: &str,
     into: &Path,
     branch: Option<&str>,
     depth: i64,
     token: Option<String>,
+    deadline: Option<Instant>,
 ) -> Result<git2::Repository> {
-    let callbacks = credential_callbacks(token);
+    let callbacks = credential_callbacks(token, deadline);
     let mut fetch = git2::FetchOptions::new();
     fetch.remote_callbacks(callbacks);
     if depth > 0 {
@@ -336,6 +358,7 @@ pub fn push_to_remote(
     branch: &str,
     local_sha: &str,
     token: Option<String>,
+    deadline: Option<Instant>,
 ) -> Result<PushOutcome> {
     let mut remote = repo
         .remote_anonymous(origin_url)
@@ -348,7 +371,7 @@ pub fn push_to_remote(
     let rejected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let rejected_cell = rejected.clone();
 
-    let mut callbacks = credential_callbacks(token);
+    let mut callbacks = credential_callbacks(token, deadline);
     callbacks.push_negotiation(move |updates| {
         for u in updates {
             if u.dst_refname() == Some(dst_for_negotiation.as_str()) {
@@ -468,6 +491,7 @@ pub fn fetch_from_remote(
     repo: &git2::Repository,
     origin_url: &str,
     token: Option<String>,
+    deadline: Option<Instant>,
 ) -> Result<FetchOutcome> {
     let mut remote =
         repo.remote_anonymous(origin_url).map_err(|e| connection_error(origin_url, &e))?;
@@ -476,7 +500,7 @@ pub fn fetch_from_remote(
     // (DEC-037): the caller diffs this against its prior
     // `refs/remotes/origin/*` view to find what went stale.
     let advertised_branches: Vec<String> = {
-        let list_callbacks = credential_callbacks(token.clone());
+        let list_callbacks = credential_callbacks(token.clone(), deadline);
         let conn = remote
             .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
             .map_err(|e| connection_error(origin_url, &e))?;
@@ -490,7 +514,7 @@ pub fn fetch_from_remote(
 
     let updates: Rc<RefCell<Vec<FetchRefUpdate>>> = Rc::new(RefCell::new(Vec::new()));
     let updates_cell = updates.clone();
-    let mut callbacks = credential_callbacks(token);
+    let mut callbacks = credential_callbacks(token, deadline);
     callbacks.update_tips(move |refname, old, new| {
         updates_cell.borrow_mut().push(FetchRefUpdate {
             ref_name: refname.to_string(),
@@ -523,11 +547,52 @@ pub fn fetch_from_remote(
 /// `require_valid_credential`. This is always `ERR_INTERNAL_ERROR`, so the two
 /// are machine-distinguishable by code alone.
 fn connection_error(origin_url: &str, e: &git2::Error) -> ToolError {
-    let host = url::Url::parse(origin_url)
+    let host = extract_host(origin_url);
+    ToolError::internal(format!("fetch from host '{host}' failed: {e}"))
+}
+
+/// The bare hostname of a URL, or the URL itself when it does not parse: the
+/// one place [`connection_error`] and [`timeout_error`] both get a host to
+/// name from a URL that was already validated by [`validate_remote_url`] at
+/// record time, so a parse failure here cannot actually occur in production.
+pub(crate) fn extract_host(url: &str) -> String {
+    url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| origin_url.to_string());
-    ToolError::internal(format!("fetch from host '{host}' failed: {e}"))
+        .unwrap_or_else(|| url.to_string())
+}
+
+/// Governs every remote operation's network round trip: clone, push, fetch
+/// and pull all pass through this one function (FR-NEW-044), so the deadline
+/// is proved once, not four times. `future` is the `on_git_thread`-wrapped
+/// blocking call; the caller must have already acquired the per-repository
+/// `write_lock` itself, before this function is ever invoked, never inside
+/// the blocking closure `future` wraps (DRIFT-009). When the deadline fires,
+/// `tokio::time::timeout` drops `future` and this returns `Err` immediately;
+/// the caller's own `?` then unwinds its stack frame, dropping the
+/// `write_lock` guard it is holding right there, which is what actually
+/// releases the lock (E2E-NEW-156) even though the orphaned blocking OS
+/// thread the network call was running on is NOT stopped: `git2` 0.20.4
+/// exposes no cancellation handle, so that thread keeps running until its own
+/// socket or TLS operation eventually errors out at the OS layer. That is a
+/// known, accepted limitation, not a defect this function hides.
+pub async fn with_remote_deadline<T>(
+    timeout_secs: u64,
+    host: &str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), future).await {
+        Ok(result) => result,
+        Err(_) => Err(timeout_error(host, timeout_secs)),
+    }
+}
+
+/// FR-NEW-049: the frozen code and message prefix for a remote deadline
+/// expiry, naming the host.
+fn timeout_error(host: &str, timeout_secs: u64) -> ToolError {
+    ToolError::internal(format!(
+        "remote timeout: host '{host}' did not respond within {timeout_secs}s"
+    ))
 }
 
 /// The dedicated, distinct identity for a non-fast-forward refusal
@@ -542,8 +607,8 @@ fn connection_error(origin_url: &str, e: &git2::Error) -> ToolError {
 /// reported through `push_update_reference`'s status message (what a real
 /// smart-HTTP remote sends).
 fn non_fast_forward_error(branch: &str) -> ToolError {
-    ToolError::no_clobber(format!(
-        "push of branch '{branch}' was refused: non-fast-forward, and force is not supported"
+    ToolError::invalid_argument(format!(
+        "push refused: not a fast-forward: branch '{branch}', force is not supported"
     ))
 }
 
@@ -954,13 +1019,15 @@ pub(crate) mod tests {
 
     // ── FR-NEW-024: push rejections are classified into distinct identities ──
 
-    /// E2E-NEW-076 (unit half): a status message containing "non-fast-forward"
-    /// is classified with a dedicated identity, naming the branch and stating
-    /// force is not supported.
+    /// E2E-NEW-076 / E2E-NEW-181 (unit half): a status message containing
+    /// "non-fast-forward" is classified with a dedicated identity, the frozen
+    /// prefix (FR-NEW-049), naming the branch and stating force is not
+    /// supported.
     #[test]
     fn a_non_fast_forward_status_gets_a_dedicated_identity() {
         let err = classify_push_rejection("non-fast-forward", "main");
-        assert_eq!(err.code, crate::errors::code::NO_CLOBBER);
+        assert_eq!(err.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(err.message.starts_with("push refused: not a fast-forward"), "got {}", err.message);
         assert!(err.message.contains("main"), "got {}", err.message);
         assert!(err.message.to_ascii_lowercase().contains("force"), "got {}", err.message);
     }
@@ -972,7 +1039,7 @@ pub(crate) mod tests {
     fn e2e_new_079_a_protected_branch_rejection_surfaces_the_remotes_reason() {
         let msg = "GH006: Protected branch update failed for refs/heads/main.";
         let err = classify_push_rejection(msg, "main");
-        assert_ne!(err.code, crate::errors::code::NO_CLOBBER);
+        assert_ne!(err.code, crate::errors::code::INVALID_ARGUMENT);
         assert!(err.message.contains("main"), "must name the branch: {}", err.message);
         assert!(err.message.contains(msg), "must surface the remote's own text: {}", err.message);
     }
@@ -983,7 +1050,7 @@ pub(crate) mod tests {
     fn non_fast_forward_and_any_other_rejection_are_distinguishable() {
         let ff = classify_push_rejection("non-fast-forward", "main");
         let other = classify_push_rejection("GH006: Protected branch update failed.", "main");
-        assert_eq!(ff.code, crate::errors::code::NO_CLOBBER);
+        assert_eq!(ff.code, crate::errors::code::INVALID_ARGUMENT);
         assert_ne!(ff.code, other.code);
     }
 }
