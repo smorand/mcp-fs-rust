@@ -62,6 +62,7 @@ impl std::fmt::Debug for OAuthSession {
 
 /// Sessions plus the original casing of the ids, needed to write through to
 /// persistence with the same person/host strings the caller used.
+#[derive(Clone)]
 struct Entry {
     person: String,
     host: String,
@@ -123,6 +124,12 @@ impl OAuthTokenStore {
         self.persistence.is_some()
     }
 
+    /// Writes memory first, then persistence when configured. A persistence
+    /// failure rolls the in-memory entry back to whatever was there before
+    /// this call (removed if there was none, restored otherwise), so a
+    /// reported failure never leaves a live credential behind (FR-NEW-064).
+    /// Both callers, `git.token_set` and the device-flow poller, share this
+    /// one rollback path rather than each reimplementing it.
     #[allow(clippy::too_many_arguments)]
     pub async fn store_token(
         &self,
@@ -141,19 +148,33 @@ impl OAuthTokenStore {
             expires_at,
             instance_url,
         };
-        {
+        let k = key(person, host);
+        let previous = {
             let mut guard = self.sessions.write().expect("token store lock poisoned");
+            let previous = guard.get(&k).cloned();
             guard.insert(
-                key(person, host),
+                k.clone(),
                 Entry {
                     person: person.to_string(),
                     host: host.to_string(),
                     session: session.clone(),
                 },
             );
-        }
-        if let Some(p) = &self.persistence {
-            p.upsert(person, host, &session).await?;
+            previous
+        };
+        if let Some(p) = &self.persistence
+            && let Err(e) = p.upsert(person, host, &session).await
+        {
+            let mut guard = self.sessions.write().expect("token store lock poisoned");
+            match previous {
+                Some(prev) => {
+                    guard.insert(k, prev);
+                }
+                None => {
+                    guard.remove(&k);
+                }
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -506,5 +527,136 @@ mod tests {
             assert!(!s.is_persistent());
             assert!(!dir.path().join("state/oauth.db").exists());
         }
+    }
+
+    // ── FR-NEW-064: a failed persistence write rolls the memory write back ────
+
+    /// A `RelationalDb` wrapping a real in-memory SQLite database: `migrate`
+    /// and `query` delegate untouched (so `RelationalOAuthPersistence::open`
+    /// succeeds normally), but `execute` fails once armed via [`Self::arm`].
+    /// `upsert` is the only caller of `execute` on this trait, so arming it
+    /// fails exactly the persistence write `store_token` performs, without
+    /// touching the schema migration that already ran during `open`.
+    struct FailingDb {
+        inner: crate::storage::rel::SqliteRelationalDb,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingDb {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage::rel::SqliteRelationalDb::open_in_memory().unwrap(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::rel::RelationalDb for FailingDb {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+
+        async fn execute(&self, query: &crate::storage::rel::Query) -> Result<u64> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::errors::ToolError::internal(
+                    "failingdb: persistence unavailable",
+                ));
+            }
+            self.inner.execute(query).await
+        }
+
+        async fn query(
+            &self,
+            query: &crate::storage::rel::Query,
+        ) -> Result<Vec<crate::storage::rel::RowValues>> {
+            self.inner.query(query).await
+        }
+
+        async fn begin(&self) -> Result<Box<dyn crate::storage::rel::RelationalTx>> {
+            self.inner.begin().await
+        }
+
+        async fn migrate(&self, schema: &crate::storage::rel::SchemaSet) -> Result<()> {
+            self.inner.migrate(schema).await
+        }
+    }
+
+    async fn failing_persistent_store() -> (Arc<FailingDb>, OAuthTokenStore) {
+        let db = Arc::new(FailingDb::new());
+        let persistence = Arc::new(
+            RelationalOAuthPersistence::open(db.clone(), [20u8; cipher::KEY_SIZE]).await.unwrap(),
+        );
+        let store = OAuthTokenStore::with_persistence(persistence).await.unwrap();
+        (db, store)
+    }
+
+    /// A failed persistence write on an empty store leaves no in-memory entry:
+    /// the store level half of E2E-NEW-221/030.
+    #[tokio::test]
+    async fn store_token_rolls_back_to_nothing_when_persistence_fails_from_empty() {
+        let (db, s) = failing_persistent_store().await;
+        db.arm();
+
+        let e = s
+            .store_token(
+                "alice@test.com",
+                "github.ibm.com",
+                "github",
+                "ghp_new",
+                vec![],
+                Some(future()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(
+            e.code,
+            crate::errors::code::INVALID_ARGUMENT,
+            "distinct from a validation error"
+        );
+        assert!(
+            s.get_token("alice@test.com", "github.ibm.com").is_none(),
+            "the memory write must not survive a persistence failure"
+        );
+    }
+
+    /// A failed persistence write restores the entry that was present before
+    /// the call: the store level half of E2E-NEW-222.
+    #[tokio::test]
+    async fn store_token_restores_the_previous_entry_when_persistence_fails() {
+        let (db, s) = failing_persistent_store().await;
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_old",
+            vec!["repo".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.arm();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "ghp_new",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let got = s.get_token("alice@test.com", "github.ibm.com").unwrap();
+        assert_eq!(got.access_token, "ghp_old", "the prior token must still be in place");
+        assert_eq!(got.scopes, vec!["repo"]);
     }
 }

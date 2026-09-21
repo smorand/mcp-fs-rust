@@ -23,6 +23,11 @@ use std::time::Duration;
 /// reports them when no provider is given.
 pub const PROVIDERS: [&str; 2] = ["github", "gitlab"];
 
+/// The bound `git.token_set` enforces on a seeded token (DEC-033): a
+/// denial-of-service bound, matching `TextKey`'s length ceiling on the
+/// persisted column (`crates/mcp-fs/src/git/oauth/persistence.rs:33-34`).
+const MAX_TOKEN_LEN: usize = 8192;
+
 /// A provider that returns `interval: 0` must not turn the poll loop into a spin.
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -113,7 +118,7 @@ pub fn register_with(
         }),
     );
 
-    let t = tokens;
+    let t = tokens.clone();
     reg.add(
         ToolSchema::new("git.auth_revoke", "Revoke the stored token for a provider.")
             .req_str("provider", "Provider whose stored token is revoked: github or gitlab."),
@@ -123,6 +128,43 @@ pub fn register_with(
                 let provider = a.str("provider")?;
                 let tokens = resolve_tokens(&ctx, t).await?;
                 auth_revoke(&ctx, &provider, &tokens).await
+            }
+        }),
+    );
+
+    let t = tokens;
+    reg.add(
+        ToolSchema::new(
+            "git.token_set",
+            "Seed a personal access token you already hold for a host declared in git.hosts, \
+             without the interactive device flow. The token is never echoed back.",
+        )
+        .req_str("host", "Hostname declared in git.hosts to store the token for.")
+        .req_str(
+            "token",
+            "The personal access token value. Never echoed back; 1 to 8192 characters.",
+        )
+        .opt_str_null(
+            "expires_at",
+            "RFC 3339 timestamp the token expires at; omit or null for a token that never \
+             expires.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let t = t.clone();
+            async move {
+                let host = a.str("host")?;
+                let token = a.str("token")?;
+                let expires_at = match a.raw("expires_at") {
+                    None => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(_) => {
+                        return Err(ToolError::invalid_argument(
+                            "argument 'expires_at' must be an RFC 3339 timestamp string",
+                        ));
+                    }
+                };
+                let tokens = resolve_tokens(&ctx, t).await?;
+                token_set(&ctx, &host, &token, expires_at, &tokens).await
             }
         }),
     );
@@ -268,6 +310,81 @@ async fn auth_revoke(ctx: &ToolCtx, provider: &str, tokens: &OAuthTokenStore) ->
     Ok(json!({"provider": provider, "revoked": true}))
 }
 
+/// `git.token_set` (FR-NEW-013): store a token the caller already holds,
+/// instead of forcing the interactive device flow for a credential the caller
+/// already possesses. The provider is resolved from `git.hosts`
+/// (`crate::git::remote::resolve_host`), never supplied by the caller.
+async fn token_set(
+    ctx: &ToolCtx,
+    host: &str,
+    token: &str,
+    expires_at: Option<String>,
+    tokens: &OAuthTokenStore,
+) -> Result<Value> {
+    let person = require_identity(ctx)?;
+
+    use crate::git::remote::Provider;
+    let provider = crate::git::remote::resolve_host(host).map_err(|_| {
+        ToolError::invalid_argument(format!(
+            "host '{host}' is not declared in git.hosts; declare it under git.hosts before \
+             seeding a token for it"
+        ))
+    })?;
+    if provider == Provider::Anonymous {
+        return Err(ToolError::invalid_argument(format!(
+            "host '{host}' is declared anonymous: an anonymous host holds no credential"
+        )));
+    }
+    let provider_name = match provider {
+        Provider::Github => "github",
+        Provider::Gitlab => "gitlab",
+        Provider::Generic => "generic",
+        Provider::Anonymous => unreachable!("handled above"),
+    };
+
+    if token.trim().is_empty() {
+        return Err(ToolError::invalid_argument("token must not be empty or whitespace-only"));
+    }
+    if token.chars().count() > MAX_TOKEN_LEN {
+        return Err(ToolError::invalid_argument(format!(
+            "token must be at most {MAX_TOKEN_LEN} characters"
+        )));
+    }
+
+    // A past expiry is accepted (DEC-017, FR-NEW-052): the token is simply
+    // already expired at seed time, reported so by `git.auth_status` rather
+    // than rejected here.
+    let expires_at = match expires_at {
+        Some(s) => Some(
+            DateTime::parse_from_rfc3339(&s)
+                .map_err(|_| {
+                    ToolError::invalid_argument(format!(
+                        "argument 'expires_at' must be an RFC 3339 timestamp, got '{s}'"
+                    ))
+                })?
+                .with_timezone(&Utc),
+        ),
+        None => None,
+    };
+
+    tokens.store_token(&person, host, provider_name, token, Vec::new(), expires_at, None).await?;
+
+    let persistent = tokens.is_persistent();
+    let mut out = json!({
+        "host": host,
+        "provider": provider_name,
+        "stored": true,
+        "persistent": persistent,
+    });
+    if !persistent {
+        out["message"] = json!(
+            "Stored in memory only: this token lives only for the current process and will \
+             not survive a restart because MCPFS_TOKEN_KEY is not configured."
+        );
+    }
+    Ok(out)
+}
+
 /// The C# `DateTimeOffset.ToString("O")`: seven fractional digits (100ns ticks)
 /// plus an explicit offset, which is always UTC here.
 fn round_trip_iso(dt: DateTime<Utc>) -> String {
@@ -371,8 +488,8 @@ mod tests {
     async fn every_git_auth_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 3);
-        for name in ["git.auth", "git.auth_status", "git.auth_revoke"] {
+        assert_eq!(r.len(), 4);
+        for name in ["git.auth", "git.auth_status", "git.auth_revoke", "git.token_set"] {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
     }
@@ -618,5 +735,574 @@ mod tests {
         assert_eq!(round_trip_iso(dt), "2023-11-14T22:13:20.1234567+00:00");
         let whole = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         assert_eq!(round_trip_iso(whole), "2023-11-14T22:13:20.0000000+00:00");
+    }
+
+    // ── git.token_set (US-004) ───────────────────────────────────────────────────────
+    //
+    // Every test touching the process wide `git.hosts` map is a plain `#[test]`
+    // run through `with_git_hosts_lock`, mirroring `tools/git.rs`'s own
+    // convention for the same reason: the map is a `static`, and holding the
+    // lock across an `.await` (needed for the whole setup-through-assertions
+    // span) is what `with_git_hosts_lock`'s private `block_on` achieves without
+    // tripping clippy's `await_holding_lock`.
+    //
+    // E2E-NEW-022 is a partial, store level test: `resolve_clone_credential`
+    // (`crates/mcp-fs/src/tools/git.rs:687`) still resolves a stored token by
+    // provider name, not by the real host, because wiring `git.remote_clone`'s
+    // credential lookup onto `git.hosts` is US-006's job, and that function is
+    // private to `git.rs`, outside this story's two-file scope. This suite
+    // proves the store level contract that wiring will read from instead: the
+    // exact token `git.token_set` stores for `(person, host)` comes back
+    // unmodified, ready to be supplied to the remote as `oauth2:<token>`
+    // (`crates/mcp-fs/src/tools/git.rs:1046-1049`).
+
+    const GHP: &str = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+
+    const REFERENCE_HOSTS: &[(&str, &str)] = &[
+        ("github.com", "github"),
+        ("github.ibm.com", "github"),
+        ("gitlab.acme.corp", "gitlab"),
+        ("git.acme.internal", "generic"),
+        ("public.example.org", "anonymous"),
+    ];
+
+    fn declare_hosts(pairs: &[(&str, &str)]) {
+        let mut cfg = crate::config::GitConfig::default();
+        cfg.hosts.0 = pairs.iter().map(|(h, p)| (h.to_string(), p.to_string())).collect();
+        crate::git::remote::validate_hosts(&cfg).expect("a valid host map");
+    }
+
+    fn with_git_hosts_lock<F: std::future::Future>(f: F) -> F::Output {
+        let _guard = crate::git::remote::tests::lock_for_test();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    async fn token_set_registry(tokens: Arc<OAuthTokenStore>) -> (Fixture, ToolRegistry) {
+        let f = Fixture::with_config(|c| c.git.enabled = true).await;
+        let mut r = ToolRegistry::new();
+        register_with(&mut r, Some(tokens), None);
+        (f, r)
+    }
+
+    /// A `RelationalDb` wrapping a real in-memory SQLite database: `migrate`
+    /// and `query` delegate untouched, so opening the store succeeds
+    /// normally, but `execute` fails once [`Self::arm`] is called. `upsert` is
+    /// the only caller of `execute` on this trait, so arming it fails exactly
+    /// the persistence write `store_token` performs.
+    struct FailingDb {
+        inner: crate::storage::rel::SqliteRelationalDb,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingDb {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage::rel::SqliteRelationalDb::open_in_memory().unwrap(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::rel::RelationalDb for FailingDb {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+
+        async fn execute(&self, query: &crate::storage::rel::Query) -> Result<u64> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ToolError::internal("failingdb: persistence unavailable"));
+            }
+            self.inner.execute(query).await
+        }
+
+        async fn query(
+            &self,
+            query: &crate::storage::rel::Query,
+        ) -> Result<Vec<crate::storage::rel::RowValues>> {
+            self.inner.query(query).await
+        }
+
+        async fn begin(&self) -> Result<Box<dyn crate::storage::rel::RelationalTx>> {
+            self.inner.begin().await
+        }
+
+        async fn migrate(&self, schema: &crate::storage::rel::SchemaSet) -> Result<()> {
+            self.inner.migrate(schema).await
+        }
+    }
+
+    async fn failing_persistent_store() -> (Arc<FailingDb>, Arc<OAuthTokenStore>) {
+        let db = Arc::new(FailingDb::new());
+        let persistence = Arc::new(
+            crate::git::oauth::persistence::RelationalOAuthPersistence::open(
+                db.clone(),
+                [30u8; crate::git::oauth::cipher::KEY_SIZE],
+            )
+            .await
+            .unwrap(),
+        );
+        let store = Arc::new(OAuthTokenStore::with_persistence(persistence).await.unwrap());
+        (db, store)
+    }
+
+    #[tokio::test]
+    async fn git_token_set_is_registered_and_takes_no_provider_parameter() {
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+        let s = &r.resolve("git.token_set").unwrap().schema;
+        let schema = s.input_schema();
+        assert!(schema["properties"].get("provider").is_none());
+        assert_eq!(schema["required"], json!(["host", "token"]));
+    }
+
+    #[test]
+    fn e2e_new_020_seeding_stores_a_token_for_a_declared_host() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            // Persistence configured (unarmed, so it succeeds), matching
+            // FR-NEW-013's example output of `"persistent": true` exactly.
+            let (_db, tokens) = failing_persistent_store().await;
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let out = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap();
+            assert_eq!(
+                out,
+                json!({"host":"github.ibm.com","provider":"github","stored":true,"persistent":true})
+            );
+
+            let s = tokens.get_token(PERSON, "github.ibm.com").unwrap();
+            assert_eq!(s.provider, "github");
+            assert_eq!(s.access_token, GHP);
+            assert!(tokens.has_valid_token(PERSON, "github.ibm.com"), "validity is 'valid'");
+        });
+    }
+
+    #[test]
+    fn e2e_new_021_seeding_derives_the_provider_from_the_map_not_the_caller() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let schema = r.resolve("git.token_set").unwrap().schema.input_schema();
+            assert!(
+                schema["properties"].get("provider").is_none(),
+                "the tool schema must expose no provider parameter"
+            );
+
+            f.call(&r, PERSON, "git.token_set", json!({"host":"git.acme.internal","token":GHP}))
+                .await
+                .unwrap();
+            assert_eq!(tokens.get_token(PERSON, "git.acme.internal").unwrap().provider, "generic");
+        });
+    }
+
+    #[test]
+    fn e2e_new_022_a_seeded_token_is_the_exact_credential_a_clone_would_supply() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let out = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap();
+            assert_eq!(out["auth".to_string()], Value::Null, "no such key: not this tool's shape");
+            assert_eq!(out["provider"], "github");
+
+            let s = tokens.get_token(PERSON, "github.ibm.com").unwrap();
+            assert_eq!(
+                s.access_token, GHP,
+                "the exact bytes a clone would pass as the oauth2 password"
+            );
+            assert!(s.is_valid_at(Utc::now()));
+        });
+    }
+
+    #[test]
+    fn e2e_new_023_the_response_never_echoes_the_token() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens).await;
+
+            let out = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap();
+            let serialized = serde_json::to_string(&out).unwrap();
+            for start in 0..=(GHP.len() - 8) {
+                let chunk = &GHP[start..start + 8];
+                assert!(!serialized.contains(chunk), "response must not contain '{chunk}'");
+            }
+        });
+    }
+
+    #[test]
+    fn e2e_new_024_an_empty_token_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let e = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":""}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none());
+        });
+    }
+
+    #[test]
+    fn e2e_new_025_a_whitespace_only_token_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let e = f
+                .call(
+                    &r,
+                    PERSON,
+                    "git.token_set",
+                    json!({"host":"github.ibm.com","token":"   \t\n "}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none());
+        });
+    }
+
+    #[test]
+    fn e2e_new_026_a_token_over_the_bound_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let long = "a".repeat(8193);
+            let e = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":long}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none());
+        });
+    }
+
+    #[test]
+    fn e2e_new_027_an_undeclared_host_is_rejected_for_seeding() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let e = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"git.unknown.test","token":GHP}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+            assert!(e.message.contains("git.unknown.test"), "{}", e.message);
+            assert!(tokens.get_token(PERSON, "git.unknown.test").is_none());
+        });
+    }
+
+    #[test]
+    fn e2e_new_028_an_anonymous_host_is_rejected_for_seeding() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let e = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"public.example.org","token":GHP}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+            assert!(e.message.contains("public.example.org"), "{}", e.message);
+            assert!(
+                e.message.to_ascii_lowercase().contains("anonymous")
+                    && e.message.to_ascii_lowercase().contains("no credential"),
+                "the message must state an anonymous host holds no credential: {}",
+                e.message
+            );
+        });
+    }
+
+    #[test]
+    fn e2e_new_029_an_unauthenticated_caller_is_rejected_for_token_set() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens).await;
+
+            let e = f
+                .call(&r, "  ", "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::UNAUTHENTICATED);
+        });
+    }
+
+    #[test]
+    fn e2e_new_030_a_failing_persistence_write_fails_the_call() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (db, tokens) = failing_persistent_store().await;
+            assert!(tokens.is_persistent());
+            db.arm();
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let e = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap_err();
+            assert_ne!(e.code, code::INVALID_ARGUMENT, "distinguishable from a validation failure");
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none(), "never reports stored");
+        });
+    }
+
+    #[test]
+    fn e2e_new_031_seeding_twice_overwrites_leaving_one_token() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":"ghp_FIRST0000000000000000000000000"}),
+            )
+            .await
+            .unwrap();
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":"ghp_SECOND000000000000000000000000"}),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                tokens.list_ids(),
+                vec![(PERSON.to_string(), "github.ibm.com".to_string())],
+                "exactly one token stored for (person, host)"
+            );
+            assert_eq!(
+                tokens.get_token(PERSON, "github.ibm.com").unwrap().access_token,
+                "ghp_SECOND000000000000000000000000"
+            );
+        });
+    }
+
+    #[test]
+    fn e2e_new_034_a_token_at_exactly_the_bound_is_accepted() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let exact = "a".repeat(8192);
+            f.call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":exact}))
+                .await
+                .unwrap();
+            let stored = tokens.get_token(PERSON, "github.ibm.com").unwrap().access_token;
+            assert_eq!(stored.len(), 8192, "stored intact, not truncated");
+        });
+    }
+
+    #[test]
+    fn e2e_new_035_memory_only_operation_is_reported_explicitly() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            assert!(!tokens.is_persistent(), "MCPFS_TOKEN_KEY is unset in this fixture");
+            let (f, r) = token_set_registry(tokens).await;
+
+            let out = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap();
+            assert_eq!(out["persistent"], false);
+            let msg = out["message"].as_str().expect("a message explaining memory-only storage");
+            assert!(
+                msg.to_ascii_lowercase().contains("process")
+                    || msg.to_ascii_lowercase().contains("restart"),
+                "got {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn e2e_new_191_an_rfc3339_expires_at_is_accepted_in_any_offset() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP,"expires_at":"2027-01-01T00:00:00Z"}),
+            )
+            .await
+            .unwrap();
+            let e1 = tokens.get_token(PERSON, "github.ibm.com").unwrap().expires_at.unwrap();
+
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({
+                    "host":"github.ibm.com","token":GHP,"expires_at":"2027-01-01T01:00:00+01:00"
+                }),
+            )
+            .await
+            .unwrap();
+            let e2 = tokens.get_token(PERSON, "github.ibm.com").unwrap().expires_at.unwrap();
+
+            assert_eq!(e1, e2, "both offsets must store the same instant");
+        });
+    }
+
+    #[test]
+    fn e2e_new_192_a_non_rfc3339_expires_at_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            for bad in [json!(1_798_761_600i64), json!("tomorrow")] {
+                let e = f
+                    .call(
+                        &r,
+                        PERSON,
+                        "git.token_set",
+                        json!({"host":"github.ibm.com","token":GHP,"expires_at":bad}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(e.code, code::INVALID_ARGUMENT, "{bad:?}");
+                assert!(e.message.contains("expires_at"), "{}", e.message);
+            }
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none());
+        });
+    }
+
+    #[test]
+    fn e2e_new_193_a_past_expires_at_is_accepted_and_reports_expired() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":GHP,"expires_at":past}),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                !tokens.has_valid_token(PERSON, "github.ibm.com"),
+                "an already-expired token reports invalid"
+            );
+            assert!(
+                tokens.get_token(PERSON, "github.ibm.com").is_some(),
+                "the session is still retrievable, only invalid"
+            );
+        });
+    }
+
+    #[test]
+    fn e2e_new_221_a_failed_persistence_write_leaves_no_in_memory_token() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (db, tokens) = failing_persistent_store().await;
+            db.arm();
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            f.call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap_err();
+
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none());
+            assert!(!tokens.has_valid_token(PERSON, "github.ibm.com"));
+        });
+    }
+
+    #[test]
+    fn e2e_new_222_a_failed_write_restores_the_previous_token() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (db, tokens) = failing_persistent_store().await;
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":"ghp_OLD00000000000000000000000000"}),
+            )
+            .await
+            .unwrap();
+
+            db.arm();
+            f.call(
+                &r,
+                PERSON,
+                "git.token_set",
+                json!({"host":"github.ibm.com","token":"ghp_NEW00000000000000000000000000"}),
+            )
+            .await
+            .unwrap_err();
+
+            let s = tokens.get_token(PERSON, "github.ibm.com").unwrap();
+            assert_eq!(s.access_token, "ghp_OLD00000000000000000000000000", "prior token intact");
+        });
+    }
+
+    /// E2E-NEW-223: the device-flow poller shares the exact same rollback
+    /// path as `git.token_set` (both call the one `store_token`), so it needs
+    /// no `git.hosts` declaration to prove it: it stores under host = provider
+    /// today (see `spawn_poller` above), never touching the host map at all.
+    #[tokio::test]
+    async fn e2e_new_223_the_device_flow_poller_rolls_back_identically() {
+        let (db, tokens) = failing_persistent_store().await;
+        db.arm();
+        let f = Fixture::with_config(|c| c.git.enabled = true).await;
+        let flow =
+            FakeFlow::new(vec![TokenPoll::granted("gho_stored", vec!["repo".into()], future())]);
+        let mut r = ToolRegistry::new();
+        register_with(&mut r, Some(tokens.clone()), Some(flow.clone()));
+
+        f.call(&r, PERSON, "git.auth", json!({"provider":"github"})).await.unwrap();
+
+        assert!(eventually(|| flow.polls() >= 1).await, "the poller must run at least once");
+        // Give the poller time to attempt (and fail) the armed persistence write.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            tokens.get_token(PERSON, "github").is_none(),
+            "no in-memory token must remain after a failed persistence write"
+        );
     }
 }
