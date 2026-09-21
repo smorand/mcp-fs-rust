@@ -254,6 +254,23 @@ impl OAuthTokenStore {
         out.sort();
         out
     }
+
+    /// Every `(host, session)` held by one person, original host casing.
+    ///
+    /// The single source `git.auth_status` (DRIFT-010, FR-MOD-003) builds its
+    /// response from: one filtered scan of the whole map, matching on the
+    /// lowercased person part of the key, never `list_ids` (which returns
+    /// pairs for every person unfiltered and would leak across people,
+    /// violating FR-NEW-040) followed by per-id lookups.
+    pub fn list_for_person(&self, person: &str) -> Vec<(String, OAuthSession)> {
+        let person_lower = person.to_lowercase();
+        let guard = self.sessions.read().expect("token store lock poisoned");
+        guard
+            .values()
+            .filter(|e| e.person.to_lowercase() == person_lower)
+            .map(|e| (e.host.clone(), e.session.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +418,82 @@ mod tests {
             .await
             .unwrap();
         assert!(s.has_valid_token("c@t.c", "github.com"));
+    }
+
+    /// DRIFT-010's store level half: enumerating one person's held hosts must
+    /// never include another person's rows. `git.auth_status` builds its
+    /// response from this, never from `list_ids`, which returns pairs for
+    /// every person unfiltered.
+    #[tokio::test]
+    async fn list_for_person_never_leaks_another_persons_hosts() {
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.com",
+            "github",
+            "alice-tok",
+            vec!["repo".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_token(
+            "alice@test.com",
+            "github.ibm.com",
+            "github",
+            "alice-ent",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.store_token(
+            "bob@test.com",
+            "github.com",
+            "github",
+            "bob-tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let alice: std::collections::HashSet<String> =
+            s.list_for_person("alice@test.com").into_iter().map(|(h, _)| h).collect();
+        assert_eq!(
+            alice,
+            ["github.com".to_string(), "github.ibm.com".to_string()].into_iter().collect()
+        );
+
+        let bob = s.list_for_person("bob@test.com");
+        assert_eq!(bob.len(), 1, "bob must never see alice's hosts");
+        assert_eq!(bob[0].0, "github.com");
+        assert_eq!(bob[0].1.access_token, "bob-tok");
+
+        assert!(s.list_for_person("nobody@test.com").is_empty());
+    }
+
+    /// The person part of the filter is caseless, matching the store's key.
+    #[tokio::test]
+    async fn list_for_person_is_caseless_on_the_person_part() {
+        let s = store();
+        s.store_token(
+            "Alice@Test.COM",
+            "github.com",
+            "github",
+            "tok",
+            vec![],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.list_for_person("alice@test.com").len(), 1);
+        assert_eq!(s.list_for_person("ALICE@TEST.COM").len(), 1);
+        assert!(s.list_for_person("bob@test.com").is_empty());
     }
 
     #[tokio::test]

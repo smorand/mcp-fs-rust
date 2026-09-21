@@ -83,7 +83,7 @@ The schema change costs nothing extra because US-003 drops and recreates `oauth_
 - **Resolution during implementation:** Add a per-person enumeration to `OAuthTokenStore`, for example `list_for_person(person) -> Vec<(String, OAuthSession)>` filtering on the lowercased person part of the key, and build the response from it. **Using `list_ids` naively would leak every person's hosts and violate FR-NEW-040.**
 - **Detected by:** E2E-MOD-002 fails, because a host with no token would still be listed. E2E-NEW-162 fails, because bob would see alice's hosts.
 - **Blocks which requirement:** FR-MOD-003, FR-NEW-038, and the isolation guarantee of FR-NEW-040.
-- **Status:** open
+- **Status:** resolved (`e2e_new_070_status_distinguishes_expired_from_absent`, `list_for_person_never_leaks_another_persons_hosts`; this commit)
 
 ## Functional Requirements
 
