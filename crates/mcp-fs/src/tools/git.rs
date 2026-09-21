@@ -30,7 +30,7 @@ use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
 use chrono::{DateTime, FixedOffset, Utc};
-use git2::{DiffFormat, DiffOptions, Oid, Repository, Tree};
+use git2::{DiffFormat, DiffOptions, FileFavor, MergeOptions, Oid, Repository, Tree};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -350,17 +350,20 @@ pub fn register_with(
     reg.add(
         ToolSchema::new(
             "git.remote_pull",
-            "Fetch from origin, then fast-forward the checked-out branch to the remote tip and \
-             update the volume's files to match. Refuses a dirty volume (commit or discard \
-             first) and refuses any branch other than the one currently checked out. A \
-             diverged history is not yet supported.",
+            "Fetch from origin, then advance the checked-out branch to the remote tip and update \
+             the volume's files to match. A fast-forward applies directly. A diverged history \
+             is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way \
+             merge resolves every conflicting file by that strategy and creates a merge \
+             commit. Refuses a dirty volume (commit or discard first) and refuses any branch \
+             other than the one currently checked out.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("branch", "Branch to pull; must be the branch currently checked out.")
         .opt_str_null(
             "on_conflict",
-            "Reserved for a future divergence-resolution strategy; ignored whenever the pull \
-             is a fast-forward.",
+            "For a diverged (non fast-forward) history: 'ours' or 'theirs' to resolve every \
+             conflicting file by that strategy and create a merge commit; omit to refuse the \
+             pull instead. Ignored whenever the pull is a fast-forward.",
         ),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), tokens.clone());
@@ -1165,6 +1168,59 @@ async fn fetch_branch(
 
 // ── git.remote_pull ─────────────────────────────────────────────────────────
 
+/// The two global conflict-resolution strategies `on_conflict` accepts
+/// (DEC-024). Matching the raw string is exact and lowercase only, mirroring
+/// `git.auth`'s provider check (`git_auth.rs:160-162`); see
+/// [`parse_on_conflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictStrategy {
+    Ours,
+    Theirs,
+}
+
+impl ConflictStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+        }
+    }
+
+    /// The `MergeOptions::file_favor` this strategy maps to (DEC-024,
+    /// `git2-0.20.4/src/merge.rs:133-136`).
+    fn file_favor(self) -> FileFavor {
+        match self {
+            Self::Ours => FileFavor::Ours,
+            Self::Theirs => FileFavor::Theirs,
+        }
+    }
+}
+
+/// FR-NEW-033: `on_conflict` is absent, exactly `"ours"`, or exactly
+/// `"theirs"`; any other value, including a differently-cased or empty one,
+/// is rejected with `ERR_INVALID_ARGUMENT` naming both accepted values.
+/// Called before the ancestry/fetch logic in [`pull_branch`] ever branches on
+/// the result, so an invalid value never triggers a network call.
+fn parse_on_conflict(value: Option<&str>) -> Result<Option<ConflictStrategy>> {
+    match value {
+        None => Ok(None),
+        Some("ours") => Ok(Some(ConflictStrategy::Ours)),
+        Some("theirs") => Ok(Some(ConflictStrategy::Theirs)),
+        Some(other) => Err(ToolError::invalid_argument(format!(
+            "git.remote_pull: on_conflict must be 'ours' or 'theirs' when supplied, got '{other}'"
+        ))),
+    }
+}
+
+/// The outcome [`pull_branch`] reaches once the fetch and ancestry test have
+/// settled: a fast-forward (US-011/US-012, unchanged by this story) or a
+/// merge (US-013). Carried out of the `on_git_thread` closure so the JSON
+/// response shape can branch on it once back on the async side.
+enum PullOutcome {
+    FastForward { old_sha: String, new_sha: String, files_changed: usize },
+    Merged { strategy: String, merge_commit: String, conflicts_resolved: usize },
+}
+
 /// FR-NEW-063: `branch` must equal what `HEAD` currently points at. Pure
 /// `entry.db` reads only, no repository lock, no libgit2 call: this settles
 /// before [`require_origin`] or [`resolve_clone_credential`] ever run, and
@@ -1246,12 +1302,19 @@ async fn remote_pull(
 /// consistent snapshot: nothing else can commit or write to this repository
 /// between the check and the apply.
 ///
-/// `on_conflict` is accepted but unused here: a divergence-resolution
-/// strategy is out of this story's scope (US-013). When the fetched history
-/// turns out to be a fast-forward regardless of whether `on_conflict` was
-/// supplied, it applies as one (E2E-NEW-134); when it is a genuine
-/// divergence, this returns `ERR_NOT_SUPPORTED` rather than guessing at a
-/// resolution.
+/// `on_conflict`, when the fetched history turns out to be a fast-forward, is
+/// ignored regardless of whether it was supplied (E2E-NEW-134): the
+/// degenerate case is never treated as a divergence just because a strategy
+/// was offered. When it is a genuine divergence (US-013, FR-NEW-030 to
+/// FR-NEW-034): absent, the pull is refused naming `on_conflict` as the way
+/// to merge, with the fetch's results (the remote-tracking ref, the fetched
+/// objects) kept, only the apply refused; `ours` or `theirs`, a three-way
+/// merge resolves every conflicting file by that strategy through
+/// `MergeOptions::file_favor` and `Repository::merge_commits`
+/// (`git2-0.20.4/src/merge.rs:133-136`, `src/repo.rs:2177`), and a merge
+/// commit is created with the previous local tip as first parent and the
+/// fetched remote tip as second (DEC-026, DEC-027). An invalid `on_conflict`
+/// value is rejected up front, before any of this branches on it.
 ///
 /// Split out from [`remote_pull`] exactly like [`push_branch`] is split from
 /// [`remote_push`], so a test can exercise real pull mechanics against a
@@ -1269,13 +1332,17 @@ async fn pull_branch(
     client: Arc<VolumeClient>,
     person: &str,
     safety: Arc<SafetyManager>,
-    _on_conflict: Option<String>,
+    on_conflict: Option<String>,
 ) -> Result<Value> {
+    // FR-NEW-033: validated before any lock is taken, any fetch runs, or the
+    // ancestry branch is even reached.
+    let strategy = parse_on_conflict(on_conflict.as_deref())?;
+
     let (branch_owned, origin_owned, local_sha_owned, person_owned) =
         (branch.to_string(), origin_url.to_string(), local_sha.to_string(), person.to_string());
     let entry_for_thread = entry.clone();
 
-    let (old_sha, new_sha, files_changed) = on_git_thread(move || async move {
+    let outcome = on_git_thread(move || async move {
         let _write = entry_for_thread.write_lock.lock().await;
         let repo = entry_for_thread.repo.lock().await;
         hydrate(&entry_for_thread, &repo).await?;
@@ -1299,7 +1366,11 @@ async fn pull_branch(
             };
 
         if remote_oid == local_oid {
-            return Ok((local_sha_owned.clone(), local_sha_owned.clone(), 0usize));
+            return Ok(PullOutcome::FastForward {
+                old_sha: local_sha_owned.clone(),
+                new_sha: local_sha_owned.clone(),
+                files_changed: 0,
+            });
         }
 
         // FR-NEW-028: ancestry is tested with `graph_descendant_of`, never a
@@ -1308,21 +1379,99 @@ async fn pull_branch(
         let is_ff = repo
             .graph_descendant_of(remote_oid, local_oid)
             .map_err(|e| git_err("ancestry check", e))?;
-        if !is_ff {
-            return Err(ToolError::not_supported(
-                "git.remote_pull: the local and remote branches have diverged; merge \
-                 resolution is not supported yet",
-            ));
-        }
 
         let local_commit =
             repo.find_commit(local_oid).map_err(|e| git_err("find local commit", e))?;
         let remote_commit =
             repo.find_commit(remote_oid).map_err(|e| git_err("find remote commit", e))?;
-        let old_tree = local_commit.tree().map_err(|e| git_err("commit tree", e))?;
-        let new_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let local_tree = local_commit.tree().map_err(|e| git_err("commit tree", e))?;
+        let remote_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
 
-        let changes = diff_tree_changes(&repo, &old_tree, &new_tree)?;
+        if !is_ff {
+            // FR-NEW-030: the fetch above already ran and its results are kept
+            // (`refs/remotes/origin/{branch}` was just advanced); only the
+            // apply below is refused. Divergence is never resolved implicitly.
+            let Some(strategy) = strategy else {
+                return Err(ToolError::not_supported(
+                    "git.remote_pull: local and remote have diverged (not a fast-forward); \
+                     supply on_conflict: 'ours' or 'theirs' to merge",
+                ));
+            };
+
+            // FR-NEW-031: resolved entirely by `file_favor`; this writes no
+            // merge algorithm of its own.
+            let mut merge_opts = MergeOptions::new();
+            merge_opts.file_favor(strategy.file_favor());
+            let mut index = repo
+                .merge_commits(&local_commit, &remote_commit, Some(&merge_opts))
+                .map_err(|e| git_err("merge commits", e))?;
+            // FR-NEW-032: `file_favor` resolves every conflicting region; an
+            // unresolved conflict here would be something the strategy cannot
+            // represent (a rename or type conflict), and this refuses rather
+            // than ever writing a conflict marker or index entry.
+            if index.has_conflicts() {
+                return Err(ToolError::internal(
+                    "git.remote_pull: the merge left unresolved conflicts that 'ours'/'theirs' \
+                     cannot represent",
+                ));
+            }
+            let merged_tree_oid =
+                index.write_tree_to(&repo).map_err(|e| git_err("write merged tree", e))?;
+            let merged_tree =
+                repo.find_tree(merged_tree_oid).map_err(|e| git_err("find merged tree", e))?;
+
+            // Only files with an actual conflicting change on both sides count
+            // (FR-NEW-031's `conflicts_resolved`), not every path either side
+            // touched: diff each side against their common ancestor and
+            // intersect the two path sets.
+            let merge_base_oid =
+                repo.merge_base(local_oid, remote_oid).map_err(|e| git_err("merge base", e))?;
+            let merge_base_commit = repo
+                .find_commit(merge_base_oid)
+                .map_err(|e| git_err("find merge base commit", e))?;
+            let merge_base_tree =
+                merge_base_commit.tree().map_err(|e| git_err("merge base tree", e))?;
+            let local_touched = changed_paths(&repo, &merge_base_tree, &local_tree)?;
+            let remote_touched = changed_paths(&repo, &merge_base_tree, &remote_tree)?;
+            let conflicts_resolved = local_touched.intersection(&remote_touched).count();
+
+            // Reuses the same delta, quota charge and atomic apply the
+            // fast-forward path uses below: a merge only changes which tree is
+            // being applied, never how.
+            let changes = diff_tree_changes(&repo, &local_tree, &merged_tree)?;
+            charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
+            apply_pull_changes_atomically(&client, &repo, &changes).await?;
+
+            // DEC-026: authored and committed by the authenticated person.
+            let name = person_owned.split('@').next().unwrap_or(&person_owned).to_string();
+            let now = Utc::now().timestamp();
+            let sig = git2::Signature::new(&name, &person_owned, &git2::Time::new(now, 0))
+                .map_err(|e| git_err("signature", e))?;
+            // DEC-027: auto-generated, no caller-supplied override.
+            let message = format!(
+                "Merge origin/{branch_owned} into {branch_owned} (conflicts resolved: {})",
+                strategy.as_str()
+            );
+            let pretty =
+                git2::message_prettify(&message, None).map_err(|e| git_err("message", e))?;
+            let merge_oid = repo
+                .commit(None, &sig, &sig, &pretty, &merged_tree, &[&local_commit, &remote_commit])
+                .map_err(|e| git_err("create merge commit", e))?;
+            entry_for_thread.objects.import_from_repo(&repo).await?;
+
+            let branch_ref_name = format!("refs/heads/{branch_owned}");
+            entry_for_thread.db.set_ref(&branch_ref_name, &merge_oid.to_string(), false).await?;
+            let _ =
+                repo.reference(&branch_ref_name, merge_oid, true, "mcp-fs git.remote_pull merge");
+
+            return Ok(PullOutcome::Merged {
+                strategy: strategy.as_str().to_string(),
+                merge_commit: merge_oid.to_string(),
+                conflicts_resolved,
+            });
+        }
+
+        let changes = diff_tree_changes(&repo, &local_tree, &remote_tree)?;
 
         // FR-NEW-069: the single authority on the basis of the pull quota charge.
         // Reuses the delta `diff_tree_changes` already computed above rather than
@@ -1331,14 +1480,7 @@ async fn pull_branch(
         // insufficient quota refuses the pull without writing anything and
         // without advancing the ref below (DEC-036, unlike clone's whole-tree
         // charge at `clone_and_import`, `tools/git.rs:778-782`).
-        let charge_bytes: i64 = changes
-            .iter()
-            .filter_map(|c| match c {
-                TreeChange::Write { oid, .. } => repo.find_blob(*oid).ok().map(|b| b.size() as i64),
-                TreeChange::Delete { .. } => None,
-            })
-            .sum();
-        safety.charge_write(&person_owned, &client.project_id, charge_bytes)?;
+        charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
 
         apply_pull_changes_atomically(&client, &repo, &changes).await?;
 
@@ -1346,17 +1488,50 @@ async fn pull_branch(
         entry_for_thread.db.set_ref(&branch_ref_name, &remote_oid.to_string(), false).await?;
         let _ = repo.reference(&branch_ref_name, remote_oid, true, "mcp-fs git.remote_pull");
 
-        Ok((local_sha_owned.clone(), remote_oid.to_string(), changes.len()))
+        Ok(PullOutcome::FastForward {
+            old_sha: local_sha_owned.clone(),
+            new_sha: remote_oid.to_string(),
+            files_changed: changes.len(),
+        })
     })
     .await?;
 
-    Ok(json!({
-        "old_sha": old_sha,
-        "new_sha": new_sha,
-        "files_changed": files_changed,
-        "merged": false,
-        "auth": auth,
-    }))
+    Ok(match outcome {
+        PullOutcome::FastForward { old_sha, new_sha, files_changed } => json!({
+            "old_sha": old_sha,
+            "new_sha": new_sha,
+            "files_changed": files_changed,
+            "merged": false,
+            "auth": auth,
+        }),
+        PullOutcome::Merged { strategy, merge_commit, conflicts_resolved } => json!({
+            "merged": true,
+            "strategy": strategy,
+            "merge_commit": merge_commit,
+            "conflicts_resolved": conflicts_resolved,
+            "auth": auth,
+        }),
+    })
+}
+
+/// FR-NEW-069: the single authority on the basis of any pull's write-quota
+/// charge, fast-forward or merged. Sums only the size of the blobs actually
+/// written (`TreeChange::Write`); a deleted path never adds bytes.
+fn charge_pull_quota(
+    repo: &Repository,
+    safety: &SafetyManager,
+    person: &str,
+    client: &VolumeClient,
+    changes: &[TreeChange],
+) -> Result<()> {
+    let charge_bytes: i64 = changes
+        .iter()
+        .filter_map(|c| match c {
+            TreeChange::Write { oid, .. } => repo.find_blob(*oid).ok().map(|b| b.size() as i64),
+            TreeChange::Delete { .. } => None,
+        })
+        .sum();
+    safety.charge_write(person, &client.project_id, charge_bytes)
 }
 
 /// FR-NEW-029: the volume's files must match the current branch tip's tree
@@ -1425,6 +1600,23 @@ fn diff_tree_changes(
         }
     }
     Ok(changes)
+}
+
+/// The set of paths one side touched, written or deleted, between two trees.
+/// Used only to find where local and remote changes collide (FR-NEW-031's
+/// `conflicts_resolved`): a path present in both sides' sets had a real
+/// conflicting change; a path only one side touched did not.
+fn changed_paths(
+    repo: &Repository,
+    old_tree: &Tree<'_>,
+    new_tree: &Tree<'_>,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(diff_tree_changes(repo, old_tree, new_tree)?
+        .into_iter()
+        .map(|c| match c {
+            TreeChange::Write { path, .. } | TreeChange::Delete { path } => path,
+        })
+        .collect())
 }
 
 /// Apply every change to the volume, or none of them (FR-NEW-035, DEC-023).
@@ -3365,6 +3557,61 @@ mod tests {
         oid.to_string()
     }
 
+    /// A bare "remote" seeded with several files in its initial commit, the
+    /// setup a US-013 test needs when a single test wants more than one
+    /// independently conflicting path (e.g. E2E-NEW-136).
+    fn seed_bare_remote_files(dir: &std::path::Path, files: &[(&str, &str)]) -> String {
+        let repo = git2::Repository::init_bare(dir).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        for (path, content) in files {
+            let blob = repo.blob(content.as_bytes()).unwrap();
+            builder.insert(*path, blob, MODE_FILE).unwrap();
+        }
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        repo.commit(Some("refs/heads/main"), &sig, &sig, "initial\n", &tree, &[]).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        format!("file://{}", dir.display())
+    }
+
+    /// One commit on the bare "remote" that writes (adds or modifies) every
+    /// `(path, content)` pair given, the shared setup US-013's divergence
+    /// tests need: a real second writer's commit on the same real bare
+    /// repository, never a mock.
+    fn advance_bare_remote_write_many(
+        dir: &std::path::Path,
+        branch_ref: &str,
+        files: &[(&str, &str)],
+    ) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        for (path, content) in files {
+            let blob = repo.blob(content.as_bytes()).unwrap();
+            builder.insert(*path, blob, MODE_FILE).unwrap();
+        }
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_001_000, 0)).unwrap();
+        let oid =
+            repo.commit(Some(branch_ref), &sig, &sig, "remote write\n", &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    /// One commit on the bare "remote" that writes a single path, the common
+    /// case of [`advance_bare_remote_write_many`].
+    fn advance_bare_remote_write(
+        dir: &std::path::Path,
+        branch_ref: &str,
+        path: &str,
+        content: &str,
+    ) -> String {
+        advance_bare_remote_write_many(dir, branch_ref, &[(path, content)])
+    }
+
     /// The current sha of one ref in the bare "remote" repository, read directly
     /// off disk rather than through anything this story's code touches.
     fn bare_ref_sha(dir: &std::path::Path, name: &str) -> Option<String> {
@@ -4323,27 +4570,55 @@ mod tests {
     /// > Given a dirty volume and a remote that has advanced. When the caller
     /// > commits, then pulls with `{"on_conflict": "ours"}`. Then the pull
     /// > succeeds with a merge commit.
-    /// Divergence detection and merge application are US-013's job, explicitly
-    /// out of this story's scope boundary; this test is owned here only by
-    /// the "first FR quoted" rule (FR-NEW-029). Left as a discoverable
-    /// placeholder for US-013 to drop the `#[ignore]` from and implement.
     #[tokio::test]
-    #[ignore = "merge engine not implemented until US-013"]
     async fn e2e_new_123_committing_then_pulling_succeeds_via_merge() {
-        unimplemented!("merge engine: US-013")
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-123");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        // Dirty the volume, then commit, which both cleans it and creates the
+        // local-only commit that diverges it from the remote.
+        e.write("/README.md", "local change\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote change\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
+        assert_eq!(out["merged"], true);
+        assert_eq!(e.read("/README.md").await, "local change\n", "'ours' keeps local content");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 2, "a real merge commit was created");
     }
 
     /// E2E-NEW-127 — The diverged error differs from the dirty error.
     /// > When one pull is refused as dirty and another as diverged. Then the
     /// > two failures are machine-distinguishable.
-    /// Diverged-history detection is US-013's job (this story returns
-    /// `ERR_NOT_SUPPORTED` for a genuine divergence rather than classifying
-    /// it, since classifying implies a resolution strategy this story does
-    /// not implement). Placeholder for US-013.
     #[tokio::test]
-    #[ignore = "merge engine not implemented until US-013"]
     async fn e2e_new_127_the_diverged_error_differs_from_the_dirty_error() {
-        unimplemented!("merge engine: US-013")
+        let e1 = Env::new().await;
+        let remote_dir1 = e1.f.dir.path().join("remote-127-dirty");
+        let url1 = seed_bare_remote(&remote_dir1, "hi\n");
+        call_clone_and_import(&e1, &url1, "anonymous").await.unwrap();
+        e1.write("/README.md", "dirty\n").await;
+        let dirty_err = call_pull_branch(&e1, &url1, "main", "anonymous", None).await.unwrap_err();
+
+        let e2 = Env::new().await;
+        let remote_dir2 = e2.f.dir.path().join("remote-127-diverged");
+        let url2 = seed_bare_remote(&remote_dir2, "hi\n");
+        call_clone_and_import(&e2, &url2, "anonymous").await.unwrap();
+        e2.write("/README.md", "local\n").await;
+        e2.commit("local change").await;
+        advance_bare_remote_write(&remote_dir2, "refs/heads/main", "README.md", "remote\n");
+        let diverged_err =
+            call_pull_branch(&e2, &url2, "main", "anonymous", None).await.unwrap_err();
+
+        assert_eq!(dirty_err.code, code::NO_CLOBBER);
+        assert_eq!(diverged_err.code, code::NOT_SUPPORTED);
+        assert_ne!(dirty_err.code, diverged_err.code, "machine-distinguishable");
     }
 
     /// E2E-NEW-131: a pull with nothing new is idempotent: it succeeds twice,
@@ -4425,6 +4700,254 @@ mod tests {
         let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
         assert_eq!(out["new_sha"], tip);
         assert_eq!(out["merged"], false, "a fast-forward is applied, never a merge");
+    }
+
+    // ── US-013: FR-NEW-030/031/032/033/034, a diverged pull ─────────────────
+
+    /// E2E-NEW-117: a diverged pull with no strategy is refused, naming
+    /// `on_conflict`, and leaves `refs/heads/main` and every volume file
+    /// unchanged.
+    #[tokio::test]
+    async fn e2e_new_117_a_diverged_pull_with_no_strategy_is_refused() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-117");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local change\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote change\n");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        let before_readme = e.read("/README.md").await;
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_SUPPORTED);
+        let lower = err.message.to_ascii_lowercase();
+        assert!(lower.contains("fast-forward"), "got {}", err.message);
+        assert!(lower.contains("on_conflict"), "got {}", err.message);
+
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must be unchanged");
+        assert_eq!(
+            e.read("/README.md").await,
+            before_readme,
+            "every volume file must be unchanged"
+        );
+    }
+
+    /// E2E-NEW-118: a diverged pull with `theirs` merges: a merge commit is
+    /// created with the previous local tip as first parent and the fetched
+    /// remote tip as second, the conflicting file holds the remote content,
+    /// and the response reports `{"merged": true, "strategy": "theirs", \
+    /// "conflicts_resolved": 1}`.
+    #[tokio::test]
+    async fn e2e_new_118_a_diverged_pull_with_theirs_merges() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-118");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "fn local()\n").await;
+        let local_sha = e.commit("local change").await;
+        let remote_tip =
+            advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "fn remote()\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap();
+        assert_eq!(out["merged"], true);
+        assert_eq!(out["strategy"], "theirs");
+        assert_eq!(out["conflicts_resolved"], 1);
+        assert_eq!(e.read("/README.md").await, "fn remote()\n");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+        let merge_commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
+        let parents: Vec<String> = merge_commit.parent_ids().map(|p| p.to_string()).collect();
+        assert_eq!(parents, vec![local_sha, remote_tip], "first parent local, second remote");
+    }
+
+    /// E2E-NEW-125: a refused diverged pull still leaves
+    /// `refs/remotes/origin/main` equal to the remote tip, and the fetched
+    /// commit object present and readable: the fetch genuinely happened, only
+    /// the apply step was refused.
+    #[tokio::test]
+    async fn e2e_new_125_a_refused_diverged_pull_keeps_the_fetched_objects() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-125");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local\n").await;
+        e.commit("local change").await;
+        let remote_tip =
+            advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote\n");
+
+        call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap().target;
+        assert_eq!(tracking, remote_tip, "refs/remotes/origin/main equals the remote tip");
+
+        let repo = entry.repo.lock().await;
+        assert!(
+            repo.find_commit(git2::Oid::from_str(&remote_tip).unwrap()).is_ok(),
+            "the fetched commit object must be present and readable"
+        );
+    }
+
+    /// E2E-NEW-126: the diverged-pull error names `on_conflict` and its
+    /// accepted values.
+    #[tokio::test]
+    async fn e2e_new_126_the_diverged_pull_error_names_the_remedy() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-126");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote\n");
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        assert!(err.message.contains("on_conflict"), "got {}", err.message);
+        assert!(err.message.contains("ours"), "got {}", err.message);
+        assert!(err.message.contains("theirs"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-128: a diverged pull with `ours` keeps local content, and a
+    /// merge commit still exists with both parents.
+    #[tokio::test]
+    async fn e2e_new_128_a_diverged_pull_with_ours_keeps_local_content() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-128");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local content\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote content\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
+        assert_eq!(e.read("/README.md").await, "local content\n");
+        assert_eq!(out["merged"], true);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 2, "a merge commit still exists with both parents");
+    }
+
+    /// E2E-NEW-129: non-conflicting changes from both sides are both kept
+    /// (local added `/a.txt`, remote added `/b.txt`, no common file touched),
+    /// and `conflicts_resolved` is 0: the strategy applies only to
+    /// conflicting files.
+    #[tokio::test]
+    async fn e2e_new_129_non_conflicting_changes_from_both_sides_are_kept() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-129");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/a.txt", "local add\n").await;
+        e.commit("add a").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "b.txt", "remote add\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
+        assert_eq!(out["conflicts_resolved"], 0);
+        assert_eq!(e.read("/a.txt").await, "local add\n");
+        assert_eq!(e.read("/b.txt").await, "remote add\n");
+    }
+
+    /// E2E-NEW-130: a branch merged per E2E-NEW-118 then pushes as a
+    /// fast-forward, closing the loop: divergence is recoverable end to end.
+    #[tokio::test]
+    async fn e2e_new_130_a_merged_branch_then_pushes_as_a_fast_forward() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-130");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "fn local()\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "fn remote()\n");
+
+        let merged = call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap();
+        let merge_sha = merged["merge_commit"].as_str().unwrap().to_string();
+
+        let out = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["created"], false);
+        assert_eq!(
+            bare_ref_sha(&remote_dir, "refs/heads/main"),
+            Some(merge_sha),
+            "the push succeeds as a fast-forward, advancing the remote to the merge commit"
+        );
+    }
+
+    /// E2E-NEW-135: an invalid conflict strategy (`union`, `OURS`, `Theirs`,
+    /// `""`, `normal`) is rejected with `ERR_INVALID_ARGUMENT` naming both
+    /// accepted values, and nothing is applied.
+    #[tokio::test]
+    async fn e2e_new_135_an_invalid_conflict_strategy_is_rejected() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-135");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote\n");
+
+        for bad in ["union", "OURS", "Theirs", "", "normal"] {
+            let err = call_pull_branch(&e, &url, "main", "anonymous", Some(bad)).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "value {bad:?}");
+            assert!(err.message.contains("ours"), "got {}", err.message);
+            assert!(err.message.contains("theirs"), "got {}", err.message);
+        }
+
+        assert_eq!(
+            e.read("/README.md").await,
+            "local\n",
+            "nothing was applied by any rejected call"
+        );
+    }
+
+    /// E2E-NEW-136: a merge resolving three conflicting files, under either
+    /// strategy, never leaves a conflict marker in any of them.
+    #[tokio::test]
+    async fn e2e_new_136_no_conflict_markers_enter_the_volume() {
+        for strategy in ["ours", "theirs"] {
+            let e = Env::new().await;
+            let remote_dir = e.f.dir.path().join(format!("remote-136-{strategy}"));
+            let url = seed_bare_remote_files(
+                &remote_dir,
+                &[("a.md", "base a\n"), ("b.md", "base b\n"), ("c.md", "base c\n")],
+            );
+            call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+            e.write("/a.md", "local a\n").await;
+            e.write("/b.md", "local b\n").await;
+            e.write("/c.md", "local c\n").await;
+            e.commit("local changes").await;
+            advance_bare_remote_write_many(
+                &remote_dir,
+                "refs/heads/main",
+                &[("a.md", "remote a\n"), ("b.md", "remote b\n"), ("c.md", "remote c\n")],
+            );
+
+            let out =
+                call_pull_branch(&e, &url, "main", "anonymous", Some(strategy)).await.unwrap();
+            assert_eq!(out["conflicts_resolved"], 3, "strategy {strategy}");
+
+            for path in ["/a.md", "/b.md", "/c.md"] {
+                let content = e.read(path).await;
+                assert!(!content.contains("<<<<<<<"), "{strategy} {path}: {content}");
+                assert!(!content.contains("======="), "{strategy} {path}: {content}");
+                assert!(!content.contains(">>>>>>>"), "{strategy} {path}: {content}");
+            }
+        }
     }
 
     // ── FR-NEW-036/055/069: pull's write-quota charge is the delta ──────────
@@ -4515,29 +5038,73 @@ mod tests {
         assert_eq!(e.read("/EXTRA.md").await, "0123456789");
     }
 
-    /// E2E-NEW-141 — A merge exceeding the quota is refused.
-    /// > Given the merged tree's changed blobs exceed the write quota. When
-    /// > the pull runs. Then it fails before writing, creates no merge
-    /// > commit, and leaves the ref unchanged.
-    /// Merge application is US-013's job, out of this story's scope boundary:
-    /// there is no merge engine yet to compute a merged tree's changed blobs
-    /// against. Placeholder for US-013.
+    /// E2E-NEW-141 — A merge exceeding the quota is refused: the clone's
+    /// README.md (790 bytes) leaves exactly 10 bytes of quota headroom out
+    /// of 800; the remote's replacement content is 20 bytes, over what
+    /// remains, so the pull fails before writing, creates no merge commit,
+    /// and leaves the ref unchanged.
     #[tokio::test]
-    #[ignore = "merge engine not implemented until US-013"]
     async fn e2e_new_141_a_merge_exceeding_the_quota_is_refused() {
-        unimplemented!("merge engine: US-013")
+        let e = Env::with_quota(800).await;
+        let remote_dir = e.f.dir.path().join("remote-141");
+        let url = seed_bare_remote(&remote_dir, &"A".repeat(790));
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/LOCAL.md", "local only\n").await;
+        e.commit("local addition").await;
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", &"B".repeat(20));
+
+        let err =
+            call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must not be advanced");
+        assert_eq!(
+            e.read("/README.md").await,
+            "A".repeat(790),
+            "unchanged since the merge never applied"
+        );
     }
 
-    /// E2E-NEW-239 — A merge charges only its changed blobs.
-    /// > Given a merged tree whose changed blobs sum to 4 MB and a quota of
-    /// > 1 MB. When the pull runs with `on_conflict`. Then it is refused, no
-    /// > merge commit is created and `refs/heads/main` is unchanged.
-    /// Merge application is US-013's job, out of this story's scope boundary.
-    /// Placeholder for US-013.
+    /// E2E-NEW-239 — A merge charges only its changed blobs: a merged tree
+    /// whose one changed blob sums to 4 MB against a quota of 1 MB is
+    /// refused, creates no merge commit, and leaves `refs/heads/main`
+    /// unchanged; the byte counter itself is untouched by the refusal
+    /// (`charge_write` never mutates state on the failing branch).
     #[tokio::test]
-    #[ignore = "merge engine not implemented until US-013"]
     async fn e2e_new_239_a_merge_charges_only_its_changed_blobs() {
-        unimplemented!("merge engine: US-013")
+        const MB: usize = 1024 * 1024;
+        let e = Env::with_quota(MB as i64).await;
+        let remote_dir = e.f.dir.path().join("remote-239");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/LOCAL.md", "local only\n").await;
+        e.commit("local addition").await;
+        let before_bytes = e.f.state.safety.bytes_written(OWNER, MOUNT);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", &"C".repeat(4 * MB));
+
+        let err =
+            call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "refs/heads/main must not be advanced");
+        assert_eq!(e.read("/README.md").await, "hi\n", "unchanged since the merge never applied");
+        assert_eq!(
+            e.f.state.safety.bytes_written(OWNER, MOUNT),
+            before_bytes,
+            "a refused charge mutates nothing"
+        );
     }
 
     /// E2E-NEW-240 (FR-NEW-069): a fast-forward whose incoming tree is byte
@@ -4563,30 +5130,160 @@ mod tests {
         );
     }
 
-    /// E2E-NEW-137 — Merge is atomic when a write fails.
-    /// > Given a merge whose tree contains one unwritable path. When the pull
-    /// > runs. Then no merge commit is created, the ref is not advanced, and
-    /// > every file retains its pre-merge content.
-    /// Merge application is US-013's job, out of this story's scope boundary.
-    /// Placeholder for US-013.
+    /// E2E-NEW-137 — Merge is atomic when a write fails. Reuses the same
+    /// nested-directory-to-file typechange E2E-NEW-132 uses for the
+    /// fast-forward path, this time on one side of a genuine divergence: the
+    /// remote replaces `/blocked` (a directory locally) with a plain file, a
+    /// change `check_path_writable`'s pass 1 refuses before any byte moves,
+    /// so no merge commit is ever created and the ref never advances.
     #[tokio::test]
-    #[ignore = "merge engine not implemented until US-013"]
     async fn e2e_new_137_merge_is_atomic_when_a_write_fails() {
-        unimplemented!("merge engine: US-013")
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-137");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        advance_bare_remote_nested(
+            &remote_dir,
+            "refs/heads/main",
+            "blocked",
+            "existing.txt",
+            "nested\n",
+        );
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local change\n").await;
+        e.commit("local change").await;
+        let readme_before = e.read("/README.md").await;
+        let nested_before = e.read("/blocked/existing.txt").await;
+
+        advance_bare_remote_typechange(
+            &remote_dir,
+            "refs/heads/main",
+            "README.md",
+            "remote change\n",
+            "blocked",
+            "now a file\n",
+        );
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+
+        let err =
+            call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap_err();
+        assert!(err.message.contains("blocked"), "must name the failing path: {}", err.message);
+
+        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(after_head, before_head, "the ref must not be advanced");
+        assert_eq!(
+            e.read("/README.md").await,
+            readme_before,
+            "every file retains its pre-merge content"
+        );
+        assert_eq!(e.read("/blocked/existing.txt").await, nested_before);
     }
 
-    /// E2E-NEW-138 — A dirty volume refuses the merge too.
-    /// > Given a dirty volume and a diverged remote, with `on_conflict`
-    /// > supplied. When the pull runs. Then it is refused as dirty before any
-    /// > merge is attempted.
-    /// Merge application is US-013's job; this story's dirty guard already
-    /// runs before any fast-forward OR divergence branch is even reached, so
-    /// once US-013 lands the guard needs no change, only this placeholder's
-    /// `#[ignore]` removed and a divergence set up to exercise it.
+    /// E2E-NEW-138 — A dirty volume refuses the merge too: refused as dirty
+    /// before any fetch, exactly like the plain dirty pull, even though
+    /// `on_conflict` was supplied and the remote has diverged.
     #[tokio::test]
-    #[ignore = "merge engine not implemented until US-013"]
     async fn e2e_new_138_a_dirty_volume_refuses_the_merge_too() {
-        unimplemented!("merge engine: US-013")
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-138");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "local change\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote change\n");
+
+        // Dirty the volume with an uncommitted edit on top of the local commit.
+        e.write("/README.md", "dirty uncommitted\n").await;
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none(),
+            "no fetch has happened yet"
+        );
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+
+        assert!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none(),
+            "refused before any fetch, exactly like the plain dirty pull"
+        );
+        assert_eq!(e.read("/README.md").await, "dirty uncommitted\n");
+    }
+
+    /// E2E-NEW-139: a conflict-free merge (diverged branches with no
+    /// overlapping file) still creates a merge commit with two parents, and
+    /// `conflicts_resolved` is 0.
+    #[tokio::test]
+    async fn e2e_new_139_a_conflict_free_merge_still_creates_a_merge_commit() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-139");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/a.txt", "local add\n").await;
+        e.commit("add a").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "b.txt", "remote add\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
+        assert_eq!(out["conflicts_resolved"], 0);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+        let commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
+        assert_eq!(
+            commit.parent_count(),
+            2,
+            "a merge commit with two parents, even with no conflict"
+        );
+    }
+
+    /// E2E-NEW-140: the merge commit's author and committer are the
+    /// authenticated person, its message is exactly `Merge origin/main into \
+    /// main (conflicts resolved: theirs)`, and `git.log` shows that message.
+    #[tokio::test]
+    async fn e2e_new_140_the_merge_commit_records_author_and_strategy() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-140");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        e.write("/README.md", "fn local()\n").await;
+        e.commit("local change").await;
+        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "fn remote()\n");
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap();
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+
+        {
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            let repo = entry.repo.lock().await;
+            let commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
+            assert_eq!(commit.author().name().unwrap(), OWNER.split('@').next().unwrap());
+            assert_eq!(commit.author().email().unwrap(), OWNER);
+            assert_eq!(commit.committer().email().unwrap(), OWNER);
+            assert_eq!(
+                commit.message().unwrap().trim(),
+                "Merge origin/main into main (conflicts resolved: theirs)"
+            );
+        }
+
+        let log = e.call("git.log", json!({"mount_id": MOUNT})).await.unwrap();
+        let messages: Vec<String> = log["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["message"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            messages
+                .contains(&"Merge origin/main into main (conflicts resolved: theirs)".to_string()),
+            "git.log must show the merge message: {messages:?}"
+        );
     }
 
     /// E2E-NEW-218: pulling a branch other than the one `HEAD` points at is
