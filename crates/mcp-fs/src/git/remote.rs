@@ -1,5 +1,7 @@
-//! The `git.hosts` map: sole owner of interpreting which git hosts this server
-//! trusts and what credential policy each carries.
+//! The single remote pipeline: host resolution, URL validation, credential
+//! supply and (eventually) the four remote operations, all in one module so
+//! the security properties FR-NEW-041/042 rest on are proved once rather than
+//! four times (FR-NEW-054).
 //!
 //! `config.rs` declares the `hosts` field on [`crate::config::GitConfig`] and
 //! calls [`validate_hosts`] once from `ServerConfig::validate`. Every other read
@@ -11,15 +13,24 @@
 //! fallback. A host absent from the map is not a `Provider::Anonymous`, it is a
 //! [`Result::Err`], because silently downgrading an undeclared host to anonymous
 //! would be exactly the ambiguity exact matching exists to remove.
+//!
+//! [`validate_remote_url`] and [`clone_to_temp`] (with the sole
+//! `git2::RemoteCallbacks` construction in the tree) complete the pipeline for
+//! clone; [`require_origin`] is the guard push, fetch and pull (US-009 to
+//! US-011) will call before ever reaching a network call, since none of those
+//! three tools take a `url` argument (DEC-021): their only source for one is
+//! the `origin` row [`crate::tools::git`]'s clone records via `git::db`.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::GitConfig;
 use crate::errors::{Result, ToolError};
+use crate::git::repo::GitRepoStore;
 
 /// The raw `git.hosts` YAML shape: hostname to provider-name pairs, in the order
 /// the operator wrote them, keeping every duplicate rather than collapsing it.
@@ -168,6 +179,116 @@ pub fn resolve_host(host: &str) -> Result<Provider> {
     map.get(host)
         .copied()
         .ok_or_else(|| ToolError::not_found(format!("host '{host}' is not declared in git.hosts")))
+}
+
+/// Reject anything that is not a bare `git@host:path` style shorthand: no
+/// `://` anywhere, and a colon that comes after a host-shaped prefix (no `/`
+/// before it). This is what `url::Url::parse` would otherwise turn into some
+/// unrelated parse error instead of the scheme rejection FR-NEW-041 requires
+/// (E2E-NEW-147): the scp form carries an implicit `ssh` scheme that never
+/// appears in the string for `url::Url` to name.
+fn looks_like_scp_shorthand(raw: &str) -> bool {
+    if raw.contains("://") {
+        return false;
+    }
+    match raw.find(':') {
+        Some(idx) => {
+            let before = &raw[..idx];
+            !before.is_empty() && !before.contains('/')
+        }
+        None => false,
+    }
+}
+
+/// Validate a remote URL before any network call and before any audit entry is
+/// written (FR-NEW-041, FR-NEW-042). Parses the URL exactly once: the returned
+/// [`url::Url`] is what callers reuse for host extraction, so an operation
+/// never parses its URL twice.
+///
+/// Rejects: any scheme other than `https` (naming the scheme, or naming the
+/// implicit `ssh` of the scp shorthand); and any URL carrying a userinfo
+/// component, whose error names the host only, never the URL itself, since the
+/// URL is exactly what carries the leaked credential.
+pub fn validate_remote_url(raw: &str) -> Result<url::Url> {
+    if looks_like_scp_shorthand(raw) {
+        return Err(ToolError::invalid_argument(format!(
+            "remote url '{raw}' uses the scp-style shorthand for an implicit 'ssh' scheme, \
+             which is not supported: only https urls are accepted"
+        )));
+    }
+    let parsed = url::Url::parse(raw).map_err(|e| {
+        ToolError::invalid_argument(format!("remote url '{raw}' is not a valid URL: {e}"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(ToolError::invalid_argument(format!(
+            "remote url scheme '{}' is not supported: only https is accepted",
+            parsed.scheme()
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let host = parsed.host_str().unwrap_or("<unknown host>");
+        return Err(ToolError::invalid_argument(format!(
+            "remote url for host '{host}' must not embed credentials in the URL; store one \
+             with git.auth instead"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Clone into a real directory: libgit2 needs a filesystem to clone into. The
+/// sole `git2::RemoteCallbacks` construction in the tree (FR-NEW-054,
+/// E2E-NEW-197): credential supply for every remote operation goes through
+/// this one closure.
+pub fn clone_to_temp(
+    url: &str,
+    into: &Path,
+    branch: Option<&str>,
+    depth: i64,
+    token: Option<String>,
+) -> Result<git2::Repository> {
+    let mut callbacks = git2::RemoteCallbacks::new();
+    if let Some(t) = token {
+        // The provider expects the token as the password; "oauth2" is the
+        // conventional username for both GitHub and GitLab.
+        callbacks
+            .credentials(move |_url, _user, _types| git2::Cred::userpass_plaintext("oauth2", &t));
+    }
+    let mut fetch = git2::FetchOptions::new();
+    fetch.remote_callbacks(callbacks);
+    if depth > 0 {
+        fetch.depth(depth.min(i32::MAX as i64) as i32);
+    }
+
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch);
+    if let Some(b) = branch {
+        builder.branch(b);
+    }
+    builder.clone(url, into).map_err(|e| {
+        // The message may name the URL but never the token: git2 does not echo
+        // credentials, and the token never appears in the URL we pass.
+        ToolError::internal(format!("clone failed: {e} (see server logs for details)"))
+    })
+}
+
+/// FR-NEW-021: push, fetch and pull take no `url`; they resolve the stored
+/// `origin`. Neither tool exists yet (US-009 to US-011), so this is the shared
+/// guard those stories call before ever reaching a network operation, rather
+/// than each reimplementing "does this volume have an origin". A volume never
+/// initialized as a repository and one initialized but never cloned into both
+/// fail the same way: there is no `origin` row to resolve.
+pub async fn require_origin(store: &GitRepoStore, volume_id: &str) -> Result<String> {
+    if !store.is_initialized(volume_id).await {
+        return Err(ToolError::invalid_argument(format!(
+            "volume '{volume_id}' has no origin remote: it was never initialized as a git \
+             repository"
+        )));
+    }
+    let db = store.get_db(volume_id).await?;
+    let remotes = db.list_remotes().await?;
+    remotes.into_iter().find(|(name, _)| name == "origin").map(|(_, url)| url).ok_or_else(|| {
+        ToolError::invalid_argument(format!("volume '{volume_id}' has no origin remote"))
+    })
 }
 
 #[cfg(test)]
@@ -427,5 +548,151 @@ pub(crate) mod tests {
         ] {
             assert_eq!(crate::git::remote::resolve_host(host).unwrap(), provider);
         }
+    }
+
+    // ── FR-NEW-041/042: URL validation ─────────────────────────────────────
+
+    /// E2E-NEW-142: a plain HTTPS URL passes validation.
+    #[test]
+    fn e2e_new_142_an_https_url_is_accepted() {
+        let parsed = validate_remote_url("https://github.ibm.com/o/r.git").unwrap();
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("github.ibm.com"));
+    }
+
+    /// E2E-NEW-143: an `ssh://` URL is rejected, naming the scheme.
+    #[test]
+    fn e2e_new_143_an_ssh_url_is_rejected() {
+        let e = validate_remote_url("ssh://git@github.com/o/r.git").unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("ssh"), "got {}", e.message);
+    }
+
+    /// E2E-NEW-144: a `git://` URL is rejected, naming the scheme.
+    #[test]
+    fn e2e_new_144_a_git_url_is_rejected() {
+        let e = validate_remote_url("git://github.com/o/r.git").unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("git"), "got {}", e.message);
+    }
+
+    /// E2E-NEW-145: a `file://` URL is rejected, whether or not it names a path
+    /// a caller might otherwise read off the server's own disk.
+    #[test]
+    fn e2e_new_145_a_file_url_is_rejected() {
+        for url in ["file:///etc/passwd", "file:///tmp/repo"] {
+            let e = validate_remote_url(url).unwrap_err();
+            assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "{url}");
+            assert!(e.message.contains("file"), "{url}: got {}", e.message);
+        }
+    }
+
+    /// E2E-NEW-146: a plain `http://` URL is rejected: a token must never
+    /// travel unencrypted.
+    #[test]
+    fn e2e_new_146_a_plain_http_url_is_rejected() {
+        let e = validate_remote_url("http://github.com/o/r.git").unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains("http"), "got {}", e.message);
+    }
+
+    /// E2E-NEW-147: the scp-style shorthand is rejected as not HTTPS, and is
+    /// never silently reinterpreted as a bare hostname (which would otherwise
+    /// surface as some unrelated parse error rather than a scheme rejection).
+    #[test]
+    fn e2e_new_147_the_scp_shorthand_is_rejected() {
+        let e = validate_remote_url("git@github.com:org/repo.git").unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.to_ascii_lowercase().contains("ssh"), "got {}", e.message);
+    }
+
+    /// E2E-NEW-148: a URL carrying userinfo is rejected, and the error names
+    /// neither the credential nor the full URL, only the host.
+    #[test]
+    fn e2e_new_148_a_url_carrying_userinfo_is_rejected() {
+        let e = validate_remote_url("https://alice:ghp_secret@github.com/o/r.git").unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(!e.message.contains("ghp_secret"), "got {}", e.message);
+        assert!(!e.message.contains("alice"), "got {}", e.message);
+        assert!(
+            !e.message.contains("https://alice:ghp_secret@github.com/o/r.git"),
+            "the full URL must not appear: got {}",
+            e.message
+        );
+        assert!(e.message.contains("github.com"), "the host must be named: got {}", e.message);
+    }
+
+    // ── FR-NEW-021: the no-origin guard ─────────────────────────────────────
+
+    fn origin_test_config(root: &std::path::Path) -> std::sync::Arc<crate::config::ServerConfig> {
+        let mut c = crate::config::ServerConfig::default();
+        c.infra.meta.dir = root.join("state/volumes").display().to_string();
+        c.infra.blob.dir = root.join("state/blobs").display().to_string();
+        c.infra.admin.path = root.join("state/admin.db").display().to_string();
+        c.git.enabled = true;
+        std::sync::Arc::new(c)
+    }
+
+    /// E2E-NEW-080: a volume never initialized as a repository fails cleanly,
+    /// with no panic and no partial state.
+    #[tokio::test]
+    async fn e2e_new_080_a_never_initialized_volume_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            GitRepoStore::new(origin_test_config(dir.path()), crate::storage::test_registry());
+        let e = require_origin(&store, "proj").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.to_ascii_lowercase().contains("origin"), "got {}", e.message);
+    }
+
+    /// E2E-NEW-075 / E2E-NEW-089 / E2E-NEW-124: push, fetch and pull don't exist
+    /// yet (US-009/010/011), so each is exercised here through the exact shared
+    /// function those stories will call: a volume from `git.init` with no
+    /// recorded remote has no `origin` to resolve.
+    #[tokio::test]
+    async fn e2e_new_075_089_124_an_initialized_volume_with_no_remote_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            GitRepoStore::new(origin_test_config(dir.path()), crate::storage::test_registry());
+        store.init_repo("proj").await.unwrap();
+        let e = require_origin(&store, "proj").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.to_ascii_lowercase().contains("origin"), "got {}", e.message);
+    }
+
+    /// A volume with a recorded `origin` resolves it: the guard only rejects
+    /// absence, never a present remote.
+    #[tokio::test]
+    async fn require_origin_returns_the_stored_url_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            GitRepoStore::new(origin_test_config(dir.path()), crate::storage::test_registry());
+        let entry = store.init_repo("proj").await.unwrap();
+        entry.db.add_remote("origin", "https://example.test/o/r.git").await.unwrap();
+        let url = require_origin(&store, "proj").await.unwrap();
+        assert_eq!(url, "https://example.test/o/r.git");
+    }
+
+    // ── FR-NEW-054: one implementation ──────────────────────────────────────
+
+    /// E2E-NEW-197: `git2::RemoteCallbacks` is constructed in exactly one file,
+    /// this one; `tools/git.rs` builds no `RemoteCallbacks` of its own.
+    #[test]
+    fn e2e_new_197_the_remote_pipeline_exists_once() {
+        let remote_src = include_str!("remote.rs");
+        let tools_git_src = include_str!("../tools/git.rs");
+        // Count only the non-test portion of this very file, since the test
+        // below necessarily mentions the construction it is looking for.
+        let production_src = remote_src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            production_src.matches("RemoteCallbacks::new()").count(),
+            1,
+            "remote.rs must construct RemoteCallbacks exactly once"
+        );
+        assert_eq!(
+            tools_git_src.matches("RemoteCallbacks").count(),
+            0,
+            "tools/git.rs must not construct a RemoteCallbacks of its own"
+        );
     }
 }

@@ -152,7 +152,7 @@ keyed text has a length ceiling there).
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
 - `.agent_docs/tools.md` : the 59 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
-- `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, OAuth.
+- `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, OAuth, the remote pipeline (host resolution, URL validation, credential supply, origin).
 - `.agent_docs/config.md` : full YAML schema, backends and dsn, resolution order, secrets.
 - `.agent_docs/backends.md` : the relational layer, adding a backend, dialect checklist,
   and the SQL Server driver decision record (read before touching `rel/sqlserver.rs`).

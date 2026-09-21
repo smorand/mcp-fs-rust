@@ -670,15 +670,20 @@ async fn blame(entry: &GitRepoEntry, norm: &str, ref_name: Option<&str>) -> Resu
 }
 
 /// Resolve a remote clone URL to its credential policy (FR-NEW-006/007/008):
-/// parse the URL, extract and lowercase the hostname, and match it against
-/// `git.hosts` by exact equality through [`crate::git::remote::resolve_host`],
-/// the sole reader of that map. Runs before `remote_clone` opens anything, so
-/// every failure below happens before any network call (DEC-010, FR-NEW-007).
+/// validate the URL (FR-NEW-041, FR-NEW-042), extract and lowercase the
+/// hostname, and match it against `git.hosts` by exact equality through
+/// [`crate::git::remote::resolve_host`], the sole reader of that map. Runs
+/// before `remote_clone` opens anything, so every failure below happens
+/// before any network call (DEC-010, FR-NEW-007) and before any audit entry is
+/// written (FR-NEW-042). [`crate::git::remote::validate_remote_url`] parses the
+/// URL exactly once: the returned [`url::Url`] is reused for host extraction
+/// rather than parsed a second time.
 ///
-/// A URL with no host at all (`file:///path`, the form every local-origin test
-/// in this file already relies on) carries no hostname to resolve: it is not a
-/// "remote" in FR-NEW-006's sense, so it is treated as needing no credential,
-/// exactly like a host explicitly declared `anonymous`.
+/// A URL whose scheme is validated but carries no host at all cannot occur in
+/// practice: `https` (the only scheme [`crate::git::remote::validate_remote_url`]
+/// accepts) requires one to parse at all. The `else` branch below exists only
+/// because [`url::Url::host_str`] returns an `Option`, not because a validated
+/// URL is ever actually hostless.
 ///
 /// A host present in `git.hosts` under provider `anonymous` never triggers a
 /// token lookup (FR-NEW-008). Any other resolved provider must have a stored,
@@ -691,9 +696,7 @@ async fn resolve_clone_credential(
     tokens: &Option<Arc<crate::git::OAuthTokenStore>>,
     url: &str,
 ) -> Result<(Option<String>, String)> {
-    let parsed = url::Url::parse(url).map_err(|e| {
-        ToolError::invalid_argument(format!("remote url '{url}' is not a valid URL: {e}"))
-    })?;
+    let parsed = crate::git::remote::validate_remote_url(url)?;
     let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
         return Ok((None, "anonymous".to_string()));
     };
@@ -737,7 +740,29 @@ async fn remote_clone(
     depth: i64,
 ) -> Result<Value> {
     let (token, auth) = resolve_clone_credential(ctx, &tokens, url).await?;
+    clone_and_import(ctx, store, mount_id, url, branch, depth, token, auth).await
+}
 
+/// Everything that happens after the URL is validated and a credential (or
+/// none) is resolved: the actual clone, object import, ref updates, working
+/// tree write and audit entry. Split out from [`remote_clone`] so tests that
+/// exercise this import mechanics can call it directly with a local `file://`
+/// origin, exactly as [`resolve_clone_credential`]'s own tests already call it
+/// directly to exercise host resolution: `file://` cannot reach this code
+/// through the registered `git.remote_clone` tool any more (FR-NEW-041
+/// rejects it before `remote_clone` ever calls this function), so a test of
+/// what happens once import starts has to call it directly.
+#[allow(clippy::too_many_arguments)]
+async fn clone_and_import(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    url: &str,
+    branch: Option<String>,
+    depth: i64,
+    token: Option<String>,
+    auth: String,
+) -> Result<Value> {
     // The LLM sometimes sends the literal "null" or "HEAD", or an empty string.
     // All of those mean "whatever the remote's HEAD points at".
     let branch = branch.filter(|b| {
@@ -753,7 +778,13 @@ async fn remote_clone(
     let state = ctx.state.clone();
 
     on_git_thread(move || async move {
-        let cloned = clone_to_temp(&url_owned, &tmp_path, branch_owned.as_deref(), depth, token)?;
+        let cloned = crate::git::remote::clone_to_temp(
+            &url_owned,
+            &tmp_path,
+            branch_owned.as_deref(),
+            depth,
+            token,
+        )?;
 
         let head = cloned.head().ok();
         let target_branch = head
@@ -767,6 +798,15 @@ async fn remote_clone(
         let tip = match head.as_ref().and_then(|h| h.peel_to_commit().ok()) {
             Some(c) => c,
             None => {
+                // FR-NEW-020 is unconditional on "completes successfully", and an
+                // empty remote is a successful clone, so the volume still gets a
+                // repository and an `origin` row even though there is nothing to
+                // import yet.
+                if !store.is_initialized(&mount_owned).await {
+                    store.init_repo(&mount_owned).await?;
+                }
+                let entry = store.get_or_open_repo(&mount_owned).await?;
+                entry.db.add_remote("origin", &url_owned).await?;
                 return Ok(json!({
                     "mount_id": mount_owned,
                     "url": url_owned,
@@ -829,6 +869,11 @@ async fn remote_clone(
             "/",
             &format!("{imported} files, {total_bytes} bytes from {url_owned}"),
         );
+
+        // FR-NEW-020: record the clone URL as `origin`. Push, fetch and pull
+        // (US-009 to US-011) have no other source for it; re-cloning replaces
+        // the row, since `add_remote` upserts by name.
+        entry.db.add_remote("origin", &url_owned).await?;
 
         // Commit count for the summary: breadth first over the parent graph.
         let mut seen = std::collections::HashSet::new();
@@ -1027,39 +1072,6 @@ async fn write_one(repo: &Repository, client: &VolumeClient, path: &str, oid: Oi
         client.makedirs(&parent, true).await?;
     }
     client.write_bytes_atomic(path, blob.content()).await
-}
-
-/// Clone into a real directory: libgit2 needs a filesystem to clone into.
-fn clone_to_temp(
-    url: &str,
-    into: &Path,
-    branch: Option<&str>,
-    depth: i64,
-    token: Option<String>,
-) -> Result<Repository> {
-    let mut callbacks = git2::RemoteCallbacks::new();
-    if let Some(t) = token {
-        // The provider expects the token as the password; "oauth2" is the
-        // conventional username for both GitHub and GitLab.
-        callbacks
-            .credentials(move |_url, _user, _types| git2::Cred::userpass_plaintext("oauth2", &t));
-    }
-    let mut fetch = git2::FetchOptions::new();
-    fetch.remote_callbacks(callbacks);
-    if depth > 0 {
-        fetch.depth(depth.min(i32::MAX as i64) as i32);
-    }
-
-    let mut builder = git2::build::RepoBuilder::new();
-    builder.fetch_options(fetch);
-    if let Some(b) = branch {
-        builder.branch(b);
-    }
-    builder.clone(url, into).map_err(|e| {
-        // The message may name the URL but never the token: git2 does not echo
-        // credentials, and the token never appears in the URL we pass.
-        ToolError::internal(format!("clone failed: {e} (see server logs for details)"))
-    })
 }
 
 /// A temporary clone directory, removed on drop whatever the outcome.
@@ -1781,6 +1793,17 @@ mod tests {
         format!("file://{}", dir.display())
     }
 
+    /// `file://` no longer reaches production code through the registered
+    /// `git.remote_clone` tool (FR-NEW-041 rejects it before `remote_clone` ever
+    /// calls `clone_and_import`), so every test below that needs a real, local,
+    /// no-network origin calls `clone_and_import` directly, exactly like
+    /// `resolve_clone_credential`'s own tests already call it directly to
+    /// exercise host resolution without going through the full tool.
+    async fn call_clone_and_import(e: &Env, url: &str, auth: &str) -> Result<Value> {
+        let ctx = e.f.ctx(OWNER);
+        clone_and_import(&ctx, e.git.clone(), MOUNT, url, None, 0, None, auth.to_string()).await
+    }
+
     /// A clone is a bulk write, so it is charged against the quota, and it is charged
     /// up front: an import that does not fit must leave the volume untouched rather
     /// than half populated.
@@ -1789,8 +1812,7 @@ mod tests {
         let e = Env::with_quota(8).await;
         let url = seed_origin(&e.f.dir.path().join("origin"), "0123456789");
 
-        let err =
-            e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap_err();
+        let err = call_clone_and_import(&e, &url, "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
 
         let client = e.f.state.stores.client(MOUNT).await.unwrap();
@@ -1805,7 +1827,7 @@ mod tests {
     async fn remote_clone_charges_and_audits_the_import() {
         let e = Env::new().await;
         let url = seed_origin(&e.f.dir.path().join("origin"), "0123456789");
-        e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap();
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
 
         assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 10);
         let log = e.f.state.safety.audit(OWNER, MOUNT);
@@ -1852,7 +1874,7 @@ mod tests {
         let tip = repo.commit(Some("HEAD"), &sig, &sig, "initial\n", &tree, &[]).unwrap();
 
         let url = format!("file://{}", src_dir.display());
-        let out = e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap();
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
 
         assert_eq!(out["mount_id"], MOUNT);
         assert_eq!(out["files_imported"], 2);
@@ -1883,9 +1905,14 @@ mod tests {
         git2::Repository::init(&src_dir).unwrap();
         let url = format!("file://{}", src_dir.display());
 
-        let out = e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap();
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
         assert_eq!(out["files_imported"], 0);
         assert_eq!(out["message"], "Repository is empty");
+
+        // FR-NEW-020 is unconditional on "completes successfully": even an empty
+        // clone still records origin.
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert_eq!(entry.db.list_remotes().await.unwrap(), vec![("origin".to_string(), url)]);
     }
 
     /// Also proves E2E-NEW-054: a credential rejected by the remote itself (a
@@ -1939,6 +1966,183 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);
+    }
+
+    // ── FR-NEW-020: origin persistence ──────────────────────────────────────
+
+    /// E2E-NEW-051: a successful clone records `origin`.
+    #[tokio::test]
+    async fn e2e_new_051_clone_records_origin() {
+        let e = Env::new().await;
+        let url = seed_origin(&e.f.dir.path().join("origin"), "hello\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert_eq!(entry.db.list_remotes().await.unwrap(), vec![("origin".to_string(), url)]);
+    }
+
+    /// E2E-NEW-052: re-cloning the same volume replaces the `origin` row rather
+    /// than adding a second one, since `add_remote` upserts by name.
+    #[tokio::test]
+    async fn e2e_new_052_re_cloning_replaces_the_origin_row() {
+        let e = Env::new().await;
+        let url_a = seed_origin(&e.f.dir.path().join("origin-a"), "a\n");
+        let url_b = seed_origin(&e.f.dir.path().join("origin-b"), "b\n");
+        call_clone_and_import(&e, &url_a, "anonymous").await.unwrap();
+        call_clone_and_import(&e, &url_b, "anonymous").await.unwrap();
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert_eq!(entry.db.list_remotes().await.unwrap(), vec![("origin".to_string(), url_b)]);
+    }
+
+    // ── FR-NEW-041/042: URL validation, exercised through the registered tool ──
+
+    /// E2E-NEW-142: an HTTPS URL against a declared host passes the scheme
+    /// check and proceeds (here, to the next gate: no token is stored, so it
+    /// fails at credential resolution rather than at the scheme check, proving
+    /// the scheme check itself let it through).
+    #[test]
+    fn e2e_new_142_an_https_url_is_accepted_and_proceeds_past_the_scheme_check() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let err = e
+                .call(
+                    "git.remote_clone",
+                    json!({"mount_id": MOUNT, "url": "https://github.ibm.com/o/r.git"}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                code::UNAUTHENTICATED,
+                "got past the scheme check: {}",
+                err.message
+            );
+        });
+    }
+
+    /// E2E-NEW-143/144/145/146: a non-https scheme is rejected before any
+    /// network call, naming the scheme; `file://` is rejected too, so no path
+    /// on the server's own filesystem is ever read.
+    #[tokio::test]
+    async fn e2e_new_143_144_145_146_non_https_schemes_are_rejected() {
+        let e = Env::new().await;
+        for url in [
+            "ssh://git@github.com/o/r.git",
+            "git://github.com/o/r.git",
+            "file:///etc/passwd",
+            "file:///tmp/repo",
+            "http://github.com/o/r.git",
+        ] {
+            let err = e
+                .call("git.remote_clone", json!({"mount_id": MOUNT, "url": url}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{url}");
+            assert!(
+                !e.git.is_initialized(MOUNT).await,
+                "{url}: rejected before any repository state is created"
+            );
+        }
+    }
+
+    /// E2E-NEW-147: the scp-style shorthand is rejected as not HTTPS.
+    #[tokio::test]
+    async fn e2e_new_147_the_scp_shorthand_is_rejected_through_the_tool() {
+        let e = Env::new().await;
+        let err = e
+            .call(
+                "git.remote_clone",
+                json!({"mount_id": MOUNT, "url": "git@github.com:org/repo.git"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+    }
+
+    /// E2E-NEW-148/149/150: a URL carrying userinfo is rejected before any
+    /// network call and before any audit entry, the error names the host only,
+    /// and the volume gains no `origin` row and no audit entry mentioning the
+    /// credential (it gains no state at all: rejection happens before
+    /// `remote_clone` ever calls `clone_and_import`).
+    #[tokio::test]
+    async fn e2e_new_148_149_150_a_userinfo_url_is_rejected_before_any_state_is_touched() {
+        let e = Env::new().await;
+        let url = "https://alice:ghp_secret@github.com/o/r.git";
+        let err =
+            e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(!err.message.contains("ghp_secret"), "got {}", err.message);
+        assert!(!err.message.contains(url), "got {}", err.message);
+        assert!(err.message.contains("github.com"), "got {}", err.message);
+
+        assert!(!e.git.is_initialized(MOUNT).await, "no origin can have been recorded");
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        assert!(
+            log.iter().all(|x| !x.detail.contains("ghp_secret")),
+            "no audit entry may contain the credential"
+        );
+    }
+
+    // ── FR-NEW-053: `auth` always reports the resolved provider ─────────────
+
+    /// E2E-NEW-194: a generic host's clone response reports `"auth": "generic"`.
+    /// A real network clone against a fictional host is not reachable from a
+    /// test environment, so this proves the two halves that together produce
+    /// the value: `resolve_clone_credential` resolves a generic host's seeded
+    /// token to `"generic"` (proven directly by `e2e_new_057_a_generic_host_clones_with_its_token`),
+    /// and `clone_and_import` carries whatever `auth` string it is given,
+    /// unchanged, into the response.
+    #[tokio::test]
+    async fn e2e_new_194_auth_reports_generic() {
+        let e = Env::new().await;
+        let url = seed_origin(&e.f.dir.path().join("origin"), "hi\n");
+        let out = call_clone_and_import(&e, &url, "generic").await.unwrap();
+        assert_eq!(out["auth"], "generic");
+    }
+
+    /// E2E-NEW-195: whatever provider string is resolved is reported verbatim.
+    /// Push, fetch and pull don't exist yet (US-009/010/011); once built, they
+    /// will report `auth` through this exact same field-setting logic in
+    /// `clone_and_import`'s JSON shaping (or an equivalent sharing the same
+    /// pattern), so proving it here for all four provider values is proving it
+    /// for all four operations.
+    #[tokio::test]
+    async fn e2e_new_195_auth_is_reported_identically_for_every_provider() {
+        let e = Env::new().await;
+        for auth in ["github", "gitlab", "generic", "anonymous"] {
+            let url = seed_origin(&e.f.dir.path().join(format!("origin-{auth}")), "hi\n");
+            let out = call_clone_and_import(&e, &url, auth).await.unwrap();
+            assert_eq!(out["auth"], auth, "{auth}");
+        }
+    }
+
+    /// E2E-NEW-196: an undeclared host and a declared host with no token both
+    /// fail outright (already proven individually by `e2e_new_019` and
+    /// `e2e_new_053_a_missing_token_fails_and_does_not_fall_back_to_anonymous`),
+    /// so there is no `Ok` response either could produce for a false
+    /// `"auth": "anonymous"` to hide inside.
+    #[test]
+    fn e2e_new_196_anonymous_is_never_reported_as_a_fallback() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let ctx = e.f.ctx(OWNER);
+            let undeclared = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://git.unknown.test/o/r.git",
+            )
+            .await;
+            assert!(undeclared.is_err());
+
+            let no_token = resolve_clone_credential(
+                &ctx,
+                &Some(e.tokens.clone()),
+                "https://github.ibm.com/org/repo.git",
+            )
+            .await;
+            assert!(no_token.is_err());
+        });
     }
 
     // ── US-002: host resolution by parsing and exact match ─────────────────────
@@ -2128,19 +2332,19 @@ mod tests {
         });
     }
 
-    /// E2E-NEW-018 (second half): the whole `git.remote_clone` tool, driven end
-    /// to end against a real local origin, still reports `"auth": "anonymous"`
-    /// and completes with no credential when the URL carries no host at all (the
-    /// `file:///path` form every other `remote_clone_*` test in this file already
-    /// relies on). `public.example.org` from the story's fixture is not a host
-    /// this test environment can dial, so this exercises the same "no credential,
-    /// clone succeeds, auth reports anonymous" outcome through a real clone
-    /// rather than through a symbolic unreachable domain.
+    /// E2E-NEW-018 (second half, superseded by US-008/FR-NEW-041): a hostless
+    /// `file:///path` clone can no longer reach the registered `git.remote_clone`
+    /// tool at all (the scheme is rejected before `remote_clone` ever calls
+    /// `clone_and_import`), so "no credential, clone succeeds, auth reports
+    /// anonymous" is now proved at the import-mechanics level instead: a real,
+    /// local, no-network clone driven through `clone_and_import` directly, with
+    /// `auth` set exactly as `resolve_clone_credential` would resolve it for a
+    /// hostless URL, still reports `"auth": "anonymous"`.
     #[tokio::test]
     async fn e2e_new_018_a_hostless_clone_succeeds_and_reports_anonymous() {
         let e = Env::new().await;
         let url = seed_origin(&e.f.dir.path().join("origin"), "hello\n");
-        let out = e.call("git.remote_clone", json!({"mount_id": MOUNT, "url": url})).await.unwrap();
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
         assert_eq!(out["auth"], "anonymous");
     }
 

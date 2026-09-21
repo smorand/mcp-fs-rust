@@ -26,8 +26,8 @@
 | 4 | US-004 | n/a | git.token_set: seed a token the caller already holds | 7 | 002, 003 | 20 | 2 | US-002, US-003 | 1 | done |
 | 5 | US-005 | n/a | An expired token fails the operation before any socket opens | 3 | 004, 014 | 10 | 3 | US-002, US-003 | 1 | done |
 | 6 | US-006 | n/a | git.auth takes a host, git.auth_status reports one entry per held host | 4 | 003, 007 | 19 | 2 | US-003 | 1 | in-progress |
-| 7 | US-007 | n/a | git.auth_revoke removes exactly one host and never reaches across hosts | 2 | 007 | 8 | 1 | US-003, US-006 | 1 | todo |
-| 8 | US-008 | n/a | Extract git/remote.rs, validate the URL, and record origin at clone | 6 | 004, 005, 009, 011, 012 | 19 | 3 | US-002, US-005 | 1 | todo |
+| 7 | US-007 | n/a | git.auth_revoke removes exactly one host and never reaches across hosts | 2 | 007 | 8 | 1 | US-003, US-006 | 1 | in-progress |
+| 8 | US-008 | n/a | Extract git/remote.rs, validate the URL, and record origin at clone | 6 | 004, 005, 009, 011, 012 | 19 | 3 | US-002, US-005 | 1 | done |
 | 9 | US-009 | n/a | git.remote_push: send one branch, fast-forward only | 6 | 009, 010 | 17 | 3 | US-008 | 1 | todo |
 | 10 | US-010 | n/a | git.remote_fetch: objects and remote-tracking refs, nothing else | 5 | 011, 012 | 14 | 3 | US-008 | 1 | todo |
 | 11 | US-011 | n/a | git.remote_pull: fast-forward, applied atomically | 4 | 012, 013, 015 | 16 | 2 | US-010 | 1 | todo |

@@ -146,6 +146,39 @@ Parameters and return keys are in `.agent_docs/tools.md`. Notable points:
   characters is treated as a sha *before* `refs/heads/{name}` is tried, so a
   branch named `beef` resolves to the sha `beef`. Short shas are 8 characters.
 
+## The remote pipeline (`git/remote.rs`)
+
+One module owns host resolution, URL validation, credential supply and (once
+US-009 to US-011 land) push/fetch/pull, so the security properties below are
+proved once rather than once per operation:
+
+* `validate_remote_url` runs first, before any network call and before any
+  audit entry: only `https` is accepted (`ssh://`, `git://`, `file://`, plain
+  `http://` and the bare `git@host:path` scp shorthand are all rejected,
+  naming the scheme), and a URL carrying userinfo (`user:pass@host`) is
+  rejected naming the host only, never the URL, since the URL itself carries
+  the leaked credential.
+* `resolve_host` (host to `Provider`) and the OAuth token lookup together
+  decide the credential; `clone_to_temp` is the sole `git2::RemoteCallbacks`
+  construction in the tree, wrapping any resolved token as
+  `git2::Cred::userpass_plaintext("oauth2", token)`.
+* On a successful `git.remote_clone`, the clone URL is recorded as the remote
+  named `origin` for that volume (`git::db::add_remote`, upsert by name: a
+  re-clone from a different URL replaces the row, including for an empty
+  remote, which still gets a repository and an `origin` row).
+* `require_origin(store, volume_id)` is the guard push, fetch and pull
+  (US-009 to US-011) call before ever reaching the network: none of those
+  three tools takes a `url` parameter, `origin` is their only source for one,
+  and a volume that was never initialized or never cloned into fails with
+  `ERR_INVALID_ARGUMENT` naming the missing remote.
+* `tools/git.rs`'s `remote_clone` is a thin two-step wrapper: resolve the
+  credential (`resolve_clone_credential`, which validates and parses the URL
+  exactly once), then delegate to `clone_and_import` for the actual clone,
+  object import, ref updates and audit entry. `clone_and_import` is also the
+  function tests call directly with a local `file://` origin to exercise
+  import mechanics, since `file://` can no longer reach `clone_and_import`
+  through the registered tool at all.
+
 ## OAuth (device flow) and token persistence
 
 `git.auth` runs the RFC 8628 device authorization grant:
