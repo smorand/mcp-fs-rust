@@ -25,8 +25,8 @@
 | 3 | US-003 | n/a | Token identity becomes (person, host), in memory, on disk, and across backends | 4 | 002, 006, 008, 008, 009 | 13 | 6 | US-001 | 1 | done |
 | 4 | US-004 | n/a | git.token_set: seed a token the caller already holds | 7 | 002, 003 | 20 | 2 | US-002, US-003 | 1 | done |
 | 5 | US-005 | n/a | An expired token fails the operation before any socket opens | 3 | 004, 014 | 10 | 3 | US-002, US-003 | 1 | done |
-| 6 | US-006 | n/a | git.auth takes a host, git.auth_status reports one entry per held host | 4 | 003, 007 | 19 | 2 | US-003 | 1 | in-progress |
-| 7 | US-007 | n/a | git.auth_revoke removes exactly one host and never reaches across hosts | 2 | 007 | 8 | 1 | US-003, US-006 | 1 | in-progress |
+| 6 | US-006 | n/a | git.auth takes a host, git.auth_status reports one entry per held host | 4 | 003, 007 | 19 | 2 | US-003 | 1 | done |
+| 7 | US-007 | n/a | git.auth_revoke removes exactly one host and never reaches across hosts | 2 | 007 | 8 | 1 | US-003, US-006 | 1 | done |
 | 8 | US-008 | n/a | Extract git/remote.rs, validate the URL, and record origin at clone | 6 | 004, 005, 009, 011, 012 | 19 | 3 | US-002, US-005 | 1 | done |
 | 9 | US-009 | n/a | git.remote_push: send one branch, fast-forward only | 6 | 009, 010 | 17 | 3 | US-008 | 1 | done |
 | 10 | US-010 | n/a | git.remote_fetch: objects and remote-tracking refs, nothing else | 5 | 011, 012 | 14 | 3 | US-008 | 1 | done |
@@ -34,7 +34,7 @@
 | 12 | US-012 | n/a | A pull charges the write quota for the bytes it actually writes | 3 | 012, 015 | 6 | 2 | US-011 | 1 | done |
 | 13 | US-013 | n/a | A diverged pull: refuse, or merge under one global strategy | 5 | 013, 015 | 11 | 2 | US-011 | 1 | done |
 | 14 | US-014 | n/a | Remote timeout, lock release, and the frozen failure messages | 2 | 010, 012 | 7 | 4 | US-009, US-010, US-011, US-013 | 1 | done |
-| 15 | US-015 | n/a | The token screen: routes, and identity from three sources | 3 | 006 | 14 | 3 | US-004, US-007 | 1 | in-progress |
+| 15 | US-015 | n/a | The token screen: routes, and identity from three sources | 3 | 006 | 14 | 3 | US-004, US-007 | 1 | done |
 | 16 | US-016 | n/a | The screen lists held hosts, ordered, and never another person's | 3 | 006 | 9 | 2 | US-015, US-006 | 1 | done |
 | 17 | US-017 | n/a | The screen seeds and revokes, protected by a single-use csrf_token | 4 | 006 | 16 | 2 | US-015, US-016, US-004, US-007 | 1 | done |
 | 18 | US-018 | n/a | Every remote operation is audited and traced, and no token is ever emitted | 3 | 004 | 9 | 2 | US-008, US-009, US-010, US-011 | 1 | done |
