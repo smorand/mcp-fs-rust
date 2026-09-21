@@ -426,6 +426,20 @@ async fn auth_revoke(
 
     let resolved_provider =
         crate::git::remote::resolve_host(&resolved_host).ok().map(provider_name);
+
+    // A declared host whose git.hosts value disagrees with a supplied
+    // provider is rejected, mirroring EXC-003b (FR-NEW-068). An undeclared
+    // host has no git.hosts value to disagree with, so it is left alone here:
+    // it must stay revocable (FR-NEW-068's undeclared-host business rule).
+    if let (Some(p), Some(rp)) = (provider, resolved_provider)
+        && p != rp
+    {
+        return Err(ToolError::invalid_argument(format!(
+            "host '{resolved_host}' maps to provider '{rp}' in git.hosts, not '{p}': both must \
+             agree"
+        )));
+    }
+
     let existed = tokens.get_token(&person, &resolved_host).is_some();
     tokens.revoke_token(&person, &resolved_host).await?;
     Ok(json!({"host": resolved_host, "provider": resolved_provider, "revoked": existed}))
@@ -1297,6 +1311,180 @@ mod tests {
     /// E2E-NEW-190: revoking an absent host returns the declared shape.
     #[tokio::test]
     async fn e2e_new_190_revoking_an_absent_host_returns_the_declared_shape() {
+        let (f, r, _tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+        let out = f
+            .call(&r, PERSON, "git.auth_revoke", json!({"host":"git.unknown.test"}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"host":"git.unknown.test","provider":null,"revoked":false}));
+    }
+
+    // ── US-007: git.auth_revoke removes exactly one host (FR-MOD-004, FR-NEW-068) ──
+
+    /// E2E-NEW-066: revoke removes exactly one host, the other is untouched.
+    #[test]
+    fn e2e_new_066_revoke_removes_exactly_one_host() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            tokens
+                .store_token(PERSON, "github.com", "github", "t1", vec![], Some(future()), None)
+                .await
+                .unwrap();
+            tokens
+                .store_token(PERSON, "github.ibm.com", "github", "t2", vec![], Some(future()), None)
+                .await
+                .unwrap();
+
+            let out = f
+                .call(
+                    &r,
+                    PERSON,
+                    "git.auth_revoke",
+                    json!({"provider":"github","host":"github.ibm.com"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(out, json!({"host":"github.ibm.com","provider":"github","revoked":true}));
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_none());
+            assert!(
+                tokens.get_token(PERSON, "github.com").is_some(),
+                "github.com must be untouched"
+            );
+        });
+    }
+
+    /// E2E-NEW-067: revoke with an omitted host targets only the canonical host.
+    #[test]
+    fn e2e_new_067_revoke_with_omitted_host_targets_only_the_canonical_host() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            tokens
+                .store_token(PERSON, "github.com", "github", "t1", vec![], Some(future()), None)
+                .await
+                .unwrap();
+            tokens
+                .store_token(PERSON, "github.ibm.com", "github", "t2", vec![], Some(future()), None)
+                .await
+                .unwrap();
+
+            let out =
+                f.call(&r, PERSON, "git.auth_revoke", json!({"provider":"github"})).await.unwrap();
+            assert_eq!(out["host"], "github.com");
+            assert!(tokens.get_token(PERSON, "github.com").is_none());
+            assert!(
+                tokens.get_token(PERSON, "github.ibm.com").is_some(),
+                "revocation must never cross hosts"
+            );
+        });
+    }
+
+    /// E2E-NEW-068: revoking an absent host is idempotent.
+    #[test]
+    fn e2e_new_068_revoking_an_absent_host_is_idempotent() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, _tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+
+            let out1 = f
+                .call(&r, PERSON, "git.auth_revoke", json!({"host":"github.ibm.com"}))
+                .await
+                .unwrap();
+            assert_eq!(out1["revoked"], false);
+
+            let out2 = f
+                .call(&r, PERSON, "git.auth_revoke", json!({"host":"github.ibm.com"}))
+                .await
+                .unwrap();
+            assert_eq!(out2["revoked"], false);
+        });
+    }
+
+    /// E2E-NEW-233: revoke by provider alone targets the canonical host.
+    #[test]
+    fn e2e_new_233_revoke_by_provider_alone_targets_the_canonical_host() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            tokens
+                .store_token(PERSON, "github.com", "github", "t1", vec![], Some(future()), None)
+                .await
+                .unwrap();
+            tokens
+                .store_token(PERSON, "github.ibm.com", "github", "t2", vec![], Some(future()), None)
+                .await
+                .unwrap();
+
+            let out =
+                f.call(&r, PERSON, "git.auth_revoke", json!({"provider":"github"})).await.unwrap();
+            assert_eq!(out, json!({"host":"github.com","provider":"github","revoked":true}));
+            assert!(tokens.get_token(PERSON, "github.ibm.com").is_some());
+        });
+    }
+
+    /// E2E-NEW-234: revoke by host alone succeeds without a provider.
+    #[test]
+    fn e2e_new_234_revoke_by_host_alone_succeeds_without_a_provider() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            tokens
+                .store_token(PERSON, "github.ibm.com", "github", "t2", vec![], Some(future()), None)
+                .await
+                .unwrap();
+
+            let out = f
+                .call(&r, PERSON, "git.auth_revoke", json!({"host":"github.ibm.com"}))
+                .await
+                .unwrap();
+            assert_eq!(out, json!({"host":"github.ibm.com","provider":"github","revoked":true}));
+        });
+    }
+
+    /// E2E-NEW-235: revoke with neither parameter is rejected, naming both.
+    #[tokio::test]
+    async fn e2e_new_235_revoke_with_neither_parameter_is_rejected() {
+        let (f, r, _tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+        let e = f.call(&r, PERSON, "git.auth_revoke", json!({})).await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(e.message.contains("provider"), "{}", e.message);
+        assert!(e.message.contains("host"), "{}", e.message);
+    }
+
+    /// E2E-NEW-236: revoke with a disagreeing provider and host is rejected.
+    #[test]
+    fn e2e_new_236_revoke_with_disagreeing_provider_and_host_is_rejected() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            tokens
+                .store_token(PERSON, "github.ibm.com", "github", "t2", vec![], Some(future()), None)
+                .await
+                .unwrap();
+
+            let e = f
+                .call(
+                    &r,
+                    PERSON,
+                    "git.auth_revoke",
+                    json!({"provider":"gitlab","host":"github.ibm.com"}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+            assert!(e.message.contains("gitlab"), "{}", e.message);
+            assert!(e.message.contains("github.ibm.com"), "{}", e.message);
+            assert!(
+                tokens.get_token(PERSON, "github.ibm.com").is_some(),
+                "a rejected call must not revoke anything"
+            );
+        });
+    }
+
+    /// E2E-NEW-237: revoking an undeclared host is possible and reports a null provider.
+    #[tokio::test]
+    async fn e2e_new_237_revoking_an_undeclared_host_reports_a_null_provider() {
         let (f, r, _tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
         let out = f
             .call(&r, PERSON, "git.auth_revoke", json!({"host":"git.unknown.test"}))
