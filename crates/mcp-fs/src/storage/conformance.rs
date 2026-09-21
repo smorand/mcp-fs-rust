@@ -111,9 +111,9 @@ fn session(token: &str) -> OAuthSession {
         provider: "github".into(),
         access_token: token.into(),
         scopes: vec!["repo".into()],
-        expires_at: DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        expires_at: Some(
+            DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z").unwrap().with_timezone(&Utc),
+        ),
         instance_url: None,
     }
 }
@@ -537,30 +537,92 @@ async fn oauth_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     let key = [7u8; cipher::KEY_SIZE];
     let p = RelationalOAuthPersistence::open(engine.db().await?, key).await?;
     let person = format!("{tag}@test.com");
+    let host = "github.com";
 
-    p.upsert(&person, "github", &session("gho_secret")).await?;
+    p.upsert(&person, host, &session("gho_secret")).await?;
     let all = p.load_all().await?;
     let mine = all.iter().find(|(who_, _, _)| who_ == &person).expect("the row we just wrote");
     assert_eq!(mine.2.access_token, "gho_secret", "{who}: the token decrypts");
     assert_eq!(mine.2.scopes, vec!["repo"], "{who}: scopes round trip");
     assert_eq!(
-        mine.2.expires_at.to_rfc3339(),
+        mine.2.expires_at.unwrap().to_rfc3339(),
         "2030-01-01T00:00:00+00:00",
         "{who}: the expiry round trips"
     );
 
-    // The upsert replaces in place: one row per (person, provider).
-    p.upsert(&person, "github", &session("gho_rotated")).await?;
+    // The upsert replaces in place: one row per (person, host).
+    p.upsert(&person, host, &session("gho_rotated")).await?;
     let all = p.load_all().await?;
     let count = all.iter().filter(|(w, _, _)| w == &person).count();
-    assert_eq!(count, 1, "{who}: the primary key is (person, provider)");
+    assert_eq!(count, 1, "{who}: the primary key is (person, host)");
     let mine = all.iter().find(|(w, _, _)| w == &person).expect("present");
     assert_eq!(mine.2.access_token, "gho_rotated", "{who}: the token was replaced");
 
-    p.delete(&person, "github").await?;
+    p.delete(&person, host).await?;
     let all = p.load_all().await?;
     assert!(!all.iter().any(|(w, _, _)| w == &person), "{who}: the row is deleted");
-    p.delete(&person, "github").await?;
+    p.delete(&person, host).await?;
+    Ok(())
+}
+
+/// DRIFT-005: a live deployment still on the legacy `(person, provider)` shape
+/// is rebuilt on the new `(person, host)` key identically on every engine, not
+/// just on SQLite. Starts by dropping whatever a previous case in this same run
+/// left behind, so it is safe to re-run against a shared server (PostgreSQL,
+/// SQL Server) rather than assuming a database it has to itself.
+async fn oauth_legacy_table_is_rebuilt_identically(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let d = db.dialect();
+
+    db.execute(&crate::storage::rel::Query::new(format!(
+        "DROP TABLE IF EXISTS {}",
+        d.quote_ident("oauth_tokens")
+    )))
+    .await?;
+
+    // Recreate on the OLD shape, as a live pre-upgrade deployment would have it.
+    let person_ty = d.column_type(crate::storage::rel::ColumnType::TextKey(320));
+    let provider_ty = d.column_type(crate::storage::rel::ColumnType::TextKey(64));
+    let text_ty = d.column_type(crate::storage::rel::ColumnType::Text);
+    let blob_ty = d.column_type(crate::storage::rel::ColumnType::Blob);
+    let ddl = format!(
+        "CREATE TABLE {} ({} {person_ty} NOT NULL, {} {provider_ty} NOT NULL, \
+         {} {blob_ty} NOT NULL, {} {text_ty} NOT NULL, {} {text_ty} NOT NULL, \
+         {} {text_ty}, PRIMARY KEY ({}, {}))",
+        d.quote_ident("oauth_tokens"),
+        d.quote_ident("person"),
+        d.quote_ident("provider"),
+        d.quote_ident("token_enc"),
+        d.quote_ident("scopes"),
+        d.quote_ident("expires_at"),
+        d.quote_ident("instance_url"),
+        d.quote_ident("person"),
+        d.quote_ident("provider"),
+    );
+    db.execute(&crate::storage::rel::Query::new(ddl)).await?;
+
+    let person = format!("{tag}@test.com");
+    db.execute(
+        &crate::storage::rel::Query::new(
+            "INSERT INTO oauth_tokens \
+             (person, provider, token_enc, scopes, expires_at, instance_url) \
+             VALUES (?1, 'github', ?2, 'repo', '2030-01-01T00:00:00Z', NULL)",
+        )
+        .bind(&person)
+        .bind(vec![0u8; 10]),
+    )
+    .await?;
+
+    let key = [9u8; cipher::KEY_SIZE];
+    let p = RelationalOAuthPersistence::open(db, key).await?;
+    assert_eq!(p.count().await?, 0, "{who}: the legacy row was dropped on rebuild");
+
+    // the rebuilt table works normally afterward
+    p.upsert(&person, "github.ibm.com", &session("rebuilt")).await?;
+    let all = p.load_all().await?;
+    assert_eq!(all.len(), 1, "{who}: the new shape accepts writes");
+    assert_eq!(all[0].1, "github.ibm.com", "{who}: keyed by host now");
     Ok(())
 }
 
@@ -579,6 +641,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     git_objects_refs_remotes(engine, &tag).await?;
     git_purge_is_scoped_to_one_volume(engine, &tag).await?;
     oauth_round_trip(engine, &tag).await?;
+    oauth_legacy_table_is_rebuilt_identically(engine, &tag).await?;
     Ok(())
 }
 

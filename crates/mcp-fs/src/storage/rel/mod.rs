@@ -286,6 +286,39 @@ pub trait RelationalTx: Send {
     async fn commit(self: Box<Self>) -> Result<()>;
 }
 
+/// True when `table` exists but does not yet carry `column`: the guard behind
+/// [`apply_table_recreations`]. `Ok(false)` when the table does not exist at
+/// all, so a fresh install is never mistaken for a legacy deployment.
+async fn table_lacks_column(db: &dyn RelationalDb, table: &str, column: &str) -> Result<bool> {
+    let rows = db.query(&Query::new(db.dialect().table_columns_query()).bind(table)).await?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let has = rows.iter().any(|r| r.text(0).map(|c| c == column).unwrap_or(false));
+    Ok(!has)
+}
+
+/// Drop every table declared in [`SchemaSet::table_recreations`] whose live
+/// shape lacks its guard column, so the following `CREATE TABLE IF NOT EXISTS`
+/// rebuilds it on the new shape (DRIFT-005). Called by every engine's
+/// `migrate` before it renders the rest of the schema.
+///
+/// Never fires on a fresh install (no table yet) and never again once the
+/// table already carries the guard column, so a restart never destroys rows a
+/// previous boot already rebuilt.
+pub(crate) async fn apply_table_recreations(
+    db: &dyn RelationalDb,
+    schema: &SchemaSet,
+) -> Result<()> {
+    for r in &schema.table_recreations {
+        if table_lacks_column(db, r.table, r.guard_column).await? {
+            db.execute(&Query::new(format!("DROP TABLE {}", db.dialect().quote_ident(r.table))))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// How many times [`run_retrying`] runs the work before giving up.
 ///
 /// Three attempts covers a lost race against one or two competing writers, which
@@ -486,6 +519,112 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             2,
             "the body ran again after the failed commit"
+        );
+    }
+
+    /// A `RelationalDb` double with no real storage: `query` answers the
+    /// `table_columns_query` probe from a seeded column list (or reports the
+    /// table absent), `execute` just records what ran, or fails, so the
+    /// DRIFT-005 guard (`apply_table_recreations`) can be tested without a live
+    /// database.
+    struct SpyDb {
+        table_exists: bool,
+        existing_columns: Vec<&'static str>,
+        executed: std::sync::Mutex<Vec<String>>,
+        fail_on_drop: bool,
+    }
+
+    impl SpyDb {
+        fn new(table_exists: bool, existing_columns: Vec<&'static str>) -> Self {
+            Self {
+                table_exists,
+                existing_columns,
+                executed: std::sync::Mutex::new(Vec::new()),
+                fail_on_drop: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RelationalDb for SpyDb {
+        fn dialect(&self) -> Dialect {
+            Dialect::Sqlite
+        }
+
+        async fn execute(&self, query: &Query) -> Result<u64> {
+            self.executed.lock().unwrap().push(query.sql.clone());
+            if self.fail_on_drop && query.sql.starts_with("DROP TABLE") {
+                // Named after the (fake) engine, as a real driver's map_error does.
+                return Err(ToolError::internal("spydb: rejected the schema change"));
+            }
+            Ok(0)
+        }
+
+        async fn query(&self, _query: &Query) -> Result<Vec<RowValues>> {
+            if !self.table_exists {
+                return Ok(Vec::new());
+            }
+            let cols: Arc<[String]> = vec!["name".to_string()].into();
+            Ok(self
+                .existing_columns
+                .iter()
+                .map(|c| RowValues::new(cols.clone(), vec![SqlValue::Text((*c).to_string())]))
+                .collect())
+        }
+
+        async fn begin(&self) -> Result<Box<dyn RelationalTx>> {
+            Err(ToolError::internal("spydb: begin not supported"))
+        }
+
+        async fn migrate(&self, _schema: &SchemaSet) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn oauth_like_schema() -> SchemaSet {
+        SchemaSet::default().recreate_if_missing_column("oauth_tokens", "host")
+    }
+
+    /// E2E-NEW-040: a fresh install (no table at all) performs no drop.
+    #[tokio::test]
+    async fn e2e_new_040_a_fresh_install_performs_no_drop() {
+        let db = SpyDb::new(false, vec![]);
+        apply_table_recreations(&db, &oauth_like_schema()).await.unwrap();
+        assert!(db.executed.lock().unwrap().is_empty(), "a fresh install must not run a DROP");
+    }
+
+    #[tokio::test]
+    async fn table_recreation_drops_a_legacy_shaped_table() {
+        let db = SpyDb::new(true, vec!["person", "provider"]); // no host column
+        apply_table_recreations(&db, &oauth_like_schema()).await.unwrap();
+        let ran = db.executed.lock().unwrap();
+        assert_eq!(ran.len(), 1);
+        assert!(ran[0].starts_with("DROP TABLE"), "{}", ran[0]);
+    }
+
+    /// This is the guard `survives_reopen_on_disk`
+    /// (`crates/mcp-fs/src/git/oauth/persistence.rs`) pins end to end: once the
+    /// table already carries the guard column, a re-migrate must not drop it.
+    #[tokio::test]
+    async fn table_recreation_is_a_no_op_once_the_column_exists() {
+        let db = SpyDb::new(true, vec!["person", "host", "provider"]);
+        apply_table_recreations(&db, &oauth_like_schema()).await.unwrap();
+        assert!(db.executed.lock().unwrap().is_empty(), "already on the new shape: no drop");
+    }
+
+    /// E2E-NEW-039: a backend that rejects the schema change fails boot, and the
+    /// error names the backend (every real driver's `map_error` already prefixes
+    /// its engine name; this proves the guard propagates that failure rather
+    /// than swallowing it).
+    #[tokio::test]
+    async fn e2e_new_039_a_failing_schema_change_fails_boot_naming_the_backend() {
+        let mut db = SpyDb::new(true, vec!["person", "provider"]);
+        db.fail_on_drop = true;
+        let err = apply_table_recreations(&db, &oauth_like_schema()).await.unwrap_err();
+        assert!(
+            err.message.contains("spydb"),
+            "the message must name the backend: {}",
+            err.message
         );
     }
 

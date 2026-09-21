@@ -197,13 +197,20 @@ fn spawn_poller(
             match flow.poll_for_token(&code).await {
                 Ok(poll) if poll.success => {
                     let Some(token) = poll.access_token else { return };
+                    // `git.auth` only ever hands this poller a provider name, not a
+                    // hostname (its tool schema is unchanged by this story: US-006
+                    // and US-007 carry the real per-host wiring). Using the provider
+                    // as the host here is a like-for-like continuation of what this
+                    // call site already did before the store's key became
+                    // `(person, host)`, not a new design decision.
                     if let Err(e) = tokens
                         .store_token(
                             &person,
                             &provider,
+                            &provider,
                             &token,
                             poll.scopes,
-                            poll.expires_at,
+                            Some(poll.expires_at),
                             instance_url,
                         )
                         .await
@@ -247,7 +254,10 @@ fn status_for(person: &str, provider: &str, tokens: &OAuthTokenStore, single: bo
     }
     if authenticated && let Some(s) = tokens.get_token(person, provider) {
         out.insert("scopes".into(), json!(s.scopes));
-        out.insert("expires_at".into(), json!(round_trip_iso(s.expires_at)));
+        // `None` (a non-expiring token, the Implementer Decision in US-003) has
+        // no caller yet: every store_token call site in this file still passes
+        // `Some`. Handled here only because the type is now `Option`.
+        out.insert("expires_at".into(), json!(s.expires_at.map(round_trip_iso)));
     }
     Value::Object(out)
 }
@@ -491,7 +501,15 @@ mod tests {
         assert_eq!(out, json!({"authenticated": false, "provider": "github"}));
 
         tokens
-            .store_token(PERSON, "github", "tok", vec!["repo".into()], future(), None)
+            .store_token(
+                PERSON,
+                "github",
+                "github",
+                "tok",
+                vec!["repo".into()],
+                Some(future()),
+                None,
+            )
             .await
             .unwrap();
         let out =
@@ -507,7 +525,15 @@ mod tests {
     async fn auth_status_reports_all_providers_when_none_is_given() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
         tokens
-            .store_token(PERSON, "gitlab", "tok", vec!["api".into()], future(), None)
+            .store_token(
+                PERSON,
+                "gitlab",
+                "gitlab",
+                "tok",
+                vec!["api".into()],
+                Some(future()),
+                None,
+            )
             .await
             .unwrap();
 
@@ -529,9 +555,10 @@ mod tests {
             .store_token(
                 PERSON,
                 "github",
+                "github",
                 "stale",
                 vec![],
-                Utc::now() - chrono::Duration::minutes(1),
+                Some(Utc::now() - chrono::Duration::minutes(1)),
                 None,
             )
             .await
@@ -544,7 +571,10 @@ mod tests {
     #[tokio::test]
     async fn revoke_clears_the_token_and_is_idempotent() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
-        tokens.store_token(PERSON, "github", "tok", vec![], future(), None).await.unwrap();
+        tokens
+            .store_token(PERSON, "github", "github", "tok", vec![], Some(future()), None)
+            .await
+            .unwrap();
 
         let out =
             f.call(&r, PERSON, "git.auth_revoke", json!({"provider":"github"})).await.unwrap();
@@ -558,7 +588,10 @@ mod tests {
     #[tokio::test]
     async fn tokens_are_per_person() {
         let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
-        tokens.store_token(PERSON, "github", "mine", vec![], future(), None).await.unwrap();
+        tokens
+            .store_token(PERSON, "github", "github", "mine", vec![], Some(future()), None)
+            .await
+            .unwrap();
         let out = f
             .call(&r, "other@test.com", "git.auth_status", json!({"provider":"github"}))
             .await

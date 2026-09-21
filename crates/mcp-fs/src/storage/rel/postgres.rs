@@ -284,6 +284,12 @@ impl RelationalDb for PostgresRelationalDb {
     }
 
     async fn migrate(&self, schema: &SchemaSet) -> Result<()> {
+        // DRIFT-005: drop any table whose live shape predates a key change,
+        // before the CREATE TABLE below rebuilds it on the new shape. Runs
+        // ahead of the transaction below: it is its own DDL step, exactly like
+        // the SQLite pragma probe it mirrors.
+        super::apply_table_recreations(self, schema).await?;
+
         // One transaction for the whole schema: Postgres has transactional DDL, so
         // a half applied schema cannot be left behind.
         let mut tx = self.pool.begin().await.map_err(map_error)?;

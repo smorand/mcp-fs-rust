@@ -127,6 +127,18 @@ pub struct ColumnMigration {
     pub default: &'static str,
 }
 
+/// A table dropped and recreated when a live deployment predates a shape
+/// change no [`ColumnMigration`] can express (for example a primary key
+/// change). Guarded so it fires only when the table exists but lacks
+/// `guard_column`: never on a fresh install (no table at all) and never again
+/// once the table already carries the new shape, so a restart never destroys
+/// the rows it just rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRecreation {
+    pub table: &'static str,
+    pub guard_column: &'static str,
+}
+
 /// Every table and index one store needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaSet {
@@ -135,6 +147,7 @@ pub struct SchemaSet {
     pub typed_indexes: Vec<TypedIndex>,
     pub virtual_tables: Vec<VirtualTableDef>,
     pub column_migrations: Vec<ColumnMigration>,
+    pub table_recreations: Vec<TableRecreation>,
 }
 
 impl SchemaSet {
@@ -145,12 +158,25 @@ impl SchemaSet {
             typed_indexes: Vec::new(),
             virtual_tables: Vec::new(),
             column_migrations: Vec::new(),
+            table_recreations: Vec::new(),
         }
     }
 
     /// Declare a column added to an already deployed table.
     pub fn column_migration(mut self, m: ColumnMigration) -> Self {
         self.column_migrations.push(m);
+        self
+    }
+
+    /// Declare a table dropped and rebuilt by the following `CREATE TABLE` when
+    /// its live shape lacks `guard_column` (DRIFT-005).
+    #[must_use]
+    pub fn recreate_if_missing_column(
+        mut self,
+        table: &'static str,
+        guard_column: &'static str,
+    ) -> Self {
+        self.table_recreations.push(TableRecreation { table, guard_column });
         self
     }
 
@@ -408,6 +434,15 @@ mod tests {
         assert!(
             mssql.contains("CREATE INDEX [idx_nodes_parent] ON [nodes] ([parent]);"),
             "{mssql}"
+        );
+    }
+
+    #[test]
+    fn recreate_if_missing_column_is_recorded_on_the_schema_set() {
+        let s = SchemaSet::default().recreate_if_missing_column("oauth_tokens", "host");
+        assert_eq!(
+            s.table_recreations,
+            vec![TableRecreation { table: "oauth_tokens", guard_column: "host" }]
         );
     }
 

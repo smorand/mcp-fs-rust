@@ -364,6 +364,25 @@ pub async fn purge_git_rows(
     Ok(())
 }
 
+/// Open the raw engine behind `infra.oauth`. See [`open_meta_db`].
+///
+/// The migration tool copies `oauth_tokens` at the row level (FR-NEW-012), so
+/// it needs the connection rather than the typed, key-holding
+/// [`RelationalOAuthPersistence`](crate::git::oauth::persistence::RelationalOAuthPersistence).
+pub async fn open_oauth_db(
+    config: &ServerConfig,
+    registry: &RelationalRegistry,
+) -> Result<Arc<dyn RelationalDb>> {
+    let o = &config.infra.oauth;
+    build_relational_db(
+        registry,
+        "oauth",
+        RelationalTarget { backend: &o.backend, dsn: &o.dsn, schema: &o.schema, pool: &o.pool },
+        || config.oauth_db_path(),
+    )
+    .await
+}
+
 /// Build the OAuth token persistence, per `infra.oauth.backend`.
 pub async fn build_oauth_persistence(
     config: &ServerConfig,

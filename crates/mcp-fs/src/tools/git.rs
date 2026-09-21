@@ -1904,9 +1904,10 @@ mod tests {
                 .store_token(
                     OWNER,
                     "github",
+                    "github",
                     "gho_supersecret",
                     vec!["repo".into()],
-                    Utc::now() + chrono::Duration::hours(1),
+                    Some(Utc::now() + chrono::Duration::hours(1)),
                     None,
                 )
                 .await
@@ -1993,9 +1994,10 @@ mod tests {
                 .store_token(
                     OWNER,
                     "github",
+                    "github",
                     "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
                     vec![],
-                    future_expiry(),
+                    Some(future_expiry()),
                     None,
                 )
                 .await
@@ -2027,9 +2029,10 @@ mod tests {
                 .store_token(
                     OWNER,
                     "gitlab",
+                    "gitlab",
                     "glpat_1111222233334444555566667777",
                     vec![],
-                    future_expiry(),
+                    Some(future_expiry()),
                     None,
                 )
                 .await
@@ -2059,7 +2062,15 @@ mod tests {
         with_git_hosts_lock(async {
             let e = Env::with_hosts(&[("github.ibm.com", "github")]).await;
             e.tokens
-                .store_token(OWNER, "github", "ghp_case_insensitive", vec![], future_expiry(), None)
+                .store_token(
+                    OWNER,
+                    "github",
+                    "github",
+                    "ghp_case_insensitive",
+                    vec![],
+                    Some(future_expiry()),
+                    None,
+                )
                 .await
                 .unwrap();
             let ctx = e.f.ctx(OWNER);
@@ -2207,9 +2218,10 @@ mod tests {
                 .store_token(
                     OWNER,
                     "generic",
+                    "generic",
                     "generic-secret-token",
                     vec![],
-                    future_expiry(),
+                    Some(future_expiry()),
                     None,
                 )
                 .await
@@ -2303,7 +2315,15 @@ mod tests {
         with_git_hosts_lock(async {
             let e = Env::with_hosts(&[("xn--gthub-cta.com", "github")]).await;
             e.tokens
-                .store_token(OWNER, "github", "idn-token", vec![], future_expiry(), None)
+                .store_token(
+                    OWNER,
+                    "github",
+                    "github",
+                    "idn-token",
+                    vec![],
+                    Some(future_expiry()),
+                    None,
+                )
                 .await
                 .unwrap();
             let ctx = e.f.ctx(OWNER);

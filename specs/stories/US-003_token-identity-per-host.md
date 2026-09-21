@@ -90,7 +90,7 @@ The schema change costs nothing extra because US-003 drops and recreates `oauth_
 - **Resolution during implementation:** Add a dialect-rendered drop-and-recreate step to the relational schema layer, guarded so it fires only when the live `oauth_tokens` lacks a `host` column. **The guard is not optional:** without it every restart destroys valid tokens. Exercise it on all three engines through `crates/mcp-fs/src/storage/conformance.rs`.
 - **Detected by:** E2E-NEW-037 fails on SQLite. If the guard is omitted, the existing `survives_reopen_on_disk` test (`crates/mcp-fs/src/git/oauth/persistence.rs:361`) fails.
 - **Blocks which requirement:** FR-NEW-010, FR-NEW-011, and therefore FR-NEW-009 in persisted mode.
-- **Status:** open
+- **Status:** resolved (e2e_new_037_legacy_rows_are_dropped_on_upgrade, this commit)
 
 #### DRIFT-004: The `migrate` verb does not copy `oauth_tokens` at all
 - **Spec says:** §9.1 lists `crates/mcp-fs/src/migrate.rs` as a **Moderate** impact that "carries the new `oauth_tokens` key". FR-NEW-012 requires the verb to copy the table under the new key.
@@ -99,7 +99,7 @@ The schema change costs nothing extra because US-003 drops and recreates `oauth_
 - **Resolution during implementation:** FR-NEW-012 is new behaviour, not a re-key. Open the source and destination oauth stores, apply `git::oauth::persistence::schema()` to both, and copy the table using the same row-count check as `migrate.rs:204-211`. Correct the §9.1 impact from "Moderate" to "New behaviour".
 - **Detected by:** E2E-NEW-041 fails, because the destination holds zero rows.
 - **Blocks which requirement:** FR-NEW-012.
-- **Status:** open
+- **Status:** resolved (e2e_new_041_migrate_carries_oauth_tokens_under_the_new_key, this commit)
 
 ## Functional Requirements
 

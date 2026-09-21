@@ -442,6 +442,10 @@ impl RelationalDb for SqlServerRelationalDb {
     }
 
     async fn migrate(&self, schema: &SchemaSet) -> Result<()> {
+        // DRIFT-005: drop any table whose live shape predates a key change,
+        // before the CREATE TABLE below rebuilds it on the new shape.
+        super::apply_table_recreations(self, schema).await?;
+
         let mut conn = self.pool.get_owned().await.map_err(map_pool_error)?;
         // SQL Server has transactional DDL, so a half applied schema cannot be
         // left behind. The guard is a manual rollback because the statements run

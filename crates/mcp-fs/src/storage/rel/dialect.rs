@@ -274,6 +274,22 @@ impl Dialect {
         }
     }
 
+    /// A query returning one text column: every column name of the table bound
+    /// as `?1`, empty when the table does not exist. Powers the DRIFT-005 guard
+    /// ([`super::apply_table_recreations`]) without engine specific code at the
+    /// call site: SQLite already probes `pragma_table_info` the same way for an
+    /// `ADD COLUMN` guard, so a missing table there is simply zero rows too.
+    pub fn table_columns_query(self) -> &'static str {
+        match self {
+            Self::Sqlite => "SELECT name FROM pragma_table_info(?1)",
+            Self::Postgres => {
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = current_schema() AND table_name = ?1"
+            }
+            Self::SqlServer => "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(?1)",
+        }
+    }
+
     /// The escape character our `LIKE` patterns use. Paired with
     /// [`Self::escape_like_literal`], which is the only way to build a pattern.
     pub const LIKE_ESCAPE: char = '\\';
@@ -600,6 +616,16 @@ mod tests {
         assert_eq!(Dialect::Sqlite.length_fn(), "length");
         assert_eq!(Dialect::Postgres.length_fn(), "length");
         assert_eq!(Dialect::SqlServer.length_fn(), "LEN");
+    }
+
+    #[test]
+    fn table_columns_query_uses_each_engines_introspection() {
+        assert!(Dialect::Sqlite.table_columns_query().contains("pragma_table_info"));
+        assert!(Dialect::Postgres.table_columns_query().contains("information_schema.columns"));
+        assert!(Dialect::SqlServer.table_columns_query().contains("sys.columns"));
+        for d in ALL {
+            assert!(d.table_columns_query().contains("?1"), "{d:?} must bind the table name");
+        }
     }
 
     #[test]

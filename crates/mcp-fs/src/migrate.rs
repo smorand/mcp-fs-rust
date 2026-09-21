@@ -21,10 +21,14 @@
 //!   it would be a different operation. Every `sha256` a node refers to is checked
 //!   against the destination blob store and reported when missing, which is what
 //!   turns a silent dangling reference into a visible one.
-//! * **OAuth tokens** are session state, encrypted with `MCPFS_TOKEN_KEY`. They
-//!   are deliberately skipped: a device flow re establishes them, and copying
-//!   ciphertext across a deployment whose key may differ would produce rows that
-//!   never decrypt.
+//! * **OAuth tokens** (`oauth_tokens`) ARE copied (FR-NEW-012), ciphertext and
+//!   all, using the same row-for-row shape as every other table: nothing here
+//!   decrypts or re-encrypts, so the destination only decrypts them again when
+//!   it runs under the same `MCPFS_TOKEN_KEY` as the source. Opening the source
+//!   store applies its schema first, which is what makes a source still on the
+//!   legacy `(person, provider)` key rebuild empty (DRIFT-005) before anything
+//!   is read from it, satisfying FR-NEW-012's "drop rows found in the legacy
+//!   format" without any legacy-detection logic of its own.
 //!
 //! # This is offline
 //!
@@ -209,6 +213,28 @@ pub async fn migrate(from: &ServerConfig, to: &ServerConfig) -> Result<Migration
                 "migration of '{table}' is incomplete: source has {want} rows, destination {got}"
             )));
         }
+    }
+
+    // OAuth tokens (FR-NEW-012): global, not scoped to a project. Applying the
+    // schema on both ends is what fires DRIFT-005's guarded drop on a source or
+    // destination still on the legacy (person, provider) shape, so a legacy
+    // source is rebuilt empty before anything is read from it.
+    let oauth_schema = crate::git::oauth::persistence::schema();
+    let src_oauth = crate::storage::open_oauth_db(from, &src_registry).await?;
+    let dst_oauth = crate::storage::open_oauth_db(to, &dst_registry).await?;
+    src_oauth.migrate(&oauth_schema).await?;
+    dst_oauth.migrate(&oauth_schema).await?;
+
+    let oauth_cols = columns_of(&oauth_schema, "oauth_tokens")?;
+    let n = copy_table(&*src_oauth, &*dst_oauth, "oauth_tokens", &oauth_cols, None).await?;
+    report.record("oauth_tokens", n);
+
+    let want = count_rows(&*src_oauth, "oauth_tokens", None).await?;
+    let got = count_rows(&*dst_oauth, "oauth_tokens", None).await?;
+    if want != got {
+        return Err(ToolError::internal(format!(
+            "migration of 'oauth_tokens' is incomplete: source has {want} rows, destination {got}"
+        )));
     }
 
     let projects = crate::storage::build_admin_store(from, &src_registry).await?;
@@ -436,6 +462,94 @@ mod tests {
         let nodes = dst_meta.subtree("/").await.unwrap();
         let files = nodes.iter().filter(|n| n.is_file()).count();
         assert_eq!(files, 2, "no duplicate rows after a second run");
+    }
+
+    /// E2E-NEW-041: the migrate verb carries `oauth_tokens` under the new
+    /// `(person, host)` key, values intact and still decryptable at the
+    /// destination under the same key.
+    #[tokio::test]
+    async fn e2e_new_041_migrate_carries_oauth_tokens_under_the_new_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = deployment(tmp.path(), "src");
+        let to = deployment(tmp.path(), "dst");
+        let token_key = [3u8; crate::git::oauth::cipher::KEY_SIZE];
+
+        let src_reg = RelationalRegistry::new();
+        let src_db = crate::storage::open_oauth_db(&from, &src_reg).await.unwrap();
+        let src_oauth =
+            crate::git::oauth::persistence::RelationalOAuthPersistence::open(src_db, token_key)
+                .await
+                .unwrap();
+        let session = crate::git::oauth::store::OAuthSession {
+            provider: "github".into(),
+            access_token: "gho_migrated".into(),
+            scopes: vec!["repo".into()],
+            expires_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            instance_url: None,
+        };
+        src_oauth.upsert("alice@test.com", "github.ibm.com", &session).await.unwrap();
+
+        let report = migrate(&from, &to).await.unwrap();
+        assert!(report.tables.iter().any(|t| t.table == "oauth_tokens" && t.rows == 1));
+
+        let dst_reg = RelationalRegistry::new();
+        let dst_db = crate::storage::open_oauth_db(&to, &dst_reg).await.unwrap();
+        let dst_oauth =
+            crate::git::oauth::persistence::RelationalOAuthPersistence::open(dst_db, token_key)
+                .await
+                .unwrap();
+        let all = dst_oauth.load_all().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "alice@test.com");
+        assert_eq!(all[0].1, "github.ibm.com", "keyed by host at the destination too");
+        assert_eq!(all[0].2.access_token, "gho_migrated", "still decryptable under the shared key");
+    }
+
+    /// E2E-NEW-042: a source still in the legacy `(person, provider)` format
+    /// never reaches the destination. Opening the source store rebuilds it
+    /// empty (DRIFT-005) before `migrate` reads a single row from it.
+    #[tokio::test]
+    async fn e2e_new_042_migrate_drops_legacy_format_source_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = deployment(tmp.path(), "src");
+        let to = deployment(tmp.path(), "dst");
+
+        let reg = RelationalRegistry::new();
+        let src_db = crate::storage::open_oauth_db(&from, &reg).await.unwrap();
+        // Simulate a live source still on the pre-US-003 shape.
+        src_db
+            .execute(&Query::new(
+                "CREATE TABLE oauth_tokens (person TEXT NOT NULL, provider TEXT NOT NULL, \
+                 token_enc BLOB NOT NULL, scopes TEXT NOT NULL, expires_at TEXT NOT NULL, \
+                 instance_url TEXT, PRIMARY KEY (person, provider))",
+            ))
+            .await
+            .unwrap();
+        src_db
+            .execute(&Query::new(
+                "INSERT INTO oauth_tokens \
+                 (person, provider, token_enc, scopes, expires_at, instance_url) \
+                 VALUES ('alice@test.com', 'github', X'00', 'repo', \
+                 '2030-01-01T00:00:00Z', NULL)",
+            ))
+            .await
+            .unwrap();
+
+        migrate(&from, &to).await.unwrap();
+
+        let dst_db = crate::storage::open_oauth_db(&to, &reg).await.unwrap();
+        let count = dst_db
+            .query_opt(&Query::new("SELECT COUNT(*) FROM oauth_tokens"))
+            .await
+            .unwrap()
+            .unwrap()
+            .i64(0)
+            .unwrap();
+        assert_eq!(count, 0, "the legacy-format row must never reach the destination");
     }
 
     #[tokio::test]
