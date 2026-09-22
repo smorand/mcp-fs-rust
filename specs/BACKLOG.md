@@ -88,6 +88,74 @@ leader election, sticky routing) instead of building for the topology actually i
 **Suggested by.** User request, 2026-09-21, grouping the horizontal-scaling gaps as one theme
 alongside BL-003.
 
+### BL-015: Two horizontal-scaling strategies, and the subsystem breakdown for the stateless one
+
+**Description.** A comparison, surfaced while evaluating whether a shared parallel filesystem
+(IBM Storage Scale, JuiceFS) could sit under `mcp-fs` as a backend, of two different ways to run
+more than one replica, plus the full list of per-subsystem work the fully-stateless strategy
+requires. Recorded here for whoever picks up BL-003/BL-014 next, so the option space does not
+need to be rediscovered.
+
+**Strategy A: shard by project, not fully stateless.** `mcp-fs` already isolates every project's
+state: its own relational data (one SQLite file, or one `volume_id` partition), its own bare git
+repository on disk, its own blob bucket, its own search index. A routing layer in front of N
+independent replicas, keyed by `project_id` (consistent hashing or an explicit registry), gets
+multi-tenant capacity without touching any subsystem: each replica keeps exactly the single-node
+design it has today. The limit is that one project's throughput stays bounded by one replica,
+which is rarely the actual constraint (a single MCP session rarely saturates a node). This is the
+cheaper strategy and needs no new infrastructure class.
+
+**Strategy B: any replica can serve any project (what BL-003/BL-014 describe).** This needs four
+separate fixes, not one:
+
+1. **Relational backend** (BL-014's third gap). PostgreSQL/SQL Server already give concurrent
+   writers, but remain single-primary: they scale reads (replicas), not writes, across nodes.
+   Genuine multi-node write scaling needs distributed SQL (Citus, CockroachDB, YugabyteDB, TiDB)
+   or a distributed KV metadata engine (TiKV, FoundationDB), the same class of engine JuiceFS
+   Community lets you plug in, and the same problem JuiceFS Enterprise's proprietary Raft engine
+   exists to solve. Plain PostgreSQL may still be enough in practice; distributed SQL is a step to
+   take only once PostgreSQL's single-primary write throughput is the measured bottleneck.
+2. **Git bare repositories on local disk.** `state/git-repos/{project_id}/` is a hard local-
+   filesystem dependency: libgit2 requires a real filesystem, not an API. No database change
+   touches this. Two options: keep project-affinity routing for git operations specifically
+   (Strategy A, scoped to just this subsystem), or put `state/git-repos/` on a filesystem shared
+   across all replicas. This second option is the one place in the whole evaluation where a shared
+   parallel/clustered POSIX filesystem (Storage Scale, JuiceFS) would have a concrete, scoped job:
+   nothing else in `mcp-fs` needs one.
+3. **Search index (Tantivy BM25 + vector).** Local, on-disk, per-process; not distributed. Needs
+   either a distributed search/vector backend (Elasticsearch/OpenSearch/Meilisearch for BM25;
+   Qdrant/Milvus/pgvector-on-Citus for vectors) behind the existing `search.*` tools, or per-shard
+   indexes under Strategy A. IBM's Content-Aware Storage was evaluated as one example of an
+   external, ACL-aware, incrementally-updated vector index that could sit behind `search.*`
+   without touching the rest of the engine; noted as a reference architecture, not a
+   recommendation, since it requires standing up Storage Scale and Fusion underneath it.
+4. **In-memory state.** OAuth tokens (in-memory by default) and the session/write-quota map
+   (BL-003) must move to a store every replica can read and write: Redis, or the same relational
+   backend as (1). Left as-is, a token issued on one replica is invisible to another, and a
+   caller's quota is multiplied by the replica count exactly as BL-003 already describes.
+
+**Why this belongs next to BL-003/BL-014 rather than replacing them.** Strategy B, done properly,
+re-derives problems that IBM Storage Scale and JuiceFS already solve for a general-purpose
+parallel filesystem: distributed metadata, a data plane shared across nodes, distributed search.
+Neither product offers a data-plane API matching what `mcp-fs` needs (read/write/edit/patch/glob/
+grep) though: both expose management-plane and, in IBM's case, vector-search-plane APIs only. Any
+adoption of either as a backend would mean reimplementing `core/fs_ops.rs` against a mounted
+filesystem instead of the current relational-plus-blob storage, losing the current
+content-addressed dedup and refcount GC unless rebuilt on top, and reconciling `mcp-fs`'s
+project-based ACL (a JWT claim plus a membership table, no OS identity involved) with POSIX
+UID/GID and, in practice, an AD/LDAP-backed identity federation, since both products enforce
+access through OS-level identity. That reconciliation can be automated with OAuth2 plus an
+identity-translation service in front of the directory, but the directory dependency itself does
+not go away, and group membership (not user identity) is the harder half to keep synchronized,
+since a project's membership table has no POSIX equivalent to map onto cleanly.
+
+**Rationale for deferral.** Same as BL-014: no current deployment needs more than one replica.
+Recorded so the strategy choice (A vs B) and, if B, the subsystem-by-subsystem plan are available
+when the need becomes concrete, rather than re-litigated then.
+
+**Suggested by.** User request, 2026-09-21, following a comparison of `mcp-fs` against IBM Storage
+Scale, IBM Content-Aware Storage and JuiceFS as possible backends.
+
 ## Theme: Git full support
 
 BL-004 through BL-013 are the pieces still missing between the current git surface and what
