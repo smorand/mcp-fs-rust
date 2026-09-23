@@ -292,7 +292,7 @@ impl Default for AdminConfig {
     }
 }
 
-/// The git index store (`git_objects`, `git_refs`, `git_remotes`).
+/// The git index store (`git_objects`, `git_operations`, `git_refs`, `git_remotes`).
 ///
 /// New section: this store existed before but its location was hardcoded, so it
 /// could not be pointed at another engine. Absent, it keeps the derived SQLite
@@ -444,6 +444,24 @@ fn d_gitlab_url() -> String {
 fn d_remote_timeout_secs() -> u64 {
     120
 }
+fn d_max_stash_entries() -> usize {
+    100
+}
+fn d_max_rebase_todo() -> usize {
+    200
+}
+fn d_provider_api_timeout_secs() -> u64 {
+    30
+}
+fn d_max_pr_diff_mb() -> usize {
+    12
+}
+fn d_github_scope() -> String {
+    "repo".into()
+}
+fn d_gitlab_scope() -> String {
+    "api read_repository write_repository".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -465,6 +483,38 @@ pub struct GitConfig {
     /// Enforced by `git::remote::with_remote_deadline`, the single wrapper all
     /// four operations share.
     pub remote_timeout_secs: u64,
+    /// FR-NEW-130: how many `refs/stash/*` entries one volume may hold at once.
+    /// A bound exists because a stash entry pins a whole volume snapshot, so an
+    /// unbounded pool is an unbounded store; the save that would exceed it is
+    /// refused rather than the oldest entry evicted, because evicting would
+    /// silently destroy the work the caller set aside.
+    pub max_stash_entries: usize,
+    /// FR-NEW-216: how many entries one `git.rebase` todo may hold. A bound
+    /// exists because the todo drives both the pre-flight range walk and the
+    /// replay, so an unbounded list is an unbounded amount of work held under
+    /// the per project write lock.
+    pub max_rebase_todo: usize,
+    /// FR-NEW-331: the scope set the GitHub device flow requests. `repo`
+    /// already covers the whole pull request surface, so the default is not
+    /// widened; it is configurable because a deployment whose provider policy
+    /// differs would otherwise need a rebuild.
+    pub github_scope: String,
+    /// FR-NEW-331, FR-MOD-109: the scope set the GitLab device flow requests.
+    /// `api` is present because GitLab documents `write_repository` as Git over
+    /// HTTP access only, granting no REST API access, which would leave every
+    /// merge request tool unauthorized.
+    pub gitlab_scope: String,
+    /// NFR 7.1: deadline for one provider REST round trip (`git.pr_*`).
+    /// Separate from `remote_timeout_secs` because a REST call is a single
+    /// small request, not a whole object transfer, so a clone sized budget
+    /// would let a hung provider hold a request thread for minutes.
+    pub provider_api_timeout_secs: u64,
+    /// FR-NEW-309: how many MiB of unified diff `git.pr_diff` returns at most.
+    /// A bound exists because a pull request diff has no natural ceiling and the
+    /// answer lands in a caller's context window; past the bound the prefix is
+    /// returned with `truncated: true` rather than the call refused, because a
+    /// prefix of a diff still reviews.
+    pub max_pr_diff_mb: usize,
 }
 impl Default for GitConfig {
     fn default() -> Self {
@@ -480,6 +530,12 @@ impl Default for GitConfig {
             gitlab_instance_url: d_gitlab_url(),
             hosts: crate::git::remote::HostMap::default(),
             remote_timeout_secs: d_remote_timeout_secs(),
+            max_stash_entries: d_max_stash_entries(),
+            max_rebase_todo: d_max_rebase_todo(),
+            github_scope: d_github_scope(),
+            gitlab_scope: d_gitlab_scope(),
+            provider_api_timeout_secs: d_provider_api_timeout_secs(),
+            max_pr_diff_mb: d_max_pr_diff_mb(),
         }
     }
 }
@@ -1087,6 +1143,62 @@ mod tests {
         assert_eq!(c.git.github_client_secret_env, "MCPFS_GITHUB_CLIENT_SECRET");
         assert_eq!(c.git.gitlab_instance_url, "https://gitlab.com");
         assert_eq!(c.git.remote_timeout_secs, 120);
+        assert_eq!(c.git.max_stash_entries, 100);
+        assert_eq!(c.git.max_rebase_todo, 200);
+    }
+
+    /// E2E-NEW-881: with nothing configured the requested scopes are exactly
+    /// the documented defaults, character for character and in order, and they
+    /// survive a serialize/parse round trip.
+    #[test]
+    fn e2e_new_881_the_requested_scopes_default_to_the_documented_strings() {
+        let parsed: crate::config::ServerConfig =
+            serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+        assert_eq!(parsed.git.github_scope, "repo");
+        assert_eq!(parsed.git.gitlab_scope, "api read_repository write_repository");
+
+        // The emitted YAML re-parses to the same two strings. `hosts` is
+        // dropped first: it serializes as a sequence and deserializes from a
+        // mapping, a pre-existing asymmetry this assertion is not about.
+        let mut emitted: serde_yaml::Value = serde_yaml::to_value(&parsed.git).unwrap();
+        if let Some(m) = emitted.as_mapping_mut() {
+            m.remove(serde_yaml::Value::from("hosts"));
+        }
+        let round: crate::config::GitConfig = serde_yaml::from_value(emitted).unwrap();
+        assert_eq!(round.github_scope, "repo");
+        assert_eq!(round.gitlab_scope, "api read_repository write_repository");
+    }
+
+    /// E2E-NEW-880: a configured scope overrides the default, per provider.
+    #[test]
+    fn e2e_new_880_a_configured_scope_overrides_the_default() {
+        let parsed: crate::config::ServerConfig =
+            serde_yaml::from_str("git:\n  github_scope: 'repo public_repo'\n  gitlab_scope: api\n")
+                .unwrap();
+        assert_eq!(parsed.git.github_scope, "repo public_repo");
+        assert_eq!(parsed.git.gitlab_scope, "api");
+    }
+
+    /// FR-NEW-216: the rebase todo bound defaults to 200 and is configurable.
+    #[test]
+    fn the_rebase_todo_bound_defaults_to_200_and_is_configurable() {
+        let parsed: crate::config::ServerConfig =
+            serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+        assert_eq!(parsed.git.max_rebase_todo, 200);
+        let parsed: crate::config::ServerConfig =
+            serde_yaml::from_str("git:\n  max_rebase_todo: 5\n").unwrap();
+        assert_eq!(parsed.git.max_rebase_todo, 5);
+    }
+
+    /// FR-NEW-130: the stash pool cap defaults to 100 and is configurable.
+    #[test]
+    fn the_stash_pool_cap_defaults_to_100_and_is_configurable() {
+        let parsed: crate::config::ServerConfig =
+            serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+        assert_eq!(parsed.git.max_stash_entries, 100);
+        let parsed: crate::config::ServerConfig =
+            serde_yaml::from_str("git:\n  max_stash_entries: 7\n").unwrap();
+        assert_eq!(parsed.git.max_stash_entries, 7);
     }
 
     /// E2E-NEW-157: the timeout default is 120 and is configurable

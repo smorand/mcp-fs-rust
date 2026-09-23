@@ -16,7 +16,7 @@ plane can never disagree.
        |                          |                            |
 +------v---------+     +----------v-----------+     +----------v---------+
 | mcp::registry  |     | api::dataplane       |     | git::http          |
-| 63 tools       |     | 38 routes            |     | smart protocol v0  |
+| 94 tools       |     | 38 routes            |     | smart protocol v0  |
 +------+---------+     +----------+-----------+     +----------+---------+
        |                          |                            |
        +------------+-------------+                            |

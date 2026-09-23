@@ -87,6 +87,23 @@ impl Args {
         }
     }
 
+    /// `bool_or`, but a value that is neither a boolean nor the string form of
+    /// one is an error instead of the default. Used where reading a bogus
+    /// value as `false` would silently perform a different operation than the
+    /// caller asked for (FR-NEW-191: `squash`).
+    pub fn strict_bool_or(&self, name: &str, default: bool) -> Result<bool> {
+        match self.get(name) {
+            None => Ok(default),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(Self::wrong(name, "a boolean")),
+            },
+            Some(_) => Err(Self::wrong(name, "a boolean")),
+        }
+    }
+
     pub fn opt_num(&self, name: &str) -> Option<f64> {
         self.get(name).and_then(|v| v.as_f64())
     }

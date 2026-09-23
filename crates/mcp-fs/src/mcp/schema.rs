@@ -103,6 +103,13 @@ impl ToolSchema {
     pub fn opt_nullable_num(self, n: &'static str, d: &'static str) -> Self {
         self.push(n, d, ParamType::NullableNum, false, Some(Value::Null))
     }
+    /// Optional object array (`resolutions` on a continue tool): same shape as
+    /// [`Self::req_obj_array`], `"default": null`, because a call that resolves
+    /// nothing is a legitimate call that the handler refuses on its own terms.
+    pub fn opt_obj_array(self, n: &'static str, d: &'static str, items: &'static str) -> Self {
+        self.push(n, d, ParamType::ObjArray(items), false, Some(Value::Null))
+    }
+
     /// Tolerant string array (`exclude_patterns`): no `type`, `"default": null`.
     pub fn opt_flexible_str_array(self, n: &'static str, d: &'static str) -> Self {
         self.push(n, d, ParamType::FlexibleStrArray, false, Some(Value::Null))

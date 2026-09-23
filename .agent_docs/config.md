@@ -273,6 +273,11 @@ doc_service:
 | `gitlab_client_secret_env` | string | `GITLAB_CLIENT_SECRET` | name of the env var holding the GitLab secret |
 | `gitlab_instance_url` | string | `https://gitlab.com` | base URL for a self hosted GitLab |
 | `remote_timeout_secs` | int | `120` | deadline for one clone/push/fetch/pull; expiry releases the per-repository write lock (DEC-032) |
+| `max_stash_entries` | int | `100` | how many `refs/stash/*` entries one volume may hold; the save that would exceed it is refused, never the oldest evicted (FR-NEW-130) |
+| `github_scope` | string | `repo` | scope set the GitHub device flow requests (FR-NEW-331) |
+| `gitlab_scope` | string | `api read_repository write_repository` | scope set the GitLab device flow requests; `api` is mandatory for REST API access, `write_repository` is Git over HTTP only (FR-MOD-109) |
+| `max_rebase_todo` | int | `200` | how many entries one `git.rebase` todo may hold, and the ceiling the pre-flight range walk stops at (FR-NEW-216) |
+| `max_pr_diff_mb` | int | `12` | MiB of unified diff `git.pr_diff` returns at most; past it the prefix is returned with `truncated: true`, never a refusal (FR-NEW-309) |
 
 Details in [`.agent_docs/git.md`](git.md).
 

@@ -28,6 +28,7 @@ pub mod edit;
 pub mod editor;
 pub mod git;
 pub mod git_auth;
+pub mod git_pr;
 pub mod lifecycle;
 pub mod listing;
 pub mod metadata;

@@ -8,7 +8,7 @@
 //! Object bytes are NOT here: they live in the blob store under `git:{sha}`. This
 //! table is an index over them, which is what makes a short sha lookup cheap.
 
-use crate::errors::Result;
+use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{ColumnType, Upsert};
 use crate::storage::rel::schema::{Column, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb};
@@ -20,6 +20,8 @@ const VOLUME_ID_LEN: u32 = 64;
 const HASH_LEN: u32 = 128;
 /// Ref names are short in practice, but a tag can nest deeply.
 const REF_NAME_LEN: u32 = 400;
+/// An operation type or state is a short keyword from a closed set.
+const OP_ENUM_LEN: u32 = 32;
 
 /// One row of the `git_objects` index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +40,125 @@ pub struct GitRefRow {
     pub symbolic: bool,
 }
 
+/// One in-progress operation, paused because it needs a human decision.
+///
+/// The record is relational rather than in-memory so a paused rebase survives a
+/// server restart and is visible to every member of the project (DEC-901).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOperationRow {
+    pub op_type: GitOpType,
+    /// Where the operation stands: exactly `conflicted` or `running`
+    /// (FR-NEW-188).
+    pub state: String,
+    /// The ref the operation is combining in, when it has one; reported as the
+    /// conflict response's `source_ref` and in `git.status` (FR-NEW-286).
+    pub source_ref: Option<String>,
+    /// The commit the operation replays onto, when it has one.
+    pub onto_sha: Option<String>,
+    /// The tip before the operation started, so an abort can restore it.
+    pub original_tip_sha: Option<String>,
+    /// The remaining plan, serialized by the caller (JSON today).
+    pub todo: Option<String>,
+    pub current_step: i64,
+    pub total_steps: i64,
+    /// Conflicting paths, serialized by the caller.
+    pub conflicts: Option<String>,
+    /// Resolutions recorded so far, serialized by the caller.
+    pub resolutions: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The closed set of operations that can pause mid-flight (FR-NEW-285).
+///
+/// `stash_apply` and `stash_pop` are distinct because completion differs: a
+/// resumed pop drops the stash entry, a resumed apply keeps it, so the row has
+/// to remember which tool was called. A pull conflict is recorded as `merge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitOpType {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    StashApply,
+    StashPop,
+}
+
+impl GitOpType {
+    /// Every value, in the order the specification lists them.
+    pub const ALL: [GitOpType; 6] = [
+        GitOpType::Merge,
+        GitOpType::Rebase,
+        GitOpType::CherryPick,
+        GitOpType::Revert,
+        GitOpType::StashApply,
+        GitOpType::StashPop,
+    ];
+
+    /// The stored and reported spelling, shared by the conflict response and by
+    /// the `operation` object of `git.status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitOpType::Merge => "merge",
+            GitOpType::Rebase => "rebase",
+            GitOpType::CherryPick => "cherry_pick",
+            GitOpType::Revert => "revert",
+            GitOpType::StashApply => "stash_apply",
+            GitOpType::StashPop => "stash_pop",
+        }
+    }
+
+    /// The tool that completes this operation (FR-NEW-241). Carried by the
+    /// type so the conflict response never guesses the pair per call site: a
+    /// pull and a stash apply are completed by the merge tools, because both
+    /// conflicts ARE merge conflicts.
+    pub fn continue_with(self) -> &'static str {
+        match self {
+            GitOpType::Merge | GitOpType::StashApply | GitOpType::StashPop => "git.merge_resolve",
+            GitOpType::Rebase => "git.rebase_continue",
+            GitOpType::CherryPick => "git.cherry_pick_continue",
+            GitOpType::Revert => "git.revert_continue",
+        }
+    }
+
+    /// The tool that abandons this operation (FR-NEW-241).
+    pub fn abort_with(self) -> &'static str {
+        match self {
+            GitOpType::Merge | GitOpType::StashApply | GitOpType::StashPop => "git.merge_abort",
+            GitOpType::Rebase => "git.rebase_abort",
+            GitOpType::CherryPick => "git.cherry_pick_abort",
+            GitOpType::Revert => "git.revert_abort",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.as_str() == s)
+            .ok_or_else(|| ToolError::internal(format!("unknown git operation type: {s}")))
+    }
+}
+
 /// The tables this store owns, named once so a purge cannot miss one.
-pub const TABLES: [&str; 3] = ["git_objects", "git_refs", "git_remotes"];
+pub const TABLES: [&str; 4] = ["git_objects", "git_operations", "git_refs", "git_remotes"];
+
+/// Every column of `git_operations`, in placeholder order. Named once so the
+/// upsert and the select cannot drift apart.
+const OPERATION_COLUMNS: [&str; 13] = [
+    "volume_id",
+    "op_type",
+    "state",
+    "source_ref",
+    "onto_sha",
+    "original_tip_sha",
+    "todo",
+    "current_step",
+    "total_steps",
+    "conflicts",
+    "resolutions",
+    "created_at",
+    "updated_at",
+];
 
 /// The tables this store owns.
 pub fn schema() -> SchemaSet {
@@ -65,6 +184,32 @@ pub fn schema() -> SchemaSet {
                     Column::required("symbolic", ColumnType::BigInt).default("0"),
                 ],
                 vec!["volume_id", "name"],
+            ),
+            // Keyed on `volume_id` alone: a volume holds at most one in-progress
+            // operation, so the primary key is what enforces FR-NEW-283.
+            Table::new(
+                "git_operations",
+                vec![
+                    volume(),
+                    Column::required("op_type", ColumnType::TextKey(OP_ENUM_LEN)),
+                    Column::required("state", ColumnType::TextKey(OP_ENUM_LEN)),
+                    // Declared in the table rather than as a column migration:
+                    // `git_operations` is introduced on this same unreleased
+                    // branch, so no deployed database carries the narrow shape.
+                    Column::new("source_ref", ColumnType::TextKey(REF_NAME_LEN)),
+                    Column::new("onto_sha", ColumnType::TextKey(HASH_LEN)),
+                    Column::new("original_tip_sha", ColumnType::TextKey(HASH_LEN)),
+                    // Payloads are unbounded: a todo list or a conflict set has no
+                    // useful length ceiling and neither is ever indexed.
+                    Column::new("todo", ColumnType::Text),
+                    Column::required("current_step", ColumnType::BigInt).default("0"),
+                    Column::required("total_steps", ColumnType::BigInt).default("0"),
+                    Column::new("conflicts", ColumnType::Text),
+                    Column::new("resolutions", ColumnType::Text),
+                    Column::required("created_at", ColumnType::Text),
+                    Column::required("updated_at", ColumnType::Text),
+                ],
+                vec!["volume_id"],
             ),
             Table::new(
                 "git_remotes",
@@ -295,6 +440,96 @@ impl RelationalGitDb {
         Ok(())
     }
 
+    // ── operations ──────────────────────────────────────────────────────────
+
+    /// Write the in-progress operation of this volume, replacing any previous
+    /// one: a volume holds at most one (FR-NEW-283).
+    pub async fn set_operation(&self, op: &GitOperationRow) -> Result<()> {
+        let sql = self.db.dialect().render_upsert(&Upsert::replace(
+            "git_operations",
+            OPERATION_COLUMNS.to_vec(),
+            vec!["volume_id"],
+        ));
+        self.db
+            .execute(
+                &Query::new(sql)
+                    .bind(&self.volume_id)
+                    .bind(op.op_type.as_str())
+                    .bind(&op.state)
+                    .bind(op.source_ref.as_ref())
+                    .bind(op.onto_sha.as_ref())
+                    .bind(op.original_tip_sha.as_ref())
+                    .bind(op.todo.as_ref())
+                    .bind(op.current_step)
+                    .bind(op.total_steps)
+                    .bind(op.conflicts.as_ref())
+                    .bind(op.resolutions.as_ref())
+                    .bind(&op.created_at)
+                    .bind(&op.updated_at),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The in-progress operation of this volume, if any.
+    pub async fn get_operation(&self) -> Result<Option<GitOperationRow>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT op_type, state, source_ref, onto_sha, original_tip_sha, todo, \
+                     current_step, total_steps, conflicts, resolutions, created_at, updated_at \
+                     FROM git_operations WHERE volume_id=?1",
+                )
+                .bind(&self.volume_id),
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(Some(GitOperationRow {
+                op_type: GitOpType::parse(&r.text(0)?)?,
+                state: r.text(1)?,
+                source_ref: r.opt_text(2)?,
+                onto_sha: r.opt_text(3)?,
+                original_tip_sha: r.opt_text(4)?,
+                todo: r.opt_text(5)?,
+                current_step: r.i64(6)?,
+                total_steps: r.i64(7)?,
+                conflicts: r.opt_text(8)?,
+                resolutions: r.opt_text(9)?,
+                created_at: r.text(10)?,
+                updated_at: r.text(11)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop the operation row. Returns whether there was one, which is how a
+    /// caller tells "aborted" from "nothing in progress" (FR-NEW-284).
+    pub async fn clear_operation(&self) -> Result<bool> {
+        let affected = self
+            .db
+            .execute(
+                &Query::new("DELETE FROM git_operations WHERE volume_id=?1").bind(&self.volume_id),
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Operation rows for this volume. Zero or one by construction.
+    pub async fn count_operations(&self) -> Result<i64> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT COUNT(*) FROM git_operations WHERE volume_id=?1")
+                    .bind(&self.volume_id),
+            )
+            .await?;
+        match row {
+            Some(r) => r.i64(0),
+            None => Ok(0),
+        }
+    }
+
     pub async fn list_remotes(&self) -> Result<Vec<(String, String)>> {
         let rows = self
             .db
@@ -318,9 +553,140 @@ mod tests {
     /// Introspection goes through the dialect instead of `sqlite_master`, which
     /// only exists on one of the three engines.
     #[tokio::test]
-    async fn schema_has_the_three_tables() {
+    async fn schema_has_the_four_tables() {
         let d = db().await;
-        assert_eq!(d.table_names().await.unwrap(), vec!["git_objects", "git_refs", "git_remotes"]);
+        assert_eq!(
+            d.table_names().await.unwrap(),
+            vec!["git_objects", "git_operations", "git_refs", "git_remotes"]
+        );
+    }
+
+    fn paused_rebase() -> GitOperationRow {
+        GitOperationRow {
+            op_type: GitOpType::Rebase,
+            state: "conflicted".into(),
+            source_ref: Some("feature".into()),
+            onto_sha: Some("onto1".into()),
+            original_tip_sha: Some("tip1".into()),
+            todo: Some(r#"[{"sha":"F1"},{"sha":"F2"}]"#.into()),
+            current_step: 1,
+            total_steps: 2,
+            conflicts: Some(r#"["/a.txt"]"#.into()),
+            resolutions: None,
+            created_at: "2026-09-22T10:00:00Z".into(),
+            updated_at: "2026-09-22T10:00:00Z".into(),
+        }
+    }
+
+    /// FR-NEW-276: a purge iterates `TABLES`, so the new table must be named there
+    /// or a deleted project leaves its operation rows behind.
+    #[test]
+    fn git_operations_is_registered_for_purge() {
+        assert_eq!(TABLES.len(), 4, "the purge list must carry every owned table");
+        assert!(TABLES.contains(&"git_operations"), "{TABLES:?}");
+    }
+
+    /// FR-NEW-285: the six values round trip through their stored spelling.
+    #[test]
+    fn op_type_is_a_six_value_closed_set() {
+        let spelled: Vec<&str> = GitOpType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(
+            spelled,
+            vec!["merge", "rebase", "cherry_pick", "revert", "stash_apply", "stash_pop"]
+        );
+        for t in GitOpType::ALL {
+            assert_eq!(GitOpType::parse(t.as_str()).unwrap(), t);
+        }
+        assert!(GitOpType::parse("pull").is_err(), "the set is closed");
+    }
+
+    /// FR-NEW-275: every declared field survives the round trip.
+    #[tokio::test]
+    async fn operation_row_round_trips() {
+        let d = db().await;
+        assert_eq!(d.get_operation().await.unwrap(), None, "nothing in progress at rest");
+        let op = paused_rebase();
+        d.set_operation(&op).await.unwrap();
+        assert_eq!(d.get_operation().await.unwrap().unwrap(), op);
+        assert_eq!(d.count_operations().await.unwrap(), 1);
+    }
+
+    /// FR-NEW-285: each of the six types round trips through the column.
+    #[tokio::test]
+    async fn every_op_type_round_trips_through_the_column() {
+        let d = db().await;
+        for t in GitOpType::ALL {
+            let op = GitOperationRow { op_type: t, ..paused_rebase() };
+            d.set_operation(&op).await.unwrap();
+            assert_eq!(d.get_operation().await.unwrap().unwrap().op_type, t);
+        }
+    }
+
+    /// FR-NEW-283: one row per volume, and every query scoped by `volume_id`.
+    #[tokio::test]
+    async fn one_operation_per_volume() {
+        let db = Arc::new(crate::storage::rel::SqliteRelationalDb::open_in_memory().unwrap());
+        let a = RelationalGitDb::open(db.clone(), "proj1").await.unwrap();
+        let b = RelationalGitDb::open(db, "proj2").await.unwrap();
+
+        a.set_operation(&paused_rebase()).await.unwrap();
+        a.set_operation(&GitOperationRow {
+            op_type: GitOpType::Merge,
+            current_step: 2,
+            ..paused_rebase()
+        })
+        .await
+        .unwrap();
+        assert_eq!(a.count_operations().await.unwrap(), 1, "the second write replaces the first");
+        let got = a.get_operation().await.unwrap().unwrap();
+        assert_eq!(got.op_type, GitOpType::Merge);
+        assert_eq!(got.current_step, 2);
+
+        assert_eq!(b.get_operation().await.unwrap(), None, "another volume is unaffected");
+        b.set_operation(&paused_rebase()).await.unwrap();
+        assert_eq!(a.get_operation().await.unwrap().unwrap().op_type, GitOpType::Merge);
+    }
+
+    /// E2E-NEW-620 at the store level (FR-NEW-284): abort clears the row, a second
+    /// abort has nothing to clear, and a fresh operation pauses identically.
+    #[tokio::test]
+    async fn e2e_new_620_abort_clears_the_row() {
+        let d = db().await;
+        d.set_operation(&paused_rebase()).await.unwrap();
+        assert_eq!(d.count_operations().await.unwrap(), 1);
+
+        assert!(d.clear_operation().await.unwrap(), "the abort found a row");
+        assert_eq!(d.count_operations().await.unwrap(), 0, "no row survives the abort");
+        assert_eq!(d.get_operation().await.unwrap(), None);
+
+        assert!(!d.clear_operation().await.unwrap(), "nothing left to abort");
+
+        // The cleared row must not poison the next attempt.
+        d.set_operation(&paused_rebase()).await.unwrap();
+        let again = d.get_operation().await.unwrap().unwrap();
+        assert_eq!(again, paused_rebase(), "the same todo pauses identically");
+        assert_eq!(again.current_step, 1, "current_step still identifies F1");
+    }
+
+    /// FR-NEW-278: a paused operation is resumable after a restart.
+    #[tokio::test]
+    async fn paused_operation_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("git").join("restart.db");
+        let open = |p: &std::path::Path| {
+            let db = crate::storage::rel::SqliteRelationalDb::open(p).unwrap();
+            RelationalGitDb::open(Arc::new(db), "proj")
+        };
+        {
+            let d = open(&path).await.unwrap();
+            d.set_operation(&paused_rebase()).await.unwrap();
+        }
+        let d2 = open(&path).await.unwrap();
+        let got = d2.get_operation().await.unwrap().unwrap();
+        assert_eq!(got.current_step, 1, "current_step unchanged");
+        assert_eq!(got.todo, paused_rebase().todo, "todo unchanged");
+        assert_eq!(got.conflicts, paused_rebase().conflicts, "conflicts unchanged");
+        assert_eq!(got, paused_rebase());
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 pub mod cipher;
 pub mod device_flow;
 pub mod persistence;
+pub mod scopes;
 pub mod store;
 
 pub use cipher::{decode_key, generate_key_base64};

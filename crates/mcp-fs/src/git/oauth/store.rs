@@ -236,6 +236,18 @@ impl OAuthTokenStore {
         token_key: &str,
         host: &str,
     ) -> Result<String> {
+        Ok(self.require_valid_session(person, token_key, host)?.access_token)
+    }
+
+    /// The same gate, returning the whole session instead of just the token, so
+    /// a caller that also needs the recorded scopes reads the store once.
+    /// Private: the two public gates above and below are the surface.
+    fn require_valid_session(
+        &self,
+        person: &str,
+        token_key: &str,
+        host: &str,
+    ) -> Result<OAuthSession> {
         let instruction = format!("authenticate with git.auth or git.token_set for host {host}");
         match self.get_token(person, token_key) {
             None => {
@@ -244,8 +256,30 @@ impl OAuthTokenStore {
             Some(session) if !session.is_valid_at(Utc::now()) => Err(ToolError::unauthenticated(
                 format!("token expired for host {host}; {instruction}"),
             )),
-            Some(session) => Ok(session.access_token),
+            Some(session) => Ok(session),
         }
+    }
+
+    /// The gate every `git.pr_*` tool runs before touching the network
+    /// (FR-NEW-332): [`Self::require_valid_credential`]'s presence and expiry
+    /// checks first, so an expired *and* narrow token reports expiry, then the
+    /// scope check from [`crate::git::oauth::scopes`]. Both read the one
+    /// session this single lookup returned, so the scope check costs no query
+    /// and no round trip.
+    pub fn require_pr_credential(
+        &self,
+        person: &str,
+        host: &str,
+        access: crate::git::oauth::scopes::PrAccess,
+    ) -> Result<String> {
+        let session = self.require_valid_session(person, host, host)?;
+        crate::git::oauth::scopes::require_pr_scope(
+            &session.provider,
+            &session.scopes,
+            host,
+            access,
+        )?;
+        Ok(session.access_token)
     }
 
     /// Every `(person, host)` currently held, original casing. Diagnostics.
@@ -959,5 +993,122 @@ mod tests {
         let got = s.get_token("alice@test.com", "github.ibm.com").unwrap();
         assert_eq!(got.access_token, "ghp_old", "the prior token must still be in place");
         assert_eq!(got.scopes, vec!["repo"]);
+    }
+
+    // ── require_pr_credential: FR-NEW-332/333/334 (US-023) ───────────────────
+    //
+    // The `git.pr_*` tools themselves belong to US-024, so these tests exercise
+    // the shared gate directly, the same way the `require_valid_credential`
+    // tests above do for the remote tools.
+
+    /// E2E-NEW-785: expiry wins over the scope check; a token both expired and
+    /// narrow reports expiry, byte compatible with the pre-existing message.
+    #[tokio::test]
+    async fn e2e_new_785_expiry_wins_over_the_scope_check() {
+        use crate::git::oauth::scopes::PrAccess;
+        let s = store();
+        s.store_token(
+            "alice@test.com",
+            "github.com",
+            "github",
+            "ghp_expired",
+            vec!["repo".into()],
+            Some(past()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err =
+            s.require_pr_credential("alice@test.com", "github.com", PrAccess::Write).unwrap_err();
+        assert_eq!(err.code, crate::errors::code::UNAUTHENTICATED);
+        assert!(
+            err.message.starts_with("token expired for host github.com"),
+            "got {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("authenticate with git.auth or git.token_set for host github.com"),
+            "got {}",
+            err.message
+        );
+        assert!(!err.message.contains("ghp_expired"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-817: a token carrying only the old GitLab scope pair is refused
+    /// with `ERR_FORBIDDEN`, and the stored token is left untouched.
+    #[tokio::test]
+    async fn e2e_new_817_the_old_gitlab_scope_pair_is_refused_before_the_network() {
+        use crate::git::oauth::scopes::PrAccess;
+        let s = store();
+        s.store_token(
+            "dev@test.com",
+            "gitlab.com",
+            "gitlab",
+            "glpat_TESTTOKEN_old_005",
+            vec!["read_repository".into(), "write_repository".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err =
+            s.require_pr_credential("dev@test.com", "gitlab.com", PrAccess::Read).unwrap_err();
+        assert_eq!(err.code, crate::errors::code::FORBIDDEN);
+        for part in ["api", "gitlab.com", "git.auth", "git.token_set"] {
+            assert!(err.message.contains(part), "missing '{part}' in: {}", err.message);
+        }
+        assert!(!err.message.contains("glpat"), "got {}", err.message);
+
+        let still = s.get_token("dev@test.com", "gitlab.com").unwrap();
+        assert_eq!(still.access_token, "glpat_TESTTOKEN_old_005");
+        assert_eq!(still.scopes, vec!["read_repository", "write_repository"]);
+    }
+
+    /// E2E-NEW-929: a token seeded with no scope information is given the
+    /// benefit of the doubt and its value is handed to the caller to use
+    /// (DEC-911), so the provider gets to answer for itself.
+    #[tokio::test]
+    async fn e2e_new_929_an_unknown_scope_token_is_handed_over_not_pre_empted() {
+        use crate::git::oauth::scopes::PrAccess;
+        let s = store();
+        s.store_token(
+            "dev@test.com",
+            "github.com",
+            "github",
+            "ghp_PAT_no_scopes_007",
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for access in [PrAccess::Read, PrAccess::Write] {
+            assert_eq!(
+                s.require_pr_credential("dev@test.com", "github.com", access).unwrap(),
+                "ghp_PAT_no_scopes_007"
+            );
+        }
+    }
+
+    /// FR-NEW-332: a sufficient scope set resolves to the token itself.
+    #[tokio::test]
+    async fn a_sufficient_scope_set_resolves_the_token() {
+        use crate::git::oauth::scopes::PrAccess;
+        let s = store();
+        s.store_token(
+            "dev@test.com",
+            "gitlab.com",
+            "gitlab",
+            "glpat_good",
+            vec!["api".into(), "read_repository".into(), "write_repository".into()],
+            Some(future()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.require_pr_credential("dev@test.com", "gitlab.com", PrAccess::Write).unwrap(),
+            "glpat_good"
+        );
     }
 }

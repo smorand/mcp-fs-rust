@@ -30,8 +30,10 @@
 
 pub mod db;
 pub mod http;
+pub mod merge;
 pub mod oauth;
 pub mod odb;
+pub mod provider;
 pub mod remote;
 pub mod repo;
 

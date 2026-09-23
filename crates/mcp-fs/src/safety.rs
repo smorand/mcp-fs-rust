@@ -141,6 +141,18 @@ impl SafetyManager {
         })
     }
 
+    /// Give back bytes charged for a write that never landed.
+    ///
+    /// Only sound when the caller knows nothing was written, which is what the
+    /// atomic apply's pass 1 pre-check guarantees: it refuses before the first
+    /// byte moves. Clamped at zero so a double refund cannot mint quota.
+    pub fn refund_write(&self, person: &str, project: &str, num_bytes: i64) {
+        let _: Result<()> = self.with_session(person, project, |s| {
+            s.bytes_written = (s.bytes_written - num_bytes).max(0);
+            Ok(())
+        });
+    }
+
     pub fn record_audit(&self, person: &str, project: &str, op: &str, path: &str, detail: &str) {
         self.with_session(person, project, |s| {
             s.audit.push_back(AuditEntry {

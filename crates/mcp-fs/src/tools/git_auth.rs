@@ -11,6 +11,7 @@
 use crate::config::ServerConfig;
 use crate::errors::{Result, ToolError};
 use crate::git::oauth::device_flow::{DeviceCode, DeviceFlowClient, HttpDeviceFlowClient};
+use crate::git::oauth::scopes::{PrAccess, pr_capability};
 use crate::git::oauth::store::OAuthTokenStore;
 use crate::mcp::registry::{ToolCtx, handler};
 use crate::mcp::{ToolRegistry, ToolSchema};
@@ -388,12 +389,29 @@ pub(crate) fn auth_status(
         .filter(|(_, s)| provider.is_none_or(|p| p == s.provider))
         .filter(|(h, _)| host.is_none_or(|hh| hh.eq_ignore_ascii_case(h)))
         .map(|(h, s)| {
+            // FR-NEW-335: the pull request surface needs read and write, and the
+            // answer has three states, so `pr_capable` is null when the recorded
+            // scope set says nothing rather than false (DEC-911).
+            let read = pr_capability(&s.provider, &s.scopes, PrAccess::Read);
+            let write = pr_capability(&s.provider, &s.scopes, PrAccess::Write);
+            let capable = match (read.as_bool(), write.as_bool()) {
+                (Some(r), Some(w)) => Some(r && w),
+                _ => None,
+            };
+            let mut missing: Vec<String> =
+                read.missing().iter().chain(write.missing()).cloned().collect();
+            missing.sort();
+            missing.dedup();
             json!({
                 "host": h,
                 "provider": s.provider,
                 "validity": if s.is_valid_at(now) { "valid" } else { "expired" },
                 "expires_at": s.expires_at.map(round_trip_iso),
                 "scopes": s.scopes,
+                "pr_read": read.as_bool(),
+                "pr_write": write.as_bool(),
+                "pr_capable": capable,
+                "missing_scopes": missing,
             })
         })
         .collect();
@@ -2118,6 +2136,193 @@ mod tests {
                 tokens.get_token(PERSON, "github.com").is_none(),
                 "no in-memory token must remain after a failed persistence write"
             );
+        });
+    }
+
+    // ── US-023: scope reporting on git.auth_status (FR-NEW-335) ─────────────
+
+    /// Seed `(PERSON, host)` directly in the store with a known scope set.
+    async fn seed(tokens: &OAuthTokenStore, host: &str, provider: &str, scopes: &[&str]) {
+        tokens
+            .store_token(
+                PERSON,
+                host,
+                provider,
+                &format!("tok_for_{host}"),
+                scopes.iter().map(|s| s.to_string()).collect(),
+                Some(future()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// E2E-NEW-775: the GitLab flow's granted scopes land on the session and
+    /// are reported verbatim, in order, as a valid entry.
+    #[test]
+    fn e2e_new_775_gitlab_granted_scopes_are_stored_and_reported() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::granted(
+                "glpat_FAKE_999",
+                vec!["api".into(), "read_repository".into(), "write_repository".into()],
+                future(),
+            )])
+            .await;
+            f.call(&r, PERSON, "git.auth", json!({"provider":"gitlab","host":"gitlab.com"}))
+                .await
+                .unwrap();
+            assert!(eventually(|| tokens.has_valid_token(PERSON, "gitlab.com")).await);
+
+            let out =
+                f.call(&r, PERSON, "git.auth_status", json!({"host":"gitlab.com"})).await.unwrap();
+            let e = &out["statuses"][0];
+            assert_eq!(e["scopes"], json!(["api", "read_repository", "write_repository"]));
+            assert_eq!(e["validity"], "valid");
+            assert_eq!(e["pr_capable"], json!(true));
+            assert_eq!(
+                tokens.get_token(PERSON, "gitlab.com").unwrap().scopes,
+                vec!["api", "read_repository", "write_repository"]
+            );
+        });
+    }
+
+    /// E2E-NEW-783: every entry keeps its five existing keys and gains the
+    /// pull request capability report, per host.
+    #[test]
+    fn e2e_new_783_auth_status_reports_pr_capability_per_host() {
+        with_git_hosts_lock(async {
+            declare_hosts(&[
+                ("github.com", "github"),
+                ("gitlab.com", "gitlab"),
+                ("gitlab.example.test", "gitlab"),
+            ]);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            seed(&tokens, "github.com", "github", &["repo"]).await;
+            seed(&tokens, "gitlab.com", "gitlab", &["read_repository", "write_repository"]).await;
+            seed(&tokens, "gitlab.example.test", "gitlab", &["api"]).await;
+
+            let out = f.call(&r, PERSON, "git.auth_status", json!({})).await.unwrap();
+            let st = out["statuses"].as_array().unwrap();
+            assert_eq!(st.len(), 3);
+            let hosts: Vec<&str> = st.iter().map(|e| e["host"].as_str().unwrap()).collect();
+            assert_eq!(hosts, vec!["github.com", "gitlab.com", "gitlab.example.test"]);
+            for e in st {
+                for k in ["host", "provider", "validity", "expires_at", "scopes"] {
+                    assert!(e.get(k).is_some(), "{k} must still be reported");
+                }
+            }
+            assert_eq!((&st[0]["pr_read"], &st[0]["pr_write"]), (&json!(true), &json!(true)));
+            assert_eq!((&st[1]["pr_read"], &st[1]["pr_write"]), (&json!(false), &json!(false)));
+            assert_eq!((&st[2]["pr_read"], &st[2]["pr_write"]), (&json!(true), &json!(true)));
+        });
+    }
+
+    /// E2E-NEW-784: `api` alone is reported as covering both halves of the
+    /// surface; nothing requires `read_repository` alongside it.
+    #[test]
+    fn e2e_new_784_api_alone_is_reported_as_pr_capable() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            seed(&tokens, "gitlab.com", "gitlab", &["api"]).await;
+            let out =
+                f.call(&r, PERSON, "git.auth_status", json!({"host":"gitlab.com"})).await.unwrap();
+            let e = &out["statuses"][0];
+            assert_eq!(e["pr_read"], json!(true));
+            assert_eq!(e["pr_write"], json!(true));
+            assert_eq!(e["missing_scopes"], json!([]));
+            // and the gate the pr tools will run agrees
+            for access in [PrAccess::Read, PrAccess::Write] {
+                tokens.require_pr_credential(PERSON, "gitlab.com", access).unwrap();
+            }
+        });
+    }
+
+    /// E2E-NEW-816: the scopes the flow granted are persisted verbatim and the
+    /// resulting token passes the pull request gate with no pre-check
+    /// rejection.
+    #[test]
+    fn e2e_new_816_granted_scopes_are_persisted_verbatim_and_pass_the_gate() {
+        with_git_hosts_lock(async {
+            declare_hosts(&[("gitlab.example.test", "gitlab")]);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::granted(
+                "glpat_FAKE_816",
+                vec!["api".into(), "read_repository".into(), "write_repository".into()],
+                future(),
+            )])
+            .await;
+            f.call(
+                &r,
+                PERSON,
+                "git.auth",
+                json!({"provider":"gitlab","instance_url":"https://gitlab.example.test"}),
+            )
+            .await
+            .unwrap();
+            assert!(eventually(|| tokens.has_valid_token(PERSON, "gitlab.example.test")).await);
+
+            assert_eq!(
+                tokens.get_token(PERSON, "gitlab.example.test").unwrap().scopes,
+                vec!["api", "read_repository", "write_repository"]
+            );
+            let out = f
+                .call(&r, PERSON, "git.auth_status", json!({"host":"gitlab.example.test"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                out["statuses"][0]["scopes"],
+                json!(["api", "read_repository", "write_repository"])
+            );
+            assert_eq!(out["statuses"][0]["pr_capable"], json!(true));
+            assert_eq!(
+                tokens
+                    .require_pr_credential(PERSON, "gitlab.example.test", PrAccess::Read)
+                    .unwrap(),
+                "glpat_FAKE_816"
+            );
+        });
+    }
+
+    /// E2E-NEW-930 / E2E-NEW-781: an empty scope set is reported as unknown,
+    /// distinguishable from both true and false, and is not refused by the
+    /// gate; no token value appears anywhere in the response.
+    #[test]
+    fn e2e_new_930_an_empty_scope_set_is_reported_unknown_not_insufficient() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let (f, r, tokens, _flow) = setup(vec![TokenPoll::pending("x")]).await;
+            seed(&tokens, "github.com", "github", &["repo"]).await;
+            seed(&tokens, "gitlab.com", "gitlab", &["read_repository", "write_repository"]).await;
+            // seeded the way `git.token_set` does it: no scope information
+            f.call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":GHP}))
+                .await
+                .unwrap();
+
+            let out = f.call(&r, PERSON, "git.auth_status", json!({})).await.unwrap();
+            let st = out["statuses"].as_array().unwrap();
+            let by = |h: &str| st.iter().find(|e| e["host"] == h).unwrap().clone();
+
+            let gh = by("github.com");
+            assert_eq!(gh["scopes"], json!(["repo"]));
+            assert_eq!(gh["pr_capable"], json!(true));
+
+            let gl = by("gitlab.com");
+            assert_eq!(gl["pr_capable"], json!(false));
+            assert_eq!(gl["missing_scopes"], json!(["api"]));
+
+            let ibm = by("github.ibm.com");
+            assert_eq!(ibm["scopes"], json!([]));
+            assert!(ibm["pr_capable"].is_null(), "unknown must not be reported as false");
+            assert_eq!(ibm["missing_scopes"], json!([]));
+
+            let body = serde_json::to_string(&out).unwrap();
+            assert!(!body.contains("ghp_"), "no token value in the response");
+            assert!(!body.contains("glpat"), "no token value in the response");
+            assert!(!body.contains(GHP));
+
+            // DEC-911: the unknown set is attempted, not pre-emptively refused.
+            tokens.require_pr_credential(PERSON, "github.ibm.com", PrAccess::Write).unwrap();
         });
     }
 }

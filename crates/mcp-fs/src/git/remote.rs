@@ -16,7 +16,7 @@
 //!
 //! [`validate_remote_url`] and [`clone_to_temp`] (with the sole
 //! `git2::RemoteCallbacks` construction in the tree) complete the pipeline for
-//! clone; [`require_origin`] is the guard push, fetch and pull (US-009 to
+//! clone; [`require_remote`] is the guard push, fetch and pull (US-009 to
 //! US-011) all call before ever reaching a network call, since none of those
 //! three tools take a `url` argument (DEC-021): their only source for one is
 //! the `origin` row [`crate::tools::git`]'s clone records via `git::db`.
@@ -312,6 +312,10 @@ fn redact(message: String, token: Option<&str>) -> String {
 /// to know whether the other one already reported.
 pub struct RemoteOpContext<'a> {
     pub operation: &'static str,
+    /// The declared remote the operation targets (FR-MOD-101, FR-MOD-103):
+    /// named in the span and in the audit detail, so two remotes on the same
+    /// host stay distinguishable in the trail.
+    pub remote: &'a str,
     pub host: &'a str,
     pub provider: &'a str,
     pub branch: Option<&'a str>,
@@ -342,6 +346,7 @@ where
     let span = tracing::info_span!(
         "git.remote",
         operation = op.operation,
+        remote = op.remote,
         host = op.host,
         provider = op.provider,
         branch = op.branch.unwrap_or(""),
@@ -365,7 +370,10 @@ where
         op.mount_id,
         op.operation,
         "/",
-        &format!("host '{}'{branch_part} outcome {outcome}: {detail}", op.host),
+        &format!(
+            "host '{}' remote '{}'{branch_part} outcome {outcome}: {detail}",
+            op.host, op.remote
+        ),
     );
 
     result
@@ -428,25 +436,46 @@ pub fn clone_to_temp(
     })
 }
 
-/// FR-NEW-021: push, fetch and pull take no `url`; they resolve the stored
-/// `origin`. `git.remote_push`, `git.remote_fetch` and `git.remote_pull`
-/// (US-009 to US-011) each call this before ever reaching a network
-/// operation, rather than each reimplementing "does this volume have an
-/// origin". A volume never initialized as a repository and one initialized
-/// but never cloned into both fail the same way: there is no `origin` row to
-/// resolve.
-pub async fn require_origin(store: &GitRepoStore, volume_id: &str) -> Result<String> {
+/// FR-NEW-021, FR-MOD-101, FR-MOD-103: push, fetch and pull take no `url`;
+/// they resolve a remote declared for the volume, `origin` unless the caller
+/// named another one. `git.remote_push`, `git.remote_fetch` and
+/// `git.remote_pull` each call this before ever reaching a network operation,
+/// rather than each reimplementing "does this volume have this remote": one
+/// `list_remotes` query settles it, and a name that is not there fails here,
+/// before any connection is opened (FR-NEW-146).
+///
+/// The two failure shapes are deliberately distinct. An absent `origin` stays
+/// `ERR_INVALID_ARGUMENT` with the wording every caller already matches on: a
+/// volume never initialized as a repository, and one initialized but never
+/// cloned into, both mean "this volume has no default remote to work with".
+/// Any other name the caller supplied is `ERR_NOT_FOUND`, naming the remote
+/// and the volume: the caller asked for a specific remote and it does not
+/// exist.
+pub async fn require_remote(store: &GitRepoStore, volume_id: &str, remote: &str) -> Result<String> {
+    let missing = |uninitialized: bool| {
+        if remote == "origin" {
+            let suffix =
+                if uninitialized { ": it was never initialized as a git repository" } else { "" };
+            ToolError::invalid_argument(format!(
+                "volume '{volume_id}' has no origin remote{suffix}"
+            ))
+        } else {
+            ToolError::not_found(format!(
+                "remote '{remote}' is not declared for volume '{volume_id}': add it with \
+                 git.remote_add, or list what is declared with git.remote_list"
+            ))
+        }
+    };
     if !store.is_initialized(volume_id).await {
-        return Err(ToolError::invalid_argument(format!(
-            "volume '{volume_id}' has no origin remote: it was never initialized as a git \
-             repository"
-        )));
+        return Err(missing(true));
     }
     let db = store.get_db(volume_id).await?;
     let remotes = db.list_remotes().await?;
-    remotes.into_iter().find(|(name, _)| name == "origin").map(|(_, url)| url).ok_or_else(|| {
-        ToolError::invalid_argument(format!("volume '{volume_id}' has no origin remote"))
-    })
+    remotes
+        .into_iter()
+        .find(|(name, _)| name == remote)
+        .map(|(_, url)| url)
+        .ok_or_else(|| missing(false))
 }
 
 /// The outcome of a successful push (FR-NEW-060): the branch's new sha on the
@@ -458,6 +487,11 @@ pub struct PushOutcome {
     pub remote_sha: String,
     pub created: bool,
     pub up_to_date: bool,
+    /// The sha the remote branch held immediately before this push, read from
+    /// the transport's own pre-push advertisement; `None` when the branch did
+    /// not exist there. FR-NEW-155/159: for a forced push this is the sha that
+    /// was destroyed, and the only record of it.
+    pub overwritten_sha: Option<String>,
 }
 
 /// Push `refs/heads/{branch}` to the same name on `origin_url`, from a bare
@@ -478,13 +512,17 @@ pub struct PushOutcome {
 /// on fast-forwardness (FR-NEW-024): no local pre-flight check runs here, a
 /// rejection is only ever recognized from `push_update_reference`'s own status
 /// message, classified by [`classify_push_rejection`].
+#[allow(clippy::too_many_arguments)]
 pub fn push_to_remote(
     repo: &git2::Repository,
     origin_url: &str,
     branch: &str,
+    remote_branch: &str,
     local_sha: &str,
     token: Option<String>,
     deadline: Option<Instant>,
+    force: bool,
+    expected_remote_sha: Option<&str>,
 ) -> Result<PushOutcome> {
     let token_for_redaction = token.clone();
     let mut remote = repo.remote_anonymous(origin_url).map_err(|e| {
@@ -494,18 +532,44 @@ pub fn push_to_remote(
         ))
     })?;
 
-    let refname = format!("refs/heads/{branch}");
-    let dst_for_negotiation = refname.clone();
+    // FR-MOD-102: the two sides of the refspec are named independently, so a
+    // local branch can land under another name on the remote. Everything the
+    // outcome is read from (the negotiation's pre-push view, the per-ref
+    // rejection status) keys off the REMOTE side, which is the ref the remote
+    // actually reports on.
+    let src_refname = format!("refs/heads/{branch}");
+    let dst_refname = format!("refs/heads/{remote_branch}");
+    let dst_for_negotiation = dst_refname.clone();
     let remote_before: Rc<RefCell<Option<git2::Oid>>> = Rc::new(RefCell::new(None));
     let before_cell = remote_before.clone();
     let rejected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let rejected_cell = rejected.clone();
+    // FR-NEW-157: the sha the remote actually holds, captured only when it
+    // fails to match the lease, so the caller can be told both values.
+    let lease_actual: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let lease_actual_cell = lease_actual.clone();
+    let lease = expected_remote_sha.map(str::to_string);
+    let lease_for_callback = lease.clone();
 
     let mut callbacks = credential_callbacks(token, deadline);
     callbacks.push_negotiation(move |updates| {
         for u in updates {
             if u.dst_refname() == Some(dst_for_negotiation.as_str()) {
                 *before_cell.borrow_mut() = Some(u.src());
+                // The lease is checked HERE, against the transport's own
+                // pre-push advertisement of the ref, which costs no second
+                // connection and no second round trip: it is the same view
+                // `created` and `up_to_date` are already read from. Returning
+                // an error aborts the push before a single object or ref
+                // update is sent, which is what leaves a stale-leased remote
+                // byte-identical (FR-NEW-157).
+                if let Some(expected) = lease_for_callback.as_deref() {
+                    let actual = u.src().to_string();
+                    if actual != expected {
+                        *lease_actual_cell.borrow_mut() = Some(actual);
+                        return Err(git2::Error::from_str("expected_remote_sha does not match"));
+                    }
+                }
             }
         }
         Ok(())
@@ -519,8 +583,18 @@ pub fn push_to_remote(
 
     let mut opts = git2::PushOptions::new();
     opts.remote_callbacks(callbacks);
-    let refspec = format!("{refname}:{refname}");
+    // FR-NEW-155: the leading `+` is what makes the update non-fast-forward,
+    // and it is only ever built from a `force` that already carries a
+    // validated lease: the two are inseparable by construction here, not by
+    // convention at the call site.
+    let refspec = format!("{}{src_refname}:{dst_refname}", if force { "+" } else { "" });
     if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut opts)) {
+        // A lease mismatch surfaces as the failure of the push the callback
+        // aborted, so it is classified before anything else: the remote never
+        // rejected this push, the lease did.
+        if let (Some(actual), Some(expected)) = (lease_actual.borrow().clone(), lease.as_deref()) {
+            return Err(lease_mismatch_error(branch, remote_branch, expected, &actual));
+        }
         // The local transport (used by every test, and by a same-host push in
         // production) raises a non-fast-forward as a hard error from `push`
         // itself, before `push_update_reference` ever runs; a remote smart-HTTP
@@ -547,6 +621,7 @@ pub fn push_to_remote(
         remote_sha: local_sha.to_string(),
         created: !existed,
         up_to_date: previous_remote_sha.as_deref() == Some(local_sha),
+        overwritten_sha: previous_remote_sha,
     })
 }
 
@@ -570,12 +645,16 @@ fn classify_push_rejection(status_msg: &str, branch: &str) -> ToolError {
     }
 }
 
-/// The single explicit fetch refspec (FR-NEW-062): destination side names only
-/// `refs/remotes/origin/*`, so an update reported by libgit2's `update_tips`
-/// callback can never name anything else. `git.remote_pull` (US-011) reuses
-/// [`fetch_from_remote`] itself, and therefore this constant, rather than
-/// writing its own copy: pull's first step is exactly this fetch (DEC-012).
-pub const FETCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+/// The single explicit fetch refspec (FR-NEW-062, FR-NEW-147): destination
+/// side names only `refs/remotes/{remote}/*`, so an update reported by
+/// libgit2's `update_tips` callback can never name anything else, in
+/// particular never a local branch and never another remote's namespace.
+/// `git.remote_pull` reuses [`fetch_from_remote`] itself, and therefore this
+/// function, rather than writing its own copy: pull's first step is exactly
+/// this fetch (DEC-012).
+pub fn fetch_refspec(remote: &str) -> String {
+    format!("+refs/heads/*:refs/remotes/{remote}/*")
+}
 
 /// One remote-tracking ref [`fetch_from_remote`] updated: `old_sha` is `None`
 /// when the ref was newly created (FR-NEW-050).
@@ -622,12 +701,13 @@ pub struct FetchOutcome {
 /// local bare repository with no network involved.
 pub fn fetch_from_remote(
     repo: &git2::Repository,
+    remote: &str,
     origin_url: &str,
     token: Option<String>,
     deadline: Option<Instant>,
 ) -> Result<FetchOutcome> {
     let token_for_redaction = token.clone();
-    let mut remote = repo
+    let mut git_remote = repo
         .remote_anonymous(origin_url)
         .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
 
@@ -636,7 +716,7 @@ pub fn fetch_from_remote(
     // `refs/remotes/origin/*` view to find what went stale.
     let advertised_branches: Vec<String> = {
         let list_callbacks = credential_callbacks(token.clone(), deadline);
-        let conn = remote
+        let conn = git_remote
             .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
             .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
         conn.list()
@@ -666,11 +746,11 @@ pub fn fetch_from_remote(
     opts.download_tags(git2::AutotagOption::None);
     opts.prune(git2::FetchPrune::Off);
 
-    remote
-        .fetch(&[FETCH_REFSPEC], Some(&mut opts), None)
+    git_remote
+        .fetch(&[fetch_refspec(remote).as_str()], Some(&mut opts), None)
         .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
 
-    let objects_fetched = remote.stats().received_objects() as i64;
+    let objects_fetched = git_remote.stats().received_objects() as i64;
     let refs_updated = updates.borrow().clone();
 
     Ok(FetchOutcome { refs_updated, advertised_branches, objects_fetched })
@@ -743,7 +823,29 @@ fn timeout_error(host: &str, timeout_secs: u64) -> ToolError {
 /// smart-HTTP remote sends).
 fn non_fast_forward_error(branch: &str) -> ToolError {
     ToolError::invalid_argument(format!(
-        "push refused: not a fast-forward: branch '{branch}', force is not supported"
+        "push refused: not a fast-forward: branch '{branch}', pass force with \
+         expected_remote_sha to overwrite the remote branch"
+    ))
+}
+
+/// FR-NEW-157: the lease failed, so the remote moved since the caller last
+/// looked. Deliberately a different message identity from
+/// [`non_fast_forward_error`] (it does not start with that prefix): the two
+/// mean different things, and a caller reacting to them must be able to tell
+/// a remote that moved from a push that was simply never a fast-forward.
+/// Both shas are named, and labelled, because acting on this error means
+/// re-reading the remote and deciding whether the actual sha is still
+/// something worth overwriting.
+fn lease_mismatch_error(
+    branch: &str,
+    remote_branch: &str,
+    expected: &str,
+    actual: &str,
+) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "push refused: the remote moved: branch '{branch}' targets '{remote_branch}' on the \
+         remote, expected {expected}, actual {actual}; nothing was overwritten, re-read the \
+         remote tip before forcing again"
     ))
 }
 
@@ -1096,7 +1198,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store =
             GitRepoStore::new(origin_test_config(dir.path()), crate::storage::test_registry());
-        let e = require_origin(&store, "proj").await.unwrap_err();
+        let e = require_remote(&store, "proj", "origin").await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
         assert!(e.message.to_ascii_lowercase().contains("origin"), "got {}", e.message);
     }
@@ -1111,7 +1213,7 @@ pub(crate) mod tests {
         let store =
             GitRepoStore::new(origin_test_config(dir.path()), crate::storage::test_registry());
         store.init_repo("proj").await.unwrap();
-        let e = require_origin(&store, "proj").await.unwrap_err();
+        let e = require_remote(&store, "proj", "origin").await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
         assert!(e.message.to_ascii_lowercase().contains("origin"), "got {}", e.message);
     }
@@ -1119,13 +1221,13 @@ pub(crate) mod tests {
     /// A volume with a recorded `origin` resolves it: the guard only rejects
     /// absence, never a present remote.
     #[tokio::test]
-    async fn require_origin_returns_the_stored_url_when_present() {
+    async fn require_remote_returns_the_stored_url_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let store =
             GitRepoStore::new(origin_test_config(dir.path()), crate::storage::test_registry());
         let entry = store.init_repo("proj").await.unwrap();
         entry.db.add_remote("origin", "https://example.test/o/r.git").await.unwrap();
-        let url = require_origin(&store, "proj").await.unwrap();
+        let url = require_remote(&store, "proj", "origin").await.unwrap();
         assert_eq!(url, "https://example.test/o/r.git");
     }
 

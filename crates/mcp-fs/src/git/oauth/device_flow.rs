@@ -34,9 +34,13 @@ pub const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token"
 /// The RFC 8628 grant type, sent when polling for the token.
 pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Scopes requested per provider, identical to the C#.
-const GITHUB_SCOPE: &str = "repo";
-const GITLAB_SCOPE: &str = "read_repository write_repository";
+/// Scopes requested per provider when nothing is configured (FR-NEW-331). The
+/// values live in [`GitConfig`], so a deployment can narrow or widen them
+/// without a rebuild; these constants are only the defaults that config type
+/// carries. GitLab's includes `api` because `write_repository` is Git over HTTP
+/// access only and grants no REST API access (FR-MOD-109).
+pub const DEFAULT_GITHUB_SCOPE: &str = "repo";
+pub const DEFAULT_GITLAB_SCOPE: &str = "api read_repository write_repository";
 
 /// Fallback poll interval when the provider omits or zeroes `interval`.
 const DEFAULT_INTERVAL: i64 = 5;
@@ -227,7 +231,7 @@ impl HttpDeviceFlowClient {
         let json: DeviceCodeBody = self
             .post_form(
                 &self.github_device_url,
-                &[("client_id", client_id), ("scope", GITHUB_SCOPE)],
+                &[("client_id", client_id), ("scope", self.config.github_scope.trim())],
                 "GitHub device/code",
             )
             .await?;
@@ -253,7 +257,7 @@ impl HttpDeviceFlowClient {
         let json: DeviceCodeBody = self
             .post_form(
                 &format!("{base}/oauth/authorize_device"),
-                &[("client_id", client_id), ("scope", GITLAB_SCOPE)],
+                &[("client_id", client_id), ("scope", self.config.gitlab_scope.trim())],
                 "GitLab authorize_device",
             )
             .await?;
@@ -647,7 +651,8 @@ mod tests {
         assert!(ttl <= Duration::hours(2), "gitlab defaults to a 2 hour session");
 
         let forms = seen.lock().unwrap();
-        assert_eq!(forms[0]["scope"], GITLAB_SCOPE);
+        // Touched by US-023: the requested GitLab scope gained `api`.
+        assert_eq!(forms[0]["scope"], DEFAULT_GITLAB_SCOPE);
         assert_eq!(forms.last().unwrap()["client_secret"], "gl-secret");
         unsafe { std::env::remove_var(ENV) };
     }
@@ -719,6 +724,71 @@ mod tests {
         let e = c.request_device_code("github", None).await.unwrap_err();
         assert_eq!(e.code, crate::errors::code::INTERNAL_ERROR);
         assert!(e.message.contains("HTTP 503"), "got {}", e.message);
+    }
+
+    /// The scope form field the GitLab device endpoint actually received.
+    async fn gitlab_scope_sent(cfg: GitConfig) -> String {
+        let (base, seen) = provider_server(
+            serde_json::json!({"device_code": "d", "user_code": "u", "verification_uri": "v",
+                               "expires_in": 600, "interval": 1}),
+            vec![serde_json::json!({})],
+        )
+        .await;
+        let c = HttpDeviceFlowClient::new(cfg).unwrap();
+        c.request_device_code("gitlab", Some(&base)).await.unwrap();
+        seen.lock().unwrap()[0]["scope"].clone()
+    }
+
+    /// The scope form field the GitHub device endpoint actually received.
+    async fn github_scope_sent(cfg: GitConfig) -> String {
+        let (base, seen) = provider_server(
+            serde_json::json!({"device_code": "d", "user_code": "u", "verification_uri": "v",
+                               "expires_in": 600, "interval": 1}),
+            vec![serde_json::json!({})],
+        )
+        .await;
+        github_client_with(&base, cfg).request_device_code("github", None).await.unwrap();
+        seen.lock().unwrap()[0]["scope"].clone()
+    }
+
+    /// E2E-NEW-773 / FR-MOD-109: the GitLab flow requests `api` in addition to
+    /// the repository scopes, and sends exactly that string.
+    #[tokio::test]
+    async fn e2e_new_773_the_gitlab_flow_requests_api_access() {
+        assert_eq!(DEFAULT_GITLAB_SCOPE, "api read_repository write_repository");
+        assert_eq!(
+            gitlab_scope_sent(config_named("unused", "unused")).await,
+            "api read_repository write_repository"
+        );
+    }
+
+    /// E2E-NEW-774: fixing GitLab must not widen GitHub, whose `repo` already
+    /// covers the whole pull request surface.
+    #[tokio::test]
+    async fn e2e_new_774_the_github_scope_is_unchanged() {
+        assert_eq!(DEFAULT_GITHUB_SCOPE, "repo");
+        assert_eq!(github_scope_sent(config_named("unused", "unused")).await, "repo");
+    }
+
+    /// E2E-NEW-880: a configured scope is what goes on the wire, per provider.
+    #[tokio::test]
+    async fn e2e_new_880_a_configured_scope_is_what_is_requested() {
+        let mut cfg = config_named("unused", "unused");
+        cfg.gitlab_scope = "api".into();
+        cfg.github_scope = "repo public_repo".into();
+        assert_eq!(gitlab_scope_sent(cfg.clone()).await, "api");
+        assert_eq!(github_scope_sent(cfg).await, "repo public_repo");
+    }
+
+    /// E2E-NEW-881: with nothing configured the wire carries the documented
+    /// defaults, character for character.
+    #[tokio::test]
+    async fn e2e_new_881_unconfigured_scopes_are_the_documented_defaults() {
+        let cfg = config_named("unused", "unused");
+        assert_eq!(cfg.github_scope, "repo");
+        assert_eq!(cfg.gitlab_scope, "api read_repository write_repository");
+        assert_eq!(github_scope_sent(cfg.clone()).await, "repo");
+        assert_eq!(gitlab_scope_sent(cfg).await, "api read_repository write_repository");
     }
 
     #[test]

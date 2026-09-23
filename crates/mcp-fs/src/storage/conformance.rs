@@ -434,6 +434,7 @@ async fn git_purge_is_scoped_to_one_volume(engine: &Engine, tag: &str) -> Result
         g.record_object("cafe01", "blob", 3).await?;
         g.set_ref("refs/heads/main", "cafe01", false).await?;
         g.add_remote("origin", "https://example.invalid/r.git").await?;
+        g.set_operation(&paused_operation()).await?;
     }
 
     // What `purge_git_rows` runs, against the engine under test.
@@ -450,10 +451,16 @@ async fn git_purge_is_scoped_to_one_volume(engine: &Engine, tag: &str) -> Result
     assert_eq!(a.count_objects().await?, 0, "{who}: the purged index is empty");
     assert!(a.list_refs().await?.is_empty(), "{who}: the purged refs are gone");
     assert!(a.list_remotes().await?.is_empty(), "{who}: the purged remotes are gone");
+    assert_eq!(a.count_operations().await?, 0, "{who}: the purged operation row is gone");
 
     assert_eq!(b.count_objects().await?, 1, "{who}: another project keeps its objects");
     assert_eq!(b.list_refs().await?.len(), 1, "{who}: another project keeps its refs");
     assert_eq!(b.list_remotes().await?.len(), 1, "{who}: another project keeps its remotes");
+    assert_eq!(
+        b.count_operations().await?,
+        1,
+        "{who}: another project keeps its in-progress operation"
+    );
 
     // A project recreated under the purged id starts empty, which is the defect
     // the purge exists to prevent.
@@ -467,6 +474,48 @@ async fn git_purge_is_scoped_to_one_volume(engine: &Engine, tag: &str) -> Result
         reborn.list_refs().await?.is_empty(),
         "{who}: a recreated project must not inherit the old refs"
     );
+    Ok(())
+}
+
+/// A paused rebase, the shape every engine must store and return unchanged.
+fn paused_operation() -> crate::git::db::GitOperationRow {
+    crate::git::db::GitOperationRow {
+        op_type: crate::git::db::GitOpType::Rebase,
+        state: "conflicted".into(),
+        source_ref: Some("feature".into()),
+        onto_sha: Some("onto1".into()),
+        original_tip_sha: Some("tip1".into()),
+        todo: Some(r#"[{"sha":"F1"}]"#.into()),
+        current_step: 1,
+        total_steps: 2,
+        conflicts: Some(r#"["/a.txt"]"#.into()),
+        resolutions: None,
+        created_at: "2026-09-22T10:00:00Z".into(),
+        updated_at: "2026-09-22T10:00:01Z".into(),
+    }
+}
+
+/// FR-NEW-277: the operation row is stored and read back identically on every
+/// engine, including the unbounded payload columns and the nullable ones.
+async fn git_operation_row_round_trips(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let g = RelationalGitDb::open(db, format!("{tag}-git-op")).await?;
+
+    assert_eq!(g.get_operation().await?, None, "{who}: nothing in progress at rest");
+    let op = paused_operation();
+    g.set_operation(&op).await?;
+    assert_eq!(g.get_operation().await?.as_ref(), Some(&op), "{who}: every field round trips");
+
+    // One row per volume: the second write replaces, it does not insert.
+    let moved = crate::git::db::GitOperationRow { current_step: 2, ..op };
+    g.set_operation(&moved).await?;
+    assert_eq!(g.count_operations().await?, 1, "{who}: at most one operation per volume");
+    assert_eq!(g.get_operation().await?.unwrap().current_step, 2, "{who}: the last write wins");
+
+    assert!(g.clear_operation().await?, "{who}: the abort found a row");
+    assert_eq!(g.count_operations().await?, 0, "{who}: completion clears the row");
+    assert!(!g.clear_operation().await?, "{who}: nothing left to clear");
     Ok(())
 }
 
@@ -639,6 +688,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     admin_projects_and_members(engine, &tag).await?;
     admin_column_migration_is_idempotent(engine, &tag).await?;
     git_objects_refs_remotes(engine, &tag).await?;
+    git_operation_row_round_trips(engine, &tag).await?;
     git_purge_is_scoped_to_one_volume(engine, &tag).await?;
     oauth_round_trip(engine, &tag).await?;
     oauth_legacy_table_is_rebuilt_identically(engine, &tag).await?;

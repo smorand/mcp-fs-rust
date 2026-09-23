@@ -1,5 +1,5 @@
 {
-  "_note": "Frozen MCP tool contract: the 63 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
+  "_note": "Frozen MCP tool contract: the 94 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
   "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
   "tools": [
     {
@@ -1352,6 +1352,115 @@
       }
     },
     {
+      "name": "git.branch_create",
+      "description": "Create a branch at a start point, optionally checking it out.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the branch to create, without the refs/heads/ prefix.",
+            "type": "string"
+          },
+          "start_point": {
+            "description": "Ref name, branch, tag or commit sha the new branch starts at; defaults to the currently checked-out commit.",
+            "type": "string",
+            "default": ""
+          },
+          "checkout": {
+            "description": "Check the new branch out, moving HEAD onto it and updating the volume's files to match; false leaves HEAD and every file untouched.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "mount_id",
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "git.branch_delete",
+      "description": "Delete a branch. Refuses the branch currently checked out, and refuses a branch holding commits reachable from no other ref unless force is true. Removes the ref only: every commit stays in the object store, so a mistaken delete is undone by recreating the branch at the reported sha with git.branch_create.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the branch to delete, without the refs/heads/ prefix.",
+            "type": "string"
+          },
+          "force": {
+            "description": "Delete the branch even when it holds commits reachable from no other ref, leaving them unreachable.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "mount_id",
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "git.branch_reset",
+      "description": "Move a branch pointer to another commit, the equivalent of git branch -f. Refuses a move that is not a fast-forward unless force is true, and always reports old_sha so a mistaken move is undone by moving back to it. On the branch currently checked out it also rewrites the volume to the target commit's tree, discarding uncommitted changes; on any other branch it moves the ref and leaves every file alone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the branch to move, without the refs/heads/ prefix.",
+            "type": "string"
+          },
+          "target_commit": {
+            "description": "Ref name, branch, tag or commit sha the branch is moved to.",
+            "type": "string"
+          },
+          "force": {
+            "description": "Move the branch even when the move is not a fast-forward, leaving the commits only the old tip reached orphaned.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "mount_id",
+          "name",
+          "target_commit"
+        ]
+      }
+    },
+    {
+      "name": "git.branch_switch",
+      "description": "Switch HEAD to an existing branch, rewriting the volume to match its commit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the branch to switch to, without the refs/heads/ prefix.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "name"
+        ]
+      }
+    },
+    {
       "name": "git.branches",
       "description": "List all branches with their SHA.",
       "inputSchema": {
@@ -1390,6 +1499,86 @@
           "mount_id",
           "commit_sha",
           "path"
+        ]
+      }
+    },
+    {
+      "name": "git.cherry_pick",
+      "description": "Apply the change one commit made onto the checked-out branch, as a NEW commit with a new sha that keeps the original author and records you as the committer. A commit already in the branch's history, or whose change the branch already carries, is reported as already_present and never duplicated. A conflicting pick applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.cherry_pick_continue or abandoned with git.cherry_pick_abort. A merge commit needs mainline, the parent its change is taken relative to. Refuses a dirty volume (commit or stash first).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "commit_sha": {
+            "description": "Full or abbreviated sha of the commit to apply; a ref name or a revision expression is not accepted.",
+            "type": "string"
+          },
+          "mainline": {
+            "description": "For a merge commit only: the 1-based index of the parent the picked change is taken relative to. Omit it for an ordinary commit.",
+            "type": "integer",
+            "default": 0
+          }
+        },
+        "required": [
+          "mount_id",
+          "commit_sha"
+        ]
+      }
+    },
+    {
+      "name": "git.cherry_pick_abort",
+      "description": "Abandon the cherry-pick paused by git.cherry_pick, discarding every resolution recorded, and leaving the branch and every volume file exactly as they were before the pick started.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.cherry_pick_continue",
+      "description": "Resume the cherry-pick paused by git.cherry_pick on a conflicting file. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the branch the commit is being applied onto, 'theirs' for the commit being picked, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the pick stays paused and nothing is written. Once every path is resolved the commit is created. A path that is not in conflict rejects the whole call, and so does a call made while something other than a cherry-pick is in progress.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "resolutions": {
+            "description": "One entry per conflicting path to resolve: path, plus exactly one of strategy ('ours' or 'theirs') or content (the literal bytes to use).",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "strategy": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            },
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id"
         ]
       }
     },
@@ -1503,6 +1692,416 @@
       }
     },
     {
+      "name": "git.merge",
+      "description": "Merge a branch, tag or commit into the checked-out branch. An already merged source is reported as already_up_to_date and changes nothing. A source the current branch is an ancestor of fast-forwards. Anything else is a three-way merge: a clean one creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or stash first).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "source_ref": {
+            "description": "Branch, tag or commit to merge into the checked-out branch.",
+            "type": "string"
+          },
+          "squash": {
+            "description": "Record the merged tree as a single commit with one parent instead of a merge commit, and never fast-forward.",
+            "type": "boolean",
+            "default": false
+          },
+          "message": {
+            "description": "Commit message for the merge commit; defaults to 'Merge {source_ref} into {current_branch}'.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id",
+          "source_ref"
+        ]
+      }
+    },
+    {
+      "name": "git.merge_abort",
+      "description": "Abandon the merge left in conflict by git.merge or git.remote_pull, discarding every resolution recorded so far and leaving HEAD and every volume file exactly as they were before the merge started.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.merge_resolve",
+      "description": "Finish a merge left in conflict by git.merge or git.remote_pull. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the checked-out branch's side, 'theirs' for the side being merged in, both taken whole) or content (the exact bytes to use, which is how a caller merges the two sides itself). Paths may be resolved over several calls: until the last one is resolved the merge stays in progress and nothing is written, and once it is the merge commit is created and every resulting file written to the volume as one all-or-nothing unit. A path that is not in conflict rejects the whole call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "resolutions": {
+            "description": "One entry per conflicting path to resolve: path, plus exactly one of strategy ('ours' or 'theirs') or content (the literal bytes to use).",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "strategy": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        "required": [
+          "mount_id",
+          "resolutions"
+        ]
+      }
+    },
+    {
+      "name": "git.pr_create",
+      "description": "Open a pull request on GitHub, or a merge request on GitLab, for a declared remote. Fails before contacting the provider when the head branch is not on the remote yet.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "base": {
+            "description": "Branch the pull request merges into, on the remote.",
+            "type": "string"
+          },
+          "head": {
+            "description": "Branch holding the changes; it must already exist on the remote.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Title of the pull request.",
+            "type": "string"
+          },
+          "body": {
+            "description": "Description of the pull request.",
+            "type": "string",
+            "default": null
+          },
+          "draft": {
+            "description": "Open the pull request as a draft; on GitLab, which has no draft flag, the title is prefixed with 'Draft: '.",
+            "type": "boolean",
+            "default": false
+          },
+          "remote": {
+            "description": "Name of the declared remote to open it on; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "base",
+          "head",
+          "title"
+        ]
+      }
+    },
+    {
+      "name": "git.pr_diff",
+      "description": "Read the unified diff of one pull request on GitHub, or one merge request on GitLab. The answer is bounded by git.max_pr_diff_mb; a larger diff is returned truncated, with truncated set to true.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Number of the pull request, as the provider numbers it.",
+            "type": "integer"
+          },
+          "remote": {
+            "description": "Name of the declared remote to read it from; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "name": "git.pr_get",
+      "description": "Read one pull request on GitHub, or one merge request on GitLab, normalized to one shape and enriched with its review state and its check state. Fails rather than reporting an unknown review or check state as none.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Number of the pull request, as the provider numbers it.",
+            "type": "integer"
+          },
+          "remote": {
+            "description": "Name of the declared remote to read it from; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "pr_number"
+        ]
+      }
+    },
+    {
+      "name": "git.pr_list",
+      "description": "List the pull requests of a declared remote on GitHub, or its merge requests on GitLab, filtered by state and normalized to one shape.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "state": {
+            "description": "Which pull requests to list: open, closed, merged or all; defaults to open.",
+            "type": "string",
+            "default": "open"
+          },
+          "remote": {
+            "description": "Name of the declared remote to list from; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.pr_merge",
+      "description": "Merge a pull request on GitHub, or a merge request on GitLab, with the chosen strategy. The merge happens on the provider: no local ref and no remote-tracking ref is updated, so git.remote_fetch is required to observe it locally. A refusal by the provider (failing checks, missing reviews, a protected branch, a strategy disabled for that repository, an already merged or closed pull request) is reported as the provider's own status and message, never as a success.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Number of the pull request, as the provider numbers it.",
+            "type": "integer"
+          },
+          "strategy": {
+            "description": "How the provider must merge it: merge, squash or rebase; the word is mapped to each provider's own spelling.",
+            "type": "string"
+          },
+          "commit_title": {
+            "description": "Title of the resulting commit; the provider's own default is used when absent.",
+            "type": "string",
+            "default": null
+          },
+          "commit_message": {
+            "description": "Body of the resulting commit; the provider's own default is used when absent.",
+            "type": "string",
+            "default": null
+          },
+          "remote": {
+            "description": "Name of the declared remote to merge on; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "pr_number",
+          "strategy"
+        ]
+      }
+    },
+    {
+      "name": "git.pr_review",
+      "description": "Submit a review verdict on a pull request on GitHub, or on a merge request on GitLab: approve it, request changes, or comment. On GitLab, which has no review verdict, approve uses the approve endpoint while the other two leave a note. A refusal by the provider (reviewing one's own pull request, a token the provider no longer accepts) is reported as the provider's own status and message, never as a success.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Number of the pull request, as the provider numbers it.",
+            "type": "integer"
+          },
+          "verdict": {
+            "description": "The verdict to submit: approve, request_changes or comment; the word is mapped to each provider's own spelling.",
+            "type": "string"
+          },
+          "body": {
+            "description": "Text of the review; required and non-empty for request_changes and comment, optional for approve.",
+            "type": "string",
+            "default": null
+          },
+          "remote": {
+            "description": "Name of the declared remote to review on; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "pr_number",
+          "verdict"
+        ]
+      }
+    },
+    {
+      "name": "git.rebase",
+      "description": "Replay the checked-out branch's commits onto another commit, following an explicit todo list. Each entry names one commit of the range between onto and the branch tip and one action: pick replays it, drop leaves it out, reword replays it with a new message, squash folds it into the entry above it. The whole todo is checked before anything is replayed: an unknown sha, a commit outside the range, a commit of the range left out, a duplicate sha, an unknown action, a leading squash or a blank reword message rejects the call and changes nothing. A branch that already contains onto is reported as up_to_date. Refuses a dirty volume (commit or stash first).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "onto": {
+            "description": "Ref name, branch, tag or commit sha the commits are replayed onto.",
+            "type": "string"
+          },
+          "todo": {
+            "description": "Ordered plan, one entry per commit of the range between onto and the branch tip: sha, action ('pick', 'squash', 'drop' or 'reword'), and message for a reword.",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "type": "string"
+                },
+                "sha": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action",
+                "sha"
+              ]
+            }
+          }
+        },
+        "required": [
+          "mount_id",
+          "onto",
+          "todo"
+        ]
+      }
+    },
+    {
+      "name": "git.rebase_abort",
+      "description": "Abandon the rebase paused by git.rebase, discarding every commit replayed so far and every resolution recorded, and leaving the branch and every volume file exactly as they were before the rebase started.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.rebase_continue",
+      "description": "Resume the rebase paused by git.rebase on a conflicting commit. Each resolution names one conflicting path of the paused commit and carries exactly one of strategy ('ours' for the side already replayed onto, 'theirs' for the commit being replayed, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the rebase stays paused at the same commit and nothing is written. Once every path is resolved that commit is replayed and the remaining todo entries follow, until the list is exhausted or a further conflict pauses it again. A path that is not in conflict rejects the whole call, and so does a call made while something other than a rebase is in progress.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "resolutions": {
+            "description": "One entry per conflicting path to resolve: path, plus exactly one of strategy ('ours' or 'theirs') or content (the literal bytes to use).",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "strategy": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            },
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.remote_add",
+      "description": "Record a named remote for the volume, so more than one repository can be pushed to, fetched from or pulled from. The URL must be https, must not embed credentials, and its host must be declared in git.hosts; store the credential with git.auth instead. A name already in use is refused rather than overwritten.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the remote, for example origin or upstream.",
+            "type": "string"
+          },
+          "url": {
+            "description": "HTTPS URL of the remote repository, without embedded credentials.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "name",
+          "url"
+        ]
+      }
+    },
+    {
       "name": "git.remote_clone",
       "description": "Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. Uses the OAuth token stored by git.auth if available for the detected provider. Copies all files into the volume AND imports the full git history into the git backend. Use depth=1 for a shallow clone (faster on large repos).",
       "inputSchema": {
@@ -1535,7 +2134,28 @@
     },
     {
       "name": "git.remote_fetch",
-      "description": "Fetch objects and update refs/remotes/origin/* from origin. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.",
+      "description": "Fetch objects and update refs/remotes/{remote}/* from a declared remote. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "remote": {
+            "description": "Name of the declared remote to fetch from; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.remote_list",
+      "description": "List every remote recorded for the volume with its resolved host and provider. A volume with no remote returns an empty list. No credential is ever included.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1551,7 +2171,7 @@
     },
     {
       "name": "git.remote_pull",
-      "description": "Fetch from origin, then advance the checked-out branch to the remote tip and update the volume's files to match. A fast-forward applies directly. A diverged history is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way merge resolves every conflicting file by that strategy and creates a merge commit. Refuses a dirty volume (commit or discard first) and refuses any branch other than the one currently checked out.",
+      "description": "Fetch from a declared remote, then advance the checked-out branch to the remote tip and update the volume's files to match. A fast-forward applies directly. A diverged history is merged: a clean three-way merge creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or discard first) and refuses any branch other than the one currently checked out.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1563,8 +2183,49 @@
             "description": "Branch to pull; must be the branch currently checked out.",
             "type": "string"
           },
-          "on_conflict": {
-            "description": "For a diverged (non fast-forward) history: 'ours' or 'theirs' to resolve every conflicting file by that strategy and create a merge commit; omit to refuse the pull instead. Ignored whenever the pull is a fast-forward.",
+          "remote": {
+            "description": "Name of the declared remote to pull from; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "branch"
+        ]
+      }
+    },
+    {
+      "name": "git.remote_push",
+      "description": "Push a local branch to a declared remote, under the same name unless remote_branch names another one. Creates the branch on the remote when it is absent there. Fails if the push is not a fast-forward, unless force is true, which requires expected_remote_sha to state the remote sha being overwritten.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "branch": {
+            "description": "Local branch to push.",
+            "type": "string"
+          },
+          "remote": {
+            "description": "Name of the declared remote to push to; defaults to origin.",
+            "type": "string",
+            "default": "origin"
+          },
+          "remote_branch": {
+            "description": "Branch name to push under on the remote; defaults to the local branch's name.",
+            "type": "string",
+            "default": null
+          },
+          "force": {
+            "description": "Overwrite the remote branch even when the push is not a fast-forward, discarding the commits it holds. Requires expected_remote_sha.",
+            "type": "boolean",
+            "default": false
+          },
+          "expected_remote_sha": {
+            "description": "The 40 character sha the remote branch is expected to be at right now, or 40 zeros when the branch must not exist there yet. Mandatory with force, refused without it: the push is rejected when the remote has moved since.",
             "type": "string",
             "default": null
           }
@@ -1576,8 +2237,8 @@
       }
     },
     {
-      "name": "git.remote_push",
-      "description": "Push a local branch to origin under the same name. Creates the branch on the remote when it is absent there. Fails if the push is not a fast-forward; force is not supported.",
+      "name": "git.remote_remove",
+      "description": "Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1585,14 +2246,120 @@
             "description": "Project/volume id the operation targets.",
             "type": "string"
           },
-          "branch": {
-            "description": "Local branch to push to origin under the same name.",
+          "name": {
+            "description": "Name of the remote to delete; matched case-sensitively.",
             "type": "string"
           }
         },
         "required": [
           "mount_id",
-          "branch"
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "git.reset",
+      "description": "Move the current branch's pointer to another commit, the equivalent of git reset. Mode soft moves the pointer alone and leaves every volume file exactly as it is, so the changes of the commits left behind stay in the volume ready to be committed again. Mode hard also rewrites the volume to the target commit's tree, discarding uncommitted changes. There is no mixed mode. Commits the branch no longer reaches are orphaned, never deleted, so a mistaken reset is undone by resetting back to the reported old_sha.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "target_ref": {
+            "description": "Ref name, branch, tag or commit sha the current branch is moved to.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "'soft' to move the pointer only, leaving the volume untouched, or 'hard' to also rewrite the volume to the target commit's tree, discarding uncommitted changes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "target_ref",
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "git.revert",
+      "description": "Undo what one commit did by adding a NEW commit on the checked-out branch whose change is the exact inverse, leaving the original commit in history untouched. The default message is Revert followed by the original subject in quotes. Reverting a revert restores the change. Reverting the very first commit of a history removes everything it added. A conflicting revert applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.revert_continue or abandoned with git.revert_abort. A merge commit needs mainline, the parent the revert is computed against. Refuses a dirty volume (commit or stash first).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "commit_sha": {
+            "description": "Full or abbreviated sha of the commit to undo; a ref name or a revision expression is not accepted.",
+            "type": "string"
+          },
+          "mainline": {
+            "description": "For a merge commit only: the 1-based index of the parent the revert is computed against, so the other parents' contribution is what gets removed. Omit it for an ordinary commit.",
+            "type": "integer",
+            "default": 0
+          }
+        },
+        "required": [
+          "mount_id",
+          "commit_sha"
+        ]
+      }
+    },
+    {
+      "name": "git.revert_abort",
+      "description": "Abandon the revert paused by git.revert, discarding every resolution recorded, and leaving the branch and every volume file exactly as they were before the revert started.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.revert_continue",
+      "description": "Resume the revert paused by git.revert on a conflicting file. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the branch the revert is being made on, 'theirs' for the state the reverted commit is being undone back to, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the revert stays paused and nothing is written. Once every path is resolved the inverse commit is created. A path that is not in conflict rejects the whole call, and so does a call made while something other than a revert is in progress.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "resolutions": {
+            "description": "One entry per conflicting path to resolve: path, plus exactly one of strategy ('ours' or 'theirs') or content (the literal bytes to use).",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "strategy": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            },
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id"
         ]
       }
     },
@@ -1614,6 +2381,106 @@
         "required": [
           "mount_id",
           "commit_sha"
+        ]
+      }
+    },
+    {
+      "name": "git.stash_apply",
+      "description": "Apply one stash entry's changes onto the current volume state, keeping the entry listed so it can be applied again. The entry applies onto whatever branch is checked out now, even one that did not exist when it was taken. A conflicting application writes nothing to the volume and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "stash_id": {
+            "description": "Id of the stash entry to apply, as returned by git.stash_save.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "stash_id"
+        ]
+      }
+    },
+    {
+      "name": "git.stash_drop",
+      "description": "Delete one stash entry by id, leaving every volume file untouched and every other entry in place. Removes the ref only: the commit stays in the object store.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "stash_id": {
+            "description": "Id of the stash entry to delete, as returned by git.stash_save.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "stash_id"
+        ]
+      }
+    },
+    {
+      "name": "git.stash_list",
+      "description": "List every stash entry of the volume, most recent first. The pool is per volume, not per branch: an entry taken on one branch is listed whatever branch is checked out, and base_sha names the commit it was taken against.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      }
+    },
+    {
+      "name": "git.stash_pop",
+      "description": "Apply one stash entry's changes onto the current volume state and delete the entry, but only once the application has fully succeeded: an application that ends in conflict reports status conflict with dropped false and keeps the entry, so no work is lost. The entry applies onto whatever branch is checked out now, even one that did not exist when it was taken. A conflicting application writes nothing to the volume and is finished with git.merge_resolve or abandoned with git.merge_abort.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "stash_id": {
+            "description": "Id of the stash entry to apply, as returned by git.stash_save.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "stash_id"
+        ]
+      }
+    },
+    {
+      "name": "git.stash_save",
+      "description": "Set the volume's uncommitted changes aside as a stash entry and rewrite the volume back to HEAD's tree. The entry is a commit holding the exact state the volume was in, identified by an opaque stash_id, and it survives deletion of the branch it was taken from. Refuses a volume that has no uncommitted changes, and refuses once the volume holds git.max_stash_entries entries.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Message describing the stashed work; defaults to 'WIP on {current_branch}'.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id"
         ]
       }
     },

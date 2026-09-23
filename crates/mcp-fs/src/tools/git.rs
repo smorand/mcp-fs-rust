@@ -24,15 +24,17 @@
 
 use crate::errors::{Result, ToolError};
 use crate::git::db::RelationalGitDb;
+use crate::git::merge;
 use crate::git::{GitRepoEntry, GitRepoStore};
 use crate::mcp::registry::{ToolCtx, handler};
 use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
 use chrono::{DateTime, FixedOffset, Utc};
-use git2::{DiffFormat, DiffOptions, FileFavor, MergeOptions, Oid, Repository, Tree};
+use git2::{DiffFormat, DiffOptions, Oid, Repository, Tree};
+use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,7 +47,7 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the fourteen `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// Register the thirty-two `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
 pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
@@ -102,8 +104,200 @@ pub fn register_with(
             async move {
                 let mount_id = a.str("mount_id")?;
                 let entry = open(&ctx, &mount_id, g).await?;
-                let branches = refs_under(&entry, "refs/heads/").await?;
-                Ok(json!({"mount_id": mount_id, "branches": branches}))
+                // Through the blocking pool like every other libgit2 reader:
+                // the divergence counts are a graph walk (FR-MOD-106).
+                on_git_thread(move || async move { branches(&mount_id, &entry).await }).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.branch_create",
+            "Create a branch at a start point, optionally checking it out.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the branch to create, without the refs/heads/ prefix.")
+        .opt_str(
+            "start_point",
+            "",
+            "Ref name, branch, tag or commit sha the new branch starts at; defaults to the \
+             currently checked-out commit.",
+        )
+        .opt_bool(
+            "checkout",
+            false,
+            "Check the new branch out, moving HEAD onto it and updating the volume's files to \
+             match; false leaves HEAD and every file untouched.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let name = a.str("name")?;
+                let start_point = a.opt_str("start_point").filter(|s| !s.is_empty());
+                let checkout = a.bool_or("checkout", false);
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_create").await?;
+                let client = ctx.state.stores.client(&mount_id).await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                on_git_thread(move || async move {
+                    branch_create(
+                        &entry,
+                        &client,
+                        &safety,
+                        &person,
+                        &name,
+                        start_point.as_deref(),
+                        checkout,
+                    )
+                    .await
+                })
+                .await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.branch_switch",
+            "Switch HEAD to an existing branch, rewriting the volume to match its commit.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the branch to switch to, without the refs/heads/ prefix."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let name = a.str("name")?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_switch").await?;
+                let client = ctx.state.stores.client(&mount_id).await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                on_git_thread(move || async move {
+                    branch_switch(&entry, &client, &safety, &person, &name).await
+                })
+                .await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.branch_delete",
+            "Delete a branch. Refuses the branch currently checked out, and refuses a branch \
+             holding commits reachable from no other ref unless force is true. Removes the ref \
+             only: every commit stays in the object store, so a mistaken delete is undone by \
+             recreating the branch at the reported sha with git.branch_create.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the branch to delete, without the refs/heads/ prefix.")
+        .opt_bool(
+            "force",
+            false,
+            "Delete the branch even when it holds commits reachable from no other ref, leaving \
+             them unreachable.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let name = a.str("name")?;
+                let force = a.bool_or("force", false);
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_delete").await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                on_git_thread(move || async move {
+                    branch_delete(&entry, &safety, &person, &name, force).await
+                })
+                .await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.branch_reset",
+            "Move a branch pointer to another commit, the equivalent of git branch -f. Refuses \
+             a move that is not a fast-forward unless force is true, and always reports old_sha \
+             so a mistaken move is undone by moving back to it. On the branch currently checked \
+             out it also rewrites the volume to the target commit's tree, discarding uncommitted \
+             changes; on any other branch it moves the ref and leaves every file alone.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the branch to move, without the refs/heads/ prefix.")
+        .req_str("target_commit", "Ref name, branch, tag or commit sha the branch is moved to.")
+        .opt_bool(
+            "force",
+            false,
+            "Move the branch even when the move is not a fast-forward, leaving the commits only \
+             the old tip reached orphaned.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let name = a.str("name")?;
+                let target_commit = a.str("target_commit")?;
+                let force = a.bool_or("force", false);
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_reset").await?;
+                let client = ctx.state.stores.client(&mount_id).await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                on_git_thread(move || async move {
+                    branch_reset(&entry, &client, &safety, &person, &name, &target_commit, force)
+                        .await
+                })
+                .await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.reset",
+            "Move the current branch's pointer to another commit, the equivalent of git reset. \
+             Mode soft moves the pointer alone and leaves every volume file exactly as it is, so \
+             the changes of the commits left behind stay in the volume ready to be committed \
+             again. Mode hard also rewrites the volume to the target commit's tree, discarding \
+             uncommitted changes. There is no mixed mode. Commits the branch no longer reaches \
+             are orphaned, never deleted, so a mistaken reset is undone by resetting back to the \
+             reported old_sha.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str(
+            "target_ref",
+            "Ref name, branch, tag or commit sha the current branch is moved to.",
+        )
+        .req_str(
+            "mode",
+            "'soft' to move the pointer only, leaving the volume untouched, or 'hard' to also \
+             rewrite the volume to the target commit's tree, discarding uncommitted changes.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let target_ref = a.str("target_ref")?;
+                let mode = ResetMode::parse(&a.str("mode")?)?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.reset").await?;
+                let client = ctx.state.stores.client(&mount_id).await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                on_git_thread(move || async move {
+                    reset(&entry, &client, &safety, &person, &target_ref, mode).await
+                })
+                .await
             }
         }),
     );
@@ -209,6 +403,7 @@ pub fn register_with(
                 let author_name = a.opt_str("author_name");
                 let author_email = a.opt_str("author_email");
                 let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.commit").await?;
                 let client = ctx.state.stores.client(&mount_id).await?;
                 let person = ctx.person.clone();
                 on_git_thread(move || async move {
@@ -279,6 +474,78 @@ pub fn register_with(
     );
 
     let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.remote_add",
+            "Record a named remote for the volume, so more than one repository can be pushed to, \
+             fetched from or pulled from. The URL must be https, must not embed credentials, and \
+             its host must be declared in git.hosts; store the credential with git.auth instead. \
+             A name already in use is refused rather than overwritten.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the remote, for example origin or upstream.")
+        .req_str("url", "HTTPS URL of the remote repository, without embedded credentials."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let name = a.str("name")?;
+                let url = a.str("url")?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.remote_add").await?;
+                remote_add(&ctx, &entry, &mount_id, &name, &url).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.remote_remove",
+            "Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. \
+             Branches, commits and files are untouched, and the objects fetched from that remote \
+             are kept. A name matching no remote is an error, never a silent no-op.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the remote to delete; matched case-sensitively."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let name = a.str("name")?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.remote_remove").await?;
+                remote_remove(&ctx, &entry, &mount_id, &name).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.remote_list",
+            "List every remote recorded for the volume with its resolved host and provider. \
+             A volume with no remote returns an empty list. No credential is ever included.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                let remotes: Vec<Value> = entry
+                    .db
+                    .list_remotes()
+                    .await?
+                    .into_iter()
+                    .map(|(name, url)| remote_entry(name, url))
+                    .collect();
+                Ok(json!({"mount_id": mount_id, "remotes": remotes, "count": remotes.len()}))
+            }
+        }),
+    );
+
+    let g = git.clone();
     let t = tokens.clone();
     reg.add(
         ToolSchema::new(
@@ -300,6 +567,7 @@ pub fn register_with(
                 let branch = a.opt_str("branch");
                 let depth = a.int_or("depth", 0);
                 let store = authorize(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_clone").await?;
                 remote_clone(&ctx, store, t, &mount_id, &url, branch, depth).await
             }
         }),
@@ -310,19 +578,66 @@ pub fn register_with(
     reg.add(
         ToolSchema::new(
             "git.remote_push",
-            "Push a local branch to origin under the same name. Creates the branch on the \
-             remote when it is absent there. Fails if the push is not a fast-forward; force \
-             is not supported.",
+            "Push a local branch to a declared remote, under the same name unless \
+             remote_branch names another one. Creates the branch on the remote when it is \
+             absent there. Fails if the push is not a fast-forward, unless force is true, \
+             which requires expected_remote_sha to state the remote sha being overwritten.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("branch", "Local branch to push to origin under the same name."),
+        .req_str("branch", "Local branch to push.")
+        .opt_str("remote", "origin", "Name of the declared remote to push to; defaults to origin.")
+        .opt_str_null(
+            "remote_branch",
+            "Branch name to push under on the remote; defaults to the local branch's name.",
+        )
+        .opt_bool(
+            "force",
+            false,
+            "Overwrite the remote branch even when the push is not a fast-forward, discarding \
+             the commits it holds. Requires expected_remote_sha.",
+        )
+        .opt_str_null(
+            "expected_remote_sha",
+            "The 40 character sha the remote branch is expected to be at right now, or 40 \
+             zeros when the branch must not exist there yet. Mandatory with force, refused \
+             without it: the push is rejected when the remote has moved since.",
+        ),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
             async move {
                 let mount_id = a.str("mount_id")?;
                 let branch = a.str("branch")?;
+                let remote = a.str_or("remote", "origin");
+                let remote_branch = a.opt_str("remote_branch");
+                let force = a.bool_or("force", false);
+                let lease = a.opt_str("expected_remote_sha");
                 let store = authorize(&ctx, &mount_id, g).await?;
-                remote_push(&ctx, store, t, &mount_id, &branch).await
+                // FR-NEW-156/158: the lease contradiction and the missing
+                // lease are settled here, before the remote is resolved, a
+                // credential is looked up or a socket is opened, so neither
+                // can ever reach the network (E2E-NEW-489, E2E-NEW-829).
+                // `push_branch_inner` checks it again for its own callers;
+                // the check is a pure function of the two arguments.
+                let lease = validate_force_lease(force, lease.as_deref())?;
+                // FR-MOD-102 with FR-NEW-104: the remote side name obeys the
+                // same rule as a local one, checked here, before any remote is
+                // resolved or contacted, and deliberately outside the audited
+                // operation: a malformed argument is not a remote operation.
+                if let Some(name) = remote_branch.as_deref() {
+                    validate_branch_name(name)?;
+                }
+                remote_push(
+                    &ctx,
+                    store,
+                    t,
+                    &mount_id,
+                    &remote,
+                    &branch,
+                    remote_branch.as_deref(),
+                    force,
+                    lease,
+                )
+                .await
             }
         }),
     );
@@ -332,17 +647,529 @@ pub fn register_with(
     reg.add(
         ToolSchema::new(
             "git.remote_fetch",
-            "Fetch objects and update refs/remotes/origin/* from origin. Never advances a \
-             local branch and never touches a working tree file. A branch removed on the \
-             remote is reported in refs_stale, not pruned locally.",
+            "Fetch objects and update refs/remotes/{remote}/* from a declared remote. Never \
+             advances a local branch and never touches a working tree file. A branch removed \
+             on the remote is reported in refs_stale, not pruned locally.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_str(
+            "remote",
+            "origin",
+            "Name of the declared remote to fetch from; defaults to origin.",
+        ),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
             async move {
                 let mount_id = a.str("mount_id")?;
+                let remote = a.str_or("remote", "origin");
                 let store = authorize(&ctx, &mount_id, g).await?;
-                remote_fetch(&ctx, store, t, &mount_id).await
+                remote_fetch(&ctx, store, t, &mount_id, &remote).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.stash_save",
+            "Set the volume's uncommitted changes aside as a stash entry and rewrite the volume \
+             back to HEAD's tree. The entry is a commit holding the exact state the volume was \
+             in, identified by an opaque stash_id, and it survives deletion of the branch it was \
+             taken from. Refuses a volume that has no uncommitted changes, and refuses once the \
+             volume holds git.max_stash_entries entries.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_str_null(
+            "message",
+            "Message describing the stashed work; defaults to 'WIP on {current_branch}'.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let message = a.opt_str("message");
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.stash_save").await?;
+                let client = ctx.state.stores.client(&mount_id).await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                let max_entries = ctx.state.config.git.max_stash_entries;
+                on_git_thread(move || async move {
+                    stash_save(&entry, &client, &safety, &person, max_entries, message).await
+                })
+                .await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.stash_list",
+            "List every stash entry of the volume, most recent first. The pool is per volume, \
+             not per branch: an entry taken on one branch is listed whatever branch is checked \
+             out, and base_sha names the commit it was taken against.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                on_git_thread(move || async move { stash_list(&mount_id, &entry).await }).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.stash_drop",
+            "Delete one stash entry by id, leaving every volume file untouched and every other \
+             entry in place. Removes the ref only: the commit stays in the object store.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("stash_id", "Id of the stash entry to delete, as returned by git.stash_save."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let stash_id = a.str("stash_id")?;
+                let entry = open(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.stash_drop").await?;
+                let client = ctx.state.stores.client(&mount_id).await?;
+                let safety = ctx.state.safety.clone();
+                let person = ctx.person.clone();
+                on_git_thread(move || async move {
+                    stash_drop(&entry, &client, &safety, &person, &stash_id).await
+                })
+                .await
+            }
+        }),
+    );
+
+    for pop in [false, true] {
+        let g = git.clone();
+        let (name, description) = if pop {
+            (
+                "git.stash_pop",
+                "Apply one stash entry's changes onto the current volume state and delete the \
+                 entry, but only once the application has fully succeeded: an application that \
+                 ends in conflict reports status conflict with dropped false and keeps the entry, \
+                 so no work is lost. The entry applies onto whatever branch is checked out now, \
+                 even one that did not exist when it was taken. A conflicting application writes \
+                 nothing to the volume and is finished with git.merge_resolve or abandoned with \
+                 git.merge_abort.",
+            )
+        } else {
+            (
+                "git.stash_apply",
+                "Apply one stash entry's changes onto the current volume state, keeping the entry \
+                 listed so it can be applied again. The entry applies onto whatever branch is \
+                 checked out now, even one that did not exist when it was taken. A conflicting \
+                 application writes nothing to the volume and returns status conflict with both \
+                 sides' content of every conflicting file, to be finished with git.merge_resolve \
+                 or abandoned with git.merge_abort.",
+            )
+        };
+        reg.add(
+            ToolSchema::new(name, description)
+                .req_str("mount_id", "Project/volume id the operation targets.")
+                .req_str(
+                    "stash_id",
+                    "Id of the stash entry to apply, as returned by git.stash_save.",
+                ),
+            handler(move |ctx: ToolCtx, a| {
+                let g = g.clone();
+                async move {
+                    let mount_id = a.str("mount_id")?;
+                    let stash_id = a.str("stash_id")?;
+                    let entry = open(&ctx, &mount_id, g).await?;
+                    reject_if_operation_in_progress(&entry, &mount_id, name).await?;
+                    let client = ctx.state.stores.client(&mount_id).await?;
+                    let safety = ctx.state.safety.clone();
+                    let person = ctx.person.clone();
+                    on_git_thread(move || async move {
+                        stash_apply(&entry, &client, &safety, &person, &stash_id, pop).await
+                    })
+                    .await
+                }
+            }),
+        );
+    }
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.merge",
+            "Merge a branch, tag or commit into the checked-out branch. An already merged \
+             source is reported as already_up_to_date and changes nothing. A source the \
+             current branch is an ancestor of fast-forwards. Anything else is a three-way \
+             merge: a clean one creates a merge commit and updates the volume, a conflicting \
+             one applies nothing and returns status conflict with both sides' content of \
+             every conflicting file, to be finished with git.merge_resolve or abandoned with \
+             git.merge_abort. Refuses a dirty volume (commit or stash first).",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("source_ref", "Branch, tag or commit to merge into the checked-out branch.")
+        .opt_bool(
+            "squash",
+            false,
+            "Record the merged tree as a single commit with one parent instead of a merge \
+             commit, and never fast-forward.",
+        )
+        .opt_str_null(
+            "message",
+            "Commit message for the merge commit; defaults to 'Merge {source_ref} into \
+             {current_branch}'.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let source_ref = a.str("source_ref")?;
+                // Strict: a squash and a merge commit are different histories,
+                // so a bogus value must be refused, not silently read as false
+                // (FR-NEW-191, E2E-NEW-541).
+                let squash = a.strict_bool_or("squash", false)?;
+                let message = a.opt_str("message");
+                let store = authorize(&ctx, &mount_id, g).await?;
+                reject_if_operation_in_progress_on(&store, &mount_id, "git.merge").await?;
+                merge_ref(&ctx, store, &mount_id, &source_ref, squash, message).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.merge_resolve",
+            "Finish a merge left in conflict by git.merge or git.remote_pull. Each resolution \
+             names one conflicting path and carries exactly one of strategy ('ours' for the \
+             checked-out branch's side, 'theirs' for the side being merged in, both taken whole) \
+             or content (the exact bytes to use, which is how a caller merges the two sides \
+             itself). Paths may be resolved over several calls: until the last one is resolved \
+             the merge stays in progress and nothing is written, and once it is the merge commit \
+             is created and every resulting file written to the volume as one all-or-nothing \
+             unit. A path that is not in conflict rejects the whole call.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_obj_array(
+            "resolutions",
+            "One entry per conflicting path to resolve: path, plus exactly one of strategy \
+             ('ours' or 'theirs') or content (the literal bytes to use).",
+            RESOLUTION_ITEMS,
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                let resolutions = parse_resolutions(&ctx, a.raw("resolutions"))?;
+                merge_resolve(&ctx, store, &mount_id, resolutions).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.merge_abort",
+            "Abandon the merge left in conflict by git.merge or git.remote_pull, discarding \
+             every resolution recorded so far and leaving HEAD and every volume file exactly \
+             as they were before the merge started.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                merge_abort(&ctx, store, &mount_id).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.rebase",
+            "Replay the checked-out branch's commits onto another commit, following an explicit \
+             todo list. Each entry names one commit of the range between onto and the branch tip \
+             and one action: pick replays it, drop leaves it out, reword replays it with a new \
+             message, squash folds it into the entry above it. The whole todo is checked before \
+             anything is replayed: an unknown sha, a commit outside the range, a commit of the \
+             range left out, a duplicate sha, an unknown action, a leading squash or a blank \
+             reword message rejects the call and changes nothing. A branch that already contains \
+             onto is reported as up_to_date. Refuses a dirty volume (commit or stash first).",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("onto", "Ref name, branch, tag or commit sha the commits are replayed onto.")
+        .req_obj_array(
+            "todo",
+            "Ordered plan, one entry per commit of the range between onto and the branch tip: \
+             sha, action ('pick', 'squash', 'drop' or 'reword'), and message for a reword.",
+            TODO_ITEMS,
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let onto = a.str("onto")?;
+                // FR-NEW-100: membership first, before anything else, so a non
+                // member is refused rather than told their payload is malformed.
+                let store = authorize(&ctx, &mount_id, g).await?;
+                // Then every pure check, so a malformed todo never even opens a
+                // repository (FR-NEW-215).
+                let todo = parse_todo(a.raw("todo"), ctx.state.config.git.max_rebase_todo)?;
+                let entry = open_on(&store, &mount_id).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.rebase").await?;
+                rebase(&ctx, entry, &mount_id, &onto, todo).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.rebase_continue",
+            "Resume the rebase paused by git.rebase on a conflicting commit. Each resolution \
+             names one conflicting path of the paused commit and carries exactly one of strategy \
+             ('ours' for the side already replayed onto, 'theirs' for the commit being replayed, \
+             both taken whole) or content (the exact bytes to use). Paths may be resolved over \
+             several calls: until the last one is resolved the rebase stays paused at the same \
+             commit and nothing is written. Once every path is resolved that commit is replayed \
+             and the remaining todo entries follow, until the list is exhausted or a further \
+             conflict pauses it again. A path that is not in conflict rejects the whole call, \
+             and so does a call made while something other than a rebase is in progress.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_obj_array(
+            "resolutions",
+            "One entry per conflicting path to resolve: path, plus exactly one of strategy \
+             ('ours' or 'theirs') or content (the literal bytes to use).",
+            RESOLUTION_ITEMS,
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                let resolutions =
+                    parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.rebase_continue")?;
+                replay_continue(&ctx, store, &mount_id, resolutions, &REBASE_FAMILY).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.rebase_abort",
+            "Abandon the rebase paused by git.rebase, discarding every commit replayed so far \
+             and every resolution recorded, and leaving the branch and every volume file exactly \
+             as they were before the rebase started.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                replay_abort(&ctx, store, &mount_id, &REBASE_FAMILY).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.cherry_pick",
+            "Apply the change one commit made onto the checked-out branch, as a NEW commit with \
+             a new sha that keeps the original author and records you as the committer. A commit \
+             already in the branch's history, or whose change the branch already carries, is \
+             reported as already_present and never duplicated. A conflicting pick applies \
+             nothing and returns status conflict with both sides' content of every conflicting \
+             file, to be finished with git.cherry_pick_continue or abandoned with \
+             git.cherry_pick_abort. A merge commit needs mainline, the parent its change is \
+             taken relative to. Refuses a dirty volume (commit or stash first).",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str(
+            "commit_sha",
+            "Full or abbreviated sha of the commit to apply; a ref name or a revision expression \
+             is not accepted.",
+        )
+        .opt_int(
+            "mainline",
+            0,
+            "For a merge commit only: the 1-based index of the parent the picked change is taken \
+             relative to. Omit it for an ordinary commit.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                // FR-NEW-100: membership first, before anything else, so a non
+                // member is refused rather than told their payload is malformed.
+                let store = authorize(&ctx, &mount_id, g).await?;
+                // Then every pure check, so a malformed sha never opens a
+                // repository (FR-NEW-237).
+                let commit_sha = parse_commit_sha("git.cherry_pick", &a.str("commit_sha")?)?;
+                let mainline = parse_mainline("git.cherry_pick", a.raw("mainline"))?;
+                let entry = open_on(&store, &mount_id).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.cherry_pick").await?;
+                cherry_pick(&ctx, entry, &mount_id, commit_sha, mainline).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.cherry_pick_continue",
+            "Resume the cherry-pick paused by git.cherry_pick on a conflicting file. Each \
+             resolution names one conflicting path and carries exactly one of strategy ('ours' \
+             for the branch the commit is being applied onto, 'theirs' for the commit being \
+             picked, both taken whole) or content (the exact bytes to use). Paths may be \
+             resolved over several calls: until the last one is resolved the pick stays paused \
+             and nothing is written. Once every path is resolved the commit is created. A path \
+             that is not in conflict rejects the whole call, and so does a call made while \
+             something other than a cherry-pick is in progress.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_obj_array(
+            "resolutions",
+            "One entry per conflicting path to resolve: path, plus exactly one of strategy \
+             ('ours' or 'theirs') or content (the literal bytes to use).",
+            RESOLUTION_ITEMS,
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                let resolutions = parse_optional_resolutions(
+                    &ctx,
+                    a.raw("resolutions"),
+                    "git.cherry_pick_continue",
+                )?;
+                replay_continue(&ctx, store, &mount_id, resolutions, &CHERRY_PICK_FAMILY).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.cherry_pick_abort",
+            "Abandon the cherry-pick paused by git.cherry_pick, discarding every resolution \
+             recorded, and leaving the branch and every volume file exactly as they were before \
+             the pick started.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                replay_abort(&ctx, store, &mount_id, &CHERRY_PICK_FAMILY).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.revert",
+            "Undo what one commit did by adding a NEW commit on the checked-out branch whose \
+             change is the exact inverse, leaving the original commit in history untouched. The \
+             default message is Revert followed by the original subject in quotes. Reverting a \
+             revert restores the change. Reverting the very first commit of a history removes \
+             everything it added. A conflicting revert applies nothing and returns status \
+             conflict with both sides' content of every conflicting file, to be finished with \
+             git.revert_continue or abandoned with git.revert_abort. A merge commit needs \
+             mainline, the parent the revert is computed against. Refuses a dirty volume (commit \
+             or stash first).",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str(
+            "commit_sha",
+            "Full or abbreviated sha of the commit to undo; a ref name or a revision expression \
+             is not accepted.",
+        )
+        .opt_int(
+            "mainline",
+            0,
+            "For a merge commit only: the 1-based index of the parent the revert is computed \
+             against, so the other parents' contribution is what gets removed. Omit it for an \
+             ordinary commit.",
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                // FR-NEW-100: membership first, before anything else, so a non
+                // member is refused rather than told their payload is malformed.
+                let store = authorize(&ctx, &mount_id, g).await?;
+                // Then every pure check, so a malformed sha or a mainline that
+                // is not a parent index never opens a repository.
+                let commit_sha = parse_commit_sha("git.revert", &a.str("commit_sha")?)?;
+                let mainline = parse_mainline("git.revert", a.raw("mainline"))?;
+                let entry = open_on(&store, &mount_id).await?;
+                reject_if_operation_in_progress(&entry, &mount_id, "git.revert").await?;
+                revert(&ctx, entry, &mount_id, commit_sha, mainline).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.revert_continue",
+            "Resume the revert paused by git.revert on a conflicting file. Each resolution names \
+             one conflicting path and carries exactly one of strategy ('ours' for the branch the \
+             revert is being made on, 'theirs' for the state the reverted commit is being undone \
+             back to, both taken whole) or content (the exact bytes to use). Paths may be \
+             resolved over several calls: until the last one is resolved the revert stays paused \
+             and nothing is written. Once every path is resolved the inverse commit is created. \
+             A path that is not in conflict rejects the whole call, and so does a call made \
+             while something other than a revert is in progress.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_obj_array(
+            "resolutions",
+            "One entry per conflicting path to resolve: path, plus exactly one of strategy \
+             ('ours' or 'theirs') or content (the literal bytes to use).",
+            RESOLUTION_ITEMS,
+        ),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                let resolutions =
+                    parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.revert_continue")?;
+                replay_continue(&ctx, store, &mount_id, resolutions, &REVERT_FAMILY).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.revert_abort",
+            "Abandon the revert paused by git.revert, discarding every resolution recorded, and \
+             leaving the branch and every volume file exactly as they were before the revert \
+             started.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets."),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let mount_id = a.str("mount_id")?;
+                let store = authorize(&ctx, &mount_id, g).await?;
+                replay_abort(&ctx, store, &mount_id, &REVERT_FAMILY).await
             }
         }),
     );
@@ -351,29 +1178,35 @@ pub fn register_with(
     reg.add(
         ToolSchema::new(
             "git.remote_pull",
-            "Fetch from origin, then advance the checked-out branch to the remote tip and update \
-             the volume's files to match. A fast-forward applies directly. A diverged history \
-             is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way \
-             merge resolves every conflicting file by that strategy and creates a merge \
-             commit. Refuses a dirty volume (commit or discard first) and refuses any branch \
-             other than the one currently checked out.",
+            "Fetch from a declared remote, then advance the checked-out branch to the remote \
+             tip and update \
+             the volume's files to match. A fast-forward applies directly. A diverged history is \
+             merged: a clean three-way merge creates a merge commit and updates the volume, a \
+             conflicting one applies nothing and returns status conflict with both sides' \
+             content of every conflicting file, to be finished with git.merge_resolve or \
+             abandoned with git.merge_abort. Refuses a dirty volume (commit or discard first) \
+             and refuses any branch other than the one currently checked out.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("branch", "Branch to pull; must be the branch currently checked out.")
-        .opt_str_null(
-            "on_conflict",
-            "For a diverged (non fast-forward) history: 'ours' or 'theirs' to resolve every \
-             conflicting file by that strategy and create a merge commit; omit to refuse the \
-             pull instead. Ignored whenever the pull is a fast-forward.",
+        .opt_str(
+            "remote",
+            "origin",
+            "Name of the declared remote to pull from; defaults to origin.",
         ),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), tokens.clone());
             async move {
                 let mount_id = a.str("mount_id")?;
                 let branch = a.str("branch")?;
-                let on_conflict = a.opt_str("on_conflict");
+                let remote = a.str_or("remote", "origin");
+                // FR-DEL-101: the parameter is gone, and a caller still sending
+                // it is told so rather than silently ignored, because it used
+                // to decide which side of every conflicting file survived.
+                reject_removed_on_conflict(&a)?;
                 let store = authorize(&ctx, &mount_id, g).await?;
-                remote_pull(&ctx, store, t, &mount_id, &branch, on_conflict).await
+                reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_pull").await?;
+                remote_pull(&ctx, store, t, &mount_id, &remote, &branch).await
             }
         }),
     );
@@ -401,6 +1234,14 @@ async fn open(
     injected: Option<Arc<GitRepoStore>>,
 ) -> Result<Arc<GitRepoEntry>> {
     let store = authorize(ctx, mount_id, injected).await?;
+    open_on(&store, mount_id).await
+}
+
+/// The second half of [`open`], for a caller that already authorized and holds
+/// the store. Splitting it keeps a tool free to run its pure argument checks
+/// between the membership check and the repository open without paying for a
+/// second membership round trip.
+async fn open_on(store: &GitRepoStore, mount_id: &str) -> Result<Arc<GitRepoEntry>> {
     if !store.is_initialized(mount_id).await {
         return Err(ToolError::not_found(format!(
             "git not initialized for mount '{mount_id}' (call git.init first)"
@@ -445,6 +1286,7 @@ fn git_err(what: &str, e: git2::Error) -> ToolError {
 #[allow(clippy::too_many_arguments)]
 async fn early_remote_failure(
     operation: &'static str,
+    remote: &str,
     mount_id: &str,
     person: &str,
     safety: &SafetyManager,
@@ -456,6 +1298,7 @@ async fn early_remote_failure(
     crate::git::remote::run_remote_operation(
         crate::git::remote::RemoteOpContext {
             operation,
+            remote,
             host,
             provider,
             branch,
@@ -527,12 +1370,89 @@ async fn status(mount_id: &str, entry: &GitRepoEntry) -> Result<Value> {
         .filter(|r| !r.symbolic)
         .map(|r| json!({"name": r.name, "sha": r.target}))
         .collect();
-    Ok(json!({
+    let mut out = json!({
         "mount_id": mount_id,
         "head": head_sha,
         "branch": branch,
         "refs": listed,
-    }))
+    });
+    // FR-NEW-281/FR-MOD-107: the key exists only while an operation is in
+    // progress, so the schema is strictly additive and a caller tests presence
+    // rather than a null. Reading it is not a write: a reopened paused merge
+    // reports the same row it was paused with.
+    if let Some(op) = operation_summary(entry).await?
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert("operation".to_string(), op);
+    }
+    Ok(out)
+}
+
+/// The tracking ref of a local branch. Every remote ref this server ever writes
+/// lands under `refs/remotes/origin/` (`crate::git::remote::FETCH_REFSPEC`), so
+/// the tracking ref of `{name}` is `refs/remotes/origin/{name}` and nothing else
+/// has to be configured per branch.
+const TRACKING_PREFIX: &str = "refs/remotes/origin/";
+
+/// FR-MOD-106: every branch, with the current marker and the divergence against
+/// its tracking ref.
+///
+/// `ahead`/`behind` are `null`, never `0`, for a branch with no tracking ref:
+/// `0/0` says "in sync", which is a different statement from "nothing to compare
+/// against".
+///
+/// Cost: the ref listing is one query, and each divergence is one
+/// `graph_ahead_behind`, a merge base walk bounded by the commits in the
+/// symmetric difference of the two tips plus the walk down to their merge base,
+/// so O(V + E) of the history that actually diverges and O(1) for a branch equal
+/// to its tracking ref. libgit2 is opened, and the object store exported into it,
+/// only when at least one branch has a tracking ref.
+async fn branches(mount_id: &str, entry: &GitRepoEntry) -> Result<Value> {
+    let refs = entry.db.list_refs().await?;
+    let head_ref = match refs.iter().find(|r| r.name == "HEAD") {
+        Some(h) if h.symbolic => Some(h.target.clone()),
+        _ => None,
+    };
+
+    let pairs: Vec<(&crate::git::db::GitRefRow, Option<&crate::git::db::GitRefRow>)> = refs
+        .iter()
+        .filter(|r| !r.symbolic && r.name.starts_with("refs/heads/"))
+        .map(|head| {
+            let short = head.name.strip_prefix("refs/heads/").unwrap_or(&head.name);
+            let tracking = format!("{TRACKING_PREFIX}{short}");
+            (head, refs.iter().find(|r| !r.symbolic && r.name == tracking))
+        })
+        .collect();
+
+    let repo = if pairs.iter().any(|(_, up)| up.is_some()) {
+        let repo = entry.repo.lock().await;
+        hydrate(entry, &repo).await?;
+        Some(repo)
+    } else {
+        None
+    };
+
+    let mut listed = Vec::with_capacity(pairs.len());
+    for (head, upstream) in pairs {
+        let (mut ahead, mut behind) = (Value::Null, Value::Null);
+        if let (Some(up), Some(repo)) = (upstream, repo.as_ref()) {
+            let (a, b) = repo
+                .graph_ahead_behind(parse_oid(&head.target)?, parse_oid(&up.target)?)
+                .map_err(|e| git_err("ahead/behind", e))?;
+            ahead = json!(a);
+            behind = json!(b);
+        }
+        listed.push(json!({
+            "name": head.name.strip_prefix("refs/heads/").unwrap_or(&head.name),
+            "full_ref": head.name,
+            "sha": head.target,
+            "current": head_ref.as_deref() == Some(head.name.as_str()),
+            "upstream": upstream.map(|up| up.name.clone()),
+            "ahead": ahead,
+            "behind": behind,
+        }));
+    }
+    Ok(json!({"mount_id": mount_id, "branches": listed}))
 }
 
 /// `refs/heads/` for branches, `refs/tags/` for tags: same shape, same order.
@@ -718,6 +1638,627 @@ async fn commit(
     }))
 }
 
+/// FR-NEW-116: the ceiling is a count of UTF-8 bytes, not of characters,
+/// because it exists to keep `refs/heads/<name>` inside the `TextKey(400)`
+/// storage ceiling of `git_refs.name` on every backend, and SQL Server renders
+/// that as a bounded `NVARCHAR(400)`.
+const MAX_BRANCH_NAME_BYTES: usize = 255;
+
+/// FR-NEW-104 and FR-NEW-116: `git check-ref-format`'s rules, applied before
+/// any ref is read or written so a refused name never leaves a partial row.
+/// Valid UTF-8 beyond ASCII is accepted and never normalized: the bytes the
+/// caller sent are the bytes stored.
+fn validate_branch_name(name: &str) -> Result<()> {
+    let reject = |why: &str| {
+        Err(ToolError::invalid_argument(format!("'{name}' is not a valid branch name: {why}")))
+    };
+    if name.is_empty() {
+        return reject("it is empty");
+    }
+    if name.len() > MAX_BRANCH_NAME_BYTES {
+        return reject(&format!(
+            "it is {} bytes of UTF-8, over the {MAX_BRANCH_NAME_BYTES} byte limit",
+            name.len()
+        ));
+    }
+    if let Some(c) = name.chars().find(|c| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return reject(&format!("it contains the forbidden character {c:?}"));
+    }
+    if name.contains("..") {
+        return reject("it contains '..'");
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        return reject("it begins or ends with '/'");
+    }
+    if name.split('/').any(|part| part.starts_with('.')) {
+        return reject("one of its '/' separated components begins with '.'");
+    }
+    if name.ends_with(".lock") {
+        return reject("it ends with '.lock'");
+    }
+    Ok(())
+}
+
+/// FR-NEW-101: create `refs/heads/{name}` at the commit `start_point` resolves
+/// to. FR-NEW-115: the per-project write lock covers the duplicate check and
+/// the ref write together, so two concurrent creations of the same name cannot
+/// both pass the check. Every refusal happens before the first write, which is
+/// what keeps a rejected call free of an audit entry and of a quota charge.
+async fn branch_create(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    name: &str,
+    start_point: Option<&str>,
+    checkout: bool,
+) -> Result<Value> {
+    validate_branch_name(name)?;
+    let branch_ref = format!("refs/heads/{name}");
+
+    let _write = entry.write_lock.lock().await;
+
+    // Refs are case sensitive, so this comparison is too: `Main` and `main` are
+    // two distinct branches, exactly as they are in git.
+    if entry.db.get_ref(&branch_ref).await?.is_some() {
+        return Err(ToolError::no_clobber(format!("branch '{name}' already exists")));
+    }
+
+    let wanted = start_point.unwrap_or("HEAD");
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+
+    let Some(sha) = resolve_ref(&entry.db, wanted).await? else {
+        // A repository with no commit at all has only symbolic refs, and the
+        // caller needs to be told that rather than that HEAD is unknown.
+        let empty = entry.db.list_refs().await?.iter().all(|r| r.symbolic);
+        return Err(ToolError::not_found(if empty {
+            format!("start point '{wanted}' not found: the repository has no commits yet")
+        } else {
+            format!("start point '{wanted}' not found")
+        }));
+    };
+    let oid = parse_oid(&sha)?;
+    // `resolve_ref` treats an all-hex name as a raw sha without checking it
+    // exists, so the object lookup is what refuses a plausible but absent one.
+    let commit = repo.find_commit(oid).map_err(|_| {
+        ToolError::not_found(format!(
+            "start point '{wanted}' resolves to commit '{}', which is not present in the git \
+             object store",
+            short(&sha)
+        ))
+    })?;
+
+    // FR-NEW-106: the dirty check comes before the first write, so a refused
+    // checkout leaves no branch row, no audit entry and no quota charge behind.
+    let old_tree = if checkout {
+        Some(head_tree_of_clean_volume(&repo, entry, client, "git.branch_create", name).await?)
+    } else {
+        None
+    };
+
+    entry.db.set_ref(&branch_ref, &sha, false).await?;
+    // Keep the on disk refs in step, the same way git.commit does, so libgit2
+    // based reads and an operator running `git branch` agree with the index.
+    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.branch_create");
+
+    if let Some(old_tree) = old_tree {
+        let new_tree = commit.tree().map_err(|e| git_err("start point tree", e))?;
+        let changes = merge::diff_tree_changes(&repo, &old_tree, &new_tree)?;
+        merge::charge_and_apply("git.branch_create", &repo, safety, person, client, &changes)
+            .await?;
+        entry.db.set_ref("HEAD", &branch_ref, true).await?;
+        let _ = repo.set_head(&branch_ref);
+    }
+
+    Ok(json!({"branch": name, "sha": sha, "checked_out": checkout}))
+}
+
+/// The commit HEAD resolves to, or `None` in a repository with no commit yet.
+async fn head_commit_sha(entry: &GitRepoEntry) -> Result<Option<String>> {
+    Ok(match entry.db.get_ref("HEAD").await? {
+        Some(h) if h.symbolic => entry.db.get_ref(&h.target).await?.map(|r| r.target),
+        Some(h) => Some(h.target),
+        None => None,
+    })
+}
+
+/// The tree HEAD points at, refusing when the volume has drifted from it
+/// (FR-NEW-106). Uncommitted work would be silently overwritten by a checkout,
+/// so both `git.branch_create --checkout` and `git.branch_switch` refuse rather
+/// than destroy it, and they say so with one wording naming the same two
+/// remedies. A repository with no commit yet has the empty tree as its HEAD
+/// state, so anything already in the volume reads as uncommitted.
+async fn head_tree_of_clean_volume<'r>(
+    repo: &'r Repository,
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    tool: &str,
+    target: &str,
+) -> Result<git2::Tree<'r>> {
+    let refuse = || {
+        Err(ToolError::invalid_argument(format!(
+            "{tool}: volume has uncommitted changes: commit them with git.commit, set them aside \
+             with git.stash_save, or discard them before moving onto '{target}'"
+        )))
+    };
+    match head_commit_sha(entry).await? {
+        Some(current) => {
+            if !volume_is_clean(repo, client, &current).await? {
+                return refuse();
+            }
+            Ok(repo
+                .find_commit(parse_oid(&current)?)
+                .map_err(|e| git_err("find head commit", e))?
+                .tree()
+                .map_err(|e| git_err("head tree", e))?)
+        }
+        None => {
+            let empty = repo
+                .treebuilder(None)
+                .and_then(|b| b.write())
+                .map_err(|e| git_err("empty tree", e))?;
+            if build_tree_from_volume(repo, client).await? != empty {
+                return refuse();
+            }
+            repo.find_tree(empty).map_err(|e| git_err("empty tree", e))
+        }
+    }
+}
+
+/// FR-NEW-105: point HEAD at `refs/heads/{name}` and rewrite the volume to that
+/// branch's tree. FR-NEW-115: the per-project write lock covers the dirty
+/// check, the volume rewrite and the HEAD move together, so a concurrent switch
+/// can never observe a half-written tree under a moved HEAD.
+///
+/// The rewrite is a tree-to-tree delta: only the paths that differ between the
+/// two commits are touched, so the cost is O(changed paths) writes plus the one
+/// volume scan the dirty check needs, never a full checkout of the target tree.
+async fn branch_switch(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    name: &str,
+) -> Result<Value> {
+    validate_branch_name(name)?;
+    let branch_ref = format!("refs/heads/{name}");
+
+    let _write = entry.write_lock.lock().await;
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+
+    let Some(row) = entry.db.get_ref(&branch_ref).await? else {
+        return Err(ToolError::not_found(format!("branch '{name}' not found")));
+    };
+    let sha = row.target;
+
+    // FR-NEW-106 before FR-NEW-107: the dirty check runs even when the target
+    // is the branch already checked out, so the caller gets one rule whatever
+    // the target.
+    let old_tree =
+        head_tree_of_clean_volume(&repo, entry, client, "git.branch_switch", name).await?;
+
+    let on_branch =
+        matches!(entry.db.get_ref("HEAD").await?, Some(h) if h.symbolic && h.target == branch_ref);
+    if on_branch {
+        // FR-NEW-107: nothing to move and nothing to write, so nothing is
+        // charged and nothing is audited either.
+        return Ok(json!({"branch": name, "sha": sha, "changed": false, "files_changed": 0}));
+    }
+
+    let new_tree = repo
+        .find_commit(parse_oid(&sha)?)
+        .map_err(|e| git_err("find branch commit", e))?
+        .tree()
+        .map_err(|e| git_err("branch tree", e))?;
+    let changes = merge::diff_tree_changes(&repo, &old_tree, &new_tree)?;
+    let files_changed = changes.len();
+    merge::charge_and_apply("git.branch_switch", &repo, safety, person, client, &changes).await?;
+
+    entry.db.set_ref("HEAD", &branch_ref, true).await?;
+    let _ = repo.set_head(&branch_ref);
+
+    safety.record_audit(
+        person,
+        &client.project_id,
+        "git.branch_switch",
+        "/",
+        &format!("switched to '{name}', files_changed {files_changed}"),
+    );
+    Ok(json!({
+        "branch": name,
+        "sha": sha,
+        "changed": files_changed > 0,
+        "files_changed": files_changed,
+    }))
+}
+
+/// The commits reachable from `tip` and from no ref other than `excluded_ref`,
+/// which is exactly the set a delete or a move leaves unreachable. `also_hidden`
+/// is the new tip of a move, whose history survives the move.
+///
+/// Cost: one revwalk with every other ref hidden, so O(V + E) over the commits
+/// reachable from `tip` and not already reachable elsewhere. A fully merged
+/// branch walks nothing, because the hides cover its whole history.
+async fn unreachable_commits(
+    repo: &Repository,
+    db: &RelationalGitDb,
+    excluded_ref: &str,
+    tip: &str,
+    also_hidden: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
+    walk.push(parse_oid(tip)?).map_err(|e| git_err("revwalk push", e))?;
+    for r in db.list_refs().await? {
+        if r.symbolic || r.name == excluded_ref {
+            continue;
+        }
+        // A ref whose object is absent hides nothing, and must not abort the
+        // walk: the answer then errs on the side of reporting more commits as
+        // unreachable, which is the safe direction for a refusal.
+        if let Ok(oid) = Oid::from_str(&r.target) {
+            let _ = walk.hide(oid);
+        }
+    }
+    if let Some(keep) = also_hidden
+        && let Ok(oid) = Oid::from_str(keep)
+    {
+        let _ = walk.hide(oid);
+    }
+    walk.map(|oid| oid.map(|o| o.to_string()).map_err(|e| git_err("revwalk", e))).collect()
+}
+
+/// FR-NEW-108, FR-NEW-109 and FR-NEW-110: remove `refs/heads/{name}`.
+///
+/// No object is ever pruned: the commits a delete strands stay in the store, so
+/// recreating the branch at the reported sha restores it exactly (DEC-912, which
+/// is also why a purely local destructive operation needs no lease). The write
+/// lock covers the guards and the ref removal together, so a branch cannot be
+/// checked out between the guard that says it is not and the delete.
+async fn branch_delete(
+    entry: &GitRepoEntry,
+    safety: &SafetyManager,
+    person: &str,
+    name: &str,
+    force: bool,
+) -> Result<Value> {
+    validate_branch_name(name)?;
+    let branch_ref = format!("refs/heads/{name}");
+
+    let _write = entry.write_lock.lock().await;
+
+    // Before the force check, so force never turns a missing branch into a
+    // success (E2E-NEW-427).
+    let Some(row) = entry.db.get_ref(&branch_ref).await? else {
+        return Err(ToolError::not_found(format!("branch '{name}' not found")));
+    };
+    let sha = row.target;
+
+    if matches!(entry.db.get_ref("HEAD").await?, Some(h) if h.symbolic && h.target == branch_ref) {
+        return Err(ToolError::invalid_argument(format!(
+            "'{name}' is the checked-out branch: switch to another branch with git.branch_switch \
+             before deleting it"
+        )));
+    }
+
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+    let stranded = unreachable_commits(&repo, &entry.db, &branch_ref, &sha, None).await?;
+    if !stranded.is_empty() && !force {
+        return Err(ToolError::invalid_argument(format!(
+            "deleting branch '{name}' would leave {} commit(s) reachable from no other ref: {}. \
+             Merge it, or pass force true to delete it anyway",
+            stranded.len(),
+            stranded.join(", ")
+        )));
+    }
+
+    entry.db.delete_ref(&branch_ref).await?;
+    // Keep the on disk refs in step, the same way git.commit does.
+    if let Ok(mut on_disk) = repo.find_reference(&branch_ref) {
+        let _ = on_disk.delete();
+    }
+
+    let forced = !stranded.is_empty();
+    safety.record_audit(
+        person,
+        &entry.project_id,
+        "git.branch_delete",
+        "/",
+        &format!("deleted '{name}' at {sha}, forced {forced}"),
+    );
+    Ok(json!({"branch": name, "sha": sha, "forced": forced}))
+}
+
+/// FR-NEW-111 to FR-NEW-114: force-move `refs/heads/{name}` to another commit,
+/// rewriting the volume when that branch is the one checked out.
+///
+/// The rewrite's basis is the tree the VOLUME currently holds, not HEAD's tree,
+/// which is what makes it a hard reset: a file that drifted since the last
+/// commit is put back on the target tree rather than left drifted. Every guard
+/// runs before the first write, so a refusal leaves the volume byte-identical
+/// and charges nothing.
+#[allow(clippy::too_many_arguments)]
+async fn branch_reset(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    name: &str,
+    target_commit: &str,
+    force: bool,
+) -> Result<Value> {
+    validate_branch_name(name)?;
+    let branch_ref = format!("refs/heads/{name}");
+
+    let _write = entry.write_lock.lock().await;
+
+    // A reset never creates a branch (E2E-NEW-437).
+    let Some(row) = entry.db.get_ref(&branch_ref).await? else {
+        return Err(ToolError::not_found(format!("branch '{name}' not found")));
+    };
+    let old_sha = row.target;
+
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+
+    let Some(new_sha) = resolve_ref(&entry.db, target_commit).await? else {
+        return Err(ToolError::not_found(format!("target commit '{target_commit}' not found")));
+    };
+    // `resolve_ref` reads an all-hex name as a raw sha without checking it
+    // exists, so the object lookup is what refuses a plausible but absent one.
+    let target = repo.find_commit(parse_oid(&new_sha)?).map_err(|_| {
+        ToolError::not_found(format!(
+            "target commit '{target_commit}' resolves to '{new_sha}', which is not present in \
+             the git object store"
+        ))
+    })?;
+
+    if !force {
+        let fast_forward = old_sha == new_sha
+            || repo
+                .graph_descendant_of(target.id(), parse_oid(&old_sha)?)
+                .map_err(|e| git_err("ancestry", e))?;
+        if !fast_forward {
+            let orphaned =
+                unreachable_commits(&repo, &entry.db, &branch_ref, &old_sha, Some(&new_sha))
+                    .await?;
+            return Err(ToolError::invalid_argument(format!(
+                "moving branch '{name}' from {old_sha} to {new_sha} is not a fast-forward and \
+                 would orphan {} commit(s): {}. Pass force true to move it anyway",
+                orphaned.len(),
+                orphaned.join(", ")
+            )));
+        }
+    }
+
+    let checked_out =
+        matches!(entry.db.get_ref("HEAD").await?, Some(h) if h.symbolic && h.target == branch_ref);
+
+    let mut files_changed = 0;
+    if checked_out {
+        let current = build_tree_from_volume(&repo, client).await?;
+        let volume_tree = repo.find_tree(current).map_err(|e| git_err("volume tree", e))?;
+        let target_tree = target.tree().map_err(|e| git_err("target tree", e))?;
+        let changes = merge::diff_tree_changes(&repo, &volume_tree, &target_tree)?;
+        files_changed = changes.len();
+        // Quota first, all-or-nothing apply, refund on refusal: the ref moves
+        // only once every byte landed.
+        merge::charge_and_apply("git.branch_reset", &repo, safety, person, client, &changes)
+            .await?;
+    }
+
+    set_branch_ref(entry, &repo, &branch_ref, &new_sha, "git.branch_reset").await?;
+
+    safety.record_audit(
+        person,
+        &entry.project_id,
+        "git.branch_reset",
+        "/",
+        &format!("moved '{name}' from {old_sha} to {new_sha}, files_changed {files_changed}"),
+    );
+    Ok(json!({
+        "branch": name,
+        "old_sha": old_sha,
+        "new_sha": new_sha,
+        "checked_out": checked_out,
+        "files_changed": files_changed,
+    }))
+}
+
+/// Move a branch ref in both places a ref lives: the relational index, which is
+/// the source of truth, and the bare repository, which the git smart protocol
+/// serves from. The repository copy is best effort, exactly as every other ref
+/// write in this file treats it, because a repository that fell behind is
+/// rebuilt from the index on the next hydrate.
+async fn set_branch_ref(
+    entry: &GitRepoEntry,
+    repo: &Repository,
+    branch_ref: &str,
+    new_sha: &str,
+    tool: &str,
+) -> Result<()> {
+    entry.db.set_ref(branch_ref, new_sha, false).await?;
+    let _ = repo.reference(branch_ref, parse_oid(new_sha)?, true, &format!("mcp-fs {tool}"));
+    Ok(())
+}
+
+/// The two reset modes of FR-NEW-252. DEC-905: there is deliberately no `mixed`,
+/// because this server keeps no index, so `mixed` would behave exactly like
+/// `soft` and offering it would be a trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetMode {
+    Soft,
+    Hard,
+}
+
+impl ResetMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "soft" => Ok(Self::Soft),
+            "hard" => Ok(Self::Hard),
+            other => Err(ToolError::invalid_argument(format!(
+                "mode '{other}' is not a reset mode; the accepted values are 'soft' and 'hard'"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+/// FR-NEW-250 to FR-NEW-255: move the CURRENT branch's pointer to `target_ref`,
+/// and in mode `hard` rewrite the volume to that commit's tree.
+///
+/// A soft reset is O(1) by construction: it reads two refs, resolves the target
+/// through the ref index, and writes one ref. It never walks the volume, never
+/// diffs a tree and never charges a byte, which is what makes it the recovery
+/// tool for a mistaken commit: the commits left behind are orphaned, never
+/// pruned, and resetting back to the reported `old_sha` restores them.
+///
+/// A hard reset adds exactly one thing: the volume rewrite, and it is the very
+/// one `git.branch_reset` performs on the checked-out branch, through the same
+/// `build_tree_from_volume` + [`merge::diff_tree_changes`] +
+/// [`merge::charge_and_apply`] chain. The basis is the tree the VOLUME holds,
+/// not HEAD's, so uncommitted work is discarded rather than left behind; only
+/// the delta between that tree and the target's is written, so a file already
+/// holding the target bytes costs nothing. Quota is charged before the first
+/// byte moves and the ref advances only once every write landed, so a refusal
+/// leaves the volume byte-identical and the pointer where it was.
+///
+/// `git.branch_reset` is the sibling for an arbitrary NAMED branch; the two
+/// also share [`set_branch_ref`] and `resolve_ref`. Their guards differ:
+/// `branch_reset` refuses a non fast-forward move unless forced, while a reset
+/// is force by definition (DEC-912).
+async fn reset(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    target_ref: &str,
+    mode: ResetMode,
+) -> Result<Value> {
+    let _write = entry.write_lock.lock().await;
+
+    let branch_ref = match entry.db.get_ref("HEAD").await? {
+        Some(h) if h.symbolic => h.target,
+        _ => {
+            return Err(ToolError::invalid_argument(
+                "HEAD is not on a branch; git.reset moves the checked-out branch's pointer",
+            ));
+        }
+    };
+    let Some(row) = entry.db.get_ref(&branch_ref).await? else {
+        return Err(ToolError::not_found(format!(
+            "branch '{branch_ref}' has no commit yet; there is nothing to reset"
+        )));
+    };
+    let old_sha = row.target;
+    let new_sha = resolve_reset_target(entry, target_ref).await?;
+
+    // FR-NEW-254: a soft reset already at the target has nothing left to do,
+    // in a mode that never touches a file. A HARD reset at the same ref is not
+    // a no-op: the volume can still be dirty, and discarding that dirt is the
+    // whole point of the mode (E2E-NEW-865).
+    if mode == ResetMode::Soft && new_sha == old_sha {
+        safety.record_audit(
+            person,
+            &entry.project_id,
+            "git.reset",
+            "/",
+            &format!("no-op soft reset of '{branch_ref}', already at {old_sha}"),
+        );
+        return Ok(reset_response(mode, &old_sha, &new_sha, 0));
+    }
+
+    // In soft mode the repository is opened only to keep its copy of the ref in
+    // step. No tree is read and no file is touched: FR-NEW-250's "SHALL NOT
+    // modify any volume file" is a property of what this branch does not call.
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+
+    let mut files_changed = 0;
+    if mode == ResetMode::Hard {
+        let target = repo.find_commit(parse_oid(&new_sha)?).map_err(|_| {
+            ToolError::not_found(format!(
+                "reset target '{target_ref}' resolves to '{new_sha}', which is not present in \
+                 the git object store"
+            ))
+        })?;
+        let current = build_tree_from_volume(&repo, client).await?;
+        let volume_tree = repo.find_tree(current).map_err(|e| git_err("volume tree", e))?;
+        let target_tree = target.tree().map_err(|e| git_err("target tree", e))?;
+        let changes = merge::diff_tree_changes(&repo, &volume_tree, &target_tree)?;
+        files_changed = changes.len();
+        // Quota first, all-or-nothing apply, refund on refusal: the ref moves
+        // only once every byte landed.
+        merge::charge_and_apply("git.reset", &repo, safety, person, client, &changes).await?;
+    }
+
+    if new_sha != old_sha {
+        set_branch_ref(entry, &repo, &branch_ref, &new_sha, "git.reset").await?;
+    }
+
+    // FR-NEW-255: the commits the branch no longer reaches are orphaned here,
+    // never pruned, and `old_sha` is the handle that brings them back.
+    let detail = if new_sha == old_sha && files_changed == 0 {
+        format!("no-op {} reset of '{branch_ref}', already at {old_sha}", mode.as_str())
+    } else {
+        format!(
+            "{} reset '{branch_ref}' from {old_sha} to {new_sha}, files_changed {files_changed}",
+            mode.as_str()
+        )
+    };
+    safety.record_audit(person, &entry.project_id, "git.reset", "/", &detail);
+    Ok(reset_response(mode, &old_sha, &new_sha, files_changed))
+}
+
+/// FR-NEW-199: the four keys `git.reset` answers with, and no others.
+fn reset_response(mode: ResetMode, old_sha: &str, new_sha: &str, files_changed: usize) -> Value {
+    json!({
+        "mode": mode.as_str(),
+        "old_sha": old_sha,
+        "new_sha": new_sha,
+        "files_changed": files_changed,
+    })
+}
+
+/// FR-NEW-253: the sha a reset target names, refused when it names no commit.
+///
+/// `resolve_ref` reads any all-hex name as a raw sha without checking it exists,
+/// so the object index lookup is what refuses a plausible but absent one. The
+/// check runs against the index rather than libgit2 so an unknown target costs
+/// one primary key lookup and never an object export.
+async fn resolve_reset_target(entry: &GitRepoEntry, target_ref: &str) -> Result<String> {
+    let Some(sha) = resolve_ref(&entry.db, target_ref).await? else {
+        return Err(ToolError::not_found(format!("reset target '{target_ref}' not found")));
+    };
+    // `resolve_ref` hands an abbreviated sha straight back, so an index lookup
+    // on it finds nothing; the object index expands the prefix, and reports the
+    // ambiguity itself when several objects share it.
+    let sha = match entry.db.get_object(&sha).await? {
+        Some(_) => sha,
+        None if sha.len() < 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) => {
+            entry.objects.resolve_prefix(&sha).await?
+        }
+        None => sha,
+    };
+    match entry.db.get_object(&sha).await? {
+        Some(obj) if obj.kind == "commit" => Ok(sha),
+        _ => Err(ToolError::not_found(format!(
+            "reset target '{target_ref}' not found: '{sha}' is not a commit in the git object \
+             store"
+        ))),
+    }
+}
+
 /// The bytes of one path inside one commit.
 async fn read_from_commit(entry: &GitRepoEntry, commit_sha: &str, norm: &str) -> Result<Vec<u8>> {
     let repo = entry.repo.lock().await;
@@ -862,6 +2403,8 @@ async fn remote_clone(
             let provider = crate::git::remote::provider_label(&host);
             early_remote_failure(
                 "git.remote_clone",
+                // A clone always records the remote it cloned from as `origin`.
+                "origin",
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -905,6 +2448,7 @@ async fn clone_and_import(
     crate::git::remote::run_remote_operation(
         crate::git::remote::RemoteOpContext {
             operation: "git.remote_clone",
+            remote: "origin",
             host: &host,
             provider: &auth_for_ctx,
             branch: branch_for_ctx.as_deref(),
@@ -1093,18 +2637,24 @@ async fn clone_and_import_inner(
 /// clone uses (FR-NEW-022): [`resolve_clone_credential`] is called unchanged,
 /// so host resolution, URL scheme validation and the token expiry gate are
 /// proved once, not twice.
+#[allow(clippy::too_many_arguments)]
 async fn remote_push(
     ctx: &ToolCtx,
     store: Arc<GitRepoStore>,
     tokens: Option<Arc<crate::git::OAuthTokenStore>>,
     mount_id: &str,
+    remote: &str,
     branch: &str,
+    remote_branch: Option<&str>,
+    force: bool,
+    expected_remote_sha: Option<String>,
 ) -> Result<Value> {
-    let origin_url = match crate::git::remote::require_origin(&store, mount_id).await {
+    let origin_url = match crate::git::remote::require_remote(&store, mount_id, remote).await {
         Ok(u) => u,
         Err(e) => {
             return early_remote_failure(
                 "git.remote_push",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1119,14 +2669,28 @@ async fn remote_push(
     match resolve_clone_credential(ctx, &tokens, &origin_url).await {
         Ok((token, auth)) => {
             let safety = ctx.state.safety.clone();
-            push_branch(store, mount_id, branch, &origin_url, token, auth, &ctx.person, safety)
-                .await
+            push_branch(
+                store,
+                mount_id,
+                remote,
+                branch,
+                remote_branch,
+                &origin_url,
+                token,
+                auth,
+                &ctx.person,
+                safety,
+                force,
+                expected_remote_sha,
+            )
+            .await
         }
         Err(e) => {
             let host = crate::git::remote::extract_host(&origin_url);
             let provider = crate::git::remote::provider_label(&host);
             early_remote_failure(
                 "git.remote_push",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1159,12 +2723,16 @@ async fn remote_push(
 async fn push_branch(
     store: Arc<GitRepoStore>,
     mount_id: &str,
+    remote: &str,
     branch: &str,
+    remote_branch: Option<&str>,
     origin_url: &str,
     token: Option<String>,
     auth: String,
     person: &str,
     safety: Arc<SafetyManager>,
+    force: bool,
+    expected_remote_sha: Option<String>,
 ) -> Result<Value> {
     let host = crate::git::remote::extract_host(origin_url);
     let auth_for_ctx = auth.clone();
@@ -1172,6 +2740,7 @@ async fn push_branch(
     crate::git::remote::run_remote_operation(
         crate::git::remote::RemoteOpContext {
             operation: "git.remote_push",
+            remote,
             host: &host,
             provider: &auth_for_ctx,
             branch: Some(branch),
@@ -1179,27 +2748,107 @@ async fn push_branch(
             person,
             safety: &safety,
         },
-        push_branch_inner(store, mount_id, branch, origin_url, token, auth),
+        push_branch_inner(
+            store,
+            mount_id,
+            remote,
+            branch,
+            remote_branch,
+            origin_url,
+            token,
+            auth,
+            force,
+            expected_remote_sha,
+        ),
         |v: &Value| {
-            format!(
+            let base = format!(
                 "created {}, up_to_date {}, remote_sha {}",
                 v.get("created").and_then(Value::as_bool).unwrap_or(false),
                 v.get("up_to_date").and_then(Value::as_bool).unwrap_or(false),
                 v.get("remote_sha").and_then(Value::as_str).unwrap_or(""),
-            )
+            );
+            // FR-NEW-159: a forced push is the only operation here that
+            // destroys work held on a shared remote, and this audit line is
+            // the only server-side record of the sha it destroyed, which is
+            // what makes recovery from the provider's reflog possible. The
+            // extra text is appended only when the push was actually forced,
+            // so an ordinary push's detail is byte-for-byte what it was.
+            if v.get("forced").and_then(Value::as_bool).unwrap_or(false) {
+                format!(
+                    "{base}, forced true, remote_branch '{}', overwritten_sha {}",
+                    v.get("remote_branch").and_then(Value::as_str).unwrap_or(branch),
+                    v.get("overwritten_sha").and_then(Value::as_str).unwrap_or(""),
+                )
+            } else {
+                base
+            }
         },
     )
     .await
 }
 
+/// The all-zero sha, the lease value meaning "this branch must not exist on
+/// the remote yet" (FR-NEW-155), and the value reported as `overwritten_sha`
+/// by a forced push that created the branch.
+pub(crate) const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// Settle `force` against `expected_remote_sha` before anything else happens
+/// (FR-NEW-156, FR-NEW-158), returning the effective lease.
+///
+/// A lease that is empty or whitespace-only is an ABSENT lease, not a lease
+/// that fails to match: trimming decides presence only. Presence settled, the
+/// RAW value must be exactly 40 hex characters, so a value with a stray space
+/// around a real sha is a malformed lease rather than a silently trimmed one.
+///
+/// Being stricter than git itself is the point (DEC-903): git allows a bare
+/// `--force`, this does not. A caller that cannot name the sha it is about to
+/// destroy has not looked at the remote, and is exactly the caller the lease
+/// exists to stop.
+fn validate_force_lease(force: bool, expected_remote_sha: Option<&str>) -> Result<Option<String>> {
+    let supplied = expected_remote_sha.filter(|s| !s.trim().is_empty());
+    match (force, supplied) {
+        (true, None) => Err(ToolError::invalid_argument(
+            "expected_remote_sha is required when force is true: supply the 40 character sha \
+             the remote branch is expected to be at right now, or 40 zeros when the branch \
+             must not exist on the remote yet",
+        )),
+        (false, Some(_)) => Err(ToolError::invalid_argument(
+            "expected_remote_sha was supplied without force: the lease only applies to a force \
+             push, so set force to true or drop expected_remote_sha",
+        )),
+        (false, None) => Ok(None),
+        (true, Some(sha)) => {
+            if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                Ok(Some(sha.to_ascii_lowercase()))
+            } else {
+                Err(ToolError::invalid_argument(format!(
+                    "expected_remote_sha must be exactly 40 hexadecimal characters, got \
+                     '{sha}' ({} characters)",
+                    sha.len()
+                )))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn push_branch_inner(
     store: Arc<GitRepoStore>,
     mount_id: &str,
+    remote: &str,
     branch: &str,
+    remote_branch: Option<&str>,
     origin_url: &str,
     token: Option<String>,
     auth: String,
+    force: bool,
+    expected_remote_sha: Option<String>,
 ) -> Result<Value> {
+    // FR-NEW-156/158: re-checked here because this is a real entry point of
+    // its own (the pipeline's internal caller), not only a continuation of
+    // the tool handler. Pure, so running it twice on the tool path costs one
+    // string comparison and can never disagree with the first run.
+    let lease = validate_force_lease(force, expected_remote_sha.as_deref())?;
     let entry = store.get_or_open_repo(mount_id).await?;
     let branch_ref = format!("refs/heads/{branch}");
     let Some(local_ref) = entry.db.get_ref(&branch_ref).await? else {
@@ -1210,8 +2859,10 @@ async fn push_branch_inner(
     };
     let local_sha = local_ref.target;
 
-    let (branch_owned, origin_owned, local_sha_owned) =
-        (branch.to_string(), origin_url.to_string(), local_sha.clone());
+    // FR-MOD-102: absent, the remote side carries the local branch's name.
+    let remote_branch = remote_branch.unwrap_or(branch);
+    let (branch_owned, remote_branch_owned, origin_owned, local_sha_owned) =
+        (branch.to_string(), remote_branch.to_string(), origin_url.to_string(), local_sha.clone());
     let entry_for_thread = entry.clone();
     // Held for the whole hydrate-plus-push, so two concurrent pushes to the
     // same branch cannot interleave (E2E-NEW-084): the same lock `git.commit`
@@ -1246,9 +2897,12 @@ async fn push_branch_inner(
                 &repo,
                 &origin_owned,
                 &branch_owned,
+                &remote_branch_owned,
                 &local_sha_owned,
                 token,
                 Some(deadline),
+                force,
+                lease.as_deref(),
             )
         }),
     )
@@ -1256,15 +2910,49 @@ async fn push_branch_inner(
 
     // A refused push returns above via `?`, before this line: nothing here
     // advances the tracking ref for a rejection (FR-NEW-061).
-    entry.db.set_ref(&format!("refs/remotes/origin/{branch}"), &outcome.remote_sha, false).await?;
+    // FR-MOD-102: the tracking ref follows the REMOTE side's name, which is
+    // the ref that actually exists on the remote; naming it after the local
+    // branch would claim a remote branch that was never created.
+    entry
+        .db
+        .set_ref(&format!("refs/remotes/{remote}/{remote_branch}"), &outcome.remote_sha, false)
+        .await?;
 
-    Ok(json!({
+    let mut out = json!({
         "branch": branch,
+        // FR-NEW-199: unconditional, unlike `remote_branch` and
+        // `overwritten_sha` below. Those two are genuinely inapplicable in
+        // their default cases, so omitting them says something true. `remote`
+        // always has a meaningful value, `origin` when the caller named none
+        // (FR-MOD-101), so a conditional key would only hide which remote
+        // received the branch from exactly the caller who relied on the
+        // default.
+        "remote": remote,
         "created": outcome.created,
         "up_to_date": outcome.up_to_date,
         "remote_sha": outcome.remote_sha,
         "auth": auth,
-    }))
+        "forced": force,
+    });
+    // FR-NEW-155: the sha the remote held before this push overwrote it,
+    // reported only for a forced push since that is the only case where
+    // something the remote held could have been destroyed. A forced create
+    // reports the all-zero sha, the same value the caller leased.
+    if force && let Some(map) = out.as_object_mut() {
+        map.insert(
+            "overwritten_sha".to_string(),
+            json!(outcome.overwritten_sha.clone().unwrap_or_else(|| ZERO_SHA.to_string())),
+        );
+    }
+    // Strictly additive, like `git.status`'s `operation` key: the key appears
+    // only when the caller named a remote branch, so a caller that did not
+    // sees the exact response shape it always saw.
+    if remote_branch != branch
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert("remote_branch".to_string(), json!(remote_branch));
+    }
+    Ok(out)
 }
 
 /// Resolve the stored `origin`, then fetch through the same credential
@@ -1278,12 +2966,14 @@ async fn remote_fetch(
     store: Arc<GitRepoStore>,
     tokens: Option<Arc<crate::git::OAuthTokenStore>>,
     mount_id: &str,
+    remote: &str,
 ) -> Result<Value> {
-    let origin_url = match crate::git::remote::require_origin(&store, mount_id).await {
+    let origin_url = match crate::git::remote::require_remote(&store, mount_id, remote).await {
         Ok(u) => u,
         Err(e) => {
             return early_remote_failure(
                 "git.remote_fetch",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1298,13 +2988,15 @@ async fn remote_fetch(
     match resolve_clone_credential(ctx, &tokens, &origin_url).await {
         Ok((token, auth)) => {
             let safety = ctx.state.safety.clone();
-            fetch_branch(store, mount_id, &origin_url, token, auth, &ctx.person, safety).await
+            fetch_branch(store, mount_id, remote, &origin_url, token, auth, &ctx.person, safety)
+                .await
         }
         Err(e) => {
             let host = crate::git::remote::extract_host(&origin_url);
             let provider = crate::git::remote::provider_label(&host);
             early_remote_failure(
                 "git.remote_fetch",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1332,9 +3024,11 @@ async fn remote_fetch(
 /// No volume byte is written and no volume file changes (FR-NEW-027): a fetch
 /// only ever moves `refs/remotes/origin/*`, so unlike [`clone_and_import`] this
 /// charges no write quota and writes no audit entry, matching [`push_branch`].
+#[allow(clippy::too_many_arguments)]
 async fn fetch_branch(
     store: Arc<GitRepoStore>,
     mount_id: &str,
+    remote: &str,
     origin_url: &str,
     token: Option<String>,
     auth: String,
@@ -1347,6 +3041,7 @@ async fn fetch_branch(
     crate::git::remote::run_remote_operation(
         crate::git::remote::RemoteOpContext {
             operation: "git.remote_fetch",
+            remote,
             host: &host,
             provider: &auth_for_ctx,
             branch: None,
@@ -1354,7 +3049,7 @@ async fn fetch_branch(
             person,
             safety: &safety,
         },
-        fetch_branch_inner(store, mount_id, origin_url, token, auth),
+        fetch_branch_inner(store, mount_id, remote, origin_url, token, auth),
         |v: &Value| {
             format!(
                 "refs_updated {}, objects_fetched {}",
@@ -1369,13 +3064,15 @@ async fn fetch_branch(
 async fn fetch_branch_inner(
     store: Arc<GitRepoStore>,
     mount_id: &str,
+    remote: &str,
     origin_url: &str,
     token: Option<String>,
     auth: String,
 ) -> Result<Value> {
     let entry = store.get_or_open_repo(mount_id).await?;
+    let tracking_prefix = format!("refs/remotes/{remote}/");
 
-    // The db-tracked view of `refs/remotes/origin/*` before this fetch runs, so
+    // The db-tracked view of this remote's tracking refs before the fetch runs, so
     // a branch present here but absent from the remote's advertisement can be
     // reported as stale rather than silently pruned (DEC-037, FR-NEW-056).
     let before: BTreeMap<String, String> = entry
@@ -1383,11 +3080,11 @@ async fn fetch_branch_inner(
         .list_refs()
         .await?
         .into_iter()
-        .filter(|r| !r.symbolic && r.name.starts_with("refs/remotes/origin/"))
+        .filter(|r| !r.symbolic && r.name.starts_with(tracking_prefix.as_str()))
         .map(|r| (r.name, r.target))
         .collect();
 
-    let origin_owned = origin_url.to_string();
+    let (remote_owned, origin_owned) = (remote.to_string(), origin_url.to_string());
     let entry_for_thread = entry.clone();
     // Held for the whole hydrate-plus-fetch, the same lock `push_branch` and
     // `git.commit` hold, so a concurrent write to this repository's on disk
@@ -1405,8 +3102,13 @@ async fn fetch_branch_inner(
         on_git_thread(move || async move {
             let repo = entry_for_thread.repo.lock().await;
             hydrate(&entry_for_thread, &repo).await?;
-            let outcome =
-                crate::git::remote::fetch_from_remote(&repo, &origin_owned, token, Some(deadline))?;
+            let outcome = crate::git::remote::fetch_from_remote(
+                &repo,
+                &remote_owned,
+                &origin_owned,
+                token,
+                Some(deadline),
+            )?;
             entry_for_thread.objects.import_from_repo(&repo).await?;
             Ok(outcome)
         }),
@@ -1424,7 +3126,7 @@ async fn fetch_branch_inner(
     }
 
     let advertised: std::collections::HashSet<String> =
-        outcome.advertised_branches.iter().map(|b| format!("refs/remotes/origin/{b}")).collect();
+        outcome.advertised_branches.iter().map(|b| format!("{tracking_prefix}{b}")).collect();
     let refs_stale: Vec<String> =
         before.keys().filter(|name| !advertised.contains(name.as_str())).cloned().collect();
 
@@ -1437,59 +3139,2482 @@ async fn fetch_branch_inner(
     }))
 }
 
-// ── git.remote_pull ─────────────────────────────────────────────────────────
+// ── git.merge ───────────────────────────────────────────────────────────────
 
-/// The two global conflict-resolution strategies `on_conflict` accepts
-/// (DEC-024). Matching the raw string is exact and lowercase only, mirroring
-/// `git.auth`'s provider check (`git_auth.rs:160-162`); see
-/// [`parse_on_conflict`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConflictStrategy {
-    Ours,
-    Theirs,
+/// What a merge reached, carried out of the `on_git_thread` closure so the
+/// response is serialized once, on the async side, through the shared types of
+/// [`crate::git::merge`] (FR-NEW-199).
+enum MergeReport {
+    AlreadyUpToDate,
+    /// A fast-forward or a real merge: both report `status: "merged"`, and are
+    /// told apart by `fast_forward` (FR-NEW-193).
+    Applied {
+        sha: String,
+        files_changed: usize,
+        fast_forward: bool,
+        squashed: bool,
+    },
+    Conflict(merge::ConflictResponse),
 }
 
-impl ConflictStrategy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ours => "ours",
-            Self::Theirs => "theirs",
+/// The checked-out branch, the only branch a merge ever targets (FR-NEW-190).
+/// Pure `entry.db` reads, so it settles before the repository lock is taken.
+async fn current_branch(entry: &GitRepoEntry, operation: &str) -> Result<String> {
+    match entry.db.get_ref("HEAD").await? {
+        Some(h) if h.symbolic => {
+            Ok(h.target.strip_prefix("refs/heads/").unwrap_or(&h.target).to_string())
         }
-    }
-
-    /// The `MergeOptions::file_favor` this strategy maps to (DEC-024,
-    /// `git2-0.20.4/src/merge.rs:133-136`).
-    fn file_favor(self) -> FileFavor {
-        match self {
-            Self::Ours => FileFavor::Ours,
-            Self::Theirs => FileFavor::Theirs,
-        }
-    }
-}
-
-/// FR-NEW-033: `on_conflict` is absent, exactly `"ours"`, or exactly
-/// `"theirs"`; any other value, including a differently-cased or empty one,
-/// is rejected with `ERR_INVALID_ARGUMENT` naming both accepted values.
-/// Called before the ancestry/fetch logic in [`pull_branch`] ever branches on
-/// the result, so an invalid value never triggers a network call.
-fn parse_on_conflict(value: Option<&str>) -> Result<Option<ConflictStrategy>> {
-    match value {
-        None => Ok(None),
-        Some("ours") => Ok(Some(ConflictStrategy::Ours)),
-        Some("theirs") => Ok(Some(ConflictStrategy::Theirs)),
-        Some(other) => Err(ToolError::invalid_argument(format!(
-            "git.remote_pull: on_conflict must be 'ours' or 'theirs' when supplied, got '{other}'"
+        _ => Err(ToolError::invalid_argument(format!(
+            "{operation}: the volume has no checked-out branch to merge into"
         ))),
     }
 }
 
+/// `git.merge`: FR-NEW-190 through FR-NEW-195, reporting a conflict through the
+/// one shape of FR-NEW-186.
+///
+/// The validation order is part of the contract: an unknown `source_ref` is
+/// rejected before the dirty check and before any row is written
+/// (E2E-NEW-849), and the dirty refusal happens before any merge work
+/// (E2E-NEW-847), so neither ever leaves an in-progress row behind.
+async fn merge_ref(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    source_ref: &str,
+    squash: bool,
+    message: Option<String>,
+) -> Result<Value> {
+    // FR-NEW-190: a volume that was never initialized has nothing to merge.
+    if !store.is_initialized(mount_id).await {
+        return Err(ToolError::invalid_argument(format!(
+            "volume '{mount_id}' was never initialized as a git repository: call git.init first"
+        )));
+    }
+    let entry = store.get_or_open_repo(mount_id).await?;
+    let branch = current_branch(&entry, "git.merge").await?;
+    let tip =
+        entry.db.get_ref(&format!("refs/heads/{branch}")).await?.map(|r| r.target).ok_or_else(
+            || {
+                ToolError::invalid_argument(format!(
+                    "git.merge: the volume has no checked-out branch with a commit to merge into: \
+                 branch '{branch}' does not exist yet"
+                ))
+            },
+        )?;
+
+    // FR-NEW-190: merging the checked-out branch into itself is meaningless, and
+    // refusing it by name is narrower than reporting it as up to date.
+    if source_ref == branch || source_ref == format!("refs/heads/{branch}") {
+        return Err(ToolError::invalid_argument(format!(
+            "git.merge: '{source_ref}' is the checked-out branch: a branch cannot be merged into \
+             itself"
+        )));
+    }
+
+    // FR-NEW-195, before the dirty check and before the lock.
+    let source_sha = resolve_ref(&entry.db, source_ref)
+        .await?
+        .ok_or_else(|| ToolError::not_found(format!("ref '{source_ref}' not found")))?;
+
+    let client = ctx.state.stores.client(mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+
+    // Acquired in the async caller, never inside the blocking closure, exactly
+    // like `git.commit` and the pull: it covers the in-progress check, the
+    // dirty check, the merge and the ref update as one snapshot, which is what
+    // makes two concurrent merges resolve to one winner (FR-NEW-283).
+    let _write = entry.write_lock.lock().await;
+
+    // FR-NEW-283: one in-progress operation per volume, enforced by the row's
+    // primary key and reported here rather than by a constraint violation.
+    if let Some(op) = entry.db.get_operation().await? {
+        return Err(ToolError::invalid_argument(format!(
+            "git.merge: a {} is already in progress on '{mount_id}': finish it with {} or \
+             abandon it with {}",
+            op.op_type.as_str(),
+            op.op_type.continue_with(),
+            op.op_type.abort_with(),
+        )));
+    }
+
+    let (
+        entry_for_thread,
+        branch_owned,
+        source_ref_owned,
+        source_sha_owned,
+        tip_owned,
+        person_owned,
+    ) = (
+        entry.clone(),
+        branch.clone(),
+        source_ref.to_string(),
+        source_sha.clone(),
+        tip.clone(),
+        person.clone(),
+    );
+    let report = on_git_thread(move || async move {
+        merge_inner(
+            entry_for_thread,
+            client,
+            safety,
+            person_owned,
+            branch_owned,
+            source_ref_owned,
+            source_sha_owned,
+            tip_owned,
+            squash,
+            message,
+        )
+        .await
+    })
+    .await?;
+
+    // NFR 7.5: one audit entry per operation, whatever its outcome, carrying no
+    // sha (a 40-hex token in an audit line reads like a credential) and no
+    // credentialed URL.
+    let (detail, response) = match report {
+        MergeReport::AlreadyUpToDate => (
+            format!("outcome ok, source {source_ref}, status already_up_to_date"),
+            merge::MergeResponse {
+                status: "already_up_to_date",
+                merge_commit: None,
+                fast_forward: false,
+                squashed: squash,
+                files_changed: 0,
+            }
+            .to_value(),
+        ),
+        MergeReport::Applied { sha, files_changed, fast_forward, squashed } => (
+            format!(
+                "outcome ok, source {source_ref}, status merged, files_changed {files_changed}"
+            ),
+            merge::MergeResponse {
+                status: "merged",
+                merge_commit: Some(sha),
+                fast_forward,
+                squashed,
+                files_changed,
+            }
+            .to_value(),
+        ),
+        MergeReport::Conflict(c) => (
+            format!("outcome conflict, source {source_ref}, conflicts {}", c.conflicts.len()),
+            c.to_value(),
+        ),
+    };
+    ctx.state.safety.record_audit(&ctx.person, mount_id, "git.merge", "/", &detail);
+    Ok(response)
+}
+
+/// The libgit2 side of `git.merge`, holding the repository lock. Never called
+/// outside [`merge_ref`], which owns the write lock, the validation order and
+/// the audit entry.
+#[allow(clippy::too_many_arguments)]
+async fn merge_inner(
+    entry: Arc<GitRepoEntry>,
+    client: Arc<VolumeClient>,
+    safety: Arc<SafetyManager>,
+    person: String,
+    branch: String,
+    source_ref: String,
+    source_sha: String,
+    tip: String,
+    squash: bool,
+    message: Option<String>,
+) -> Result<MergeReport> {
+    let repo = entry.repo.lock().await;
+    hydrate(&entry, &repo).await?;
+
+    let source_oid = parse_oid(&source_sha)?;
+    let source_commit = repo
+        .find_commit(source_oid)
+        .map_err(|_| ToolError::not_found(format!("commit '{source_sha}' not found")))?;
+    let tip_oid = parse_oid(&tip)?;
+    let tip_commit = repo
+        .find_commit(tip_oid)
+        .map_err(|_| ToolError::not_found(format!("commit '{tip}' not found")))?;
+
+    // FR-NEW-194: refused before any merge work, so no row and no object are
+    // left behind. An untracked addition counts as dirt, because this compares
+    // whole trees.
+    if !volume_is_clean(&repo, &client, &tip).await? {
+        return Err(ToolError::invalid_argument(
+            "git.merge refused: volume has uncommitted changes: commit them with git.commit or \
+             set them aside with git.stash_save before merging",
+        ));
+    }
+
+    // FR-NEW-192: an ancestor is an ancestor whether it was named by ref or by
+    // sha. `graph_descendant_of` does not consider a commit its own descendant,
+    // which is why equality is tested first.
+    if source_oid == tip_oid
+        || repo
+            .graph_descendant_of(tip_oid, source_oid)
+            .map_err(|e| git_err("ancestry check", e))?
+    {
+        return Ok(MergeReport::AlreadyUpToDate);
+    }
+
+    let tip_tree = tip_commit.tree().map_err(|e| git_err("commit tree", e))?;
+    let source_tree = source_commit.tree().map_err(|e| git_err("commit tree", e))?;
+    let branch_ref = format!("refs/heads/{branch}");
+
+    // FR-NEW-193: a fast-forward moves the branch and writes no object at all.
+    if !squash
+        && repo
+            .graph_descendant_of(source_oid, tip_oid)
+            .map_err(|e| git_err("ancestry check", e))?
+    {
+        let changes = merge::diff_tree_changes(&repo, &tip_tree, &source_tree)?;
+        merge::charge_and_apply("git.merge", &repo, &safety, &person, &client, &changes).await?;
+        entry.db.set_ref(&branch_ref, &source_sha, false).await?;
+        let _ = repo.reference(&branch_ref, source_oid, true, "mcp-fs git.merge fast-forward");
+        return Ok(MergeReport::Applied {
+            sha: source_sha,
+            files_changed: changes.len(),
+            fast_forward: true,
+            squashed: false,
+        });
+    }
+
+    // DEC-902: no global strategy. Conflicts are surfaced with both sides'
+    // content and nothing is applied (FR-NEW-171); a disjoint divergence merges
+    // with no caller decision at all (FR-NEW-173).
+    match merge::three_way_merge(&repo, &tip_commit, &source_commit, None)? {
+        merge::MergeOutcome::Conflicted { conflicts } => {
+            // DEC-901: the pause is a relational row, so it survives a restart
+            // and is visible to every project member. FR-NEW-188: `conflicted`,
+            // never `paused`.
+            let now = Utc::now().to_rfc3339();
+            let paths: Vec<String> = conflicts.iter().map(|c| c.path.clone()).collect();
+            let row = crate::git::db::GitOperationRow {
+                op_type: crate::git::db::GitOpType::Merge,
+                state: "conflicted".to_string(),
+                source_ref: Some(source_ref.clone()),
+                // The exact commit being merged in, not the tip: the resolve
+                // happens in a later call, possibly after a restart and after
+                // the source branch moved, and it must finish the merge that
+                // was actually reported.
+                onto_sha: Some(source_sha.clone()),
+                original_tip_sha: Some(tip.clone()),
+                todo: None,
+                // FR-NEW-187: a merge is single step, so the row carries zeroes
+                // and the response reports null.
+                current_step: 0,
+                total_steps: 0,
+                conflicts: Some(
+                    serde_json::to_string(&paths)
+                        .map_err(|e| ToolError::internal(format!("serialize conflicts: {e}")))?,
+                ),
+                resolutions: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            entry.db.set_operation(&row).await?;
+            Ok(MergeReport::Conflict(merge::ConflictResponse::new(
+                crate::git::db::GitOpType::Merge,
+                operation_id(&entry.project_id, crate::git::db::GitOpType::Merge, &now),
+                Some(source_ref),
+                None,
+                conflicts,
+            )))
+        }
+        merge::MergeOutcome::Clean { tree } => {
+            let merged_tree = repo.find_tree(tree).map_err(|e| git_err("find merged tree", e))?;
+            let changes = merge::diff_tree_changes(&repo, &tip_tree, &merged_tree)?;
+            merge::charge_and_apply("git.merge", &repo, &safety, &person, &client, &changes)
+                .await?;
+
+            // Authored and committed by the authenticated person, like
+            // `git.commit` and the pull's merge commit.
+            let name = person.split('@').next().unwrap_or(&person).to_string();
+            let now = Utc::now().timestamp();
+            let sig = git2::Signature::new(&name, &person, &git2::Time::new(now, 0))
+                .map_err(|e| git_err("signature", e))?;
+            let text = message.unwrap_or_else(|| format!("Merge {source_ref} into {branch}"));
+            let pretty = git2::message_prettify(&text, None).map_err(|e| git_err("message", e))?;
+            // The target tip first, the source tip second: the ordering the
+            // pull's merge commit already establishes.
+            let parents: Vec<&git2::Commit<'_>> =
+                if squash { vec![&tip_commit] } else { vec![&tip_commit, &source_commit] };
+            let oid = repo
+                .commit(None, &sig, &sig, &pretty, &merged_tree, &parents)
+                .map_err(|e| git_err("create merge commit", e))?;
+            entry.objects.import_from_repo(&repo).await?;
+            entry.db.set_ref(&branch_ref, &oid.to_string(), false).await?;
+            let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.merge");
+            Ok(MergeReport::Applied {
+                sha: oid.to_string(),
+                files_changed: changes.len(),
+                fast_forward: false,
+                squashed: squash,
+            })
+        }
+    }
+}
+
+/// The `operation_id` of FR-NEW-186. Derived from the row rather than stored:
+/// `git_operations` is keyed by volume, so the volume, the type and the
+/// creation instant identify one pause uniquely and survive a restart, with no
+/// extra column and no counter.
+fn operation_id(volume_id: &str, op: crate::git::db::GitOpType, created_at: &str) -> String {
+    format!("{volume_id}:{}:{created_at}", op.as_str())
+}
+
+/// The `operation` object of `git.status` (FR-NEW-286), absent when nothing is
+/// in progress.
+async fn operation_summary(entry: &GitRepoEntry) -> Result<Option<Value>> {
+    let Some(row) = entry.db.get_operation().await? else { return Ok(None) };
+    let remaining: Vec<String> =
+        row.conflicts.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+    // FR-NEW-187: integers for a rebase, null for every single step operation.
+    let steps = matches!(row.op_type, crate::git::db::GitOpType::Rebase)
+        .then_some((row.current_step, row.total_steps));
+    Ok(Some(
+        serde_json::to_value(merge::OperationSummary {
+            op_type: row.op_type.as_str(),
+            source_ref: row.source_ref.clone(),
+            current_step: steps.map(|(c, _)| c),
+            total_steps: steps.map(|(_, t)| t),
+            remaining_conflicts: remaining,
+            continue_with: row.op_type.continue_with(),
+            abort_with: row.op_type.abort_with(),
+        })
+        .unwrap_or(Value::Null),
+    ))
+}
+
+// ── git.remote_add, git.remote_remove, git.remote_list ──────────────────────
+
+/// The single shape a remote is reported in, emitted by `git.remote_add` and
+/// by every entry of `git.remote_list` (FR-NEW-140, FR-NEW-144), so the two
+/// can never drift apart. The URL stored is always credential free, because
+/// `validate_remote_url` refused it otherwise before the row was written, so
+/// echoing it back cannot leak a secret (FR-NEW-145).
+fn remote_entry(name: String, url: String) -> Value {
+    let host = crate::git::remote::extract_host(&url);
+    let provider = crate::git::remote::provider_label(&host);
+    json!({"name": name, "url": url, "host": host, "provider": provider})
+}
+
+/// The remote naming rule, checked before anything is stored (FR-NEW-140).
+/// Deliberately narrower than git's own `check_ref_format`: a remote name here
+/// also becomes the `refs/remotes/{name}/` namespace the removal sweeps, so a
+/// name carrying a '/' or a leading '-' is refused rather than reasoned about.
+fn validate_remote_name(name: &str) -> Result<()> {
+    const MAX: usize = 100;
+    let shaped = !name.is_empty()
+        && name.len() <= MAX
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if shaped {
+        return Ok(());
+    }
+    Err(ToolError::invalid_argument(format!(
+        "'{name}' is not a valid remote name: use 1 to {MAX} characters, letters, digits, '.', \
+         '_' or '-', not starting with '-'"
+    )))
+}
+
+/// FR-NEW-140/141: record a remote, refusing a name already in use.
+///
+/// The duplicate check lives here, above the storage, because
+/// `RelationalGitDb::add_remote` is an upsert: calling it blindly would
+/// silently rewrite the stored URL.
+async fn remote_add(
+    ctx: &ToolCtx,
+    entry: &GitRepoEntry,
+    mount_id: &str,
+    name: &str,
+    url: &str,
+) -> Result<Value> {
+    validate_remote_name(name)?;
+    if let Some((_, existing)) = entry.db.list_remotes().await?.into_iter().find(|(n, _)| n == name)
+    {
+        return Err(ToolError::invalid_argument(format!(
+            "remote '{name}' already exists with url '{existing}'; remove it with \
+             git.remote_remove before adding it again"
+        )));
+    }
+    // The one URL validator in the tree, shared with clone, push, fetch and
+    // pull: https only, no embedded credential, and its error names the host
+    // rather than the URL, so a rejected credentialed URL leaks nothing.
+    let parsed = crate::git::remote::validate_remote_url(url)?;
+    let host = parsed.host_str().unwrap_or_default().to_string();
+    crate::git::remote::resolve_host(&host)?;
+
+    entry.db.add_remote(name, url).await?;
+    ctx.state.safety.record_audit(
+        &ctx.person,
+        mount_id,
+        "git.remote_add",
+        "/",
+        &format!("added remote '{name}' for host '{host}'"),
+    );
+    Ok(remote_entry(name.to_string(), url.to_string()))
+}
+
+/// FR-NEW-142/143: delete a remote and its remote-tracking refs.
+///
+/// The existence check lives here, above the storage, because
+/// `RelationalGitDb::remove_remote` is an unconditional DELETE: calling it
+/// blindly would report success for a name that never existed, and the ref
+/// sweep would then run for a namespace nothing owns.
+async fn remote_remove(
+    ctx: &ToolCtx,
+    entry: &GitRepoEntry,
+    mount_id: &str,
+    name: &str,
+) -> Result<Value> {
+    if !entry.db.list_remotes().await?.iter().any(|(n, _)| n == name) {
+        return Err(ToolError::not_found(format!(
+            "remote '{name}' does not exist on '{mount_id}'"
+        )));
+    }
+    // Refs are repository state, so this takes the same per repository write
+    // lock every ref mutating operation takes.
+    let _write = entry.write_lock.lock().await;
+    let prefix = format!("refs/remotes/{name}/");
+    let stale: Vec<String> = entry
+        .db
+        .list_refs()
+        .await?
+        .into_iter()
+        .filter(|r| r.name.starts_with(&prefix))
+        .map(|r| r.name)
+        .collect();
+    let refs_removed = stale.len();
+    for ref_name in stale {
+        entry.db.delete_ref(&ref_name).await?;
+    }
+    entry.db.remove_remote(name).await?;
+
+    ctx.state.safety.record_audit(
+        &ctx.person,
+        mount_id,
+        "git.remote_remove",
+        "/",
+        &format!("removed remote '{name}' and {refs_removed} tracking refs"),
+    );
+    Ok(json!({"name": name, "removed": true}))
+}
+
+/// FR-NEW-279: refuse a ref mutating tool while an operation is paused on this
+/// volume, naming the active type and the exact pair that finishes it so the
+/// caller never has to guess. One function, called by every such handler, so a
+/// later operation family (rebase, cherry pick, stash) gets the guard by
+/// calling it rather than by copying it.
+///
+/// Cost on the hot path: one primary key lookup on `git_operations`, keyed by
+/// `volume_id` alone, and nothing else. There is no in-memory cache because a
+/// cache would have to be invalidated across processes, which is exactly the
+/// restart hazard DEC-901 rejected.
+async fn reject_if_operation_in_progress(
+    entry: &GitRepoEntry,
+    mount_id: &str,
+    tool: &str,
+) -> Result<()> {
+    let Some(row) = entry.db.get_operation().await? else { return Ok(()) };
+    Err(ToolError::invalid_argument(format!(
+        "{tool}: a {} is in progress on '{mount_id}'; finish it with {} or abandon it with {}",
+        row.op_type.as_str(),
+        row.op_type.continue_with(),
+        row.op_type.abort_with(),
+    )))
+}
+
+/// [`reject_if_operation_in_progress`] for a handler that holds the store
+/// rather than an open repository. A volume `git.init` never ran on cannot
+/// carry an operation, so it passes without opening anything.
+async fn reject_if_operation_in_progress_on(
+    store: &GitRepoStore,
+    mount_id: &str,
+    tool: &str,
+) -> Result<()> {
+    if !store.is_initialized(mount_id).await {
+        return Ok(());
+    }
+    let entry = store.get_or_open_repo(mount_id).await?;
+    reject_if_operation_in_progress(&entry, mount_id, tool).await
+}
+
+// ── git.rebase: todo validation and planning ────────────────────────────────
+
+/// The `todo` item schema. The action set is a runtime rule, not a JSON Schema
+/// enum, for the same reason as `RESOLUTION_ITEMS`: the generated schema shape
+/// is frozen by the tool contract.
+const TODO_ITEMS: &str = r#"{"type":"object","properties":{"action":{"type":"string"},"sha":{"type":"string"},"message":{"type":"string"}},"required":["action","sha"]}"#;
+
+/// The spelling of every accepted action, in the order the refusal lists them.
+const REBASE_ACTIONS: [&str; 4] = ["pick", "squash", "drop", "reword"];
+
+/// The ref naming the commit a paused replay has replayed up to, shared by
+/// every operation built on [`replay_steps`] (rebase and cherry-pick today).
+/// The spelling still says `rebase` because a paused rebase written by an
+/// earlier build has to keep resuming after an upgrade.
+///
+/// A pause has to survive a restart (FR-NEW-278), and the commits replayed
+/// before it are unreferenced objects: naming them with a ref is what keeps
+/// them findable, exactly as git's own `rebase-merge` state does, and it costs
+/// no column on `git_operations`. It lives outside `refs/heads/` so it is
+/// neither a branch nor a tag to any reader.
+const REPLAY_HEAD_REF: &str = "refs/mcp-fs/rebase-head";
+
+/// The four actions a rebase todo may carry (DEC-918). `edit`, `fixup`, `exec`
+/// and `break` are deliberately absent: `exec` would run arbitrary commands on
+/// the server, `edit` and `break` want an interactive pause with no conflict to
+/// resolve, which the operation model does not represent, and `fixup` is a
+/// `squash` that drops the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RebaseAction {
+    Pick,
+    Squash,
+    Drop,
+    Reword,
+    /// Apply the named commit's change BACKWARDS (FR-NEW-260). Never written
+    /// by a caller: `RebaseAction::parse` does not accept it, so it reaches a
+    /// todo only through `git.revert`, which builds its own single entry.
+    Revert,
+}
+
+impl RebaseAction {
+    /// Exact match, like [`merge::Side::parse`]: `PICK` is not `pick`, because
+    /// guessing at a caller's intent is how a plan replays the wrong history.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pick" => Some(Self::Pick),
+            "squash" => Some(Self::Squash),
+            "drop" => Some(Self::Drop),
+            "reword" => Some(Self::Reword),
+            _ => None,
+            // `revert` is deliberately absent: a rebase todo replays history
+            // forward, and an inverse entry belongs to `git.revert` alone.
+        }
+    }
+}
+
+/// One validated todo entry, consumed by both halves of the tool: validation
+/// needs the shas and the ordering, the replay needs the action and the reword
+/// message.
+///
+/// Serialized into `git_operations.todo` at a pause, in the caller's own
+/// vocabulary, so a paused rebase is readable in the database and resumes from
+/// the very plan that was validated (FR-NEW-219).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct RebaseStep {
+    action: RebaseAction,
+    sha: String,
+    /// The new message of a `reword`, already known to be non blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    /// The 1-based parent whose change is replayed, for a merge commit
+    /// (FR-NEW-240). Zero everywhere else, which is libgit2's "this commit has
+    /// one parent" value, and skipped when serialized so a rebase todo keeps
+    /// the exact JSON it was frozen with.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    mainline: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// FR-NEW-215 and FR-NEW-216, the checks that need nothing but the argument:
+/// shape, bound, action set, leading squash, duplicate sha and blank reword
+/// message. Pure, so it runs before the repository is opened and a rejection
+/// costs one pass over the list.
+fn parse_todo(raw: Option<&Value>, max: usize) -> Result<Vec<RebaseStep>> {
+    let items = match raw {
+        None => return Err(ToolError::invalid_argument("missing required argument 'todo'")),
+        Some(Value::Array(a)) => a,
+        Some(_) => {
+            return Err(ToolError::invalid_argument(
+                "git.rebase: todo must be an array of {action, sha, message?} objects",
+            ));
+        }
+    };
+    if items.is_empty() {
+        return Err(ToolError::invalid_argument(
+            "git.rebase: todo is empty, there is nothing to replay",
+        ));
+    }
+    if items.len() > max {
+        return Err(ToolError::invalid_argument(format!(
+            "git.rebase: todo holds {} entries, at most {max} are accepted (git.max_rebase_todo)",
+            items.len()
+        )));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let raw_action = item.get("action").and_then(Value::as_str).ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "git.rebase: todo entry {index} must carry an 'action' string"
+            ))
+        })?;
+        let action = RebaseAction::parse(raw_action).ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "git.rebase: unknown action '{raw_action}' in todo entry {index}, the accepted \
+                 actions are exactly '{}', '{}', '{}' and '{}'",
+                REBASE_ACTIONS[0], REBASE_ACTIONS[1], REBASE_ACTIONS[2], REBASE_ACTIONS[3]
+            ))
+        })?;
+        let sha = item
+            .get("sha")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolError::invalid_argument(format!(
+                    "git.rebase: todo entry {index} must carry a 'sha' string"
+                ))
+            })?
+            .to_string();
+        // FR-NEW-215: the first entry has nothing above it to fold into, so a
+        // leading squash is a plan that cannot be executed, not a plan that
+        // silently becomes a pick.
+        if index == 0 && action == RebaseAction::Squash {
+            return Err(ToolError::invalid_argument(format!(
+                "git.rebase: todo cannot start with 'squash' ({}): the first entry has no commit \
+                 above it to fold into",
+                short(&sha)
+            )));
+        }
+        // The same rule one step deeper: a squash whose every predecessor is a
+        // drop would fold into `onto` itself, rewriting a commit outside the
+        // range. Pure, so it is caught with the rest of the argument checks.
+        if action == RebaseAction::Squash
+            && out.iter().all(|s: &RebaseStep| s.action == RebaseAction::Drop)
+        {
+            return Err(ToolError::invalid_argument(format!(
+                "git.rebase: the squash entry for {} has no replayed commit above it to fold \
+                 into, every preceding entry is a drop",
+                short(&sha)
+            )));
+        }
+        let message = match action {
+            RebaseAction::Reword => {
+                let m = item.get("message").and_then(Value::as_str).unwrap_or_default();
+                if m.trim().is_empty() {
+                    return Err(ToolError::invalid_argument(format!(
+                        "git.rebase: the reword entry for {} carries an empty message",
+                        short(&sha)
+                    )));
+                }
+                Some(m.to_string())
+            }
+            _ => None,
+        };
+        if !seen.insert(sha.clone()) {
+            return Err(ToolError::invalid_argument(format!(
+                "git.rebase: duplicate sha {} in the todo",
+                short(&sha)
+            )));
+        }
+        out.push(RebaseStep { action, sha, message, mainline: 0 });
+    }
+    Ok(out)
+}
+
+/// The object index says whether a sha names a commit at all, without any
+/// libgit2 work: an unknown sha is reported before the repository is even
+/// hydrated (FR-NEW-215, E2E-NEW-623).
+async fn require_commit(db: &RelationalGitDb, sha: &str, what: &str) -> Result<()> {
+    match db.get_object(sha).await? {
+        Some(row) if row.kind == "commit" => Ok(()),
+        Some(row) => Err(ToolError::invalid_argument(format!(
+            "git.rebase: {what} '{sha}' is a {} object, not a commit",
+            row.kind
+        ))),
+        None => Err(ToolError::not_found(format!("git.rebase: {what} '{sha}' not found"))),
+    }
+}
+
+/// `git.rebase`: FR-NEW-210's pre-flight half, FR-NEW-215 through FR-NEW-218.
+///
+/// The order is the contract: an unknown branch, an unknown `onto` and an
+/// unknown todo sha are all settled from the relational index, then the write
+/// lock is taken, then the dirty refusal, then the range walk. Nothing here
+/// creates a commit, moves a ref or writes a `git_operations` row, so every
+/// rejection leaves the volume exactly as it was.
+async fn rebase(
+    ctx: &ToolCtx,
+    entry: Arc<GitRepoEntry>,
+    mount_id: &str,
+    onto: &str,
+    todo: Vec<RebaseStep>,
+) -> Result<Value> {
+    let branch = match entry.db.get_ref("HEAD").await? {
+        Some(h) if h.symbolic => {
+            h.target.strip_prefix("refs/heads/").unwrap_or(&h.target).to_string()
+        }
+        _ => {
+            return Err(ToolError::invalid_argument(
+                "git.rebase: the volume has no checked-out branch to rebase",
+            ));
+        }
+    };
+    let tip =
+        entry.db.get_ref(&format!("refs/heads/{branch}")).await?.map(|r| r.target).ok_or_else(
+            || {
+                ToolError::invalid_argument(format!(
+                    "git.rebase: branch '{branch}' has no commit yet, there is nothing to rebase"
+                ))
+            },
+        )?;
+
+    let onto_sha = resolve_ref(&entry.db, onto)
+        .await?
+        .ok_or_else(|| ToolError::not_found(format!("ref '{onto}' not found")))?;
+    require_commit(&entry.db, &onto_sha, "onto").await?;
+
+    // FR-NEW-217's sibling: a branch rebased onto its own tip has no range at
+    // all, which is a different answer from "already contains onto".
+    if onto_sha == tip {
+        return Err(ToolError::invalid_argument(
+            "git.rebase: 'onto' resolves to the same commit as the current branch tip, there is \
+             nothing to rebase",
+        ));
+    }
+    for step in &todo {
+        require_commit(&entry.db, &step.sha, "commit").await?;
+    }
+
+    let client = ctx.state.stores.client(mount_id).await?;
+    let max = ctx.state.config.git.max_rebase_todo;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+
+    // FR-NEW-226: acquired in the async caller, never inside the blocking
+    // closure, exactly like `git.merge`. It covers the in-progress re-check,
+    // the dirty check, the range walk AND the whole replay as one snapshot, so
+    // no concurrent commit can interleave into a half rewritten history.
+    let _write = entry.write_lock.lock().await;
+    reject_if_operation_in_progress(&entry, mount_id, "git.rebase").await?;
+    // Re-read under the lock: the tip read above is a pre-lock snapshot, and a
+    // commit that landed in between must be seen by the range walk rather than
+    // silently discarded by the ref move at the end of the replay.
+    let tip =
+        entry.db.get_ref(&format!("refs/heads/{branch}")).await?.map(|r| r.target).unwrap_or(tip);
+
+    let (entry_for_thread, branch_owned, onto_owned, onto_sha_owned) =
+        (entry.clone(), branch.clone(), onto.to_string(), onto_sha.clone());
+    let out = on_git_thread(move || async move {
+        rebase_plan(
+            entry_for_thread,
+            client,
+            safety,
+            person,
+            branch_owned,
+            tip,
+            onto_sha_owned,
+            onto_owned,
+            todo,
+            max,
+        )
+        .await
+    })
+    .await?;
+
+    // NFR 7.5: one audit entry per rebase that actually did something, whether
+    // it finished or paused. An `up_to_date` report replayed nothing, so it
+    // records nothing, and neither does any refusal above.
+    let detail = match out["status"].as_str() {
+        Some("completed") => Some(format!(
+            "outcome ok, onto {onto} {onto_sha}, replayed {}, dropped {}, squashed {}",
+            out["replayed"], out["dropped"], out["squashed"]
+        )),
+        Some("conflict") => Some(format!(
+            "outcome conflict, onto {onto}, step {}, conflicts {}",
+            out["current_step"],
+            out["conflicts"].as_array().map_or(0, Vec::len)
+        )),
+        _ => None,
+    };
+    if let Some(detail) = detail {
+        ctx.state.safety.record_audit(&ctx.person, mount_id, "git.rebase", "/", &detail);
+    }
+    Ok(out)
+}
+
+/// The libgit2 side of `git.rebase`, holding the repository lock. Never called
+/// outside [`rebase`], which owns the write lock and the validation order.
+#[allow(clippy::too_many_arguments)]
+async fn rebase_plan(
+    entry: Arc<GitRepoEntry>,
+    client: Arc<VolumeClient>,
+    safety: Arc<SafetyManager>,
+    person: String,
+    branch: String,
+    tip: String,
+    onto_sha: String,
+    onto_label: String,
+    todo: Vec<RebaseStep>,
+    max: usize,
+) -> Result<Value> {
+    let repo = entry.repo.lock().await;
+    hydrate(&entry, &repo).await?;
+
+    // FR-NEW-218 ahead of every other repository read: uncommitted work would
+    // be overwritten by the first replay, so it is refused with the same
+    // wording `git.branch_switch` and `git.stash_save` use.
+    head_tree_of_clean_volume(&repo, &entry, &client, "git.rebase", &onto_label).await?;
+
+    let tip_oid = parse_oid(&tip)?;
+    let onto_oid = parse_oid(&onto_sha)?;
+    // FR-NEW-217: the branch already contains `onto`, so no commit needs
+    // replaying and the tip stays the very sha it was. A libgit2 failure here
+    // reads as "not a descendant", which falls through to the range walk and
+    // its named refusal rather than reporting a no-op that never happened.
+    if repo.graph_descendant_of(tip_oid, onto_oid).unwrap_or(false) {
+        return Ok(merge::RebaseResponse::up_to_date(branch, tip).to_value());
+    }
+
+    let range = rebase_range(&repo, tip_oid, onto_oid, max, &onto_label, &branch)?;
+    validate_todo_against_range(&todo, &range)?;
+
+    match replay_steps(&repo, onto_oid, &todo, 0, &person, None)? {
+        // FR-NEW-219: the pause is at a commit boundary. The entries already
+        // replayed stay replayed, held by the pause ref, and the volume is not
+        // touched at all until the whole todo is exhausted.
+        ReplayOutcome::Paused { index, tip: replay_tip, conflicts } => {
+            pause_replay(
+                &entry,
+                &repo,
+                crate::git::db::GitOpType::Rebase,
+                None,
+                &tip,
+                &onto_sha,
+                &todo,
+                index,
+                replay_tip,
+                conflicts,
+                None,
+            )
+            .await
+        }
+        ReplayOutcome::Done(new_tip) => {
+            finish_rebase(
+                &entry,
+                &repo,
+                &client,
+                &safety,
+                &person,
+                &branch,
+                &tip,
+                &todo,
+                new_tip,
+                "git.rebase",
+            )
+            .await
+        }
+    }
+}
+
+/// Land a replay that reached the end of its todo: the volume first, then the
+/// branch, then the pause state (FR-NEW-184).
+///
+/// The volume is rewritten as one tree-to-tree delta from the pre-rebase tip to
+/// where the replay ended, so a fifty step rebase writes each changed path
+/// once, not once per step, and a rebase resumed three times writes it once in
+/// total. Charged before applied, and applied before the branch moves: a
+/// refusal here leaves the replayed commits dangling and unreferenced, exactly
+/// as if the rebase had never run.
+#[allow(clippy::too_many_arguments)]
+async fn finish_rebase(
+    entry: &GitRepoEntry,
+    repo: &Repository,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    branch: &str,
+    original_tip: &str,
+    todo: &[RebaseStep],
+    new_tip: Oid,
+    tool: &str,
+) -> Result<Value> {
+    let tip = land_replay(entry, repo, client, safety, person, branch, original_tip, new_tip, tool)
+        .await?;
+    let (replayed, dropped, squashed) = todo_tallies(todo);
+    Ok(merge::RebaseResponse::completed(branch.to_string(), tip, replayed, dropped, squashed)
+        .to_value())
+}
+
+/// [`finish_rebase`] without the rebase specific response: the volume, the
+/// branch and the pause state, which is every landing step a replay based
+/// operation shares. Returns the new tip sha.
+#[allow(clippy::too_many_arguments)]
+async fn land_replay(
+    entry: &GitRepoEntry,
+    repo: &Repository,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    branch: &str,
+    original_tip: &str,
+    new_tip: Oid,
+    tool: &str,
+) -> Result<String> {
+    let original_tip_tree = repo
+        .find_commit(parse_oid(original_tip)?)
+        .map_err(|e| git_err("find branch tip", e))?
+        .tree()
+        .map_err(|e| git_err("branch tip tree", e))?;
+    let new_tree = repo
+        .find_commit(new_tip)
+        .map_err(|e| git_err("find replayed tip", e))?
+        .tree()
+        .map_err(|e| git_err("replayed tip tree", e))?;
+    let changes = merge::diff_tree_changes(repo, &original_tip_tree, &new_tree)?;
+    merge::charge_and_apply(tool, repo, safety, person, client, &changes).await?;
+
+    entry.objects.import_from_repo(repo).await?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let tip = new_tip.to_string();
+    entry.db.set_ref(&branch_ref, &tip, false).await?;
+    // The dual write `git.commit` establishes: the on disk ref must agree with
+    // the index, or a later libgit2 read walks the pre-replay history.
+    let _ = repo.reference(&branch_ref, new_tip, true, tool);
+    clear_replay_state(entry, repo).await?;
+    Ok(tip)
+}
+
+/// Record the pause and report it (FR-NEW-219, FR-NEW-220).
+///
+/// `created_at` is carried over when a resumed rebase pauses again, so the
+/// operation keeps the identity it was reported with and `updated_at` is what
+/// moves. Nothing is written to the volume and the branch is not touched: the
+/// only state is the replay ref, the imported objects and the row.
+#[allow(clippy::too_many_arguments)]
+async fn pause_replay(
+    entry: &GitRepoEntry,
+    repo: &Repository,
+    op: crate::git::db::GitOpType,
+    source_ref: Option<String>,
+    original_tip: &str,
+    onto_sha: &str,
+    todo: &[RebaseStep],
+    index: usize,
+    replay_tip: Oid,
+    conflicts: Vec<merge::ConflictFile>,
+    created_at: Option<String>,
+) -> Result<Value> {
+    // FR-NEW-187: a rebase reports where it is in its todo, every single step
+    // operation reports null on the wire. The columns are not nullable, so the
+    // row carries 0/1 for a single step operation and the response is what
+    // makes the distinction visible.
+    let steps = matches!(op, crate::git::db::GitOpType::Rebase)
+        .then_some((index as i64, todo.len() as i64));
+    entry.objects.import_from_repo(repo).await?;
+    let replay_sha = replay_tip.to_string();
+    entry.db.set_ref(REPLAY_HEAD_REF, &replay_sha, false).await?;
+    let _ = repo.reference(REPLAY_HEAD_REF, replay_tip, true, "mcp-fs git.rebase pause");
+
+    let now = Utc::now().to_rfc3339();
+    let created_at = created_at.unwrap_or_else(|| now.clone());
+    let paths: Vec<String> = conflicts.iter().map(|c| c.path.clone()).collect();
+    let row = crate::git::db::GitOperationRow {
+        op_type: op,
+        // FR-NEW-188: `conflicted`, never `paused`.
+        state: "conflicted".to_string(),
+        // A rebase replays a plan rather than combining a named ref in, so it
+        // has no source ref to report; a cherry-pick names the commit it is
+        // picking.
+        source_ref,
+        onto_sha: Some(onto_sha.to_string()),
+        // FR-NEW-223: the abort target, fixed when the rebase started.
+        original_tip_sha: Some(original_tip.to_string()),
+        todo: Some(encode_op_json(&todo)?),
+        // FR-NEW-187: zero based, and always an integer for a rebase.
+        current_step: index as i64,
+        total_steps: todo.len() as i64,
+        conflicts: Some(encode_op_json(&paths)?),
+        // An empty object, not NULL: a reader parses the same shape whether or
+        // not a decision has been recorded yet.
+        resolutions: Some(encode_op_json(&BTreeMap::<String, merge::Resolution>::new())?),
+        created_at: created_at.clone(),
+        updated_at: now,
+    };
+    entry.db.set_operation(&row).await?;
+
+    Ok(merge::ConflictResponse::new(
+        op,
+        operation_id(&entry.project_id, op, &created_at),
+        row.source_ref.clone(),
+        steps,
+        conflicts,
+    )
+    .to_value())
+}
+
+/// Drop everything a pause left behind: the replay ref on both sides of the
+/// dual write and the operation row. Idempotent, so the clean path calls it
+/// without asking whether the rebase ever paused.
+async fn clear_replay_state(entry: &GitRepoEntry, repo: &Repository) -> Result<()> {
+    entry.db.delete_ref(REPLAY_HEAD_REF).await?;
+    if let Ok(mut r) = repo.find_reference(REPLAY_HEAD_REF) {
+        let _ = r.delete();
+    }
+    entry.db.clear_operation().await?;
+    Ok(())
+}
+
+/// The per action tallies [`merge::RebaseResponse`] reports. A function of the
+/// todo alone, which is why they survive any number of pauses without being
+/// carried in the row: each entry is dropped, squashed or replayed, once.
+fn todo_tallies(todo: &[RebaseStep]) -> (usize, usize, usize) {
+    let dropped = todo.iter().filter(|s| s.action == RebaseAction::Drop).count();
+    let squashed = todo.iter().filter(|s| s.action == RebaseAction::Squash).count();
+    (todo.len() - dropped - squashed, dropped, squashed)
+}
+
+/// The index one todo entry produces. A pick applies the commit's change
+/// forward, a revert applies it backwards (FR-NEW-260); both are the same
+/// three way merge with the ancestor and the incoming side swapped, which is
+/// why one function covers the whole replay machinery.
+///
+/// A parentless commit has no parent tree for libgit2 to diff against, and
+/// `git_revert_commit` refuses it outright, so its inverse is computed with
+/// the empty tree standing in for the missing parent (FR-NEW-263).
+///
+/// Cost: one three way merge, O(paths changed by the commit plus paths changed
+/// since its parent). No tree is materialized into memory.
+fn replay_index(
+    repo: &Repository,
+    step: &RebaseStep,
+    original: &git2::Commit<'_>,
+    head: &git2::Commit<'_>,
+) -> Result<git2::Index> {
+    if step.action != RebaseAction::Revert {
+        return repo
+            .cherrypick_commit(original, head, step.mainline, None)
+            .map_err(|e| git_err("replay commit", e));
+    }
+    if original.parent_count() == 0 {
+        let builder = repo.treebuilder(None).map_err(|e| git_err("empty tree", e))?;
+        let empty_oid = builder.write().map_err(|e| git_err("empty tree", e))?;
+        let empty = repo.find_tree(empty_oid).map_err(|e| git_err("empty tree", e))?;
+        let ancestor = original.tree().map_err(|e| git_err("reverted tree", e))?;
+        let ours = head.tree().map_err(|e| git_err("branch tip tree", e))?;
+        // The same three sides `git_revert_commit` uses, with the parent side
+        // empty: ancestor is the commit being undone, theirs is what preceded
+        // it, so the merge reproduces the state before it existed.
+        return repo
+            .merge_trees(&ancestor, &ours, &empty, None)
+            .map_err(|e| git_err("revert root commit", e));
+    }
+    repo.revert_commit(original, head, step.mainline, None).map_err(|e| git_err("revert commit", e))
+}
+
+/// The subject `git revert` gives its commit: `Revert "<subject>"`
+/// (FR-NEW-260). Quotes and backslashes of the original subject are escaped,
+/// so reverting a revert nests readably instead of producing an unbalanced
+/// quote a reader cannot split back apart.
+fn revert_subject(message: &str) -> String {
+    let subject = message.lines().next().unwrap_or_default().trim();
+    let escaped = subject.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("Revert \"{escaped}\"")
+}
+
+/// Where a replay stopped: at the end of the todo, or on an entry whose sides
+/// disagree (FR-NEW-219).
+enum ReplayOutcome {
+    Done(Oid),
+    Paused { index: usize, tip: Oid, conflicts: Vec<merge::ConflictFile> },
+}
+
+/// FR-NEW-211 through FR-NEW-214 and FR-NEW-219/220/221: replay the validated
+/// todo from `start` onto `tip`, writing commits into the object database and
+/// nothing else. No ref moves and no volume byte is touched here, so a failure
+/// or a pause mid replay leaves only unreferenced objects behind.
+///
+/// `resolved_first_tree` is the tree a caller already settled for entry
+/// `start`, which is how a resumed rebase picks up at exactly the entry it
+/// paused on: the entries before it are never looked at again, so a resume
+/// costs the remaining steps and not the whole todo.
+///
+/// Cost: one three way merge per non dropped entry replayed by this call, each
+/// O(paths changed by that commit plus paths changed since its parent), which
+/// is libgit2's `cherrypick_commit`. Only the commit objects are looked up per
+/// step; the trees are never materialized into memory and the volume is read
+/// zero times.
+fn replay_steps(
+    repo: &Repository,
+    tip: Oid,
+    todo: &[RebaseStep],
+    start: usize,
+    person: &str,
+    resolved_first_tree: Option<Oid>,
+) -> Result<ReplayOutcome> {
+    // FR-NEW-211: the caller is the committer of every replayed commit, whoever
+    // authored the original.
+    let name = person.split('@').next().unwrap_or(person).to_string();
+    let now = Utc::now().timestamp();
+    let committer = git2::Signature::new(&name, person, &git2::Time::new(now, 0))
+        .map_err(|e| git_err("signature", e))?;
+
+    let mut out = tip;
+    let mut resolved = resolved_first_tree;
+    for (index, step) in todo.iter().enumerate().skip(start) {
+        // FR-NEW-213: a dropped commit is never read and never replayed.
+        if step.action == RebaseAction::Drop {
+            continue;
+        }
+        let original =
+            repo.find_commit(parse_oid(&step.sha)?).map_err(|e| git_err("find todo commit", e))?;
+        let head = repo.find_commit(out).map_err(|e| git_err("find replay tip", e))?;
+        let tree_oid = match resolved.take() {
+            // The caller resolved this very entry, so its tree is settled and
+            // the merge is not replayed a second time.
+            Some(tree) => tree,
+            None => {
+                let mut merged = replay_index(repo, step, &original, &head)?;
+                if merged.has_conflicts() {
+                    return Ok(ReplayOutcome::Paused {
+                        index,
+                        tip: out,
+                        conflicts: merge::conflicts_of_index(repo, &merged)?,
+                    });
+                }
+                merged.write_tree_to(repo).map_err(|e| git_err("write replayed tree", e))?
+            }
+        };
+        let tree = repo.find_tree(tree_oid).map_err(|e| git_err("find replayed tree", e))?;
+
+        let (author, message, parents) = match step.action {
+            // FR-NEW-212: the fold replaces the preceding replayed commit, so
+            // it keeps that commit's parent and author and carries both
+            // messages, and the replay tip count stays where it was.
+            RebaseAction::Squash => {
+                let folded: Vec<git2::Commit<'_>> = head.parents().collect();
+                let message = format!(
+                    "{}\n\n{}",
+                    head.message().unwrap_or_default().trim(),
+                    original.message().unwrap_or_default().trim()
+                );
+                (head.author().to_owned(), message, folded)
+            }
+            // FR-NEW-214: the supplied message, on a tree identical to a pick.
+            RebaseAction::Reword => {
+                let message = step.message.clone().unwrap_or_default();
+                (original.author().to_owned(), message, vec![head.clone()])
+            }
+            // FR-NEW-211: message and author carried over untouched.
+            RebaseAction::Pick => {
+                let message = original.message().unwrap_or_default().to_string();
+                (original.author().to_owned(), message, vec![head.clone()])
+            }
+            // FR-NEW-260: a revert is a NEW change, not a replay of someone
+            // else's, so the caller authors it as well as commits it.
+            RebaseAction::Revert => {
+                let message = revert_subject(original.message().unwrap_or_default());
+                (committer.to_owned(), message, vec![head.clone()])
+            }
+            RebaseAction::Drop => unreachable!("drop is handled above"),
+        };
+        let pretty = git2::message_prettify(&message, None).map_err(|e| git_err("message", e))?;
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        out = repo
+            .commit(None, &author, &committer, &pretty, &tree, &parent_refs)
+            .map_err(|e| git_err("create replayed commit", e))?;
+    }
+    Ok(ReplayOutcome::Done(out))
+}
+
+/// The commits between `onto` and `tip`, newest first, which is exactly the set
+/// the todo must account for.
+///
+/// Cost: one revwalk stopped at `max + 1` commits, so a rejection never walks
+/// more than the todo bound allows, whatever the history behind the tip.
+fn rebase_range(
+    repo: &Repository,
+    tip: Oid,
+    onto: Oid,
+    max: usize,
+    onto_label: &str,
+    branch: &str,
+) -> Result<Vec<String>> {
+    let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
+    walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
+    walk.hide(onto).map_err(|e| git_err("revwalk hide", e))?;
+    let mut out = Vec::new();
+    for oid in walk {
+        let oid = oid.map_err(|e| git_err("revwalk", e))?;
+        if out.len() == max {
+            return Err(ToolError::invalid_argument(format!(
+                "git.rebase: the range between '{onto_label}' and branch '{branch}' holds more \
+                 than {max} commits, which is the git.max_rebase_todo bound; rebase onto a \
+                 nearer commit"
+            )));
+        }
+        out.push(oid.to_string());
+    }
+    Ok(out)
+}
+
+/// FR-NEW-215: the todo must name every commit of the range and nothing else.
+/// Both directions are checked, because an extra entry replays foreign work and
+/// a missing one silently drops history.
+fn validate_todo_against_range(todo: &[RebaseStep], range: &[String]) -> Result<()> {
+    let in_range: HashSet<&str> = range.iter().map(String::as_str).collect();
+    for step in todo {
+        if !in_range.contains(step.sha.as_str()) {
+            return Err(ToolError::invalid_argument(format!(
+                "git.rebase: commit {} is not in the rebase range",
+                short(&step.sha)
+            )));
+        }
+    }
+    let planned: HashSet<&str> = todo.iter().map(|s| s.sha.as_str()).collect();
+    // Oldest first, the order a caller would have written the todo in.
+    let missing: Vec<String> = range
+        .iter()
+        .rev()
+        .filter(|sha| !planned.contains(sha.as_str()))
+        .map(|sha| short(sha))
+        .collect();
+    if !missing.is_empty() {
+        return Err(ToolError::invalid_argument(format!(
+            "git.rebase: todo is missing commit(s) in the rebase range: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+// ── git.merge_resolve and git.merge_abort ───────────────────────────────────
+
+/// The `resolutions` item schema: a path plus exactly one of `strategy` or
+/// `content`. The exclusivity is a runtime rule (FR-NEW-179), not a JSON Schema
+/// one, because the generated schema shape is frozen by the tool contract.
+const RESOLUTION_ITEMS: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"strategy":{"type":"string"},"content":{"type":"string"}},"required":["path"]}"#;
+
+fn no_merge_in_progress(tool: &str, mount_id: &str) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "{tool}: no operation in progress on '{mount_id}', so no merge is in progress to finish"
+    ))
+}
+
+/// FR-NEW-224, in the wording the rebase tools are refused with.
+fn no_rebase_in_progress(tool: &str, mount_id: &str) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "{tool}: no operation in progress on '{mount_id}', so there is no rebase in progress to \
+         continue or abort"
+    ))
+}
+
+/// FR-NEW-179, FR-NEW-176: every entry is validated before any of them is
+/// applied, so a single bad entry rejects the whole call and the operation is
+/// never left half resolved. Runs in the registration handler, before the
+/// repository is even opened.
+fn parse_resolutions(
+    ctx: &ToolCtx,
+    raw: Option<&Value>,
+) -> Result<Vec<(String, merge::Resolution)>> {
+    parse_resolutions_for(ctx, raw, "git.merge_resolve", true)
+}
+
+/// [`parse_resolutions`] with the argument optional, which is what a continue
+/// tool needs: a call resolving nothing is well formed and is refused by the
+/// unresolved-path rule (FR-NEW-222), not by argument parsing, so the caller
+/// gets the list of paths it still owes rather than a shape complaint.
+fn parse_optional_resolutions(
+    ctx: &ToolCtx,
+    raw: Option<&Value>,
+    tool: &'static str,
+) -> Result<Vec<(String, merge::Resolution)>> {
+    match raw {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        some => parse_resolutions_for(ctx, some, tool, false),
+    }
+}
+
+fn parse_resolutions_for(
+    ctx: &ToolCtx,
+    raw: Option<&Value>,
+    tool: &'static str,
+    require_entry: bool,
+) -> Result<Vec<(String, merge::Resolution)>> {
+    let items = match raw {
+        None => return Err(ToolError::invalid_argument("missing required argument 'resolutions'")),
+        Some(Value::Array(a)) => a,
+        Some(_) => {
+            return Err(ToolError::invalid_argument(format!(
+                "{tool}: resolutions must be an array of {{path, strategy|content}} objects"
+            )));
+        }
+    };
+    if require_entry && items.is_empty() {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: resolutions must carry at least one entry"
+        )));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let raw_path = item.get("path").and_then(Value::as_str).ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "{tool}: every resolution must carry a 'path' string"
+            ))
+        })?;
+        let path = ctx.state.safety.normalize_path(raw_path)?;
+        let strategy = item.get("strategy").filter(|v| !v.is_null());
+        let content = item.get("content").filter(|v| !v.is_null());
+        let resolution = match (strategy, content) {
+            (Some(s), None) => {
+                let s = s.as_str().unwrap_or_default();
+                merge::Resolution::Strategy(merge::Side::parse(s).ok_or_else(|| {
+                    ToolError::invalid_argument(format!(
+                        "{tool}: strategy for '{path}' must be exactly 'ours' or 'theirs', got \
+                         '{s}'"
+                    ))
+                })?)
+            }
+            (None, Some(c)) => {
+                let c = c.as_str().ok_or_else(|| {
+                    ToolError::invalid_argument(format!(
+                        "{tool}: content for '{path}' must be a string"
+                    ))
+                })?;
+                merge::Resolution::Content(c.to_string())
+            }
+            _ => {
+                return Err(ToolError::invalid_argument(format!(
+                    "{tool}: the resolution for '{path}' must carry exactly one of strategy or \
+                     content"
+                )));
+            }
+        };
+        if !seen.insert(path.clone()) {
+            return Err(ToolError::invalid_argument(format!(
+                "{tool}: duplicate resolution for path '{path}'"
+            )));
+        }
+        out.push((path, resolution));
+    }
+    Ok(out)
+}
+
+/// The repository a resolve or an abort works on. A volume that was never
+/// initialized cannot hold an in-progress operation, so it reports the same
+/// refusal as an initialized one with no row (FR-NEW-198).
+async fn open_for_operation(
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    tool: &str,
+    missing: fn(&str, &str) -> ToolError,
+) -> Result<Arc<GitRepoEntry>> {
+    if !store.is_initialized(mount_id).await {
+        return Err(missing(tool, mount_id));
+    }
+    store.get_or_open_repo(mount_id).await
+}
+
+/// The in-progress row, refusing anything the merge tools do not complete.
+/// Membership in the merge family is read off [`GitOpType::continue_with`]
+/// rather than re-listed here, so a new operation type cannot drift out of sync
+/// with the tool that finishes it (FR-NEW-241).
+async fn require_merge_operation(
+    entry: &GitRepoEntry,
+    mount_id: &str,
+    tool: &str,
+) -> Result<crate::git::db::GitOperationRow> {
+    let Some(row) = entry.db.get_operation().await? else {
+        return Err(no_merge_in_progress(tool, mount_id));
+    };
+    if row.op_type.continue_with() != "git.merge_resolve" {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: no merge is in progress on '{mount_id}': a {} is, finish it with {} or \
+             abandon it with {}",
+            row.op_type.as_str(),
+            row.op_type.continue_with(),
+            row.op_type.abort_with(),
+        )));
+    }
+    Ok(row)
+}
+
+fn decode_op_json<T: serde::de::DeserializeOwned + Default>(raw: Option<&str>) -> Result<T> {
+    match raw {
+        None => Ok(T::default()),
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| ToolError::internal(format!("decode operation state: {e}"))),
+    }
+}
+
+fn encode_op_json<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|e| ToolError::internal(format!("serialize operation state: {e}")))
+}
+
+/// `git.merge_resolve`: FR-NEW-196 plus the resolution mechanics of FR-NEW-174
+/// through FR-NEW-179 and FR-NEW-184/185.
+///
+/// The write lock covers the whole read-decide-write sequence, so two callers
+/// resolving the same operation cannot both see it as the last one.
+async fn merge_resolve(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    resolutions: Vec<(String, merge::Resolution)>,
+) -> Result<Value> {
+    let entry =
+        open_for_operation(store, mount_id, "git.merge_resolve", no_merge_in_progress).await?;
+    let _write = entry.write_lock.lock().await;
+    let row = require_merge_operation(&entry, mount_id, "git.merge_resolve").await?;
+
+    let mut remaining: Vec<String> = decode_op_json(row.conflicts.as_deref())?;
+    let mut recorded: BTreeMap<String, merge::Resolution> =
+        decode_op_json(row.resolutions.as_deref())?;
+
+    // FR-NEW-177: all-or-nothing, so every path is checked before the first one
+    // is recorded.
+    for (path, _) in &resolutions {
+        if !remaining.iter().any(|c| c == path) {
+            return Err(ToolError::invalid_argument(format!(
+                "git.merge_resolve: '{path}' is not in conflict for the merge in progress on \
+                 '{mount_id}'"
+            )));
+        }
+    }
+    // FR-NEW-182, FR-NEW-183: a binary or type changed path accepts only a
+    // side. Checked here, before the first decision is recorded, so a refusal
+    // leaves the operation exactly as it was; the replay it costs is paid only
+    // when a literal content resolution is actually present.
+    if resolutions.iter().any(|(_, r)| matches!(r, merge::Resolution::Content(_))) {
+        let restricted = merge_restrictions(&entry, &row).await?;
+        for (path, resolution) in &resolutions {
+            if matches!(resolution, merge::Resolution::Content(_))
+                && let Some(reason) = restricted.get(path.as_str())
+            {
+                return Err(ToolError::invalid_argument(format!(
+                    "git.merge_resolve: '{path}' is a {reason} conflict: its resolution must name \
+                     a side, strategy 'ours' or 'theirs', because literal content cannot carry \
+                     it"
+                )));
+            }
+        }
+    }
+
+    for (path, resolution) in resolutions {
+        remaining.retain(|c| c != &path);
+        recorded.insert(path, resolution);
+    }
+    let resolved_count = recorded.len();
+
+    // FR-NEW-178: a partial resolution buffers the decisions and writes nothing
+    // to the volume.
+    if !remaining.is_empty() {
+        let updated = crate::git::db::GitOperationRow {
+            conflicts: Some(encode_op_json(&remaining)?),
+            resolutions: Some(encode_op_json(&recorded)?),
+            updated_at: Utc::now().to_rfc3339(),
+            ..row
+        };
+        entry.db.set_operation(&updated).await?;
+        let detail =
+            format!("outcome conflict, resolved {resolved_count}, remaining {}", remaining.len());
+        ctx.state.safety.record_audit(&ctx.person, mount_id, "git.merge_resolve", "/", &detail);
+        return Ok(merge::ResolveResponse {
+            status: "conflict",
+            merge_commit: None,
+            remaining_conflicts: remaining,
+            resolved_count,
+            files_changed: 0,
+        }
+        .to_value());
+    }
+
+    let branch = current_branch(&entry, "git.merge_resolve").await?;
+    let tip = row.original_tip_sha.clone().ok_or_else(|| {
+        ToolError::internal("the in-progress merge records no pre-merge tip to merge onto")
+    })?;
+    let source_sha = row.onto_sha.clone().ok_or_else(|| {
+        ToolError::internal("the in-progress merge records no source commit to merge in")
+    })?;
+    let source_ref = row.source_ref.clone().unwrap_or_else(|| short(&source_sha));
+    let client = ctx.state.stores.client(mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    let thread_entry = entry.clone();
+    // DRIFT 2026-09-22: a stash apply or pop is a working tree operation whose
+    // CONFLICT happens to be a merge conflict, which is the only reason
+    // GitOpType::StashApply/StashPop route their completion here (FR-NEW-241).
+    // Resuming one must therefore restore files and nothing else: no commit, no
+    // ref move. The distinction is read off the row's op_type, the same value
+    // `require_merge_operation` already validated, so no new state is threaded
+    // through the pause and a restart mid conflict still resolves correctly.
+    let completion = match row.op_type {
+        crate::git::db::GitOpType::StashApply => Completion::WorkingTree { drop_stash: false },
+        crate::git::db::GitOpType::StashPop => Completion::WorkingTree { drop_stash: true },
+        _ => Completion::MergeCommit,
+    };
+    let stash_ref = matches!(completion, Completion::WorkingTree { drop_stash: true })
+        .then(|| format!("{STASH_REF_PREFIX}{source_sha}"));
+
+    let (sha, files_changed) = on_git_thread(move || async move {
+        merge_resolve_inner(
+            thread_entry,
+            client,
+            safety,
+            person,
+            branch,
+            source_ref,
+            source_sha,
+            tip,
+            recorded,
+            completion,
+        )
+        .await
+    })
+    .await?;
+
+    // FR-NEW-125: a pop's entry is deleted only once every resolved byte has
+    // landed, exactly the order the non conflicting pop uses. A conflict
+    // deferred that delete (E2E-NEW-463); this is where it finally happens.
+    if let Some(name) = stash_ref {
+        entry.db.delete_ref(&name).await?;
+    }
+
+    // FR-NEW-196: the record is cleared only once the commit exists and every
+    // file has landed. A failure above leaves the row exactly as it was, so the
+    // caller can fix the cause and retry (FR-NEW-185).
+    entry.db.clear_operation().await?;
+    // A stash completion has no commit sha to report, so `merge_commit` is null
+    // rather than a fabricated value, and the status is the `applied` the
+    // non conflicting stash tools already return.
+    let status = if matches!(completion, Completion::MergeCommit) { "merged" } else { "applied" };
+    let detail = format!("outcome ok, status {status}, files_changed {files_changed}");
+    ctx.state.safety.record_audit(&ctx.person, mount_id, "git.merge_resolve", "/", &detail);
+    Ok(merge::ResolveResponse {
+        status,
+        merge_commit: sha,
+        remaining_conflicts: Vec::new(),
+        resolved_count,
+        files_changed,
+    }
+    .to_value())
+}
+
+/// What `git.merge_resolve` does once every conflict is settled. The merge
+/// family commits the resolved tree; the stash family only restores it, because
+/// a stash holds uncommitted work (DRIFT 2026-09-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    MergeCommit,
+    WorkingTree { drop_stash: bool },
+}
+
+/// The conflicting paths of the in-progress merge that refuse a literal
+/// `content` resolution, keyed by path and carrying the reason for the error
+/// message (FR-NEW-182, FR-NEW-183). Replays the merge on the git thread, so
+/// the answer comes from the same code that produced the conflict response
+/// rather than from a second, drifting classification.
+async fn merge_restrictions(
+    entry: &Arc<GitRepoEntry>,
+    row: &crate::git::db::GitOperationRow,
+) -> Result<BTreeMap<String, &'static str>> {
+    let tip = row.original_tip_sha.clone().ok_or_else(|| {
+        ToolError::internal("the in-progress merge records no pre-merge tip to merge onto")
+    })?;
+    let source_sha = row.onto_sha.clone().ok_or_else(|| {
+        ToolError::internal("the in-progress merge records no source commit to merge in")
+    })?;
+    let entry = entry.clone();
+    on_git_thread(move || async move {
+        let repo = entry.repo.lock().await;
+        hydrate(&entry, &repo).await?;
+        let tip_commit = repo
+            .find_commit(parse_oid(&tip)?)
+            .map_err(|_| ToolError::not_found(format!("commit '{tip}' not found")))?;
+        let source_commit = repo
+            .find_commit(parse_oid(&source_sha)?)
+            .map_err(|_| ToolError::not_found(format!("commit '{source_sha}' not found")))?;
+        merge::conflict_restrictions(&repo, &tip_commit, &source_commit)
+    })
+    .await
+}
+
+/// The libgit2 side of a completed resolution, holding the repository lock.
+/// FR-NEW-184: quota first, then the atomic apply, then the commit, and only
+/// then the ref. A [`Completion::WorkingTree`] stops after the apply, so it
+/// returns no sha.
+#[allow(clippy::too_many_arguments)]
+async fn merge_resolve_inner(
+    entry: Arc<GitRepoEntry>,
+    client: Arc<VolumeClient>,
+    safety: Arc<SafetyManager>,
+    person: String,
+    branch: String,
+    source_ref: String,
+    source_sha: String,
+    tip: String,
+    resolutions: BTreeMap<String, merge::Resolution>,
+    completion: Completion,
+) -> Result<(Option<String>, usize)> {
+    let repo = entry.repo.lock().await;
+    hydrate(&entry, &repo).await?;
+
+    let tip_commit = repo
+        .find_commit(parse_oid(&tip)?)
+        .map_err(|_| ToolError::not_found(format!("commit '{tip}' not found")))?;
+    let source_commit = repo
+        .find_commit(parse_oid(&source_sha)?)
+        .map_err(|_| ToolError::not_found(format!("commit '{source_sha}' not found")))?;
+
+    let tree_oid = merge::resolve_merged_tree(&repo, &tip_commit, &source_commit, &resolutions)?;
+    let merged_tree = repo.find_tree(tree_oid).map_err(|e| git_err("find merged tree", e))?;
+    let tip_tree = tip_commit.tree().map_err(|e| git_err("commit tree", e))?;
+    let mut changes = merge::diff_tree_changes(&repo, &tip_tree, &merged_tree)?;
+    // Every resolved path is written, even the ones whose bytes happen to equal
+    // the tip's (a `ours` strategy): the caller stated the final content of
+    // those files, so the volume is made to match it explicitly rather than
+    // trusted to already. `files_changed` therefore counts every file the
+    // resolution settled (E2E-NEW-911).
+    let already: HashSet<&str> = changes
+        .iter()
+        .map(|c| match c {
+            merge::TreeChange::Write { path, .. } | merge::TreeChange::Delete { path } => {
+                path.as_str()
+            }
+        })
+        .collect();
+    let extra: Vec<merge::TreeChange> = resolutions
+        .keys()
+        .filter(|p| !already.contains(p.as_str()))
+        .filter_map(|p| {
+            merged_tree
+                .get_path(Path::new(p.trim_start_matches('/')))
+                .ok()
+                .map(|e| merge::TreeChange::Write { path: p.clone(), oid: e.id() })
+        })
+        .collect();
+    changes.extend(extra);
+    merge::charge_and_apply("git.merge_resolve", &repo, &safety, &person, &client, &changes)
+        .await?;
+
+    // The stash families stop here: the resolved files ARE the result, left as
+    // uncommitted work on a branch whose tip never moves (DRIFT 2026-09-22).
+    if completion != Completion::MergeCommit {
+        return Ok((None, changes.len()));
+    }
+
+    let message = format!("Merge {source_ref} into {branch}");
+    let oid = create_merge_commit(
+        &repo,
+        &person,
+        &message,
+        &merged_tree,
+        &[&tip_commit, &source_commit],
+    )?;
+    entry.objects.import_from_repo(&repo).await?;
+    let branch_ref = format!("refs/heads/{branch}");
+    entry.db.set_ref(&branch_ref, &oid.to_string(), false).await?;
+    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.merge_resolve");
+    Ok((Some(oid.to_string()), changes.len()))
+}
+
+/// One commit object, authored and committed by the authenticated person, with
+/// the target tip first and the source tip second.
+fn create_merge_commit(
+    repo: &Repository,
+    person: &str,
+    message: &str,
+    tree: &Tree<'_>,
+    parents: &[&git2::Commit<'_>],
+) -> Result<Oid> {
+    let name = person.split('@').next().unwrap_or(person);
+    let now = Utc::now().timestamp();
+    let sig = git2::Signature::new(name, person, &git2::Time::new(now, 0))
+        .map_err(|e| git_err("signature", e))?;
+    let pretty = git2::message_prettify(message, None).map_err(|e| git_err("message", e))?;
+    repo.commit(None, &sig, &sig, &pretty, tree, parents)
+        .map_err(|e| git_err("create merge commit", e))
+}
+
+/// `git.merge_abort`: FR-NEW-197.
+///
+/// A merge-family pause writes nothing to the volume and never advances the ref
+/// (FR-NEW-171), so the pre-merge state IS the current state: restoring it is
+/// exactly deleting the record and the resolutions buffered in it. The tip is
+/// compared against the recorded one so that invariant is asserted rather than
+/// assumed.
+async fn merge_abort(ctx: &ToolCtx, store: Arc<GitRepoStore>, mount_id: &str) -> Result<Value> {
+    let entry =
+        open_for_operation(store, mount_id, "git.merge_abort", no_merge_in_progress).await?;
+    let _write = entry.write_lock.lock().await;
+    let row = require_merge_operation(&entry, mount_id, "git.merge_abort").await?;
+
+    if let Some(original) = row.original_tip_sha.as_deref() {
+        let branch = current_branch(&entry, "git.merge_abort").await?;
+        let now = entry.db.get_ref(&format!("refs/heads/{branch}")).await?.map(|r| r.target);
+        if now.as_deref() != Some(original) {
+            return Err(ToolError::internal(format!(
+                "git.merge_abort: branch '{branch}' moved while a {} was in progress, so the \
+                 pre-merge state cannot be restored",
+                row.op_type.as_str()
+            )));
+        }
+    }
+
+    entry.db.clear_operation().await?;
+    let detail = format!("outcome ok, status aborted, operation {}", row.op_type.as_str());
+    ctx.state.safety.record_audit(&ctx.person, mount_id, "git.merge_abort", "/", &detail);
+    Ok(merge::AbortResponse {
+        status: "aborted",
+        operation: row.op_type.as_str(),
+        restored_sha: None,
+    }
+    .to_value())
+}
+
+// ── the shared continue/abort machinery of a paused replay ──────────────────
+
+/// One replay based operation's completion surface: the type recorded in the
+/// row, and how a refusal names it. The tool pair itself is read off
+/// [`crate::git::db::GitOpType`], never spelled at a call site, so a message
+/// can never name the wrong pair (FR-NEW-241).
+struct ReplayFamily {
+    op: crate::git::db::GitOpType,
+    /// How the operation is spelled in prose, which is not always how it is
+    /// spelled in the row: `cherry_pick` reads as "cherry-pick" to a caller.
+    label: &'static str,
+    missing: fn(&str, &str) -> ToolError,
+}
+
+const REBASE_FAMILY: ReplayFamily = ReplayFamily {
+    op: crate::git::db::GitOpType::Rebase,
+    label: "rebase",
+    missing: no_rebase_in_progress,
+};
+
+const CHERRY_PICK_FAMILY: ReplayFamily = ReplayFamily {
+    op: crate::git::db::GitOpType::CherryPick,
+    label: "cherry-pick",
+    missing: no_cherry_pick_in_progress,
+};
+
+const REVERT_FAMILY: ReplayFamily = ReplayFamily {
+    op: crate::git::db::GitOpType::Revert,
+    label: "revert",
+    missing: no_revert_in_progress,
+};
+
+/// FR-NEW-266 for the revert pair, in the wording FR-NEW-239 names.
+fn no_revert_in_progress(tool: &str, mount_id: &str) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "{tool}: no revert is in progress on '{mount_id}': there is no revert in progress to \
+         continue or abort"
+    ))
+}
+
+/// FR-NEW-224 for the cherry-pick pair, in the wording FR-NEW-239 names.
+fn no_cherry_pick_in_progress(tool: &str, mount_id: &str) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "{tool}: no operation in progress on '{mount_id}', so there is no cherry-pick in progress \
+         to continue or abort"
+    ))
+}
+
+/// The in-progress row, refusing anything this family's tools do not complete
+/// (FR-NEW-225). Mirrors [`require_merge_operation`]: the refusal names the
+/// operation that IS in progress and the pair that finishes it, so a caller
+/// that reached for the wrong channel is told where to go.
+async fn require_replay_operation(
+    entry: &GitRepoEntry,
+    mount_id: &str,
+    tool: &str,
+    fam: &ReplayFamily,
+) -> Result<crate::git::db::GitOperationRow> {
+    let Some(row) = entry.db.get_operation().await? else {
+        return Err((fam.missing)(tool, mount_id));
+    };
+    if row.op_type != fam.op {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: no {} in progress on '{mount_id}': a {} is, finish it with {} or abandon it \
+             with {}",
+            fam.label,
+            row.op_type.as_str(),
+            row.op_type.continue_with(),
+            row.op_type.abort_with(),
+        )));
+    }
+    Ok(row)
+}
+
+/// `git.rebase_continue` and `git.cherry_pick_continue`: FR-NEW-221,
+/// FR-NEW-222, FR-NEW-224 and FR-NEW-239.
+///
+/// The write lock covers reading the row, recording the decisions and the whole
+/// resumed replay, for the reason `git.rebase` holds it across the first one: a
+/// concurrent commit interleaving into a half rewritten history is exactly what
+/// the lock exists to prevent.
+async fn replay_continue(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    resolutions: Vec<(String, merge::Resolution)>,
+    fam: &'static ReplayFamily,
+) -> Result<Value> {
+    let tool = fam.op.continue_with();
+    let entry = open_for_operation(store, mount_id, tool, fam.missing).await?;
+    let _write = entry.write_lock.lock().await;
+    let row = require_replay_operation(&entry, mount_id, tool, fam).await?;
+
+    let mut remaining: Vec<String> = decode_op_json(row.conflicts.as_deref())?;
+    let mut recorded: BTreeMap<String, merge::Resolution> =
+        decode_op_json(row.resolutions.as_deref())?;
+
+    // FR-NEW-177: all-or-nothing, so every path is checked before the first one
+    // is recorded.
+    for (path, _) in &resolutions {
+        if !remaining.iter().any(|c| c == path) {
+            return Err(ToolError::invalid_argument(format!(
+                "{tool}: '{path}' is not in conflict for the {} in progress on '{mount_id}'",
+                fam.label
+            )));
+        }
+    }
+    let recorded_anything = !resolutions.is_empty();
+    for (path, resolution) in resolutions {
+        remaining.retain(|c| c != &path);
+        recorded.insert(path, resolution);
+    }
+
+    // FR-NEW-222: the decisions made so far are kept, the continue itself is
+    // refused, and the pause stays at the very same step.
+    if !remaining.is_empty() {
+        if recorded_anything {
+            let updated = crate::git::db::GitOperationRow {
+                conflicts: Some(encode_op_json(&remaining)?),
+                resolutions: Some(encode_op_json(&recorded)?),
+                updated_at: Utc::now().to_rfc3339(),
+                ..row
+            };
+            entry.db.set_operation(&updated).await?;
+        }
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: the paused step still has unresolved conflicting path(s): {}",
+            remaining.join(", ")
+        )));
+    }
+
+    let branch = current_branch(&entry, tool).await?;
+    let todo: Vec<RebaseStep> = decode_op_json(row.todo.as_deref())?;
+    let step = usize::try_from(row.current_step).unwrap_or(0);
+    if step >= todo.len() {
+        return Err(ToolError::internal(format!(
+            "the paused {} records a step outside its own todo",
+            fam.label
+        )));
+    }
+    let original_tip = row.original_tip_sha.clone().ok_or_else(|| {
+        ToolError::internal(format!(
+            "the paused {} records no pre-operation tip to restore",
+            fam.label
+        ))
+    })?;
+    let onto_sha = row.onto_sha.clone().ok_or_else(|| {
+        ToolError::internal(format!("the paused {} records no commit to replay onto", fam.label))
+    })?;
+    // The commits replayed before the pause, named by the ref written with the
+    // row: the resume starts here and never looks at an earlier entry again.
+    let replay_tip =
+        entry.db.get_ref(REPLAY_HEAD_REF).await?.map(|r| r.target).ok_or_else(|| {
+            ToolError::internal(format!(
+                "the paused {} records no replay head to continue from",
+                fam.label
+            ))
+        })?;
+    let created_at = row.created_at.clone();
+    let source_ref = row.source_ref.clone();
+
+    let client = ctx.state.stores.client(mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    let thread_entry = entry.clone();
+    let out = on_git_thread(move || async move {
+        replay_continue_inner(
+            thread_entry,
+            client,
+            safety,
+            person,
+            branch,
+            original_tip,
+            onto_sha,
+            replay_tip,
+            created_at,
+            source_ref,
+            todo,
+            step,
+            recorded,
+            fam,
+        )
+        .await
+    })
+    .await?;
+
+    let detail = match out["status"].as_str() {
+        Some("conflict") => format!(
+            "outcome conflict, step {}, conflicts {}",
+            out["current_step"],
+            out["conflicts"].as_array().map_or(0, Vec::len)
+        ),
+        Some(status) => format!("outcome ok, status {status}"),
+        None => "outcome ok".to_string(),
+    };
+    ctx.state.safety.record_audit(&ctx.person, mount_id, tool, "/", &detail);
+    Ok(out)
+}
+
+/// The libgit2 side of a continue, holding the repository lock. Resolves the
+/// paused entry with the recorded decisions, commits it, then replays whatever
+/// is left.
+#[allow(clippy::too_many_arguments)]
+async fn replay_continue_inner(
+    entry: Arc<GitRepoEntry>,
+    client: Arc<VolumeClient>,
+    safety: Arc<SafetyManager>,
+    person: String,
+    branch: String,
+    original_tip: String,
+    onto_sha: String,
+    replay_tip: String,
+    created_at: String,
+    source_ref: Option<String>,
+    todo: Vec<RebaseStep>,
+    step: usize,
+    resolutions: BTreeMap<String, merge::Resolution>,
+    fam: &ReplayFamily,
+) -> Result<Value> {
+    let repo = entry.repo.lock().await;
+    hydrate(&entry, &repo).await?;
+
+    let head = repo
+        .find_commit(parse_oid(&replay_tip)?)
+        .map_err(|_| ToolError::not_found(format!("commit '{replay_tip}' not found")))?;
+    let original = repo
+        .find_commit(parse_oid(&todo[step].sha)?)
+        .map_err(|e| git_err("find todo commit", e))?;
+    // The same merge the pause reported, replayed rather than cached, so the
+    // resolution is applied to the exact index the caller was shown even after
+    // a restart (FR-NEW-278).
+    let mut index = replay_index(&repo, &todo[step], &original, &head)?;
+    let tree = merge::resolve_index(&repo, &mut index, &resolutions)?;
+
+    let tool = fam.op.continue_with();
+    match replay_steps(&repo, head.id(), &todo, step, &person, Some(tree))? {
+        // FR-NEW-220: a resumed rebase can pause again, further along.
+        ReplayOutcome::Paused { index, tip, conflicts } => {
+            pause_replay(
+                &entry,
+                &repo,
+                fam.op,
+                source_ref,
+                &original_tip,
+                &onto_sha,
+                &todo,
+                index,
+                tip,
+                conflicts,
+                Some(created_at),
+            )
+            .await
+        }
+        ReplayOutcome::Done(new_tip) => match fam.op {
+            crate::git::db::GitOpType::Rebase => {
+                finish_rebase(
+                    &entry,
+                    &repo,
+                    &client,
+                    &safety,
+                    &person,
+                    &branch,
+                    &original_tip,
+                    &todo,
+                    new_tip,
+                    tool,
+                )
+                .await
+            }
+            // FR-NEW-239 and FR-NEW-266: a resolved pick or revert always
+            // lands a commit, even when the resolution chose `ours` and the
+            // tree is therefore the one the branch already had; the caller
+            // asked for this commit.
+            op => {
+                let sha = land_replay(
+                    &entry,
+                    &repo,
+                    &client,
+                    &safety,
+                    &person,
+                    &branch,
+                    &original_tip,
+                    new_tip,
+                    tool,
+                )
+                .await?;
+                let source = todo[step].sha.clone();
+                Ok(match op {
+                    crate::git::db::GitOpType::Revert => {
+                        merge::RevertResponse::committed(sha, source).to_value()
+                    }
+                    _ => merge::CherryPickResponse::committed(sha, source).to_value(),
+                })
+            }
+        },
+    }
+}
+
+/// `git.rebase_abort` and `git.cherry_pick_abort`: FR-NEW-223, FR-NEW-224 and
+/// FR-NEW-239.
+///
+/// A paused replay holds its commits in the object database and has written
+/// neither the volume nor the branch (FR-NEW-219), and the in-progress guard
+/// keeps any other writer out while it is paused, so the pre-operation state IS
+/// the current state. The branch is still written back to the recorded
+/// `original_tip_sha` rather than assumed to be there, which is what makes the
+/// restoration exact instead of merely likely.
+async fn replay_abort(
+    ctx: &ToolCtx,
+    store: Arc<GitRepoStore>,
+    mount_id: &str,
+    fam: &ReplayFamily,
+) -> Result<Value> {
+    let tool = fam.op.abort_with();
+    let entry = open_for_operation(store, mount_id, tool, fam.missing).await?;
+    let _write = entry.write_lock.lock().await;
+    let row = require_replay_operation(&entry, mount_id, tool, fam).await?;
+    let original_tip = row.original_tip_sha.clone().ok_or_else(|| {
+        ToolError::internal(format!(
+            "the paused {} records no pre-operation tip to restore",
+            fam.label
+        ))
+    })?;
+    let branch = current_branch(&entry, tool).await?;
+
+    let thread_entry = entry.clone();
+    let restore_to = original_tip.clone();
+    on_git_thread(move || async move {
+        let repo = thread_entry.repo.lock().await;
+        let branch_ref = format!("refs/heads/{branch}");
+        thread_entry.db.set_ref(&branch_ref, &restore_to, false).await?;
+        let _ = repo.reference(&branch_ref, parse_oid(&restore_to)?, true, "mcp-fs replay abort");
+        clear_replay_state(&thread_entry, &repo).await
+    })
+    .await?;
+
+    let detail = format!("outcome ok, status aborted, operation {}", row.op_type.as_str());
+    ctx.state.safety.record_audit(&ctx.person, mount_id, tool, "/", &detail);
+    // FR-NEW-239: the cherry-pick abort names the tip it put back, so a caller
+    // can assert the restoration without a second read. The two older aborts
+    // keep the exact two key shape they were frozen with.
+    let restored_sha =
+        matches!(fam.op, crate::git::db::GitOpType::CherryPick | crate::git::db::GitOpType::Revert)
+            .then_some(original_tip);
+    Ok(merge::AbortResponse { status: "aborted", operation: row.op_type.as_str(), restored_sha }
+        .to_value())
+}
+
+// ── git.cherry_pick ─────────────────────────────────────────────────────────
+
+/// FR-NEW-237: a `commit_sha` that is not a sha at all is an argument error,
+/// settled before any repository is opened, and distinct from a well formed
+/// sha that names nothing.
+fn parse_commit_sha(tool: &str, raw: &str) -> Result<String> {
+    let ok = (4..=40).contains(&raw.len()) && raw.chars().all(|c| c.is_ascii_hexdigit());
+    if !ok {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: commit_sha must be a full or abbreviated commit sha, 4 to 40 hexadecimal \
+             characters, got '{raw}'"
+        )));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+/// FR-NEW-240 and FR-NEW-262: `mainline` is the 1-based index of a parent, so
+/// every value below 1 is refused rather than folded into the "absent"
+/// sentinel a caller cannot see. Pure, so it settles before any repository is
+/// opened. Zero means absent, which is also libgit2's "this commit has one
+/// parent" value.
+fn parse_mainline(tool: &str, raw: Option<&Value>) -> Result<u32> {
+    let Some(value) = raw.filter(|v| !v.is_null()) else { return Ok(0) };
+    let Some(n) = value.as_i64() else {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: mainline must be an integer, the 1-based index of one of the commit's parents"
+        )));
+    };
+    u32::try_from(n).ok().filter(|n| *n >= 1).ok_or_else(|| {
+        ToolError::invalid_argument(format!(
+            "{tool}: mainline {n} is not a parent index, a commit's parents are numbered from 1"
+        ))
+    })
+}
+
+/// FR-NEW-240 and FR-NEW-262: whether `mainline` is required, forbidden or out
+/// of range is decided by the commit's parent count alone, so `git.cherry_pick`
+/// and `git.revert` share the rule and can never drift apart on it. Only
+/// `used_for`, the clause naming what the chosen parent serves, differs.
+fn check_mainline(
+    tool: &str,
+    sha: &str,
+    parents: u32,
+    mainline: u32,
+    used_for: &str,
+) -> Result<()> {
+    if parents > 1 && mainline == 0 {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: '{}' is a merge commit with {parents} parents, so the change it made is not \
+             defined on its own: pass mainline (1 or {parents}), the 1-based index of the parent \
+             {used_for}",
+            short(sha)
+        )));
+    }
+    if mainline > 0 && parents < 2 {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: '{}' is not a merge commit, so mainline does not apply to it: it has \
+             {parents} parent{}",
+            short(sha),
+            if parents == 1 { "" } else { "s" }
+        )));
+    }
+    if mainline > parents {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: mainline {mainline} is out of range, '{}' has {parents} parents",
+            short(sha)
+        )));
+    }
+    Ok(())
+}
+
+/// FR-NEW-237: the object index settles whether the sha names a commit at all,
+/// before libgit2 is involved. An object of another kind is reported as no
+/// commit rather than as an internal failure.
+async fn require_pickable_commit(db: &RelationalGitDb, tool: &str, sha: &str) -> Result<()> {
+    match db.get_object(sha).await? {
+        Some(row) if row.kind == "commit" => Ok(()),
+        Some(row) => Err(ToolError::not_found(format!(
+            "{tool}: '{sha}' is a {} object, not a commit",
+            row.kind
+        ))),
+        None => Err(ToolError::not_found(format!("{tool}: commit '{sha}' not found"))),
+    }
+}
+
+/// `git.cherry_pick`: FR-NEW-235 through FR-NEW-240.
+///
+/// Structurally a one entry replay, so it is exactly [`replay_steps`] over a
+/// single `pick`, landed by [`land_replay`] and paused by [`pause_replay`]:
+/// the rebase machinery, not a parallel implementation of it.
+async fn cherry_pick(
+    ctx: &ToolCtx,
+    entry: Arc<GitRepoEntry>,
+    mount_id: &str,
+    source_sha: String,
+    mainline: u32,
+) -> Result<Value> {
+    require_pickable_commit(&entry.db, "git.cherry_pick", &source_sha).await?;
+    let branch = current_branch(&entry, "git.cherry_pick").await?;
+    let tip = entry.db.get_ref(&format!("refs/heads/{branch}")).await?.map(|r| r.target);
+
+    let client = ctx.state.stores.client(mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+
+    // FR-NEW-226: taken in the async caller, never inside the blocking closure,
+    // and held across the in-progress re-check, the dirty check and the whole
+    // replay, so no concurrent commit can interleave into it.
+    let _write = entry.write_lock.lock().await;
+    reject_if_operation_in_progress(&entry, mount_id, "git.cherry_pick").await?;
+    // Re-read under the lock: the read above is a pre-lock snapshot, and a
+    // commit that landed in between is the one the pick must be applied onto.
+    let tip = entry
+        .db
+        .get_ref(&format!("refs/heads/{branch}"))
+        .await?
+        .map(|r| r.target)
+        .or(tip)
+        .ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "git.cherry_pick: branch '{branch}' has no commit on the current branch to pick \
+                 onto"
+            ))
+        })?;
+
+    let thread_entry = entry.clone();
+    let source = source_sha.clone();
+    let out = on_git_thread(move || async move {
+        cherry_pick_apply(thread_entry, client, safety, person, branch, tip, source, mainline).await
+    })
+    .await?;
+
+    // NFR 7.5: one audit entry per pick, whatever it reported, carrying the
+    // FULL source sha so the picked commit is identifiable from the trail
+    // alone. The pick is its own audited operation and never a nested
+    // `git.commit`.
+    let detail = format!("outcome {}, source {source_sha}", out["status"]);
+    ctx.state.safety.record_audit(&ctx.person, mount_id, "git.cherry_pick", "/", &detail);
+    Ok(out)
+}
+
+/// The libgit2 side of `git.cherry_pick`, holding the repository lock. Never
+/// called outside [`cherry_pick`], which owns the write lock.
+#[allow(clippy::too_many_arguments)]
+async fn cherry_pick_apply(
+    entry: Arc<GitRepoEntry>,
+    client: Arc<VolumeClient>,
+    safety: Arc<SafetyManager>,
+    person: String,
+    branch: String,
+    tip: String,
+    source_sha: String,
+    mainline: u32,
+) -> Result<Value> {
+    let repo = entry.repo.lock().await;
+    hydrate(&entry, &repo).await?;
+    // Uncommitted work would be overwritten by the applied diff, so it is
+    // refused with the same wording every other volume rewriting tool uses.
+    head_tree_of_clean_volume(&repo, &entry, &client, "git.cherry_pick", &short(&source_sha))
+        .await?;
+
+    let source_oid = parse_oid(&source_sha)?;
+    let source = repo.find_commit(source_oid).map_err(|e| git_err("find cherry-pick source", e))?;
+    let parents = source.parent_count() as u32;
+    // FR-NEW-240: with two parents there is no single "the change this commit
+    // made", so the caller has to say which parent it is relative to.
+    check_mainline(
+        "git.cherry_pick",
+        &source_sha,
+        parents,
+        mainline,
+        "the picked change is taken relative to",
+    )?;
+
+    let tip_oid = parse_oid(&tip)?;
+    // FR-NEW-236, by sha: the commit is already in this branch's history, so
+    // replaying it would duplicate it.
+    if tip_oid == source_oid || repo.graph_descendant_of(tip_oid, source_oid).unwrap_or(false) {
+        return Ok(merge::CherryPickResponse::already_present(source_sha).to_value());
+    }
+
+    let todo = vec![RebaseStep {
+        action: RebaseAction::Pick,
+        sha: source_sha.clone(),
+        message: None,
+        mainline,
+    }];
+    match replay_steps(&repo, tip_oid, &todo, 0, &person, None)? {
+        // FR-NEW-238: nothing is written, the branch does not move, and the
+        // pause is recorded exactly as a rebase's is.
+        ReplayOutcome::Paused { index, tip: replay_tip, conflicts } => {
+            pause_replay(
+                &entry,
+                &repo,
+                crate::git::db::GitOpType::CherryPick,
+                Some(source_sha.clone()),
+                &tip,
+                &source_sha,
+                &todo,
+                index,
+                replay_tip,
+                conflicts,
+                None,
+            )
+            .await
+        }
+        ReplayOutcome::Done(new_tip) => {
+            let head_tree =
+                repo.find_commit(tip_oid).map_err(|e| git_err("find branch tip", e))?.tree_id();
+            let picked = repo.find_commit(new_tip).map_err(|e| git_err("find picked commit", e))?;
+            // FR-NEW-236, by content: the replay produced the very tree the
+            // branch already has, so there is nothing to commit. The commit
+            // object written above stays unreferenced and unimported.
+            if picked.tree_id() == head_tree {
+                return Ok(merge::CherryPickResponse::already_present(source_sha).to_value());
+            }
+            let sha = land_replay(
+                &entry,
+                &repo,
+                &client,
+                &safety,
+                &person,
+                &branch,
+                &tip,
+                new_tip,
+                "git.cherry_pick",
+            )
+            .await?;
+            Ok(merge::CherryPickResponse::committed(sha, source_sha).to_value())
+        }
+    }
+}
+// ── git.revert ──────────────────────────────────────────────────────────────
+
+/// `git.revert`: FR-NEW-260 through FR-NEW-266.
+///
+/// Structurally the same one entry replay as [`cherry_pick`], with the inverse
+/// diff instead of the forward one, so it is [`replay_steps`] over a single
+/// `revert` entry, landed by [`land_replay`] and paused by [`pause_replay`].
+/// The original commit is never touched: a revert is a forward commit, not a
+/// history edit.
+async fn revert(
+    ctx: &ToolCtx,
+    entry: Arc<GitRepoEntry>,
+    mount_id: &str,
+    source_sha: String,
+    mainline: u32,
+) -> Result<Value> {
+    require_pickable_commit(&entry.db, "git.revert", &source_sha).await?;
+    let branch = current_branch(&entry, "git.revert").await?;
+    let tip = entry.db.get_ref(&format!("refs/heads/{branch}")).await?.map(|r| r.target);
+
+    let client = ctx.state.stores.client(mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+
+    // FR-NEW-226: taken in the async caller, never inside the blocking closure,
+    // and held across the in-progress re-check, the dirty check and the whole
+    // replay, so no concurrent commit can interleave into it.
+    let _write = entry.write_lock.lock().await;
+    reject_if_operation_in_progress(&entry, mount_id, "git.revert").await?;
+    // Re-read under the lock: a commit that landed in between is the one the
+    // inverse change must be applied onto.
+    let tip = entry
+        .db
+        .get_ref(&format!("refs/heads/{branch}"))
+        .await?
+        .map(|r| r.target)
+        .or(tip)
+        .ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "git.revert: branch '{branch}' has no commit on the current branch to revert onto"
+            ))
+        })?;
+
+    let thread_entry = entry.clone();
+    let source = source_sha.clone();
+    let out = on_git_thread(move || async move {
+        revert_apply(thread_entry, client, safety, person, branch, tip, source, mainline).await
+    })
+    .await?;
+
+    // NFR 7.5: one audit entry per revert, whatever it reported, carrying the
+    // FULL reverted sha so the undone commit is identifiable from the trail
+    // alone.
+    let detail = format!("outcome {}, reverted {source_sha}", out["status"]);
+    ctx.state.safety.record_audit(&ctx.person, mount_id, "git.revert", "/", &detail);
+    Ok(out)
+}
+
+/// The libgit2 side of `git.revert`, holding the repository lock. Never called
+/// outside [`revert`], which owns the write lock.
+#[allow(clippy::too_many_arguments)]
+async fn revert_apply(
+    entry: Arc<GitRepoEntry>,
+    client: Arc<VolumeClient>,
+    safety: Arc<SafetyManager>,
+    person: String,
+    branch: String,
+    tip: String,
+    source_sha: String,
+    mainline: u32,
+) -> Result<Value> {
+    let repo = entry.repo.lock().await;
+    hydrate(&entry, &repo).await?;
+    // Uncommitted work would be overwritten by the inverse diff, so it is
+    // refused with the same wording every other volume rewriting tool uses.
+    head_tree_of_clean_volume(&repo, &entry, &client, "git.revert", &short(&source_sha)).await?;
+
+    let source_oid = parse_oid(&source_sha)?;
+    let source = repo.find_commit(source_oid).map_err(|e| git_err("find reverted commit", e))?;
+    let parents = source.parent_count() as u32;
+    // FR-NEW-261 and FR-NEW-262.
+    check_mainline("git.revert", &source_sha, parents, mainline, "the revert is computed against")?;
+
+    let tip_oid = parse_oid(&tip)?;
+    let todo = vec![RebaseStep {
+        action: RebaseAction::Revert,
+        sha: source_sha.clone(),
+        message: None,
+        mainline,
+    }];
+    match replay_steps(&repo, tip_oid, &todo, 0, &person, None)? {
+        // FR-NEW-264: nothing is written, the branch does not move, and the
+        // pause is recorded exactly as a cherry-pick's is.
+        ReplayOutcome::Paused { index, tip: replay_tip, conflicts } => {
+            pause_replay(
+                &entry,
+                &repo,
+                crate::git::db::GitOpType::Revert,
+                Some(source_sha.clone()),
+                &tip,
+                &source_sha,
+                &todo,
+                index,
+                replay_tip,
+                conflicts,
+                None,
+            )
+            .await
+        }
+        ReplayOutcome::Done(new_tip) => {
+            let head_tree =
+                repo.find_commit(tip_oid).map_err(|e| git_err("find branch tip", e))?.tree_id();
+            let reverted =
+                repo.find_commit(new_tip).map_err(|e| git_err("find revert commit", e))?;
+            // The inverse produced the very tree the branch already has, so the
+            // change is already undone and there is nothing to commit. The
+            // commit object written above stays unreferenced and unimported.
+            if reverted.tree_id() == head_tree {
+                return Ok(merge::RevertResponse::already_present(source_sha).to_value());
+            }
+            let sha = land_replay(
+                &entry,
+                &repo,
+                &client,
+                &safety,
+                &person,
+                &branch,
+                &tip,
+                new_tip,
+                "git.revert",
+            )
+            .await?;
+            Ok(merge::RevertResponse::committed(sha, source_sha).to_value())
+        }
+    }
+}
+
+// ── git.remote_pull ─────────────────────────────────────────────────────────
+
+/// FR-DEL-101: `on_conflict` no longer exists. A caller that still sends it
+/// had asked for one global side to be applied to every conflicting file, so
+/// ignoring it would silently change which content survives; the call is
+/// refused instead, before authorization, any lock and any network attempt,
+/// and the message names the tool that replaces it.
+fn reject_removed_on_conflict(a: &crate::mcp::args::Args) -> Result<()> {
+    if a.raw("on_conflict").is_some_and(|v| !v.is_null()) {
+        return Err(ToolError::invalid_argument(
+            "git.remote_pull: the on_conflict parameter was removed; a diverged pull now merges \
+             on its own and reports every conflicting file with both sides' content, which you \
+             resolve per file with git.merge_resolve or abandon with git.merge_abort",
+        ));
+    }
+    Ok(())
+}
+
 /// The outcome [`pull_branch`] reaches once the fetch and ancestry test have
-/// settled: a fast-forward (US-011/US-012, unchanged by this story) or a
-/// merge (US-013). Carried out of the `on_git_thread` closure so the JSON
-/// response shape can branch on it once back on the async side.
+/// settled: a fast-forward (US-011/US-012), a merge that completed on its own,
+/// or a merge paused on conflicts (US-007). Carried out of the `on_git_thread`
+/// closure so the JSON response shape can branch on it once back on the async
+/// side.
 enum PullOutcome {
     FastForward { old_sha: String, new_sha: String, files_changed: usize },
-    Merged { strategy: String, merge_commit: String, conflicts_resolved: usize },
+    Merged { merge_commit: String, files_changed: usize },
+    Conflict(merge::ConflictResponse),
 }
 
 /// FR-NEW-063: `branch` must equal what `HEAD` currently points at. Pure
@@ -1530,12 +5655,13 @@ async fn remote_pull(
     store: Arc<GitRepoStore>,
     tokens: Option<Arc<crate::git::OAuthTokenStore>>,
     mount_id: &str,
+    remote: &str,
     branch: &str,
-    on_conflict: Option<String>,
 ) -> Result<Value> {
     if !store.is_initialized(mount_id).await {
         return early_remote_failure(
             "git.remote_pull",
+            remote,
             mount_id,
             &ctx.person,
             &ctx.state.safety,
@@ -1554,6 +5680,7 @@ async fn remote_pull(
         Err(e) => {
             return early_remote_failure(
                 "git.remote_pull",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1570,6 +5697,7 @@ async fn remote_pull(
         Err(e) => {
             return early_remote_failure(
                 "git.remote_pull",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1582,11 +5710,12 @@ async fn remote_pull(
         }
     };
 
-    let origin_url = match crate::git::remote::require_origin(&store, mount_id).await {
+    let origin_url = match crate::git::remote::require_remote(&store, mount_id, remote).await {
         Ok(u) => u,
         Err(e) => {
             return early_remote_failure(
                 "git.remote_pull",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1605,6 +5734,7 @@ async fn remote_pull(
         Err(e) => {
             return early_remote_failure(
                 "git.remote_pull",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1621,6 +5751,7 @@ async fn remote_pull(
         Err(e) => {
             return early_remote_failure(
                 "git.remote_pull",
+                remote,
                 mount_id,
                 &ctx.person,
                 &ctx.state.safety,
@@ -1635,6 +5766,7 @@ async fn remote_pull(
 
     pull_branch(
         entry,
+        remote,
         branch,
         &local_sha,
         &origin_url,
@@ -1643,7 +5775,6 @@ async fn remote_pull(
         client,
         &ctx.person,
         ctx.state.safety.clone(),
-        on_conflict,
         ctx.state.config.git.remote_timeout_secs,
     )
     .await
@@ -1661,19 +5792,15 @@ async fn remote_pull(
 /// consistent snapshot: nothing else can commit or write to this repository
 /// between the check and the apply.
 ///
-/// `on_conflict`, when the fetched history turns out to be a fast-forward, is
-/// ignored regardless of whether it was supplied (E2E-NEW-134): the
-/// degenerate case is never treated as a divergence just because a strategy
-/// was offered. When it is a genuine divergence (US-013, FR-NEW-030 to
-/// FR-NEW-034): absent, the pull is refused naming `on_conflict` as the way
-/// to merge, with the fetch's results (the remote-tracking ref, the fetched
-/// objects) kept, only the apply refused; `ours` or `theirs`, a three-way
-/// merge resolves every conflicting file by that strategy through
-/// `MergeOptions::file_favor` and `Repository::merge_commits`
-/// (`git2-0.20.4/src/merge.rs:133-136`, `src/repo.rs:2177`), and a merge
-/// commit is created with the previous local tip as first parent and the
-/// fetched remote tip as second (DEC-026, DEC-027). An invalid `on_conflict`
-/// value is rejected up front, before any of this branches on it.
+/// A genuine divergence (FR-MOD-104) is merged by the shared engine with no
+/// caller decision: a clean three way merge creates a merge commit with the
+/// previous local tip as first parent and the fetched remote tip as second
+/// (DEC-026, DEC-027), and a conflicting one applies nothing, records the
+/// pause as a `merge` operation and returns the shared conflict response, to
+/// be finished with `git.merge_resolve` or abandoned with `git.merge_abort`
+/// (FR-MOD-105). Either way the fetch's results, the remote-tracking ref and
+/// the fetched objects, are kept: only the apply is deferred, so a resolve or
+/// a retry costs no second download.
 ///
 /// Split out from [`remote_pull`] exactly like [`push_branch`] is split from
 /// [`remote_push`], so a test can exercise real pull mechanics against a
@@ -1683,6 +5810,7 @@ async fn remote_pull(
 #[allow(clippy::too_many_arguments)]
 async fn pull_branch(
     entry: Arc<GitRepoEntry>,
+    remote: &str,
     branch: &str,
     local_sha: &str,
     origin_url: &str,
@@ -1691,7 +5819,6 @@ async fn pull_branch(
     client: Arc<VolumeClient>,
     person: &str,
     safety: Arc<SafetyManager>,
-    on_conflict: Option<String>,
     timeout_secs: u64,
 ) -> Result<Value> {
     let host = crate::git::remote::extract_host(origin_url);
@@ -1702,6 +5829,7 @@ async fn pull_branch(
     crate::git::remote::run_remote_operation(
         crate::git::remote::RemoteOpContext {
             operation: "git.remote_pull",
+            remote,
             host: &host,
             provider: &auth_for_ctx,
             branch: Some(branch),
@@ -1711,6 +5839,7 @@ async fn pull_branch(
         },
         pull_branch_inner(
             entry,
+            remote,
             branch,
             local_sha,
             origin_url,
@@ -1719,15 +5848,18 @@ async fn pull_branch(
             client,
             person,
             safety,
-            on_conflict,
             timeout_secs,
         ),
         |v: &Value| {
-            if v.get("merged").and_then(Value::as_bool).unwrap_or(false) {
+            if v.get("status").and_then(Value::as_str) == Some("conflict") {
                 format!(
-                    "merged via {} strategy, conflicts_resolved {}",
-                    v.get("strategy").and_then(Value::as_str).unwrap_or(""),
-                    v.get("conflicts_resolved").and_then(Value::as_u64).unwrap_or(0),
+                    "conflict, {} paths, finish with git.merge_resolve",
+                    v.get("conflicts").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                )
+            } else if v.get("merged").and_then(Value::as_bool).unwrap_or(false) {
+                format!(
+                    "merged, files_changed {}",
+                    v.get("files_changed").and_then(Value::as_u64).unwrap_or(0),
                 )
             } else {
                 format!(
@@ -1744,6 +5876,7 @@ async fn pull_branch(
 #[allow(clippy::too_many_arguments)]
 async fn pull_branch_inner(
     entry: Arc<GitRepoEntry>,
+    remote: &str,
     branch: &str,
     local_sha: &str,
     origin_url: &str,
@@ -1752,15 +5885,15 @@ async fn pull_branch_inner(
     client: Arc<VolumeClient>,
     person: &str,
     safety: Arc<SafetyManager>,
-    on_conflict: Option<String>,
     timeout_secs: u64,
 ) -> Result<Value> {
-    // FR-NEW-033: validated before any lock is taken, any fetch runs, or the
-    // ancestry branch is even reached.
-    let strategy = parse_on_conflict(on_conflict.as_deref())?;
-
-    let (branch_owned, origin_owned, local_sha_owned, person_owned) =
-        (branch.to_string(), origin_url.to_string(), local_sha.to_string(), person.to_string());
+    let (remote_owned, branch_owned, origin_owned, local_sha_owned, person_owned) = (
+        remote.to_string(),
+        branch.to_string(),
+        origin_url.to_string(),
+        local_sha.to_string(),
+        person.to_string(),
+    );
     let entry_for_thread = entry.clone();
     // Acquired here, in the async caller, never inside the blocking closure
     // below (DRIFT-009): see `push_branch` for why this is what makes a
@@ -1781,15 +5914,20 @@ async fn pull_branch_inner(
             // FR-NEW-029: refused before any fetch.
             require_clean_volume(&repo, &client, &local_sha_owned).await?;
 
-            let outcome =
-                crate::git::remote::fetch_from_remote(&repo, &origin_owned, token, Some(deadline))?;
+            let outcome = crate::git::remote::fetch_from_remote(
+                &repo,
+                &remote_owned,
+                &origin_owned,
+                token,
+                Some(deadline),
+            )?;
             entry_for_thread.objects.import_from_repo(&repo).await?;
             for u in &outcome.refs_updated {
                 entry_for_thread.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
             }
 
             let local_oid = parse_oid(&local_sha_owned)?;
-            let remote_ref_name = format!("refs/remotes/origin/{branch_owned}");
+            let remote_ref_name = format!("refs/remotes/{remote_owned}/{branch_owned}");
             let remote_oid =
                 match repo.find_reference(&remote_ref_name).and_then(|r| r.peel_to_commit()) {
                     Ok(c) => c.id(),
@@ -1820,82 +5958,91 @@ async fn pull_branch_inner(
             let remote_tree = remote_commit.tree().map_err(|e| git_err("commit tree", e))?;
 
             if !is_ff {
-                // FR-NEW-030: the fetch above already ran and its results are kept
-                // (`refs/remotes/origin/{branch}` was just advanced); only the
-                // apply below is refused. Divergence is never resolved implicitly.
-                let Some(strategy) = strategy else {
-                    return Err(ToolError::invalid_argument(
-                        "pull refused: not a fast-forward: local and remote have diverged; supply \
-                     on_conflict: 'ours' or 'theirs' to merge",
-                    ));
-                };
-
-                // FR-NEW-031: resolved entirely by `file_favor`; this writes no
-                // merge algorithm of its own.
-                let mut merge_opts = MergeOptions::new();
-                merge_opts.file_favor(strategy.file_favor());
-                let mut index = repo
-                    .merge_commits(&local_commit, &remote_commit, Some(&merge_opts))
-                    .map_err(|e| git_err("merge commits", e))?;
-                // FR-NEW-032: `file_favor` resolves every conflicting region; an
-                // unresolved conflict here would be something the strategy cannot
-                // represent (a rename or type conflict), and this refuses rather
-                // than ever writing a conflict marker or index entry.
-                if index.has_conflicts() {
-                    return Err(ToolError::internal(
-                        "git.remote_pull: the merge left unresolved conflicts that 'ours'/'theirs' \
-                     cannot represent",
-                    ));
-                }
+                // FR-MOD-104: the fetch above already ran and its results are
+                // kept (`refs/remotes/origin/{branch}` was just advanced);
+                // only the apply is deferred when the merge cannot complete,
+                // so a resolve or a retry costs no second download.
+                //
+                // DEC-902: no global strategy. The three way merge is the
+                // shared engine (US-002), so `git.merge` and the pull cannot
+                // drift apart, and a conflict is reported with both sides'
+                // content instead of being pre-resolved.
                 let merged_tree_oid =
-                    index.write_tree_to(&repo).map_err(|e| git_err("write merged tree", e))?;
+                    match merge::three_way_merge(&repo, &local_commit, &remote_commit, None)? {
+                        merge::MergeOutcome::Conflicted { conflicts } => {
+                            // FR-NEW-285: a paused pull IS a merge, recorded
+                            // and reported as one, so the merge tools that
+                            // finish it find the shape they expect.
+                            let source_ref = format!("{remote_owned}/{branch_owned}");
+                            let now = Utc::now().to_rfc3339();
+                            let paths: Vec<String> =
+                                conflicts.iter().map(|c| c.path.clone()).collect();
+                            let row = crate::git::db::GitOperationRow {
+                                op_type: crate::git::db::GitOpType::Merge,
+                                state: "conflicted".to_string(),
+                                source_ref: Some(source_ref.clone()),
+                                // The fetched commit, not the tracking ref: a
+                                // later fetch may move the ref, and the resolve
+                                // must finish the merge that was reported.
+                                onto_sha: Some(remote_oid.to_string()),
+                                original_tip_sha: Some(local_sha_owned.clone()),
+                                todo: None,
+                                // FR-NEW-187: a pull is single step, so the row
+                                // carries zeroes and the response reports null.
+                                current_step: 0,
+                                total_steps: 0,
+                                conflicts: Some(serde_json::to_string(&paths).map_err(|e| {
+                                    ToolError::internal(format!("serialize conflicts: {e}"))
+                                })?),
+                                resolutions: None,
+                                created_at: now.clone(),
+                                updated_at: now.clone(),
+                            };
+                            entry_for_thread.db.set_operation(&row).await?;
+                            return Ok(PullOutcome::Conflict(merge::ConflictResponse::new(
+                                crate::git::db::GitOpType::Merge,
+                                operation_id(
+                                    &entry_for_thread.project_id,
+                                    crate::git::db::GitOpType::Merge,
+                                    &now,
+                                ),
+                                Some(source_ref),
+                                None,
+                                conflicts,
+                            )));
+                        }
+                        merge::MergeOutcome::Clean { tree } => tree,
+                    };
                 let merged_tree =
                     repo.find_tree(merged_tree_oid).map_err(|e| git_err("find merged tree", e))?;
-
-                // Only files with an actual conflicting change on both sides count
-                // (FR-NEW-031's `conflicts_resolved`), not every path either side
-                // touched: diff each side against their common ancestor and
-                // intersect the two path sets.
-                let merge_base_oid =
-                    repo.merge_base(local_oid, remote_oid).map_err(|e| git_err("merge base", e))?;
-                let merge_base_commit = repo
-                    .find_commit(merge_base_oid)
-                    .map_err(|e| git_err("find merge base commit", e))?;
-                let merge_base_tree =
-                    merge_base_commit.tree().map_err(|e| git_err("merge base tree", e))?;
-                let local_touched = changed_paths(&repo, &merge_base_tree, &local_tree)?;
-                let remote_touched = changed_paths(&repo, &merge_base_tree, &remote_tree)?;
-                let conflicts_resolved = local_touched.intersection(&remote_touched).count();
 
                 // Reuses the same delta, quota charge and atomic apply the
                 // fast-forward path uses below: a merge only changes which tree is
                 // being applied, never how.
-                let changes = diff_tree_changes(&repo, &local_tree, &merged_tree)?;
-                charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
-                apply_pull_changes_atomically(&client, &repo, &changes).await?;
+                let changes = merge::diff_tree_changes(&repo, &local_tree, &merged_tree)?;
+                merge::charge_and_apply(
+                    "git.remote_pull",
+                    &repo,
+                    &safety,
+                    &person_owned,
+                    &client,
+                    &changes,
+                )
+                .await?;
 
                 // DEC-026: authored and committed by the authenticated person.
-                let name = person_owned.split('@').next().unwrap_or(&person_owned).to_string();
-                let now = Utc::now().timestamp();
-                let sig = git2::Signature::new(&name, &person_owned, &git2::Time::new(now, 0))
-                    .map_err(|e| git_err("signature", e))?;
                 // DEC-027: auto-generated, no caller-supplied override.
                 let message = format!(
-                    "Merge origin/{branch_owned} into {branch_owned} (conflicts resolved: {})",
-                    strategy.as_str()
+                    "Merge remote-tracking branch '{remote_owned}/{branch_owned}' into \
+                     {branch_owned}"
                 );
-                let pretty =
-                    git2::message_prettify(&message, None).map_err(|e| git_err("message", e))?;
-                let merge_oid = repo
-                    .commit(
-                        None,
-                        &sig,
-                        &sig,
-                        &pretty,
-                        &merged_tree,
-                        &[&local_commit, &remote_commit],
-                    )
-                    .map_err(|e| git_err("create merge commit", e))?;
+                let merge_oid = create_merge_commit(
+                    &repo,
+                    &person_owned,
+                    &message,
+                    &merged_tree,
+                    &[&local_commit, &remote_commit],
+                )?;
                 entry_for_thread.objects.import_from_repo(&repo).await?;
 
                 let branch_ref_name = format!("refs/heads/{branch_owned}");
@@ -1911,24 +6058,29 @@ async fn pull_branch_inner(
                 );
 
                 return Ok(PullOutcome::Merged {
-                    strategy: strategy.as_str().to_string(),
                     merge_commit: merge_oid.to_string(),
-                    conflicts_resolved,
+                    files_changed: changes.len(),
                 });
             }
 
-            let changes = diff_tree_changes(&repo, &local_tree, &remote_tree)?;
+            let changes = merge::diff_tree_changes(&repo, &local_tree, &remote_tree)?;
 
             // FR-NEW-069: the single authority on the basis of the pull quota charge.
-            // Reuses the delta `diff_tree_changes` already computed above rather than
+            // Reuses the delta `merge::diff_tree_changes` already computed above rather than
             // walking the tree a second time; a deleted path never adds bytes. This
-            // charge runs before `apply_pull_changes_atomically`'s first write, so an
+            // charge runs before the apply's first write, so an
             // insufficient quota refuses the pull without writing anything and
             // without advancing the ref below (DEC-036, unlike clone's whole-tree
             // charge at `clone_and_import`, `tools/git.rs:778-782`).
-            charge_pull_quota(&repo, &safety, &person_owned, &client, &changes)?;
-
-            apply_pull_changes_atomically(&client, &repo, &changes).await?;
+            merge::charge_and_apply(
+                "git.remote_pull",
+                &repo,
+                &safety,
+                &person_owned,
+                &client,
+                &changes,
+            )
+            .await?;
 
             let branch_ref_name = format!("refs/heads/{branch_owned}");
             entry_for_thread.db.set_ref(&branch_ref_name, &remote_oid.to_string(), false).await?;
@@ -1951,202 +6103,445 @@ async fn pull_branch_inner(
             "merged": false,
             "auth": auth,
         }),
-        PullOutcome::Merged { strategy, merge_commit, conflicts_resolved } => json!({
+        PullOutcome::Merged { merge_commit, files_changed } => json!({
+            "status": "merged",
             "merged": true,
-            "strategy": strategy,
             "merge_commit": merge_commit,
-            "conflicts_resolved": conflicts_resolved,
+            "files_changed": files_changed,
             "auth": auth,
         }),
+        // The shared conflict response, verbatim: no pull specific key is
+        // added to it, so one caller side handler covers every operation.
+        PullOutcome::Conflict(response) => response.to_value(),
     })
 }
 
-/// FR-NEW-069: the single authority on the basis of any pull's write-quota
-/// charge, fast-forward or merged. Sums only the size of the blobs actually
-/// written (`TreeChange::Write`); a deleted path never adds bytes.
-fn charge_pull_quota(
-    repo: &Repository,
-    safety: &SafetyManager,
-    person: &str,
-    client: &VolumeClient,
-    changes: &[TreeChange],
-) -> Result<()> {
-    let charge_bytes: i64 = changes
-        .iter()
-        .filter_map(|c| match c {
-            TreeChange::Write { oid, .. } => repo.find_blob(*oid).ok().map(|b| b.size() as i64),
-            TreeChange::Delete { .. } => None,
-        })
-        .sum();
-    safety.charge_write(person, &client.project_id, charge_bytes)
+// ── git.stash_save, git.stash_list, git.stash_drop ──────────────────────────
+
+/// DEC-913: a stash entry is a commit under this prefix in the existing
+/// `git_refs` table. The namespace is reachable through no branch or tag tool,
+/// because both filter on their own prefix, so a stash can never be checked
+/// out or deleted as if it were a branch.
+const STASH_REF_PREFIX: &str = "refs/stash/";
+
+/// Separates the caller's message from the entry's metadata inside the stash
+/// commit's message. `branch` and a millisecond timestamp have nowhere else to
+/// live: `git_refs` stores a name and a target, and a git signature only
+/// carries seconds. Reading splits on the LAST occurrence, so a caller whose
+/// own message contains this line still round-trips byte for byte.
+const STASH_TRAILER: &str = "\n\nmcp-fs-stash: ";
+
+/// The default message when the caller sends none, mirroring git's own
+/// "WIP on {branch}".
+fn default_stash_message(branch: &str) -> String {
+    format!("WIP on {branch}")
 }
 
-/// FR-NEW-029: the volume's files must match the current branch tip's tree
-/// exactly; a modified, added, or deleted uncommitted file all count, because
-/// this compares the whole tree, not a per-path listing. Reuses
+/// One `git.stash_list` entry: exactly `stash_id`, `message`, `base_sha`,
+/// `branch`, `created_at` (FR-NEW-131). A struct rather than a hand built
+/// object, so a renamed field is a compile error instead of a wire change.
+#[derive(Debug, Serialize)]
+struct StashEntry {
+    stash_id: String,
+    message: String,
+    base_sha: String,
+    branch: String,
+    created_at: i64,
+}
+
+/// The `git.stash_save` response: the listing entry plus `sha` and
+/// `files_stashed` (FR-NEW-120).
+#[derive(Debug, Serialize)]
+struct StashSaveResponse {
+    stash_id: String,
+    sha: String,
+    message: String,
+    base_sha: String,
+    branch: String,
+    created_at: i64,
+    files_stashed: usize,
+}
+
+/// Split a stash commit's message back into the caller's message and the
+/// metadata this server appended. A commit missing or carrying an unreadable
+/// trailer still lists, with the whole message and a zero timestamp, because a
+/// listing that hides an entry is worse than one that shows it degraded.
+fn split_stash_message(raw: &str) -> (String, Option<(String, i64)>) {
+    let Some(at) = raw.rfind(STASH_TRAILER) else { return (raw.to_string(), None) };
+    let meta: Value = match serde_json::from_str(raw[at + STASH_TRAILER.len()..].trim_end()) {
+        Ok(v) => v,
+        Err(_) => return (raw.to_string(), None),
+    };
+    let branch = meta.get("branch").and_then(Value::as_str).map(str::to_string);
+    let created_at = meta.get("created_at").and_then(Value::as_i64);
+    match (branch, created_at) {
+        (Some(b), Some(t)) => (raw[..at].to_string(), Some((b, t))),
+        _ => (raw.to_string(), None),
+    }
+}
+
+/// The stash refs of this volume, newest first: `created_at` descending, with
+/// the id as a deterministic tiebreak so two entries saved inside one
+/// millisecond still list in a stable order (FR-NEW-122, FR-NEW-131).
+///
+/// Cost: one ref listing plus one commit lookup per entry, both bounded by
+/// `git.max_stash_entries`, and one object store export.
+async fn stash_entries(entry: &GitRepoEntry, repo: &Repository) -> Result<Vec<StashEntry>> {
+    let mut out = Vec::new();
+    for r in entry.db.list_refs().await? {
+        if r.symbolic || !r.name.starts_with(STASH_REF_PREFIX) {
+            continue;
+        }
+        let commit =
+            repo.find_commit(parse_oid(&r.target)?).map_err(|e| git_err("find stash commit", e))?;
+        let (message, meta) = split_stash_message(commit.message().unwrap_or_default());
+        let (branch, created_at) = meta.unwrap_or_else(|| (String::new(), 0));
+        out.push(StashEntry {
+            stash_id: r.target.clone(),
+            message,
+            base_sha: commit.parent_id(0).map(|o| o.to_string()).unwrap_or_default(),
+            branch,
+            created_at,
+        });
+    }
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.stash_id.cmp(&a.stash_id)));
+    Ok(out)
+}
+
+/// FR-NEW-120: snapshot the volume as a commit under `refs/stash/{sha}`, then
+/// rewrite the volume back to HEAD's tree. FR-NEW-115: the whole sequence runs
+/// under the per-project write lock, so a concurrent save can never snapshot a
+/// half-reverted volume.
+///
+/// Cost: one full volume walk to build the snapshot tree (the same one
+/// `git.commit` pays, and the reason the pool is bounded), then a tree-to-tree
+/// delta, so the revert writes O(dirty paths) and never a full checkout.
+async fn stash_save(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    max_entries: usize,
+    message: Option<String>,
+) -> Result<Value> {
+    let _write = entry.write_lock.lock().await;
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+
+    // FR-NEW-130 first: the cap is one ref listing, where everything below is a
+    // full volume walk, and a refused save must leave the volume untouched.
+    let held = stash_ref_count(entry).await?;
+    if held >= max_entries {
+        return Err(ToolError::invalid_argument(format!(
+            "git.stash_save: '{}' already holds {held} stash entries, the git.max_stash_entries \
+             limit of {max_entries}; drop one with git.stash_drop before saving another",
+            client.project_id
+        )));
+    }
+
+    let Some(base_sha) = head_commit_sha(entry).await? else {
+        return Err(ToolError::not_found(
+            "git.stash_save: HEAD resolves to nothing because the repository has no commits \
+             yet; there is no state to revert the volume to, so create one with git.commit",
+        ));
+    };
+    let base =
+        repo.find_commit(parse_oid(&base_sha)?).map_err(|e| git_err("find head commit", e))?;
+    let head_tree = base.tree().map_err(|e| git_err("head tree", e))?;
+
+    let snapshot_id = build_tree_from_volume(&repo, client).await?;
+    if snapshot_id == head_tree.id() {
+        // FR-NEW-121: worded so it can never be mistaken for the dirty-volume
+        // refusal the switch, merge and pull tools share.
+        return Err(ToolError::invalid_argument(
+            "git.stash_save: nothing to stash, the volume has no uncommitted changes against HEAD",
+        ));
+    }
+    let snapshot = repo.find_tree(snapshot_id).map_err(|e| git_err("snapshot tree", e))?;
+
+    let branch = match entry.db.get_ref("HEAD").await? {
+        Some(h) if h.symbolic => {
+            h.target.strip_prefix("refs/heads/").unwrap_or(&h.target).to_string()
+        }
+        _ => String::new(),
+    };
+    let message = message.unwrap_or_else(|| default_stash_message(&branch));
+    let created_at = Utc::now().timestamp_millis();
+    let full_message =
+        format!("{message}{STASH_TRAILER}{}", json!({"branch": &branch, "created_at": created_at}));
+
+    let name = person.split('@').next().unwrap_or(person).to_string();
+    let sig = git2::Signature::new(&name, person, &git2::Time::new(created_at / 1000, 0))
+        .map_err(|e| git_err("signature", e))?;
+    let oid = repo
+        .commit(None, &sig, &sig, &full_message, &snapshot, &[&base])
+        .map_err(|e| git_err("create stash commit", e))?;
+    let stash_id = oid.to_string();
+    entry.objects.import_from_repo(&repo).await?;
+
+    // The ref lands before the revert, so a revert that fails on quota or on an
+    // unwritable path leaves the caller's work saved rather than lost; the ref
+    // is taken back on that path so the pair stays all-or-nothing.
+    entry.db.set_ref(&format!("{STASH_REF_PREFIX}{stash_id}"), &stash_id, false).await?;
+    let changes = merge::diff_tree_changes(&repo, &snapshot, &head_tree)?;
+    let files_stashed = changes.len();
+    if let Err(e) =
+        merge::charge_and_apply("git.stash_save", &repo, safety, person, client, &changes).await
+    {
+        entry.db.delete_ref(&format!("{STASH_REF_PREFIX}{stash_id}")).await?;
+        return Err(e);
+    }
+
+    safety.record_audit(
+        person,
+        &client.project_id,
+        "git.stash_save",
+        "/",
+        &format!("stashed as {stash_id}: {message}, files_stashed {files_stashed}"),
+    );
+    Ok(serde_json::to_value(StashSaveResponse {
+        stash_id: stash_id.clone(),
+        sha: stash_id,
+        message,
+        base_sha,
+        branch,
+        created_at,
+        files_stashed,
+    })
+    .unwrap_or(Value::Null))
+}
+
+/// How many stash entries this volume holds right now. A live count, never a
+/// monotonic counter, so a drop really re-opens a slot (FR-NEW-130).
+async fn stash_ref_count(entry: &GitRepoEntry) -> Result<usize> {
+    Ok(entry
+        .db
+        .list_refs()
+        .await?
+        .iter()
+        .filter(|r| !r.symbolic && r.name.starts_with(STASH_REF_PREFIX))
+        .count())
+}
+
+/// FR-NEW-122: every entry of the volume, newest first. Read only, so it takes
+/// no write lock and stays available while an operation is in progress.
+async fn stash_list(mount_id: &str, entry: &GitRepoEntry) -> Result<Value> {
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+    let stashes = stash_entries(entry, &repo).await?;
+    Ok(json!({
+        "mount_id": mount_id,
+        "stashes": serde_json::to_value(&stashes).unwrap_or(Value::Null),
+        "count": stashes.len(),
+    }))
+}
+
+/// FR-NEW-127: remove the ref, and nothing else. The commit object is left in
+/// the store, exactly like `git.branch_delete` leaves its commits, so a
+/// mistaken drop is still recoverable by whoever kept the id.
+async fn stash_drop(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    stash_id: &str,
+) -> Result<Value> {
+    // FR-NEW-128: a malformed id is a caller mistake, not a missing entry, and
+    // the two are different codes.
+    if stash_id.len() != 40 || !stash_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ToolError::invalid_argument(format!(
+            "git.stash_drop: '{stash_id}' is not a stash id: a stash id is 40 hexadecimal \
+             characters, as returned by git.stash_save and git.stash_list"
+        )));
+    }
+    let name = format!("{STASH_REF_PREFIX}{stash_id}");
+
+    let _write = entry.write_lock.lock().await;
+    if entry.db.get_ref(&name).await?.is_none() {
+        return Err(ToolError::not_found(format!(
+            "git.stash_drop: no stash entry '{stash_id}' on this volume"
+        )));
+    }
+    entry.db.delete_ref(&name).await?;
+
+    safety.record_audit(
+        person,
+        &client.project_id,
+        "git.stash_drop",
+        "/",
+        &format!("dropped stash {stash_id}"),
+    );
+    Ok(json!({"stash_id": stash_id, "dropped": true}))
+}
+
+/// FR-NEW-124, FR-NEW-125, FR-NEW-126: replay one stash entry onto whatever is
+/// checked out now, and, for a pop, delete the entry only once the whole
+/// application has succeeded.
+///
+/// The order is the point of this story: charge, apply, and only then drop. A
+/// conflict, a quota refusal or an unwritable path all return before the
+/// delete, so the caller's only copy of that work is still listed afterwards.
+///
+/// The application is the shared three way merge of HEAD against the stash
+/// commit, whose parent is `base_sha`: libgit2 therefore takes `base_sha` as
+/// the merge base and replays exactly the stashed diff, which is why the entry
+/// applies onto a branch that did not exist when it was taken (FR-NEW-129).
+///
+/// Cost: one libgit2 merge, O(paths changed on either side), then a tree to
+/// tree delta whose writes are O(changed paths). Nothing walks the volume and
+/// no file content is cloned.
+async fn stash_apply(
+    entry: &GitRepoEntry,
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    stash_id: &str,
+    pop: bool,
+) -> Result<Value> {
+    let tool = if pop { "git.stash_pop" } else { "git.stash_apply" };
+    // FR-NEW-128: a malformed id is a caller mistake, not a missing entry.
+    if stash_id.len() != 40 || !stash_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: '{stash_id}' is not a stash id: a stash id is 40 hexadecimal characters, as \
+             returned by git.stash_save and git.stash_list"
+        )));
+    }
+    let ref_name = format!("{STASH_REF_PREFIX}{stash_id}");
+
+    let _write = entry.write_lock.lock().await;
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+
+    if entry.db.get_ref(&ref_name).await?.is_none() {
+        return Err(ToolError::not_found(format!(
+            "{tool}: no stash entry '{stash_id}' on this volume"
+        )));
+    }
+    let Some(tip_sha) = head_commit_sha(entry).await? else {
+        return Err(ToolError::invalid_argument(format!(
+            "{tool}: HEAD resolves to nothing because the repository has no commits yet; there is \
+             no state to apply the entry onto"
+        )));
+    };
+    let tip = repo
+        .find_commit(parse_oid(&tip_sha)?)
+        .map_err(|_| ToolError::not_found(format!("commit '{tip_sha}' not found")))?;
+    let stash = repo.find_commit(parse_oid(stash_id)?).map_err(|_| {
+        ToolError::not_found(format!("{tool}: stash commit '{stash_id}' not found"))
+    })?;
+
+    match merge::three_way_merge(&repo, &tip, &stash, None)? {
+        merge::MergeOutcome::Conflicted { conflicts } => {
+            // FR-NEW-126: the volume is untouched and the entry retained,
+            // whichever of the two tools was called; the row remembers which,
+            // because a resumed pop drops the entry and a resumed apply keeps
+            // it (DEC-901, the pause survives a restart).
+            let op = if pop {
+                crate::git::db::GitOpType::StashPop
+            } else {
+                crate::git::db::GitOpType::StashApply
+            };
+            let now = Utc::now().to_rfc3339();
+            let paths: Vec<String> = conflicts.iter().map(|c| c.path.clone()).collect();
+            let row = crate::git::db::GitOperationRow {
+                op_type: op,
+                state: "conflicted".to_string(),
+                source_ref: Some(stash_id.to_string()),
+                onto_sha: Some(stash_id.to_string()),
+                original_tip_sha: Some(tip_sha.clone()),
+                todo: None,
+                current_step: 0,
+                total_steps: 0,
+                conflicts: Some(encode_op_json(&paths)?),
+                resolutions: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            entry.db.set_operation(&row).await?;
+
+            safety.record_audit(
+                person,
+                &client.project_id,
+                tool,
+                "/",
+                &format!("outcome conflict, stash {stash_id}, conflicts {}", paths.len()),
+            );
+            // The shared conflict response verbatim, carrying the three stash
+            // keys of FR-NEW-132 alongside it: one caller side handler still
+            // covers every operation, and `dropped` is false because the entry
+            // is retained until a resolution succeeds.
+            let mut value = merge::ConflictResponse::new(
+                op,
+                operation_id(&entry.project_id, op, &now),
+                Some(stash_id.to_string()),
+                None,
+                conflicts,
+            )
+            .to_value();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("stash_id".to_string(), json!(stash_id));
+                obj.insert("files_changed".to_string(), json!(0));
+                obj.insert("dropped".to_string(), json!(false));
+            }
+            Ok(value)
+        }
+        merge::MergeOutcome::Clean { tree } => {
+            let applied = repo.find_tree(tree).map_err(|e| git_err("find merged tree", e))?;
+            let tip_tree = tip.tree().map_err(|e| git_err("commit tree", e))?;
+            let changes = merge::diff_tree_changes(&repo, &tip_tree, &applied)?;
+            // An apply never commits and never moves a ref: it only restores
+            // the files, leaving the result as uncommitted work.
+            merge::charge_and_apply(tool, &repo, safety, person, client, &changes).await?;
+
+            // Only here, with every byte landed, may a pop delete the entry.
+            if pop {
+                entry.db.delete_ref(&ref_name).await?;
+            }
+            let files_changed = changes.len();
+            safety.record_audit(
+                person,
+                &client.project_id,
+                tool,
+                "/",
+                &format!("applied stash {stash_id}, files_changed {files_changed}, dropped {pop}"),
+            );
+            Ok(json!({
+                "stash_id": stash_id,
+                "status": "applied",
+                "files_changed": files_changed,
+                "dropped": pop,
+            }))
+        }
+    }
+}
+
+/// FR-NEW-029: whether the volume's files match `tip_sha`'s tree exactly; a
+/// modified, added, or deleted uncommitted file all count, because this
+/// compares the whole tree, not a per-path listing. Reuses
 /// [`build_tree_from_volume`], the same snapshot `git.commit` builds, rather
-/// than a second tree-diff implementation: comparing its resulting oid
-/// against the tip commit's tree oid IS the full volume tree walk the open
-/// §15.2 question describes, done once, not twice.
+/// than a second tree-diff implementation.
+///
+/// Returns the answer instead of an error because the two callers word their
+/// refusal differently: a pull names discarding, a merge names `git.commit`
+/// and `git.stash_save` (FR-NEW-194).
+async fn volume_is_clean(repo: &Repository, client: &VolumeClient, tip_sha: &str) -> Result<bool> {
+    let tip = repo
+        .find_commit(parse_oid(tip_sha)?)
+        .map_err(|_| ToolError::not_found(format!("commit '{tip_sha}' not found")))?;
+    let tip_tree_id = tip.tree().map_err(|e| git_err("commit tree", e))?.id();
+    Ok(build_tree_from_volume(repo, client).await? == tip_tree_id)
+}
+
 async fn require_clean_volume(
     repo: &Repository,
     client: &VolumeClient,
     local_sha: &str,
 ) -> Result<()> {
-    let tip = repo
-        .find_commit(parse_oid(local_sha)?)
-        .map_err(|_| ToolError::not_found(format!("commit '{local_sha}' not found")))?;
-    let tip_tree_id = tip.tree().map_err(|e| git_err("commit tree", e))?.id();
-    let volume_tree_id = build_tree_from_volume(repo, client).await?;
-    if volume_tree_id != tip_tree_id {
+    if !volume_is_clean(repo, client, local_sha).await? {
         return Err(ToolError::invalid_argument(
-            "pull refused: volume has uncommitted changes: commit or discard them before \
-             pulling",
+            "pull refused: volume has uncommitted changes: commit them with git.commit, set \
+             them aside with git.stash_save, or discard them before pulling",
         ));
-    }
-    Ok(())
-}
-
-/// One path a fast-forward's tree diff touches: written with new content, or
-/// removed. Renames are never reported here: `diff_tree_to_tree` without
-/// `find_similar` reports a rename as a delete plus an add, which is exactly
-/// how they end up represented as two separate [`TreeChange`] values.
-enum TreeChange {
-    Write { path: String, oid: Oid },
-    Delete { path: String },
-}
-
-/// The paths a fast-forward from `old_tree` to `new_tree` touches, without
-/// rename detection (`diff_tree_to_tree`'s default: a replaced file surfaces
-/// as a delete of the old path plus an add of the new one, which is exactly
-/// the shape [`apply_pull_changes_atomically`] needs).
-fn diff_tree_changes(
-    repo: &Repository,
-    old_tree: &Tree<'_>,
-    new_tree: &Tree<'_>,
-) -> Result<Vec<TreeChange>> {
-    let diff = repo
-        .diff_tree_to_tree(Some(old_tree), Some(new_tree), None)
-        .map_err(|e| git_err("diff", e))?;
-    let mut changes = Vec::new();
-    for delta in diff.deltas() {
-        match delta.status() {
-            git2::Delta::Deleted => {
-                if let Some(p) = delta.old_file().path() {
-                    changes.push(TreeChange::Delete { path: format!("/{}", p.to_string_lossy()) });
-                }
-            }
-            git2::Delta::Added | git2::Delta::Modified | git2::Delta::Typechange => {
-                if let Some(p) = delta.new_file().path() {
-                    changes.push(TreeChange::Write {
-                        path: format!("/{}", p.to_string_lossy()),
-                        oid: delta.new_file().id(),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(changes)
-}
-
-/// The set of paths one side touched, written or deleted, between two trees.
-/// Used only to find where local and remote changes collide (FR-NEW-031's
-/// `conflicts_resolved`): a path present in both sides' sets had a real
-/// conflicting change; a path only one side touched did not.
-fn changed_paths(
-    repo: &Repository,
-    old_tree: &Tree<'_>,
-    new_tree: &Tree<'_>,
-) -> Result<std::collections::HashSet<String>> {
-    Ok(diff_tree_changes(repo, old_tree, new_tree)?
-        .into_iter()
-        .map(|c| match c {
-            TreeChange::Write { path, .. } | TreeChange::Delete { path } => path,
-        })
-        .collect())
-}
-
-/// Apply every change to the volume, or none of them (FR-NEW-035, DEC-023).
-/// Deliberately unlike [`clone_and_import`]'s per-file tolerance
-/// (`tools/git.rs:785-791`, the anti-pattern this story exists to avoid): a
-/// half-applied clone is recoverable by re-cloning into a fresh volume, but a
-/// branch ref advanced over a partially written tree would leave the volume
-/// silently inconsistent with its own `HEAD`. Every write target is checked
-/// for writability before any byte moves (pass 1), so a failure is caught
-/// pre-commit; only once every check passes does anything actually mutate
-/// (pass 2), and only after that does the caller advance the ref.
-async fn apply_pull_changes_atomically(
-    client: &VolumeClient,
-    repo: &Repository,
-    changes: &[TreeChange],
-) -> Result<()> {
-    let delete_paths: std::collections::HashSet<&str> = changes
-        .iter()
-        .filter_map(|c| match c {
-            TreeChange::Delete { path } => Some(path.as_str()),
-            TreeChange::Write { .. } => None,
-        })
-        .collect();
-
-    // Pass 1: every write target must be provably writable before the first
-    // byte moves.
-    for change in changes {
-        if let TreeChange::Write { path, .. } = change {
-            check_path_writable(client, path, &delete_paths).await?;
-        }
-    }
-
-    // Pass 2: apply. Deletes first, so a path changing from a file to a
-    // directory of the same name (or the reverse, where the pre-check above
-    // already refused it) lands in the right final state.
-    for change in changes {
-        if let TreeChange::Delete { path } = change {
-            client.delete_file(path).await?;
-        }
-    }
-    for change in changes {
-        if let TreeChange::Write { path, oid } = change {
-            let blob = repo.find_blob(*oid).map_err(|e| git_err("read blob", e))?;
-            if let Some(parent) = crate::util::PosixPath::parent_of(path)
-                && parent != "/"
-            {
-                client.makedirs(&parent, true).await?;
-            }
-            client.write_bytes_atomic(path, blob.content()).await?;
-        }
-    }
-    Ok(())
-}
-
-/// `path` itself must not already be a directory (a directory-to-file
-/// typechange is not supported by this apply: it would need a whole-subtree
-/// delete, which this story's atomic apply deliberately does not attempt),
-/// and every ancestor directory of `path` must be absent, already a
-/// directory, or itself scheduled for deletion in this same pull (a
-/// file-to-directory typechange, which the delete side of the diff already
-/// clears out of the way).
-async fn check_path_writable(
-    client: &VolumeClient,
-    path: &str,
-    delete_paths: &std::collections::HashSet<&str>,
-) -> Result<()> {
-    if client.is_dir(path).await? {
-        return Err(ToolError::invalid_argument(format!(
-            "git.remote_pull cannot write '{path}': it already exists as a directory in the \
-             volume"
-        )));
-    }
-    let Some(parent) = crate::util::PosixPath::parent_of(path) else { return Ok(()) };
-    let mut probe = String::new();
-    for seg in parent.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
-        probe.push('/');
-        probe.push_str(seg);
-        if !delete_paths.contains(probe.as_str()) && client.is_file(&probe).await? {
-            return Err(ToolError::invalid_argument(format!(
-                "git.remote_pull cannot write '{path}': '{probe}' already exists as a file"
-            )));
-        }
     }
     Ok(())
 }
@@ -2476,10 +6871,15 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 14] = [
+    const ALL_GIT_TOOLS: [&str; 39] = [
         "git.init",
         "git.status",
         "git.branches",
+        "git.branch_create",
+        "git.branch_switch",
+        "git.branch_delete",
+        "git.branch_reset",
+        "git.reset",
         "git.tags",
         "git.log",
         "git.show",
@@ -2487,6 +6887,26 @@ mod tests {
         "git.commit",
         "git.checkout_file",
         "git.blame",
+        "git.merge",
+        "git.merge_resolve",
+        "git.merge_abort",
+        "git.rebase",
+        "git.rebase_continue",
+        "git.rebase_abort",
+        "git.cherry_pick",
+        "git.cherry_pick_continue",
+        "git.cherry_pick_abort",
+        "git.revert",
+        "git.revert_continue",
+        "git.revert_abort",
+        "git.stash_save",
+        "git.stash_list",
+        "git.stash_drop",
+        "git.stash_apply",
+        "git.stash_pop",
+        "git.remote_add",
+        "git.remote_remove",
+        "git.remote_list",
         "git.remote_clone",
         "git.remote_push",
         "git.remote_fetch",
@@ -2497,7 +6917,7 @@ mod tests {
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 14);
+        assert_eq!(r.len(), 39);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -2546,13 +6966,34 @@ mod tests {
     }
 
     #[test]
+    fn git_merge_schema_matches_the_contract() {
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+        let s = &r.resolve("git.merge").unwrap().schema;
+        assert!(s.description.starts_with(
+            "Merge a branch, tag or commit into the checked-out branch. An already merged "
+        ));
+        let expected: Value = serde_json::from_str(
+            r#"{"type":"object","properties":{
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
+                 "source_ref":{"description":"Branch, tag or commit to merge into the checked-out branch.","type":"string"},
+                 "squash":{"description":"Record the merged tree as a single commit with one parent instead of a merge commit, and never fast-forward.","type":"boolean","default":false},
+                 "message":{"description":"Commit message for the merge commit; defaults to 'Merge {source_ref} into {current_branch}'.","type":"string","default":null}},
+               "required":["mount_id","source_ref"]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.input_schema(), expected);
+    }
+
+    #[test]
     fn git_remote_fetch_schema_matches_the_contract() {
         let mut r = ToolRegistry::new();
         register(&mut r);
         let s = &r.resolve("git.remote_fetch").unwrap().schema;
         let expected: Value = serde_json::from_str(
             r#"{"type":"object","properties":{
-                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"}},
+                 "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
+                 "remote":{"description":"Name of the declared remote to fetch from; defaults to origin.","type":"string","default":"origin"}},
                "required":["mount_id"]}"#,
         )
         .unwrap();
@@ -2572,14 +7013,19 @@ mod tests {
         let push = &r.resolve("git.remote_push").unwrap().schema;
         assert_eq!(
             push.description,
-            "Push a local branch to origin under the same name. Creates the branch on the \
-             remote when it is absent there. Fails if the push is not a fast-forward; force \
-             is not supported."
+            "Push a local branch to a declared remote, under the same name unless \
+             remote_branch names another one. Creates the branch on the remote when it is \
+             absent there. Fails if the push is not a fast-forward, unless force is true, \
+             which requires expected_remote_sha to state the remote sha being overwritten."
         );
         let expected_push: Value = serde_json::from_str(
             r#"{"type":"object","properties":{
                  "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
-                 "branch":{"description":"Local branch to push to origin under the same name.","type":"string"}},
+                 "branch":{"description":"Local branch to push.","type":"string"},
+                 "remote":{"description":"Name of the declared remote to push to; defaults to origin.","type":"string","default":"origin"},
+                 "remote_branch":{"description":"Branch name to push under on the remote; defaults to the local branch's name.","type":"string","default":null},
+                 "force":{"description":"Overwrite the remote branch even when the push is not a fast-forward, discarding the commits it holds. Requires expected_remote_sha.","type":"boolean","default":false},
+                 "expected_remote_sha":{"description":"The 40 character sha the remote branch is expected to be at right now, or 40 zeros when the branch must not exist there yet. Mandatory with force, refused without it: the push is rejected when the remote has moved since.","type":"string","default":null}},
                "required":["mount_id","branch"]}"#,
         )
         .unwrap();
@@ -2592,25 +7038,26 @@ mod tests {
         let pull = &r.resolve("git.remote_pull").unwrap().schema;
         assert_eq!(
             pull.description,
-            "Fetch from origin, then advance the checked-out branch to the remote tip and update \
-             the volume's files to match. A fast-forward applies directly. A diverged history \
-             is refused unless on_conflict is 'ours' or 'theirs', in which case a three-way \
-             merge resolves every conflicting file by that strategy and creates a merge \
-             commit. Refuses a dirty volume (commit or discard first) and refuses any branch \
-             other than the one currently checked out."
+            "Fetch from a declared remote, then advance the checked-out branch to the remote \
+             tip and update the volume's files to match. A fast-forward applies directly. A diverged history is \
+             merged: a clean three-way merge creates a merge commit and updates the volume, a \
+             conflicting one applies nothing and returns status conflict with both sides' \
+             content of every conflicting file, to be finished with git.merge_resolve or \
+             abandoned with git.merge_abort. Refuses a dirty volume (commit or discard first) \
+             and refuses any branch other than the one currently checked out."
         );
         let expected_pull: Value = serde_json::from_str(
             r#"{"type":"object","properties":{
                  "mount_id":{"description":"Project/volume id the operation targets.","type":"string"},
                  "branch":{"description":"Branch to pull; must be the branch currently checked out.","type":"string"},
-                 "on_conflict":{"description":"For a diverged (non fast-forward) history: 'ours' or 'theirs' to resolve every conflicting file by that strategy and create a merge commit; omit to refuse the pull instead. Ignored whenever the pull is a fast-forward.","type":"string","default":null}},
+                 "remote":{"description":"Name of the declared remote to pull from; defaults to origin.","type":"string","default":"origin"}},
                "required":["mount_id","branch"]}"#,
         )
         .unwrap();
         assert_eq!(
             pull.input_schema(),
             expected_pull,
-            "branch must stay required, on_conflict optional and nullable"
+            "branch must stay required, and on_conflict is gone (FR-DEL-101)"
         );
     }
 
@@ -2681,30 +7128,146 @@ mod tests {
 
     // ── authorization ───────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn a_platform_admin_who_is_not_a_member_is_forbidden_on_every_git_tool() {
-        let e = Env::new().await;
-        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
-
-        // The separation of duties that matters: administering the platform does
-        // not grant access to a project's source history.
-        for (name, args) in [
-            ("git.init", json!({"mount_id": MOUNT})),
-            ("git.status", json!({"mount_id": MOUNT})),
-            ("git.branches", json!({"mount_id": MOUNT})),
-            ("git.tags", json!({"mount_id": MOUNT})),
-            ("git.log", json!({"mount_id": MOUNT})),
+    /// Every git tool that carries a `mount_id`, with a structurally valid,
+    /// minimal argument set. The values never need to name anything that exists:
+    /// authorization runs before any lookup, which is what the tests below
+    /// assert. A tool absent from this list is an unguarded tool, so
+    /// `the_blanket_authorization_list_covers_every_mount_scoped_git_tool`
+    /// compares it to the live registry in both directions.
+    ///
+    /// The four `git.auth*` tools are deliberately absent: they take no
+    /// `mount_id` and are scoped to the caller, not to a project, so there is no
+    /// membership to check on them.
+    fn mount_scoped_git_tools() -> Vec<(&'static str, Value)> {
+        let m = json!({"mount_id": MOUNT});
+        vec![
+            ("git.init", m.clone()),
+            ("git.status", m.clone()),
+            ("git.branches", m.clone()),
+            ("git.branch_create", json!({"mount_id": MOUNT, "name": "feature/evil"})),
+            ("git.branch_switch", json!({"mount_id": MOUNT, "name": "feature/evil"})),
+            ("git.branch_delete", json!({"mount_id": MOUNT, "name": "feature/evil"})),
+            (
+                "git.branch_reset",
+                json!({"mount_id": MOUNT, "name": "main", "target_commit": "abc"}),
+            ),
+            ("git.reset", json!({"mount_id": MOUNT, "target_ref": "abc", "mode": "hard"})),
+            ("git.tags", m.clone()),
+            ("git.log", m.clone()),
             ("git.show", json!({"mount_id": MOUNT, "commit_sha": "abc"})),
             ("git.diff", json!({"mount_id": MOUNT, "from_ref": "main"})),
             ("git.commit", json!({"mount_id": MOUNT, "message": "x"})),
             ("git.checkout_file", json!({"mount_id": MOUNT, "commit_sha": "abc", "path": "/a"})),
             ("git.blame", json!({"mount_id": MOUNT, "path": "/a"})),
+            ("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature"})),
+            ("git.merge_resolve", json!({"mount_id": MOUNT, "resolutions": []})),
+            ("git.merge_abort", m.clone()),
+            ("git.rebase", json!({"mount_id": MOUNT, "onto": "main", "todo": []})),
+            ("git.rebase_continue", m.clone()),
+            ("git.rebase_abort", m.clone()),
+            ("git.cherry_pick", json!({"mount_id": MOUNT, "commit_sha": "abc"})),
+            ("git.cherry_pick_continue", m.clone()),
+            ("git.cherry_pick_abort", m.clone()),
+            ("git.revert", json!({"mount_id": MOUNT, "commit_sha": "abc"})),
+            ("git.revert_continue", m.clone()),
+            ("git.revert_abort", m.clone()),
+            ("git.stash_save", json!({"mount_id": MOUNT, "message": "x"})),
+            ("git.stash_list", m.clone()),
+            ("git.stash_drop", json!({"mount_id": MOUNT, "stash_id": "abc"})),
+            ("git.stash_apply", json!({"mount_id": MOUNT, "stash_id": "abc"})),
+            ("git.stash_pop", json!({"mount_id": MOUNT, "stash_id": "abc"})),
+            (
+                "git.remote_add",
+                json!({"mount_id": MOUNT, "name": "evil", "url": "https://evil.test/x.git"}),
+            ),
+            ("git.remote_remove", json!({"mount_id": MOUNT, "name": "origin"})),
+            ("git.remote_list", m.clone()),
             ("git.remote_clone", json!({"mount_id": MOUNT, "url": "https://example.test/r.git"})),
-        ] {
+            ("git.remote_push", json!({"mount_id": MOUNT, "branch": "main"})),
+            ("git.remote_fetch", m.clone()),
+            ("git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"})),
+            (
+                "git.pr_create",
+                json!({"mount_id": MOUNT, "base": "main", "head": "f", "title": "t"}),
+            ),
+            ("git.pr_list", m.clone()),
+            ("git.pr_get", json!({"mount_id": MOUNT, "pr_number": 1})),
+            ("git.pr_diff", json!({"mount_id": MOUNT, "pr_number": 1})),
+            ("git.pr_merge", json!({"mount_id": MOUNT, "pr_number": 1, "strategy": "merge"})),
+            ("git.pr_review", json!({"mount_id": MOUNT, "pr_number": 1, "verdict": "approve"})),
+        ]
+    }
+
+    /// An env whose registry also carries the pull request family, which
+    /// registers from its own entry point.
+    async fn env_with_every_git_tool() -> Env {
+        let mut e = Env::new().await;
+        super::super::git_pr::register_with(
+            &mut e.reg,
+            Some(e.git.clone()),
+            Some(e.tokens.clone()),
+            None,
+        );
+        e
+    }
+
+    /// FR-NEW-347: the blanket list is the whole mount scoped surface, in both
+    /// directions. A tool registered and not listed here would never be checked
+    /// by the two tests below, which is how an unguarded tool ships.
+    #[test]
+    fn the_blanket_authorization_list_covers_every_mount_scoped_git_tool() {
+        let mut reg = ToolRegistry::new();
+        register(&mut reg);
+        super::super::git_auth::register(&mut reg);
+        super::super::git_pr::register(&mut reg);
+
+        let registered: std::collections::BTreeSet<&str> = reg
+            .names()
+            .iter()
+            .copied()
+            .filter(|n| {
+                let schema = reg.resolve(n).expect("a listed name resolves").schema.input_schema();
+                schema["required"].as_array().is_some_and(|r| r.iter().any(|v| v == "mount_id"))
+            })
+            .collect();
+        let listed: std::collections::BTreeSet<&str> =
+            mount_scoped_git_tools().iter().map(|(n, _)| *n).collect();
+
+        assert_eq!(listed, registered, "the blanket authorization list drifted from the registry");
+        assert_eq!(listed.len(), 45, "39 git.* plus the 6 git.pr_* tools take a mount_id");
+    }
+
+    /// E2E-MOD-406: the separation of duties that matters, over the whole
+    /// surface. Administering the platform does not grant access to a project's
+    /// source history.
+    #[tokio::test]
+    async fn a_platform_admin_who_is_not_a_member_is_forbidden_on_every_git_tool() {
+        let e = env_with_every_git_tool().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+
+        for (name, args) in mount_scoped_git_tools() {
             let err = e.as_person(ADMIN, name, args).await.unwrap_err();
             assert_eq!(err.code, code::FORBIDDEN, "{name} must refuse a non member admin");
             assert!(err.message.contains("is not a member of"), "{name}: {}", err.message);
         }
+        assert_eq!(e.ops().await, 0, "no operation row was written for the refused calls");
+        assert!(e.f.state.safety.audit(ADMIN, MOUNT).is_empty(), "a refused call audits nothing");
+    }
+
+    /// FR-NEW-347: the same surface, for a plain non member.
+    #[tokio::test]
+    async fn a_non_member_is_forbidden_on_every_git_tool() {
+        let e = env_with_every_git_tool().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let stranger = "stranger@test.com";
+
+        for (name, args) in mount_scoped_git_tools() {
+            let err = e.as_person(stranger, name, args).await.unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN, "{name} must refuse a non member");
+            assert!(err.message.contains(stranger), "{name}: {}", err.message);
+        }
+        assert_eq!(e.ops().await, 0, "no operation row was written for the refused calls");
+        assert!(e.f.state.safety.audit(stranger, MOUNT).is_empty());
     }
 
     #[tokio::test]
@@ -2811,9 +7374,19 @@ mod tests {
 
         // branches list it too
         let b = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        // FR-MOD-106 widened this shape: the current marker plus the tracking
+        // divergence, null here because there is no `refs/remotes/origin/main`.
         assert_eq!(
             b["branches"],
-            json!([{"name": "main", "full_ref": "refs/heads/main", "sha": sha}])
+            json!([{
+                "name": "main",
+                "full_ref": "refs/heads/main",
+                "sha": sha,
+                "current": true,
+                "upstream": null,
+                "ahead": null,
+                "behind": null,
+            }])
         );
 
         // log walks it
@@ -4329,15 +8902,32 @@ mod tests {
         branch: &str,
         auth: &str,
     ) -> Result<Value> {
+        call_push_branch_to(e, "origin", origin_url, branch, None, auth).await
+    }
+
+    /// [`call_push_branch`] with the remote named, and optionally a different
+    /// branch name on the remote side (US-021).
+    async fn call_push_branch_to(
+        e: &Env,
+        remote: &str,
+        origin_url: &str,
+        branch: &str,
+        remote_branch: Option<&str>,
+        auth: &str,
+    ) -> Result<Value> {
         push_branch(
             e.git.clone(),
             MOUNT,
+            remote,
             branch,
+            remote_branch,
             origin_url,
             None,
             auth.to_string(),
             OWNER,
             e.f.state.safety.clone(),
+            false,
+            None,
         )
         .await
     }
@@ -4408,7 +8998,7 @@ mod tests {
     }
 
     /// E2E-NEW-074 / E2E-NEW-209 / E2E-NEW-210: a push that sends a real update
-    /// carries all five response keys correctly valued; pushed again with no
+    /// carries every unconditional response key correctly valued; pushed again with no
     /// intervening commit, it succeeds idempotently, reporting `up_to_date`.
     #[tokio::test]
     async fn e2e_new_074_209_210_response_shape_and_idempotency() {
@@ -4423,8 +9013,8 @@ mod tests {
         assert_eq!(
             updated,
             json!({
-                "branch": "main", "created": false, "up_to_date": false,
-                "remote_sha": sha, "auth": "anonymous",
+                "branch": "main", "remote": "origin", "created": false, "up_to_date": false,
+                "remote_sha": sha, "auth": "anonymous", "forced": false,
             })
         );
 
@@ -4432,8 +9022,8 @@ mod tests {
         assert_eq!(
             repeated,
             json!({
-                "branch": "main", "created": false, "up_to_date": true,
-                "remote_sha": sha, "auth": "anonymous",
+                "branch": "main", "remote": "origin", "created": false, "up_to_date": true,
+                "remote_sha": sha, "auth": "anonymous", "forced": false,
             })
         );
     }
@@ -4566,22 +9156,30 @@ mod tests {
             push_branch(
                 e.git.clone(),
                 MOUNT,
+                "origin",
                 "main",
+                None,
                 &url,
                 None,
                 "anonymous".to_string(),
                 OWNER,
                 e.f.state.safety.clone(),
+                false,
+                None,
             ),
             push_branch(
                 e.git.clone(),
                 MOUNT,
+                "origin",
                 "main",
+                None,
                 &url,
                 None,
                 "anonymous".to_string(),
                 OWNER,
                 e.f.state.safety.clone(),
+                false,
+                None,
             ),
         );
         let r1 = r1.unwrap();
@@ -4610,6 +9208,590 @@ mod tests {
 
         let err = call_push_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT, "the same identity as a non-racing rejection");
+    }
+
+    // ── FR-NEW-155..160 (US-022): force push behind a mandatory lease ───────
+
+    /// A forced (or plain) push driven at the internal-function level, the
+    /// only way a `file://` origin reaches the real push mechanics: the
+    /// registered tool rejects that scheme first. No audit entry is written by
+    /// this path, `push_branch` is the audited wrapper.
+    async fn call_push_leased(
+        e: &Env,
+        url: &str,
+        branch: &str,
+        remote_branch: Option<&str>,
+        force: bool,
+        lease: Option<&str>,
+    ) -> Result<Value> {
+        push_branch_inner(
+            e.git.clone(),
+            MOUNT,
+            "origin",
+            branch,
+            remote_branch,
+            url,
+            None,
+            "anonymous".to_string(),
+            force,
+            lease.map(str::to_string),
+        )
+        .await
+    }
+
+    /// [`call_push_leased`] through the audited wrapper, for the tests that
+    /// assert on the audit trail.
+    async fn call_push_leased_audited(
+        e: &Env,
+        url: &str,
+        branch: &str,
+        remote_branch: Option<&str>,
+        force: bool,
+        lease: Option<&str>,
+    ) -> Result<Value> {
+        push_branch(
+            e.git.clone(),
+            MOUNT,
+            "origin",
+            branch,
+            remote_branch,
+            url,
+            None,
+            "anonymous".to_string(),
+            OWNER,
+            e.f.state.safety.clone(),
+            force,
+            lease.map(str::to_string),
+        )
+        .await
+    }
+
+    /// Every `git.remote_push` audit entry recorded for OWNER on MOUNT.
+    fn push_audit(e: &Env) -> Vec<crate::safety::AuditEntry> {
+        e.f.state
+            .safety
+            .audit(OWNER, MOUNT)
+            .into_iter()
+            .filter(|a| a.op == "git.remote_push")
+            .collect()
+    }
+
+    /// [`seed_r`] with the directory built from `name`, returning it too:
+    /// every test below needs the bare repository's path to read refs and
+    /// blobs straight off disk.
+    async fn seed_r_at(e: &Env, name: &str) -> (std::path::PathBuf, String, String) {
+        let remote_dir = e.f.dir.path().join(name);
+        let (url, _sha_r1, local_tip) = seed_r(e, &remote_dir).await;
+        (remote_dir, url, local_tip)
+    }
+
+    /// E2E-NEW-489: `force:true` with no lease is refused outright, before the
+    /// origin URL is ever validated, so no network work can have happened.
+    #[tokio::test]
+    async fn e2e_new_489_force_without_expected_remote_sha_is_refused_outright() {
+        let e = Env::new().await;
+        let (remote_dir, _url, _tip) = seed_r_at(&e, "remote-489").await;
+
+        let err = e
+            .call("git.remote_push", json!({"mount_id": MOUNT, "branch": "main", "force": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(
+            err.message.contains("expected_remote_sha is required when force is true"),
+            "got {}",
+            err.message
+        );
+        // The stored origin is a `file://` url, which URL validation rejects
+        // with this exact wording: seeing the lease error instead proves the
+        // lease check ran ahead of it, hence ahead of any network attempt.
+        assert!(!err.message.contains("only https is accepted"), "got {}", err.message);
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none());
+        assert!(push_audit(&e).is_empty(), "a rejected argument is not a remote operation");
+        assert!(bare_ref_sha(&remote_dir, "refs/heads/main").is_some());
+    }
+
+    /// E2E-NEW-490: a lease matching the remote's actual tip permits a
+    /// non-fast-forward push, and the remote ends up at the local tip.
+    #[tokio::test]
+    async fn e2e_new_490_a_matching_lease_permits_a_non_fast_forward_push() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-490").await;
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "remote-only\n");
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main").as_deref(), Some(sha_r2.as_str()));
+
+        let out = call_push_leased(&e, &url, "main", None, true, Some(&sha_r2)).await.unwrap();
+        assert_eq!(out["branch"], "main");
+        assert_eq!(out["created"], false);
+        assert_eq!(out["up_to_date"], false);
+        assert_eq!(out["forced"], true);
+        assert_eq!(out["remote_sha"], local_tip.clone());
+        assert_eq!(out["overwritten_sha"], sha_r2);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(local_tip));
+    }
+
+    /// E2E-NEW-491: the audit entry of a successful forced push records the
+    /// sha it destroyed, once, with no credential material in it.
+    #[tokio::test]
+    async fn e2e_new_491_the_audit_entry_records_the_overwritten_sha() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-491").await;
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "remote-only\n");
+
+        call_push_leased_audited(&e, &url, "main", None, true, Some(&sha_r2)).await.unwrap();
+
+        let entries = push_audit(&e);
+        assert_eq!(entries.len(), 1, "exactly one audit entry per remote operation");
+        let entry = &entries[0];
+        assert_eq!(entry.path, "/");
+        let detail = &entry.detail;
+        assert!(detail.contains("outcome ok"), "got {detail}");
+        assert!(detail.contains(&sha_r2), "the overwritten sha must be recorded: {detail}");
+        assert!(detail.contains(&local_tip), "got {detail}");
+        assert!(detail.contains("forced true"), "got {detail}");
+        assert!(!detail.contains("ghp_"), "got {detail}");
+        assert!(!detail.contains('@'), "no credentialed url may appear: {detail}");
+    }
+
+    /// E2E-NEW-492: a stale lease is rejected naming both shas, under an
+    /// identity distinct from the fast-forward refusal.
+    #[tokio::test]
+    async fn e2e_new_492_a_stale_lease_is_rejected_naming_both_shas() {
+        let e = Env::new().await;
+        let (remote_dir, url, _tip) = seed_r_at(&e, "remote-492").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "someone-else\n");
+
+        let err = call_push_leased(&e, &url, "main", None, true, Some(&sha_r1)).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains(&sha_r1), "got {}", err.message);
+        assert!(err.message.contains(&sha_r2), "got {}", err.message);
+        assert!(err.message.contains("expected"), "got {}", err.message);
+        assert!(err.message.contains("actual"), "got {}", err.message);
+        assert!(
+            !err.message.starts_with("push refused: not a fast-forward"),
+            "a lease failure is a distinct identity: {}",
+            err.message
+        );
+    }
+
+    /// E2E-NEW-493: the rejected lease leaves the bare remote exactly as the
+    /// third party left it, and fabricates no tracking update locally.
+    #[tokio::test]
+    async fn e2e_new_493_a_rejected_lease_leaves_the_remote_and_tracking_ref_untouched() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-493").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "someone-else\n");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        entry.db.set_ref("refs/remotes/origin/main", &sha_r1, false).await.unwrap();
+        let before_readme = e.read("/README.md").await;
+
+        let err = call_push_leased_audited(&e, &url, "main", None, true, Some(&sha_r1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r2));
+        let bare = git2::Repository::open_bare(&remote_dir).unwrap();
+        for r in bare.references().unwrap() {
+            let r = r.unwrap();
+            assert_ne!(
+                r.target().map(|o| o.to_string()).as_deref(),
+                Some(local_tip.as_str()),
+                "no reference on the remote may point at the local tip"
+            );
+        }
+
+        assert_eq!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap().target,
+            sha_r1
+        );
+        assert_eq!(entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target, local_tip);
+        assert_eq!(e.read("/README.md").await, before_readme);
+
+        let entries = push_audit(&e);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].detail.contains("outcome error"), "got {}", entries[0].detail);
+    }
+
+    /// E2E-NEW-494: `force:false`, and force omitted, both keep today's
+    /// fast-forward-only refusal, with its frozen message prefix.
+    #[tokio::test]
+    async fn e2e_new_494_force_false_preserves_the_fast_forward_refusal() {
+        let e = Env::new().await;
+        let (remote_dir, url, _tip) = seed_r_at(&e, "remote-494").await;
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "extra\n");
+
+        for force in [false, false] {
+            let err = call_push_leased(&e, &url, "main", None, force, None).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT);
+            assert!(
+                err.message.starts_with("push refused: not a fast-forward"),
+                "got {}",
+                err.message
+            );
+            assert!(err.message.contains("branch 'main'"), "got {}", err.message);
+        }
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r2));
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-495: the all-zero lease means "this branch must not exist on
+    /// the remote yet"; it matches an absent branch and stops matching the
+    /// moment the branch exists.
+    ///
+    /// Deviation recorded deliberately: the story's own text asks for
+    /// `overwritten_sha: null` here while E2E-NEW-830 asks for the 40 zeros
+    /// for the same call. The two cannot both hold, and the zeros win: they
+    /// are what the caller leased, and reporting the leased value keeps
+    /// `overwritten_sha` present for every forced push.
+    #[tokio::test]
+    async fn e2e_new_495_the_must_not_exist_lease_is_forty_zeros() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-495").await;
+
+        let out = call_push_leased(&e, &url, "main", Some("sandbox"), true, Some(ZERO_SHA))
+            .await
+            .unwrap();
+        assert_eq!(out["created"], true);
+        assert_eq!(out["forced"], true);
+        assert_eq!(out["remote_sha"], local_tip.clone());
+        assert_eq!(out["overwritten_sha"], ZERO_SHA);
+        assert_eq!(
+            bare_ref_sha(&remote_dir, "refs/heads/sandbox").as_deref(),
+            Some(local_tip.as_str())
+        );
+
+        let err = call_push_leased(&e, &url, "main", Some("sandbox"), true, Some(ZERO_SHA))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains(ZERO_SHA), "got {}", err.message);
+        assert!(err.message.contains(&local_tip), "got {}", err.message);
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/sandbox"), Some(local_tip));
+    }
+
+    /// E2E-NEW-496: a malformed lease is refused, naming the parameter and
+    /// its required length, before any URL handling.
+    #[tokio::test]
+    async fn e2e_new_496_a_malformed_expected_remote_sha_is_refused() {
+        let e = Env::new().await;
+        let (remote_dir, _url, local_tip) = seed_r_at(&e, "remote-496").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let trailing_space = format!("{local_tip} ");
+
+        for value in ["", "deadbeef", &"z".repeat(40), trailing_space.as_str()] {
+            let err = e
+                .call(
+                    "git.remote_push",
+                    json!({"mount_id": MOUNT, "branch": "main", "force": true,
+                           "expected_remote_sha": value}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "value {value:?}");
+            assert!(
+                err.message.contains("expected_remote_sha"),
+                "value {value:?}: {}",
+                err.message
+            );
+            assert!(err.message.contains("40"), "value {value:?}: {}", err.message);
+            if value == "deadbeef" {
+                assert!(!err.message.contains("only https is accepted"), "got {}", err.message);
+            }
+        }
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+    }
+
+    /// E2E-NEW-497: a lease without force is a contradiction, never silently
+    /// ignored.
+    #[tokio::test]
+    async fn e2e_new_497_a_lease_supplied_without_force_is_refused() {
+        let e = Env::new().await;
+        let (remote_dir, _url, _tip) = seed_r_at(&e, "remote-497").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+
+        let err = e
+            .call(
+                "git.remote_push",
+                json!({"mount_id": MOUNT, "branch": "main", "force": false,
+                       "expected_remote_sha": sha_r1}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("expected_remote_sha"), "got {}", err.message);
+        assert!(err.message.contains("force"), "got {}", err.message);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+    }
+
+    /// E2E-NEW-498: the remote moving between the caller's lease read and the
+    /// push is what the lease exists for. Made deterministic by advancing the
+    /// remote first and only then pushing the now-stale lease, the technique
+    /// `e2e_new_084_concurrent_pushes_serialize` already uses. The second half
+    /// races two real force pushes carrying the same lease: exactly one wins.
+    #[tokio::test]
+    async fn e2e_new_498_the_remote_moves_between_the_lease_read_and_the_push() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-498").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let sha_r3 = advance_bare_remote(&remote_dir, "refs/heads/main", "racer\n");
+
+        let err = call_push_leased(&e, &url, "main", None, true, Some(&sha_r1)).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains(&sha_r1), "got {}", err.message);
+        assert!(err.message.contains(&sha_r3), "got {}", err.message);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main").as_deref(), Some(sha_r3.as_str()));
+        // The racer's own content survives intact, read out of the bare repo.
+        let bare = git2::Repository::open_bare(&remote_dir).unwrap();
+        let commit = bare.find_reference("refs/heads/main").unwrap().peel_to_commit().unwrap();
+        let entry_blob = commit.tree().unwrap().get_name("EXTRA.md").unwrap().id();
+        assert_eq!(bare.find_blob(entry_blob).unwrap().content(), b"racer\n");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap();
+        assert!(tracking.is_none(), "a refused push never advances the tracking ref");
+
+        // Two writers, the same lease, different local tips: one wins, the
+        // other finds the lease stale.
+        let other_tip = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
+        assert_eq!(other_tip, local_tip);
+        let parent_tip = {
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let oid = parse_oid(&local_tip).unwrap();
+            repo.find_commit(oid).unwrap().parent(0).unwrap().id().to_string()
+        };
+        entry.db.set_ref("refs/heads/other", &parent_tip, false).await.unwrap();
+
+        let (a, b) = tokio::join!(
+            call_push_leased(&e, &url, "main", None, true, Some(&sha_r3)),
+            call_push_leased(&e, &url, "other", Some("main"), true, Some(&sha_r3)),
+        );
+        let winner = match (&a, &b) {
+            (Ok(_), Err(err)) => {
+                assert_eq!(err.code, code::INVALID_ARGUMENT);
+                local_tip.clone()
+            }
+            (Err(err), Ok(_)) => {
+                assert_eq!(err.code, code::INVALID_ARGUMENT);
+                parent_tip.clone()
+            }
+            other => panic!("exactly one force push must win, got {other:?}"),
+        };
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(winner));
+    }
+
+    /// E2E-NEW-828: an empty lease is an ABSENT lease, not a contradiction, so
+    /// a plain fast-forward push with `force:false` still runs; a real lease
+    /// with `force:false` is the contradiction.
+    #[tokio::test]
+    async fn e2e_new_828_an_empty_lease_with_force_false_is_treated_as_absent() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-828").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+
+        let out = call_push_leased(&e, &url, "main", None, false, Some("")).await.unwrap();
+        assert_eq!(out["forced"], false);
+        assert!(out.get("overwritten_sha").is_none(), "got {out}");
+        assert_eq!(
+            bare_ref_sha(&remote_dir, "refs/heads/main").as_deref(),
+            Some(local_tip.as_str())
+        );
+
+        let err = call_push_leased(&e, &url, "main", None, false, Some(&sha_r1)).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("expected_remote_sha"), "got {}", err.message);
+        assert!(err.message.contains("force"), "got {}", err.message);
+    }
+
+    /// E2E-NEW-829: the contradiction is caught before any network contact:
+    /// the remote is untouched, nothing was uploaded, and no audit entry was
+    /// written, because a rejected argument is not a remote operation.
+    #[tokio::test]
+    async fn e2e_new_829_the_contradiction_is_caught_before_any_network_contact() {
+        let e = Env::new().await;
+        let (remote_dir, _url, local_tip) = seed_r_at(&e, "remote-829").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+
+        let err = e
+            .call(
+                "git.remote_push",
+                json!({"mount_id": MOUNT, "branch": "main", "force": false,
+                       "expected_remote_sha": sha_r1}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("expected_remote_sha"), "got {}", err.message);
+        assert!(err.message.contains("force"), "got {}", err.message);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+        assert!(push_audit(&e).is_empty());
+        let bare = git2::Repository::open_bare(&remote_dir).unwrap();
+        assert!(
+            !bare.odb().unwrap().exists(parse_oid(&local_tip).unwrap()),
+            "nothing may be uploaded before the rejection"
+        );
+    }
+
+    /// E2E-NEW-830: a create-only force push audits the all-zero lease, so the
+    /// trail states plainly that nothing was destroyed.
+    #[tokio::test]
+    async fn e2e_new_830_a_create_only_force_push_audits_the_all_zero_lease() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-830").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+
+        let out = call_push_leased_audited(&e, &url, "main", Some("sandbox"), true, Some(ZERO_SHA))
+            .await
+            .unwrap();
+        assert_eq!(out["forced"], true);
+        assert_eq!(out["overwritten_sha"], ZERO_SHA);
+        assert_eq!(out["remote_sha"], local_tip.clone());
+
+        let entries = push_audit(&e);
+        assert_eq!(entries.len(), 1);
+        let detail = &entries[0].detail;
+        assert!(detail.contains("forced"), "got {detail}");
+        assert!(detail.contains("sandbox"), "got {detail}");
+        assert!(detail.contains(ZERO_SHA), "got {detail}");
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/sandbox"), Some(local_tip));
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+    }
+
+    /// E2E-NEW-831: a lease-rejected force push destroyed nothing, so the
+    /// internal pipeline appends no destroyed-sha line of its own.
+    #[tokio::test]
+    async fn e2e_new_831_a_lease_rejected_force_push_writes_no_audit_entry() {
+        let e = Env::new().await;
+        let (remote_dir, url, _tip) = seed_r_at(&e, "remote-831").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "someone-else\n");
+        let before: Vec<(String, String)> =
+            e.f.state.safety.audit(OWNER, MOUNT).into_iter().map(|a| (a.op, a.detail)).collect();
+
+        let err = call_push_leased(&e, &url, "main", None, true, Some(&sha_r1)).await.unwrap_err();
+        assert!(err.message.contains(&sha_r1), "got {}", err.message);
+        assert!(err.message.contains(&sha_r2), "got {}", err.message);
+
+        let after: Vec<(String, String)> =
+            e.f.state.safety.audit(OWNER, MOUNT).into_iter().map(|a| (a.op, a.detail)).collect();
+        assert_eq!(after, before);
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r2));
+    }
+
+    /// E2E-NEW-832: a fast-forward push with force absent still succeeds, and
+    /// says nothing about force anywhere.
+    #[tokio::test]
+    async fn e2e_new_832_a_fast_forward_push_with_force_false_still_succeeds() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-832").await;
+
+        let out = call_push_leased_audited(&e, &url, "main", None, false, None).await.unwrap();
+        assert_eq!(out["forced"], false);
+        assert!(out.get("overwritten_sha").is_none(), "got {out}");
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(local_tip));
+
+        let entries = push_audit(&e);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].detail.contains("forced"), "got {}", entries[0].detail);
+    }
+
+    /// E2E-NEW-833: the refused non-fast-forward leaves the remote
+    /// byte-identical, down to the content of the file the other writer
+    /// committed.
+    #[tokio::test]
+    async fn e2e_new_833_the_refused_non_fast_forward_leaves_the_remote_byte_identical() {
+        let e = Env::new().await;
+        let (remote_dir, url, _tip) = seed_r_at(&e, "remote-833").await;
+        let sha_r2 =
+            advance_bare_remote_write(&remote_dir, "refs/heads/main", "hello.txt", "remote-2\n");
+
+        let err = call_push_leased(&e, &url, "main", None, false, None).await.unwrap_err();
+        assert!(err.message.contains("not a fast-forward"), "got {}", err.message);
+        assert!(err.message.contains("force"), "got {}", err.message);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r2));
+        let bare = git2::Repository::open_bare(&remote_dir).unwrap();
+        let commit = bare.find_reference("refs/heads/main").unwrap().peel_to_commit().unwrap();
+        let blob = commit.tree().unwrap().get_name("hello.txt").unwrap().id();
+        assert_eq!(bare.find_blob(blob).unwrap().content(), b"remote-2\n");
+
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(entry.db.get_ref("refs/remotes/origin/main").await.unwrap().is_none());
+        assert!(push_audit(&e).is_empty(), "the internal pipeline writes no audit entry");
+    }
+
+    /// E2E-NEW-905: a forced push advances the local tracking ref to the sha
+    /// it just wrote, so the value is directly usable as the next lease with
+    /// no fetch in between.
+    #[tokio::test]
+    async fn e2e_new_905_a_forced_push_advances_the_local_tracking_ref() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-905").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        entry.db.set_ref("refs/remotes/origin/main", &sha_r1, false).await.unwrap();
+
+        let out = call_push_leased(&e, &url, "main", None, true, Some(&sha_r1)).await.unwrap();
+        assert_eq!(out["forced"], true);
+        assert_eq!(out["overwritten_sha"], sha_r1);
+        assert_eq!(out["remote_sha"], local_tip.clone());
+
+        assert_eq!(
+            entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap().target,
+            local_tip
+        );
+        assert_eq!(
+            bare_ref_sha(&remote_dir, "refs/heads/main").as_deref(),
+            Some(local_tip.as_str())
+        );
+
+        let again = call_push_leased(&e, &url, "main", None, true, Some(&local_tip)).await.unwrap();
+        assert_eq!(again["up_to_date"], true);
+        assert_eq!(again["overwritten_sha"], local_tip);
+    }
+
+    /// E2E-NEW-906: a whitespace-only lease is an absent lease, so it raises
+    /// the missing-lease error, never the stale-lease one.
+    #[tokio::test]
+    async fn e2e_new_906_a_whitespace_only_lease_with_force_is_refused_before_the_network() {
+        let e = Env::new().await;
+        let (remote_dir, _url, _tip) = seed_r_at(&e, "remote-906").await;
+        let sha_r1 = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+
+        for value in ["   ", "\t\n"] {
+            let err = e
+                .call(
+                    "git.remote_push",
+                    json!({"mount_id": MOUNT, "branch": "main", "force": true,
+                           "expected_remote_sha": value}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "value {value:?}");
+            assert!(err.message.contains("expected_remote_sha"), "got {}", err.message);
+            assert!(
+                !err.message.contains(&sha_r1),
+                "a missing lease is not a stale lease: {}",
+                err.message
+            );
+        }
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+        assert!(push_audit(&e).is_empty());
     }
 
     /// E2E-NEW-211: `created` and `up_to_date` are never both true: a branch
@@ -4726,6 +9908,7 @@ mod tests {
         fetch_branch(
             e.git.clone(),
             MOUNT,
+            "origin",
             origin_url,
             None,
             auth.to_string(),
@@ -4801,6 +9984,7 @@ mod tests {
 
         let err = crate::git::remote::fetch_from_remote(
             &repo,
+            "origin",
             "https://mcp-fs-fetch-unreachable-test.invalid/o/r.git",
             None,
             None,
@@ -4968,7 +10152,8 @@ mod tests {
         {
             let repo = entry.repo.lock().await;
             hydrate(&entry, &repo).await.unwrap();
-            let outcome = crate::git::remote::fetch_from_remote(&repo, &url, None, None).unwrap();
+            let outcome =
+                crate::git::remote::fetch_from_remote(&repo, "origin", &url, None, None).unwrap();
             assert!(
                 outcome.refs_updated.iter().all(|u| !u.ref_name.contains("tags")),
                 "got {:?}",
@@ -5104,7 +10289,17 @@ mod tests {
         origin_url: &str,
         branch: &str,
         auth: &str,
-        on_conflict: Option<&str>,
+    ) -> Result<Value> {
+        call_pull_branch_from(e, "origin", origin_url, branch, auth).await
+    }
+
+    /// [`call_pull_branch`] with the remote named (US-021).
+    async fn call_pull_branch_from(
+        e: &Env,
+        remote: &str,
+        origin_url: &str,
+        branch: &str,
+        auth: &str,
     ) -> Result<Value> {
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let local_sha =
@@ -5112,6 +10307,7 @@ mod tests {
         let client = e.f.state.stores.client(MOUNT).await.unwrap();
         pull_branch(
             entry,
+            remote,
             branch,
             &local_sha,
             origin_url,
@@ -5120,10 +10316,63 @@ mod tests {
             client,
             OWNER,
             e.f.state.safety.clone(),
-            on_conflict.map(str::to_string),
             e.git.config().git.remote_timeout_secs,
         )
         .await
+    }
+
+    /// A pull that, when it pauses on conflicts, is finished through the
+    /// shared `git.merge_resolve` with the same side for every conflicting
+    /// path. The old global `on_conflict` did this inside the pull; the model
+    /// US-007 moved to does it here, in the caller, which is the point.
+    /// Returns the final response, whether the pull merged on its own or the
+    /// resolve completed it.
+    async fn call_pull_then_resolve(
+        e: &Env,
+        origin_url: &str,
+        branch: &str,
+        auth: &str,
+        strategy: &str,
+    ) -> Result<Value> {
+        let out = call_pull_branch(e, origin_url, branch, auth).await?;
+        if out["status"] != "conflict" {
+            return Ok(out);
+        }
+        let resolutions: Vec<Value> = out["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| json!({"path": c["path"], "strategy": strategy}))
+            .collect();
+        e.resolve(Value::Array(resolutions)).await
+    }
+
+    /// One commit on the bare "remote" replacing the whole `subdir` tree with
+    /// exactly `files`. The flat `treebuilder` helpers above cannot carry a
+    /// nested path, which the US-007 seeds need (`/src/config.toml`).
+    fn write_bare_remote_subtree(
+        dir: &std::path::Path,
+        branch_ref: &str,
+        subdir: &str,
+        files: &[(&str, &[u8])],
+    ) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let parent = repo.find_reference(branch_ref).unwrap().peel_to_commit().unwrap();
+        let mut sub = repo.treebuilder(None).unwrap();
+        for (name, content) in files {
+            let blob = repo.blob(content).unwrap();
+            sub.insert(*name, blob, MODE_FILE).unwrap();
+        }
+        let sub_oid = sub.write().unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        builder.insert(subdir, sub_oid, MODE_DIR).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_002_000, 0)).unwrap();
+        repo.commit(Some(branch_ref), &sig, &sig, "remote subtree\n", &tree, &[&parent])
+            .unwrap()
+            .to_string()
     }
 
     /// E2E-NEW-114: a fast-forward pull advances `refs/heads/main` to the
@@ -5140,7 +10389,7 @@ mod tests {
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let before = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(out["old_sha"], before);
         assert_eq!(out["new_sha"], tip);
         assert_eq!(out["merged"], false);
@@ -5169,7 +10418,7 @@ mod tests {
             "new doc\n",
         );
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(out["files_changed"], 2);
         assert_eq!(e.read("/docs/new.md").await, "new doc\n");
         assert_eq!(e.read("/README.md").await, "updated\n");
@@ -5186,7 +10435,7 @@ mod tests {
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
         let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(out["new_sha"], tip, "the new tip IS the fetched commit, not a synthesized one");
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
@@ -5212,7 +10461,7 @@ mod tests {
 
         e.write("/README.md", "dirty edit\n").await;
 
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
         assert!(
             err.message.starts_with("pull refused: volume has uncommitted changes"),
@@ -5242,7 +10491,7 @@ mod tests {
 
         e.write("/scratch.txt", "temp\n").await;
 
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
         assert_eq!(e.read("/scratch.txt").await, "temp\n");
     }
@@ -5258,7 +10507,7 @@ mod tests {
         let client = e.f.state.stores.client(MOUNT).await.unwrap();
         client.delete_file("/README.md").await.unwrap();
 
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
     }
 
@@ -5279,8 +10528,8 @@ mod tests {
         e.commit("local change").await;
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote change\n");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
-        assert_eq!(out["merged"], true);
+        let out = call_pull_then_resolve(&e, &url, "main", "anonymous", "ours").await.unwrap();
+        assert_eq!(out["status"], "merged");
         assert_eq!(e.read("/README.md").await, "local change\n", "'ours' keeps local content");
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
@@ -5303,7 +10552,7 @@ mod tests {
         let url1 = seed_bare_remote(&remote_dir1, "hi\n");
         call_clone_and_import(&e1, &url1, "anonymous").await.unwrap();
         e1.write("/README.md", "dirty\n").await;
-        let dirty_err = call_pull_branch(&e1, &url1, "main", "anonymous", None).await.unwrap_err();
+        let dirty_err = call_pull_branch(&e1, &url1, "main", "anonymous").await.unwrap_err();
 
         let e2 = Env::new().await;
         let remote_dir2 = e2.f.dir.path().join("remote-127-diverged");
@@ -5312,14 +10561,14 @@ mod tests {
         e2.write("/README.md", "local\n").await;
         e2.commit("local change").await;
         advance_bare_remote_write(&remote_dir2, "refs/heads/main", "README.md", "remote\n");
-        let diverged_err =
-            call_pull_branch(&e2, &url2, "main", "anonymous", None).await.unwrap_err();
+        let diverged = call_pull_branch(&e2, &url2, "main", "anonymous").await.unwrap();
 
         assert_eq!(dirty_err.code, code::INVALID_ARGUMENT);
-        assert_eq!(diverged_err.code, code::INVALID_ARGUMENT);
         assert!(dirty_err.message.starts_with("pull refused: volume has uncommitted changes"));
-        assert!(diverged_err.message.starts_with("pull refused: not a fast-forward"));
-        assert_ne!(dirty_err.message, diverged_err.message, "machine-distinguishable by prefix");
+        // FR-MOD-104: divergence is no longer a failure at all, which is the
+        // sharpest possible distinction from the dirty refusal.
+        assert_eq!(diverged["status"], "conflict");
+        assert_eq!(diverged["continue_with"], "git.merge_resolve");
     }
 
     /// E2E-NEW-131: a pull with nothing new is idempotent: it succeeds twice,
@@ -5331,11 +10580,11 @@ mod tests {
         let url = seed_bare_remote(&remote_dir, "hi\n");
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
 
-        let first = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let first = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(first["old_sha"], first["new_sha"], "nothing new since the clone");
         assert_eq!(first["files_changed"], 0);
 
-        let second = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let second = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(second["old_sha"], second["new_sha"]);
         assert_eq!(second["files_changed"], 0);
     }
@@ -5373,7 +10622,7 @@ mod tests {
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
 
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert!(err.message.contains("blocked"), "must name the failing path: {}", err.message);
 
         let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
@@ -5398,52 +10647,17 @@ mod tests {
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
         let tip = advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
+        let out = call_pull_then_resolve(&e, &url, "main", "anonymous", "ours").await.unwrap();
         assert_eq!(out["new_sha"], tip);
         assert_eq!(out["merged"], false, "a fast-forward is applied, never a merge");
     }
 
     // ── US-013: FR-NEW-030/031/032/033/034, a diverged pull ─────────────────
 
-    /// E2E-NEW-117: a diverged pull with no strategy is refused, naming
-    /// `on_conflict`, and leaves `refs/heads/main` and every volume file
-    /// unchanged.
-    #[tokio::test]
-    async fn e2e_new_117_a_diverged_pull_with_no_strategy_is_refused() {
-        let e = Env::new().await;
-        let remote_dir = e.f.dir.path().join("remote-117");
-        let url = seed_bare_remote(&remote_dir, "hi\n");
-        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
-
-        e.write("/README.md", "local change\n").await;
-        e.commit("local change").await;
-        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote change\n");
-
-        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
-        let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
-        let before_readme = e.read("/README.md").await;
-
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
-        assert_eq!(err.code, code::INVALID_ARGUMENT);
-        assert!(err.message.starts_with("pull refused: not a fast-forward"), "got {}", err.message);
-        let lower = err.message.to_ascii_lowercase();
-        assert!(lower.contains("fast-forward"), "got {}", err.message);
-        assert!(lower.contains("on_conflict"), "got {}", err.message);
-
-        let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
-        assert_eq!(after_head, before_head, "refs/heads/main must be unchanged");
-        assert_eq!(
-            e.read("/README.md").await,
-            before_readme,
-            "every volume file must be unchanged"
-        );
-    }
-
-    /// E2E-NEW-118: a diverged pull with `theirs` merges: a merge commit is
-    /// created with the previous local tip as first parent and the fetched
-    /// remote tip as second, the conflicting file holds the remote content,
-    /// and the response reports `{"merged": true, "strategy": "theirs", \
-    /// "conflicts_resolved": 1}`.
+    /// E2E-MOD-401 (was E2E-NEW-118): the same divergence now returns the
+    /// shared conflict response instead of resolving every file by one global
+    /// side, and the caller finishes it per file with `git.merge_resolve`
+    /// (FR-MOD-104, FR-MOD-105, FR-DEL-101).
     #[tokio::test]
     async fn e2e_new_118_a_diverged_pull_with_theirs_merges() {
         let e = Env::new().await;
@@ -5451,29 +10665,48 @@ mod tests {
         let url = seed_bare_remote(&remote_dir, "hi\n");
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
 
-        e.write("/README.md", "fn local()\n").await;
+        e.write("/shared.txt", "fn local()\n").await;
         let local_sha = e.commit("local change").await;
-        let remote_tip =
-            advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "fn remote()\n");
+        let before = e.byte_map().await;
+        let remote_tip = advance_bare_remote_write(
+            &remote_dir,
+            "refs/heads/main",
+            "shared.txt",
+            "fn remote()\n",
+        );
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap();
-        assert_eq!(out["merged"], true);
-        assert_eq!(out["strategy"], "theirs");
-        assert_eq!(out["conflicts_resolved"], 1);
-        assert_eq!(e.read("/README.md").await, "fn remote()\n");
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        // FR-NEW-285: a paused pull is recorded and reported as a merge.
+        assert_eq!(out["operation"], "merge");
+        assert_eq!(out["continue_with"], "git.merge_resolve");
+        assert_eq!(out["abort_with"], "git.merge_abort");
+        assert_eq!(out["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(out["conflicts"][0]["path"], "/shared.txt");
+        assert_eq!(conflict_side(&out, 0, "ours")["content"], "fn local()\n");
+        assert_eq!(conflict_side(&out, 0, "theirs")["content"], "fn remote()\n");
+        assert_eq!(conflict_side(&out, 0, "base")["exists"], false);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(local_sha.as_str()));
+        assert_eq!(e.byte_map().await, before, "nothing is applied while paused");
+        assert_eq!(e.ops().await, 1, "exactly one operation row for this volume");
+
+        let done = e.resolve(json!([{"path": "/shared.txt", "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.read("/shared.txt").await, "fn remote()\n");
+        assert_eq!(e.ops().await, 0, "the row is gone once the merge lands");
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let repo = entry.repo.lock().await;
-        let merge_sha = out["merge_commit"].as_str().unwrap();
+        let merge_sha = done["merge_commit"].as_str().unwrap();
         let merge_commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
         let parents: Vec<String> = merge_commit.parent_ids().map(|p| p.to_string()).collect();
         assert_eq!(parents, vec![local_sha, remote_tip], "first parent local, second remote");
     }
 
-    /// E2E-NEW-125: a refused diverged pull still leaves
-    /// `refs/remotes/origin/main` equal to the remote tip, and the fetched
-    /// commit object present and readable: the fetch genuinely happened, only
-    /// the apply step was refused.
+    /// E2E-MOD-404 (was E2E-NEW-125): the retention guarantee survives the
+    /// move to the shared model. The trigger is now a conflict response that
+    /// leaves the merge in progress rather than a refusal, and the fetched
+    /// objects and the remote-tracking ref are still kept (FR-MOD-104).
     #[tokio::test]
     async fn e2e_new_125_a_refused_diverged_pull_keeps_the_fetched_objects() {
         let e = Env::new().await;
@@ -5481,45 +10714,44 @@ mod tests {
         let url = seed_bare_remote(&remote_dir, "hi\n");
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
 
-        e.write("/README.md", "local\n").await;
-        e.commit("local change").await;
+        e.write("/shared.txt", "local\n").await;
+        let local_sha = e.commit("local change").await;
         let remote_tip =
-            advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote\n");
+            advance_bare_remote_write(&remote_dir, "refs/heads/main", "shared.txt", "remote\n");
 
-        call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let tracking = entry.db.get_ref("refs/remotes/origin/main").await.unwrap().unwrap().target;
         assert_eq!(tracking, remote_tip, "refs/remotes/origin/main equals the remote tip");
-
-        let repo = entry.repo.lock().await;
-        assert!(
-            repo.find_commit(git2::Oid::from_str(&remote_tip).unwrap()).is_ok(),
-            "the fetched commit object must be present and readable"
+        assert_eq!(
+            entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target,
+            local_sha,
+            "refs/heads/main is unmoved"
         );
+        {
+            let repo = entry.repo.lock().await;
+            assert!(
+                repo.find_commit(git2::Oid::from_str(&remote_tip).unwrap()).is_ok(),
+                "the fetched commit object must be present and readable"
+            );
+        }
+
+        // A second pull does not re-fetch: the in-progress guard refuses it.
+        let err = e
+            .call("git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("in progress"), "got {}", err.message);
+
+        e.abort().await.unwrap();
     }
 
-    /// E2E-NEW-126: the diverged-pull error names `on_conflict` and its
-    /// accepted values.
-    #[tokio::test]
-    async fn e2e_new_126_the_diverged_pull_error_names_the_remedy() {
-        let e = Env::new().await;
-        let remote_dir = e.f.dir.path().join("remote-126");
-        let url = seed_bare_remote(&remote_dir, "hi\n");
-        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
-
-        e.write("/README.md", "local\n").await;
-        e.commit("local change").await;
-        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote\n");
-
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
-        assert!(err.message.contains("on_conflict"), "got {}", err.message);
-        assert!(err.message.contains("ours"), "got {}", err.message);
-        assert!(err.message.contains("theirs"), "got {}", err.message);
-    }
-
-    /// E2E-NEW-128: a diverged pull with `ours` keeps local content, and a
-    /// merge commit still exists with both parents.
+    /// E2E-MOD-402 (was E2E-NEW-128): the identical guarantee, local content
+    /// kept, reached through the shared conflict model with a per-file `ours`
+    /// strategy rather than a global parameter (FR-MOD-104, FR-MOD-105).
     #[tokio::test]
     async fn e2e_new_128_a_diverged_pull_with_ours_keeps_local_content() {
         let e = Env::new().await;
@@ -5527,25 +10759,35 @@ mod tests {
         let url = seed_bare_remote(&remote_dir, "hi\n");
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
 
-        e.write("/README.md", "local content\n").await;
+        e.write("/shared.txt", "local content\n").await;
         e.commit("local change").await;
-        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote content\n");
+        let remote_tip = advance_bare_remote_write(
+            &remote_dir,
+            "refs/heads/main",
+            "shared.txt",
+            "remote content\n",
+        );
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
-        assert_eq!(e.read("/README.md").await, "local content\n");
-        assert_eq!(out["merged"], true);
+        let paused = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(paused["status"], "conflict");
+        assert_eq!(e.read("/shared.txt").await, "local content\n", "nothing is applied");
+
+        let out = e.resolve(json!([{"path": "/shared.txt", "strategy": "ours"}])).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.read("/shared.txt").await, "local content\n", "'ours' keeps local content");
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let repo = entry.repo.lock().await;
         let merge_sha = out["merge_commit"].as_str().unwrap();
         let commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
         assert_eq!(commit.parent_count(), 2, "a merge commit still exists with both parents");
+        assert_eq!(commit.parent_id(1).unwrap().to_string(), remote_tip, "second is the fetch");
     }
 
-    /// E2E-NEW-129: non-conflicting changes from both sides are both kept
-    /// (local added `/a.txt`, remote added `/b.txt`, no common file touched),
-    /// and `conflicts_resolved` is 0: the strategy applies only to
-    /// conflicting files.
+    /// E2E-MOD-403 (was E2E-NEW-129): non-conflicting changes from both sides
+    /// are both kept, and the pull now completes on its own, with no strategy
+    /// parameter and no caller decision at all (FR-MOD-104, FR-DEL-101). This
+    /// is the test that carries SC-911.
     #[tokio::test]
     async fn e2e_new_129_non_conflicting_changes_from_both_sides_are_kept() {
         let e = Env::new().await;
@@ -5557,10 +10799,18 @@ mod tests {
         e.commit("add a").await;
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "b.txt", "remote add\n");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
-        assert_eq!(out["conflicts_resolved"], 0);
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "merged", "not a conflict, and not an error");
         assert_eq!(e.read("/a.txt").await, "local add\n");
         assert_eq!(e.read("/b.txt").await, "remote add\n");
+        assert_eq!(e.ops().await, 0, "no operation row was ever created");
+
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(merge_sha));
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let commit = repo.find_commit(git2::Oid::from_str(merge_sha).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 2);
     }
 
     /// E2E-NEW-130: a branch merged per E2E-NEW-118 then pushes as a
@@ -5576,7 +10826,7 @@ mod tests {
         e.commit("local change").await;
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "fn remote()\n");
 
-        let merged = call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap();
+        let merged = call_pull_then_resolve(&e, &url, "main", "anonymous", "theirs").await.unwrap();
         let merge_sha = merged["merge_commit"].as_str().unwrap().to_string();
 
         let out = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
@@ -5585,34 +10835,6 @@ mod tests {
             bare_ref_sha(&remote_dir, "refs/heads/main"),
             Some(merge_sha),
             "the push succeeds as a fast-forward, advancing the remote to the merge commit"
-        );
-    }
-
-    /// E2E-NEW-135: an invalid conflict strategy (`union`, `OURS`, `Theirs`,
-    /// `""`, `normal`) is rejected with `ERR_INVALID_ARGUMENT` naming both
-    /// accepted values, and nothing is applied.
-    #[tokio::test]
-    async fn e2e_new_135_an_invalid_conflict_strategy_is_rejected() {
-        let e = Env::new().await;
-        let remote_dir = e.f.dir.path().join("remote-135");
-        let url = seed_bare_remote(&remote_dir, "hi\n");
-        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
-
-        e.write("/README.md", "local\n").await;
-        e.commit("local change").await;
-        advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "remote\n");
-
-        for bad in ["union", "OURS", "Theirs", "", "normal"] {
-            let err = call_pull_branch(&e, &url, "main", "anonymous", Some(bad)).await.unwrap_err();
-            assert_eq!(err.code, code::INVALID_ARGUMENT, "value {bad:?}");
-            assert!(err.message.contains("ours"), "got {}", err.message);
-            assert!(err.message.contains("theirs"), "got {}", err.message);
-        }
-
-        assert_eq!(
-            e.read("/README.md").await,
-            "local\n",
-            "nothing was applied by any rejected call"
         );
     }
 
@@ -5640,8 +10862,9 @@ mod tests {
             );
 
             let out =
-                call_pull_branch(&e, &url, "main", "anonymous", Some(strategy)).await.unwrap();
-            assert_eq!(out["conflicts_resolved"], 3, "strategy {strategy}");
+                call_pull_then_resolve(&e, &url, "main", "anonymous", strategy).await.unwrap();
+            assert_eq!(out["status"], "merged", "strategy {strategy}");
+            assert_eq!(out["resolved_count"], 3, "strategy {strategy}");
 
             for path in ["/a.md", "/b.md", "/c.md"] {
                 let content = e.read(path).await;
@@ -5650,6 +10873,658 @@ mod tests {
                 assert!(!content.contains(">>>>>>>"), "{strategy} {path}: {content}");
             }
         }
+    }
+
+    // ── US-007: git.remote_pull on the shared conflict model ────────────────
+
+    const PULL_CFG: &str = "/src/config.toml";
+    const PULL_BASE_CFG: &str =
+        "[server]\nport = 8080\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    const PULL_OURS_CFG: &str =
+        "[server]\nport = 8000\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    const PULL_THEIRS_CFG: &str =
+        "[server]\nport = 9090\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+
+    /// SEED-PULL-CONFLICT: `/src/config.toml` holds `port = 8080` in the
+    /// common base, `port = 8000` locally and `port = 9090` on the remote, so
+    /// both sides changed the same line. Returns the origin url, the local tip
+    /// and the fetched remote tip.
+    async fn seed_pull_conflict(
+        e: &Env,
+        name: &str,
+    ) -> (std::path::PathBuf, String, String, String) {
+        let remote_dir = e.f.dir.path().join(name);
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("config.toml", PULL_BASE_CFG.as_bytes())],
+        );
+        call_clone_and_import(e, &url, "anonymous").await.unwrap();
+        e.write(PULL_CFG, PULL_OURS_CFG).await;
+        let local = e.commit("local change").await;
+        let remote_tip = write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("config.toml", PULL_THEIRS_CFG.as_bytes())],
+        );
+        (remote_dir, url, local, remote_tip)
+    }
+
+    /// SEED-PULL-DISJOINT: the local side changes `/docs/readme.md`, the
+    /// remote side `/src/api.rs`, and no path is touched by both.
+    async fn seed_pull_disjoint(
+        e: &Env,
+        name: &str,
+    ) -> (std::path::PathBuf, String, String, String) {
+        let remote_dir = e.f.dir.path().join(name);
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("api.rs", b"pub fn get() {}\n")],
+        );
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "docs",
+            &[("readme.md", b"docs v1\n")],
+        );
+        call_clone_and_import(e, &url, "anonymous").await.unwrap();
+        e.write("/docs/readme.md", "docs v2\n").await;
+        let local = e.commit("local docs").await;
+        let remote_tip = write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("api.rs", b"pub fn get() {}\npub fn post() {}\n")],
+        );
+        (remote_dir, url, local, remote_tip)
+    }
+
+    /// E2E-NEW-508: a conflicted pull is finished by `git.merge_resolve`, the
+    /// same tool a conflicted `git.merge` is finished by.
+    #[tokio::test]
+    async fn e2e_new_508_conflicted_pull_finished_by_git_merge_resolve() {
+        let e = Env::new().await;
+        let (_dir, url, local_sha, remote_tip) = seed_pull_conflict(&e, "remote-508").await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["operation"], "merge");
+        assert_eq!(out["current_step"], Value::Null);
+        assert_eq!(out["total_steps"], Value::Null);
+        assert_eq!(out["continue_with"], "git.merge_resolve");
+        assert_eq!(out["abort_with"], "git.merge_abort");
+        assert_eq!(out["conflicts"][0]["path"], PULL_CFG);
+        for forbidden in
+            ["conflicting_paths", "resolve_with", "step", "target_ref", "present", "size"]
+        {
+            assert!(out.get(forbidden).is_none(), "{forbidden} must be emitted by no tool");
+        }
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await.as_deref(),
+            Some(remote_tip.as_str()),
+            "the fetch advanced the tracking ref even though the apply is deferred"
+        );
+
+        let done = e.resolve(json!([{"path": PULL_CFG, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.read(PULL_CFG).await, PULL_THEIRS_CFG);
+        assert_eq!(e.read(PULL_CFG).await.lines().nth(1).unwrap(), "port = 9090");
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let commit = repo
+            .find_commit(git2::Oid::from_str(done["merge_commit"].as_str().unwrap()).unwrap())
+            .unwrap();
+        assert_eq!(commit.parent_count(), 2);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), local_sha);
+        assert_eq!(commit.parent_id(1).unwrap().to_string(), remote_tip);
+    }
+
+    /// E2E-NEW-531: `git.remote_pull` is blocked while a merge is in progress,
+    /// before any network call (FR-NEW-279).
+    #[tokio::test]
+    async fn e2e_new_531_remote_pull_is_blocked_while_a_merge_is_in_progress() {
+        let e = Env::new().await;
+        let (_dir, url, _local, remote_tip) = seed_pull_conflict(&e, "remote-531").await;
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        let audit_before = e.audit().iter().filter(|a| a.op == "git.remote_pull").count();
+
+        let err = e
+            .call("git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for needle in ["merge", "in progress", "git.merge_resolve"] {
+            assert!(err.message.contains(needle), "got {}", err.message);
+        }
+
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await.as_deref(),
+            Some(remote_tip.as_str()),
+            "no network call happened, so the tracking ref is untouched"
+        );
+        assert_eq!(
+            e.audit().iter().filter(|a| a.op == "git.remote_pull").count(),
+            audit_before,
+            "a refused-before-attempt pull writes no audit entry"
+        );
+    }
+
+    /// E2E-NEW-535: the removed `on_conflict` parameter is refused by name and
+    /// is gone from the schema (FR-DEL-101).
+    #[tokio::test]
+    async fn e2e_new_535_the_removed_on_conflict_parameter_is_refused() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote) = seed_pull_conflict(&e, "remote-535").await;
+        let _ = url;
+        let log_before = e.log_shas("main").await.len();
+
+        let err = e
+            .call(
+                "git.remote_pull",
+                json!({"mount_id": MOUNT, "branch": "main", "on_conflict": "ours"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("on_conflict"), "got {}", err.message);
+        assert!(err.message.contains("removed"), "got {}", err.message);
+        assert!(err.message.contains("git.merge_resolve"), "got {}", err.message);
+
+        let schema = &e.reg.resolve("git.remote_pull").unwrap().schema.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(!props.contains_key("on_conflict"), "the schema still declares on_conflict");
+        assert_eq!(e.log_shas("main").await.len(), log_before, "no merge commit was created");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-558: no conflict marker enters the volume, before or after the
+    /// resolution of a conflicted pull (FR-NEW-172).
+    #[tokio::test]
+    async fn e2e_new_558_no_conflict_markers_after_a_conflicted_pull() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote) = seed_pull_conflict(&e, "remote-558").await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_no_markers(&e).await;
+
+        e.resolve(json!([{"path": PULL_CFG, "strategy": "theirs"}])).await.unwrap();
+        assert_no_markers(&e).await;
+    }
+
+    /// Every byte of every file in the volume, scanned for the three markers.
+    async fn assert_no_markers(e: &Env) {
+        for (path, bytes) in e.byte_map().await {
+            let text = String::from_utf8_lossy(&bytes);
+            for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
+                assert!(!text.contains(marker), "{marker} reached {path}");
+            }
+        }
+    }
+
+    /// E2E-NEW-811: `on_conflict` is refused even on a pull that would
+    /// fast-forward, before the fetch (FR-DEL-101).
+    #[tokio::test]
+    async fn e2e_new_811_on_conflict_is_rejected_even_on_a_fast_forward_pull() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-811");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&remote_dir, "refs/heads/main", "c1\n");
+
+        let head_before = e.ref_sha("refs/heads/main").await;
+        let tracking_before = e.ref_sha("refs/remotes/origin/main").await;
+
+        let err = e
+            .call(
+                "git.remote_pull",
+                json!({"mount_id": MOUNT, "branch": "main", "on_conflict": "ours"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("on_conflict"), "got {}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await, head_before, "no fast-forward happened");
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await,
+            tracking_before,
+            "no fetch happened either"
+        );
+    }
+
+    /// E2E-NEW-813: `git.merge_abort` on a paused pull undoes the merge, never
+    /// the fetch (FR-NEW-197, FR-MOD-104).
+    #[tokio::test]
+    async fn e2e_new_813_merge_abort_on_a_paused_pull_keeps_the_fetched_objects() {
+        let e = Env::new().await;
+        let (_dir, url, local_sha, remote_tip) = seed_pull_conflict(&e, "remote-813").await;
+        let before = e.byte_map().await;
+
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await.as_deref(),
+            Some(remote_tip.as_str())
+        );
+        assert!(e.objects().await > 0);
+
+        let aborted = e.abort().await.unwrap();
+        assert_eq!(aborted["status"], "aborted");
+        assert_eq!(e.ops().await, 0, "no git_operations row remains");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(local_sha.as_str()));
+        assert_eq!(
+            e.byte_map().await,
+            before,
+            "every file is byte identical to its pre-pull bytes"
+        );
+        assert_eq!(e.read(PULL_CFG).await, PULL_OURS_CFG);
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await.as_deref(),
+            Some(remote_tip.as_str()),
+            "the abort undoes the merge, not the fetch"
+        );
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            assert!(repo.find_commit(git2::Oid::from_str(&remote_tip).unwrap()).is_ok());
+        }
+
+        // The same conflict is re-entered from local objects alone.
+        let again = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(again["status"], "conflict");
+        assert_eq!(again["conflicts"][0]["path"], PULL_CFG);
+    }
+
+    /// E2E-NEW-940: a divergent pull with disjoint changes merges with no
+    /// caller decision and no strategy parameter (FR-MOD-104, FR-DEL-101).
+    #[tokio::test]
+    async fn e2e_new_940_a_divergent_pull_with_disjoint_changes_merges() {
+        let e = Env::new().await;
+        let (_dir, url, local_sha, remote_tip) = seed_pull_disjoint(&e, "remote-940").await;
+
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            let client = e.f.state.stores.client(MOUNT).await.unwrap();
+            assert!(
+                volume_is_clean(&repo, &client, &local_sha).await.unwrap(),
+                "the volume is clean before the pull"
+            );
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(local_sha.as_str()));
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        for forbidden in ["conflicts", "continue_with", "abort_with", "operation_id"] {
+            assert!(out.get(forbidden).is_none(), "{forbidden} must not appear on a clean merge");
+        }
+        assert_eq!(e.read_bytes("/src/api.rs").await, b"pub fn get() {}\npub fn post() {}\n");
+        assert_eq!(e.read_bytes("/docs/readme.md").await, b"docs v2\n");
+
+        let merge_sha = out["merge_commit"].as_str().unwrap();
+        assert_eq!(merge_sha.len(), 40);
+        assert!(merge_sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(merge_sha, local_sha);
+        assert_ne!(merge_sha, remote_tip);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(merge_sha));
+        assert_eq!(e.ops().await, 0, "no operation row exists for this volume");
+    }
+
+    /// E2E-NEW-941: a divergent pull is still refused on a dirty volume; the
+    /// refusal is about the dirt, not the divergence (FR-NEW-194).
+    #[tokio::test]
+    async fn e2e_new_941_a_divergent_pull_is_still_refused_on_a_dirty_volume() {
+        let e = Env::new().await;
+        let (_dir, url, local_sha, _remote) = seed_pull_disjoint(&e, "remote-941").await;
+        // The git Env registers the git tools only, so the uncommitted edit
+        // goes through the volume client, which is what fs.write_text does.
+        e.write("/docs/readme.md", "docs LOCAL WIP\n").await;
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for needle in ["uncommitted changes", "git.commit", "git.stash_save"] {
+            assert!(err.message.contains(needle), "got {}", err.message);
+        }
+        assert_eq!(e.read_bytes("/docs/readme.md").await, b"docs LOCAL WIP\n");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(local_sha.as_str()));
+        assert_eq!(e.ops().await, 0);
+
+        e.commit("wip").await;
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "merged");
+    }
+
+    /// E2E-NEW-942: the automatic merge is refused when the quota cannot cover
+    /// it, and the fetch's results are still retained (FR-NEW-185, FR-MOD-104).
+    #[tokio::test]
+    async fn e2e_new_942_the_automatic_merge_is_refused_when_the_quota_cannot_cover_it() {
+        // The clone charges 27 bytes (3 + 16 + 8); the merged tree rewrites
+        // /src/api.rs at 31 bytes, which does not fit in what a 40-byte quota
+        // leaves.
+        let e = Env::with_quota(40).await;
+        let (_dir, url, local_sha, remote_tip) = seed_pull_disjoint(&e, "remote-942").await;
+        let spent = e.bytes_written();
+        assert!(spent <= 40, "the clone alone fits: {spent}");
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+        assert_eq!(e.read_bytes("/src/api.rs").await, b"pub fn get() {}\n");
+        assert_eq!(e.read_bytes("/docs/readme.md").await, b"docs v2\n");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(local_sha.as_str()));
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await.as_deref(),
+            Some(remote_tip.as_str()),
+            "fetched objects and the tracking ref are retained, so a retry costs no download"
+        );
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            assert!(repo.find_commit(git2::Oid::from_str(&remote_tip).unwrap()).is_ok());
+        }
+
+        // The quota is a config value with no runtime setter, so headroom is
+        // made by giving the session's charge back: the retry then merges.
+        e.f.state.safety.refund_write(OWNER, MOUNT, spent);
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "merged");
+    }
+
+    /// E2E-NEW-943: disjoint regions of the SAME file also merge automatically
+    /// (FR-NEW-173).
+    #[tokio::test]
+    async fn e2e_new_943_disjoint_regions_of_the_same_file_also_merge() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-943");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("config.toml", PULL_BASE_CFG.as_bytes())],
+        );
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        e.write(PULL_CFG, &PULL_BASE_CFG.replace("retries = 2", "retries = 7")).await;
+        e.commit("local retries").await;
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("config.toml", PULL_THEIRS_CFG.as_bytes())],
+        );
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert!(out.get("conflicts").is_none());
+        assert_eq!(
+            e.read(PULL_CFG).await,
+            "[server]\nport = 9090\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 7\n",
+            "both edits present, one file, no markers"
+        );
+        assert_no_markers(&e).await;
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-944: the refs, parents, message, audit and quota charge an
+    /// automatic pull merge leaves behind (FR-MOD-104, FR-NEW-184).
+    #[tokio::test]
+    async fn e2e_new_944_the_automatic_pull_merge_leaves_exactly_the_expected_side_effects() {
+        let e = Env::new().await;
+        let (_dir, url, local_sha, remote_tip) = seed_pull_disjoint(&e, "remote-944").await;
+        let before_bytes = e.bytes_written();
+        let before_audit = e.audit().len();
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.ops().await, 0, "no git_operations row was created at any point");
+
+        let merged_api = e.read_bytes("/src/api.rs").await;
+        assert_eq!(
+            e.bytes_written() - before_bytes,
+            merged_api.len() as i64,
+            "exactly the bytes of the one file the merge rewrote"
+        );
+
+        let new_audit: Vec<_> = e.audit().into_iter().skip(before_audit).collect();
+        let pulls: Vec<_> = new_audit.iter().filter(|a| a.op == "git.remote_pull").collect();
+        assert_eq!(pulls.len(), 1);
+        assert!(pulls[0].detail.contains("merged"), "got {}", pulls[0].detail);
+        assert!(!pulls[0].detail.contains("conflict"), "got {}", pulls[0].detail);
+
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await.as_deref(),
+            Some(remote_tip.as_str())
+        );
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let commit = repo
+            .find_commit(git2::Oid::from_str(out["merge_commit"].as_str().unwrap()).unwrap())
+            .unwrap();
+        assert_eq!(commit.parent_count(), 2);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), local_sha);
+        assert_eq!(commit.parent_id(1).unwrap().to_string(), remote_tip);
+        assert_eq!(
+            commit.message().unwrap().trim(),
+            "Merge remote-tracking branch 'origin/main' into main"
+        );
+    }
+
+    /// E2E-NEW-945: a pull conflict resolved with bytes belonging to neither
+    /// side (FR-NEW-175).
+    #[tokio::test]
+    async fn e2e_new_945_a_pull_conflict_resolved_with_bytes_of_neither_side() {
+        let e = Env::new().await;
+        let (_dir, url, local_sha, remote_tip) = seed_pull_conflict(&e, "remote-945").await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["operation"], "merge");
+        assert_eq!(out["conflicts"][0]["path"], PULL_CFG);
+        assert_eq!(conflict_side(&out, 0, "ours")["content"], PULL_OURS_CFG);
+        assert_eq!(conflict_side(&out, 0, "theirs")["content"], PULL_THEIRS_CFG);
+        assert_eq!(conflict_side(&out, 0, "base")["content"], PULL_BASE_CFG);
+        assert_eq!(out["continue_with"], "git.merge_resolve");
+        assert_eq!(out["abort_with"], "git.merge_abort");
+
+        let resolved =
+            "[server]\nport = 8443\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+        let done = e.resolve(json!([{"path": PULL_CFG, "content": resolved}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(done["files_changed"], 1);
+        assert_eq!(e.read(PULL_CFG).await, resolved);
+
+        let sha = done["merge_commit"].as_str().unwrap().to_string();
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            let commit = repo.find_commit(git2::Oid::from_str(&sha).unwrap()).unwrap();
+            assert_eq!(commit.parent_count(), 2);
+            assert_eq!(commit.parent_id(0).unwrap().to_string(), local_sha);
+            assert_eq!(commit.parent_id(1).unwrap().to_string(), remote_tip);
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-946: supplied content is refused for a binary path in a pull
+    /// conflict (FR-NEW-182).
+    #[tokio::test]
+    async fn e2e_new_946_supplied_content_is_refused_for_a_binary_pull_conflict() {
+        const LOGO: &str = "/assets/logo.png";
+        let base: [u8; 10] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01];
+        let mut theirs = base;
+        theirs[9] = 0x02;
+        let mut ours = base;
+        ours[9] = 0x03;
+
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-946");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        write_bare_remote_subtree(&remote_dir, "refs/heads/main", "assets", &[("logo.png", &base)]);
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.write_bytes_atomic(LOGO, &ours).await.unwrap();
+        e.commit("local logo").await;
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "assets",
+            &[("logo.png", &theirs)],
+        );
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"][0]["path"], LOGO);
+        assert_eq!(out["conflicts"][0]["binary"], true);
+
+        let err = e.resolve(json!([{"path": LOGO, "content": "anything"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for needle in ["binary", "ours", "theirs"] {
+            assert!(err.message.contains(needle), "got {}", err.message);
+        }
+        assert_eq!(e.read_bytes(LOGO).await, ours.to_vec(), "nothing was applied");
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type.as_str(), "merge");
+        assert_eq!(row.conflicts.as_deref(), Some(format!("[\"{LOGO}\"]").as_str()));
+
+        let done = e.resolve(json!([{"path": LOGO, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.read_bytes(LOGO).await, theirs.to_vec());
+    }
+
+    /// E2E-NEW-947: one path that is not in conflict rejects the whole content
+    /// resolution (FR-NEW-177).
+    #[tokio::test]
+    async fn e2e_new_947_one_bad_path_rejects_the_whole_content_resolution() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-947");
+        let url = seed_bare_remote(&remote_dir, "hi\n");
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("config.toml", PULL_BASE_CFG.as_bytes()), ("app.rs", b"fn base() {}\n")],
+        );
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "docs",
+            &[("readme.md", b"docs\n")],
+        );
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        e.write(PULL_CFG, PULL_OURS_CFG).await;
+        e.write("/src/app.rs", "fn local() {}\n").await;
+        e.commit("local").await;
+        write_bare_remote_subtree(
+            &remote_dir,
+            "refs/heads/main",
+            "src",
+            &[("config.toml", PULL_THEIRS_CFG.as_bytes()), ("app.rs", b"fn remote() {}\n")],
+        );
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"].as_array().unwrap().len(), 2);
+        let before = e.byte_map().await;
+
+        let err = e
+            .resolve(json!([
+                {"path": PULL_CFG, "content": "port = 8443\n"},
+                {"path": "/src/app.rs", "content": "fn main() {}\n"},
+                {"path": "/docs/readme.md", "content": "docs\n"},
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("/docs/readme.md"), "got {}", err.message);
+        assert!(err.message.contains("not in conflict"), "got {}", err.message);
+
+        let row = e.op_row().await.unwrap();
+        assert!(
+            row.resolutions.as_deref().is_none_or(|r| r == "{}"),
+            "the call is all-or-nothing: got {:?}",
+            row.resolutions
+        );
+        assert_eq!(e.byte_map().await, before, "no file changed");
+
+        let done = e
+            .resolve(json!([
+                {"path": PULL_CFG, "content": "port = 8443\n"},
+                {"path": "/src/app.rs", "content": "fn main() {}\n"},
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.read_bytes(PULL_CFG).await, b"port = 8443\n");
+    }
+
+    /// E2E-NEW-948: empty supplied content produces an empty file, not a
+    /// deletion (FR-NEW-175).
+    #[tokio::test]
+    async fn e2e_new_948_empty_supplied_content_produces_an_empty_file() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote) = seed_pull_conflict(&e, "remote-948").await;
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        let done = e.resolve(json!([{"path": PULL_CFG, "content": ""}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        assert!(client.exists(PULL_CFG).await.unwrap(), "an empty string is content");
+        assert_eq!(e.read_bytes(PULL_CFG).await.len(), 0);
+        let show = e
+            .call(
+                "git.show",
+                json!({"mount_id": MOUNT, "commit_sha": done["merge_commit"].as_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        let listed = serde_json::to_string(&show).unwrap();
+        assert!(listed.contains("src/config.toml"), "the tree still carries the entry: {listed}");
+
+        // Contrasting fresh run: a side strategy yields the remote content, so
+        // the empty case is not a silent fallback.
+        let e2 = Env::new().await;
+        let (_d2, url2, _l2, _r2) = seed_pull_conflict(&e2, "remote-948b").await;
+        call_pull_branch(&e2, &url2, "main", "anonymous").await.unwrap();
+        e2.resolve(json!([{"path": PULL_CFG, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(e2.read(PULL_CFG).await, PULL_THEIRS_CFG);
+    }
+
+    /// E2E-NEW-949: the resolved pull charges exactly the written bytes and
+    /// clears the row (FR-NEW-184, FR-NEW-284).
+    #[tokio::test]
+    async fn e2e_new_949_the_resolved_pull_charges_exactly_the_written_bytes() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote) = seed_pull_conflict(&e, "remote-949").await;
+        let pre_pull_bytes = e.bytes_written();
+
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.bytes_written(), pre_pull_bytes, "a conflict charges nothing");
+        let paused_bytes = e.bytes_written();
+        let paused_audit = e.audit().len();
+
+        let resolved =
+            "[server]\nport = 8443\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+        let done = e.resolve(json!([{"path": PULL_CFG, "content": resolved}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.bytes_written() - paused_bytes, resolved.len() as i64);
+        assert_eq!(e.ops().await, 0);
+
+        let new_audit: Vec<_> = e.audit().into_iter().skip(paused_audit).collect();
+        let resolves: Vec<_> = new_audit.iter().filter(|a| a.op == "git.merge_resolve").collect();
+        assert_eq!(resolves.len(), 1);
+        assert!(resolves[0].detail.contains("merged"), "got {}", resolves[0].detail);
+
+        let err = e.abort().await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no merge is in progress"), "got {}", err.message);
     }
 
     // ── FR-NEW-036/055/069: pull's write-quota charge is the delta ──────────
@@ -5685,7 +11560,7 @@ mod tests {
 
         advance_bare_remote(&remote_dir, "refs/heads/main", "01234567890");
 
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
 
         let client = e.f.state.stores.client(MOUNT).await.unwrap();
@@ -5713,7 +11588,7 @@ mod tests {
 
         advance_bare_remote(&remote_dir, "refs/heads/main", "0123456789");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(out["files_changed"], 1);
         assert_eq!(
             e.f.state.safety.bytes_written(OWNER, MOUNT),
@@ -5734,7 +11609,7 @@ mod tests {
 
         advance_bare_remote(&remote_dir, "refs/heads/main", "0123456789");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(out["files_changed"], 1);
         assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 800, "charged 790 + 10, not more");
         assert_eq!(e.read("/EXTRA.md").await, "0123456789");
@@ -5761,7 +11636,7 @@ mod tests {
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", &"B".repeat(20));
 
         let err =
-            call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap_err();
+            call_pull_then_resolve(&e, &url, "main", "anonymous", "theirs").await.unwrap_err();
         assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
 
         let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
@@ -5796,7 +11671,7 @@ mod tests {
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", &"C".repeat(4 * MB));
 
         let err =
-            call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap_err();
+            call_pull_then_resolve(&e, &url, "main", "anonymous", "theirs").await.unwrap_err();
         assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
 
         let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
@@ -5822,7 +11697,7 @@ mod tests {
 
         let tip = advance_bare_remote_same_tree(&remote_dir, "refs/heads/main");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap();
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
         assert_eq!(out["new_sha"], tip);
         assert_eq!(out["files_changed"], 0, "an identical tree diffs to no changes");
         assert_eq!(
@@ -5870,7 +11745,7 @@ mod tests {
         let before_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
 
         let err =
-            call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap_err();
+            call_pull_then_resolve(&e, &url, "main", "anonymous", "theirs").await.unwrap_err();
         assert!(err.message.contains("blocked"), "must name the failing path: {}", err.message);
 
         let after_head = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target;
@@ -5906,7 +11781,7 @@ mod tests {
             "no fetch has happened yet"
         );
 
-        let err = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap_err();
+        let err = call_pull_then_resolve(&e, &url, "main", "anonymous", "ours").await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
 
         assert!(
@@ -5930,8 +11805,11 @@ mod tests {
         e.commit("add a").await;
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "b.txt", "remote add\n");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("ours")).await.unwrap();
-        assert_eq!(out["conflicts_resolved"], 0);
+        let out = call_pull_then_resolve(&e, &url, "main", "anonymous", "ours").await.unwrap();
+        // Disjoint files never conflict, so the pull merged on its own and no
+        // resolution was needed at all (FR-MOD-104).
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.ops().await, 0);
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         let repo = entry.repo.lock().await;
@@ -5945,8 +11823,8 @@ mod tests {
     }
 
     /// E2E-NEW-140: the merge commit's author and committer are the
-    /// authenticated person, its message is exactly `Merge origin/main into \
-    /// main (conflicts resolved: theirs)`, and `git.log` shows that message.
+    /// authenticated person, its message is exactly `Merge origin/main into
+    /// main`, and `git.log` shows that message.
     #[tokio::test]
     async fn e2e_new_140_the_merge_commit_records_author_and_strategy() {
         let e = Env::new().await;
@@ -5958,7 +11836,7 @@ mod tests {
         e.commit("local change").await;
         advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", "fn remote()\n");
 
-        let out = call_pull_branch(&e, &url, "main", "anonymous", Some("theirs")).await.unwrap();
+        let out = call_pull_then_resolve(&e, &url, "main", "anonymous", "theirs").await.unwrap();
         let merge_sha = out["merge_commit"].as_str().unwrap();
 
         {
@@ -5968,10 +11846,9 @@ mod tests {
             assert_eq!(commit.author().name().unwrap(), OWNER.split('@').next().unwrap());
             assert_eq!(commit.author().email().unwrap(), OWNER);
             assert_eq!(commit.committer().email().unwrap(), OWNER);
-            assert_eq!(
-                commit.message().unwrap().trim(),
-                "Merge origin/main into main (conflicts resolved: theirs)"
-            );
+            // The merge commit of a resolved pull is created by
+            // git.merge_resolve, whose message names the source ref.
+            assert_eq!(commit.message().unwrap().trim(), "Merge origin/main into main");
         }
 
         let log = e.call("git.log", json!({"mount_id": MOUNT})).await.unwrap();
@@ -5982,8 +11859,7 @@ mod tests {
             .map(|c| c["message"].as_str().unwrap().to_string())
             .collect();
         assert!(
-            messages
-                .contains(&"Merge origin/main into main (conflicts resolved: theirs)".to_string()),
+            messages.contains(&"Merge origin/main into main".to_string()),
             "git.log must show the merge message: {messages:?}"
         );
     }
@@ -6115,7 +11991,7 @@ mod tests {
         let url1 = seed_bare_remote(&remote_dir1, "hi\n");
         call_clone_and_import(&e1, &url1, "anonymous").await.unwrap();
         e1.write("/README.md", "dirty\n").await;
-        let dirty_err = call_pull_branch(&e1, &url1, "main", "anonymous", None).await.unwrap_err();
+        let dirty_err = call_pull_branch(&e1, &url1, "main", "anonymous").await.unwrap_err();
 
         let e2 = Env::new().await;
         let remote_dir2 = e2.f.dir.path().join("remote-182-diverged");
@@ -6124,22 +12000,18 @@ mod tests {
         e2.write("/README.md", "local\n").await;
         e2.commit("local change").await;
         advance_bare_remote_write(&remote_dir2, "refs/heads/main", "README.md", "remote\n");
-        let diverged_err =
-            call_pull_branch(&e2, &url2, "main", "anonymous", None).await.unwrap_err();
+        let diverged = call_pull_branch(&e2, &url2, "main", "anonymous").await.unwrap();
 
         assert_eq!(dirty_err.code, code::INVALID_ARGUMENT);
-        assert_eq!(diverged_err.code, code::INVALID_ARGUMENT);
         assert!(
             dirty_err.message.starts_with("pull refused: volume has uncommitted changes"),
             "got {}",
             dirty_err.message
         );
-        assert!(
-            diverged_err.message.starts_with("pull refused: not a fast-forward"),
-            "got {}",
-            diverged_err.message
-        );
-        assert_ne!(dirty_err.message, diverged_err.message);
+        // FR-MOD-104: the diverged pull is no longer a failure; it pauses on
+        // the shared conflict response, which no refusal can be confused with.
+        assert_eq!(diverged["status"], "conflict");
+        assert_eq!(diverged["operation"], "merge");
     }
 
     /// E2E-NEW-183: the timeout code and message prefix are exact
@@ -6286,12 +12158,16 @@ mod tests {
             push_branch(
                 e.git.clone(),
                 MOUNT,
+                "origin",
                 "main",
+                None,
                 &url,
                 t2,
                 a2,
                 OWNER,
                 e.f.state.safety.clone(),
+                false,
+                None,
             )
             .await
             .unwrap();
@@ -6304,9 +12180,18 @@ mod tests {
             )
             .await
             .unwrap();
-            fetch_branch(e.git.clone(), MOUNT, &url, t3, a3, OWNER, e.f.state.safety.clone())
-                .await
-                .unwrap();
+            fetch_branch(
+                e.git.clone(),
+                MOUNT,
+                "origin",
+                &url,
+                t3,
+                a3,
+                OWNER,
+                e.f.state.safety.clone(),
+            )
+            .await
+            .unwrap();
 
             advance_bare_remote(&remote_dir, "refs/heads/main", "c2\n");
             let (t4, a4) = resolve_clone_credential(
@@ -6321,6 +12206,7 @@ mod tests {
             let client = e.f.state.stores.client(MOUNT).await.unwrap();
             pull_branch(
                 entry,
+                "origin",
                 "main",
                 &local_sha,
                 &url,
@@ -6329,7 +12215,6 @@ mod tests {
                 client,
                 OWNER,
                 e.f.state.safety.clone(),
-                None,
                 e.git.config().git.remote_timeout_secs,
             )
             .await
@@ -6422,12 +12307,16 @@ mod tests {
             let push_err = push_branch(
                 e.git.clone(),
                 MOUNT,
+                "origin",
                 "main",
+                None,
                 &bogus_url,
                 resolved_token.clone(),
                 auth.clone(),
                 OWNER,
                 e.f.state.safety.clone(),
+                false,
+                None,
             )
             .await
             .unwrap_err();
@@ -6436,6 +12325,7 @@ mod tests {
             let fetch_err = fetch_branch(
                 e.git.clone(),
                 MOUNT,
+                "origin",
                 &bogus_url,
                 resolved_token,
                 auth,
@@ -6493,12 +12383,16 @@ mod tests {
             push_branch(
                 e.git.clone(),
                 MOUNT,
+                "origin",
                 "main",
+                None,
                 &url,
                 t2,
                 a2,
                 OWNER,
                 e.f.state.safety.clone(),
+                false,
+                None,
             )
             .await
             .unwrap();
@@ -6511,9 +12405,18 @@ mod tests {
             )
             .await
             .unwrap();
-            fetch_branch(e.git.clone(), MOUNT, &url, t3, a3, OWNER, e.f.state.safety.clone())
-                .await
-                .unwrap();
+            fetch_branch(
+                e.git.clone(),
+                MOUNT,
+                "origin",
+                &url,
+                t3,
+                a3,
+                OWNER,
+                e.f.state.safety.clone(),
+            )
+            .await
+            .unwrap();
 
             let log = e.f.state.safety.audit(OWNER, MOUNT);
             assert!(!log.is_empty());
@@ -6561,7 +12464,7 @@ mod tests {
         call_fetch_branch(&e, &url, "anonymous").await.unwrap();
 
         e.write("/dirty.txt", "uncommitted\n").await;
-        let err = call_pull_branch(&e, &url, "main", "anonymous", None).await.unwrap_err();
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
         assert_eq!(err.code, code::INVALID_ARGUMENT);
         assert!(err.message.contains("uncommitted changes"), "got {}", err.message);
 
@@ -6666,5 +12569,10426 @@ mod tests {
                 }
             }
         });
+    }
+
+    // ── git.merge (US-002) ──────────────────────────────────────────────────
+
+    const CFG: &str = "/src/config.toml";
+    const BASE_CFG: &str =
+        "[server]\nport = 8080\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    /// SEED-CONFLICT and SEED-AUTOMERGE share this base: main moves line 2,
+    /// feature moves line 2 (conflict) or line 5 (auto-mergeable).
+    const MAIN_CFG: &str =
+        "[server]\nport = 8000\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    const FEATURE_CFG_CONFLICT: &str =
+        "[server]\nport = 9090\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    const FEATURE_CFG_AUTOMERGE: &str =
+        "[server]\nport = 8080\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 60\nretries = 2\n";
+    const MERGED_CFG: &str =
+        "[server]\nport = 8000\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 60\nretries = 2\n";
+
+    impl Env {
+        async fn entry(&self) -> Arc<GitRepoEntry> {
+            self.git.get_or_open_repo(MOUNT).await.unwrap()
+        }
+
+        async fn set_branch(&self, branch: &str, sha: &str) {
+            self.entry()
+                .await
+                .db
+                .set_ref(&format!("refs/heads/{branch}"), sha, false)
+                .await
+                .unwrap();
+        }
+
+        /// Move `HEAD` to `branch`, the only checkout this story needs
+        /// (`git.branch_switch` is a later story).
+        async fn checkout(&self, branch: &str) {
+            self.entry()
+                .await
+                .db
+                .set_ref("HEAD", &format!("refs/heads/{branch}"), true)
+                .await
+                .unwrap();
+        }
+
+        async fn ref_sha(&self, name: &str) -> Option<String> {
+            self.entry().await.db.get_ref(name).await.unwrap().map(|r| r.target)
+        }
+
+        async fn ops(&self) -> i64 {
+            self.entry().await.db.count_operations().await.unwrap()
+        }
+
+        async fn objects(&self) -> i64 {
+            self.entry().await.db.count_objects().await.unwrap()
+        }
+
+        fn audit(&self) -> Vec<crate::safety::AuditEntry> {
+            self.f.state.safety.audit(OWNER, MOUNT)
+        }
+
+        fn bytes_written(&self) -> i64 {
+            self.f.state.safety.bytes_written(OWNER, MOUNT)
+        }
+
+        /// Every file in the volume with its raw bytes: the byte-identity
+        /// snapshot FR-NEW-171 is asserted with.
+        async fn byte_map(&self) -> BTreeMap<String, Vec<u8>> {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            let mut out = BTreeMap::new();
+            for (dir, _subdirs, files) in client.walk("/").await.unwrap() {
+                for f in files {
+                    let path = if dir == "/" { format!("/{f}") } else { format!("{}/{}", dir, f) };
+                    let bytes = client.read_bytes(&path).await.unwrap();
+                    out.insert(path, bytes);
+                }
+            }
+            out
+        }
+
+        async fn log_shas(&self, ref_name: &str) -> Vec<String> {
+            let out = self
+                .call("git.log", json!({"mount_id": MOUNT, "ref_name": ref_name, "limit": 100}))
+                .await
+                .unwrap();
+            out["commits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["sha"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        async fn merge(&self, source_ref: &str) -> Result<Value> {
+            self.call("git.merge", json!({"mount_id": MOUNT, "source_ref": source_ref})).await
+        }
+
+        // ── US-003 helpers ──────────────────────────────────────────────
+
+        async fn resolve(&self, resolutions: Value) -> Result<Value> {
+            self.resolve_at(MOUNT, resolutions).await
+        }
+
+        async fn resolve_at(&self, mount: &str, resolutions: Value) -> Result<Value> {
+            self.call("git.merge_resolve", json!({"mount_id": mount, "resolutions": resolutions}))
+                .await
+        }
+
+        async fn abort(&self) -> Result<Value> {
+            self.call("git.merge_abort", json!({"mount_id": MOUNT})).await
+        }
+
+        async fn read_bytes(&self, path: &str) -> Vec<u8> {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.read_bytes(path).await.unwrap()
+        }
+
+        async fn op_row(&self) -> Option<crate::git::db::GitOperationRow> {
+            self.entry().await.db.get_operation().await.unwrap()
+        }
+
+        // Mount aware variants, for the per volume isolation test.
+        async fn entry_at(&self, mount: &str) -> Arc<GitRepoEntry> {
+            self.git.get_or_open_repo(mount).await.unwrap()
+        }
+
+        async fn write_at(&self, mount: &str, path: &str, content: &str) {
+            let client = self.f.state.stores.client(mount).await.unwrap();
+            client.write_text_atomic(path, content).await.unwrap();
+        }
+
+        async fn read_at(&self, mount: &str, path: &str) -> String {
+            let client = self.f.state.stores.client(mount).await.unwrap();
+            client.read_text(path).await.unwrap()
+        }
+
+        async fn commit_at(&self, mount: &str, message: &str) -> String {
+            self.call("git.commit", json!({"mount_id": mount, "message": message}))
+                .await
+                .unwrap()["commit_sha"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        async fn set_ref_at(&self, mount: &str, name: &str, target: &str, symbolic: bool) {
+            self.entry_at(mount).await.db.set_ref(name, target, symbolic).await.unwrap();
+        }
+    }
+
+    /// SEED-CONFLICT on an arbitrary mount, for E2E-NEW-578.
+    async fn seed_conflict_at(e: &Env, mount: &str) {
+        e.call("git.init", json!({"mount_id": mount})).await.unwrap();
+        e.write_at(mount, CFG, BASE_CFG).await;
+        let c0 = e.commit_at(mount, "C0").await;
+        e.set_ref_at(mount, "refs/heads/feature", &c0, false).await;
+        e.set_ref_at(mount, "HEAD", "refs/heads/feature", true).await;
+        e.write_at(mount, CFG, FEATURE_CFG_CONFLICT).await;
+        e.commit_at(mount, "C1").await;
+        e.set_ref_at(mount, "HEAD", "refs/heads/main", true).await;
+        e.write_at(mount, CFG, MAIN_CFG).await;
+        e.commit_at(mount, "C2").await;
+    }
+
+    /// C0 on `main`, `feature` forking from it as C1, then `main` as C2.
+    /// Each tuple is (path, base content, feature content, main content); a
+    /// `None` main content leaves `main` at C0, which is SEED-FF.
+    async fn seed_diverged(
+        e: &Env,
+        files: &[(&str, &str, &str, Option<&str>)],
+    ) -> (String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        for (path, base, _, _) in files {
+            e.write(path, base).await;
+        }
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        for (path, _, feature, _) in files {
+            e.write(path, feature).await;
+        }
+        let c1 = e.commit("C1").await;
+
+        e.checkout("main").await;
+        let mut c2 = c0.clone();
+        if files.iter().any(|(_, _, _, m)| m.is_some()) {
+            for (path, base, _, main) in files {
+                e.write(path, main.unwrap_or(base)).await;
+            }
+            c2 = e.commit("C2").await;
+        } else {
+            // SEED-FF: `main` stays at C0, so the volume is restored to the
+            // base content without a commit.
+            for (path, base, _, _) in files {
+                e.write(path, base).await;
+            }
+        }
+        (c0, c1, c2)
+    }
+
+    async fn seed_conflict(e: &Env) -> (String, String, String) {
+        seed_diverged(e, &[(CFG, BASE_CFG, FEATURE_CFG_CONFLICT, Some(MAIN_CFG))]).await
+    }
+
+    async fn seed_automerge(e: &Env) -> (String, String, String) {
+        seed_diverged(e, &[(CFG, BASE_CFG, FEATURE_CFG_AUTOMERGE, Some(MAIN_CFG))]).await
+    }
+
+    /// SEED-FF: `main` at C0, `feature` one commit ahead writing `hello\n`.
+    async fn seed_ff(e: &Env) -> (String, String) {
+        let (c0, c1, _) = seed_diverged(e, &[("/docs/readme.md", "old\n", "hello\n", None)]).await;
+        (c0, c1)
+    }
+
+    /// SEED-MULTI(n): n files conflicting on the same line.
+    async fn seed_multi(e: &Env, n: usize) -> Vec<String> {
+        let paths: Vec<String> = (0..n).map(|i| format!("/f/{i:03}.txt")).collect();
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        for p in &paths {
+            e.write(p, "line-BASE\n").await;
+        }
+        let c0 = e.commit("C0").await;
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        for p in &paths {
+            e.write(p, "line-FEATURE\n").await;
+        }
+        e.commit("C1").await;
+        e.checkout("main").await;
+        for p in &paths {
+            e.write(p, "line-MAIN\n").await;
+        }
+        e.commit("C2").await;
+        paths
+    }
+
+    fn conflict_side(v: &Value, path_index: usize, side: &str) -> Value {
+        v["conflicts"][path_index][side].clone()
+    }
+
+    /// E2E-NEW-500: disjoint regions merge with no caller decision.
+    #[tokio::test]
+    async fn e2e_new_500_auto_mergeable_divergence_completes_automatically() {
+        let e = Env::new().await;
+        seed_automerge(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert!(out.get("conflicts").is_none(), "a clean merge carries no conflicts key");
+        let sha = out["merge_commit"].as_str().unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(out["files_changed"], 1);
+        assert_eq!(e.read(CFG).await, MERGED_CFG);
+        assert_eq!(e.ops().await, 0, "a clean merge records no operation row");
+    }
+
+    /// E2E-NEW-501: a strictly ahead source fast-forwards.
+    #[tokio::test]
+    async fn e2e_new_501_merge_of_a_strictly_ahead_branch() {
+        let e = Env::new().await;
+        let (_c0, c1) = seed_ff(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(out["fast_forward"], true);
+        assert_eq!(out["merge_commit"], c1);
+        assert_eq!(e.read("/docs/readme.md").await, "hello\n");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c1.as_str()));
+        assert_eq!(e.log_shas("main").await.len(), 2, "no commit was created");
+    }
+
+    /// E2E-NEW-502: the conflict response shape, field by field, plus
+    /// FR-NEW-171 (nothing applied) and FR-NEW-172 (no markers).
+    #[tokio::test]
+    async fn e2e_new_502_conflict_response_shape() {
+        let e = Env::new().await;
+        let (c0, _c1, c2) = seed_conflict(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["operation"], "merge");
+        assert_eq!(out["source_ref"], "feature");
+        assert_eq!(out["current_step"], Value::Null);
+        assert_eq!(out["total_steps"], Value::Null);
+        assert!(out["operation_id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(out["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(out["conflicts"][0]["path"], CFG);
+        assert_eq!(conflict_side(&out, 0, "ours")["content"], MAIN_CFG);
+        assert_eq!(conflict_side(&out, 0, "theirs")["content"], FEATURE_CFG_CONFLICT);
+        assert_eq!(conflict_side(&out, 0, "base")["content"], BASE_CFG);
+        for side in ["ours", "theirs", "base"] {
+            assert_eq!(conflict_side(&out, 0, side)["exists"], true, "{side}");
+        }
+        assert_eq!(out["conflicts"][0]["binary"], false);
+        assert_eq!(out["conflicts"][0]["type_change"], false);
+        assert_eq!(out["continue_with"], "git.merge_resolve");
+        assert_eq!(out["abort_with"], "git.merge_abort");
+        // Not a key any tool emits.
+        for forbidden in ["conflicting_paths", "resolve_with", "step", "target_ref"] {
+            assert!(out.get(forbidden).is_none(), "{forbidden} must be emitted by no tool");
+        }
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_ne!(c0, c2);
+        let volume = e.read(CFG).await;
+        assert!(volume.contains("port = 8000"));
+        for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
+            assert!(!volume.contains(marker), "{marker} reached the volume");
+        }
+    }
+
+    /// E2E-NEW-510: merging an already merged branch is a reported no-op.
+    #[tokio::test]
+    async fn e2e_new_510_merging_an_already_fully_merged_branch_is_a_no_op() {
+        let e = Env::new().await;
+        seed_ff(&e).await;
+        e.merge("feature").await.unwrap();
+        let after_first = e.ref_sha("refs/heads/main").await;
+        let log_before = e.log_shas("main").await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "already_up_to_date");
+        assert_eq!(out["merge_commit"], Value::Null);
+        assert_eq!(e.ref_sha("refs/heads/main").await, after_first);
+        assert_eq!(e.log_shas("main").await, log_before);
+    }
+
+    /// E2E-NEW-515: an unknown source ref is not found, and nothing moves.
+    #[tokio::test]
+    async fn e2e_new_515_unknown_source_ref() {
+        let e = Env::new().await;
+        let (_c0, _c1, c2) = seed_conflict(&e).await;
+
+        let err = e.merge("nope").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(err.message.contains("nope"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-516: a branch cannot be merged into itself.
+    #[tokio::test]
+    async fn e2e_new_516_merging_the_checked_out_branch_into_itself() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let log_before = e.log_shas("main").await;
+
+        let err = e.merge("main").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("main"), "{}", err.message);
+        assert!(err.message.contains("itself"), "{}", err.message);
+        assert_eq!(e.log_shas("main").await, log_before);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-517: a dirty volume refuses the merge, and keeps the dirt.
+    #[tokio::test]
+    async fn e2e_new_517_dirty_volume_refuses_the_merge() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.write(CFG, "[server]\nport = 1\n").await;
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        assert_eq!(e.read(CFG).await, "[server]\nport = 1\n");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-538: no HEAD commit at all.
+    #[tokio::test]
+    async fn e2e_new_538_merge_on_a_volume_with_no_head() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no checked-out branch"), "{}", err.message);
+    }
+
+    /// E2E-NEW-539: `git.init` was never called.
+    #[tokio::test]
+    async fn e2e_new_539_merge_on_a_non_initialized_volume() {
+        let e = Env::new().await;
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains(MOUNT), "{}", err.message);
+        assert!(err.message.contains("never initialized"), "{}", err.message);
+    }
+
+    /// E2E-NEW-545 and E2E-NEW-542's parent ordering, on the clean merge this
+    /// story can reach without the resolution tools of US-003: the target ref
+    /// moves to the merge commit in both stores, and the commit carries the
+    /// target tip first and the source tip second.
+    #[tokio::test]
+    async fn e2e_new_545_target_ref_moves_to_the_merge_commit() {
+        let e = Env::new().await;
+        let (_c0, c1, c2) = seed_automerge(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        let merge_commit = out["merge_commit"].as_str().unwrap().to_string();
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(merge_commit.as_str()));
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let reference = repo.find_reference("refs/heads/main").unwrap();
+        assert_eq!(reference.peel_to_commit().unwrap().id().to_string(), merge_commit);
+        let commit = repo.find_commit(Oid::from_str(&merge_commit).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 2);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), c2);
+        assert_eq!(commit.parent_id(1).unwrap().to_string(), c1);
+    }
+
+    /// E2E-NEW-546: the source ref is untouched, and exactly one ref moved.
+    #[tokio::test]
+    async fn e2e_new_546_source_ref_is_untouched() {
+        let e = Env::new().await;
+        let (_c0, c1, _c2) = seed_automerge(&e).await;
+        let before: BTreeMap<String, String> = e
+            .entry()
+            .await
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.target))
+            .collect();
+
+        e.merge("feature").await.unwrap();
+
+        let after: BTreeMap<String, String> = e
+            .entry()
+            .await
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.target))
+            .collect();
+        assert_eq!(after.get("refs/heads/feature").map(String::as_str), Some(c1.as_str()));
+        let differing: Vec<&String> =
+            after.keys().filter(|k| after.get(*k) != before.get(*k)).collect();
+        assert_eq!(differing, vec!["refs/heads/main"], "exactly one ref may move");
+    }
+
+    /// E2E-NEW-547: exactly one audit entry per completed merge, with no sha
+    /// and no credential in its detail.
+    #[tokio::test]
+    async fn e2e_new_547_exactly_one_audit_entry_per_completed_merge() {
+        let e = Env::new().await;
+        seed_automerge(&e).await;
+        let before = e.audit().len();
+
+        e.merge("feature").await.unwrap();
+
+        let audit = e.audit();
+        assert_eq!(audit.len(), before + 1);
+        let last = audit.last().unwrap();
+        assert_eq!(last.op, "git.merge");
+        assert_eq!(last.path, "/");
+        assert!(last.detail.contains("outcome ok"), "{}", last.detail);
+        assert!(last.detail.contains("source feature"), "{}", last.detail);
+        assert!(
+            !last
+                .detail
+                .split_whitespace()
+                .any(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())),
+            "the detail must carry no sha sized token: {}",
+            last.detail
+        );
+        assert!(!last.detail.contains('@'), "{}", last.detail);
+    }
+
+    /// E2E-NEW-548: a conflicted merge audits too, with `outcome conflict`.
+    /// The `git.merge_resolve` half of the test belongs to US-003.
+    #[tokio::test]
+    async fn e2e_new_548_conflicted_merge_still_audits_with_outcome_conflict() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let before = e.audit().len();
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+
+        let audit = e.audit();
+        assert_eq!(audit.len(), before + 1);
+        let last = audit.last().unwrap();
+        assert_eq!(last.op, "git.merge");
+        assert!(last.detail.contains("outcome conflict"), "{}", last.detail);
+        assert!(last.detail.contains("conflicts 1"), "{}", last.detail);
+    }
+
+    /// E2E-NEW-556: a conflicted merge creates no commit object.
+    #[tokio::test]
+    async fn e2e_new_556_no_commit_object_on_a_conflicted_merge() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let log_before = e.log_shas("main").await;
+        let objects_before = e.objects().await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(e.log_shas("main").await, log_before);
+
+        let entry = e.entry().await;
+        let commits_with_merge = {
+            let repo = entry.repo.lock().await;
+            entry
+                .db
+                .list_objects()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|o| o.kind == "commit")
+                .filter(|o| {
+                    Oid::from_str(&o.hash)
+                        .ok()
+                        .and_then(|oid| repo.find_commit(oid).ok())
+                        .and_then(|c| c.message().map(|m| m.contains("Merge")))
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        assert_eq!(commits_with_merge, 0, "no merge commit may exist");
+        assert_eq!(e.objects().await, objects_before, "no object may be created");
+    }
+
+    /// E2E-NEW-557: no conflict marker enters the volume, whatever the shape of
+    /// the conflicting files.
+    #[tokio::test]
+    async fn e2e_new_557_no_conflict_markers_after_a_conflicted_merge() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let binary_base: Vec<u8> = vec![0, 1, 2, 3];
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+
+        e.write(CFG, BASE_CFG).await;
+        for i in 0..3 {
+            e.write(&format!("/f/{i:03}.txt"), "line-BASE\n").await;
+        }
+        client.write_bytes_atomic("/bin.dat", &binary_base).await.unwrap();
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write(CFG, FEATURE_CFG_CONFLICT).await;
+        for i in 0..3 {
+            e.write(&format!("/f/{i:03}.txt"), "line-FEATURE\n").await;
+        }
+        client.write_bytes_atomic("/bin.dat", &[0, 9, 9, 9]).await.unwrap();
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.write(CFG, MAIN_CFG).await;
+        for i in 0..3 {
+            e.write(&format!("/f/{i:03}.txt"), "line-MAIN\n").await;
+        }
+        client.write_bytes_atomic("/bin.dat", &[0, 7, 7, 7]).await.unwrap();
+        e.commit("C2").await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        // The binary side reports its existence but never its bytes.
+        let binary = out["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "/bin.dat")
+            .expect("the binary file conflicts too");
+        assert_eq!(binary["binary"], true);
+        assert_eq!(binary["ours"]["exists"], true);
+        assert_eq!(binary["ours"]["content"], Value::Null);
+
+        for (path, bytes) in e.byte_map().await {
+            for marker in [b"<<<<<<<".as_slice(), b"=======".as_slice(), b">>>>>>>".as_slice()] {
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker),
+                    "{path} carries a conflict marker"
+                );
+            }
+        }
+    }
+
+    /// E2E-NEW-560: the volume is byte-identical after a conflicted merge.
+    #[tokio::test]
+    async fn e2e_new_560_volume_byte_identical_after_a_conflicted_merge() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.write("/keep.txt", "k\n").await;
+        e.commit("keep").await;
+        let before = e.byte_map().await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(e.byte_map().await, before);
+    }
+
+    /// E2E-NEW-568: an empty base side reports `exists` true with empty content.
+    #[tokio::test]
+    async fn e2e_new_568_empty_file_on_one_side() {
+        let e = Env::new().await;
+        seed_diverged(&e, &[("/flag", "", "on\n", Some("off\n"))]).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"][0]["base"]["exists"], true);
+        assert_eq!(out["conflicts"][0]["base"]["content"], "");
+        assert_eq!(out["conflicts"][0]["ours"]["content"], "off\n");
+        assert_eq!(out["conflicts"][0]["theirs"]["content"], "on\n");
+    }
+
+    /// E2E-NEW-569: 250 conflicting files are one operation, not 250, and every
+    /// path is reported in sorted order with all three sides.
+    #[tokio::test]
+    async fn e2e_new_569_250_conflicting_files() {
+        let e = Env::new().await;
+        let paths = seed_multi(&e, 250).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        let conflicts = out["conflicts"].as_array().unwrap();
+        assert_eq!(conflicts.len(), 250);
+        let reported: Vec<&str> = conflicts.iter().map(|c| c["path"].as_str().unwrap()).collect();
+        assert_eq!(reported, paths.iter().map(String::as_str).collect::<Vec<_>>());
+        for c in conflicts {
+            assert_eq!(c["ours"]["content"], "line-MAIN\n");
+            assert_eq!(c["theirs"]["content"], "line-FEATURE\n");
+            assert_eq!(c["base"]["content"], "line-BASE\n");
+        }
+        assert_eq!(e.ops().await, 1, "one row, not 250");
+    }
+
+    /// E2E-NEW-573: unrelated histories conflict with no base side.
+    #[tokio::test]
+    async fn e2e_new_573_unrelated_histories_have_no_common_ancestor() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "alpha\n").await;
+        let c0 = e.commit("C0").await;
+
+        // An orphan branch: `HEAD` points at a branch with no ref yet, so the
+        // commit gets no parent.
+        e.checkout("island").await;
+        e.write("/a.txt", "omega\n").await;
+        e.commit("island").await;
+
+        e.checkout("main").await;
+        e.write("/a.txt", "alpha\n").await;
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c0.as_str()));
+
+        let out = e.merge("island").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"][0]["base"]["exists"], false);
+        assert_eq!(out["conflicts"][0]["base"]["content"], Value::Null);
+        assert_eq!(out["conflicts"][0]["ours"]["content"], "alpha\n");
+        assert_eq!(out["conflicts"][0]["theirs"]["content"], "omega\n");
+    }
+
+    /// E2E-NEW-574: a conflicting path at the length ceiling is reported
+    /// character for character. The resolution half belongs to US-003.
+    #[tokio::test]
+    async fn e2e_new_574_conflicting_path_at_the_length_ceiling() {
+        let e = Env::new().await;
+        let long = format!("/{}/x.txt", "d".repeat(240));
+        seed_diverged(&e, &[(long.as_str(), "base\n", "B\n", Some("A\n"))]).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"][0]["path"].as_str().unwrap(), long.as_str());
+    }
+
+    /// E2E-NEW-577: two concurrent merges, exactly one wins.
+    #[tokio::test]
+    async fn e2e_new_577_two_concurrent_merges_exactly_one_wins() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let before = e.byte_map().await;
+
+        let (a, b) = tokio::join!(e.merge("feature"), e.merge("feature"));
+        let mut conflicts = 0;
+        let mut refused = 0;
+        for r in [a, b] {
+            match r {
+                Ok(v) => {
+                    assert_eq!(v["status"], "conflict");
+                    conflicts += 1;
+                }
+                Err(err) => {
+                    assert_eq!(err.code, code::INVALID_ARGUMENT);
+                    assert!(err.message.contains("in progress"), "{}", err.message);
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!((conflicts, refused), (1, 1));
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.byte_map().await, before);
+    }
+
+    /// E2E-NEW-835: an automatic merge records nothing to resolve.
+    #[tokio::test]
+    async fn e2e_new_835_an_automatic_merge_records_nothing_to_resolve() {
+        let e = Env::new().await;
+        seed_automerge(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        for absent in ["continue_with", "abort_with", "operation_id", "conflicts"] {
+            assert!(out.get(absent).is_none(), "{absent} must be absent from a clean merge");
+        }
+        assert_eq!(e.ops().await, 0);
+        let st = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(st["operation"], Value::Null, "nothing is in progress");
+        assert_eq!(e.ops().await, 0);
+
+        let audit: Vec<_> = e.audit().into_iter().filter(|a| a.op == "git.merge").collect();
+        assert_eq!(audit.len(), 1);
+        assert!(audit[0].detail.contains("merged"), "{}", audit[0].detail);
+        assert!(!audit[0].detail.contains("conflict"), "{}", audit[0].detail);
+    }
+
+    /// E2E-NEW-842: the no-op merge charges no quota and claims no sha.
+    #[tokio::test]
+    async fn e2e_new_842_the_no_op_merge_charges_no_quota() {
+        let e = Env::new().await;
+        seed_ff(&e).await;
+        e.merge("feature").await.unwrap();
+        let before_bytes = e.bytes_written();
+        let before_audit = e.audit().len();
+        let before_ref = e.ref_sha("refs/heads/main").await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "already_up_to_date");
+        assert_eq!(e.bytes_written(), before_bytes);
+        for entry in e.audit().into_iter().skip(before_audit) {
+            assert!(entry.detail.contains("already_up_to_date"), "{}", entry.detail);
+            assert!(
+                !entry
+                    .detail
+                    .split_whitespace()
+                    .any(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())),
+                "{}",
+                entry.detail
+            );
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await, before_ref);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-843: an ancestor is an ancestor whether named by ref or by sha.
+    /// The story's second half, merging `main` by name, is pinned by
+    /// E2E-NEW-516 as the self-merge refusal instead: FR-NEW-190's explicit
+    /// refusal is the narrower rule and wins.
+    #[tokio::test]
+    async fn e2e_new_843_merging_a_raw_sha_that_is_already_an_ancestor() {
+        let e = Env::new().await;
+        let (c0, _c1) = seed_ff(&e).await;
+        e.merge("feature").await.unwrap();
+        let log_before = e.log_shas("main").await;
+
+        let out = e.merge(&c0).await.unwrap();
+        assert_eq!(out["status"], "already_up_to_date");
+        assert_eq!(out["merge_commit"], Value::Null);
+
+        let err = e.merge("main").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("itself"), "{}", err.message);
+        assert_eq!(e.log_shas("main").await, log_before);
+    }
+
+    /// E2E-NEW-845: the fast-forward creates no object at all.
+    /// The story's `status == "fast_forward"` and null `merge_commit` lines
+    /// contradict FR-NEW-199's closed status set and E2E-NEW-501, which both
+    /// win: a fast-forward reports `merged` with `fast_forward: true` and the
+    /// sha the branch moved to.
+    #[tokio::test]
+    async fn e2e_new_845_the_fast_forward_creates_no_new_object_at_all() {
+        let e = Env::new().await;
+        let (_c0, c1) = seed_ff(&e).await;
+        let before_objects = e.objects().await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(out["fast_forward"], true);
+        assert_eq!(out["merge_commit"], c1);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c1.as_str()));
+        assert_eq!(e.objects().await, before_objects, "no object may be created");
+        assert_eq!(e.log_shas("main").await, e.log_shas("feature").await);
+    }
+
+    /// E2E-NEW-846: dirt consisting only of an untracked file still refuses.
+    #[tokio::test]
+    async fn e2e_new_846_untracked_file_dirt_still_refuses() {
+        let e = Env::new().await;
+        seed_automerge(&e).await;
+        let before_ref = e.ref_sha("refs/heads/main").await;
+        e.write("/notes.md", "todo\n").await;
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for expected in ["uncommitted changes", "git.commit", "git.stash_save"] {
+            assert!(err.message.contains(expected), "{}: {}", expected, err.message);
+        }
+        assert_eq!(e.read("/notes.md").await, "todo\n");
+        assert!(e.read(CFG).await.contains("port = 8000"));
+        assert_eq!(e.ref_sha("refs/heads/main").await, before_ref);
+    }
+
+    /// E2E-NEW-847: the dirty refusal leaves no row, no object and no ref move,
+    /// and the volume usable: committing the dirt then merging conflicts
+    /// normally.
+    #[tokio::test]
+    async fn e2e_new_847_the_dirty_refusal_records_no_operation() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let before_objects = e.objects().await;
+        let before_refs: Vec<(String, String)> = e
+            .entry()
+            .await
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.target))
+            .collect();
+        e.write(CFG, &MAIN_CFG.replace("retries = 2", "retries = 9")).await;
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.objects().await, before_objects);
+        let after_refs: Vec<(String, String)> = e
+            .entry()
+            .await
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.target))
+            .collect();
+        assert_eq!(after_refs, before_refs);
+
+        e.call("git.commit", json!({"mount_id": MOUNT, "message": "retries"})).await.unwrap();
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+    }
+
+    /// E2E-NEW-848: a well formed but absent sha, and an absent full ref path.
+    #[tokio::test]
+    async fn e2e_new_848_a_well_formed_but_absent_40_hex_sha() {
+        let e = Env::new().await;
+        let (_c0, _c1, c2) = seed_conflict(&e).await;
+        let ghost = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let err = e.merge(ghost).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(err.message.contains(ghost), "{}", err.message);
+
+        let err = e.merge("refs/heads/ghost").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(err.message.contains("refs/heads/ghost"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-849: the unknown source is rejected before anything is recorded,
+    /// even with `squash` set.
+    #[tokio::test]
+    async fn e2e_new_849_unknown_source_rejected_before_anything() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let before_audit = e.audit();
+        let before_bytes = e.bytes_written();
+        let before_cfg = e.read(CFG).await;
+
+        let err = e
+            .call("git.merge", json!({"mount_id": MOUNT, "source_ref": "nope", "squash": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(err.message.contains("nope"), "{}", err.message);
+
+        let after = e.audit();
+        assert_eq!(after.len(), before_audit.len());
+        assert_eq!(e.bytes_written(), before_bytes);
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.read(CFG).await, before_cfg);
+    }
+
+    /// E2E-NEW-870: a paused merge survives a store reopen with its conflict
+    /// set intact, and `git.status` reports it. The completion across the
+    /// restart boundary belongs to US-003.
+    #[tokio::test]
+    async fn e2e_new_870_a_paused_merge_survives_the_reopen() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        let captured = e.entry().await.db.get_operation().await.unwrap().unwrap();
+        assert_eq!(captured.state, "conflicted", "FR-NEW-188: never 'paused'");
+
+        // The reopen: drop every cached repository handle and rebuild from the
+        // same configuration.
+        let store =
+            Arc::new(GitRepoStore::new(e.f.state.config.clone(), crate::storage::test_registry()));
+        let mut reg = ToolRegistry::new();
+        register_with(&mut reg, Some(store.clone()), Some(e.tokens.clone()));
+        let st = e.f.call(&reg, OWNER, "git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(st["operation"]["op_type"], "merge");
+        assert_eq!(
+            st["operation"]["remaining_conflicts"],
+            json!(["/f/000.txt", "/f/001.txt", "/f/002.txt"])
+        );
+        assert_eq!(st["operation"]["current_step"], Value::Null);
+        assert_eq!(st["operation"]["total_steps"], Value::Null);
+        assert_eq!(st["operation"]["source_ref"], "feature");
+        assert_eq!(st["operation"]["continue_with"], "git.merge_resolve");
+        assert_eq!(st["operation"]["abort_with"], "git.merge_abort");
+
+        let reread = store.get_or_open_repo(MOUNT).await.unwrap().db.get_operation().await.unwrap();
+        assert_eq!(reread.as_ref(), Some(&captured), "a reopen is not a write");
+    }
+
+    // ── git.merge_resolve / git.merge_abort (US-003) ──────────────────────
+
+    /// E2E-NEW-503: resolve by strategy `ours` completes the merge with the
+    /// checked-out branch's side.
+    #[tokio::test]
+    async fn e2e_new_503_resolve_by_strategy_ours() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+
+        let out = e.resolve(json!([{"path": CFG, "strategy": "ours"}])).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        let sha = out["merge_commit"].as_str().unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(out["remaining_conflicts"], json!([]));
+
+        assert_eq!(e.read(CFG).await.split('\n').nth(1).unwrap(), "port = 8000");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-504: caller supplied content wins over both sides, byte for byte.
+    #[tokio::test]
+    async fn e2e_new_504_resolve_by_literal_content() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let manual =
+            "[server]\nport = 9000\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+
+        let out = e.resolve(json!([{"path": CFG, "content": manual}])).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.read_bytes(CFG).await, manual.as_bytes());
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let oid = Oid::from_str(out["merge_commit"].as_str().unwrap()).unwrap();
+        let blob = repo
+            .find_commit(oid)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("src/config.toml"))
+            .unwrap()
+            .id();
+        assert_eq!(blob, Oid::hash_object(git2::ObjectType::Blob, manual.as_bytes()).unwrap());
+    }
+
+    /// E2E-NEW-505: strategies and content mix freely in one call.
+    #[tokio::test]
+    async fn e2e_new_505_mixed_strategy_and_content() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+
+        let out = e
+            .resolve(json!([
+                {"path": "/f/000.txt", "strategy": "ours"},
+                {"path": "/f/001.txt", "strategy": "theirs"},
+                {"path": "/f/002.txt", "content": "line-MANUAL\n"},
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(out["remaining_conflicts"], json!([]));
+        assert_eq!(e.read("/f/000.txt").await, "line-MAIN\n");
+        assert_eq!(e.read("/f/001.txt").await, "line-FEATURE\n");
+        assert_eq!(e.read("/f/002.txt").await, "line-MANUAL\n");
+    }
+
+    /// E2E-NEW-507: abort restores the pre-merge state and clears the row.
+    #[tokio::test]
+    async fn e2e_new_507_merge_abort_restores_pre_merge_state() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let head_before = e.ref_sha("refs/heads/main").await.unwrap();
+        let bytes_before = e.read_bytes(CFG).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+
+        let out = e.abort().await.unwrap();
+        assert_eq!(out["status"], "aborted");
+        assert_eq!(out["operation"], "merge");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(head_before.as_str()));
+        let head = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap();
+        assert!(head.symbolic);
+        assert_eq!(head.target, "refs/heads/main");
+        assert_eq!(e.read_bytes(CFG).await, bytes_before);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-518: a path that is not in conflict rejects the whole call.
+    #[tokio::test]
+    async fn e2e_new_518_resolving_a_path_that_is_not_in_conflict() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.write("/keep.txt", "k\n").await;
+        e.commit("keep").await;
+        e.merge("feature").await.unwrap();
+        let log_before = e.log_shas("main").await;
+
+        let err = e.resolve(json!([{"path": "/keep.txt", "strategy": "ours"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("/keep.txt"), "{}", err.message);
+        assert!(err.message.contains("not in conflict"), "{}", err.message);
+
+        let st = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(st["operation"]["remaining_conflicts"], json!([CFG]));
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.log_shas("main").await, log_before, "no commit was created");
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-521: strategy and content are mutually exclusive.
+    #[tokio::test]
+    async fn e2e_new_521_strategy_and_content_both_supplied() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e
+            .resolve(json!([{"path": CFG, "strategy": "ours", "content": "x\n"}]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for expected in ["strategy", "content", "exactly one"] {
+            assert!(err.message.contains(expected), "{expected}: {}", err.message);
+        }
+        assert_eq!(e.ops().await, 1);
+        assert!(e.read(CFG).await.contains("port = 8000"));
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-522: neither strategy nor content is the same refusal.
+    #[tokio::test]
+    async fn e2e_new_522_neither_strategy_nor_content() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e.resolve(json!([{"path": CFG}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("exactly one"), "{}", err.message);
+        assert_eq!(e.ops().await, 1);
+        assert!(e.read(CFG).await.contains("port = 8000"));
+    }
+
+    /// E2E-NEW-523: the strategy match is exact and lowercase only.
+    #[tokio::test]
+    async fn e2e_new_523_strategy_is_case_sensitive() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e.resolve(json!([{"path": CFG, "strategy": "Ours"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for expected in ["'ours'", "'theirs'", "Ours"] {
+            assert!(err.message.contains(expected), "{expected}: {}", err.message);
+        }
+        assert_eq!(e.ops().await, 1);
+    }
+
+    /// E2E-NEW-524: an unknown strategy names both accepted values.
+    #[tokio::test]
+    async fn e2e_new_524_unknown_strategy_value() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e.resolve(json!([{"path": CFG, "strategy": "union"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for expected in ["union", "'ours'", "'theirs'"] {
+            assert!(err.message.contains(expected), "{expected}: {}", err.message);
+        }
+        assert_eq!(e.ops().await, 1);
+    }
+
+    /// E2E-NEW-525: an empty resolutions list resolves nothing.
+    #[tokio::test]
+    async fn e2e_new_525_empty_resolutions_list() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e.resolve(json!([])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for expected in ["resolutions", "at least one"] {
+            assert!(err.message.contains(expected), "{expected}: {}", err.message);
+        }
+        let st = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(st["operation"]["remaining_conflicts"], json!([CFG]));
+        assert_eq!(e.ops().await, 1);
+    }
+
+    /// E2E-NEW-527: the same path twice in one call is a refusal, not a
+    /// last-one-wins.
+    #[tokio::test]
+    async fn e2e_new_527_same_path_twice_in_one_call() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e
+            .resolve(json!([
+                {"path": CFG, "strategy": "ours"},
+                {"path": CFG, "strategy": "theirs"},
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains(CFG), "{}", err.message);
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+        assert_eq!(e.ops().await, 1);
+        assert!(e.read(CFG).await.contains("port = 8000"));
+    }
+
+    /// E2E-NEW-536: the quota is charged before the apply, so an over-quota
+    /// merge writes nothing at all.
+    #[tokio::test]
+    async fn e2e_new_536_merge_exceeding_the_write_quota() {
+        let e = Env::with_quota(10).await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/keep.txt", "k\n").await;
+        let c0 = e.commit("C0").await;
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write("/docs/readme.md", &"a".repeat(64)).await;
+        e.commit("C1").await;
+        e.checkout("main").await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/docs/readme.md").await.unwrap();
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+        assert!(!client.is_file("/docs/readme.md").await.unwrap());
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c0.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-537: an over-quota resolution changes nothing and keeps the
+    /// operation open for a retry.
+    #[tokio::test]
+    async fn e2e_new_537_resolution_content_exceeding_the_quota() {
+        let e = Env::with_quota(40).await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let log_before = e.log_shas("main").await;
+
+        let err = e.resolve(json!([{"path": CFG, "content": "z".repeat(200)}])).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+        assert!(e.read(CFG).await.contains("port = 8000"));
+        assert_eq!(e.log_shas("main").await, log_before);
+        assert_eq!(e.ops().await, 1);
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-549: an auto-merge charges exactly the merged bytes.
+    #[tokio::test]
+    async fn e2e_new_549_quota_charged_exactly_the_merged_bytes() {
+        let e = Env::new().await;
+        seed_automerge(&e).await;
+        let before = e.bytes_written();
+
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "merged");
+        assert_eq!(e.read(CFG).await, MERGED_CFG);
+        assert_eq!(e.bytes_written() - before, MERGED_CFG.len() as i64);
+    }
+
+    /// E2E-NEW-550: a conflicted merge charges nothing.
+    #[tokio::test]
+    async fn e2e_new_550_conflicted_merge_charges_nothing() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let before = e.bytes_written();
+
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+        assert_eq!(e.bytes_written() - before, 0);
+    }
+
+    /// E2E-NEW-555: a partial resolve shrinks the set and writes nothing.
+    #[tokio::test]
+    async fn e2e_new_555_partial_resolve_shrinks_the_conflict_set() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+
+        let out = e.resolve(json!([{"path": "/f/001.txt", "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["remaining_conflicts"], json!(["/f/000.txt", "/f/002.txt"]));
+        assert_eq!(out["resolved_count"], 1);
+
+        let row = e.op_row().await.unwrap();
+        let conflicts: Vec<String> =
+            serde_json::from_str(row.conflicts.as_deref().unwrap()).unwrap();
+        assert_eq!(conflicts, vec!["/f/000.txt", "/f/002.txt"]);
+        assert_eq!(e.read("/f/001.txt").await, "line-MAIN\n", "partial resolution buffers");
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-561: pass 1 gates every write before pass 2 moves a byte.
+    #[tokio::test]
+    async fn e2e_new_561_mid_apply_failure_leaves_the_volume_untouched() {
+        let e = Env::new().await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/keep.txt", "k\n").await;
+        let c0 = e.commit("C0").await;
+
+        // feature adds two files, main adds a third: the merge is clean, and its
+        // apply must write both of feature's files.
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write("/f/000.txt", "line-FEATURE\n").await;
+        e.write("/f/001.txt", "line-FEATURE\n").await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        client.delete_file("/f/000.txt").await.unwrap();
+        client.delete_file("/f/001.txt").await.unwrap();
+        e.write("/f/002.txt", "line-MAIN\n").await;
+        let c2 = e.commit("C2").await;
+
+        // The blocker: a directory where the merged tree needs a file.
+        client.makedirs("/f/001.txt", true).await.unwrap();
+        let before = e.byte_map().await;
+        let bytes_before = e.bytes_written();
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("/f/001.txt"), "{}", err.message);
+        assert!(err.message.contains("already exists as a directory"), "{}", err.message);
+
+        assert_eq!(e.byte_map().await, before, "/f/000.txt sorts first and was not written");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.bytes_written() - bytes_before, 0);
+    }
+
+    /// E2E-NEW-562: abort restores the volume and HEAD exactly and charges
+    /// nothing.
+    #[tokio::test]
+    async fn e2e_new_562_abort_restores_volume_and_head_exactly() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        let before = e.byte_map().await;
+        let head_sha = e.ref_sha("refs/heads/main").await.unwrap();
+        let head_target = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap().target;
+        let bytes_before = e.bytes_written();
+
+        e.merge("feature").await.unwrap();
+        e.resolve(json!([{"path": "/f/000.txt", "strategy": "theirs"}])).await.unwrap();
+        e.abort().await.unwrap();
+
+        assert_eq!(e.byte_map().await, before);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(head_sha.as_str()));
+        assert_eq!(e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap().target, head_target);
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.bytes_written() - bytes_before, 0);
+    }
+
+    /// E2E-NEW-567: unicode survives the report and the resolution as bytes.
+    #[tokio::test]
+    async fn e2e_new_567_unicode_content_conflict() {
+        let e = Env::new().await;
+        let base = "bonjour: cafe\nadieu: na\u{ef}ve\n";
+        let ours = "bonjour: kaf\u{e9} \u{2615}\nadieu: na\u{ef}ve\n";
+        let theirs = "bonjour: caff\u{e8} \u{1f1ee}\u{1f1f9}\nadieu: na\u{ef}ve\n";
+        let manual = "bonjour: caf\u{e9} \u{2615}\u{1f1ee}\u{1f1f9}\nadieu: na\u{ef}ve\n";
+        seed_diverged(&e, &[("/i18n/fr.txt", base, theirs, Some(ours))]).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(
+            out["conflicts"][0]["ours"]["content"].as_str().unwrap().as_bytes(),
+            ours.as_bytes()
+        );
+        assert_eq!(
+            out["conflicts"][0]["theirs"]["content"].as_str().unwrap().as_bytes(),
+            theirs.as_bytes()
+        );
+
+        e.resolve(json!([{"path": "/i18n/fr.txt", "content": manual}])).await.unwrap();
+        assert_eq!(e.read_bytes("/i18n/fr.txt").await, manual.as_bytes());
+        assert_eq!(e.read_bytes("/i18n/fr.txt").await.len(), manual.len());
+    }
+
+    /// E2E-NEW-571: an explicit empty resolution is valid, and distinct from a
+    /// missing field.
+    #[tokio::test]
+    async fn e2e_new_571_resolution_content_is_the_empty_string() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let before = e.bytes_written();
+
+        let out = e.resolve(json!([{"path": CFG, "content": ""}])).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.read_bytes(CFG).await.len(), 0);
+        assert_eq!(e.bytes_written() - before, 0);
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let oid = Oid::from_str(out["merge_commit"].as_str().unwrap()).unwrap();
+        let blob = repo
+            .find_commit(oid)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("src/config.toml"))
+            .unwrap()
+            .id();
+        assert_eq!(blob.to_string(), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+    }
+
+    /// E2E-NEW-572: CRLF and a missing trailing newline are preserved verbatim.
+    #[tokio::test]
+    async fn e2e_new_572_crlf_and_no_trailing_newline_preserved() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let manual = "[server]\r\nport = 7000\r\nretries = 2";
+
+        e.resolve(json!([{"path": CFG, "content": manual}])).await.unwrap();
+        let bytes = e.read_bytes(CFG).await;
+        assert_eq!(bytes, manual.as_bytes());
+        assert_eq!(*bytes.last().unwrap(), 0x32);
+        assert_eq!(bytes.windows(2).filter(|w| w == b"\r\n").count(), 2);
+        assert_eq!(bytes.iter().filter(|b| **b == 0x0A).count(), 2, "no bare LF");
+    }
+
+    /// E2E-NEW-575: an abort leaves no residue, so the merge re-runs identically.
+    #[tokio::test]
+    async fn e2e_new_575_merge_re_runs_cleanly_after_an_abort() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+
+        let first = e.merge("feature").await.unwrap();
+        e.abort().await.unwrap();
+        let second = e.merge("feature").await.unwrap();
+        // `operation_id` carries the pause instant, which is the one field that
+        // legitimately differs between two attempts.
+        let strip = |mut v: Value| {
+            v.as_object_mut().unwrap().remove("operation_id");
+            v
+        };
+        assert_eq!(strip(second), strip(first));
+
+        let out = e.resolve(json!([{"path": CFG, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.read(CFG).await.split('\n').nth(1).unwrap(), "port = 9090");
+
+        let ops: Vec<String> =
+            e.audit().into_iter().map(|a| a.op).filter(|o| o.starts_with("git.merge")).collect();
+        assert_eq!(ops, vec!["git.merge", "git.merge_abort", "git.merge", "git.merge_resolve"]);
+    }
+
+    /// E2E-NEW-576: a decision recorded by call 1 survives into call 2.
+    #[tokio::test]
+    async fn e2e_new_576_resolving_across_two_sequential_partial_calls() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+
+        let one = e.resolve(json!([{"path": "/f/000.txt", "strategy": "ours"}])).await.unwrap();
+        assert_eq!(one["status"], "conflict");
+        assert_eq!(one["remaining_conflicts"].as_array().unwrap().len(), 2);
+
+        let two = e
+            .resolve(json!([
+                {"path": "/f/001.txt", "content": "line-X\n"},
+                {"path": "/f/002.txt", "strategy": "theirs"},
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(two["status"], "merged");
+        assert_eq!(e.read("/f/000.txt").await, "line-MAIN\n");
+        assert_eq!(e.read("/f/001.txt").await, "line-X\n");
+        assert_eq!(e.read("/f/002.txt").await, "line-FEATURE\n");
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let oid = Oid::from_str(two["merge_commit"].as_str().unwrap()).unwrap();
+        assert_eq!(repo.find_commit(oid).unwrap().parent_count(), 2);
+        drop(repo);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-578: resolving one volume leaves every other volume untouched.
+    #[tokio::test]
+    async fn e2e_new_578_per_volume_isolation_of_resolution() {
+        const OTHER: &str = "projb";
+        let e = Env::new().await;
+        e.f.seed_project(OTHER, OWNER).await;
+        seed_conflict_at(&e, MOUNT).await;
+        seed_conflict_at(&e, OTHER).await;
+        for m in [MOUNT, OTHER] {
+            let out =
+                e.call("git.merge", json!({"mount_id": m, "source_ref": "feature"})).await.unwrap();
+            assert_eq!(out["status"], "conflict", "{m}");
+        }
+        let other_log = e
+            .call("git.log", json!({"mount_id": OTHER, "ref_name": "main", "limit": 100}))
+            .await
+            .unwrap()["commits"]
+            .as_array()
+            .unwrap()
+            .len();
+
+        let out = e.resolve_at(MOUNT, json!([{"path": CFG, "strategy": "ours"}])).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.read(CFG).await.split('\n').nth(1).unwrap(), "port = 8000");
+        assert_eq!(e.entry_at(MOUNT).await.db.count_operations().await.unwrap(), 0);
+
+        assert_eq!(e.entry_at(OTHER).await.db.count_operations().await.unwrap(), 1);
+        let row = e.entry_at(OTHER).await.db.get_operation().await.unwrap().unwrap();
+        assert_eq!(row.conflicts.as_deref(), Some(r#"["/src/config.toml"]"#));
+        assert_eq!(e.read_at(OTHER, CFG).await.split('\n').nth(1).unwrap(), "port = 8000");
+        assert_eq!(
+            e.call("git.log", json!({"mount_id": OTHER, "ref_name": "main", "limit": 100}))
+                .await
+                .unwrap()["commits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            other_log,
+            "no commit was created on the other volume"
+        );
+
+        e.call("git.merge_abort", json!({"mount_id": OTHER})).await.unwrap();
+    }
+
+    /// E2E-NEW-871: a resolution recorded before a restart is applied after it.
+    #[tokio::test]
+    async fn e2e_new_871_partial_resolutions_survive_a_restart() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+
+        let out =
+            e.resolve(json!([{"path": "/f/000.txt", "content": "line-MERGED\n"}])).await.unwrap();
+        assert_eq!(out["remaining_conflicts"], json!(["/f/001.txt", "/f/002.txt"]));
+        let row = e.op_row().await.unwrap();
+        assert!(
+            row.resolutions.as_deref().unwrap().contains("line-MERGED"),
+            "{:?}",
+            row.resolutions
+        );
+
+        // The restart: a brand new store and registry over the same state dirs.
+        let store =
+            Arc::new(GitRepoStore::new(e.f.state.config.clone(), crate::storage::test_registry()));
+        let mut reg = ToolRegistry::new();
+        register_with(&mut reg, Some(store.clone()), Some(e.tokens.clone()));
+        let out =
+            e.f.call(
+                &reg,
+                OWNER,
+                "git.merge_resolve",
+                json!({"mount_id": MOUNT, "resolutions": [
+                    {"path": "/f/001.txt", "strategy": "ours"},
+                    {"path": "/f/002.txt", "strategy": "theirs"},
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.read_bytes("/f/000.txt").await, b"line-MERGED\n");
+        assert_eq!(e.read_bytes("/f/001.txt").await, b"line-MAIN\n");
+        assert_eq!(e.read_bytes("/f/002.txt").await, b"line-FEATURE\n");
+        assert_eq!(
+            store.get_or_open_repo(MOUNT).await.unwrap().db.count_operations().await.unwrap(),
+            0
+        );
+    }
+
+    /// E2E-NEW-908: abort discards the recorded resolutions, which are state of
+    /// the operation and never of the volume.
+    #[tokio::test]
+    async fn e2e_new_908_abort_after_a_partial_resolve_discards_the_resolutions() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+        e.resolve(json!([{"path": "/f/000.txt", "content": "line-X\n"}])).await.unwrap();
+
+        e.abort().await.unwrap();
+        assert_eq!(e.ops().await, 0);
+        for p in ["/f/000.txt", "/f/001.txt", "/f/002.txt"] {
+            assert_eq!(e.read_bytes(p).await, b"line-MAIN\n", "{p}");
+        }
+
+        let err = e.resolve(json!([{"path": "/f/001.txt", "strategy": "ours"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no merge is in progress"), "{}", err.message);
+
+        let again = e.merge("feature").await.unwrap();
+        assert_eq!(again["status"], "conflict");
+        assert_eq!(again["conflicts"].as_array().unwrap().len(), 3);
+    }
+
+    /// E2E-NEW-910: the ref advances only after the last file write lands.
+    ///
+    /// The fault is injected the way E2E-NEW-561 injects it, the only technique
+    /// this volume layer offers: a directory standing where the merged tree
+    /// needs a file, which the pass 1 pre-check refuses with
+    /// `ERR_INVALID_ARGUMENT` before pass 2 moves a byte. The story's
+    /// `ERR_INTERNAL_ERROR` presumes a lower level I/O fault hook that does not
+    /// exist; the ordering it pins is what is asserted here.
+    #[tokio::test]
+    async fn e2e_new_910_the_ref_advances_only_after_the_last_write_lands() {
+        let e = Env::new().await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        let paths = seed_multi(&e, 2).await;
+        // feature also adds a third path, absent from main: a clean add the
+        // resolved tree must still write.
+        e.checkout("feature").await;
+        for p in &paths {
+            e.write(p, "line-FEATURE\n").await;
+        }
+        e.write("/f/002.txt", "line-FEATURE\n").await;
+        e.commit("C3").await;
+        e.checkout("main").await;
+        for p in &paths {
+            e.write(p, "line-MAIN\n").await;
+        }
+        client.delete_file("/f/002.txt").await.unwrap();
+
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+        let sha_pre = e.ref_sha("refs/heads/main").await.unwrap();
+        client.makedirs("/f/002.txt", true).await.unwrap();
+
+        let err = e
+            .resolve(json!([
+                {"path": "/f/000.txt", "strategy": "ours"},
+                {"path": "/f/001.txt", "strategy": "ours"},
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha_pre.as_str()));
+        for p in &paths {
+            assert_eq!(e.read_bytes(p).await, b"line-MAIN\n", "{p}");
+        }
+        let row = e.op_row().await.unwrap();
+        let conflicts: Vec<String> =
+            serde_json::from_str(row.conflicts.as_deref().unwrap()).unwrap();
+        assert_eq!(conflicts, vec!["/f/000.txt", "/f/001.txt"]);
+
+        // Clear the fault and retry: the merge completes and THEN the ref moves.
+        client.delete_tree("/f/002.txt").await.unwrap();
+        let out = e
+            .resolve(json!([
+                {"path": "/f/000.txt", "strategy": "ours"},
+                {"path": "/f/001.txt", "strategy": "ours"},
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_ne!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha_pre.as_str()));
+        assert_eq!(e.read_bytes("/f/002.txt").await, b"line-FEATURE\n");
+    }
+
+    /// E2E-NEW-911: 250 conflicting paths resolved in one call.
+    #[tokio::test]
+    async fn e2e_new_911_a_250_path_conflict_set_resolved_in_one_call() {
+        let e = Env::new().await;
+        let paths = seed_multi(&e, 250).await;
+        assert_eq!(e.merge("feature").await.unwrap()["conflicts"].as_array().unwrap().len(), 250);
+        let before = e.bytes_written();
+
+        let resolutions: Vec<Value> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({"path": p, "strategy": if i % 2 == 0 {"ours"} else {"theirs"}}))
+            .collect();
+        let out = e.resolve(Value::Array(resolutions)).await.unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(out["files_changed"], 250);
+
+        for (p, expected) in [
+            ("/f/000.txt", "line-MAIN\n"),
+            ("/f/001.txt", "line-FEATURE\n"),
+            ("/f/248.txt", "line-MAIN\n"),
+            ("/f/249.txt", "line-FEATURE\n"),
+        ] {
+            assert_eq!(e.read_bytes(p).await, expected.as_bytes(), "{p}");
+        }
+        let expected_bytes: i64 =
+            125 * "line-MAIN\n".len() as i64 + 125 * "line-FEATURE\n".len() as i64;
+        assert_eq!(e.bytes_written() - before, expected_bytes);
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let oid = Oid::from_str(out["merge_commit"].as_str().unwrap()).unwrap();
+        assert_eq!(repo.find_commit(oid).unwrap().parent_count(), 2);
+        drop(repo);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-542 (carried in from US-002, which could not call these tools):
+    /// the merge commit of a resolved conflict has exactly two parents, target
+    /// tip first.
+    #[tokio::test]
+    async fn e2e_new_542_merge_commit_has_exactly_two_parents() {
+        let e = Env::new().await;
+        let (_c0, c1, c2) = seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let out = e.resolve(json!([{"path": CFG, "strategy": "ours"}])).await.unwrap();
+        let sha = out["merge_commit"].as_str().unwrap().to_string();
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            let c = repo.find_commit(Oid::from_str(&sha).unwrap()).unwrap();
+            assert_eq!(c.parent_count(), 2);
+            assert_eq!(c.parent_id(0).unwrap().to_string(), c2);
+            assert_eq!(c.parent_id(1).unwrap().to_string(), c1);
+        }
+        let shown =
+            e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": sha})).await.unwrap();
+        assert_eq!(shown["commit"]["parents"], json!([short(&c2), short(&c1)]));
+    }
+
+    /// E2E-NEW-551 (carried in from US-002): a conflicted merge records exactly
+    /// one row, field for field.
+    ///
+    /// `current_step`/`total_steps` are stored as 0 because the column is not
+    /// nullable; FR-NEW-186's "null for a single step operation" is a response
+    /// shape rule, asserted here on the response the caller actually sees.
+    #[tokio::test]
+    async fn e2e_new_551_git_operations_row_created_on_conflict() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["current_step"], Value::Null);
+        assert_eq!(out["total_steps"], Value::Null);
+
+        assert_eq!(e.ops().await, 1, "exactly one row for this volume");
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Merge);
+        assert_eq!(row.state, "conflicted");
+        assert_eq!(row.current_step, 0);
+        assert_eq!(row.total_steps, 0);
+        let conflicts: Vec<String> =
+            serde_json::from_str(row.conflicts.as_deref().unwrap()).unwrap();
+        assert_eq!(conflicts, ["/f/000.txt", "/f/001.txt", "/f/002.txt"]);
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-554 (carried in from US-002): the row is scoped by `volume_id`,
+    /// so a conflict on one project never blocks another.
+    #[tokio::test]
+    async fn e2e_new_554_the_row_is_scoped_by_volume_id() {
+        const PROJ_B: &str = "projb";
+        let e = Env::new().await;
+        e.f.seed_project(PROJ_B, OWNER).await;
+        seed_conflict_at(&e, MOUNT).await;
+        seed_conflict_at(&e, PROJ_B).await;
+
+        let out =
+            e.call("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature"})).await.unwrap();
+        assert_eq!(out["status"], "conflict");
+
+        assert_eq!(e.entry_at(MOUNT).await.db.count_operations().await.unwrap(), 1);
+        assert_eq!(e.entry_at(PROJ_B).await.db.count_operations().await.unwrap(), 0);
+
+        // The guard reads the other volume's rows, not this one's: without the
+        // volume_id in the WHERE clause this commit would be refused.
+        let commit =
+            e.call("git.commit", json!({"mount_id": PROJ_B, "message": "ok"})).await.unwrap();
+        assert_eq!(commit["commit_sha"].as_str().unwrap().len(), 40);
+
+        e.call("git.merge_abort", json!({"mount_id": MOUNT})).await.unwrap();
+    }
+
+    /// FX-FORK conflicting, on any mount: `main` at C2 setting `/a.txt` line 2
+    /// to MAIN, `feature` at F1 setting the same line to FEAT1. `head` names the
+    /// branch left checked out, with the volume matching it.
+    async fn seed_fork_conflict_at(e: &Env, mount: &str, head: &str) -> (String, String) {
+        const MAIN_LINE: &str = "a1\nMAIN\n";
+        e.call("git.init", json!({"mount_id": mount})).await.unwrap();
+        e.write_at(mount, "/a.txt", "a1\n").await;
+        let c1 = e.commit_at(mount, "C1 base").await;
+        e.write_at(mount, "/a.txt", MAIN_LINE).await;
+        let c2 = e.commit_at(mount, "C2 main edit").await;
+
+        e.set_ref_at(mount, "refs/heads/feature", &c1, false).await;
+        e.set_ref_at(mount, "HEAD", "refs/heads/feature", true).await;
+        e.write_at(mount, "/a.txt", "a1\nFEAT1\n").await;
+        let f1 = e.commit_at(mount, "F1 feature edit").await;
+
+        if head != "feature" {
+            e.set_ref_at(mount, "HEAD", &format!("refs/heads/{head}"), true).await;
+            // The volume must match HEAD, or the next operation refuses a dirty
+            // volume before it ever reaches the conflict.
+            e.write_at(mount, "/a.txt", MAIN_LINE).await;
+        }
+        (c2, f1)
+    }
+
+    /// E2E-NEW-695 (carried in): two volumes pause two different operations at
+    /// the same time, and neither sees the other's row.
+    #[tokio::test]
+    async fn e2e_new_695_git_operations_rows_are_volume_scoped() {
+        const PROJ2: &str = "proj2";
+        let e = Env::new().await;
+        e.f.seed_project(PROJ2, OWNER).await;
+        let (_c2, f1) = seed_fork_conflict_at(&e, MOUNT, "feature").await;
+        let (p2_main, p2_f1) = seed_fork_conflict_at(&e, PROJ2, "main").await;
+
+        let paused_rebase = e
+            .call(
+                "git.rebase",
+                json!({"mount_id": MOUNT, "onto": "main", "todo": [{"action": "pick", "sha": f1}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused_rebase["status"], "conflict", "{paused_rebase}");
+        let paused_pick = e
+            .call("git.cherry_pick", json!({"mount_id": PROJ2, "commit_sha": p2_f1}))
+            .await
+            .unwrap();
+        assert_eq!(paused_pick["status"], "conflict", "{paused_pick}");
+
+        let row_of = async |mount: &str| e.entry_at(mount).await.db.get_operation().await.unwrap();
+        assert_eq!(row_of(MOUNT).await.unwrap().op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(e.entry_at(MOUNT).await.db.count_operations().await.unwrap(), 1);
+        assert_eq!(row_of(PROJ2).await.unwrap().op_type, crate::git::db::GitOpType::CherryPick);
+        assert_eq!(e.entry_at(PROJ2).await.db.count_operations().await.unwrap(), 1);
+
+        let p2_row_before = row_of(PROJ2).await.unwrap();
+        let p2_volume_before = e.read_at(PROJ2, "/a.txt").await;
+        e.call("git.rebase_abort", json!({"mount_id": MOUNT})).await.unwrap();
+
+        assert_eq!(e.entry_at(MOUNT).await.db.count_operations().await.unwrap(), 0);
+        assert_eq!(row_of(PROJ2).await.unwrap(), p2_row_before, "the other volume is untouched");
+        assert_eq!(e.read_at(PROJ2, "/a.txt").await, p2_volume_before);
+        assert_eq!(
+            e.entry_at(PROJ2).await.db.get_ref("refs/heads/main").await.unwrap().unwrap().target,
+            p2_main
+        );
+
+        // proj2 holds a cherry-pick, not a rebase, so the rebase pair refuses.
+        let err = e.call("git.rebase_continue", json!({"mount_id": PROJ2})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no rebase in progress"), "{}", err.message);
+
+        e.call("git.cherry_pick_abort", json!({"mount_id": PROJ2})).await.unwrap();
+    }
+
+    /// E2E-NEW-806 (carried in): a project purge removes its `git_operations`
+    /// row through the same `TABLES` loop as every other owned table, and takes
+    /// no other volume's rows with it.
+    ///
+    /// What a default build can prove: `TABLES` names the table, and
+    /// `storage::purge_git_rows`, the exact function `GitRepoStore::purge_repo`
+    /// calls on a shared database, clears the row for one `volume_id` only. What
+    /// it cannot prove here: the end to end `admin.delete_project` path on
+    /// PostgreSQL or SQL Server, whose suites are opt in
+    /// (`MCPFS_TEST_PG_DSN`, `.agent_docs/testing.md`); on SQLite `purge_repo`
+    /// deletes the index file outright and never reads `TABLES`, which is
+    /// E2E-NEW-808 below.
+    #[tokio::test]
+    async fn e2e_new_806_a_purge_removes_the_paused_operation_row() {
+        assert_eq!(crate::git::db::TABLES.len(), 4, "the purge list must carry every owned table");
+        assert!(crate::git::db::TABLES.contains(&"git_operations"), "{:?}", crate::git::db::TABLES);
+
+        let e = Env::new().await;
+        let path = e.f.state.config.git_db_path(MOUNT);
+        tokio::fs::create_dir_all(path.parent().expect("the index path has a parent"))
+            .await
+            .unwrap();
+        let db = Arc::new(crate::storage::rel::SqliteRelationalDb::open(&path).unwrap());
+        // Two volumes in one index, which is what a shared PostgreSQL or SQL
+        // Server database always looks like.
+        let doomed = RelationalGitDb::open(db.clone(), MOUNT).await.unwrap();
+        let keeper = RelationalGitDb::open(db, "projb").await.unwrap();
+        for g in [&doomed, &keeper] {
+            g.record_object("cafe01", "blob", 3).await.unwrap();
+            g.set_ref("refs/heads/main", "cafe01", false).await.unwrap();
+            g.add_remote("origin", "https://example.invalid/r.git").await.unwrap();
+            g.set_operation(&paused_rebase_row()).await.unwrap();
+        }
+
+        crate::storage::purge_git_rows(&e.f.state.config, &crate::storage::test_registry(), MOUNT)
+            .await
+            .unwrap();
+
+        assert_eq!(doomed.count_operations().await.unwrap(), 0, "the paused operation is gone");
+        assert_eq!(doomed.count_objects().await.unwrap(), 0);
+        assert!(doomed.list_refs().await.unwrap().is_empty());
+        assert!(doomed.list_remotes().await.unwrap().is_empty());
+
+        assert_eq!(keeper.count_operations().await.unwrap(), 1, "another volume keeps its row");
+        assert_eq!(keeper.count_objects().await.unwrap(), 1);
+        assert_eq!(keeper.list_refs().await.unwrap().len(), 1);
+        assert_eq!(keeper.list_remotes().await.unwrap().len(), 1);
+    }
+
+    /// A paused rebase row, for the purge test above.
+    fn paused_rebase_row() -> crate::git::db::GitOperationRow {
+        crate::git::db::GitOperationRow {
+            op_type: crate::git::db::GitOpType::Rebase,
+            state: "conflicted".into(),
+            source_ref: Some("feature".into()),
+            onto_sha: Some("onto1".into()),
+            original_tip_sha: Some("tip1".into()),
+            todo: Some(r#"[{"sha":"F1"}]"#.into()),
+            current_step: 1,
+            total_steps: 1,
+            conflicts: Some(r#"["/a.txt"]"#.into()),
+            resolutions: None,
+            created_at: "2026-09-22T10:00:00Z".into(),
+            updated_at: "2026-09-22T10:00:00Z".into(),
+        }
+    }
+
+    /// E2E-NEW-808 (carried in): on SQLite the index is a file, so deleting the
+    /// project deletes every row with it, siblings included, and a project
+    /// recreated under the same id inherits no paused operation.
+    #[tokio::test]
+    async fn e2e_new_808_on_sqlite_the_index_file_carries_the_rows_away() {
+        let mut e = Env::new().await;
+        super::super::admin::register_with(&mut e.reg, Some(e.git.clone()));
+        let (_c2, f1) = seed_fork_conflict_at(&e, MOUNT, "feature").await;
+        let paused = e
+            .call(
+                "git.rebase",
+                json!({"mount_id": MOUNT, "onto": "main", "todo": [{"action": "pick", "sha": f1}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused["status"], "conflict", "{paused}");
+        assert_eq!(e.ops().await, 1);
+
+        let db = e.f.state.config.git_db_path(MOUNT);
+        assert!(db.exists(), "the index file exists while the project does");
+
+        e.as_person(ADMIN, "admin.delete_project", json!({"project_id": MOUNT})).await.unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let p = std::path::PathBuf::from(format!("{}{}", db.display(), suffix));
+            assert!(!p.exists(), "{} survived the delete", p.display());
+        }
+
+        e.as_person(ADMIN, "admin.create_project", json!({"project_id": MOUNT, "owner": OWNER}))
+            .await
+            .unwrap();
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(status["operation"], Value::Null, "no paused rebase was inherited");
+        assert_eq!(e.ops().await, 0);
+
+        let err = e
+            .call(
+                "git.rebase_continue",
+                json!({"mount_id": MOUNT, "resolutions": [{"path": "/a.txt", "strategy": "ours"}]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no rebase in progress"), "{}", err.message);
+    }
+
+    /// E2E-NEW-552 (carried in from US-002): the row is removed on a full
+    /// resolve.
+    #[tokio::test]
+    async fn e2e_new_552_row_removed_on_full_resolve() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+        assert_eq!(e.ops().await, 1);
+
+        let out = e
+            .resolve(json!([
+                {"path": "/f/000.txt", "strategy": "ours"},
+                {"path": "/f/001.txt", "strategy": "ours"},
+                {"path": "/f/002.txt", "strategy": "ours"},
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "merged");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-553 (carried in from US-002): the row is removed on an abort.
+    #[tokio::test]
+    async fn e2e_new_553_row_removed_on_abort() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        e.merge("feature").await.unwrap();
+        assert_eq!(e.ops().await, 1);
+
+        assert_eq!(e.abort().await.unwrap()["status"], "aborted");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// FR-NEW-198: both tools refuse when nothing is in progress.
+    #[tokio::test]
+    async fn e2e_new_198_resolve_or_abort_with_no_operation_in_progress() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+
+        for err in [
+            e.resolve(json!([{"path": CFG, "strategy": "ours"}])).await.unwrap_err(),
+            e.abort().await.unwrap_err(),
+        ] {
+            assert_eq!(err.code, code::INVALID_ARGUMENT);
+            assert!(err.message.contains("no merge is in progress"), "{}", err.message);
+        }
+        assert_eq!(e.ops().await, 0);
+    }
+
+    // ── US-004: conflict edge semantics ─────────────────────────────────────
+
+    /// The base bytes of SEED-BINARY; the last byte identifies the side.
+    fn png(last: u8) -> Vec<u8> {
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, last]
+    }
+
+    const UTIL: &str = "/lib/util.rs";
+    const UTIL_BASE: &str = "pub fn a() {}\n";
+    const UTIL_MAIN: &str = "pub fn a() { println!(\"x\"); }\n";
+    const PNG: &str = "/assets/logo.png";
+
+    impl Env {
+        async fn write_bytes(&self, path: &str, data: &[u8]) {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.write_bytes_atomic(path, data).await.unwrap();
+        }
+
+        async fn remove(&self, path: &str) {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.delete_file(path).await.unwrap();
+        }
+
+        async fn remove_tree(&self, path: &str) {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.delete_tree(path).await.unwrap();
+        }
+
+        async fn exists(&self, path: &str) -> bool {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.exists(path).await.unwrap()
+        }
+
+        async fn is_dir(&self, path: &str) -> bool {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.is_dir(path).await.unwrap()
+        }
+
+        async fn try_read_bytes(&self, path: &str) -> Result<Vec<u8>> {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.read_bytes(path).await
+        }
+
+        /// The commit the branch ref points at, as a libgit2 tree lookup: the
+        /// merge commit's tree is asserted directly rather than through a tool.
+        async fn tree_has(&self, sha: &str, rel: &str) -> bool {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let c = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            c.tree().unwrap().get_path(Path::new(rel)).is_ok()
+        }
+
+        async fn parents_of(&self, sha: &str) -> Vec<String> {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let c = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            c.parent_ids().map(|o| o.to_string()).collect()
+        }
+
+        /// The paths the in-progress row still lists as conflicting.
+        async fn row_conflicts(&self) -> Vec<String> {
+            let row = self.op_row().await.expect("an operation in progress");
+            serde_json::from_str(row.conflicts.as_deref().unwrap_or("[]")).unwrap()
+        }
+
+        async fn row_resolutions(&self) -> BTreeMap<String, merge::Resolution> {
+            let row = self.op_row().await.expect("an operation in progress");
+            serde_json::from_str(row.resolutions.as_deref().unwrap_or("{}")).unwrap()
+        }
+    }
+
+    /// SEED-DELDEL: both sides delete `/tmp/scratch.txt`, both edit `/keep.txt`.
+    async fn seed_deldel(e: &Env) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/tmp/scratch.txt", "x\n").await;
+        e.write("/keep.txt", "k\n").await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.remove("/tmp/scratch.txt").await;
+        e.write("/keep.txt", "k-feature\n").await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        // The volume is already at C0 minus scratch.txt, which is exactly what
+        // main's own deletion leaves; only `/keep.txt` differs.
+        e.write("/keep.txt", "k-main\n").await;
+        e.commit("C2").await;
+    }
+
+    /// SEED-DELMOD: `feature` deletes `/lib/util.rs`, `main` rewrites it.
+    async fn seed_delmod(e: &Env) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write(UTIL, UTIL_BASE).await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.remove(UTIL).await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.write(UTIL, UTIL_MAIN).await;
+        e.commit("C2").await;
+    }
+
+    /// SEED-BINARY: `/assets/logo.png` differs in its last byte on every side.
+    async fn seed_binary(e: &Env) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write_bytes(PNG, &png(0x01)).await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write_bytes(PNG, &png(0x02)).await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.write_bytes(PNG, &png(0x03)).await;
+        e.commit("C2").await;
+    }
+
+    /// SEED-TYPECHANGE: `/mod` is a file on `main`, a directory on `feature`.
+    async fn seed_typechange(e: &Env) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/mod", "placeholder\n").await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.remove("/mod").await;
+        e.write("/mod/inner.rs", "pub const N: u8 = 1;\n").await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.remove_tree("/mod").await;
+        e.write("/mod", "placeholder v2\n").await;
+        e.commit("C2").await;
+    }
+
+    /// SEED-COLLIDE: `main` has the directory `/report/`, `feature` the file
+    /// `/report`.
+    async fn seed_collide(e: &Env) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/seed.txt", "s\n").await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write("/report", "r\n").await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.remove("/report").await;
+        e.write("/report/q.csv", "a,b\n").await;
+        e.commit("C2").await;
+    }
+
+    /// E2E-NEW-563: an identical deletion on both sides is not a conflict.
+    #[tokio::test]
+    async fn e2e_new_563_both_sides_deleted_the_same_file() {
+        let e = Env::new().await;
+        seed_deldel(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        let paths: Vec<&str> = out["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["/keep.txt"], "an identical deletion is auto-resolved");
+
+        let done =
+            e.resolve(json!([{"path": "/keep.txt", "content": "k-merged\n"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert!(!e.exists("/tmp/scratch.txt").await);
+        assert_eq!(e.read("/keep.txt").await, "k-merged\n");
+        let sha = done["merge_commit"].as_str().unwrap().to_string();
+        assert!(!e.tree_has(&sha, "tmp/scratch.txt").await);
+    }
+
+    /// E2E-NEW-564: one side deleted, the other modified.
+    #[tokio::test]
+    async fn e2e_new_564_one_side_deleted_the_other_modified() {
+        let e = Env::new().await;
+        seed_delmod(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"][0]["path"], UTIL);
+        assert_eq!(conflict_side(&out, 0, "theirs")["exists"], false);
+        assert_eq!(conflict_side(&out, 0, "theirs")["content"], Value::Null);
+        assert_eq!(conflict_side(&out, 0, "ours")["exists"], true);
+        assert_eq!(conflict_side(&out, 0, "ours")["content"], UTIL_MAIN);
+        assert_eq!(conflict_side(&out, 0, "base")["exists"], true);
+        assert_eq!(conflict_side(&out, 0, "base")["content"], UTIL_BASE);
+
+        let done = e.resolve(json!([{"path": UTIL, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert!(!e.exists(UTIL).await);
+        let sha = done["merge_commit"].as_str().unwrap().to_string();
+        assert!(!e.tree_has(&sha, "lib/util.rs").await);
+        // Documented: empty directories are not pruned by the apply.
+        assert!(e.is_dir("/lib").await, "the empty parent directory survives");
+    }
+
+    /// E2E-NEW-565: a binary conflict is marked and its bytes are omitted.
+    #[tokio::test]
+    async fn e2e_new_565_binary_file_conflict() {
+        let e = Env::new().await;
+        seed_binary(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["conflicts"][0]["path"], PNG);
+        assert_eq!(out["conflicts"][0]["binary"], true);
+        for side in ["ours", "theirs", "base"] {
+            assert_eq!(conflict_side(&out, 0, side)["exists"], true, "{side}");
+            assert_eq!(conflict_side(&out, 0, side)["content"], Value::Null, "{side}");
+        }
+
+        let done = e.resolve(json!([{"path": PNG, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        let bytes = e.read_bytes(PNG).await;
+        assert_eq!(bytes.len(), 10);
+        assert_eq!(bytes, png(0x02));
+    }
+
+    /// E2E-NEW-566: a file against a directory is surfaced, never refused.
+    #[tokio::test]
+    async fn e2e_new_566_file_directory_type_change() {
+        let e = Env::new().await;
+        seed_typechange(&e).await;
+        let before = e.bytes_written();
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict", "DEC-909: surfaced, never refused");
+        assert_eq!(out["conflicts"][0]["path"], "/mod");
+        assert_eq!(out["conflicts"][0]["type_change"], true);
+        assert_eq!(conflict_side(&out, 0, "ours")["exists"], true);
+        assert_eq!(conflict_side(&out, 0, "ours")["content"], "placeholder v2\n");
+        assert_eq!(conflict_side(&out, 0, "theirs")["exists"], false);
+        assert_eq!(conflict_side(&out, 0, "theirs")["content"], Value::Null);
+        assert!(out["conflicts"][0].get("kind").is_none(), "no kind key is emitted");
+
+        assert_eq!(e.read("/mod").await, "placeholder v2\n");
+        assert!(!e.exists("/mod/inner.rs").await);
+        assert_eq!(e.bytes_written() - before, 0);
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-570: a resolution whose path is a directory in the volume.
+    #[tokio::test]
+    async fn e2e_new_570_resolution_path_collides_with_an_existing_directory() {
+        let e = Env::new().await;
+        seed_collide(&e).await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        let err = e.resolve(json!([{"path": "/report", "strategy": "theirs"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        assert!(err.message.contains("/report"), "{}", err.message);
+        assert!(err.message.contains("already exists as a directory"), "{}", err.message);
+
+        assert_eq!(e.read("/report/q.csv").await, "a,b\n");
+        assert!(e.is_dir("/report").await);
+        assert_eq!(e.ops().await, 1, "the operation is still in progress");
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-836: choosing the modifying side keeps the exact bytes.
+    #[tokio::test]
+    async fn e2e_new_836_choosing_the_modifying_side_keeps_the_file() {
+        let e = Env::new().await;
+        seed_delmod(&e).await;
+        let main_tip = e.ref_sha("refs/heads/main").await.unwrap();
+        let feature_tip = e.ref_sha("refs/heads/feature").await.unwrap();
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(out["conflicts"][0]["path"], UTIL);
+
+        let done = e.resolve(json!([{"path": UTIL, "strategy": "ours"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(done["files_changed"], 1);
+        assert_eq!(e.read_bytes(UTIL).await, UTIL_MAIN.as_bytes());
+        let sha = done["merge_commit"].as_str().unwrap().to_string();
+        assert_eq!(e.parents_of(&sha).await, vec![main_tip, feature_tip]);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-837: the deleting side is named, never invented as a verb.
+    #[tokio::test]
+    async fn e2e_new_837_an_invented_strategy_for_the_deleted_side_is_refused() {
+        let e = Env::new().await;
+        seed_delmod(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = e.resolve(json!([{"path": UTIL, "strategy": "delete"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        for needle in ["delete", "ours", "theirs"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+        assert_eq!(e.row_conflicts().await, vec![UTIL.to_string()]);
+        assert!(e.row_resolutions().await.is_empty());
+        assert_eq!(e.read_bytes(UTIL).await, UTIL_MAIN.as_bytes());
+
+        assert_eq!(
+            e.resolve(json!([{"path": UTIL, "strategy": "theirs"}])).await.unwrap()["status"],
+            "merged"
+        );
+        assert_eq!(e.try_read_bytes(UTIL).await.unwrap_err().code, code::NOT_FOUND);
+    }
+
+    /// E2E-NEW-838: the both-deleted path is absent from the conflict set and
+    /// from the volume.
+    #[tokio::test]
+    async fn e2e_new_838_the_both_deleted_path_is_absent_from_the_conflict_set() {
+        let e = Env::new().await;
+        seed_deldel(&e).await;
+        let before = e.byte_map().await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict");
+        let paths: Vec<&str> = out["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["/keep.txt"]);
+        // FR-NEW-171: a conflict applies nothing. `/tmp/scratch.txt` is already
+        // gone because main's own C2 committed the deletion, so "nothing
+        // applied" is asserted as byte identity with the pre-merge volume.
+        assert_eq!(e.byte_map().await, before);
+
+        let done = e.resolve(json!([{"path": "/keep.txt", "strategy": "ours"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.try_read_bytes("/tmp/scratch.txt").await.unwrap_err().code, code::NOT_FOUND);
+        let sha = done["merge_commit"].as_str().unwrap().to_string();
+        assert!(!e.tree_has(&sha, "tmp/scratch.txt").await);
+        assert_eq!(e.read_bytes("/keep.txt").await, b"k-main\n");
+    }
+
+    /// E2E-NEW-839: both sides delete an entire directory.
+    #[tokio::test]
+    async fn e2e_new_839_both_sides_delete_an_entire_directory() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/old/a.txt", "a\n").await;
+        e.write("/old/b.txt", "b\n").await;
+        e.write("/keep.txt", "k\n").await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.remove_tree("/old").await;
+        e.write("/keep.txt", "k-feature\n").await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.write("/keep.txt", "k-main\n").await;
+        e.commit("C2").await;
+
+        let out = e.merge("feature").await.unwrap();
+        let paths: Vec<&str> = out["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["/keep.txt"]);
+
+        let done = e.resolve(json!([{"path": "/keep.txt", "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert!(!e.exists("/old/a.txt").await);
+        assert!(!e.exists("/old/b.txt").await);
+        assert_eq!(e.read_bytes("/keep.txt").await, b"k-feature\n");
+    }
+
+    /// E2E-NEW-840: literal content for a binary path is refused.
+    #[tokio::test]
+    async fn e2e_new_840_literal_content_for_a_binary_path_is_refused() {
+        let e = Env::new().await;
+        seed_binary(&e).await;
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["conflicts"][0]["binary"], true);
+
+        let err = e.resolve(json!([{"path": PNG, "content": "\u{89}PNG"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        for needle in ["binary", "ours", "theirs"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+        assert_eq!(e.read_bytes(PNG).await, png(0x03));
+        assert_eq!(e.row_conflicts().await, vec![PNG.to_string()]);
+        assert!(e.row_resolutions().await.is_empty());
+
+        let done = e.resolve(json!([{"path": PNG, "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.read_bytes(PNG).await, png(0x02));
+    }
+
+    /// E2E-NEW-841: the binary entry omits the bytes entirely.
+    #[tokio::test]
+    async fn e2e_new_841_the_binary_entry_omits_the_bytes() {
+        let e = Env::new().await;
+        seed_binary(&e).await;
+        let out = e.merge("feature").await.unwrap();
+
+        let expected: Value = json!({
+            "path": PNG,
+            "ours": {"exists": true, "content": Value::Null},
+            "theirs": {"exists": true, "content": Value::Null},
+            "base": {"exists": true, "content": Value::Null},
+            "binary": true,
+            "type_change": false,
+        });
+        assert_eq!(out["conflicts"][0], expected);
+
+        let text = serde_json::to_string(&out).unwrap();
+        for forbidden in ["\\u0000", "PNG", "\u{89}", "\u{fffd}"] {
+            assert!(!text.contains(forbidden), "{forbidden:?} leaked into {text}");
+        }
+        let round: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(round, out);
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-907: one call mixing a text, a binary and a delete/modify path.
+    #[tokio::test]
+    async fn e2e_new_907_one_mixed_resolution_call() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write(CFG, BASE_CFG).await;
+        e.write_bytes(PNG, &png(0x01)).await;
+        e.write(UTIL, UTIL_BASE).await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write(CFG, FEATURE_CFG_CONFLICT).await;
+        e.write_bytes(PNG, &png(0x02)).await;
+        e.remove(UTIL).await;
+        e.commit("C1").await;
+
+        e.checkout("main").await;
+        e.write(CFG, MAIN_CFG).await;
+        e.write_bytes(PNG, &png(0x03)).await;
+        e.write(UTIL, UTIL_MAIN).await;
+        e.commit("C2").await;
+
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["conflicts"].as_array().unwrap().len(), 3);
+
+        const MIXED_CFG: &str =
+            "[server]\nport = 8500\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+        let done = e
+            .resolve(json!([
+                {"path": CFG, "content": MIXED_CFG},
+                {"path": PNG, "strategy": "theirs"},
+                {"path": UTIL, "strategy": "ours"},
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(done["files_changed"], 3);
+        assert_eq!(e.read_bytes(CFG).await, MIXED_CFG.as_bytes());
+        assert_eq!(e.read_bytes(PNG).await, png(0x02));
+        assert_eq!(e.read_bytes(UTIL).await, UTIL_MAIN.as_bytes());
+        assert_eq!(e.ops().await, 0);
+        let sha = done["merge_commit"].as_str().unwrap().to_string();
+        assert_eq!(e.parents_of(&sha).await.len(), 2);
+    }
+
+    /// E2E-NEW-909: literal content is refused for a type-change conflict.
+    #[tokio::test]
+    async fn e2e_new_909_literal_content_is_refused_for_a_type_change() {
+        let e = Env::new().await;
+        seed_typechange(&e).await;
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["conflicts"][0]["type_change"], true);
+
+        let err = e.resolve(json!([{"path": "/mod", "content": "whatever\n"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        for needle in ["type change", "ours", "theirs"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+        assert_eq!(e.read_bytes("/mod").await, b"placeholder v2\n");
+        assert!(!e.exists("/mod/inner.rs").await);
+        assert_eq!(e.row_conflicts().await, vec!["/mod".to_string()]);
+
+        let done = e.resolve(json!([{"path": "/mod", "strategy": "theirs"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+        assert_eq!(e.read_bytes("/mod/inner.rs").await, b"pub const N: u8 = 1;\n");
+        assert!(e.try_read_bytes("/mod").await.is_err(), "'/mod' is a directory now");
+    }
+
+    // ── US-005: the in-progress guard and git.status reporting ──────────────
+
+    /// E2E-NEW-509: the `operation` object is exactly the seven keys of
+    /// FR-NEW-286, and the pre-existing status fields are untouched.
+    #[tokio::test]
+    async fn e2e_new_509_status_reports_the_active_operation() {
+        let e = Env::new().await;
+        seed_multi(&e, 3).await;
+        let before = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+
+        e.merge("feature").await.unwrap();
+        e.resolve(json!([{"path": "/f/000.txt", "strategy": "ours"}])).await.unwrap();
+
+        let st = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(
+            st.get("operation").expect("the operation object is present"),
+            &json!({
+                "op_type": "merge",
+                "source_ref": "feature",
+                "current_step": Value::Null,
+                "total_steps": Value::Null,
+                "remaining_conflicts": ["/f/001.txt", "/f/002.txt"],
+                "continue_with": "git.merge_resolve",
+                "abort_with": "git.merge_abort",
+            })
+        );
+        // Additive: every field that existed before the merge is unchanged.
+        for key in ["head", "branch", "refs", "mount_id"] {
+            assert_eq!(st[key], before[key], "{key}");
+        }
+        assert!(before.get("operation").is_none(), "absent before the merge");
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-519: resolve with nothing in progress.
+    #[tokio::test]
+    async fn e2e_new_519_merge_resolve_with_nothing_in_progress() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let refs_before = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        let bytes_before = e.byte_map().await;
+
+        let err = e.resolve(json!([{"path": CFG, "strategy": "ours"}])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no operation in progress"), "{}", err.message);
+
+        assert_eq!(e.byte_map().await, bytes_before);
+        let after = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(after["refs"], refs_before["refs"]);
+    }
+
+    /// E2E-NEW-520: abort with nothing in progress.
+    #[tokio::test]
+    async fn e2e_new_520_merge_abort_with_nothing_in_progress() {
+        let e = Env::new().await;
+        let (_c0, _c1, c2) = seed_conflict(&e).await;
+        let bytes_before = e.byte_map().await;
+
+        let err = e.abort().await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("no operation in progress"), "{}", err.message);
+
+        assert_eq!(
+            e.entry().await.db.get_ref("refs/heads/main").await.unwrap().unwrap().target,
+            c2
+        );
+        assert_eq!(e.byte_map().await, bytes_before);
+    }
+
+    /// E2E-NEW-528: FR-NEW-279, a commit cannot slip into a paused merge.
+    #[tokio::test]
+    async fn e2e_new_528_commit_blocked_while_a_merge_is_in_progress() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let log_before = e.log_shas("main").await;
+
+        let err =
+            e.call("git.commit", json!({"mount_id": MOUNT, "message": "sneak"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        for needle in ["merge", "in progress", "git.merge_resolve", "git.merge_abort"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+
+        assert_eq!(e.log_shas("main").await, log_before);
+        let log = e
+            .call("git.log", json!({"mount_id": MOUNT, "ref_name": "main", "limit": 100}))
+            .await
+            .unwrap();
+        assert!(!log.to_string().contains("sneak"), "{log}");
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-530: a second merge is refused and the paused row is intact.
+    #[tokio::test]
+    async fn e2e_new_530_second_merge_blocked() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let row_before = e.op_row().await.expect("a paused merge");
+
+        let err = e.merge("feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        for needle in ["merge", "in progress"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.op_row().await.unwrap(), row_before);
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-579: FR-NEW-280, reads keep working while an operation is paused
+    /// and none of them clears it. The story names `fs.read_text`, which this
+    /// server spells `fs.read`; it is registered into a local registry because
+    /// the git `Env` only wires the git family.
+    #[tokio::test]
+    async fn e2e_new_579_read_only_tools_remain_available() {
+        let e = Env::new().await;
+        let (c0, _c1, c2) = seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        assert!(e.call("git.log", json!({"mount_id": MOUNT})).await.is_ok());
+        assert!(e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": c2})).await.is_ok());
+        assert!(
+            e.call("git.diff", json!({"mount_id": MOUNT, "from_ref": c0, "to_ref": c2}))
+                .await
+                .is_ok()
+        );
+        assert!(e.call("git.branches", json!({"mount_id": MOUNT})).await.is_ok());
+        assert!(e.call("git.status", json!({"mount_id": MOUNT})).await.is_ok());
+
+        let mut fs_reg = ToolRegistry::new();
+        crate::tools::read::register(&mut fs_reg);
+        let read =
+            e.f.call(
+                &fs_reg,
+                OWNER,
+                "fs.read",
+                json!({"mount_id": MOUNT, "path": CFG,
+                 "line_numbered": false}),
+            )
+            .await
+            .unwrap();
+        // `fs.read` returns line oriented content, without the trailing newline.
+        assert_eq!(read["content"].as_str().unwrap(), MAIN_CFG.trim_end_matches('\n'));
+        assert!(read["content"].as_str().unwrap().contains("port = 8000"));
+
+        assert_eq!(e.log_shas("main").await.len(), 2);
+        assert_eq!(e.ops().await, 1, "no read cleared the operation");
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-580: FR-NEW-282, membership is the only gate on an abort.
+    #[tokio::test]
+    async fn e2e_new_580_another_member_can_abort_the_operation() {
+        const SECOND: &str = "second@acme.test";
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.f.state.admin.add_member(MOUNT, SECOND, OWNER).await.unwrap();
+        let before = e.byte_map().await;
+        let owner_audit_before = e.audit().len();
+
+        e.merge("feature").await.unwrap();
+        let out = e.as_person(SECOND, "git.merge_abort", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(out["status"], "aborted");
+
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.byte_map().await, before);
+
+        let second_audit: Vec<_> =
+            e.f.state
+                .safety
+                .audit(SECOND, MOUNT)
+                .into_iter()
+                .filter(|a| a.op == "git.merge_abort")
+                .collect();
+        assert_eq!(second_audit.len(), 1, "{second_audit:?}");
+        assert!(
+            e.audit().into_iter().all(|a| a.op != "git.merge_abort"),
+            "the abort is not audited under the owner"
+        );
+        assert!(e.audit().len() >= owner_audit_before);
+    }
+
+    // ── US-006: squash merge ────────────────────────────────────────────
+
+    /// SEED-FF extended: `main` at C0, `feature` two commits ahead, adding
+    /// `/docs/readme.md` then `/docs/guide.md`. Returns (C0, Cf1, Cf2).
+    async fn seed_squash(e: &Env) -> (String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/base.txt", "base\n").await;
+        let c0 = e.commit("C0").await;
+
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        e.write("/docs/readme.md", "hello\n").await;
+        let cf1 = e.commit("Cf1").await;
+        e.write("/docs/guide.md", "guide\n").await;
+        let cf2 = e.commit("Cf2").await;
+
+        e.checkout("main").await;
+        // The volume still holds the feature files, which would read as dirt
+        // against C0; remove them so `main` is clean before the merge.
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/docs/readme.md").await.unwrap();
+        client.delete_file("/docs/guide.md").await.unwrap();
+        (c0, cf1, cf2)
+    }
+
+    /// E2E-NEW-506: FR-NEW-191, one commit carrying the cumulative difference.
+    #[tokio::test]
+    async fn e2e_new_506_squash_merge() {
+        let e = Env::new().await;
+        seed_squash(&e).await;
+
+        let out = e
+            .call("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature", "squash": true}))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "merged", "{out}");
+        assert_eq!(out["squashed"], true, "{out}");
+        let sha = out["merge_commit"].as_str().expect("a merge commit sha");
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        assert_eq!(e.read_bytes("/docs/readme.md").await, b"hello\n");
+        assert_eq!(e.read_bytes("/docs/guide.md").await, b"guide\n");
+    }
+
+    /// E2E-NEW-541: FR-NEW-191, a non-boolean `squash` is refused outright
+    /// rather than silently read as false.
+    #[tokio::test]
+    async fn e2e_new_541_squash_given_a_non_boolean() {
+        let e = Env::new().await;
+        let (c0, _cf1, _cf2) = seed_squash(&e).await;
+        let before = e.byte_map().await;
+
+        let err = e
+            .call("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature", "squash": "yes"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        assert!(err.message.contains("squash"), "{}", err.message);
+
+        assert_eq!(e.log_shas("main").await, vec![c0]);
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.byte_map().await, before);
+    }
+
+    /// E2E-NEW-543: FR-NEW-191, exactly one parent, the pre-merge target tip.
+    #[tokio::test]
+    async fn e2e_new_543_squash_commit_has_exactly_one_parent() {
+        let e = Env::new().await;
+        let (c0, _cf1, _cf2) = seed_squash(&e).await;
+
+        let out = e
+            .call("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature", "squash": true}))
+            .await
+            .unwrap();
+        let sha = out["merge_commit"].as_str().unwrap().to_string();
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let commit = repo.find_commit(Oid::from_str(&sha).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), c0);
+    }
+
+    /// E2E-NEW-544: FR-NEW-191, the source's commits are absent from the
+    /// target's history while its cumulative tree is present.
+    #[tokio::test]
+    async fn e2e_new_544_squash_omits_the_sources_individual_commits() {
+        let e = Env::new().await;
+        let (c0, cf1, cf2) = seed_squash(&e).await;
+
+        let out = e
+            .call("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature", "squash": true}))
+            .await
+            .unwrap();
+        let sha = out["merge_commit"].as_str().unwrap().to_string();
+
+        assert_eq!(e.log_shas("main").await, vec![sha.clone(), c0]);
+        for absent in [&cf1, &cf2] {
+            assert!(!e.log_shas("main").await.contains(absent), "{absent} leaked into main");
+        }
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let tree = repo.find_commit(Oid::from_str(&sha).unwrap()).unwrap().tree().unwrap();
+        for path in ["docs/readme.md", "docs/guide.md"] {
+            assert!(tree.get_path(std::path::Path::new(path)).is_ok(), "{path} missing");
+        }
+    }
+
+    /// E2E-NEW-844: FR-NEW-193 and FR-NEW-191, a squash never fast-forwards.
+    #[tokio::test]
+    async fn e2e_new_844_squash_on_a_fast_forwardable_merge_commits_instead() {
+        let e = Env::new().await;
+        let (c0, c1) = seed_ff(&e).await;
+
+        let out = e
+            .call("git.merge", json!({"mount_id": MOUNT, "source_ref": "feature", "squash": true}))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "merged", "{out}");
+        assert_eq!(out["fast_forward"], false, "{out}");
+        let sha = out["merge_commit"].as_str().unwrap().to_string();
+        assert_eq!(sha.len(), 40);
+        assert_ne!(sha, c1, "the branch must not be moved onto the source tip");
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha.as_str()));
+        assert_eq!(e.read_bytes("/docs/readme.md").await, b"hello\n");
+        let log = e.log_shas("main").await;
+        assert!(!log.contains(&c1), "the source commit leaked into main: {log:?}");
+
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        let commit = repo.find_commit(Oid::from_str(&sha).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), c0);
+    }
+
+    /// E2E-NEW-814: the key is absent, not null, when nothing is in progress.
+    #[tokio::test]
+    async fn e2e_new_814_the_operation_key_is_absent_when_nothing_is_in_progress() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+
+        let first = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert!(first.get("operation").is_none(), "{first}");
+
+        e.merge("feature").await.unwrap();
+        e.abort().await.unwrap();
+
+        let second = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert!(second.get("operation").is_none(), "{second}");
+        assert_eq!(second, first);
+    }
+
+    // ── US-008: git.branch_create ───────────────────────────────────────────
+
+    /// SEED-A: two commits on `main`, `/src/lib.rs` written by the first.
+    async fn seed_a(e: &Env) -> (String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/src/lib.rs", "fn a() {}\n").await;
+        let c1 = e.commit("C1").await;
+        e.write("/src/main.rs", "fn main() {}\n").await;
+        let c2 = e.commit("C2").await;
+        (c1, c2)
+    }
+
+    /// SEED-B: SEED-A plus a third commit parked on `release/1.0`, `main`
+    /// left at C2.
+    async fn seed_b(e: &Env) -> (String, String, String) {
+        let (c1, c2) = seed_a(e).await;
+        e.write("/src/release.rs", "fn r() {}\n").await;
+        let c3 = e.commit("C3").await;
+        e.set_branch("release/1.0", &c3).await;
+        e.set_branch("main", &c2).await;
+        (c1, c2, c3)
+    }
+
+    async fn branch_create(e: &Env, args: Value) -> Result<Value> {
+        let mut args = args;
+        args["mount_id"] = json!(MOUNT);
+        e.call("git.branch_create", args).await
+    }
+
+    async fn ref_names(e: &Env) -> Vec<String> {
+        e.entry().await.db.list_refs().await.unwrap().into_iter().map(|r| r.name).collect()
+    }
+
+    /// E2E-NEW-400: FR-NEW-101, creation at an explicit start point.
+    #[tokio::test]
+    async fn e2e_new_400_create_a_branch_at_an_explicit_start_point() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+
+        let out =
+            branch_create(&e, json!({"name": "feature/login", "start_point": c2})).await.unwrap();
+        assert_eq!(out, json!({"branch": "feature/login", "sha": c2, "checked_out": false}));
+
+        let row = e.entry().await.db.get_ref("refs/heads/feature/login").await.unwrap().unwrap();
+        assert_eq!(row.target, c2);
+        assert!(!row.symbolic);
+
+        let head = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap();
+        assert_eq!(head.target, "refs/heads/main");
+        assert!(head.symbolic);
+
+        let branches = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        let full: Vec<&str> = branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["full_ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(full, vec!["refs/heads/feature/login", "refs/heads/main"]);
+    }
+
+    /// E2E-NEW-402: FR-NEW-102, a duplicate name never moves the existing ref.
+    #[tokio::test]
+    async fn e2e_new_402_an_existing_branch_name_is_refused() {
+        let e = Env::new().await;
+        let (c1, c2) = seed_a(&e).await;
+
+        let err = branch_create(&e, json!({"name": "main", "start_point": c1})).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER, "{err:?}");
+        assert!(err.message.contains("branch 'main' already exists"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+    }
+
+    /// E2E-NEW-403: FR-NEW-103, an unresolvable start point.
+    #[tokio::test]
+    async fn e2e_new_403_an_unresolvable_start_point() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        let err = branch_create(&e, json!({"name": "feature/x", "start_point": "nosuchref"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("nosuchref"), "{}", err.message);
+        assert!(e.ref_sha("refs/heads/feature/x").await.is_none());
+
+        // An all-hex start point resolves to a raw sha, so the refusal has to
+        // come from the object being absent rather than from the ref lookup.
+        let ghost = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let err = branch_create(&e, json!({"name": "feature/y", "start_point": ghost}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("deadbeef"), "{}", err.message);
+        assert!(e.ref_sha("refs/heads/feature/y").await.is_none());
+    }
+
+    /// E2E-NEW-404: FR-NEW-104 and FR-NEW-116, an invalid name writes nothing.
+    #[tokio::test]
+    async fn e2e_new_404_an_invalid_branch_name_is_refused_before_any_write() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+
+        for name in [
+            "",
+            "bad..name",
+            "has space",
+            "/leading",
+            "trailing/",
+            "tip.lock",
+            "wild*card",
+            "caret^name",
+        ] {
+            let err =
+                branch_create(&e, json!({"name": name, "start_point": c2})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{name:?}: {err:?}");
+            assert!(
+                err.message.contains("is not a valid branch name"),
+                "{name:?}: {}",
+                err.message
+            );
+        }
+
+        assert_eq!(ref_names(&e).await, vec!["HEAD", "refs/heads/main"]);
+    }
+
+    /// E2E-NEW-405: FR-NEW-101/104/116, a unicode name round-trips byte for byte.
+    #[tokio::test]
+    async fn e2e_new_405_a_unicode_branch_name_round_trips_exactly() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+        let name = "feature/café-日本";
+
+        let out = branch_create(&e, json!({"name": name, "start_point": c2})).await.unwrap();
+        assert_eq!(out["branch"].as_str(), Some(name));
+
+        assert_eq!(e.ref_sha(&format!("refs/heads/{name}")).await.as_deref(), Some(c2.as_str()));
+
+        let branches = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        let found = branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["name"].as_str() == Some(name))
+            .expect("the unicode branch is listed");
+        assert_eq!(found["full_ref"].as_str(), Some(format!("refs/heads/{name}").as_str()));
+
+        // US-009 shipped `git.branch_switch`, so the checked-out state is set
+        // through the real tool rather than by writing the ref directly.
+        switch_to(&e, name).await.unwrap();
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(status["branch"].as_str(), Some(name));
+    }
+
+    /// E2E-NEW-406: FR-NEW-104 and FR-NEW-116, exactly 255 bytes is accepted.
+    #[tokio::test]
+    async fn e2e_new_406_a_255_byte_branch_name_is_accepted() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+        let name = format!("f/{}", "a".repeat(253));
+        assert_eq!(name.chars().count(), 255);
+
+        branch_create(&e, json!({"name": name, "start_point": c2})).await.unwrap();
+        assert_eq!(e.ref_sha(&format!("refs/heads/{name}")).await.as_deref(), Some(c2.as_str()));
+    }
+
+    /// E2E-NEW-407: FR-NEW-104 and FR-NEW-116, 256 bytes is refused.
+    #[tokio::test]
+    async fn e2e_new_407_a_256_byte_branch_name_is_refused() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+        let name = format!("f/{}", "a".repeat(254));
+        assert_eq!(name.chars().count(), 256);
+
+        let err = branch_create(&e, json!({"name": name, "start_point": c2})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("256"), "{}", err.message);
+        assert!(err.message.contains("255"), "{}", err.message);
+        assert_eq!(ref_names(&e).await.len(), 2);
+    }
+
+    /// E2E-NEW-410: FR-NEW-103, a repository with no commits at all.
+    #[tokio::test]
+    async fn e2e_new_410_create_in_a_repo_with_no_commits() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        assert!(e.ref_sha("refs/heads/main").await.is_none());
+
+        let err = branch_create(&e, json!({"name": "feature/x", "start_point": "HEAD"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("HEAD"), "{}", err.message);
+        assert!(err.message.contains("no commits"), "{}", err.message);
+        assert!(!ref_names(&e).await.contains(&"refs/heads/feature/x".to_string()));
+    }
+
+    /// E2E-NEW-818: FR-NEW-102/104, refs are case sensitive.
+    #[tokio::test]
+    async fn e2e_new_818_refs_are_case_sensitive() {
+        let e = Env::new().await;
+        let (c1, c2) = seed_a(&e).await;
+
+        let out = branch_create(&e, json!({"name": "Main", "start_point": c1})).await.unwrap();
+        assert_eq!(out, json!({"branch": "Main", "sha": c1, "checked_out": false}));
+
+        assert_eq!(e.ref_sha("refs/heads/Main").await.as_deref(), Some(c1.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(ref_names(&e).await, vec!["HEAD", "refs/heads/Main", "refs/heads/main"]);
+
+        let err = branch_create(&e, json!({"name": "Main", "start_point": c2})).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER, "{err:?}");
+        assert!(err.message.contains("branch 'Main' already exists"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/Main").await.as_deref(), Some(c1.as_str()));
+    }
+
+    /// E2E-NEW-819: FR-NEW-102, a refused duplicate is inert, even when the
+    /// call also asked for a checkout.
+    #[tokio::test]
+    async fn e2e_new_819_a_refused_duplicate_writes_no_audit_entry_and_charges_no_quota() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a(&e).await;
+        let before_audit = e.audit().len();
+        let before_bytes = e.bytes_written();
+
+        let err = branch_create(&e, json!({"name": "main", "start_point": c1, "checkout": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER, "{err:?}");
+        assert!(err.message.contains("branch 'main' already exists"), "{}", err.message);
+
+        assert_eq!(e.audit().len(), before_audit);
+        assert_eq!(e.bytes_written(), before_bytes);
+
+        let head = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap();
+        assert_eq!(head.target, "refs/heads/main");
+        assert!(head.symbolic);
+        assert_eq!(e.read_bytes("/src/lib.rs").await, b"fn a() {}\n");
+    }
+
+    /// E2E-NEW-893: FR-NEW-101/103, fully qualified ref paths as start points.
+    #[tokio::test]
+    async fn e2e_new_893_a_full_ref_path_as_start_point() {
+        let e = Env::new().await;
+        let (_c1, _c2, c3) = seed_b(&e).await;
+
+        let out = branch_create(
+            &e,
+            json!({"name": "from-full", "start_point": "refs/heads/release/1.0"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["sha"].as_str(), Some(c3.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/from-full").await.as_deref(), Some(c3.as_str()));
+
+        let err =
+            branch_create(&e, json!({"name": "from-ghost", "start_point": "refs/heads/ghost"}))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("refs/heads/ghost"), "{}", err.message);
+
+        let err = branch_create(
+            &e,
+            json!({"name": "from-remote", "start_point": "refs/remotes/origin/main"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("refs/remotes/origin/main"), "{}", err.message);
+        assert!(!ref_names(&e).await.contains(&"refs/heads/from-remote".to_string()));
+    }
+
+    // ── US-009: git.branch_switch ───────────────────────────────────────────
+
+    /// The story's SEED-A: C1 holds `/README.md` alone, C2 adds `/src/lib.rs`.
+    async fn seed_a9(e: &Env) -> (String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/README.md", "alpha\n").await;
+        let c1 = e.commit("C1").await;
+        e.write("/src/lib.rs", "fn a() {}\n").await;
+        let c2 = e.commit("C2").await;
+        (c1, c2)
+    }
+
+    /// The story's SEED-B: SEED-A plus `release/1.0` at C3, whose tree is
+    /// `/README.md` plus `/docs/rel.md` and no `/src/lib.rs`. `main` is left at
+    /// C2 with the volume matching C2 exactly.
+    async fn seed_b9(e: &Env) -> (String, String, String) {
+        let (c1, c2) = seed_a9(e).await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/src/lib.rs").await.unwrap();
+        e.write("/docs/rel.md", "rel\n").await;
+        let c3 = e.commit("C3").await;
+        e.set_branch("release/1.0", &c3).await;
+        e.set_branch("main", &c2).await;
+        // Put the volume back on C2's tree, so `main` is clean again.
+        client.delete_file("/docs/rel.md").await.unwrap();
+        e.write("/src/lib.rs", "fn a() {}\n").await;
+        (c1, c2, c3)
+    }
+
+    async fn switch_to(e: &Env, name: &str) -> Result<Value> {
+        e.call("git.branch_switch", json!({"mount_id": MOUNT, "name": name})).await
+    }
+
+    async fn exists(e: &Env, path: &str) -> bool {
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.exists(path).await.unwrap()
+    }
+
+    /// E2E-NEW-401: FR-NEW-101 and FR-NEW-105, create with checkout rewrites
+    /// HEAD and the volume.
+    #[tokio::test]
+    async fn e2e_new_401_create_with_checkout_rewrites_head_and_the_volume() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a9(&e).await;
+
+        let out =
+            branch_create(&e, json!({"name": "hotfix/c1", "start_point": c1, "checkout": true}))
+                .await
+                .unwrap();
+        assert_eq!(out, json!({"branch": "hotfix/c1", "sha": c1, "checked_out": true}));
+
+        let head = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap();
+        assert_eq!(head.target, "refs/heads/hotfix/c1");
+        assert!(head.symbolic);
+
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(status["branch"].as_str(), Some("hotfix/c1"));
+        assert_eq!(status["head"].as_str(), Some(c1.as_str()));
+
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert!(!exists(&e, "/src/lib.rs").await);
+    }
+
+    /// E2E-NEW-408: FR-NEW-106, create+checkout is refused on a dirty volume.
+    #[tokio::test]
+    async fn e2e_new_408_create_with_checkout_is_refused_on_a_dirty_volume() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a9(&e).await;
+        e.write("/README.md", "alpha MODIFIED\n").await;
+
+        let err = branch_create(
+            &e,
+            json!({"name": "feature/dirty", "start_point": c1, "checkout": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        assert!(!err.message.contains("pull refused"), "{}", err.message);
+
+        assert_eq!(e.read("/README.md").await, "alpha MODIFIED\n");
+        assert_eq!(e.ref_sha("HEAD").await.as_deref(), Some("refs/heads/main"));
+    }
+
+    /// E2E-NEW-409: the rejected create of E2E-NEW-408 leaves nothing behind.
+    #[tokio::test]
+    async fn e2e_new_409_the_rejected_create_leaves_nothing_behind() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a9(&e).await;
+        e.write("/README.md", "alpha MODIFIED\n").await;
+        let before_bytes = e.bytes_written();
+
+        branch_create(&e, json!({"name": "feature/dirty", "start_point": c1, "checkout": true}))
+            .await
+            .unwrap_err();
+
+        assert!(e.ref_sha("refs/heads/feature/dirty").await.is_none());
+        assert!(e.audit().iter().all(|a| a.op != "git.branch_create"));
+        assert_eq!(e.bytes_written(), before_bytes);
+    }
+
+    /// E2E-NEW-414: FR-NEW-105, switch rewrites the volume to the target tree.
+    #[tokio::test]
+    async fn e2e_new_414_switch_rewrites_the_volume_to_the_target_tree() {
+        let e = Env::new().await;
+        let (_c1, _c2, c3) = seed_b9(&e).await;
+
+        let out = switch_to(&e, "release/1.0").await.unwrap();
+        assert_eq!(
+            out,
+            json!({"branch": "release/1.0", "sha": c3, "changed": true, "files_changed": 2})
+        );
+
+        assert_eq!(e.read("/docs/rel.md").await, "rel\n");
+        assert!(!exists(&e, "/src/lib.rs").await);
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+
+        switch_to(&e, "main").await.unwrap();
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        assert!(!exists(&e, "/docs/rel.md").await);
+    }
+
+    /// E2E-NEW-415: FR-NEW-106, switch refuses a dirty volume and touches
+    /// nothing.
+    #[tokio::test]
+    async fn e2e_new_415_switch_refuses_a_dirty_volume() {
+        let e = Env::new().await;
+        seed_b9(&e).await;
+        e.write("/src/lib.rs", "fn a() { todo!() }\n").await;
+
+        let err = switch_to(&e, "release/1.0").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        assert!(err.message.contains("release/1.0"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("HEAD").await.as_deref(), Some("refs/heads/main"));
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { todo!() }\n");
+        assert!(!exists(&e, "/docs/rel.md").await);
+    }
+
+    /// E2E-NEW-416: FR-NEW-105, switch to an unknown branch.
+    #[tokio::test]
+    async fn e2e_new_416_switch_to_an_unknown_branch() {
+        let e = Env::new().await;
+        seed_a9(&e).await;
+
+        let err = switch_to(&e, "release/9.9").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("branch 'release/9.9'"), "{}", err.message);
+        assert_eq!(e.ref_sha("HEAD").await.as_deref(), Some("refs/heads/main"));
+    }
+
+    /// E2E-NEW-417: FR-NEW-107, switching to the current branch is a no-op.
+    #[tokio::test]
+    async fn e2e_new_417_switching_to_the_current_branch_is_a_no_op() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a9(&e).await;
+        let before = e.bytes_written();
+
+        let out = switch_to(&e, "main").await.unwrap();
+        assert_eq!(out, json!({"branch": "main", "sha": c2, "changed": false, "files_changed": 0}));
+        assert_eq!(e.bytes_written(), before);
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+    }
+
+    /// E2E-NEW-418: FR-NEW-105, switch under an exhausted quota.
+    #[tokio::test]
+    async fn e2e_new_418_switch_under_an_exhausted_quota() {
+        let e = Env::with_quota(60).await;
+        seed_b9(&e).await;
+        // The seed writes through the volume client, which never charges, so
+        // the headroom is set explicitly rather than guessed: 3 bytes, against
+        // the 4 bytes `/docs/rel.md` needs.
+        e.f.state.safety.charge_write(OWNER, MOUNT, 57).unwrap();
+        assert_eq!(e.bytes_written(), 57);
+
+        let err = switch_to(&e, "release/1.0").await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED, "{err:?}");
+        assert!(
+            err.message.contains("session write quota of 60 bytes exceeded"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// E2E-NEW-419: the quota-refused switch left the volume untouched.
+    #[tokio::test]
+    async fn e2e_new_419_the_quota_refused_switch_left_the_volume_untouched() {
+        let e = Env::with_quota(60).await;
+        seed_b9(&e).await;
+        e.f.state.safety.charge_write(OWNER, MOUNT, 57).unwrap();
+
+        switch_to(&e, "release/1.0").await.unwrap_err();
+
+        assert!(!exists(&e, "/docs/rel.md").await);
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        assert_eq!(e.ref_sha("HEAD").await.as_deref(), Some("refs/heads/main"));
+        assert_eq!(e.bytes_written(), 57);
+    }
+
+    /// E2E-NEW-420: a successful switch charges quota and writes one audit
+    /// entry.
+    #[tokio::test]
+    async fn e2e_new_420_a_successful_switch_charges_quota_and_audits_once() {
+        let e = Env::new().await;
+        seed_b9(&e).await;
+        let before = e.bytes_written();
+
+        switch_to(&e, "release/1.0").await.unwrap();
+
+        assert_eq!(e.bytes_written() - before, 4);
+        let switches: Vec<_> =
+            e.audit().into_iter().filter(|a| a.op == "git.branch_switch").collect();
+        assert_eq!(switches.len(), 1, "{switches:?}");
+        assert_eq!(switches[0].path, "/");
+        assert!(switches[0].detail.contains("release/1.0"), "{}", switches[0].detail);
+        assert!(switches[0].detail.contains("files_changed 2"), "{}", switches[0].detail);
+    }
+
+    /// E2E-NEW-421: FR-NEW-115, two switches race and no mixed state survives.
+    #[tokio::test]
+    async fn e2e_new_421_two_switches_race() {
+        let e = Env::new().await;
+        let (_c1, c2, _c3) = seed_b9(&e).await;
+        // A third branch off C1, adding `/z.txt` and no `/src/lib.rs`.
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/src/lib.rs").await.unwrap();
+        e.write("/z.txt", "z\n").await;
+        let c4 = e.commit("C4").await;
+        e.set_branch("feature/z", &c4).await;
+        e.set_branch("main", &c2).await;
+        client.delete_file("/z.txt").await.unwrap();
+        e.write("/src/lib.rs", "fn a() {}\n").await;
+
+        let (a, b) = tokio::join!(switch_to(&e, "release/1.0"), switch_to(&e, "feature/z"));
+        for out in [&a, &b] {
+            if let Err(err) = out {
+                assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+                assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+            }
+        }
+
+        let head = e.ref_sha("HEAD").await.unwrap();
+        match head.as_str() {
+            "refs/heads/release/1.0" => {
+                assert_eq!(e.read("/docs/rel.md").await, "rel\n");
+                assert!(!exists(&e, "/z.txt").await);
+            }
+            "refs/heads/feature/z" => {
+                assert_eq!(e.read("/z.txt").await, "z\n");
+                assert!(!exists(&e, "/docs/rel.md").await);
+            }
+            other => panic!("unexpected HEAD {other}"),
+        }
+    }
+
+    /// E2E-NEW-529: FR-NEW-279, a switch cannot slip into a paused merge.
+    #[tokio::test]
+    async fn e2e_new_529_branch_switch_blocked_while_a_merge_is_in_progress() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+
+        let err = switch_to(&e, "feature").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+        for needle in ["merge", "in progress", "git.merge_abort"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+
+        let head = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap();
+        assert!(head.symbolic);
+        assert_eq!(head.target, "refs/heads/main");
+        assert_eq!(e.read(CFG).await, MAIN_CFG);
+
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-820: FR-NEW-107, the no-op switch writes nothing at all.
+    #[tokio::test]
+    async fn e2e_new_820_the_no_op_switch_writes_nothing_at_all() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a9(&e).await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        let before_mtime = client.stat("/README.md").await.unwrap().mtime;
+        let before_audit = e.audit();
+        let before_bytes = e.bytes_written();
+
+        let out = switch_to(&e, "main").await.unwrap();
+        assert_eq!(out, json!({"branch": "main", "sha": c2, "changed": false, "files_changed": 0}));
+
+        let after_audit = e.audit();
+        assert_eq!(after_audit.len(), before_audit.len());
+        for (a, b) in after_audit.iter().zip(before_audit.iter()) {
+            assert_eq!((&a.op, &a.path, &a.detail), (&b.op, &b.path, &b.detail));
+        }
+        assert_eq!(e.bytes_written(), before_bytes);
+        assert_eq!(client.stat("/README.md").await.unwrap().mtime, before_mtime);
+    }
+
+    /// E2E-NEW-821: FR-NEW-106 and FR-NEW-107, the dirty check runs before the
+    /// no-op shortcut.
+    #[tokio::test]
+    async fn e2e_new_821_the_dirty_check_runs_before_the_no_op_shortcut() {
+        let e = Env::new().await;
+        seed_a9(&e).await;
+        e.write("/README.md", "alpha-DIRTY\n").await;
+
+        let err = switch_to(&e, "main").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["uncommitted changes", "git.commit", "git.stash_save"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+
+        assert_eq!(e.read_bytes("/README.md").await, b"alpha-DIRTY\n");
+        assert_eq!(e.ref_sha("HEAD").await.as_deref(), Some("refs/heads/main"));
+        assert!(e.audit().iter().all(|a| a.op != "git.branch_switch"));
+    }
+
+    // ── US-010: branch_delete, branch_reset, tracking divergence ────────────
+
+    async fn branch_delete(e: &Env, args: Value) -> Result<Value> {
+        let mut args = args;
+        args["mount_id"] = json!(MOUNT);
+        e.call("git.branch_delete", args).await
+    }
+
+    async fn branch_reset(e: &Env, args: Value) -> Result<Value> {
+        let mut args = args;
+        args["mount_id"] = json!(MOUNT);
+        e.call("git.branch_reset", args).await
+    }
+
+    async fn branch_entries(e: &Env) -> Vec<Value> {
+        e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap()["branches"]
+            .as_array()
+            .expect("branches is an array")
+            .clone()
+    }
+
+    fn branch_entry<'a>(branches: &'a [Value], name: &str) -> &'a Value {
+        branches
+            .iter()
+            .find(|b| b["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("branch {name} is listed"))
+    }
+
+    /// E2E-NEW-422: FR-NEW-108, deleting a merged branch.
+    #[tokio::test]
+    async fn e2e_new_422_delete_a_merged_branch() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a9(&e).await;
+        branch_create(&e, json!({"name": "feature/merged", "start_point": c1})).await.unwrap();
+
+        let out = branch_delete(&e, json!({"name": "feature/merged"})).await.unwrap();
+        assert_eq!(out, json!({"branch": "feature/merged", "sha": c1, "forced": false}));
+
+        assert!(e.ref_sha("refs/heads/feature/merged").await.is_none());
+        let listed = branch_entries(&e).await;
+        let names: Vec<&str> = listed.iter().filter_map(|b| b["name"].as_str()).collect();
+        assert_eq!(names, vec!["main"]);
+    }
+
+    /// E2E-NEW-423: FR-NEW-109, the checked-out branch cannot be deleted.
+    #[tokio::test]
+    async fn e2e_new_423_the_checked_out_branch_cannot_be_deleted() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a9(&e).await;
+
+        let err = branch_delete(&e, json!({"name": "main"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("'main' is the checked-out branch"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+    }
+
+    /// E2E-NEW-426: FR-NEW-108, a force delete removes the ref, never the
+    /// objects. Builds on E2E-NEW-425, the force delete itself.
+    #[tokio::test]
+    async fn e2e_new_426_a_force_delete_removes_the_ref_never_the_objects() {
+        let e = Env::new().await;
+        let (_c1, _c2, c3) = seed_b9(&e).await;
+
+        let out = branch_delete(&e, json!({"name": "release/1.0", "force": true})).await.unwrap();
+        assert_eq!(out, json!({"branch": "release/1.0", "sha": c3, "forced": true}));
+        assert!(e.ref_sha("refs/heads/release/1.0").await.is_none());
+
+        let shown = e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": c3})).await.unwrap();
+        assert_eq!(shown["commit"]["sha"].as_str(), Some(c3.as_str()));
+        assert!(!shown["diff"].as_str().unwrap().is_empty(), "{shown}");
+
+        let row = e.entry().await.db.get_object(&c3).await.unwrap().expect("the commit object");
+        assert_eq!(row.kind, "commit");
+    }
+
+    /// E2E-NEW-427: FR-NEW-108, an unknown branch, with and without force.
+    #[tokio::test]
+    async fn e2e_new_427_delete_an_unknown_branch() {
+        let e = Env::new().await;
+        seed_a9(&e).await;
+
+        for args in
+            [json!({"name": "feature/ghost"}), json!({"name": "feature/ghost", "force": true})]
+        {
+            let err = branch_delete(&e, args).await.unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+            assert!(err.message.contains("branch 'feature/ghost'"), "{}", err.message);
+        }
+    }
+
+    /// E2E-NEW-428: FR-NEW-109 and FR-NEW-110, both rejected deletes leave
+    /// every ref intact and write no audit entry.
+    #[tokio::test]
+    async fn e2e_new_428_the_rejected_deletes_left_every_ref_intact() {
+        let e = Env::new().await;
+        let (_c1, c2, c3) = seed_b9(&e).await;
+
+        let err = branch_delete(&e, json!({"name": "main"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+
+        let err = branch_delete(&e, json!({"name": "release/1.0"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("force"), "{}", err.message);
+        assert!(err.message.contains(&c3), "{}", err.message);
+
+        assert_eq!(ref_names(&e).await, vec!["HEAD", "refs/heads/main", "refs/heads/release/1.0"]);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/release/1.0").await.as_deref(), Some(c3.as_str()));
+        assert!(e.audit().iter().all(|a| a.op != "git.branch_delete"));
+    }
+
+    /// E2E-NEW-431: FR-NEW-112, resetting another branch never touches the
+    /// volume. Builds on E2E-NEW-430, the reset itself.
+    #[tokio::test]
+    async fn e2e_new_431_resetting_another_branch_never_touches_the_volume() {
+        let e = Env::new().await;
+        let (c1, _c2, c3) = seed_b9(&e).await;
+        let before = e.bytes_written();
+
+        let out =
+            branch_reset(&e, json!({"name": "release/1.0", "target_commit": c1, "force": true}))
+                .await
+                .unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "branch": "release/1.0",
+                "old_sha": c3,
+                "new_sha": c1,
+                "checked_out": false,
+                "files_changed": 0,
+            })
+        );
+
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        assert!(!exists(&e, "/docs/rel.md").await);
+        assert_eq!(e.bytes_written(), before);
+
+        let resets: Vec<_> = e.audit().into_iter().filter(|a| a.op == "git.branch_reset").collect();
+        assert_eq!(resets.len(), 1, "{resets:?}");
+        assert!(resets[0].detail.contains(&c3), "{}", resets[0].detail);
+        assert!(resets[0].detail.contains(&c1), "{}", resets[0].detail);
+    }
+
+    /// E2E-NEW-435: FR-NEW-112, the hard reset of E2E-NEW-434 removed the file
+    /// and was accounted.
+    #[tokio::test]
+    async fn e2e_new_435_the_hard_reset_removed_the_file_and_was_accounted() {
+        let e = Env::new().await;
+        let (c1, c2, _c3) = seed_b9(&e).await;
+        let before = e.bytes_written();
+
+        let out = branch_reset(&e, json!({"name": "main", "target_commit": c1, "force": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "branch": "main",
+                "old_sha": c2,
+                "new_sha": c1,
+                "checked_out": true,
+                "files_changed": 1,
+            })
+        );
+
+        assert!(!exists(&e, "/src/lib.rs").await);
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert_eq!(e.bytes_written() - before, 0);
+
+        let resets: Vec<_> = e.audit().into_iter().filter(|a| a.op == "git.branch_reset").collect();
+        assert_eq!(resets.len(), 1, "{resets:?}");
+        assert_eq!(resets[0].path, "/");
+        assert!(resets[0].detail.contains("files_changed 1"), "{}", resets[0].detail);
+    }
+
+    /// E2E-NEW-436: FR-NEW-114, an unknown target commit.
+    #[tokio::test]
+    async fn e2e_new_436_an_unknown_target_commit() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a9(&e).await;
+        let ghost = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let err = branch_reset(&e, json!({"name": "main", "target_commit": ghost, "force": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("deadbeef"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+    }
+
+    /// E2E-NEW-437: FR-NEW-114, resetting an unknown branch never creates it.
+    #[tokio::test]
+    async fn e2e_new_437_resetting_an_unknown_branch() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a9(&e).await;
+
+        let err =
+            branch_reset(&e, json!({"name": "feature/ghost", "target_commit": c1, "force": true}))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("branch 'feature/ghost'"), "{}", err.message);
+        assert!(!ref_names(&e).await.contains(&"refs/heads/feature/ghost".to_string()));
+    }
+
+    /// E2E-NEW-439: FR-NEW-113 and FR-NEW-114, the rejected resets of
+    /// E2E-NEW-432 (non fast-forward without force) and E2E-NEW-438 (unknown
+    /// target) left the refs untouched.
+    #[tokio::test]
+    async fn e2e_new_439_the_rejected_resets_left_the_refs_untouched() {
+        let e = Env::new().await;
+        let (c1, c2, c3) = seed_b9(&e).await;
+        e.write("/README.md", "alpha-DIRTY\n").await;
+        let before = e.bytes_written();
+
+        // E2E-NEW-432: C3 is not an ancestor of C1, so the move orphans C3.
+        let err = branch_reset(&e, json!({"name": "release/1.0", "target_commit": c1}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("force"), "{}", err.message);
+        assert!(err.message.contains(&c3), "{}", err.message);
+
+        // E2E-NEW-438: an unknown target on the checked-out branch.
+        let err = branch_reset(
+            &e,
+            json!({"name": "main", "target_commit": "refs/heads/ghost", "force": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+
+        assert_eq!(e.ref_sha("refs/heads/release/1.0").await.as_deref(), Some(c3.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert!(e.audit().iter().all(|a| a.op != "git.branch_reset"));
+        assert_eq!(e.bytes_written(), before);
+    }
+
+    /// E2E-NEW-442: FR-MOD-106, exactly one branch is marked current.
+    #[tokio::test]
+    async fn e2e_new_442_git_branches_marks_exactly_one_current_branch() {
+        let e = Env::new().await;
+        seed_b9(&e).await;
+
+        let branches = branch_entries(&e).await;
+        assert_eq!(branches.len(), 2, "{branches:?}");
+        assert_eq!(branch_entry(&branches, "main")["current"], json!(true));
+        assert_eq!(branch_entry(&branches, "release/1.0")["current"], json!(false));
+        assert_eq!(branches.iter().filter(|b| b["current"] == json!(true)).count(), 1);
+
+        switch_to(&e, "release/1.0").await.unwrap();
+        let branches = branch_entries(&e).await;
+        assert_eq!(branch_entry(&branches, "release/1.0")["current"], json!(true));
+        assert_eq!(branch_entry(&branches, "main")["current"], json!(false));
+        assert_eq!(branches.iter().filter(|b| b["current"] == json!(true)).count(), 1);
+    }
+
+    /// E2E-NEW-443: FR-MOD-106, ahead and behind against the tracking ref.
+    #[tokio::test]
+    async fn e2e_new_443_ahead_and_behind_versus_the_remote_tracking_ref() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a9(&e).await;
+        let db = e.entry().await.db.clone();
+        db.set_ref("refs/remotes/origin/main", &c1, false).await.unwrap();
+
+        e.write("/a.txt", "a\n").await;
+        e.commit("c3").await;
+        e.write("/b.txt", "b\n").await;
+        let c4 = e.commit("c4").await;
+
+        // The behind side comes from a sibling branch off C1.
+        branch_create(&e, json!({"name": "feature/upstream", "start_point": c1, "checkout": true}))
+            .await
+            .unwrap();
+        e.write("/u.txt", "u\n").await;
+        let u2 = e.commit("U2").await;
+        switch_to(&e, "main").await.unwrap();
+        db.set_ref("refs/remotes/origin/main", &u2, false).await.unwrap();
+
+        let branches = branch_entries(&e).await;
+        let main = branch_entry(&branches, "main");
+        assert_eq!(main["sha"].as_str(), Some(c4.as_str()));
+        assert_eq!(main["upstream"], json!("refs/remotes/origin/main"));
+        assert_eq!(main["ahead"], json!(3));
+        assert_eq!(main["behind"], json!(1));
+
+        assert_eq!(e.log_shas("main").await.len(), 4);
+    }
+
+    /// E2E-NEW-444: FR-MOD-106, no upstream reports null, never zero.
+    #[tokio::test]
+    async fn e2e_new_444_a_branch_with_no_upstream_reports_null_not_zero() {
+        let e = Env::new().await;
+        seed_b9(&e).await;
+        assert!(ref_names(&e).await.iter().all(|n| !n.starts_with("refs/remotes/")));
+
+        let branches = branch_entries(&e).await;
+        assert_eq!(branches.len(), 2);
+        for b in &branches {
+            assert!(b["upstream"].is_null(), "{b}");
+            assert!(b["ahead"].is_null(), "{b}");
+            assert!(b["behind"].is_null(), "{b}");
+        }
+    }
+
+    /// E2E-NEW-445: FR-MOD-106, a repository with no commits at all.
+    #[tokio::test]
+    async fn e2e_new_445_git_branches_on_a_repo_with_no_commits() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+
+        let out = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(out, json!({"mount_id": MOUNT, "branches": []}));
+
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(status["branch"].as_str(), Some("main"));
+        assert!(status["head"].is_null(), "{status}");
+    }
+
+    // ── US-011: git.stash_save, git.stash_list, git.stash_drop ──────────────
+
+    /// The story's SEED-A: C1 holds `/README.md`, C2 adds `/src/lib.rs`.
+    /// Identical to [`seed_a9`]; named apart so a later edit of one story's
+    /// seed cannot silently move the other story's ground.
+    async fn seed_a11(e: &Env) -> (String, String) {
+        seed_a9(e).await
+    }
+
+    async fn stash_save(e: &Env, args: Value) -> Result<Value> {
+        let mut args = args;
+        args["mount_id"] = json!(MOUNT);
+        e.call("git.stash_save", args).await
+    }
+
+    async fn stash_list(e: &Env) -> Value {
+        e.call("git.stash_list", json!({"mount_id": MOUNT})).await.unwrap()
+    }
+
+    async fn stash_entries(e: &Env) -> Vec<Value> {
+        stash_list(e).await["stashes"].as_array().cloned().unwrap_or_default()
+    }
+
+    async fn stash_drop(e: &Env, id: &str) -> Result<Value> {
+        e.call("git.stash_drop", json!({"mount_id": MOUNT, "stash_id": id})).await
+    }
+
+    async fn stash_ref_names(e: &Env) -> Vec<String> {
+        ref_names(e).await.into_iter().filter(|n| n.starts_with("refs/stash/")).collect()
+    }
+
+    /// The fixture E2E-NEW-446 and every test built on it share: SEED-A plus
+    /// one modification and one addition, stashed under "wip: login".
+    async fn stashed_446(e: &Env) -> (String, String) {
+        seed_a11(e).await;
+        e.write("/src/lib.rs", "fn a() { 1 }\n").await;
+        e.write("/notes.txt", "draft\n").await;
+        let out = stash_save(e, json!({"message": "wip: login"})).await.unwrap();
+        let id = out["stash_id"].as_str().unwrap().to_string();
+        (id, out["base_sha"].as_str().unwrap().to_string())
+    }
+
+    fn is_sha(v: &Value) -> bool {
+        v.as_str().is_some_and(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    /// E2E-NEW-446: FR-NEW-120, a save creates an entry.
+    #[tokio::test]
+    async fn e2e_new_446_stash_save_creates_an_entry() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/src/lib.rs", "fn a() { 1 }\n").await;
+        e.write("/notes.txt", "draft\n").await;
+
+        let out = stash_save(&e, json!({"message": "wip: login"})).await.unwrap();
+        assert!(is_sha(&out["stash_id"]), "{out}");
+        assert_eq!(out["sha"], out["stash_id"]);
+        assert_eq!(out["message"], "wip: login");
+        assert_eq!(out["branch"], "main");
+        assert_eq!(out["files_stashed"], 2);
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"], out["stash_id"]);
+    }
+
+    /// E2E-NEW-447: FR-NEW-120, the save reverts the volume to HEAD.
+    #[tokio::test]
+    async fn e2e_new_447_stash_save_reverts_the_volume_to_head() {
+        let e = Env::new().await;
+        stashed_446(&e).await;
+
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        assert!(!exists(&e, "/notes.txt").await);
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+
+        let err = stash_save(&e, json!({"message": "second"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("nothing to stash"), "{}", err.message);
+    }
+
+    /// E2E-NEW-448: FR-NEW-120/123/131, the entry lives in `git_refs`.
+    #[tokio::test]
+    async fn e2e_new_448_the_stash_lives_in_git_refs_under_refs_stash() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+
+        let db = &e.entry().await.db;
+        let row = db.get_ref(&format!("refs/stash/{id}")).await.unwrap().expect("the stash ref");
+        assert_eq!(row.target, id);
+        assert!(!row.symbolic);
+        assert_eq!(stash_ref_names(&e).await, vec![format!("refs/stash/{id}")]);
+        let obj = db.get_object(&id).await.unwrap().expect("the stash commit object");
+        assert_eq!(obj.kind, "commit");
+    }
+
+    /// E2E-NEW-449: FR-NEW-121, a clean volume has nothing to stash.
+    #[tokio::test]
+    async fn e2e_new_449_stash_save_on_a_clean_volume() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+
+        let err = stash_save(&e, json!({"message": "nothing here"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("nothing to stash"), "{}", err.message);
+        assert!(err.message.contains("no uncommitted changes"), "{}", err.message);
+        // Distinguishable from the dirty-volume refusal every other tool uses.
+        assert!(!err.message.contains("uncommitted changes: commit or discard"), "{}", err.message);
+        assert!(stash_ref_names(&e).await.is_empty());
+    }
+
+    /// E2E-NEW-450: FR-NEW-121, a repository with no commits has no HEAD tree.
+    #[tokio::test]
+    async fn e2e_new_450_stash_save_in_a_repo_with_no_commits() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/scratch.txt", "s\n").await;
+
+        let err = stash_save(&e, json!({"message": "early"})).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("HEAD"), "{}", err.message);
+        assert!(err.message.contains("no commits"), "{}", err.message);
+        assert_eq!(e.read("/scratch.txt").await, "s\n");
+        assert!(stash_ref_names(&e).await.is_empty());
+    }
+
+    /// E2E-NEW-451: FR-NEW-120, the revert is charged and the save audited.
+    #[tokio::test]
+    async fn e2e_new_451_stash_save_charges_quota_and_audits() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/src/lib.rs", "fn a() { 1 }\n").await;
+        let before = e.f.state.safety.bytes_written(OWNER, MOUNT);
+
+        stash_save(&e, json!({"message": "wip"})).await.unwrap();
+
+        // Only the blob the revert writes back is charged, 10 bytes.
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT) - before, 10);
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        let saves: Vec<_> = log.iter().filter(|a| a.op == "git.stash_save").collect();
+        assert_eq!(saves.len(), 1, "{log:?}");
+        assert_eq!(saves[0].path, "/");
+        assert!(saves[0].detail.contains("wip"), "{}", saves[0].detail);
+        assert!(saves[0].detail.contains("files_stashed 1"), "{}", saves[0].detail);
+    }
+
+    /// E2E-NEW-452: FR-NEW-120/122, unicode and very long messages survive, and
+    /// an omitted message defaults.
+    #[tokio::test]
+    async fn e2e_new_452_unicode_and_very_long_stash_messages() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/notes.txt", "x\n").await;
+        let msg = format!("réunion 日本 🚀 {}", "m".repeat(987));
+        assert_eq!(msg.chars().count(), 1000);
+
+        let out = stash_save(&e, json!({"message": msg})).await.unwrap();
+        assert_eq!(out["message"].as_str().unwrap(), msg);
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries[0]["message"].as_str().unwrap(), msg);
+
+        e.write("/notes2.txt", "y\n").await;
+        let out = stash_save(&e, json!({})).await.unwrap();
+        assert_eq!(out["message"], "WIP on main");
+    }
+
+    /// E2E-NEW-453: FR-NEW-122/131, newest first with the exact field shape.
+    #[tokio::test]
+    async fn e2e_new_453_stash_list_is_newest_first_with_the_full_field_shape() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a11(&e).await;
+        e.write("/a.txt", "1\n").await;
+        let s1 = stash_save(&e, json!({"message": "first"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        e.write("/b.txt", "2\n").await;
+        let s2 = stash_save(&e, json!({"message": "second"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(s2.as_str()));
+        assert_eq!(entries[0]["message"], "second");
+        assert_eq!(entries[1]["stash_id"].as_str(), Some(s1.as_str()));
+        assert_eq!(entries[1]["message"], "first");
+        for entry in &entries {
+            let keys: Vec<&str> = entry.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(keys, ["stash_id", "message", "base_sha", "branch", "created_at"]);
+            assert_eq!(entry["base_sha"].as_str(), Some(c2.as_str()));
+            assert_eq!(entry["branch"], "main");
+            assert!(entry["created_at"].as_i64().unwrap_or(0) > 0, "{entry}");
+        }
+    }
+
+    /// E2E-NEW-454: FR-NEW-122/131, an empty pool is an empty list, not an error.
+    #[tokio::test]
+    async fn e2e_new_454_stash_list_on_an_empty_pool() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+
+        let out = e.call("git.stash_list", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(out, json!({"mount_id": MOUNT, "stashes": [], "count": 0}));
+    }
+
+    /// E2E-NEW-460: FR-NEW-128, a drop with an unknown id.
+    #[tokio::test]
+    async fn e2e_new_460_stash_drop_with_an_unknown_id() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+
+        let err = stash_drop(&e, "not-a-sha").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("not-a-sha"), "{}", err.message);
+        assert!(err.message.contains("40"), "{}", err.message);
+
+        let err = stash_drop(&e, &"f".repeat(40)).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+
+        let db = &e.entry().await.db;
+        assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_some());
+    }
+
+    /// E2E-NEW-461: FR-NEW-127, a drop removes the entry and nothing else.
+    #[tokio::test]
+    async fn e2e_new_461_stash_drop_removes_the_entry_without_touching_the_volume() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+        let before = e.f.state.safety.bytes_written(OWNER, MOUNT);
+
+        let out = stash_drop(&e, &id).await.unwrap();
+        assert_eq!(out, json!({"stash_id": id, "dropped": true}));
+
+        assert_eq!(stash_entries(&e).await, Vec::<Value>::new());
+        let db = &e.entry().await.db;
+        assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_none());
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        assert!(!exists(&e, "/notes.txt").await);
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), before);
+    }
+
+    /// E2E-NEW-467: FR-NEW-130, the pool cap boundary at the default of 100.
+    #[tokio::test]
+    async fn e2e_new_467_the_stash_pool_cap_boundary() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        for i in 0..100 {
+            e.write(&format!("/s{i}.txt"), &format!("{i}\n")).await;
+            stash_save(&e, json!({"message": format!("s{i}")})).await.unwrap();
+        }
+        assert_eq!(stash_entries(&e).await.len(), 100);
+
+        e.write("/s100.txt", "100\n").await;
+        let err = stash_save(&e, json!({"message": "s100"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("100"), "{}", err.message);
+        assert!(err.message.contains("stash"), "{}", err.message);
+        assert!(err.message.contains("drop"), "{}", err.message);
+
+        assert_eq!(stash_entries(&e).await.len(), 100);
+        assert_eq!(e.read("/s100.txt").await, "100\n");
+    }
+
+    /// E2E-NEW-469: FR-NEW-120/115, two saves race under the write lock.
+    #[tokio::test]
+    async fn e2e_new_469_two_stash_save_calls_race() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/p.txt", "p\n").await;
+        e.write("/q.txt", "q\n").await;
+
+        let (a, b) = tokio::join!(
+            stash_save(&e, json!({"message": "A"})),
+            stash_save(&e, json!({"message": "B"}))
+        );
+
+        let ok: Vec<&Value> = [&a, &b].into_iter().filter_map(|r| r.as_ref().ok()).collect();
+        match (&a, &b) {
+            (Ok(x), Ok(y)) => assert_ne!(x["stash_id"], y["stash_id"]),
+            _ => {
+                assert_eq!(ok.len(), 1, "{a:?} {b:?}");
+                let err = [&a, &b].into_iter().find_map(|r| r.as_ref().err()).unwrap();
+                assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+                assert!(err.message.contains("nothing to stash"), "{}", err.message);
+            }
+        }
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), ok.len());
+        let mut ids: Vec<String> =
+            entries.iter().map(|x| x["stash_id"].as_str().unwrap().to_string()).collect();
+        let db = &e.entry().await.db;
+        for id in &ids {
+            assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_some(), "{id}");
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), entries.len());
+
+        assert!(!exists(&e, "/p.txt").await);
+        assert!(!exists(&e, "/q.txt").await);
+    }
+
+    /// E2E-NEW-470: FR-NEW-123, stash refs never leak into branch or tag lists.
+    #[tokio::test]
+    async fn e2e_new_470_stash_refs_never_leak_into_branch_or_tag_listings() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/a.txt", "1\n").await;
+        let s1 = stash_save(&e, json!({"message": "first"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        e.write("/b.txt", "2\n").await;
+        let s2 = stash_save(&e, json!({"message": "second"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let branches = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        let listed = branches["branches"].as_array().unwrap();
+        assert_eq!(listed.len(), 1, "{branches}");
+        assert!(
+            listed.iter().all(|b| !b["full_ref"].as_str().unwrap().starts_with("refs/stash/")),
+            "{branches}"
+        );
+        let tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(tags["tags"], json!([]));
+
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        let names: Vec<&str> = status["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&format!("refs/stash/{s1}").as_str()), "{status}");
+        assert!(names.contains(&format!("refs/stash/{s2}").as_str()), "{status}");
+    }
+
+    /// Two stashes over `/README.md`, as E2E-NEW-822 and E2E-NEW-823 need them.
+    async fn two_readme_stashes(e: &Env) -> (String, String) {
+        seed_a11(e).await;
+        e.write("/README.md", "alpha-1\n").await;
+        let s1 = stash_save(e, json!({"message": "wip one"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        e.write("/README.md", "alpha-2\n").await;
+        let s2 = stash_save(e, json!({"message": "wip two"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (s1, s2)
+    }
+
+    /// E2E-NEW-822: FR-NEW-127/122, a drop touches neither the volume nor the
+    /// other entries, and never prunes the commit object.
+    #[tokio::test]
+    async fn e2e_new_822_drop_touches_neither_the_volume_nor_the_other_entries() {
+        let e = Env::new().await;
+        let (s1, s2) = two_readme_stashes(&e).await;
+        let before = e.f.state.safety.bytes_written(OWNER, MOUNT);
+        let db_s2 = e.entry().await.db.get_ref(&format!("refs/stash/{s2}")).await.unwrap();
+
+        let out = stash_drop(&e, &s1).await.unwrap();
+        assert_eq!(out, json!({"stash_id": s1, "dropped": true}));
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(s2.as_str()));
+        assert_eq!(entries[0]["message"], "wip two");
+
+        let db = &e.entry().await.db;
+        assert!(db.get_ref(&format!("refs/stash/{s1}")).await.unwrap().is_none());
+        assert_eq!(
+            db.get_ref(&format!("refs/stash/{s2}")).await.unwrap().map(|r| r.target),
+            db_s2.map(|r| r.target)
+        );
+        assert_eq!(e.read_bytes("/README.md").await, b"alpha\n");
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), before);
+        assert!(db.object_exists(&s1).await.unwrap());
+    }
+
+    /// E2E-NEW-823: FR-NEW-127/128, dropping the same id twice.
+    #[tokio::test]
+    async fn e2e_new_823_dropping_the_same_id_twice() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/README.md", "alpha-1\n").await;
+        let s1 = stash_save(&e, json!({"message": "wip one"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        stash_drop(&e, &s1).await.unwrap();
+        let err = stash_drop(&e, &s1).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains(&s1), "{}", err.message);
+
+        assert_eq!(stash_list(&e).await["stashes"], json!([]));
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        assert_eq!(log.iter().filter(|a| a.op == "git.stash_drop").count(), 1, "{log:?}");
+    }
+
+    /// Three stashes under a cap of 3, then a dirty volume again.
+    async fn three_stashes_at_cap(e: &Env) -> Vec<String> {
+        seed_a11(e).await;
+        let mut ids = Vec::new();
+        for i in 1..=3 {
+            e.write("/README.md", &format!("alpha-{i}\n")).await;
+            ids.push(
+                stash_save(e, json!({"message": format!("wip {i}")})).await.unwrap()["stash_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        e.write("/README.md", "alpha-4\n").await;
+        ids
+    }
+
+    /// E2E-NEW-824: FR-NEW-130, the refusal names the limit and the remedy.
+    #[tokio::test]
+    async fn e2e_new_824_the_refusal_names_the_limit_and_the_remedy() {
+        let e = Env::build(|c| {
+            c.git.enabled = true;
+            c.git.max_stash_entries = 3;
+        })
+        .await;
+        three_stashes_at_cap(&e).await;
+
+        let err = stash_save(&e, json!({"message": "wip 4"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains('3'), "{}", err.message);
+        assert!(err.message.contains("git.stash_drop"), "{}", err.message);
+
+        let listed = stash_entries(&e).await;
+        let messages: Vec<&str> = listed.iter().map(|x| x["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["wip 3", "wip 2", "wip 1"]);
+        assert_eq!(e.read_bytes("/README.md").await, b"alpha-4\n");
+        assert_eq!(stash_ref_names(&e).await.len(), 3);
+    }
+
+    /// E2E-NEW-825: FR-NEW-130/127, dropping one entry at the cap re-opens a slot.
+    #[tokio::test]
+    async fn e2e_new_825_dropping_one_entry_at_the_cap_re_opens_a_slot() {
+        let e = Env::build(|c| {
+            c.git.enabled = true;
+            c.git.max_stash_entries = 3;
+        })
+        .await;
+        let ids = three_stashes_at_cap(&e).await;
+        assert!(stash_save(&e, json!({"message": "wip 4"})).await.is_err());
+
+        stash_drop(&e, &ids[0]).await.unwrap();
+        let out = stash_save(&e, json!({"message": "wip 4"})).await.unwrap();
+        assert_eq!(out["message"], "wip 4");
+
+        let listed = stash_entries(&e).await;
+        let messages: Vec<&str> = listed.iter().map(|x| x["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["wip 4", "wip 3", "wip 2"]);
+        assert_eq!(e.read_bytes("/README.md").await, b"alpha\n");
+    }
+
+    /// E2E-NEW-895: FR-NEW-121/120, dirt that is only an added file is still
+    /// stashable, and US-012's carried clause: the entry restores through
+    /// `git.stash_apply`.
+    #[tokio::test]
+    async fn e2e_new_895_dirt_that_is_only_an_added_file_is_still_stashable() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a11(&e).await;
+        e.write("/scratch/new.txt", "n\n").await;
+
+        let out = stash_save(&e, json!({"message": "wip added only"})).await.unwrap();
+        assert_eq!(out["files_stashed"], 1);
+        assert_eq!(out["base_sha"].as_str(), Some(c2.as_str()));
+
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        let err = client.read_bytes("/scratch/new.txt").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+
+        let err = stash_save(&e, json!({"message": "again"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("nothing to stash"), "{}", err.message);
+
+        // The clause carried from US-011, where no apply tool existed yet: the
+        // added file comes back byte for byte. Asserted last, so the clean
+        // volume the refusal above needs is still clean when it runs.
+        let id = out["stash_id"].as_str().unwrap().to_string();
+        stash_apply(&e, &id).await.unwrap();
+        assert_eq!(e.read_bytes("/scratch/new.txt").await, b"n\n");
+    }
+
+    /// E2E-NEW-896: FR-NEW-123, a stash ref is unreachable through branch tools.
+    #[tokio::test]
+    async fn e2e_new_896_a_stash_ref_cannot_be_checked_out() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/README.md", "alpha-1\n").await;
+        let s1 = stash_save(&e, json!({"message": "wip one"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let err = switch_to(&e, &s1).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains(&s1), "{}", err.message);
+
+        let full = format!("refs/stash/{s1}");
+        let err = switch_to(&e, &full).await.unwrap_err();
+        assert!(err.code == code::NOT_FOUND || err.code == code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains(&s1), "{}", err.message);
+
+        let db = &e.entry().await.db;
+        let head = db.get_ref("HEAD").await.unwrap().unwrap();
+        assert_eq!(head.target, "refs/heads/main");
+        assert!(head.symbolic);
+
+        assert!(e.call("git.branch_delete", json!({"mount_id": MOUNT, "name": s1})).await.is_err());
+        assert!(db.get_ref(&full).await.unwrap().is_some());
+    }
+
+    // ── US-012: git.stash_apply and git.stash_pop ───────────────────────────
+
+    async fn stash_apply(e: &Env, id: &str) -> Result<Value> {
+        e.call("git.stash_apply", json!({"mount_id": MOUNT, "stash_id": id})).await
+    }
+
+    async fn stash_pop(e: &Env, id: &str) -> Result<Value> {
+        e.call("git.stash_pop", json!({"mount_id": MOUNT, "stash_id": id})).await
+    }
+
+    /// The E2E-NEW-462/463 fixture: the stash and the volume diverged on the
+    /// same path, so applying it cannot succeed on its own.
+    async fn conflicting_stash(e: &Env) -> String {
+        seed_a11(e).await;
+        e.write("/src/lib.rs", "fn a() { STASHED }\n").await;
+        let id = stash_save(e, json!({"message": "conflicting"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        e.write("/src/lib.rs", "fn a() { LOCAL }\n").await;
+        e.commit("c3").await;
+        id
+    }
+
+    /// E2E-NEW-455: FR-NEW-124/131, an apply restores and keeps the entry.
+    #[tokio::test]
+    async fn e2e_new_455_stash_apply_restores_and_keeps_the_entry() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+
+        let out = stash_apply(&e, &id).await.unwrap();
+        assert_eq!(
+            out,
+            json!({"stash_id": id, "status": "applied", "files_changed": 2, "dropped": false})
+        );
+
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { 1 }\n");
+        assert_eq!(e.read("/notes.txt").await, "draft\n");
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        let db = &e.entry().await.db;
+        assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_some());
+    }
+
+    /// E2E-NEW-456: FR-NEW-125, a pop restores and removes the entry.
+    #[tokio::test]
+    async fn e2e_new_456_stash_pop_restores_and_removes_the_entry() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(
+            out,
+            json!({"stash_id": id, "status": "applied", "files_changed": 2, "dropped": true})
+        );
+
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { 1 }\n");
+        assert_eq!(e.read("/notes.txt").await, "draft\n");
+        assert_eq!(stash_list(&e).await["stashes"], json!([]));
+    }
+
+    /// E2E-NEW-457: FR-NEW-125, the pop deletes the `refs/stash/` row and
+    /// nothing else.
+    #[tokio::test]
+    async fn e2e_new_457_pop_deletes_the_refs_stash_row() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+        stash_pop(&e, &id).await.unwrap();
+
+        let db = &e.entry().await.db;
+        assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_none());
+        assert!(stash_ref_names(&e).await.is_empty());
+        assert!(db.get_object(&id).await.unwrap().is_some(), "the commit object survives");
+
+        let log = e.f.state.safety.audit(OWNER, MOUNT);
+        let last = log.last().expect("an audit entry");
+        assert_eq!(last.op, "git.stash_pop", "{log:?}");
+        assert!(last.detail.contains(&id), "{}", last.detail);
+        assert!(last.detail.contains("dropped true"), "{}", last.detail);
+    }
+
+    /// E2E-NEW-458: FR-NEW-128, an apply with an unknown id.
+    #[tokio::test]
+    async fn e2e_new_458_stash_apply_with_an_unknown_id() {
+        let e = Env::new().await;
+        let (id, _base) = stashed_446(&e).await;
+        let unknown = "0123456789abcdef0123456789abcdef01234567";
+
+        let err = stash_apply(&e, unknown).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains(unknown), "{}", err.message);
+        assert!(err.message.contains("stash"), "{}", err.message);
+
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+    }
+
+    /// E2E-NEW-459: FR-NEW-128, a pop with an unknown id leaves the pool intact.
+    #[tokio::test]
+    async fn e2e_new_459_stash_pop_with_an_unknown_id_leaves_the_pool_intact() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/a.txt", "1\n").await;
+        let s1 = stash_save(&e, json!({"message": "first"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        e.write("/b.txt", "2\n").await;
+        let s2 = stash_save(&e, json!({"message": "second"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let err = stash_pop(&e, &"f".repeat(40)).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("ffffffff"), "{}", err.message);
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(s2.as_str()));
+        assert_eq!(entries[1]["stash_id"].as_str(), Some(s1.as_str()));
+        let names = stash_ref_names(&e).await;
+        assert!(names.contains(&format!("refs/stash/{s1}")), "{names:?}");
+        assert!(names.contains(&format!("refs/stash/{s2}")), "{names:?}");
+    }
+
+    /// E2E-NEW-462: FR-NEW-126/170, a conflicting apply writes nothing.
+    #[tokio::test]
+    async fn e2e_new_462_a_conflicting_stash_apply_writes_nothing() {
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+
+        let out = stash_apply(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["files_changed"], 0, "{out}");
+        let conflicts = out["conflicts"].as_array().expect("conflicts");
+        assert_eq!(conflicts.len(), 1, "{out}");
+        assert_eq!(conflicts[0]["path"], "/src/lib.rs");
+
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { LOCAL }\n");
+        assert!(!e.read("/src/lib.rs").await.contains("<<<<<<<"));
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+    }
+
+    /// E2E-NEW-463: FR-NEW-126/171, a conflicting pop does NOT drop the entry.
+    #[tokio::test]
+    async fn e2e_new_463_a_conflicting_stash_pop_does_not_drop_the_entry() {
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+        let before = e.f.state.safety.bytes_written(OWNER, MOUNT);
+
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["dropped"], false, "{out}");
+
+        let db = &e.entry().await.db;
+        let row = db.get_ref(&format!("refs/stash/{id}")).await.unwrap().expect("the stash ref");
+        assert_eq!(row.target, id);
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { LOCAL }\n");
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), before);
+    }
+
+    // ── T-drift-closure: resuming a conflicted stash creates no commit ──────
+    //
+    // The drift finding of 2026-09-22: `GitOpType::StashApply`/`StashPop`
+    // route their completion to `git.merge_resolve`, which used to commit and
+    // move the branch unconditionally. Applying a stash restores uncommitted
+    // work, so the three tests below pin the whole settled contract: no commit
+    // and no ref move for a stash, the resolved bytes really landing, the pop
+    // dropping its entry at resolution time, and the real merge path still
+    // committing with two parents.
+
+    /// The tip sha and the number of commits reachable from the current branch,
+    /// the pair a stash completion must leave untouched.
+    async fn main_tip_and_depth(e: &Env) -> (String, usize) {
+        let tip = e.ref_sha("refs/heads/main").await.expect("refs/heads/main");
+        (tip, e.log_shas("main").await.len())
+    }
+
+    /// A resolved conflicted `git.stash_apply` restores the resolved bytes and
+    /// creates NO commit: the branch tip is byte-identical and the branch holds
+    /// the same number of commits it did before.
+    #[tokio::test]
+    async fn a_resolved_conflicted_stash_apply_creates_no_commit() {
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+        assert_eq!(stash_apply(&e, &id).await.unwrap()["status"], "conflict");
+        let (tip_before, depth_before) = main_tip_and_depth(&e).await;
+
+        let out = e.resolve(json!([res("/src/lib.rs", "theirs")])).await.unwrap();
+
+        assert_eq!(out["status"], "applied", "{out}");
+        assert!(out["merge_commit"].is_null(), "a stash completion commits nothing: {out}");
+        assert_eq!(out["files_changed"], 1, "{out}");
+        assert_eq!(out["resolved_count"], 1, "{out}");
+        assert_eq!(out["remaining_conflicts"], json!([]), "{out}");
+
+        let (tip_after, depth_after) = main_tip_and_depth(&e).await;
+        assert_eq!(tip_after, tip_before, "the branch tip must not move for a stash apply");
+        assert_eq!(depth_after, depth_before, "a stash apply must add no commit");
+        // The volume carries the resolution, so the fix is not "do nothing":
+        // `theirs` is the stashed side.
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { STASHED }\n");
+        assert_eq!(e.ops().await, 0, "the operation row is cleared");
+        // FR-NEW-131: an apply keeps its entry, resolved or not.
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+    }
+
+    /// A resolved conflicted `git.stash_pop` behaves like the apply above and
+    /// additionally drops the entry, the step the conflicted pop deferred.
+    #[tokio::test]
+    async fn a_resolved_conflicted_stash_pop_creates_no_commit_and_drops_the_entry() {
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+        assert_eq!(stash_pop(&e, &id).await.unwrap()["status"], "conflict");
+        let (tip_before, depth_before) = main_tip_and_depth(&e).await;
+
+        let out = e.resolve(json!([res("/src/lib.rs", "theirs")])).await.unwrap();
+
+        assert_eq!(out["status"], "applied", "{out}");
+        assert!(out["merge_commit"].is_null(), "a stash completion commits nothing: {out}");
+        assert_eq!(out["files_changed"], 1, "{out}");
+
+        let (tip_after, depth_after) = main_tip_and_depth(&e).await;
+        assert_eq!(tip_after, tip_before, "the branch tip must not move for a stash pop");
+        assert_eq!(depth_after, depth_before, "a stash pop must add no commit");
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() { STASHED }\n");
+        assert_eq!(e.ops().await, 0, "the operation row is cleared");
+
+        // FR-NEW-125: the pop's drop happens once the work has really landed,
+        // which for a conflicted pop is here, not at conflict time.
+        assert!(
+            e.entry().await.db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_none(),
+            "a resolved pop drops its entry"
+        );
+        assert_eq!(stash_entries(&e).await, Vec::<Value>::new());
+    }
+
+    /// The regression guard for the branch above: a real merge still creates a
+    /// merge commit with two parents and still moves the branch.
+    #[tokio::test]
+    async fn a_resolved_merge_still_commits_and_moves_the_branch() {
+        let e = Env::new().await;
+        let (_c0, c1, c2) = seed_conflict(&e).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+        let depth_before = e.log_shas("main").await.len();
+
+        let out = e.resolve(json!([res(CFG, "theirs")])).await.unwrap();
+
+        assert_eq!(out["status"], "merged", "{out}");
+        let sha = out["merge_commit"].as_str().expect("a merge commit sha").to_string();
+        assert_eq!(e.parents_of(&sha).await, vec![c2.clone(), c1.clone()]);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha.as_str()));
+        assert_eq!(e.log_shas("main").await.len(), depth_before + 1);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-464: FR-NEW-129, the pool survives deletion of its origin branch.
+    #[tokio::test]
+    async fn e2e_new_464_the_stash_pool_survives_deletion_of_its_origin_branch() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a11(&e).await;
+        e.call(
+            "git.branch_create",
+            json!({"mount_id": MOUNT, "name": "feature/temp", "start_point": c2, "checkout": true}),
+        )
+        .await
+        .unwrap();
+        e.write("/tmp.txt", "t\n").await;
+        let id = stash_save(&e, json!({"message": "on temp"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        switch_to(&e, "main").await.unwrap();
+
+        e.call(
+            "git.branch_delete",
+            json!({"mount_id": MOUNT, "name": "feature/temp", "force": true}),
+        )
+        .await
+        .unwrap();
+
+        let db = &e.entry().await.db;
+        assert!(db.get_ref("refs/heads/feature/temp").await.unwrap().is_none());
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        assert_eq!(entries[0]["branch"], "feature/temp");
+        assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_some());
+
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "applied", "{out}");
+        assert_eq!(e.read("/tmp.txt").await, "t\n");
+    }
+
+    /// E2E-NEW-466: FR-NEW-124/185, an apply under an exhausted quota.
+    #[tokio::test]
+    async fn e2e_new_466_stash_apply_under_an_exhausted_quota() {
+        let e = Env::with_quota(40).await;
+        seed_a11(&e).await;
+        e.write("/big.txt", &"x".repeat(20)).await;
+        let id = stash_save(&e, json!({"message": "big"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // `Env::write` goes straight to the volume client, which is not the
+        // charged path, so the seed's 36 bytes are charged here explicitly to
+        // put the session where the story's precondition puts it: 36 of 40
+        // consumed, 4 bytes of headroom against a 20 byte apply.
+        e.f.state
+            .safety
+            .charge_write(OWNER, MOUNT, 36 - e.f.state.safety.bytes_written(OWNER, MOUNT))
+            .unwrap();
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 36);
+
+        let err = stash_apply(&e, &id).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED, "{err:?}");
+        assert!(
+            err.message.contains("session write quota of 40 bytes exceeded"),
+            "{}",
+            err.message
+        );
+
+        assert!(!exists(&e, "/big.txt").await);
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        let db = &e.entry().await.db;
+        assert!(db.get_ref(&format!("refs/stash/{id}")).await.unwrap().is_some());
+        assert_eq!(e.f.state.safety.bytes_written(OWNER, MOUNT), 36);
+    }
+
+    /// E2E-NEW-540: FR-NEW-126/177/186, a popped conflict is finished by the
+    /// shared merge pair, and a resolution for a path that is not in conflict
+    /// changes nothing.
+    #[tokio::test]
+    async fn e2e_new_540_stash_pop_conflict_then_a_bad_resolve() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/notes.md", "todo\n").await;
+        e.commit("C0").await;
+        e.write("/notes.md", "todo local\n").await;
+        let id = stash_save(&e, json!({"message": "wip"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        e.write("/notes.md", "todo upstream\n").await;
+        e.commit("C1").await;
+
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "stash_pop", "{out}");
+        assert_eq!(out["conflicts"][0]["path"], "/notes.md", "{out}");
+        assert_eq!(out["continue_with"], "git.merge_resolve", "{out}");
+        assert_eq!(out["abort_with"], "git.merge_abort", "{out}");
+
+        let err = e
+            .call(
+                "git.merge_resolve",
+                json!({
+                    "mount_id": MOUNT,
+                    "resolutions": [{"path": "/other.md", "strategy": "ours"}],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("/other.md"), "{}", err.message);
+        assert!(err.message.contains("not in conflict"), "{}", err.message);
+
+        assert_eq!(e.read("/notes.md").await, "todo upstream\n");
+        assert!(!e.read("/notes.md").await.contains("<<<<<<<"));
+        assert_eq!(stash_entries(&e).await.len(), 1);
+
+        e.call("git.merge_abort", json!({"mount_id": MOUNT})).await.unwrap();
+    }
+
+    /// E2E-NEW-897: FR-NEW-124/129, one entry applied onto two branches in turn.
+    #[tokio::test]
+    async fn e2e_new_897_one_stash_applied_onto_two_branches_in_turn() {
+        let e = Env::new().await;
+        seed_b9(&e).await;
+        e.write("/README.md", "alpha-wip\n").await;
+        let id = stash_save(&e, json!({"message": "wip"})).await.unwrap()["stash_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let target = e
+            .entry()
+            .await
+            .db
+            .get_ref(&format!("refs/stash/{id}"))
+            .await
+            .unwrap()
+            .map(|r| r.target);
+
+        let first = stash_apply(&e, &id).await.unwrap();
+        assert_eq!(first["status"], "applied", "{first}");
+        e.commit("take wip").await;
+        switch_to(&e, "release/1.0").await.unwrap();
+        let second = stash_apply(&e, &id).await.unwrap();
+        assert_eq!(second["status"], "applied", "{second}");
+
+        assert_eq!(e.read_bytes("/README.md").await, b"alpha-wip\n");
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        assert_eq!(
+            e.entry()
+                .await
+                .db
+                .get_ref(&format!("refs/stash/{id}"))
+                .await
+                .unwrap()
+                .map(|r| r.target),
+            target
+        );
+    }
+
+    /// E2E-NEW-898: FR-NEW-125/185, a quota-exhausted pop keeps the entry, and
+    /// the same call succeeds once there is headroom again.
+    #[tokio::test]
+    async fn e2e_new_898_a_quota_exhausted_stash_pop_keeps_the_entry() {
+        // The stash's revert charges the 6 bytes of `/README.md` at HEAD, so
+        // of a 12 byte quota only 6 are left against the pop's 10 byte write.
+        let e = Env::with_quota(12).await;
+        seed_a11(&e).await;
+        e.write("/README.md", "alpha-wip\n").await;
+        let saved = stash_save(&e, json!({"message": "wip"})).await.unwrap();
+        let id = saved["stash_id"].as_str().unwrap().to_string();
+
+        let err = stash_pop(&e, &id).await.unwrap_err();
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED, "{err:?}");
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        assert_eq!(entries[0]["message"], "wip");
+        assert_eq!(entries[0]["base_sha"], saved["base_sha"]);
+        assert_eq!(e.read_bytes("/README.md").await, b"alpha\n");
+
+        // Headroom again: the identical call now succeeds and the entry goes.
+        e.f.state.safety.refund_write(OWNER, MOUNT, 6);
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "applied", "{out}");
+        assert_eq!(out["dropped"], true, "{out}");
+        assert_eq!(stash_list(&e).await["stashes"], json!([]));
+    }
+
+    /// E2E-NEW-950: FR-NEW-122/124/129, a stash taken on a deleted branch
+    /// applies cleanly onto another.
+    #[tokio::test]
+    async fn e2e_new_950_stash_taken_on_a_deleted_branch_applies_onto_another() {
+        let e = Env::new().await;
+        let (_c1, c2, _c3) = seed_b9(&e).await;
+        e.call(
+            "git.branch_create",
+            json!({"mount_id": MOUNT, "name": "feature/tmp", "start_point": c2, "checkout": true}),
+        )
+        .await
+        .unwrap();
+        e.write("/src/lib.rs", "fn a() {}\nfn b() {}\n").await;
+        let saved = stash_save(&e, json!({"message": "wip b"})).await.unwrap();
+        let id = saved["stash_id"].as_str().unwrap().to_string();
+        assert_eq!(saved["base_sha"].as_str(), Some(c2.as_str()));
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+
+        switch_to(&e, "main").await.unwrap();
+        e.call("git.branch_delete", json!({"mount_id": MOUNT, "name": "feature/tmp"}))
+            .await
+            .unwrap();
+
+        let entries = stash_entries(&e).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["stash_id"].as_str(), Some(id.as_str()));
+        assert_eq!(entries[0]["message"], "wip b");
+        assert_eq!(entries[0]["base_sha"].as_str(), Some(c2.as_str()));
+
+        let out = stash_apply(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "applied", "{out}");
+        assert_eq!(out["files_changed"], 1, "{out}");
+        assert!(out.get("conflicts").is_none(), "{out}");
+
+        assert_eq!(e.read_bytes("/src/lib.rs").await, b"fn a() {}\nfn b() {}\n");
+        let db = &e.entry().await.db;
+        assert_eq!(
+            db.get_ref("refs/heads/main").await.unwrap().map(|r| r.target).as_deref(),
+            Some(c2.as_str())
+        );
+        // `git.status` carries no dirty/changes keys yet (a later story's
+        // requirement), so the uncommitted result is asserted the way this
+        // codebase defines dirt: the volume tree no longer matches HEAD's,
+        // which is exactly what `git.stash_save` refuses to call clean.
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(status["head"].as_str(), Some(c2.as_str()), "{status}");
+        let saved_again = stash_save(&e, json!({"message": "still dirty"})).await.unwrap();
+        assert_eq!(saved_again["files_stashed"], 1);
+        stash_drop(&e, saved_again["stash_id"].as_str().unwrap()).await.unwrap();
+
+        assert_eq!(stash_entries(&e).await.len(), 1);
+        assert!(db.get_ref("refs/heads/feature/tmp").await.unwrap().is_none());
+    }
+
+    // ── US-013: git.rebase todo validation and planning ─────────────────
+
+    /// FX-LINE: `main` with four linear commits C1..C4, volume clean.
+    async fn seed_line(e: &Env) -> Vec<String> {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let mut shas = Vec::new();
+        for (i, path) in ["/a.txt", "/b.txt", "/c.txt", "/d.txt"].iter().enumerate() {
+            e.write(path, &format!("v{i}\n")).await;
+            shas.push(e.commit(&format!("C{}", i + 1)).await);
+        }
+        shas
+    }
+
+    /// FX-FORK-CLEAN: C1 base, `main` at C2, `feature` at F2 with HEAD on it,
+    /// volume matching F2 exactly. The rebase range `main..feature` is {F1, F2}.
+    async fn seed_fork_clean(e: &Env) -> (String, String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\n").await;
+        e.write("/g.txt", "g\n").await;
+        let f1 = e.commit("F1 feature edit").await;
+        e.write("/f.txt", "f\n").await;
+        let f2 = e.commit("F2 feature add").await;
+        (c1, c2, f1, f2)
+    }
+
+    fn pick(sha: &str) -> Value {
+        json!({"action": "pick", "sha": sha})
+    }
+
+    async fn rebase(e: &Env, onto: &str, todo: Value) -> Result<Value> {
+        e.call("git.rebase", json!({"mount_id": MOUNT, "onto": onto, "todo": todo})).await
+    }
+
+    /// E2E-NEW-607: FR-NEW-217, a rebase onto an ancestor replays nothing.
+    #[tokio::test]
+    async fn e2e_new_607_rebase_onto_an_ancestor_is_a_no_op() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let objects_before = e.objects().await;
+        let bytes_before = e.bytes_written();
+        let volume_before = e.byte_map().await;
+
+        let out = rebase(&e, &c[1], json!([pick(&c[2]), pick(&c[3])])).await.unwrap();
+
+        assert_eq!(out["status"], "up_to_date", "{out}");
+        assert_eq!(out["replayed"], 0, "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.objects().await, objects_before);
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.bytes_written(), bytes_before);
+    }
+
+    /// E2E-NEW-608: rebasing a branch onto its own tip is refused by name.
+    #[tokio::test]
+    async fn e2e_new_608_rebase_branch_and_onto_identical() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+
+        let err = rebase(&e, "main", json!([pick(&c[3])])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("onto"), "{}", err.message);
+        assert!(err.message.contains("same"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-915: FR-NEW-217, an `up_to_date` rebase writes nothing at all.
+    #[tokio::test]
+    async fn e2e_new_915_an_up_to_date_rebase_writes_nothing_at_all() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let before_audit = e.audit();
+        let before_bytes = e.bytes_written();
+        let before_objects = e.objects().await;
+
+        let out = rebase(&e, &c[2], json!([pick(&c[3])])).await.unwrap();
+
+        assert_eq!(out["status"], "up_to_date", "{out}");
+        assert_eq!(out["replayed"], 0, "{out}");
+        assert_eq!(out["dropped"], 0, "{out}");
+        assert_eq!(out["squashed"], 0, "{out}");
+        assert!(out.get("operation_id").is_none(), "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.objects().await, before_objects);
+        assert_eq!(e.audit().len(), before_audit.len());
+        assert_eq!(e.bytes_written(), before_bytes);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-622: FR-NEW-215, a todo omitting a commit in range is refused.
+    #[tokio::test]
+    async fn e2e_new_622_rebase_todo_omits_a_commit_in_range() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "main", json!([pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("todo"), "{}", err.message);
+        assert!(err.message.contains("missing"), "{}", err.message);
+        assert!(err.message.contains(&short(&f1)), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-623: FR-NEW-215, an unknown sha in the todo is not found.
+    #[tokio::test]
+    async fn e2e_new_623_rebase_unknown_sha_in_todo() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let bytes_before = e.bytes_written();
+
+        let err = rebase(
+            &e,
+            "main",
+            json!([pick(&f1), pick("0000000000000000000000000000000000000000")]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("0000000"), "{}", err.message);
+        assert!(err.message.contains("not found"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.bytes_written(), bytes_before);
+    }
+
+    /// E2E-NEW-624: FR-NEW-215, a sha outside the rebase range is refused.
+    #[tokio::test]
+    async fn e2e_new_624_rebase_sha_outside_the_range() {
+        let e = Env::new().await;
+        let (c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "main", json!([pick(&f1), pick(&f2), pick(&c1)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains(&short(&c1)), "{}", err.message);
+        assert!(err.message.contains("not in the rebase range"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-626: FR-NEW-216, the todo length is bounded by config.
+    #[tokio::test]
+    async fn e2e_new_626_rebase_todo_longer_than_the_bound() {
+        let e = Env::build(|c| {
+            c.git.enabled = true;
+            c.git.max_rebase_todo = 2;
+        })
+        .await;
+        let (c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let bound = e.f.state.config.git.max_rebase_todo;
+        assert_eq!(bound, 2);
+
+        let err = rebase(&e, "main", json!([pick(&f1), pick(&f2), pick(&c1)])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("todo"), "{}", err.message);
+        assert!(err.message.contains(&bound.to_string()), "{}", err.message);
+        assert!(err.message.contains("at most"), "{}", err.message);
+
+        // The accept side: a todo of exactly the bound clears it, and whatever
+        // it fails on later, it is never the bound.
+        let later = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await;
+        let message = later.err().map(|x| x.message).unwrap_or_default();
+        assert!(!message.contains("at most"), "{message}");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-627: FR-NEW-215, an empty todo is refused.
+    #[tokio::test]
+    async fn e2e_new_627_rebase_empty_todo() {
+        let e = Env::new().await;
+        let (_c1, _c2, _f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "main", json!([])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("todo"), "{}", err.message);
+        assert!(err.message.contains("empty"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-628: FR-NEW-215, the action set is closed and exact-match.
+    #[tokio::test]
+    async fn e2e_new_628_rebase_unknown_action() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "main", json!([{"action": "fixup", "sha": f1.clone()}, pick(&f2)]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["fixup", "pick", "squash", "drop", "reword"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+
+        let upper = rebase(&e, "main", json!([{"action": "PICK", "sha": f1.clone()}, pick(&f2)]))
+            .await
+            .unwrap_err();
+        assert_eq!(upper.code, code::INVALID_ARGUMENT, "{upper:?}");
+        assert!(upper.message.contains("PICK"), "{}", upper.message);
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-631: FR-NEW-210, an `onto` that resolves to nothing is not found.
+    #[tokio::test]
+    async fn e2e_new_631_rebase_unknown_onto_ref() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "refs/heads/nope", json!([pick(&f1)])).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("nope"), "{}", err.message);
+
+        let ghost = rebase(&e, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", json!([pick(&f1)]))
+            .await
+            .unwrap_err();
+        assert_eq!(ghost.code, code::NOT_FOUND, "{ghost:?}");
+        assert!(ghost.message.contains("deadbeef"), "{}", ghost.message);
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-632: FR-NEW-210, every required argument is named when missing.
+    #[tokio::test]
+    async fn e2e_new_632_rebase_missing_required_arguments() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, _f2) = seed_fork_clean(&e).await;
+
+        let cases: [(Value, &str); 3] = [
+            (json!({"mount_id": MOUNT, "todo": [pick(&f1)]}), "onto"),
+            (json!({"mount_id": MOUNT, "onto": "main"}), "todo"),
+            (json!({"onto": "main", "todo": [pick(&f1)]}), "mount_id"),
+        ];
+        for (args, named) in cases {
+            let err = e.call("git.rebase", args).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{named}: {err:?}");
+            assert!(err.message.contains(named), "{named} missing from {}", err.message);
+        }
+
+        for bad in [json!("pick"), json!({"action": "pick"})] {
+            let err = e
+                .call("git.rebase", json!({"mount_id": MOUNT, "onto": "main", "todo": bad}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert!(err.message.contains("todo"), "{}", err.message);
+            assert!(err.message.contains("array"), "{}", err.message);
+        }
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-633: FR-NEW-215, a duplicate sha in the todo is refused.
+    #[tokio::test]
+    async fn e2e_new_633_rebase_duplicate_sha_in_todo() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "main", json!([pick(&f1), pick(&f2), pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains(&short(&f2)), "{}", err.message);
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-634: FR-NEW-215, every rejection happens before any work.
+    #[tokio::test]
+    async fn e2e_new_634_rebase_validation_happens_before_any_work() {
+        let e = Env::new().await;
+        let (c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        let volume = e.byte_map().await;
+        let q0 = e.bytes_written();
+        let n0 = e.audit().len();
+        let obj0 = e.objects().await;
+
+        let rejected: [Value; 5] = [
+            json!([pick(&f2)]), // 622, omitted
+            json!([pick(&f1), pick("0000000000000000000000000000000000000000")]), // 623, unknown
+            json!([pick(&f1), pick(&f2), pick(&c1)]), // 624, out of range
+            json!([{"action": "squash", "sha": f1.clone()}, pick(&f2)]), // leading squash
+            json!([{"action": "reword", "sha": f1.clone(), "message": "   "}, pick(&f2)]),
+        ];
+        for todo in rejected {
+            let err = rebase(&e, "main", todo.clone()).await.unwrap_err();
+            assert!(
+                err.code == code::INVALID_ARGUMENT || err.code == code::NOT_FOUND,
+                "{todo}: {err:?}"
+            );
+            assert_eq!(e.ops().await, 0, "{todo}");
+        }
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await, Some(tip));
+        assert_eq!(e.byte_map().await, volume);
+        assert_eq!(e.bytes_written(), q0);
+        assert_eq!(e.objects().await, obj0);
+        assert_eq!(e.audit().len(), n0);
+    }
+
+    /// FR-NEW-215: a leading `squash` has nothing to fold into, and a `reword`
+    /// with a blank message names the entry it came from.
+    #[tokio::test]
+    async fn rebase_rejects_a_leading_squash_and_a_blank_reword() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err = rebase(&e, "main", json!([{"action": "squash", "sha": f1.clone()}, pick(&f2)]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("squash"), "{}", err.message);
+
+        for blank in [json!(""), json!("  \t\n")] {
+            let err = rebase(
+                &e,
+                "main",
+                json!([{"action": "reword", "sha": f1.clone(), "message": blank}, pick(&f2)]),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert!(err.message.contains("reword"), "{}", err.message);
+            assert!(err.message.contains(&short(&f1)), "{}", err.message);
+        }
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-532: FR-NEW-279, a paused merge blocks `git.rebase`.
+    #[tokio::test]
+    async fn e2e_new_532_git_rebase_blocked_by_an_operation_in_progress() {
+        let e = Env::new().await;
+        let (_c0, c1, c2) = seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let before: BTreeMap<String, String> = e
+            .entry()
+            .await
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.target))
+            .collect();
+
+        let err = rebase(&e, "feature", json!([pick(&c1)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("merge"), "{}", err.message);
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        let after: BTreeMap<String, String> = e
+            .entry()
+            .await
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.target))
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+    }
+
+    /// E2E-NEW-801: FR-NEW-218, a dirty volume refuses the rebase.
+    #[tokio::test]
+    async fn e2e_new_801_a_dirty_volume_refuses_the_rebase() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_fork_clean(&e).await;
+        e.write("/a.txt", "a1\nDIRTY\n").await;
+
+        let err = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        assert!(err.message.contains("git.commit"), "{}", err.message);
+        assert!(err.message.contains("git.stash_save"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nDIRTY\n");
+        assert_eq!(e.ops().await, 0);
+        assert!(e.audit().iter().all(|a| a.op != "git.rebase"), "no audit entry for a refusal");
+    }
+
+    /// E2E-NEW-802: FR-NEW-218, dirt that is only a deletion still refuses.
+    #[tokio::test]
+    async fn e2e_new_802_dirt_that_is_only_a_deletion_still_refuses() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/g.txt").await.unwrap();
+
+        let err = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        assert_eq!(client.read_bytes("/g.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+
+        // Committing the deletion clears the dirt: the next attempt gets past
+        // the guard, whatever it then reports.
+        let f3 = e.commit("drop g").await;
+        let after = rebase(&e, "main", json!([pick(&f1), pick(&f2), pick(&f3)])).await;
+        let message = after.err().map(|x| x.message).unwrap_or_default();
+        assert!(!message.contains("uncommitted changes"), "{message}");
+    }
+
+    // ── US-014: git.rebase replay (pick, squash, drop, reword) ───────────
+
+    fn squash(sha: &str) -> Value {
+        json!({"action": "squash", "sha": sha})
+    }
+
+    fn dropped(sha: &str) -> Value {
+        json!({"action": "drop", "sha": sha})
+    }
+
+    fn reword(sha: &str, message: &str) -> Value {
+        json!({"action": "reword", "sha": sha, "message": message})
+    }
+
+    impl Env {
+        /// Every commit object of `ref_name`, newest first, straight out of
+        /// `git.log` so the assertions read the wire shape a caller sees.
+        async fn log_commits(&self, ref_name: &str) -> Vec<Value> {
+            let out = self
+                .call("git.log", json!({"mount_id": MOUNT, "ref_name": ref_name, "limit": 500}))
+                .await
+                .unwrap();
+            out["commits"].as_array().unwrap().clone()
+        }
+
+        async fn log_messages(&self, ref_name: &str) -> Vec<String> {
+            self.log_commits(ref_name)
+                .await
+                .iter()
+                .map(|c| c["message"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        /// The entry names of a commit's tree, sorted.
+        async fn tree_names(&self, sha: &str) -> Vec<String> {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            let commit = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            let mut names: Vec<String> =
+                commit.tree().unwrap().iter().filter_map(|e| e.name().map(String::from)).collect();
+            names.sort();
+            names
+        }
+
+        /// A commit's tree oid, which is its content address: two equal oids
+        /// are two byte identical trees.
+        async fn tree_oid(&self, sha: &str) -> String {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            let commit = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            commit.tree_id().to_string()
+        }
+
+        /// The committer identity libgit2 recorded, which `git.log` does not
+        /// report (it carries the author only).
+        async fn committer_of(&self, sha: &str) -> (String, i64) {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            let commit = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            let c = commit.committer();
+            (c.email().unwrap_or_default().to_string(), c.when().seconds())
+        }
+
+        /// A commit whose author is `email` but whose caller is still OWNER.
+        async fn commit_as_author(&self, message: &str, email: &str) -> String {
+            self.call(
+                "git.commit",
+                json!({
+                    "mount_id": MOUNT,
+                    "message": message,
+                    "author_name": email.split('@').next().unwrap(),
+                    "author_email": email,
+                }),
+            )
+            .await
+            .unwrap()["commit_sha"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        async fn delete(&self, path: &str) {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.delete_file(path).await.unwrap();
+        }
+
+        async fn missing(&self, path: &str) -> bool {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            matches!(client.read_bytes(path).await, Err(err) if err.code == code::NOT_FOUND)
+        }
+    }
+
+    /// FX-FORK4-CLEAN: `main` at C2, `feature` at F4 with four conflict-free
+    /// additions F1..F4 off C1.
+    async fn seed_fork4_clean(e: &Env) -> (String, Vec<String>) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\n").await;
+        let names = ["one", "two", "three", "four"];
+        let mut shas = Vec::new();
+        for (i, word) in names.iter().enumerate() {
+            e.write(&format!("/f{}.txt", i + 1), &format!("{}\n", i + 1)).await;
+            shas.push(e.commit(&format!("F{} feat {word}", i + 1)).await);
+        }
+        (c2, shas)
+    }
+
+    /// `main` at C2 (adding `/m.txt`), `feature` off C1 carrying `n` clean
+    /// additions, HEAD on `feature`.
+    async fn seed_many_on_feature(e: &Env, n: usize) -> (String, Vec<String>) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/m.txt", "m\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.delete("/m.txt").await;
+        let mut shas = Vec::with_capacity(n);
+        for i in 1..=n {
+            e.write(&format!("/s/{i:03}.txt"), &format!("s{i}\n")).await;
+            shas.push(e.commit(&format!("S{i}")).await);
+        }
+        (c2, shas)
+    }
+
+    /// Spin until the rebase running alongside this future has taken the per
+    /// project write lock, so the racing call provably arrives second. Bounded,
+    /// because a rebase that already finished must not hang the test.
+    async fn wait_until_locked(entry: &Arc<GitRepoEntry>) {
+        for _ in 0..200_000 {
+            if entry.write_lock.try_lock().is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// E2E-NEW-600: FR-NEW-210/211, two picks replay onto main with new shas.
+    #[tokio::test]
+    async fn e2e_new_600_rebase_happy_pick_two_commits_onto_main() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 2, "{out}");
+        assert_eq!(out["dropped"], 0, "{out}");
+        assert_eq!(out["squashed"], 0, "{out}");
+        assert!(out.get("operation_id").is_none(), "{out}");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c.len(), 4, "{c:?}");
+        let messages: Vec<&str> = c.iter().map(|x| x["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["F2 feature add", "F1 feature edit", "C2 main edit", "C1 base"]);
+        assert_ne!(c[0]["sha"].as_str().unwrap(), f2, "the replayed tip is a new commit");
+        assert_ne!(c[1]["sha"].as_str().unwrap(), f1);
+        assert_eq!(c[1]["parents"], json!([short(&c2)]));
+        assert_eq!(c[0]["parents"], json!([short(c[1]["sha"].as_str().unwrap())]));
+        for entry in c.iter().take(3) {
+            assert_eq!(entry["parents"].as_array().unwrap().len(), 1, "{entry}");
+        }
+        assert_eq!(c[3]["parents"].as_array().unwrap().len(), 0, "{}", c[3]);
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), c[0]["sha"].as_str());
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+        assert_eq!(e.read_bytes("/g.txt").await, b"g\n");
+        assert_eq!(e.read_bytes("/f.txt").await, b"f\n");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-601: FR-NEW-212, a squash folds F2 into F1.
+    #[tokio::test]
+    async fn e2e_new_601_rebase_happy_squash_f2_into_f1() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), squash(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["squashed"], 1, "{out}");
+        assert_eq!(out["replayed"], 1, "{out}");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c.len(), 3, "{c:?}");
+        let messages: Vec<&str> = c.iter().map(|x| x["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["F1 feature edit\n\nF2 feature add", "C2 main edit", "C1 base"]);
+        assert_eq!(c[0]["parents"], json!([short(&c2)]), "the fold sits directly on C2");
+        assert_eq!(e.read_bytes("/g.txt").await, b"g\n");
+        assert_eq!(e.read_bytes("/f.txt").await, b"f\n");
+        for entry in &c {
+            let sha = entry["sha"].as_str().unwrap();
+            assert_ne!(sha, f1);
+            assert_ne!(sha, f2);
+        }
+    }
+
+    /// E2E-NEW-602: FR-NEW-213, a dropped commit leaves no trace.
+    #[tokio::test]
+    async fn e2e_new_602_rebase_happy_drop() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), dropped(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["dropped"], 1, "{out}");
+        assert_eq!(out["replayed"], 1, "{out}");
+
+        assert_eq!(e.log_messages("feature").await, ["F1 feature edit", "C2 main edit", "C1 base"]);
+        assert_eq!(e.read_bytes("/g.txt").await, b"g\n");
+        assert!(e.missing("/f.txt").await, "the dropped commit's file never enters the volume");
+
+        let tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        assert_eq!(e.tree_names(&tip).await, ["a.txt", "g.txt"]);
+    }
+
+    /// E2E-NEW-603: FR-NEW-214, a reword replays the same tree with a new
+    /// message and the original author.
+    #[tokio::test]
+    async fn e2e_new_603_rebase_happy_reword() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let out = rebase(&e, "main", json!([reword(&f1, "F1 reworded"), pick(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 2, "{out}");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c[1]["message"], "F1 reworded", "{c:?}");
+        assert_eq!(c[0]["message"], "F2 feature add", "{c:?}");
+        assert_ne!(c[1]["sha"].as_str().unwrap(), f1);
+        assert_eq!(c[1]["author_email"], OWNER);
+
+        // "identical to a pick of the same commit": the same fixture replayed
+        // with `pick` in that slot must produce the very same tree. Trees are
+        // content addressed, so equal oids mean byte identical trees.
+        let reworded = e.tree_oid(c[1]["sha"].as_str().unwrap()).await;
+        let picked = {
+            let e2 = Env::new().await;
+            let (_c1, _c2, g1, g2) = seed_fork_clean(&e2).await;
+            rebase(&e2, "main", json!([pick(&g1), pick(&g2)])).await.unwrap();
+            let c2 = e2.log_commits("feature").await;
+            e2.tree_oid(c2[1]["sha"].as_str().unwrap()).await
+        };
+        assert_eq!(reworded, picked, "a reword changes no byte of the tree");
+    }
+
+    /// E2E-NEW-604: FR-NEW-212, a chain of squashes folds into one commit.
+    #[tokio::test]
+    async fn e2e_new_604_rebase_happy_squash_chain_of_three() {
+        let e = Env::new().await;
+        let (_c2, f) = seed_fork4_clean(&e).await;
+
+        let out =
+            rebase(&e, "main", json!([pick(&f[0]), squash(&f[1]), squash(&f[2]), pick(&f[3])]))
+                .await
+                .unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["squashed"], 2, "{out}");
+        assert_eq!(out["replayed"], 2, "{out}");
+
+        assert_eq!(
+            e.log_messages("feature").await,
+            [
+                "F4 feat four",
+                "F1 feat one\n\nF2 feat two\n\nF3 feat three",
+                "C2 main edit",
+                "C1 base"
+            ]
+        );
+        let c = e.log_commits("feature").await;
+        let folded = c[1]["sha"].as_str().unwrap();
+        assert_eq!(e.tree_names(folded).await, ["a.txt", "f1.txt", "f2.txt", "f3.txt"]);
+        for (i, bytes) in [b"1\n", b"2\n", b"3\n", b"4\n"].iter().enumerate() {
+            assert_eq!(e.read_bytes(&format!("/f{}.txt", i + 1)).await, *bytes);
+        }
+    }
+
+    /// E2E-NEW-605: FR-NEW-213, dropping every commit lands the branch exactly
+    /// on `onto`.
+    #[tokio::test]
+    async fn e2e_new_605_rebase_edge_all_commits_dropped() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let out = rebase(&e, "main", json!([dropped(&f1), dropped(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["dropped"], 2, "{out}");
+        assert_eq!(out["replayed"], 0, "{out}");
+        assert_eq!(out["new_tip"], c2, "{out}");
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.log_commits("feature").await, e.log_commits("main").await);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+        assert!(e.missing("/g.txt").await);
+        assert!(e.missing("/f.txt").await);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-606: FR-NEW-210/211, a single pick.
+    #[tokio::test]
+    async fn e2e_new_606_rebase_happy_single_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\n").await;
+        e.write("/g.txt", "g\n").await;
+        let f1 = e.commit("F1 feature edit").await;
+
+        let out = rebase(&e, "main", json!([pick(&f1)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c.len(), 3, "{c:?}");
+        let messages: Vec<&str> = c.iter().map(|x| x["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["F1 feature edit", "C2 main edit", "C1 base"]);
+        assert_ne!(c[0]["sha"].as_str().unwrap(), f1);
+        assert_eq!(c[0]["parents"], json!([short(&c2)]));
+    }
+
+    /// E2E-NEW-625: FR-NEW-215, a todo starting with a squash is refused by
+    /// name and changes nothing.
+    #[tokio::test]
+    async fn e2e_new_625_rebase_failure_todo_starts_with_squash() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_fork_clean(&e).await;
+        let volume_before = e.byte_map().await;
+
+        let err = rebase(&e, "main", json!([squash(&f1), pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("squash"), "{}", err.message);
+        assert!(err.message.contains("first"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.byte_map().await, volume_before);
+    }
+
+    /// E2E-NEW-629: FR-NEW-214, a reword to an empty message is refused before
+    /// any replay.
+    #[tokio::test]
+    async fn e2e_new_629_rebase_failure_reword_to_an_empty_message() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let volume_before = e.byte_map().await;
+
+        let err = rebase(&e, "main", json!([reword(&f1, ""), pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["reword", "message", "empty"] {
+            assert!(err.message.contains(needle), "{needle}: {}", err.message);
+        }
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-630: FR-NEW-214, a whitespace only reword message is the empty
+    /// message once prettified, and is refused identically.
+    #[tokio::test]
+    async fn e2e_new_630_rebase_failure_reword_to_whitespace_only() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let err =
+            rebase(&e, "main", json!([reword(&f1, "   \n\t \n"), pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["reword", "message", "empty"] {
+            assert!(err.message.contains(needle), "{needle}: {}", err.message);
+        }
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+    }
+
+    /// E2E-NEW-694: FR-NEW-226, the write lock serializes a rebase against a
+    /// concurrent commit, so neither history is lost.
+    #[tokio::test]
+    async fn e2e_new_694_write_lock_serializes_the_new_ops() {
+        let e = Env::new().await;
+        let (_c2, shas) = seed_many_on_feature(&e, 50).await;
+        let todo: Vec<Value> = shas.iter().map(|s| pick(s)).collect();
+        let entry = e.entry().await;
+
+        // The racer commits without touching the volume: a write would race the
+        // rebase's own cleanliness check, which is a different guard from the
+        // ref serialization this test is about.
+        let racer = async {
+            wait_until_locked(&entry).await;
+            e.call("git.commit", json!({"mount_id": MOUNT, "message": "racer"})).await
+        };
+        let (rebased, committed) = tokio::join!(rebase(&e, "main", json!(todo)), racer);
+
+        let rebased = rebased.expect("the rebase completes");
+        assert_eq!(rebased["status"], "completed", "{rebased}");
+        committed.expect("the racing commit completes");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c.len(), 53, "50 replayed, one racer, C1 and C2: {}", c.len());
+        for pair in c.windows(2) {
+            assert_eq!(pair[0]["parents"].as_array().unwrap().len(), 1, "{}", pair[0]);
+            assert_eq!(
+                pair[0]["parents"],
+                json!([short(pair[1]["sha"].as_str().unwrap())]),
+                "unbroken parent chain"
+            );
+        }
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-699: FR-NEW-115/226, the db and the on disk refs agree after a
+    /// clean rebase and after a `git.rebase_abort`. The cherry-pick, reset and
+    /// revert legs of the original sweep land with the stories that add those
+    /// tools.
+    #[tokio::test]
+    async fn e2e_new_699_ref_duality_db_and_on_disk_agree_after_a_rebase() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+
+        let entry = e.entry().await;
+        let refs = entry.db.list_refs().await.unwrap();
+        {
+            let repo = entry.repo.lock().await;
+            for r in refs.iter().filter(|r| !r.symbolic) {
+                let on_disk = repo.find_reference(&r.name).unwrap();
+                assert_eq!(
+                    on_disk.target().unwrap().to_string(),
+                    r.target,
+                    "{} drifted between the index and the bare repo",
+                    r.name
+                );
+            }
+            // The db row is the authority on HEAD. The bare repo's own HEAD is
+            // written only by the tools that check a branch out, and this
+            // fixture moved HEAD through `Env::checkout`, which is a db write.
+            let head = refs.iter().find(|r| r.name == "HEAD").unwrap();
+            assert!(head.symbolic && head.target == "refs/heads/feature", "{head:?}");
+        }
+        for c in e.log_commits("feature").await {
+            let sha = c["sha"].as_str().unwrap();
+            assert!(
+                entry.db.object_exists(sha).await.unwrap(),
+                "{sha} was never imported into the object store"
+            );
+        }
+
+        // The abort leg: a paused rebase restored by `git.rebase_abort` leaves
+        // the index and the bare repo agreeing on the pre-rebase tip.
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let tip_before = e.ref_sha("refs/heads/feature").await.unwrap();
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        rebase_abort(&e).await.unwrap();
+
+        let entry = e.entry().await;
+        let refs = entry.db.list_refs().await.unwrap();
+        let repo = entry.repo.lock().await;
+        for r in refs.iter().filter(|r| !r.symbolic) {
+            let on_disk = repo.find_reference(&r.name).unwrap();
+            assert_eq!(on_disk.target().unwrap().to_string(), r.target, "{} drifted", r.name);
+        }
+        assert_eq!(
+            repo.find_reference("refs/heads/feature").unwrap().target().unwrap().to_string(),
+            tip_before
+        );
+    }
+
+    /// E2E-NEW-834: FR-NEW-173/211, a step whose sides touch disjoint lines
+    /// replays without pausing.
+    #[tokio::test]
+    async fn e2e_new_834_a_rebase_step_whose_sides_are_disjoint_replays_without_pausing() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/cfg.toml", "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/cfg.toml", "a = 99\nb = 2\nc = 3\nd = 4\ne = 5\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/cfg.toml", "a = 1\nb = 2\nc = 3\nd = 4\ne = 99\n").await;
+        let f1 = e.commit("F1 feature edit").await;
+
+        let out = rebase(&e, "main", json!([pick(&f1)])).await.unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert!(out.get("conflicts").is_none(), "{out}");
+        assert!(out.get("operation_id").is_none(), "{out}");
+        assert_eq!(e.read_bytes("/cfg.toml").await, b"a = 99\nb = 2\nc = 3\nd = 4\ne = 99\n");
+        let c = e.log_commits("feature").await;
+        assert_eq!(c.len(), 3, "{c:?}");
+        assert_eq!(c[0]["parents"], json!([short(&c2)]));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-913: FR-NEW-211, a pick keeps the author and its timestamp, and
+    /// makes the caller the committer.
+    #[tokio::test]
+    async fn e2e_new_913_pick_preserves_the_author_and_sets_the_committer_to_the_caller() {
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, "second@test.com", OWNER).await.unwrap();
+        let started = Utc::now().timestamp();
+
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\n").await;
+        e.write("/g.txt", "g\n").await;
+        let f1 = e.commit_as_author("F1 feature edit", "author@test.com").await;
+        e.write("/f.txt", "f\n").await;
+        let f2 = e.commit_as_author("F2 feature add", "author@test.com").await;
+
+        let before = e.log_commits("feature").await;
+        let (t2, t1) = (before[0]["timestamp"].clone(), before[1]["timestamp"].clone());
+
+        let out = e
+            .as_person(
+                "second@test.com",
+                "git.rebase",
+                json!({"mount_id": MOUNT, "onto": "main", "todo": [pick(&f1), pick(&f2)]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c[0]["message"], "F2 feature add", "{c:?}");
+        assert_eq!(c[1]["message"], "F1 feature edit", "{c:?}");
+        assert_eq!(c[0]["author_email"], "author@test.com");
+        assert_eq!(c[1]["author_email"], "author@test.com");
+        assert_eq!(c[0]["timestamp"], t2, "the author timestamp is carried over");
+        assert_eq!(c[1]["timestamp"], t1);
+        assert_ne!(c[0]["sha"].as_str().unwrap(), f2);
+        assert_ne!(c[1]["sha"].as_str().unwrap(), f1);
+
+        for entry in c.iter().take(2) {
+            let (email, when) = e.committer_of(entry["sha"].as_str().unwrap()).await;
+            assert_eq!(email, "second@test.com", "{entry}");
+            assert!(when >= started, "{when} is before the test started");
+        }
+    }
+
+    /// E2E-NEW-917: FR-NEW-226, `git.branch_create` cannot interleave into a
+    /// running rebase.
+    #[tokio::test]
+    async fn e2e_new_917_git_branch_create_cannot_interleave_into_a_running_rebase() {
+        let e = Env::new().await;
+        let (_c2, shas) = seed_many_on_feature(&e, 50).await;
+        let todo: Vec<Value> = shas.iter().map(|s| pick(s)).collect();
+        let entry = e.entry().await;
+        let s50 = shas.last().unwrap().clone();
+
+        let racer = async {
+            wait_until_locked(&entry).await;
+            e.call(
+                "git.branch_create",
+                json!({"mount_id": MOUNT, "name": "race/x", "start_point": "feature"}),
+            )
+            .await
+        };
+        let (rebased, created) = tokio::join!(rebase(&e, "main", json!(todo)), racer);
+
+        let rebased = rebased.expect("the rebase completes");
+        assert_eq!(rebased["status"], "completed", "{rebased}");
+        let created = created.expect("the branch create completes");
+        assert_eq!(created["branch"], "race/x");
+
+        let c = e.log_commits("feature").await;
+        assert_eq!(c.len(), 52, "50 replayed plus C1 and C2");
+        let shas_now: Vec<&str> = c.iter().map(|x| x["sha"].as_str().unwrap()).collect();
+        let unique: HashSet<&str> = shas_now.iter().copied().collect();
+        assert_eq!(unique.len(), shas_now.len(), "no duplicate sha");
+
+        let tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        let race = e.ref_sha("refs/heads/race/x").await.unwrap();
+        assert!(race == s50 || race == tip, "race/x is at {race}, neither S50 nor the final tip");
+        if race != s50 {
+            assert_eq!(race, tip, "never an intermediate replayed sha");
+        }
+        assert_eq!(e.ops().await, 0);
+    }
+
+    // ── carried from US-013: the six tests its pre-flight could not run ──
+
+    /// E2E-NEW-610: NFR 7.5, a completed rebase writes exactly one audit entry.
+    #[tokio::test]
+    async fn e2e_new_610_rebase_side_effect_audit_entries() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_fork_clean(&e).await;
+        let n0 = e.audit().len();
+
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let appended: Vec<crate::safety::AuditEntry> = e.audit().split_off(n0);
+        assert!(!appended.is_empty(), "a completed rebase is audited");
+        assert!(appended.iter().all(|a| a.op == "git.rebase"), "{appended:?}");
+        assert!(appended.iter().all(|a| a.path == "/"), "{appended:?}");
+        let detail = &appended[0].detail;
+        assert!(detail.contains("onto"), "{detail}");
+        assert!(detail.contains(&c2), "{detail}");
+        let times: Vec<f64> = appended.iter().map(|a| a.timestamp).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "oldest first: {times:?}");
+    }
+
+    /// E2E-NEW-611: FR-NEW-210, every byte the rebase writes to the volume is
+    /// charged. The rebase writes the tree-to-tree delta between the old and
+    /// the new tip, so only `/a.txt` moves here: `/g.txt` and `/f.txt` are
+    /// byte identical on both sides and are not rewritten.
+    #[tokio::test]
+    async fn e2e_new_611_rebase_side_effect_write_quota_charged() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let before = e.byte_map().await;
+        let q0 = e.bytes_written();
+
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let after = e.byte_map().await;
+        let written: i64 = after
+            .iter()
+            .filter(|(path, bytes)| before.get(*path) != Some(*bytes))
+            .map(|(_, bytes)| bytes.len() as i64)
+            .sum();
+        assert_eq!(written, 8, "only /a.txt differs between the two tips");
+        assert_eq!(e.bytes_written() - q0, written);
+    }
+
+    /// E2E-NEW-612: FR-NEW-284, a clean rebase leaves no `git_operations` row,
+    /// so `git.rebase_continue` has nothing to advance.
+    #[tokio::test]
+    async fn e2e_new_612_rebase_side_effect_no_in_progress_row_on_success() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        assert_eq!(e.ops().await, 0);
+
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        assert_eq!(e.ops().await, 0, "a clean rebase pauses nothing");
+        assert!(e.op_row().await.is_none());
+        let err = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no rebase in progress"), "{}", err.message);
+    }
+
+    /// E2E-NEW-800: FR-NEW-218/210, a rebase runs once the dirt is committed.
+    #[tokio::test]
+    async fn e2e_new_800_a_rebase_runs_once_the_dirt_is_committed() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        e.write("/scratch.txt", "tmp\n").await;
+        let f3 = e.commit("F3 scratch").await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2), pick(&f3)])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 3, "{out}");
+
+        assert_eq!(
+            e.log_messages("feature").await,
+            ["F3 scratch", "F2 feature add", "F1 feature edit", "C2 main edit", "C1 base"]
+        );
+        assert_eq!(e.read_bytes("/scratch.txt").await, b"tmp\n");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-850: FR-NEW-216/210, exactly `max_rebase_todo` entries replay.
+    #[tokio::test]
+    async fn e2e_new_850_exactly_max_rebase_todo_entries_are_accepted() {
+        let e = Env::new().await;
+        assert_eq!(e.f.state.config.git.max_rebase_todo, 200);
+        let (_c2, shas) = seed_many_on_feature(&e, 200).await;
+        let todo: Vec<Value> = shas.iter().map(|s| pick(s)).collect();
+        assert_eq!(todo.len(), 200);
+
+        let out = rebase(&e, "main", json!(todo)).await.unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 200, "{out}");
+        assert_eq!(e.log_commits("feature").await.len(), 202);
+        assert_eq!(e.read_bytes("/s/200.txt").await, b"s200\n");
+        assert_eq!(e.read_bytes("/m.txt").await, b"m\n");
+    }
+
+    // ── US-015: rebase pause, continue and abort ────────────────────────
+
+    /// FX-FORK conflicting: C1 base, `main` at C2 setting `/a.txt` line 2 to
+    /// MAIN, `feature` at F2 with F1 setting the same line to FEAT1 and F2
+    /// adding `/f.txt`. The volume matches F2.
+    async fn seed_fork_conflict(e: &Env) -> (String, String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\nFEAT1\n").await;
+        let f1 = e.commit("F1 feature edit").await;
+        e.write("/f.txt", "f1\n").await;
+        let f2 = e.commit("F2 feature add").await;
+        (c1, c2, f1, f2)
+    }
+
+    /// FX-FORK4 conflicting: `main` at C2 (`/a.txt` line 2 = MAIN), `feature`
+    /// at F4 with F1 and F3 clean additions and F2 and F4 both rewriting the
+    /// contested line. F2 conflicts against the new base; F4 conflicts against
+    /// whatever F2's resolution left behind when that resolution kept the
+    /// `ours` side.
+    async fn seed_fork4_conflict(e: &Env) -> (String, String, Vec<String>) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        // Back to C1's content, so F1's only delta is the file it adds.
+        e.write("/a.txt", "a1\n").await;
+        e.write("/f1.txt", "1\n").await;
+        let f1 = e.commit("F1 feat one").await;
+        e.write("/a.txt", "a1\nFEAT2\n").await;
+        let f2 = e.commit("F2 feat two").await;
+        e.write("/f3.txt", "3\n").await;
+        let f3 = e.commit("F3 feat three").await;
+        e.write("/a.txt", "a1\nFEAT4\n").await;
+        let f4 = e.commit("F4 feat four").await;
+        (c1, c2, vec![f1, f2, f3, f4])
+    }
+
+    /// FX-FORK4 with the conflicts on entries 0 and 2 instead of 1 and 3: F1
+    /// and F3 rewrite the contested line, F2 and F4 add a file each.
+    async fn seed_fork4_odd_conflicts(e: &Env) -> (String, Vec<String>) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\nFEAT1\n").await;
+        let f1 = e.commit("F1 feat one").await;
+        e.write("/f2.txt", "f2\n").await;
+        let f2 = e.commit("F2 feat two").await;
+        e.write("/a.txt", "a1\nFEAT3\n").await;
+        let f3 = e.commit("F3 feat three").await;
+        e.write("/f4.txt", "f4\n").await;
+        let f4 = e.commit("F4 feat four").await;
+        (c2, vec![f1, f2, f3, f4])
+    }
+
+    /// FX-TAIL: the conflicting entry is the last of two.
+    async fn seed_tail_conflict(e: &Env) -> (String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.write("/a.txt", "a1\n").await;
+        e.write("/t1.txt", "t1\n").await;
+        let t1 = e.commit("T1 add").await;
+        e.write("/a.txt", "a1\nFEAT\n").await;
+        let t2 = e.commit("T2 edit").await;
+        (c2, t1, t2)
+    }
+
+    /// FX-FORK3C: three feature commits, each rewriting the contested line.
+    async fn seed_fork3c(e: &Env) -> Vec<String> {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        let mut out = Vec::new();
+        for name in ["G1", "G2", "G3"] {
+            e.write("/a.txt", &format!("a1\n{name}\n")).await;
+            out.push(e.commit(name).await);
+        }
+        out
+    }
+
+    /// SEED-MULTI(3) on `feature`: three files conflicting on the same line,
+    /// rewritten by one feature commit.
+    async fn seed_multi_feature(e: &Env) -> (Vec<String>, String) {
+        let paths: Vec<String> = (0..3).map(|i| format!("/f/{i:03}.txt")).collect();
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        for p in &paths {
+            e.write(p, "line-A\n").await;
+        }
+        let c0 = e.commit("C0").await;
+        e.set_branch("feature", &c0).await;
+        e.checkout("feature").await;
+        for p in &paths {
+            e.write(p, "line-FEATURE\n").await;
+        }
+        let fm1 = e.commit("FM1").await;
+
+        // `main` moves the same three lines, off the same base.
+        e.set_branch("main", &c0).await;
+        e.checkout("main").await;
+        for p in &paths {
+            e.write(p, "line-MAIN\n").await;
+        }
+        e.commit("CM1").await;
+        e.checkout("feature").await;
+        for p in &paths {
+            e.write(p, "line-FEATURE\n").await;
+        }
+        (paths, fm1)
+    }
+
+    fn res(path: &str, strategy: &str) -> Value {
+        json!({"path": path, "strategy": strategy})
+    }
+
+    async fn rebase_continue(e: &Env, resolutions: Value) -> Result<Value> {
+        e.call("git.rebase_continue", json!({"mount_id": MOUNT, "resolutions": resolutions})).await
+    }
+
+    async fn rebase_abort(e: &Env) -> Result<Value> {
+        e.call("git.rebase_abort", json!({"mount_id": MOUNT})).await
+    }
+
+    /// Every conflicting path of a conflict response, in order.
+    fn conflict_paths(v: &Value) -> Vec<String> {
+        v["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The conflict set recorded in the `git_operations` row.
+    async fn row_conflicts(e: &Env) -> Vec<String> {
+        let row = e.op_row().await.expect("an operation in progress");
+        serde_json::from_str(row.conflicts.as_deref().unwrap()).unwrap()
+    }
+
+    /// The todo recorded in the row, as raw JSON.
+    async fn row_todo(e: &Env) -> Value {
+        let row = e.op_row().await.expect("an operation in progress");
+        serde_json::from_str(row.todo.as_deref().unwrap()).unwrap()
+    }
+
+    fn assert_no_conflict_markers(map: &BTreeMap<String, Vec<u8>>) {
+        for (path, bytes) in map {
+            let text = String::from_utf8_lossy(bytes);
+            for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
+                assert!(!text.contains(marker), "{path} carries a conflict marker: {text}");
+            }
+        }
+    }
+
+    /// E2E-NEW-613: FR-NEW-219, a conflicting step pauses at its own index and
+    /// changes nothing.
+    #[tokio::test]
+    async fn e2e_new_613_rebase_conflict_single_pause_on_the_first_entry() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let before = e.byte_map().await;
+        assert_eq!(before.get("/a.txt").map(Vec::as_slice), Some(&b"a1\nFEAT1\n"[..]));
+        assert_eq!(before.get("/f.txt").map(Vec::as_slice), Some(&b"f1\n"[..]));
+
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "rebase", "{out}");
+        assert_eq!(out["current_step"], 0, "{out}");
+        assert_eq!(out["total_steps"], 2, "{out}");
+        assert!(out.get("step").is_none(), "no response key is named step: {out}");
+        assert_eq!(conflict_paths(&out), ["/a.txt"], "{out}");
+        assert_eq!(out["continue_with"], "git.rebase_continue", "{out}");
+        assert_eq!(out["abort_with"], "git.rebase_abort", "{out}");
+
+        assert_eq!(e.ops().await, 1);
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(row.state, "conflicted");
+        assert_eq!(row.current_step, 0);
+        assert_eq!(row.total_steps, 2);
+        let todo = row_todo(&e).await;
+        assert_eq!(todo.as_array().unwrap().len(), 2, "{todo}");
+        assert_eq!(todo[0]["sha"], f1.as_str(), "{todo}");
+        assert_eq!(todo[1]["sha"], f2.as_str(), "{todo}");
+        assert_eq!(todo[0]["sha"], out_todo_sha(&out, &e).await, "{todo}");
+
+        assert_eq!(e.byte_map().await, before, "the pause writes nothing");
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+    }
+
+    /// `todo[current_step].sha` read off the persisted row, which is how the
+    /// specification identifies the paused entry.
+    async fn out_todo_sha(out: &Value, e: &Env) -> String {
+        let step = out["current_step"].as_i64().unwrap() as usize;
+        row_todo(e).await[step]["sha"].as_str().unwrap().to_string()
+    }
+
+    /// E2E-NEW-614: FR-NEW-221, a continue with `theirs` finishes the rebase.
+    #[tokio::test]
+    async fn e2e_new_614_rebase_continue_with_theirs_completes() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let out = rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 2, "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT1\n");
+        assert_eq!(
+            e.log_messages("feature").await,
+            ["F2 feature add", "F1 feature edit", "C2 main edit", "C1 base"]
+        );
+        let shas = e.log_shas("feature").await;
+        assert_ne!(shas[0], f2);
+        assert_ne!(shas[1], f1);
+        assert_eq!(e.ops().await, 0);
+        assert_no_conflict_markers(&e.byte_map().await);
+    }
+
+    /// E2E-NEW-615: FR-NEW-220, a rebase pauses twice and finishes.
+    #[tokio::test]
+    async fn e2e_new_615_rebase_multi_pause_on_two_entries() {
+        let e = Env::new().await;
+        let (_c1, c2, f) = seed_fork4_conflict(&e).await;
+        let before = e.byte_map().await;
+        let todo = json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]);
+
+        let first = rebase(&e, "main", todo).await.unwrap();
+        assert_eq!(first["status"], "conflict", "{first}");
+        assert_eq!(first["current_step"], 1, "{first}");
+        assert_eq!(first["total_steps"], 4, "{first}");
+        assert_eq!(row_todo(&e).await[1]["sha"], f[1].as_str());
+        assert_eq!(conflict_paths(&first), ["/a.txt"]);
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.op_row().await.unwrap().current_step, 1);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f[3].as_str()));
+        assert_eq!(e.byte_map().await, before, "nothing is applied while paused");
+
+        // `ours` keeps the new base's side, which is what leaves F4's own edit
+        // conflicting further down the todo.
+        let second = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+        assert_eq!(second["status"], "conflict", "{second}");
+        assert_eq!(second["current_step"], 3, "{second}");
+        assert_eq!(row_todo(&e).await[3]["sha"], f[3].as_str());
+        assert_eq!(e.ops().await, 1);
+
+        let third = rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap();
+        assert_eq!(third["status"], "completed", "{third}");
+        assert_eq!(third["replayed"], 4, "{third}");
+
+        assert_eq!(
+            e.log_messages("feature").await,
+            [
+                "F4 feat four",
+                "F3 feat three",
+                "F2 feat two",
+                "F1 feat one",
+                "C2 main edit",
+                "C1 base"
+            ]
+        );
+        let commits = e.log_commits("feature").await;
+        for (i, sha) in f.iter().enumerate() {
+            assert_ne!(commits[3 - i]["sha"].as_str().unwrap(), sha, "entry {i} was replayed");
+            assert_eq!(commits[3 - i]["parents"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(commits[3]["parents"], json!([short(&c2)]));
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT4\n");
+        assert_eq!(e.read_bytes("/f1.txt").await, b"1\n");
+        assert_eq!(e.read_bytes("/f3.txt").await, b"3\n");
+        assert_no_conflict_markers(&e.byte_map().await);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-616: FR-NEW-171, the volume is untouched at a pause, path set
+    /// included.
+    #[tokio::test]
+    async fn e2e_new_616_rebase_conflict_leaves_the_volume_untouched() {
+        let e = Env::new().await;
+        let (_c1, _c2, f) = seed_fork4_conflict(&e).await;
+        let before = e.byte_map().await;
+
+        let out = rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+
+        let after = e.byte_map().await;
+        assert_eq!(after.keys().collect::<Vec<_>>(), before.keys().collect::<Vec<_>>());
+        assert_eq!(after, before);
+    }
+
+    /// E2E-NEW-617: FR-NEW-175, a literal content resolution is taken verbatim.
+    #[tokio::test]
+    async fn e2e_new_617_rebase_continue_with_literal_content() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let out = rebase_continue(&e, json!([{"path": "/a.txt", "content": "a1\nMERGED\n"}]))
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMERGED\n");
+        let commits = e.log_commits("feature").await;
+        let show = e
+            .call("git.show", json!({"mount_id": MOUNT, "commit_sha": commits[1]["sha"]}))
+            .await
+            .unwrap();
+        assert!(show["diff"].as_str().unwrap().contains("MERGED"), "{show}");
+        assert_no_conflict_markers(&e.byte_map().await);
+    }
+
+    /// E2E-NEW-618: FR-NEW-172, a conflict marker never enters the volume.
+    #[tokio::test]
+    async fn e2e_new_618_rebase_conflict_markers_never_enter_the_volume() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        assert_no_conflict_markers(&e.byte_map().await);
+
+        let out = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_no_conflict_markers(&e.byte_map().await);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+    }
+
+    /// E2E-NEW-619: FR-NEW-223, abort restores the tip and every byte exactly.
+    #[tokio::test]
+    async fn e2e_new_619_rebase_abort_restores_exactly() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let tip_before = e.ref_sha("refs/heads/feature").await.unwrap();
+        assert_eq!(tip_before, f2);
+        let volume_before = e.byte_map().await;
+        let log_before = e.log_commits("feature").await;
+
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        let out = rebase_abort(&e).await.unwrap();
+
+        assert_eq!(out["status"], "aborted", "{out}");
+        assert_eq!(out["operation"], "rebase", "{out}");
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(tip_before.as_str()));
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            let on_disk = repo.find_reference("refs/heads/feature").unwrap();
+            assert_eq!(on_disk.target().unwrap().to_string(), tip_before);
+        }
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.log_commits("feature").await, log_before);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-621: FR-NEW-223, abort after one continue undoes everything.
+    #[tokio::test]
+    async fn e2e_new_621_rebase_abort_mid_multi_pause() {
+        let e = Env::new().await;
+        let (_c1, _c2, f) = seed_fork4_conflict(&e).await;
+        let tip_before = e.ref_sha("refs/heads/feature").await.unwrap();
+        let volume_before = e.byte_map().await;
+
+        let first = rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+        assert_eq!(first["status"], "conflict", "{first}");
+        let second = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+        assert_eq!(second["status"], "conflict", "{second}");
+
+        rebase_abort(&e).await.unwrap();
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(tip_before.as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT4\n");
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(
+            e.log_messages("feature").await,
+            ["F4 feat four", "F3 feat three", "F2 feat two", "F1 feat one", "C1 base"]
+        );
+        assert_eq!(
+            e.log_shas("feature").await[..4],
+            f.iter().rev().cloned().collect::<Vec<_>>()[..]
+        );
+    }
+
+    /// E2E-NEW-635: FR-NEW-224, continue with nothing in progress.
+    #[tokio::test]
+    async fn e2e_new_635_rebase_continue_with_nothing_in_progress() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let before = e.byte_map().await;
+
+        let bare = e.call("git.rebase_continue", json!({"mount_id": MOUNT})).await.unwrap_err();
+        assert_eq!(bare.code, code::INVALID_ARGUMENT, "{bare:?}");
+        assert!(bare.message.contains("no rebase in progress"), "{}", bare.message);
+
+        let with = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert_eq!(with.code, code::INVALID_ARGUMENT, "{with:?}");
+        assert!(with.message.contains("no rebase in progress"), "{}", with.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, before);
+    }
+
+    /// E2E-NEW-636: FR-NEW-224, abort with nothing in progress.
+    #[tokio::test]
+    async fn e2e_new_636_rebase_abort_with_nothing_in_progress() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+
+        let err = rebase_abort(&e).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no rebase in progress"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-637: FR-NEW-283, a second rebase while one is paused is refused
+    /// and overwrites nothing.
+    #[tokio::test]
+    async fn e2e_new_637_starting_a_second_rebase_while_one_is_paused() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        let row_before = e.op_row().await.unwrap();
+        let volume_before = e.byte_map().await;
+
+        let err = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_abort"), "{}", err.message);
+        assert_eq!(e.ops().await, 1);
+        let after = e.op_row().await.unwrap();
+        assert_eq!(after.current_step, row_before.current_step);
+        assert_eq!(after.todo, row_before.todo);
+        assert_eq!(e.byte_map().await, volume_before);
+    }
+
+    /// E2E-NEW-638: FR-NEW-279, a commit is refused while a rebase is paused,
+    /// and allowed again once it is aborted.
+    #[tokio::test]
+    async fn e2e_new_638_commit_while_a_rebase_is_paused() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let err = e
+            .call("git.commit", json!({"mount_id": MOUNT, "message": "sneaky"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert!(!e.log_messages("feature").await.contains(&"sneaky".to_string()));
+
+        rebase_abort(&e).await.unwrap();
+        e.commit("sneaky").await;
+        assert!(e.log_messages("feature").await.contains(&"sneaky".to_string()));
+    }
+
+    /// E2E-NEW-697: FR-NEW-278, a paused rebase survives a repo-store reopen.
+    #[tokio::test]
+    async fn e2e_new_697_a_paused_rebase_survives_a_repo_store_reopen() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        let before = e.op_row().await.unwrap();
+
+        // The cold-open path: the in process entry is dropped, so the next call
+        // rebuilds it from the on disk state alone.
+        e.git.teardown_repo(MOUNT).await.unwrap();
+
+        let after = e.op_row().await.unwrap();
+        assert_eq!(after.current_step, before.current_step);
+        assert_eq!(after.todo, before.todo);
+        assert_eq!(after.conflicts, before.conflicts);
+
+        let out = rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap();
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT1\n");
+        assert_eq!(
+            e.log_messages("feature").await,
+            ["F2 feature add", "F1 feature edit", "C2 main edit", "C1 base"]
+        );
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-803: FR-NEW-222/221, a second call covering the rest lets the
+    /// continue through, and both calls' resolutions are combined.
+    #[tokio::test]
+    async fn e2e_new_803_a_second_resolution_call_lets_the_continue_through() {
+        let e = Env::new().await;
+        let (paths, fm1) = seed_multi_feature(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&fm1)])).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(conflict_paths(&out), paths);
+
+        let err = rebase_continue(&e, json!([res(&paths[0], "theirs"), res(&paths[1], "theirs")]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains(&paths[2]), "{}", err.message);
+        assert!(err.message.contains("unresolved"), "{}", err.message);
+
+        let done = rebase_continue(&e, json!([res(&paths[2], "ours")])).await.unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["replayed"], 1, "{done}");
+        assert_eq!(e.read_bytes(&paths[0]).await, b"line-FEATURE\n");
+        assert_eq!(e.read_bytes(&paths[1]).await, b"line-FEATURE\n");
+        assert_eq!(e.read_bytes(&paths[2]).await, b"line-MAIN\n");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-804: FR-NEW-222, an empty resolutions array keeps the pause
+    /// exactly as it was.
+    ///
+    /// The specification's own body also asserts `/a.txt` reads the onto side
+    /// at the pause, which contradicts E2E-NEW-613 and E2E-NEW-616 on the same
+    /// fixture and the same pause. This implementation applies nothing to the
+    /// volume until the rebase completes, so the byte assertion here is the
+    /// pre-rebase content.
+    #[tokio::test]
+    async fn e2e_new_804_continue_with_an_empty_resolutions_array() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        let before = e.op_row().await.unwrap();
+        assert_eq!(before.op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(before.current_step, 0);
+        assert_eq!(before.total_steps, 2);
+        assert_eq!(row_conflicts(&e).await, ["/a.txt"]);
+
+        let err = rebase_continue(&e, json!([])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("/a.txt"), "{}", err.message);
+        assert!(err.message.contains("unresolved"), "{}", err.message);
+
+        let after = e.op_row().await.unwrap();
+        assert_eq!(
+            crate::git::db::GitOperationRow { updated_at: before.updated_at.clone(), ..after },
+            before
+        );
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f2.as_str()));
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT1\n");
+
+        let done = rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+    }
+
+    /// E2E-NEW-805: FR-NEW-222/177, repeated partial continues never advance
+    /// the step index, and the recorded resolutions survive every rejection.
+    #[tokio::test]
+    async fn e2e_new_805_repeated_partial_continues_never_advance_the_step() {
+        let e = Env::new().await;
+        let (paths, fm1) = seed_multi_feature(&e).await;
+        rebase(&e, "main", json!([pick(&fm1)])).await.unwrap();
+        let tip_before = e.ref_sha("refs/heads/feature").await.unwrap();
+        assert_eq!(tip_before, fm1);
+
+        for p in &paths[..2] {
+            let err = rebase_continue(&e, json!([res(p, "ours")])).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert_eq!(e.op_row().await.unwrap().current_step, 0);
+        }
+
+        let err = rebase_continue(&e, json!([res("/f/999.txt", "ours")])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("/f/999.txt"), "{}", err.message);
+        assert!(err.message.contains("not in conflict"), "{}", err.message);
+
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.current_step, 0);
+        assert_eq!(row.total_steps, 1);
+        // `conflicts` is the REMAINING set, the same meaning it carries for the
+        // merge family and the same one `git.status` reports as
+        // `remaining_conflicts`; the specification's own body reads it as the
+        // original set, which would make a partly resolved pause report paths
+        // it no longer owes.
+        assert_eq!(row_conflicts(&e).await, [paths[2].clone()]);
+        let recorded: BTreeMap<String, merge::Resolution> =
+            serde_json::from_str(row.resolutions.as_deref().unwrap()).unwrap();
+        assert_eq!(recorded.keys().cloned().collect::<Vec<_>>(), paths[..2]);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(tip_before.as_str()));
+
+        let done = rebase_continue(&e, json!([res(&paths[2], "ours")])).await.unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(e.read_bytes(&paths[0]).await, b"line-MAIN\n");
+    }
+
+    /// E2E-NEW-812: FR-NEW-225, `git.rebase_continue` cannot finish a paused
+    /// pull.
+    #[tokio::test]
+    async fn e2e_new_812_rebase_continue_cannot_finish_a_paused_pull() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote) = seed_pull_conflict(&e, "remote-812").await;
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+
+        for out in [
+            rebase_continue(&e, json!([res(PULL_CFG, "theirs")])).await,
+            cherry_pick_continue(&e, json!([res(PULL_CFG, "theirs")])).await,
+        ] {
+            let err = out.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert!(err.message.contains("merge"), "{}", err.message);
+            assert!(err.message.contains("git.merge_resolve"), "{}", err.message);
+            assert!(err.message.contains("git.merge_abort"), "{}", err.message);
+        }
+
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Merge);
+        assert_eq!(row_conflicts(&e).await, [PULL_CFG]);
+        assert_eq!(e.read(PULL_CFG).await.lines().nth(1).unwrap(), "port = 8000");
+    }
+
+    /// E2E-NEW-815: FR-NEW-281, status names the rebase tools, not the merge
+    /// tools.
+    #[tokio::test]
+    async fn e2e_new_815_status_names_the_rebase_tools() {
+        let e = Env::new().await;
+        let (_c1, f) = seed_fork4_odd_conflicts(&e).await;
+        let out = rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["current_step"], 0, "{out}");
+
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+
+        assert_eq!(
+            status["operation"],
+            json!({
+                "op_type": "rebase",
+                "source_ref": Value::Null,
+                "current_step": 0,
+                "total_steps": 4,
+                "remaining_conflicts": ["/a.txt"],
+                "continue_with": "git.rebase_continue",
+                "abort_with": "git.rebase_abort",
+            }),
+            "{status}"
+        );
+        let rendered = status["operation"].to_string();
+        assert!(!rendered.contains("git.merge_resolve"), "{rendered}");
+        assert!(!rendered.contains("git.merge_abort"), "{rendered}");
+        assert_eq!(status["branch"], "feature", "{status}");
+        assert_eq!(status["head"].as_str(), Some(f[3].as_str()), "{status}");
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-852: FR-NEW-219/275, the paused row holds every named field.
+    #[tokio::test]
+    async fn e2e_new_852_the_paused_row_holds_every_field_the_spec_names() {
+        let e = Env::new().await;
+        let (_c1, c2, f) = seed_fork4_conflict(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(row.state, "conflicted");
+        assert_eq!(row.source_ref, None);
+        assert_eq!(row.onto_sha.as_deref(), Some(c2.as_str()));
+        assert_eq!(row.original_tip_sha.as_deref(), Some(f[3].as_str()));
+        assert_eq!(row.current_step, 1);
+        assert_eq!(row.total_steps, 4);
+        assert_eq!(row_conflicts(&e).await, ["/a.txt"]);
+        let recorded: BTreeMap<String, merge::Resolution> =
+            serde_json::from_str(row.resolutions.as_deref().unwrap()).unwrap();
+        assert!(recorded.is_empty(), "{recorded:?}");
+        assert_eq!(row.created_at, row.updated_at);
+
+        let todo = row_todo(&e).await;
+        let actions: Vec<&str> =
+            todo.as_array().unwrap().iter().map(|t| t["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, ["pick", "pick", "pick", "pick"]);
+        let shas: Vec<&str> =
+            todo.as_array().unwrap().iter().map(|t| t["sha"].as_str().unwrap()).collect();
+        assert_eq!(shas, f.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(f[3].as_str()));
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-853: FR-NEW-219/220, a conflict on the last entry pauses with
+    /// `current_step == total_steps - 1`.
+    ///
+    /// The volume assertion is the pre-rebase content: replayed steps are held
+    /// in the object database and land on the volume only at completion (see
+    /// E2E-NEW-616).
+    #[tokio::test]
+    async fn e2e_new_853_a_conflict_on_the_last_entry() {
+        let e = Env::new().await;
+        let (_c2, t1, t2) = seed_tail_conflict(&e).await;
+
+        let out = rebase(&e, "main", json!([pick(&t1), pick(&t2)])).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["current_step"], 1, "{out}");
+        assert_eq!(out["total_steps"], 2, "{out}");
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.current_step, 1);
+        assert_eq!(row.total_steps, 2);
+        assert_eq!(e.read_bytes("/t1.txt").await, b"t1\n");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT\n");
+
+        let done = rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["replayed"], 2, "{done}");
+        assert_eq!(e.read_bytes("/t1.txt").await, b"t1\n");
+    }
+
+    /// E2E-NEW-854: FR-NEW-220/275, the step index moves forward between
+    /// pauses and never backwards.
+    #[tokio::test]
+    async fn e2e_new_854_the_step_index_moves_forward_between_pauses() {
+        let e = Env::new().await;
+        let (_c2, f) = seed_fork4_odd_conflicts(&e).await;
+        let out = rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        let first = e.op_row().await.unwrap();
+        assert_eq!(first.current_step, 0);
+        assert_eq!(first.total_steps, 4);
+        assert_eq!(first.created_at, first.updated_at);
+
+        let second = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+
+        assert_eq!(second["status"], "conflict", "{second}");
+        assert_eq!(second["current_step"], 2, "{second}");
+        assert_eq!(second["total_steps"], 4, "{second}");
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.current_step, 2);
+        assert_eq!(row.total_steps, 4);
+        assert_eq!(row_conflicts(&e).await, ["/a.txt"]);
+        let recorded: BTreeMap<String, merge::Resolution> =
+            serde_json::from_str(row.resolutions.as_deref().unwrap()).unwrap();
+        assert!(recorded.is_empty(), "the previous step's resolutions are consumed: {recorded:?}");
+        assert!(row.updated_at > row.created_at, "{row:?}");
+        assert_eq!(row.created_at, first.created_at);
+        assert_eq!(row.onto_sha, first.onto_sha);
+        assert_eq!(row.original_tip_sha, first.original_tip_sha);
+        assert_eq!(e.read_bytes("/f2.txt").await, b"f2\n");
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-855: FR-NEW-220/221, three pauses in one rebase.
+    ///
+    /// Each pause is resolved with the side that keeps the conflict alive for
+    /// the next entry (`ours`), which is what makes every entry conflict in
+    /// turn; the last takes `theirs`, so the final content is G3's.
+    #[tokio::test]
+    async fn e2e_new_855_three_pauses_in_one_rebase() {
+        let e = Env::new().await;
+        let g = seed_fork3c(&e).await;
+
+        let first =
+            rebase(&e, "main", json!([pick(&g[0]), pick(&g[1]), pick(&g[2])])).await.unwrap();
+        assert_eq!(first["status"], "conflict", "{first}");
+        assert_eq!(first["current_step"], 0, "{first}");
+
+        let second = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+        assert_eq!(second["status"], "conflict", "{second}");
+        assert_eq!(second["current_step"], 1, "{second}");
+
+        let third = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+        assert_eq!(third["status"], "conflict", "{third}");
+        assert_eq!(third["current_step"], 2, "{third}");
+
+        let done = rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["replayed"], 3, "{done}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nG3\n");
+        assert_eq!(e.log_messages("feature").await, ["G3", "G2", "G1", "C2 main edit", "C1 base"]);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-856: FR-NEW-221/175, literal content keeps the original message.
+    #[tokio::test]
+    async fn e2e_new_856_continue_with_literal_content_keeps_the_message() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let out = rebase_continue(&e, json!([{"path": "/a.txt", "content": "a1\nMAIN+FEAT1\n"}]))
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 2, "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN+FEAT1\n");
+        assert_eq!(e.log_commits("feature").await[1]["message"], "F1 feature edit");
+        assert_eq!(e.read_bytes("/f.txt").await, b"f1\n");
+    }
+
+    /// E2E-NEW-857: FR-NEW-225, the rebase channel refuses a merge.
+    #[tokio::test]
+    async fn e2e_new_857_rebase_continue_while_a_merge_is_in_progress() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+
+        let err = rebase_continue(&e, json!([res(CFG, "ours")])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("merge"), "{}", err.message);
+        assert!(err.message.contains("git.merge_resolve"), "{}", err.message);
+        assert!(err.message.contains("git.merge_abort"), "{}", err.message);
+
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Merge);
+        assert_eq!(row_conflicts(&e).await, [CFG]);
+        let recorded: BTreeMap<String, merge::Resolution> =
+            decode_op_json(row.resolutions.as_deref()).unwrap();
+        assert!(recorded.is_empty(), "{recorded:?}");
+
+        let abort_err = rebase_abort(&e).await.unwrap_err();
+        assert_eq!(abort_err.code, code::INVALID_ARGUMENT, "{abort_err:?}");
+        assert!(abort_err.message.contains("merge"), "{}", abort_err.message);
+
+        let done = e.resolve(json!([res(CFG, "ours")])).await.unwrap();
+        assert_eq!(done["status"], "merged", "{done}");
+    }
+
+    /// E2E-NEW-873: FR-NEW-280, the read-only set answers during a paused
+    /// rebase. `git.remote_list` is a later story, so the eight tools that
+    /// exist today are the ones exercised.
+    #[tokio::test]
+    async fn e2e_new_873_the_read_only_set_answers_during_a_paused_rebase() {
+        let e = Env::new().await;
+        let (c1, f) = seed_fork4_odd_conflicts(&e).await;
+        e.entry().await.db.set_ref("refs/tags/v1", &c1, false).await.unwrap();
+        e.write("/scratch.txt", "wip\n").await;
+        let stash = stash_save(&e, json!({"message": "wip"})).await.unwrap();
+        let stash_id = stash["stash_id"].as_str().unwrap().to_string();
+
+        let out = rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+
+        assert!(e.call("git.status", json!({"mount_id": MOUNT})).await.is_ok());
+        assert!(e.call("git.log", json!({"mount_id": MOUNT, "ref_name": "feature"})).await.is_ok());
+        assert!(e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": c1})).await.is_ok());
+        assert!(
+            e.call("git.diff", json!({"mount_id": MOUNT, "from_ref": c1, "to_ref": "main"}))
+                .await
+                .is_ok()
+        );
+        let branches = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        let names: Vec<&str> = branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["feature", "main"], "{branches}");
+        let current: Vec<&str> = branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["current"] == true)
+            .map(|b| b["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(current, ["feature"], "{branches}");
+        let tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(tags["tags"][0]["name"], "v1", "{tags}");
+        assert!(e.call("git.blame", json!({"mount_id": MOUNT, "path": "/a.txt"})).await.is_ok());
+        let listed = e.call("git.stash_list", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(listed["stashes"][0]["stash_id"], stash_id.as_str(), "{listed}");
+
+        let err =
+            e.call("git.commit", json!({"mount_id": MOUNT, "message": "nope"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+
+        // A cherry-pick is a write, so the paused rebase refuses it too, and
+        // the cherry-pick completion pair does not answer for the rebase.
+        let pick_err = cherry_pick(&e, &c1).await.unwrap_err();
+        assert_eq!(pick_err.code, code::INVALID_ARGUMENT, "{pick_err:?}");
+        assert!(pick_err.message.contains("rebase"), "{}", pick_err.message);
+        let cont_err = cherry_pick_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert!(cont_err.message.contains("no cherry-pick in progress"), "{}", cont_err.message);
+        let abort_err = cherry_pick_abort(&e).await.unwrap_err();
+        assert!(abort_err.message.contains("no cherry-pick in progress"), "{}", abort_err.message);
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-874: FR-NEW-281/220, `git.status` tracks the step counters.
+    #[tokio::test]
+    async fn e2e_new_874_the_step_counters_track_a_multi_step_rebase() {
+        let e = Env::new().await;
+        let (_c2, f) = seed_fork4_odd_conflicts(&e).await;
+        let tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        rebase(&e, "main", json!([pick(&f[0]), pick(&f[1]), pick(&f[2]), pick(&f[3])]))
+            .await
+            .unwrap();
+
+        let first = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(first["operation"]["current_step"], 0, "{first}");
+        assert_eq!(first["operation"]["total_steps"], 4, "{first}");
+
+        let paused = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap();
+        assert_eq!(paused["status"], "conflict", "{paused}");
+
+        let second = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(second["operation"]["current_step"], 2, "{second}");
+        assert_eq!(second["operation"]["total_steps"], 4, "{second}");
+        for s in [&first, &second] {
+            assert_eq!(s["operation"]["remaining_conflicts"], json!(["/a.txt"]), "{s}");
+            assert_eq!(s["operation"]["continue_with"], "git.rebase_continue", "{s}");
+            assert_eq!(s["operation"]["abort_with"], "git.rebase_abort", "{s}");
+        }
+        assert_eq!(second["head"].as_str(), Some(tip.as_str()), "{second}");
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-876: FR-NEW-282/221, a second member continues a rebase the
+    /// first member started.
+    #[tokio::test]
+    async fn e2e_new_876_a_second_member_continues_the_rebase() {
+        const SECOND: &str = "second@test.com";
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, SECOND, OWNER).await.unwrap();
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let out = e
+            .as_person(
+                SECOND,
+                "git.rebase_continue",
+                json!({"mount_id": MOUNT, "resolutions": [res("/a.txt", "theirs")]}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        assert_eq!(out["replayed"], 2, "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT1\n");
+
+        let commits = e.log_commits("feature").await;
+        assert_eq!(commits[0]["author_email"], OWNER);
+        {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            for c in &commits[..2] {
+                let commit =
+                    repo.find_commit(parse_oid(c["sha"].as_str().unwrap()).unwrap()).unwrap();
+                assert_eq!(commit.committer().email(), Some(SECOND), "{c}");
+                assert_eq!(commit.author().email(), Some(OWNER), "{c}");
+            }
+        }
+        let second_audit = e.f.state.safety.audit(SECOND, MOUNT);
+        assert!(second_audit.iter().any(|a| a.op == "git.rebase_continue"), "{second_audit:?}");
+        assert!(e.audit().iter().any(|a| a.op == "git.rebase"), "{:?}", e.audit());
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-912: FR-NEW-198/225, `git.merge_resolve` refuses to advance a
+    /// rebase and names the tools that would.
+    #[tokio::test]
+    async fn e2e_new_912_merge_resolve_refuses_to_advance_a_rebase() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let err = e.resolve(json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_abort"), "{}", err.message);
+
+        let abort_err = e.abort().await.unwrap_err();
+        assert_eq!(abort_err.code, code::INVALID_ARGUMENT, "{abort_err:?}");
+        assert!(abort_err.message.contains("rebase"), "{}", abort_err.message);
+        assert!(abort_err.message.contains("git.rebase_abort"), "{}", abort_err.message);
+        assert_eq!(e.op_row().await.unwrap().current_step, 0);
+
+        rebase_abort(&e).await.unwrap();
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-914: FR-NEW-213/219, dropping a commit a later entry depends on
+    /// pauses instead of silently succeeding.
+    #[tokio::test]
+    async fn e2e_new_914_dropping_a_commit_a_later_entry_depends_on_pauses() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/m.txt", "m\n").await;
+        e.commit("C2 main edit").await;
+
+        e.set_branch("feature", &c1).await;
+        e.checkout("feature").await;
+        e.delete("/m.txt").await;
+        e.write("/dep.txt", "v1\n").await;
+        let d1 = e.commit("D1 add dep").await;
+        e.write("/dep.txt", "v2\n").await;
+        let d2 = e.commit("D2 edit dep").await;
+
+        let out = rebase(
+            &e,
+            "main",
+            json!([{"action": "drop", "sha": d1}, {"action": "pick", "sha": d2}]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        let c = &out["conflicts"][0];
+        assert_eq!(c["path"], "/dep.txt", "{out}");
+        assert_eq!(c["ours"]["exists"], false, "{out}");
+        assert_eq!(c["theirs"]["exists"], true, "{out}");
+        assert_eq!(c["theirs"]["content"], "v2\n", "{out}");
+        assert_eq!(c["base"]["exists"], true, "{out}");
+        assert_eq!(c["base"]["content"], "v1\n", "{out}");
+
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(row.current_step, 1);
+        assert_eq!(row.total_steps, 2);
+
+        let done = rebase_continue(&e, json!([res("/dep.txt", "theirs")])).await.unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(e.read_bytes("/dep.txt").await, b"v2\n");
+        assert_eq!(e.log_commits("feature").await.len(), 3);
+    }
+
+    /// E2E-NEW-951: FR-NEW-241/225, each operation type routes to exactly one
+    /// completion pair. The revert leg lands with the story that adds those
+    /// tools; merge, rebase, cherry_pick and stash_pop exist today.
+    #[tokio::test]
+    async fn e2e_new_951_each_operation_routes_to_one_completion_pair() {
+        // A conflicted merge is advanced by the merge tools and by no other.
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+        let err = rebase_continue(&e, json!([res(CFG, "ours")])).await.unwrap_err();
+        assert!(err.message.contains("merge"), "{}", err.message);
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Merge);
+        assert_eq!(e.resolve(json!([res(CFG, "ours")])).await.unwrap()["status"], "merged");
+
+        // A conflicted rebase is advanced by the rebase tools and by no other.
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        let err = e.resolve(json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(
+            rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap()["status"],
+            "completed"
+        );
+
+        // A conflicted cherry-pick is advanced by the cherry-pick tools and by
+        // no other.
+        let e = Env::new().await;
+        let (_c1, _c2, f1, _f2) = seed_cp_conflict(&e).await;
+        assert_eq!(cherry_pick(&e, &f1).await.unwrap()["status"], "conflict");
+        let err = e.resolve(json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("cherry_pick"), "{}", err.message);
+        let err = rebase_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("cherry_pick"), "{}", err.message);
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::CherryPick);
+        assert_eq!(
+            cherry_pick_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap()["status"],
+            "committed"
+        );
+
+        // A conflicted stash pop is advanced by the merge tools and by no other.
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+        assert_eq!(stash_pop(&e, &id).await.unwrap()["status"], "conflict");
+        let err = rebase_continue(&e, json!([res("/src/lib.rs", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("stash_pop"), "{}", err.message);
+        let err = cherry_pick_continue(&e, json!([res("/src/lib.rs", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("stash_pop"), "{}", err.message);
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::StashPop);
+
+        // US-020 leg: the remote management tools route the same way. The two
+        // that mutate refs or state are refused and name the paused operation;
+        // the read-only listing stays available while it is paused.
+        let err = e
+            .call(
+                "git.remote_add",
+                json!({"mount_id": MOUNT, "name": "upstream",
+                                         "url": "https://github.com/o/r.git"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("stash_pop"), "{}", err.message);
+        let err = e
+            .call("git.remote_remove", json!({"mount_id": MOUNT, "name": "origin"}))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("stash_pop"), "{}", err.message);
+        let listed = e.call("git.remote_list", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(listed["remotes"], json!([]));
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::StashPop);
+
+        assert!(e.abort().await.is_ok());
+    }
+
+    // ── US-016: git.cherry_pick, continue and abort ──────────────────────
+
+    async fn cherry_pick_args(e: &Env, args: Value) -> Result<Value> {
+        e.call("git.cherry_pick", args).await
+    }
+
+    async fn cherry_pick(e: &Env, sha: &str) -> Result<Value> {
+        cherry_pick_args(e, json!({"mount_id": MOUNT, "commit_sha": sha})).await
+    }
+
+    async fn cherry_pick_continue(e: &Env, resolutions: Value) -> Result<Value> {
+        e.call("git.cherry_pick_continue", json!({"mount_id": MOUNT, "resolutions": resolutions}))
+            .await
+    }
+
+    async fn cherry_pick_abort(e: &Env) -> Result<Value> {
+        e.call("git.cherry_pick_abort", json!({"mount_id": MOUNT})).await
+    }
+
+    impl Env {
+        /// Create a branch at `start` and check it out through the real tool,
+        /// so the volume always matches HEAD and no cherry-pick ever starts
+        /// against a dirty volume.
+        async fn branch_at(&self, name: &str, start: &str) {
+            self.call(
+                "git.branch_create",
+                json!({"mount_id": MOUNT, "name": name, "start_point": start,
+                       "checkout": true}),
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn switch_to(&self, name: &str) {
+            self.call("git.branch_switch", json!({"mount_id": MOUNT, "name": name})).await.unwrap();
+        }
+
+        async fn commit_by(&self, message: &str, name: &str, email: &str) -> String {
+            self.call(
+                "git.commit",
+                json!({"mount_id": MOUNT, "message": message, "author_name": name,
+                       "author_email": email}),
+            )
+            .await
+            .unwrap()["commit_sha"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        /// The committer email libgit2 recorded, which `git.show` does not
+        /// expose today.
+        async fn committer_email(&self, sha: &str) -> String {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let c = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            c.committer().email().unwrap_or_default().to_string()
+        }
+
+        /// A commit's parents and tree entry names, read straight from libgit2.
+        async fn commit_shape(&self, sha: &str) -> (Vec<String>, Vec<String>) {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let c = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            let parents: Vec<String> = c.parent_ids().map(|p| p.to_string()).collect();
+            let mut names: Vec<String> = Vec::new();
+            c.tree()
+                .unwrap()
+                .walk(git2::TreeWalkMode::PreOrder, |dir, e| {
+                    if e.kind() == Some(git2::ObjectType::Blob) {
+                        names.push(format!("{dir}{}", e.name().unwrap_or_default()));
+                    }
+                    git2::TreeWalkResult::Ok
+                })
+                .unwrap();
+            names.sort();
+            (parents, names)
+        }
+    }
+
+    /// FX-FORK-CLEAN: `main` at C2 and checked out with the volume matching it,
+    /// `feature` at F2 whose commits do not touch the line C2 changed. F2 is
+    /// authored by Ada, so the author preservation of FR-NEW-235 is visible.
+    async fn seed_cp_clean(e: &Env) -> (String, String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.branch_at("feature", &c1).await;
+        e.write("/g.txt", "g1\n").await;
+        let f1 = e.commit("F1 feature edit").await;
+        e.write("/f.txt", "f1\n").await;
+        let f2 = e.commit_by("F2 feature add", "Ada", "ada@example.test").await;
+        e.switch_to("main").await;
+        (c1, c2, f1, f2)
+    }
+
+    /// FX-FORK conflicting: same shape, but F1 rewrites the very line C2
+    /// rewrote, so picking F1 onto `main` conflicts on `/a.txt`.
+    async fn seed_cp_conflict(e: &Env) -> (String, String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.write("/a.txt", "a1\nMAIN\n").await;
+        let c2 = e.commit("C2 main edit").await;
+
+        e.branch_at("feature", &c1).await;
+        e.write("/a.txt", "a1\nFEAT1\n").await;
+        let f1 = e.commit("F1 feature edit").await;
+        e.write("/f.txt", "f1\n").await;
+        let f2 = e.commit("F2 feature add").await;
+        e.switch_to("main").await;
+        (c1, c2, f1, f2)
+    }
+
+    /// FX-MERGE: `main` at MG merging `side` into M1, plus a branch `other` off
+    /// C1 which is the one checked out. MG's parent 1 is M1.
+    async fn seed_cp_merge(e: &Env) -> (String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.branch_at("side", &c1).await;
+        e.write("/s.txt", "s1\n").await;
+        e.commit("S1 side add").await;
+        e.switch_to("main").await;
+        e.write("/m.txt", "m1\n").await;
+        let m1 = e.commit("M1 main add").await;
+        let merged = e.merge("side").await.unwrap();
+        let mg = merged["merge_commit"].as_str().unwrap().to_string();
+        e.branch_at("other", &c1).await;
+        (c1, mg, m1)
+    }
+
+    /// E2E-NEW-640: FR-NEW-235, a clean pick lands a new commit that keeps the
+    /// author and records the caller as committer.
+    #[tokio::test]
+    async fn e2e_new_640_cherry_pick_applies_one_commit() {
+        let e = Env::new().await;
+        let (_c1, c2, _f1, f2) = seed_cp_clean(&e).await;
+
+        let out = cherry_pick(&e, &f2).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(out["source_sha"], f2.as_str(), "{out}");
+        let new_sha = out["new_sha"].as_str().unwrap().to_string();
+        assert_eq!(new_sha.len(), 40, "{out}");
+        assert_ne!(new_sha, f2);
+        // FR-NEW-199: exactly these three keys, no more.
+        assert_eq!(
+            out.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["status", "new_sha", "source_sha"]
+        );
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(
+            commits.iter().map(|c| c["message"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["F2 feature add", "C2 main edit", "C1 base"]
+        );
+        assert_eq!(commits[0]["author"], "Ada", "{:?}", commits[0]);
+        assert_eq!(commits[0]["author_email"], "ada@example.test", "{:?}", commits[0]);
+        assert_eq!(e.committer_email(&new_sha).await, OWNER);
+
+        let (parents, _names) = e.commit_shape(&new_sha).await;
+        assert_eq!(parents, [c2.as_str()]);
+
+        assert_eq!(e.read_bytes("/f.txt").await, b"f1\n");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-641: FR-NEW-235, only the commit's diff is applied, never its
+    /// whole tree.
+    #[tokio::test]
+    async fn e2e_new_641_cherry_pick_applies_only_the_diff() {
+        let e = Env::new().await;
+        let (_c1, _c2, _f1, f2) = seed_cp_clean(&e).await;
+        e.write("/keep.txt", "keep\n").await;
+        e.commit("C2b add keep").await;
+
+        let out = cherry_pick(&e, &f2).await.unwrap();
+        assert_eq!(out["status"], "committed", "{out}");
+
+        let (_p, names) = e.commit_shape(out["new_sha"].as_str().unwrap()).await;
+        assert_eq!(names, ["a.txt", "f.txt", "keep.txt"]);
+        assert_eq!(e.read_bytes("/keep.txt").await, b"keep\n");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        let err = client.read_bytes("/g.txt").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+    }
+
+    /// E2E-NEW-642: FR-NEW-235, two sequential picks stack.
+    #[tokio::test]
+    async fn e2e_new_642_two_sequential_cherry_picks() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, f2) = seed_cp_clean(&e).await;
+
+        let first = cherry_pick(&e, &f1).await.unwrap();
+        let second = cherry_pick(&e, &f2).await.unwrap();
+        let (p1, p2) = (first["new_sha"].as_str().unwrap(), second["new_sha"].as_str().unwrap());
+        assert_ne!(p1, p2);
+        assert!(![f1.as_str(), f2.as_str()].contains(&p1));
+        assert!(![f1.as_str(), f2.as_str()].contains(&p2));
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(
+            commits.iter().map(|c| c["message"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["F2 feature add", "F1 feature edit", "C2 main edit", "C1 base"]
+        );
+        assert_eq!(e.commit_shape(p2).await.0, [p1]);
+        assert_eq!(e.commit_shape(p1).await.0, [c2.as_str()]);
+        assert_eq!(e.read_bytes("/g.txt").await, b"g1\n");
+        assert_eq!(e.read_bytes("/f.txt").await, b"f1\n");
+    }
+
+    /// E2E-NEW-643: FR-NEW-235, the pick is audited once and charged once.
+    #[tokio::test]
+    async fn e2e_new_643_cherry_pick_audit_and_quota() {
+        let e = Env::new().await;
+        let (_c1, _c2, _f1, f2) = seed_cp_clean(&e).await;
+        let n0 = e.audit().len();
+        let q0 = e.bytes_written();
+
+        cherry_pick(&e, &f2).await.unwrap();
+
+        let all = e.audit();
+        let new = &all[n0..];
+        let picks: Vec<&crate::safety::AuditEntry> =
+            new.iter().filter(|a| a.op == "git.cherry_pick").collect();
+        assert_eq!(picks.len(), 1, "{new:?}");
+        assert!(picks[0].detail.contains(&f2), "{}", picks[0].detail);
+        assert!(!new.iter().any(|a| a.op == "git.commit"), "{new:?}");
+        assert_eq!(e.bytes_written() - q0, 3);
+    }
+
+    /// E2E-NEW-644: FR-NEW-235, the source branch and HEAD are untouched.
+    #[tokio::test]
+    async fn e2e_new_644_cherry_pick_leaves_the_source_branch_alone() {
+        let e = Env::new().await;
+        let (_c1, _c2, _f1, f2) = seed_cp_clean(&e).await;
+        let feature_tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        let before = e.log_commits("feature").await;
+
+        cherry_pick(&e, &f2).await.unwrap();
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(feature_tip.as_str()));
+        assert_eq!(e.log_commits("feature").await, before);
+        let head = e.entry().await.db.get_ref("HEAD").await.unwrap().unwrap();
+        assert!(head.symbolic);
+        assert_eq!(head.target, "refs/heads/main");
+    }
+
+    /// E2E-NEW-645: FR-NEW-238, a conflicting pick applies nothing.
+    #[tokio::test]
+    async fn e2e_new_645_cherry_pick_conflict_applies_nothing() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, _f2) = seed_cp_conflict(&e).await;
+        let volume_before = e.byte_map().await;
+
+        let out = cherry_pick(&e, &f1).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(conflict_paths(&out), ["/a.txt"]);
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::CherryPick);
+        assert_eq!(row.state, "conflicted");
+        assert_eq!(row_todo(&e).await[0]["sha"], f1.as_str());
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+        assert_no_conflict_markers(&e.byte_map().await);
+    }
+
+    /// E2E-NEW-646: FR-NEW-239, continue with a per file side.
+    #[tokio::test]
+    async fn e2e_new_646_cherry_pick_continue_with_a_side() {
+        for (side, expected) in
+            [("ours", b"a1\nMAIN\n".to_vec()), ("theirs", b"a1\nFEAT1\n".to_vec())]
+        {
+            let e = Env::new().await;
+            let (_c1, c2, f1, _f2) = seed_cp_conflict(&e).await;
+            assert_eq!(cherry_pick(&e, &f1).await.unwrap()["status"], "conflict");
+
+            let out = cherry_pick_continue(&e, json!([res("/a.txt", side)])).await.unwrap();
+
+            assert_eq!(out["status"], "committed", "{out}");
+            assert_eq!(out["source_sha"], f1.as_str(), "{out}");
+            let new_sha = out["new_sha"].as_str().unwrap().to_string();
+            assert_ne!(new_sha, f1);
+            assert_eq!(
+                out.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["status", "new_sha", "source_sha"]
+            );
+            assert_eq!(e.read_bytes("/a.txt").await, expected);
+
+            let commits = e.log_commits("main").await;
+            assert_eq!(commits.len(), 3, "{commits:?}");
+            assert_eq!(commits[0]["message"], "F1 feature edit");
+            assert_eq!(e.commit_shape(&new_sha).await.0, [c2.as_str()]);
+            assert_eq!(e.ops().await, 0);
+        }
+    }
+
+    /// E2E-NEW-647: FR-NEW-239, abort restores the tip and every byte exactly.
+    #[tokio::test]
+    async fn e2e_new_647_cherry_pick_abort_restores_exactly() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, _f2) = seed_cp_conflict(&e).await;
+        let volume_before = e.byte_map().await;
+        assert_eq!(cherry_pick(&e, &f1).await.unwrap()["status"], "conflict");
+
+        let out = cherry_pick_abort(&e).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({"status": "aborted", "operation": "cherry_pick", "restored_sha": c2.clone()}),
+            "{out}"
+        );
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        assert_eq!(
+            repo.find_reference("refs/heads/main").unwrap().target().unwrap().to_string(),
+            c2
+        );
+        drop(repo);
+        let after = e.byte_map().await;
+        assert_eq!(after.keys().collect::<Vec<_>>(), volume_before.keys().collect::<Vec<_>>());
+        assert_eq!(after, volume_before);
+        assert_eq!(e.ops().await, 0);
+
+        let err = cherry_pick_abort(&e).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no cherry-pick in progress"), "{}", err.message);
+    }
+
+    /// E2E-NEW-648: FR-NEW-236, a commit already in the branch's history.
+    #[tokio::test]
+    async fn e2e_new_648_cherry_pick_of_an_ancestor_is_already_present() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let q0 = e.bytes_written();
+
+        let out = cherry_pick(&e, &c[1]).await.unwrap();
+
+        assert_eq!(out["status"], "already_present", "{out}");
+        assert_eq!(out["new_sha"], Value::Null, "{out}");
+        assert_eq!(out["source_sha"], c[1].as_str(), "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        let shas = e.log_shas("main").await;
+        assert_eq!(shas.len(), 4);
+        assert_eq!(shas.iter().filter(|s| *s == &c[1]).count(), 1);
+        assert_eq!(e.bytes_written(), q0);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-649: FR-NEW-236, the same change picked twice is reported the
+    /// second time, by content rather than by sha.
+    #[tokio::test]
+    async fn e2e_new_649_an_equivalent_change_is_already_present() {
+        let e = Env::new().await;
+        let (_c1, _c2, _f1, f2) = seed_cp_clean(&e).await;
+        let first = cherry_pick(&e, &f2).await.unwrap();
+        let p1 = first["new_sha"].as_str().unwrap().to_string();
+
+        let out = cherry_pick(&e, &f2).await.unwrap();
+
+        assert_eq!(out["status"], "already_present", "{out}");
+        assert_eq!(out["new_sha"], Value::Null, "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(p1.as_str()));
+        assert_eq!(e.log_commits("main").await.len(), 3);
+    }
+
+    /// E2E-NEW-650: FR-NEW-240, a merge commit needs a mainline.
+    #[tokio::test]
+    async fn e2e_new_650_cherry_pick_of_a_merge_commit_needs_a_mainline() {
+        let e = Env::new().await;
+        let (c1, mg, _m1) = seed_cp_merge(&e).await;
+        let q0 = e.bytes_written();
+
+        let err = cherry_pick(&e, &mg).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("merge commit"), "{}", err.message);
+        assert!(err.message.contains("2 parents"), "{}", err.message);
+        assert!(err.message.contains("mainline"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/other").await.as_deref(), Some(c1.as_str()));
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.bytes_written(), q0);
+    }
+
+    /// E2E-NEW-651: FR-NEW-235, a commit whose tree equals its parent's.
+    #[tokio::test]
+    async fn e2e_new_651_cherry_pick_of_an_empty_commit_changes_nothing() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.branch_at("feature", &c1).await;
+        let e1 = e.commit("E1 empty").await;
+        e.switch_to("main").await;
+
+        let out = cherry_pick(&e, &e1).await.unwrap();
+
+        assert_eq!(out["status"], "already_present", "{out}");
+        assert_eq!(out["new_sha"], Value::Null, "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c1.as_str()));
+        assert_eq!(e.log_commits("main").await.len(), 1);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-652: FR-NEW-237, a well formed sha that names nothing.
+    #[tokio::test]
+    async fn e2e_new_652_cherry_pick_of_an_unknown_sha_is_not_found() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let (q0, n0) = (e.bytes_written(), e.audit().len());
+        let zero = "0".repeat(40);
+
+        let err = cherry_pick(&e, &zero).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains(&zero), "{}", err.message);
+        assert!(err.message.contains("not found"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.bytes_written(), q0);
+        assert_eq!(e.audit().len(), n0);
+    }
+
+    /// E2E-NEW-653: FR-NEW-237, a value that is not a sha at all.
+    #[tokio::test]
+    async fn e2e_new_653_cherry_pick_of_a_malformed_sha_is_an_argument_error() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+
+        for raw in ["zzzz", "", "HEAD~1"] {
+            let err = cherry_pick(&e, raw).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{raw}: {err:?}");
+            assert!(err.message.contains("commit_sha"), "{raw}: {}", err.message);
+            assert!(
+                err.message.contains("full or abbreviated commit sha"),
+                "{raw}: {}",
+                err.message
+            );
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-654: FR-NEW-235, `commit_sha` is required.
+    #[tokio::test]
+    async fn e2e_new_654_cherry_pick_without_a_commit_sha_is_rejected() {
+        let e = Env::new().await;
+        seed_line(&e).await;
+
+        let err = cherry_pick_args(&e, json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("commit_sha"), "{}", err.message);
+    }
+
+    /// E2E-NEW-655: FR-NEW-239/224/225, continue with nothing in progress, and
+    /// with the WRONG thing in progress.
+    #[tokio::test]
+    async fn e2e_new_655_cherry_pick_continue_needs_a_paused_cherry_pick() {
+        let e = Env::new().await;
+        seed_line(&e).await;
+
+        let err = cherry_pick_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no cherry-pick in progress"), "{}", err.message);
+
+        // A paused REBASE does not answer the cherry-pick channel.
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        assert_eq!(
+            rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap()["status"],
+            "conflict"
+        );
+        let err = cherry_pick_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no cherry-pick in progress"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Rebase);
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-656: FR-NEW-239/224/225, abort with nothing in progress.
+    #[tokio::test]
+    async fn e2e_new_656_cherry_pick_abort_needs_a_paused_cherry_pick() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+
+        let err = cherry_pick_abort(&e).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no cherry-pick in progress"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-657: FR-NEW-235, an empty repository and an unborn HEAD.
+    #[tokio::test]
+    async fn e2e_new_657_cherry_pick_on_a_repository_with_no_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let sha = "1".repeat(40);
+
+        let err = cherry_pick(&e, &sha).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("not found"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await, None);
+
+        // Objects exist, but HEAD names a branch that has no commit yet.
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        e.checkout("unborn").await;
+        let err = cherry_pick(&e, &c[1]).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no commit on the current branch"), "{}", err.message);
+    }
+
+    /// E2E-NEW-658 (carried from US-003): FR-NEW-185, an over-quota pick writes
+    /// nothing and creates no commit.
+    #[tokio::test]
+    async fn e2e_new_658_cherry_pick_refused_by_the_write_quota() {
+        // The fixture's own cost is measured on a probe volume, so the real
+        // one can be built with exactly one byte of room left while the pick
+        // must write three.
+        let probe = Env::new().await;
+        seed_cp_clean(&probe).await;
+        let quota = probe.bytes_written() + 1;
+
+        let e = Env::with_quota(quota).await;
+        let (_c1, c2, _f1, f2) = seed_cp_clean(&e).await;
+        let q0 = e.bytes_written();
+        assert_eq!(q0, quota - 1);
+
+        let err = cherry_pick(&e, &f2).await.unwrap_err();
+
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED, "{err:?}");
+        assert_eq!(err.message, format!("session write quota of {quota} bytes exceeded"));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        assert!(client.read_bytes("/f.txt").await.is_err());
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+        assert_eq!(e.bytes_written(), q0);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-533: FR-NEW-279, a paused merge blocks `git.cherry_pick`.
+    #[tokio::test]
+    async fn e2e_new_533_cherry_pick_is_blocked_by_a_paused_merge() {
+        let e = Env::new().await;
+        let (c1, _c2, _c3) = seed_conflict(&e).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+        let tip = e.ref_sha("refs/heads/main").await.unwrap();
+
+        let err = cherry_pick(&e, &c1).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("merge"), "{}", err.message);
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(tip.as_str()));
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Merge);
+    }
+
+    /// E2E-NEW-559: FR-NEW-172, no conflict marker ever reaches the volume,
+    /// whichever operation paused.
+    #[tokio::test]
+    async fn e2e_new_559_no_conflict_markers_after_any_paused_operation() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "rebase", "{out}");
+        assert_no_conflict_markers(&e.byte_map().await);
+        rebase_abort(&e).await.unwrap();
+
+        let e = Env::new().await;
+        let (_c1, _c2, f1, _f2) = seed_cp_conflict(&e).await;
+        let out = cherry_pick(&e, &f1).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "cherry_pick", "{out}");
+        assert_no_conflict_markers(&e.byte_map().await);
+        cherry_pick_abort(&e).await.unwrap();
+
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "stash_pop", "{out}");
+        assert_no_conflict_markers(&e.byte_map().await);
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-698: FR-NEW-283, a paused rebase blocks a cherry-pick and a
+    /// revert alike. The `git.reset` leg lands with the story that adds it.
+    #[tokio::test]
+    async fn e2e_new_698_rebase_and_cherry_pick_are_mutually_exclusive() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        let tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        let volume_before = e.byte_map().await;
+        let step_before = e.op_row().await.unwrap().current_step;
+
+        let err = cherry_pick(&e, &f2).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_abort"), "{}", err.message);
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.op_row().await.unwrap().current_step, step_before);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(tip.as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+
+        // US-019: the revert leg, refused by the very same guard.
+        let err =
+            e.call("git.revert", json!({"mount_id": MOUNT, "commit_sha": &f1})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("in progress"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_abort"), "{}", err.message);
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.op_row().await.unwrap().current_step, step_before);
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(tip.as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-858: FR-NEW-238/275, the paused cherry-pick row and response.
+    #[tokio::test]
+    async fn e2e_new_858_the_cherry_pick_row_is_typed_and_single_stepped() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, _f2) = seed_cp_conflict(&e).await;
+
+        let out = cherry_pick(&e, &f1).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "cherry_pick", "{out}");
+        assert_eq!(out["continue_with"], "git.cherry_pick_continue", "{out}");
+        assert_eq!(out["abort_with"], "git.cherry_pick_abort", "{out}");
+        // FR-NEW-187: a single step operation reports null, not 0 of 1.
+        assert_eq!(out["current_step"], Value::Null, "{out}");
+        assert_eq!(out["total_steps"], Value::Null, "{out}");
+        assert_eq!(out["source_ref"], f1.as_str(), "{out}");
+
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::CherryPick);
+        assert_eq!(row.state, "conflicted");
+        assert_eq!(row.original_tip_sha.as_deref(), Some(c2.as_str()));
+        assert_eq!(row.source_ref.as_deref(), Some(f1.as_str()));
+        assert_eq!(row_conflicts(&e).await, ["/a.txt"]);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nMAIN\n");
+
+        cherry_pick_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-859: FR-NEW-238/180, a delete against a modify surfaces a null
+    /// side and resolves to a delete.
+    #[tokio::test]
+    async fn e2e_new_859_a_cherry_pick_delete_modify_conflict_surfaces_a_null_side() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/lib/util.rs", "pub fn a() {}\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.branch_at("side", &c1).await;
+        e.delete("/lib/util.rs").await;
+        let s1 = e.commit("S1 delete").await;
+        e.switch_to("main").await;
+        e.write("/lib/util.rs", "pub fn a() { 1 }\n").await;
+        let c2 = e.commit("C2 rewrite").await;
+
+        let out = cherry_pick(&e, &s1).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        let c = &out["conflicts"][0];
+        assert_eq!(c["path"], "/lib/util.rs", "{out}");
+        assert_eq!(c["theirs"]["exists"], false, "{out}");
+        assert_eq!(c["ours"]["exists"], true, "{out}");
+        assert_eq!(c["ours"]["content"], "pub fn a() { 1 }\n", "{out}");
+        assert_eq!(c["base"]["exists"], true, "{out}");
+        assert_eq!(c["base"]["content"], "pub fn a() {}\n", "{out}");
+
+        let done = cherry_pick_continue(&e, json!([res("/lib/util.rs", "theirs")])).await.unwrap();
+        assert_eq!(done["status"], "committed", "{done}");
+        let new_sha = done["new_sha"].as_str().unwrap().to_string();
+        assert_ne!(new_sha, s1);
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        let err = client.read_bytes("/lib/util.rs").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        let (parents, names) = e.commit_shape(&new_sha).await;
+        assert_eq!(parents, [c2.as_str()]);
+        assert!(!names.iter().any(|n| n == "lib/util.rs"), "{names:?}");
+    }
+
+    /// E2E-NEW-861: FR-NEW-240/235, `mainline:1` picks the merge's change
+    /// relative to its first parent.
+    #[tokio::test]
+    async fn e2e_new_861_mainline_one_picks_the_change_against_the_first_parent() {
+        let e = Env::new().await;
+        let (c1, mg, _m1) = seed_cp_merge(&e).await;
+
+        let out = cherry_pick_args(&e, json!({"mount_id": MOUNT, "commit_sha": mg, "mainline": 1}))
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(out["source_sha"], mg.as_str(), "{out}");
+        let new_sha = out["new_sha"].as_str().unwrap().to_string();
+        assert_ne!(new_sha, mg);
+        assert_eq!(e.read_bytes("/s.txt").await, b"s1\n");
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        assert!(client.read_bytes("/m.txt").await.is_err());
+        assert_eq!(e.commit_shape(&new_sha).await.0, [c1.as_str()]);
+    }
+
+    /// E2E-NEW-875: FR-NEW-281/238, `git.status` names the cherry-pick tools.
+    #[tokio::test]
+    async fn e2e_new_875_status_names_the_cherry_pick_tools() {
+        let e = Env::new().await;
+        let (_c1, c2, f1, _f2) = seed_cp_conflict(&e).await;
+        assert_eq!(cherry_pick(&e, &f1).await.unwrap()["status"], "conflict");
+
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+
+        assert_eq!(
+            status["operation"],
+            json!({
+                "op_type": "cherry_pick",
+                "source_ref": f1.clone(),
+                "current_step": Value::Null,
+                "total_steps": Value::Null,
+                "remaining_conflicts": ["/a.txt"],
+                "continue_with": "git.cherry_pick_continue",
+                "abort_with": "git.cherry_pick_abort",
+            }),
+            "{status}"
+        );
+        let rendered = status.to_string();
+        assert!(!rendered.contains("git.merge_resolve"), "{rendered}");
+        assert!(!rendered.contains("git.rebase_continue"), "{rendered}");
+
+        cherry_pick_abort(&e).await.unwrap();
+        let after = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert!(after.get("operation").is_none(), "{after}");
+        assert_eq!(after["head"].as_str(), Some(c2.as_str()), "{after}");
+    }
+
+    /// E2E-NEW-918: FR-NEW-236, an `already_present` pick changes nothing
+    /// observable.
+    #[tokio::test]
+    async fn e2e_new_918_an_already_present_cherry_pick_changes_nothing() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let before_audit = e.audit().len();
+        let before_bytes = e.bytes_written();
+        let before_objects = e.objects().await;
+        let before_log = e.log_commits("main").await;
+
+        let out = cherry_pick(&e, &c[1]).await.unwrap();
+
+        assert_eq!(out["status"], "already_present", "{out}");
+        assert_eq!(out["new_sha"], Value::Null, "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.log_commits("main").await, before_log);
+        assert_eq!(e.objects().await, before_objects);
+        assert_eq!(e.bytes_written(), before_bytes);
+        let added = &e.audit()[before_audit..];
+        assert!(added.len() <= 1, "{added:?}");
+        assert!(added.iter().all(|a| a.detail.contains("already_present")), "{added:?}");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-919: FR-NEW-237, a sha that exists but names another kind of
+    /// object.
+    #[tokio::test]
+    async fn e2e_new_919_a_sha_naming_a_non_commit_object_is_not_a_commit() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let (tree_sha, blob_sha) = {
+            let entry = e.entry().await;
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let commit = repo.find_commit(parse_oid(&c[3]).unwrap()).unwrap();
+            let tree = commit.tree().unwrap();
+            let blob = tree.get_name("a.txt").unwrap().id().to_string();
+            (tree.id().to_string(), blob)
+        };
+        assert!(e.entry().await.db.get_object(&blob_sha).await.unwrap().is_some());
+
+        for sha in [&blob_sha, &tree_sha] {
+            let err = cherry_pick(&e, sha).await.unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{sha}: {err:?}");
+            assert!(err.message.contains(sha), "{}", err.message);
+            assert!(err.message.contains("not a commit"), "{}", err.message);
+        }
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert!(e.entry().await.db.get_object(&blob_sha).await.unwrap().is_some());
+    }
+
+    // ── US-017: git.reset soft, pointer only ────────────────────────────
+
+    async fn reset(e: &Env, args: Value) -> Result<Value> {
+        let mut args = args;
+        args["mount_id"] = json!(MOUNT);
+        e.call("git.reset", args).await
+    }
+
+    impl Env {
+        /// The ref as the BARE REPOSITORY holds it, not as the index holds it:
+        /// E2E-NEW-660 asserts both copies moved together.
+        async fn on_disk_ref(&self, name: &str) -> Option<String> {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            repo.find_reference(name).ok().and_then(|r| r.target()).map(|o| o.to_string())
+        }
+
+        async fn read_bytes_result(&self, path: &str) -> Result<Vec<u8>> {
+            let client = self.f.state.stores.client(MOUNT).await.unwrap();
+            client.read_bytes(path).await
+        }
+
+        async fn parent_of(&self, sha: &str) -> Option<String> {
+            let entry = self.entry().await;
+            let repo = entry.repo.lock().await;
+            let commit = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
+            commit.parent_id(0).ok().map(|o| o.to_string())
+        }
+    }
+
+    /// E2E-NEW-660: FR-NEW-250, a soft reset backwards moves the pointer and
+    /// leaves every byte of the volume alone.
+    #[tokio::test]
+    async fn e2e_new_660_reset_soft_to_c2() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let volume_before = e.byte_map().await;
+        let bytes_before = e.bytes_written();
+
+        let out = reset(&e, json!({"target_ref": &c[1], "mode": "soft"})).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({"mode": "soft", "old_sha": c[3], "new_sha": c[1], "files_changed": 0})
+        );
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[1].as_str()));
+        assert_eq!(e.on_disk_ref("refs/heads/main").await.as_deref(), Some(c[1].as_str()));
+        assert_eq!(e.log_messages("main").await, ["C2", "C1"]);
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.bytes_written(), bytes_before);
+    }
+
+    /// E2E-NEW-664: FR-NEW-250, a soft reset on a dirty volume keeps the dirt,
+    /// and the next commit records exactly that state on the new parent.
+    #[tokio::test]
+    async fn e2e_new_664_reset_soft_on_a_dirty_volume_keeps_the_dirt() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        e.write("/a.txt", "DIRTY\n").await;
+        e.write("/new.txt", "n\n").await;
+
+        reset(&e, json!({"target_ref": &c[1], "mode": "soft"})).await.unwrap();
+
+        assert_eq!(e.read_bytes("/a.txt").await, b"DIRTY\n");
+        assert_eq!(e.read_bytes("/new.txt").await, b"n\n");
+        // C4 is unreachable now, yet the file it added is still in the volume.
+        assert_eq!(e.read_bytes("/d.txt").await, b"v3\n");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[1].as_str()));
+
+        let after = e.commit("after soft reset").await;
+        assert_eq!(e.parent_of(&after).await.as_deref(), Some(c[1].as_str()));
+        assert_eq!(e.tree_names(&after).await, ["a.txt", "b.txt", "c.txt", "d.txt", "new.txt"]);
+        assert_eq!(e.read_bytes("/a.txt").await, b"DIRTY\n");
+    }
+
+    /// E2E-NEW-665: FR-NEW-254, resetting to the current tip changes nothing,
+    /// in either mode.
+    #[tokio::test]
+    async fn e2e_new_665_reset_to_the_current_tip_is_a_no_op_in_both_modes() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let volume_before = e.byte_map().await;
+        let log_before = e.log_commits("main").await;
+        let bytes_before = e.bytes_written();
+        let objects_before = e.objects().await;
+
+        for args in [
+            json!({"target_ref": &c[3], "mode": "soft"}),
+            json!({"target_ref": "main", "mode": "hard"}),
+        ] {
+            let out = reset(&e, args.clone()).await.unwrap();
+            assert_eq!(out["old_sha"], json!(c[3]), "{out}");
+            assert_eq!(out["new_sha"], json!(c[3]), "{out}");
+            assert_eq!(out["files_changed"], 0, "{out}");
+            assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+            assert_eq!(e.log_commits("main").await, log_before);
+            assert_eq!(e.byte_map().await, volume_before);
+            assert_eq!(e.objects().await, objects_before);
+            assert_eq!(e.bytes_written(), bytes_before, "{args} charged bytes");
+        }
+    }
+
+    /// E2E-NEW-669: FR-NEW-253, an unknown target leaves the ref and the
+    /// volume untouched.
+    #[tokio::test]
+    async fn e2e_new_669_reset_failure_unknown_target_ref() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let volume_before = e.byte_map().await;
+        let bytes_before = e.bytes_written();
+
+        for target in ["nope", &"0".repeat(40)] {
+            let err = reset(&e, json!({"target_ref": target, "mode": "hard"})).await.unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{target}: {err:?}");
+            assert!(err.message.contains(target), "{}", err.message);
+            assert!(err.message.contains("not found"), "{}", err.message);
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.bytes_written(), bytes_before);
+    }
+
+    /// E2E-NEW-670: FR-NEW-252, mode is required and closed, and so is
+    /// target_ref.
+    #[tokio::test]
+    async fn e2e_new_670_reset_failure_missing_mode() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let volume_before = e.byte_map().await;
+
+        let err = reset(&e, json!({"target_ref": &c[1]})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("mode"), "{}", err.message);
+
+        let err = reset(&e, json!({"mode": "hard"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("target_ref"), "{}", err.message);
+
+        // DEC-905: there is no mixed mode, and the refusal names the two that
+        // do exist rather than leaving the caller to guess.
+        let err = reset(&e, json!({"target_ref": &c[1], "mode": "mixed"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["mode", "soft", "hard"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+    }
+
+    /// E2E-NEW-863: FR-NEW-253, a deleted branch name resolves to nothing even
+    /// though the commit it pointed at is still there under its sha.
+    #[tokio::test]
+    async fn e2e_new_863_a_branch_name_that_existed_and_was_deleted() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        e.call(
+            "git.branch_create",
+            json!({"mount_id": MOUNT, "name": "tmp/old", "start_point": &c[1]}),
+        )
+        .await
+        .unwrap();
+        branch_delete(&e, json!({"name": "tmp/old"})).await.unwrap();
+
+        let err = reset(&e, json!({"target_ref": "tmp/old", "mode": "soft"})).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("tmp/old"), "{}", err.message);
+
+        let out = reset(&e, json!({"target_ref": &c[1], "mode": "soft"})).await.unwrap();
+        assert_eq!(out["old_sha"], json!(c[3]), "{out}");
+        assert_eq!(out["new_sha"], json!(c[1]), "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[1].as_str()));
+    }
+
+    /// E2E-NEW-864: FR-NEW-254, the no-op reset reports equal shas, charges
+    /// nothing and says so in the audit.
+    #[tokio::test]
+    async fn e2e_new_864_the_no_op_reset_reports_equal_shas_and_charges_nothing() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        let before_audit = e.audit().len();
+        let before_bytes = e.bytes_written();
+
+        let out = reset(&e, json!({"target_ref": "main", "mode": "hard"})).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({"mode": "hard", "old_sha": c[3], "new_sha": c[3], "files_changed": 0})
+        );
+        assert_eq!(e.bytes_written(), before_bytes);
+        let added = &e.audit()[before_audit..];
+        assert!(added.len() <= 1, "{added:?}");
+        assert!(added.iter().all(|a| a.detail.contains("no-op")), "{added:?}");
+        assert!(added.iter().all(|a| !a.detail.contains(".txt")), "{added:?}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+    }
+
+    /// E2E-NEW-920: FR-NEW-250, a soft reset FORWARD leaves the volume behind,
+    /// which is what makes the volume dirty against the new HEAD.
+    ///
+    /// The precondition uses `git.branch_reset`, which is the tool that already
+    /// force-moves the checked-out branch and rewrites the volume; `git.reset`
+    /// mode `hard` is US-018.
+    #[tokio::test]
+    async fn e2e_new_920_a_soft_reset_forward_leaves_the_volume_behind() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        branch_reset(&e, json!({"name": "main", "target_commit": &c[1], "force": true}))
+            .await
+            .unwrap();
+        let volume_before = e.byte_map().await;
+        assert!(!volume_before.contains_key("/d.txt"), "{volume_before:?}");
+        let bytes_before = e.bytes_written();
+
+        let out = reset(&e, json!({"target_ref": &c[3], "mode": "soft"})).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({"mode": "soft", "old_sha": c[1], "new_sha": c[3], "files_changed": 0})
+        );
+        assert_eq!(e.read_bytes("/a.txt").await, b"v0\n");
+        let err = e.read_bytes_result("/d.txt").await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        // The volume is byte identical to what it was before the reset, while
+        // HEAD now names a commit whose tree it does not match: that is the
+        // dirt the reset created.
+        assert_eq!(e.byte_map().await, volume_before);
+        let status = e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(status["head"].as_str(), Some(c[3].as_str()), "{status}");
+        assert_eq!(e.bytes_written(), bytes_before);
+    }
+
+    /// E2E-NEW-534: FR-NEW-279, a reset cannot slip into a paused merge.
+    #[tokio::test]
+    async fn e2e_new_534_git_reset_blocked_while_an_operation_is_in_progress() {
+        let e = Env::new().await;
+        let (c0, _f1, c2) = seed_conflict(&e).await;
+        e.merge("feature").await.unwrap();
+        let volume_before = e.byte_map().await;
+
+        let err = reset(&e, json!({"target_ref": &c0, "mode": "soft"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["merge", "in progress"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c2.as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        e.abort().await.unwrap();
+    }
+
+    /// E2E-NEW-440: `git.branch_reset` racing a commit on the same branch ends
+    /// on one of the two tips, never on a third interleaved value, because
+    /// both hold `entry.write_lock` for their whole body.
+    #[tokio::test]
+    async fn e2e_new_440_reset_races_a_commit_on_the_same_branch() {
+        let e = Env::new().await;
+        let (c1, _c2) = seed_a(&e).await;
+        e.write("/new.txt", "n\n").await;
+
+        let (reset_out, commit_out) = tokio::join!(
+            branch_reset(&e, json!({"name": "main", "target_commit": &c1, "force": true})),
+            e.call("git.commit", json!({"mount_id": MOUNT, "message": "c3"})),
+        );
+        if let Err(err) = &reset_out {
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert!(err.message.contains("uncommitted changes"), "{}", err.message);
+        }
+        let committed = commit_out.unwrap()["commit_sha"].as_str().unwrap().to_string();
+
+        let tip = e.ref_sha("refs/heads/main").await.unwrap();
+        assert!(tip == c1 || tip == committed, "interleaved tip {tip}");
+        assert_eq!(e.log_shas("main").await.first(), Some(&tip));
+    }
+
+    // ── US-018: git.reset hard, volume rewrite and orphaning ────────────
+
+    /// FX-LINE as this story defines it: four linear commits on `main` whose
+    /// bytes are pinned, because every assertion below is byte exact.
+    /// C1 `/a.txt`="a1\n", C2 adds `/b.txt`="b1\n", C3 rewrites `/a.txt` to
+    /// "a1\na3\n", C4 adds `/d.txt`="d1\n".
+    async fn seed_fx_line(e: &Env) -> Vec<String> {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let mut c = Vec::new();
+        e.write("/a.txt", "a1\n").await;
+        c.push(e.commit("C1 base").await);
+        e.write("/b.txt", "b1\n").await;
+        c.push(e.commit("C2 add b").await);
+        e.write("/a.txt", "a1\na3\n").await;
+        c.push(e.commit("C3 edit a").await);
+        e.write("/d.txt", "d1\n").await;
+        c.push(e.commit("C4 add d").await);
+        c
+    }
+
+    /// Every file path the volume holds, sorted.
+    async fn volume_paths(e: &Env) -> Vec<String> {
+        e.byte_map().await.into_keys().collect()
+    }
+
+    async fn object_exists(e: &Env, sha: &str) -> bool {
+        e.entry().await.db.object_exists(sha).await.unwrap()
+    }
+
+    /// Every commit sha reachable from any non symbolic ref: what "orphaned"
+    /// is asserted against.
+    async fn reachable_shas(e: &Env) -> Vec<String> {
+        let refs = e.entry().await.db.list_refs().await.unwrap();
+        let mut out = Vec::new();
+        for r in refs.into_iter().filter(|r| !r.symbolic) {
+            out.extend(e.log_shas(&r.name).await);
+        }
+        out
+    }
+
+    async fn show(e: &Env, sha: &str) -> Result<Value> {
+        e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": sha})).await
+    }
+
+    /// E2E-NEW-609: FR-NEW-210/FR-NEW-255, a rebase leaves the ORIGINAL
+    /// commits unreachable, and leaves their objects perfectly readable.
+    #[tokio::test]
+    async fn e2e_new_609_rebase_originals_are_unreachable_but_retained() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        let reachable = reachable_shas(&e).await;
+        assert!(!reachable.contains(&f1), "{f1} still reachable: {reachable:?}");
+        assert!(!reachable.contains(&f2), "{f2} still reachable: {reachable:?}");
+        assert!(object_exists(&e, &f1).await, "{f1} was pruned");
+        assert!(object_exists(&e, &f2).await, "{f2} was pruned");
+        let out = show(&e, &f1).await.unwrap();
+        assert_eq!(out["commit"]["message"], json!("F1 feature edit"), "{out}");
+    }
+
+    /// E2E-NEW-661: FR-NEW-251, the pointer moves and the volume becomes the
+    /// target tree exactly.
+    #[tokio::test]
+    async fn e2e_new_661_reset_hard_to_c2() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+
+        let out = reset(&e, json!({"target_ref": &c[1], "mode": "hard"})).await.unwrap();
+
+        assert_eq!(out["mode"], json!("hard"), "{out}");
+        assert_eq!(out["old_sha"], json!(c[3]), "{out}");
+        assert_eq!(out["new_sha"], json!(c[1]), "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[1].as_str()));
+        assert_eq!(e.log_messages("main").await, ["C2 add b", "C1 base"]);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+        assert_eq!(e.read_bytes("/b.txt").await, b"b1\n");
+        assert_eq!(e.read_bytes_result("/d.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(volume_paths(&e).await, ["/a.txt", "/b.txt"]);
+    }
+
+    /// E2E-NEW-662: FR-NEW-251, files and whole directories added after the
+    /// target are removed, nested ones included.
+    #[tokio::test]
+    async fn e2e_new_662_reset_hard_deletes_files_added_after_the_target() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        e.write("/e.txt", "e1\n").await;
+        e.write("/sub/deep.txt", "deep\n").await;
+        e.commit("C5 add e").await;
+
+        let out = reset(&e, json!({"target_ref": &c[3], "mode": "hard"})).await.unwrap();
+        assert_eq!(out["new_sha"], json!(c[3]), "{out}");
+
+        assert_eq!(e.read_bytes_result("/e.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes_result("/sub/deep.txt").await.unwrap_err().code, code::NOT_FOUND);
+        // The shared apply deletes files, never directory nodes, exactly as
+        // every other volume rewrite in this file does (a merge that drops a
+        // whole directory leaves the same empty node, E2E-NEW-839). What the
+        // reset owes is that no FILE of `/sub` survives.
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        for (dir, _subdirs, files) in client.walk("/").await.unwrap() {
+            if dir.starts_with("/sub") {
+                assert!(files.is_empty(), "{dir}: {files:?}");
+            }
+        }
+        assert_eq!(volume_paths(&e).await, ["/a.txt", "/b.txt", "/d.txt"]);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\na3\n");
+        assert_eq!(e.read_bytes("/b.txt").await, b"b1\n");
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+    }
+
+    /// E2E-NEW-663: FR-NEW-251, a hard reset discards uncommitted work by
+    /// design, the modified file and the brand new one alike.
+    #[tokio::test]
+    async fn e2e_new_663_reset_hard_on_a_dirty_volume() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        e.write("/a.txt", "DIRTY\n").await;
+        e.write("/new.txt", "n\n").await;
+
+        reset(&e, json!({"target_ref": &c[1], "mode": "hard"})).await.unwrap();
+
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+        assert_eq!(e.read_bytes_result("/new.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(volume_paths(&e).await, ["/a.txt", "/b.txt"]);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[1].as_str()));
+    }
+
+    /// E2E-NEW-666: FR-NEW-255, the commits a hard reset left behind are
+    /// orphaned, never pruned, and stay fully readable.
+    #[tokio::test]
+    async fn e2e_new_666_reset_orphaned_commits_survive_as_objects() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+
+        reset(&e, json!({"target_ref": &c[1], "mode": "hard"})).await.unwrap();
+
+        assert!(object_exists(&e, &c[2]).await);
+        assert!(object_exists(&e, &c[3]).await);
+        let out = show(&e, &c[3]).await.unwrap();
+        assert_eq!(out["commit"]["message"], json!("C4 add d"), "{out}");
+        let reachable = reachable_shas(&e).await;
+        assert!(!reachable.contains(&c[2]), "{reachable:?}");
+        assert!(!reachable.contains(&c[3]), "{reachable:?}");
+
+        e.call(
+            "git.checkout_file",
+            json!({"mount_id": MOUNT, "commit_sha": &c[3], "path": "/d.txt"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+    }
+
+    /// E2E-NEW-667: FR-NEW-251, every form a target can take resolves to the
+    /// same commit: bare branch name, full ref path, tag, abbreviated sha.
+    #[tokio::test]
+    async fn e2e_new_667_reset_target_ref_forms() {
+        for form in ["old", "refs/heads/old", "v1", "short"] {
+            let e = Env::new().await;
+            let c = seed_fx_line(&e).await;
+            let db = e.entry().await.db.clone();
+            db.set_ref("refs/heads/old", &c[1], false).await.unwrap();
+            db.set_ref("refs/tags/v1", &c[1], false).await.unwrap();
+            let target = if form == "short" { c[1][..8].to_string() } else { form.to_string() };
+
+            reset(&e, json!({"target_ref": target, "mode": "hard"})).await.unwrap();
+
+            assert_eq!(
+                e.ref_sha("refs/heads/main").await.as_deref(),
+                Some(c[1].as_str()),
+                "form {form}"
+            );
+            assert_eq!(volume_paths(&e).await, ["/a.txt", "/b.txt"], "form {form}");
+        }
+
+        // HEAD names the current tip, so it is the no-op of E2E-NEW-665.
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let out = reset(&e, json!({"target_ref": "HEAD", "mode": "hard"})).await.unwrap();
+        assert_eq!(
+            out,
+            json!({"mode": "hard", "old_sha": c[3], "new_sha": c[3], "files_changed": 0})
+        );
+    }
+
+    /// E2E-NEW-668: FR-NEW-251, the hard reset is audited under its own tool
+    /// name and charges exactly the bytes it wrote.
+    ///
+    /// The rewrite is the tree-to-tree delta `git.branch_reset` already uses,
+    /// so a file whose bytes already match the target is not rewritten: only
+    /// `/a.txt` (3 bytes) moves here, `/b.txt` is untouched and `/d.txt` is a
+    /// deletion, which is never charged.
+    #[tokio::test]
+    async fn e2e_new_668_reset_side_effect_audit_and_quota_for_hard() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let n0 = e.audit().len();
+        let q0 = e.bytes_written();
+
+        reset(&e, json!({"target_ref": &c[1], "mode": "hard"})).await.unwrap();
+
+        let added = e.audit()[n0..].to_vec();
+        let hard = added
+            .iter()
+            .find(|a| a.op == "git.reset")
+            .unwrap_or_else(|| panic!("no git.reset audit entry in {added:?}"));
+        assert!(hard.detail.contains("hard"), "{}", hard.detail);
+        assert!(hard.detail.contains(&c[1]), "{}", hard.detail);
+        assert_eq!(e.bytes_written() - q0, 3, "only /a.txt is rewritten");
+
+        let n1 = e.audit().len();
+        let q1 = e.bytes_written();
+        reset(&e, json!({"target_ref": &c[0], "mode": "soft"})).await.unwrap();
+        let soft = e.audit()[n1..]
+            .iter()
+            .find(|a| a.op == "git.reset")
+            .cloned()
+            .expect("a soft audit entry");
+        assert!(soft.detail.contains("soft"), "{}", soft.detail);
+        assert_eq!(e.bytes_written(), q1);
+    }
+
+    /// E2E-NEW-671: FR-NEW-252, `mixed` is refused by name, and nothing moves.
+    #[tokio::test]
+    async fn e2e_new_671_reset_failure_mixed_is_rejected() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let volume_before = e.byte_map().await;
+        let bytes_before = e.bytes_written();
+
+        let err = reset(&e, json!({"target_ref": &c[1], "mode": "mixed"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["mixed", "soft", "hard"] {
+            assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.bytes_written(), bytes_before);
+
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+        let schema = r.resolve("git.reset").unwrap().schema.input_schema();
+        let mode = schema["properties"]["mode"]["description"].as_str().unwrap();
+        assert!(mode.contains("soft") && mode.contains("hard"), "{mode}");
+        assert!(!mode.contains("mixed"), "{mode}");
+    }
+
+    /// E2E-NEW-672: FR-NEW-252, the mode is matched exactly: no case folding
+    /// and no trimming.
+    #[tokio::test]
+    async fn e2e_new_672_reset_failure_case_sensitive_mode() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+
+        for mode in ["HARD", "Soft", "", "hard "] {
+            let err = reset(&e, json!({"target_ref": &c[1], "mode": mode})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "mode {mode:?}: {err:?}");
+            for needle in ["soft", "hard"] {
+                assert!(err.message.contains(needle), "{needle} missing from {}", err.message);
+            }
+            assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        }
+    }
+
+    /// E2E-NEW-673: FR-NEW-251/FR-NEW-185, the quota is checked before the ref
+    /// moves, so a refusal leaves both the pointer and every byte in place.
+    #[tokio::test]
+    async fn e2e_new_673_reset_hard_blocked_by_quota_leaves_everything_in_place() {
+        let probe = Env::new().await;
+        seed_fx_line(&probe).await;
+        let quota = probe.bytes_written() + 1;
+
+        let e = Env::with_quota(quota).await;
+        let c = seed_fx_line(&e).await;
+        let volume_before = e.byte_map().await;
+        let q0 = e.bytes_written();
+        assert_eq!(q0, quota - 1);
+
+        let err = reset(&e, json!({"target_ref": &c[1], "mode": "hard"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED, "{err:?}");
+        assert_eq!(err.message, format!("session write quota of {quota} bytes exceeded"));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, volume_before);
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+        assert_eq!(e.bytes_written(), q0);
+    }
+
+    /// E2E-NEW-862: FR-NEW-253/FR-NEW-251, an unknown target is refused before
+    /// anything is discarded, which matters precisely because a hard reset
+    /// discards on purpose.
+    #[tokio::test]
+    async fn e2e_new_862_the_refused_hard_reset_leaves_the_dirty_volume_alone() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        e.write("/a.txt", "a1\na3\nLOCAL\n").await;
+        let before_audit = e.audit();
+        let before_bytes = e.bytes_written();
+
+        let err = reset(&e, json!({"target_ref": "nosuchref", "mode": "hard"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains("nosuchref"), "{}", err.message);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\na3\nLOCAL\n");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.audit().len(), before_audit.len());
+        assert_eq!(e.bytes_written(), before_bytes);
+    }
+
+    /// E2E-NEW-865: FR-NEW-254/FR-NEW-251, a hard reset to the CURRENT tip is
+    /// a no-op for the ref and not for the volume: it still discards.
+    #[tokio::test]
+    async fn e2e_new_865_a_hard_reset_to_the_current_tip_still_discards() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let clean = e.byte_map().await;
+        e.write("/a.txt", "CLOBBERED\n").await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.delete_file("/d.txt").await.unwrap();
+
+        let out = reset(&e, json!({"target_ref": "main", "mode": "hard"})).await.unwrap();
+
+        assert_eq!(out["old_sha"], json!(c[3]), "{out}");
+        assert_eq!(out["new_sha"], json!(c[3]), "{out}");
+        assert_eq!(out["files_changed"], json!(2), "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\na3\n");
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+        assert_eq!(e.byte_map().await, clean);
+        // This server has no index, so "clean" is exactly what git.stash_save
+        // calls nothing to stash: the volume tree equals HEAD's tree.
+        let err = stash_save(&e, json!({"message": "probe"})).await.unwrap_err();
+        assert!(err.message.contains("nothing to stash"), "{}", err.message);
+
+        // The same sequence in soft mode leaves the dirt exactly where it is.
+        e.write("/a.txt", "CLOBBERED\n").await;
+        reset(&e, json!({"target_ref": "main", "mode": "soft"})).await.unwrap();
+        assert_eq!(e.read_bytes("/a.txt").await, b"CLOBBERED\n");
+    }
+
+    /// E2E-NEW-894: FR-NEW-111/FR-NEW-255, `git.branch_reset` records both
+    /// shas, so the audit line alone is enough to replay the recovery.
+    #[tokio::test]
+    async fn e2e_new_894_branch_reset_audits_both_shas_so_the_move_is_recoverable() {
+        let e = Env::new().await;
+        let (c1, _c2, c3) = seed_b(&e).await;
+        let n0 = e.audit().len();
+
+        let out =
+            branch_reset(&e, json!({"name": "release/1.0", "target_commit": &c1, "force": true}))
+                .await
+                .unwrap();
+
+        // `checked_out` is part of this tool's frozen contract and is false
+        // here: `release/1.0` is not the branch HEAD points at.
+        assert_eq!(
+            out,
+            json!({
+                "branch": "release/1.0",
+                "old_sha": c3,
+                "new_sha": c1,
+                "checked_out": false,
+                "files_changed": 0,
+            })
+        );
+        let added: Vec<_> =
+            e.audit()[n0..].iter().filter(|a| a.op == "git.branch_reset").cloned().collect();
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].detail.contains(&c3), "{}", added[0].detail);
+        assert!(added[0].detail.contains(&c1), "{}", added[0].detail);
+        assert!(object_exists(&e, &c3).await);
+
+        branch_reset(&e, json!({"name": "release/1.0", "target_commit": &c3, "force": true}))
+            .await
+            .unwrap();
+        assert_eq!(e.ref_sha("refs/heads/release/1.0").await.as_deref(), Some(c3.as_str()));
+    }
+
+    /// E2E-NEW-899: FR-NEW-129/FR-NEW-255, a stash still applies once its base
+    /// commit is reachable from no ref at all, because nothing pruned it.
+    #[tokio::test]
+    async fn e2e_new_899_a_stash_applies_after_its_base_commit_became_unreachable() {
+        let e = Env::new().await;
+        let (_c1, _c2, c3) = seed_b(&e).await;
+        // SEED-B parks `main` at C2 while the volume still holds C3's tree,
+        // so HEAD is moved directly: `git.branch_switch` refuses a volume that
+        // does not match its branch, which is a different story's guard.
+        e.checkout("release/1.0").await;
+        e.write("/docs/rel.md", "rel-wip\n").await;
+        let saved = stash_save(&e, json!({"message": "wip rel"})).await.unwrap();
+        let stash_id = saved["stash_id"].as_str().unwrap().to_string();
+        assert_eq!(saved["base_sha"], json!(c3), "{saved}");
+
+        e.call("git.branch_switch", json!({"mount_id": MOUNT, "name": "main"})).await.unwrap();
+        branch_delete(&e, json!({"name": "release/1.0", "force": true})).await.unwrap();
+        // No BRANCH reaches C3 any more. The stash's own ref still does, which
+        // is exactly the retention FR-NEW-255 describes and what makes the
+        // apply below computable at all.
+        let branches = e.entry().await.db.list_refs().await.unwrap();
+        for r in branches.iter().filter(|r| r.name.starts_with("refs/heads/")) {
+            assert!(!e.log_shas(&r.name).await.contains(&c3), "{} reaches {c3}", r.name);
+        }
+
+        let applied = stash_apply(&e, &stash_id).await.unwrap();
+
+        assert_eq!(applied["status"], json!("applied"), "{applied}");
+        assert_eq!(e.read_bytes("/docs/rel.md").await, b"rel-wip\n");
+        assert!(object_exists(&e, &c3).await);
+        let listed = stash_entries(&e).await;
+        let entry = listed.iter().find(|s| s["stash_id"] == json!(stash_id)).expect("the stash");
+        assert_eq!(entry["base_sha"], json!(c3), "{entry}");
+    }
+
+    /// E2E-NEW-916: FR-NEW-223/FR-NEW-255, aborting a rebase takes the already
+    /// replayed commit off the branch and leaves its object in place.
+    #[tokio::test]
+    async fn e2e_new_916_aborting_keeps_the_replayed_commit_object() {
+        let e = Env::new().await;
+        let (c2, t1, t2) = seed_tail_conflict(&e).await;
+        let out = rebase(&e, "main", json!([pick(&t1), pick(&t2)])).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+
+        // While paused the replayed entries are held by the replay ref, not
+        // by the branch, which still names the pre-rebase tip.
+        let replayed = e.ref_sha(REPLAY_HEAD_REF).await.expect("a replay tip");
+        assert!(object_exists(&e, &replayed).await);
+
+        rebase_abort(&e).await.unwrap();
+
+        assert_eq!(e.ref_sha("refs/heads/feature").await.as_deref(), Some(t2.as_str()));
+        let shas = e.log_shas("feature").await;
+        assert!(!shas.contains(&replayed), "{shas:?}");
+        for sha in &shas {
+            assert_ne!(e.parent_of(sha).await.as_deref(), Some(c2.as_str()), "{sha} sits on main");
+        }
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nFEAT\n");
+        assert_eq!(e.read_bytes("/t1.txt").await, b"t1\n");
+        assert!(object_exists(&e, &replayed).await, "abort unreaches, it does not prune");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-921: FR-NEW-255/FR-NEW-111, the loop the requirement exists
+    /// for: a mistaken hard reset is fully recovered from the reported
+    /// `old_sha`, bytes and history alike.
+    #[tokio::test]
+    async fn e2e_new_921_a_mistaken_hard_reset_is_recovered_from_the_reported_old_sha() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let before = e.byte_map().await;
+        let log_before = e.log_shas("main").await;
+
+        let out = reset(&e, json!({"target_ref": &c[0], "mode": "hard"})).await.unwrap();
+
+        assert_eq!(out["old_sha"], json!(c[3]), "{out}");
+        assert_eq!(e.read_bytes_result("/b.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes_result("/d.txt").await.unwrap_err().code, code::NOT_FOUND);
+
+        let old_sha = out["old_sha"].as_str().unwrap().to_string();
+        branch_reset(&e, json!({"name": "main", "target_commit": &old_sha, "force": true}))
+            .await
+            .unwrap();
+        reset(&e, json!({"target_ref": "main", "mode": "hard"})).await.unwrap();
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, before);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\na3\n");
+        assert_eq!(e.read_bytes("/b.txt").await, b"b1\n");
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+        assert_eq!(e.log_shas("main").await, log_before);
+    }
+
+    // ── US-019: git.revert, continue and abort ──────────────────────────
+
+    async fn revert_args(e: &Env, args: Value) -> Result<Value> {
+        e.call("git.revert", args).await
+    }
+
+    async fn revert(e: &Env, sha: &str) -> Result<Value> {
+        revert_args(e, json!({"mount_id": MOUNT, "commit_sha": sha})).await
+    }
+
+    async fn revert_mainline(e: &Env, sha: &str, mainline: Value) -> Result<Value> {
+        revert_args(e, json!({"mount_id": MOUNT, "commit_sha": sha, "mainline": mainline})).await
+    }
+
+    async fn revert_continue(e: &Env, resolutions: Value) -> Result<Value> {
+        e.call("git.revert_continue", json!({"mount_id": MOUNT, "resolutions": resolutions})).await
+    }
+
+    async fn revert_abort(e: &Env) -> Result<Value> {
+        e.call("git.revert_abort", json!({"mount_id": MOUNT})).await
+    }
+
+    /// FX-MERGE: `main` at MG, the merge of `side` into `main`. Parent 1 is M1
+    /// (the main side, `/m.txt`), parent 2 is S1 (the side branch, `/s.txt`).
+    /// HEAD stays on `main` and the volume holds `/a.txt`, `/m.txt`, `/s.txt`.
+    async fn seed_fx_merge(e: &Env) -> (String, String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        let c1 = e.commit("C1 base").await;
+        e.branch_at("side", &c1).await;
+        e.write("/s.txt", "s1\n").await;
+        let s1 = e.commit("S1 side add").await;
+        e.switch_to("main").await;
+        e.write("/m.txt", "m1\n").await;
+        let m1 = e.commit("M1 main add").await;
+        let merged = e.merge("side").await.unwrap();
+        let mg = merged["merge_commit"].as_str().unwrap().to_string();
+        (mg, m1, s1)
+    }
+
+    /// FX-INIT: a history of exactly one parentless commit.
+    async fn seed_fx_init(e: &Env) -> String {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        e.commit("C1 base").await
+    }
+
+    /// FX-LINE plus C5, which rewrites `/a.txt` wholesale so the inverse of C3
+    /// no longer applies.
+    async fn seed_fx_line_rewritten(e: &Env) -> Vec<String> {
+        let mut c = seed_fx_line(e).await;
+        e.write("/a.txt", "TOTALLY DIFFERENT\n").await;
+        c.push(e.commit("C5 rewrite a").await);
+        c
+    }
+
+    /// E2E-NEW-675: FR-NEW-260, reverting C3 inverts its diff and nothing else.
+    #[tokio::test]
+    async fn e2e_new_675_revert_happy_revert_c3() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+
+        let out = revert(&e, &c[2]).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(out["reverted_sha"], json!(c[2]), "{out}");
+        let new_sha = out["new_sha"].as_str().unwrap().to_string();
+        assert_eq!(new_sha.len(), 40, "{out}");
+        assert!(!c.contains(&new_sha), "a new commit, not a seed one");
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits.len(), 5, "{commits:?}");
+        assert_eq!(commits[0]["message"], "Revert \"C3 edit a\"", "{}", commits[0]);
+        assert_eq!(commits[1]["message"], "C4 add d", "{}", commits[1]);
+        assert_eq!(commits[0]["parents"], json!([short(&c[3])]), "{}", commits[0]);
+        assert_eq!(commits[2]["sha"], json!(c[2]), "the original stays in history");
+
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+        assert_eq!(e.read_bytes("/b.txt").await, b"b1\n");
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-676: FR-NEW-260, reverting a file add removes the file and
+    /// lands on the tree the commit before it had.
+    #[tokio::test]
+    async fn e2e_new_676_revert_happy_revert_a_file_add_commit() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+
+        let out = revert(&e, &c[3]).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(e.read_bytes_result("/d.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(volume_paths(&e).await, ["/a.txt", "/b.txt"]);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\na3\n");
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits.len(), 5, "{commits:?}");
+        assert_eq!(commits[0]["message"], "Revert \"C4 add d\"", "{}", commits[0]);
+
+        let new_sha = out["new_sha"].as_str().unwrap();
+        let d = e
+            .call("git.diff", json!({"mount_id": MOUNT, "from_ref": &c[2], "to_ref": new_sha}))
+            .await
+            .unwrap();
+        assert_eq!(d["diff"].as_str().unwrap(), "", "the revert lands on C3's tree: {d}");
+    }
+
+    /// E2E-NEW-677: FR-NEW-265, reverting a revert reapplies the change.
+    #[tokio::test]
+    async fn e2e_new_677_revert_happy_reverting_a_revert_reapplies() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let r1 = revert(&e, &c[3]).await.unwrap()["new_sha"].as_str().unwrap().to_string();
+        assert_eq!(e.read_bytes_result("/d.txt").await.unwrap_err().code, code::NOT_FOUND);
+
+        let out = revert(&e, &r1).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits.len(), 6, "{commits:?}");
+        assert_eq!(
+            commits[0]["message"], "Revert \"Revert \\\"C4 add d\\\"\"",
+            "nested reverts keep the inner subject quoted: {}",
+            commits[0]
+        );
+
+        let tip = out["new_sha"].as_str().unwrap();
+        let d = e
+            .call("git.diff", json!({"mount_id": MOUNT, "from_ref": &c[3], "to_ref": tip}))
+            .await
+            .unwrap();
+        assert_eq!(d["diff"].as_str().unwrap(), "", "back on C4's tree: {d}");
+
+        let r2 = tip.to_string();
+        let distinct: HashSet<&String> = [&c[3], &r1, &r2].into_iter().collect();
+        assert_eq!(distinct.len(), 3, "C4, R1 and R2 are three distinct commits");
+        for sha in [&c[3], &r1, &r2] {
+            assert!(object_exists(&e, sha).await, "{sha} is reachable");
+        }
+    }
+
+    /// E2E-NEW-678: FR-NEW-261, mainline 1 reverts the side branch's work.
+    #[tokio::test]
+    async fn e2e_new_678_revert_merge_commit_with_mainline_one() {
+        let e = Env::new().await;
+        let (mg, _m1, _s1) = seed_fx_merge(&e).await;
+
+        let out = revert_mainline(&e, &mg, json!(1)).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(e.read_bytes_result("/s.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes("/m.txt").await, b"m1\n");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits[0]["message"], "Revert \"Merge side into main\"", "{}", commits[0]);
+        assert_eq!(commits[0]["parents"], json!([short(&mg)]), "{}", commits[0]);
+        assert_eq!(commits[1]["sha"], json!(mg), "the merge stays reachable");
+    }
+
+    /// E2E-NEW-679: FR-NEW-261/262, mainline 2 reverts the main branch's work
+    /// instead, and the two choices land on different trees.
+    #[tokio::test]
+    async fn e2e_new_679_revert_merge_commit_with_mainline_two() {
+        let e = Env::new().await;
+        let (mg, _m1, _s1) = seed_fx_merge(&e).await;
+
+        let out = revert_mainline(&e, &mg, json!(2)).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(e.read_bytes_result("/m.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes("/s.txt").await, b"s1\n");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+        assert_eq!(volume_paths(&e).await, ["/a.txt", "/s.txt"]);
+        // `git.log` walks first parents, so `main` reads C1, M1, MG, revert
+        // whichever mainline was chosen: the revert is a forward commit, not a
+        // history edit, in both runs.
+        assert_eq!(e.log_messages("main").await.len(), 4);
+
+        // The other choice, from the same fixture, lands on the other tree.
+        let other = Env::new().await;
+        let (mg2, _, _) = seed_fx_merge(&other).await;
+        revert_mainline(&other, &mg2, json!(1)).await.unwrap();
+        assert_eq!(volume_paths(&other).await, ["/a.txt", "/m.txt"]);
+        assert_eq!(other.log_messages("main").await.len(), 4);
+    }
+
+    /// E2E-NEW-680 and E2E-NEW-866: FR-NEW-263, the initial commit's inverse
+    /// is computed against the empty tree.
+    #[tokio::test]
+    async fn e2e_new_680_revert_the_initial_commit_with_no_parent() {
+        let e = Env::new().await;
+        let c1 = seed_fx_init(&e).await;
+
+        let out = revert(&e, &c1).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(out["reverted_sha"], json!(c1), "{out}");
+        assert_eq!(e.read_bytes_result("/a.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert!(volume_paths(&e).await.is_empty(), "the volume is empty");
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits.len(), 2, "{commits:?}");
+        assert_eq!(commits[0]["message"], "Revert \"C1 base\"", "{}", commits[0]);
+        assert_eq!(commits[0]["parents"], json!([short(&c1)]), "{}", commits[0]);
+        assert_eq!(commits[1]["sha"], json!(c1), "the original stays reachable");
+
+        let new_sha = out["new_sha"].as_str().unwrap();
+        assert_eq!(new_sha.len(), 40);
+        assert_ne!(new_sha, c1.as_str());
+        let (parents, files) = e.commit_shape(new_sha).await;
+        assert_eq!(parents, std::slice::from_ref(&c1), "exactly one parent");
+        assert!(files.is_empty(), "the revert commit's tree is empty: {files:?}");
+    }
+
+    /// E2E-NEW-866: FR-NEW-263/260, the response shape of that same revert,
+    /// asserted through `fs.list` rather than through the byte map.
+    #[tokio::test]
+    async fn e2e_new_866_reverting_the_initial_commit_empties_the_tree() {
+        let e = Env::new().await;
+        let c1 = seed_fx_init(&e).await;
+
+        let out = revert(&e, &c1).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({"status": "committed", "new_sha": out["new_sha"], "reverted_sha": c1.clone()}),
+            "exactly three keys: {out}"
+        );
+        assert!(volume_paths(&e).await.is_empty(), "the volume holds no entry at all");
+    }
+
+    /// E2E-NEW-867: FR-NEW-263/255, the reverted initial commit is still in
+    /// the object store, so a hard reset brings its content back byte for byte.
+    #[tokio::test]
+    async fn e2e_new_867_the_reverted_initial_commit_stays_in_history() {
+        let e = Env::new().await;
+        let c1 = seed_fx_init(&e).await;
+        revert(&e, &c1).await.unwrap();
+
+        assert_eq!(e.log_messages("main").await, ["Revert \"C1 base\"", "C1 base"]);
+        assert_eq!(e.log_commits("main").await[1]["sha"], json!(c1));
+        assert!(object_exists(&e, &c1).await);
+        let shown = show(&e, &c1).await.unwrap();
+        assert!(shown["diff"].as_str().unwrap().contains("a1"), "{shown}");
+
+        e.call("git.reset", json!({"mount_id": MOUNT, "target_ref": &c1, "mode": "hard"}))
+            .await
+            .unwrap();
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+    }
+
+    /// E2E-NEW-681: FR-NEW-260, a non-tip commit is reverted without
+    /// disturbing the commits that came after it.
+    #[tokio::test]
+    async fn e2e_new_681_revert_a_non_tip_commit() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+
+        let out = revert(&e, &c[1]).await.unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(e.read_bytes_result("/b.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\na3\n");
+        assert_eq!(e.read_bytes("/d.txt").await, b"d1\n");
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits.len(), 5, "{commits:?}");
+        assert_eq!(commits[0]["message"], "Revert \"C2 add b\"", "{}", commits[0]);
+    }
+
+    /// E2E-NEW-682: NFR 7.5 and FR-NEW-260, the audit entry, the quota charged
+    /// and the untouched original.
+    #[tokio::test]
+    async fn e2e_new_682_revert_side_effect_audit_quota_and_original() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let n0 = e.audit().len();
+        let q0 = e.bytes_written();
+
+        revert(&e, &c[2]).await.unwrap();
+
+        let appended: Vec<crate::safety::AuditEntry> = e.audit().split_off(n0);
+        let mine: Vec<&crate::safety::AuditEntry> =
+            appended.iter().filter(|a| a.op == "git.revert").collect();
+        assert_eq!(mine.len(), 1, "{appended:?}");
+        assert!(mine[0].detail.contains(&c[2]), "{}", mine[0].detail);
+
+        // Only `/a.txt` differs between the two tips, so only its 3 bytes are
+        // rewritten: `/b.txt` and `/d.txt` are untouched by the inverse diff.
+        assert_eq!(e.bytes_written() - q0, 3);
+        assert!(object_exists(&e, &c[2]).await);
+        assert!(e.log_shas("main").await.contains(&c[2]));
+    }
+
+    /// E2E-NEW-683: FR-NEW-264, an inverse that does not apply pauses instead
+    /// of writing anything.
+    #[tokio::test]
+    async fn e2e_new_683_revert_conflict_inverse_diff_does_not_apply() {
+        let e = Env::new().await;
+        let c = seed_fx_line_rewritten(&e).await;
+        let before = e.byte_map().await;
+
+        let out = revert(&e, &c[2]).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "revert", "{out}");
+        assert_eq!(conflict_paths(&out), ["/a.txt"], "{out}");
+        assert_eq!(out["current_step"], Value::Null, "{out}");
+        assert_eq!(out["total_steps"], Value::Null, "{out}");
+
+        assert_eq!(e.ops().await, 1);
+        let row = e.op_row().await.unwrap();
+        assert_eq!(row.op_type, crate::git::db::GitOpType::Revert);
+        assert_eq!(row.state, "conflicted");
+        assert!(row.todo.as_deref().unwrap().contains(&c[2]), "{:?}", row.todo);
+        assert_eq!(row_conflicts(&e).await, ["/a.txt"]);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[4].as_str()));
+        assert_eq!(e.read_bytes("/a.txt").await, b"TOTALLY DIFFERENT\n");
+        assert_eq!(e.byte_map().await, before);
+        assert_no_conflict_markers(&e.byte_map().await);
+        revert_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-684: FR-NEW-264/266/186, continue lands the inverse commit and
+    /// abort restores the tip and every byte exactly.
+    #[tokio::test]
+    async fn e2e_new_684_revert_conflict_continue_resolves_and_abort_restores() {
+        // (a) continue.
+        let e = Env::new().await;
+        let c = seed_fx_line_rewritten(&e).await;
+        assert_eq!(revert(&e, &c[2]).await.unwrap()["status"], "conflict");
+
+        let out = revert_continue(&e, json!([{"path": "/a.txt", "content": "RESOLVED\n"}]))
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        assert_eq!(out["reverted_sha"], json!(c[2]), "{out}");
+        assert_eq!(e.read_bytes("/a.txt").await, b"RESOLVED\n");
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits[0]["message"], "Revert \"C3 edit a\"", "{}", commits[0]);
+        assert_eq!(commits[0]["parents"], json!([short(&c[4])]), "{}", commits[0]);
+        assert_eq!(e.ops().await, 0);
+
+        // (b) abort, from the same precondition.
+        let e = Env::new().await;
+        let c = seed_fx_line_rewritten(&e).await;
+        let tip_before = c[4].clone();
+        assert_eq!(revert(&e, &c[2]).await.unwrap()["status"], "conflict");
+        let before = e.byte_map().await;
+
+        let out = revert_abort(&e).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({"status": "aborted", "operation": "revert", "restored_sha": tip_before}),
+            "{out}"
+        );
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(tip_before.as_str()));
+        assert_eq!(e.byte_map().await, before);
+        assert_eq!(e.ops().await, 0);
+
+        let err = revert_abort(&e).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no revert in progress"), "{}", err.message);
+        let err = revert_continue(&e, json!([])).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no revert in progress"), "{}", err.message);
+    }
+
+    /// E2E-NEW-685: FR-NEW-261, reverting a merge without a mainline is
+    /// refused, and refused before anything is written.
+    #[tokio::test]
+    async fn e2e_new_685_revert_failure_merge_commit_without_mainline() {
+        let e = Env::new().await;
+        let (mg, _m1, _s1) = seed_fx_merge(&e).await;
+        let before = e.byte_map().await;
+        let q0 = e.bytes_written();
+
+        let err = revert(&e, &mg).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        for needle in ["merge commit", "mainline", "1", "2"] {
+            assert!(err.message.contains(needle), "{needle}: {}", err.message);
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(mg.as_str()));
+        assert_eq!(e.byte_map().await, before);
+        assert_eq!(e.bytes_written(), q0);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-686: FR-NEW-262, an out-of-range mainline names the commit's
+    /// real parent count.
+    #[tokio::test]
+    async fn e2e_new_686_revert_failure_mainline_out_of_range() {
+        let e = Env::new().await;
+        let (mg, _m1, _s1) = seed_fx_merge(&e).await;
+        let before = e.byte_map().await;
+
+        for supplied in [3, 99] {
+            let err = revert_mainline(&e, &mg, json!(supplied)).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            for needle in ["mainline", &supplied.to_string(), "2 parents"] {
+                assert!(err.message.contains(needle), "{needle}: {}", err.message);
+            }
+        }
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(mg.as_str()));
+        assert_eq!(e.byte_map().await, before);
+    }
+
+    /// E2E-NEW-687: FR-NEW-262, mainline is a 1-based integer.
+    #[tokio::test]
+    async fn e2e_new_687_revert_failure_mainline_is_one_based() {
+        let e = Env::new().await;
+        let (mg, _m1, _s1) = seed_fx_merge(&e).await;
+
+        for supplied in [json!(0), json!(-1)] {
+            let err = revert_mainline(&e, &mg, supplied.clone()).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert!(err.message.contains("mainline"), "{}", err.message);
+            assert!(err.message.contains('1'), "{}", err.message);
+        }
+        let err = revert_mainline(&e, &mg, json!("1")).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("mainline"), "{}", err.message);
+        assert!(err.message.contains("integer"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(mg.as_str()));
+    }
+
+    /// E2E-NEW-688: FR-NEW-262, mainline on a non-merge commit is refused
+    /// rather than silently ignored.
+    #[tokio::test]
+    async fn e2e_new_688_revert_failure_mainline_on_a_non_merge_commit() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let before = e.byte_map().await;
+
+        let err = revert_mainline(&e, &c[2], json!(1)).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("mainline"), "{}", err.message);
+        assert!(err.message.contains("not a merge commit"), "{}", err.message);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, before);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-689: FR-NEW-260, an unknown, a malformed and a missing
+    /// `commit_sha` each leave the repository untouched.
+    #[tokio::test]
+    async fn e2e_new_689_revert_failure_unknown_and_malformed_sha() {
+        let e = Env::new().await;
+        let c = seed_fx_line(&e).await;
+        let before = e.byte_map().await;
+        let q0 = e.bytes_written();
+        let audit0 = e.audit().len();
+        let zero = "0".repeat(40);
+
+        let err = revert(&e, &zero).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert!(err.message.contains(&zero), "{}", err.message);
+        assert!(err.message.contains("not found"), "{}", err.message);
+
+        let err = revert(&e, "zzz").await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("commit_sha"), "{}", err.message);
+
+        let err = revert_args(&e, json!({"mount_id": MOUNT})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("commit_sha"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c[3].as_str()));
+        assert_eq!(e.byte_map().await, before);
+        assert_eq!(e.bytes_written(), q0);
+        assert_eq!(e.audit().len(), audit0);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-860: FR-NEW-240/262, `git.cherry_pick` states the same mainline
+    /// rule with the same parent counts.
+    #[tokio::test]
+    async fn e2e_new_860_an_out_of_range_mainline_names_the_actual_parent_count() {
+        let e = Env::new().await;
+        let (_c1, mg, m1) = seed_cp_merge(&e).await;
+        let tip = e.ref_sha("refs/heads/other").await.unwrap();
+
+        let err =
+            cherry_pick_args(&e, json!({"mount_id": MOUNT, "commit_sha": &mg, "mainline": 3}))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains('3'), "{}", err.message);
+        assert!(err.message.contains('2'), "{}", err.message);
+
+        let err =
+            cherry_pick_args(&e, json!({"mount_id": MOUNT, "commit_sha": &mg, "mainline": 0}))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains('0'), "{}", err.message);
+
+        let err =
+            cherry_pick_args(&e, json!({"mount_id": MOUNT, "commit_sha": &m1, "mainline": 1}))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("mainline"), "{}", err.message);
+        assert!(err.message.contains("1 parent"), "{}", err.message);
+
+        assert_eq!(e.ref_sha("refs/heads/other").await.as_deref(), Some(tip.as_str()));
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-868: FR-NEW-265, three reverts in a row alternate the state.
+    #[tokio::test]
+    async fn e2e_new_868_a_chain_of_three_reverts_lands_on_the_removed_state() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        e.commit("C1 base").await;
+        e.write("/b.txt", "b1\n").await;
+        let c2 = e.commit("C2 add b").await;
+
+        let r1 = revert(&e, &c2).await.unwrap()["new_sha"].as_str().unwrap().to_string();
+        assert_eq!(e.read_bytes_result("/b.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+
+        let r2 = revert(&e, &r1).await.unwrap()["new_sha"].as_str().unwrap().to_string();
+        assert_eq!(e.read_bytes("/b.txt").await, b"b1\n");
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+
+        let r3 = revert(&e, &r2).await.unwrap()["new_sha"].as_str().unwrap().to_string();
+        assert_eq!(e.read_bytes_result("/b.txt").await.unwrap_err().code, code::NOT_FOUND);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\n");
+
+        let d = e
+            .call("git.diff", json!({"mount_id": MOUNT, "from_ref": &r1, "to_ref": &r3}))
+            .await
+            .unwrap();
+        assert_eq!(d["diff"].as_str().unwrap(), "", "R3 lands on R1's tree: {d}");
+    }
+
+    /// E2E-NEW-869: FR-NEW-265/260, each revert is its own forward commit and
+    /// the original object is never rewritten.
+    #[tokio::test]
+    async fn e2e_new_869_each_revert_is_its_own_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        e.commit("C1 base").await;
+        e.write("/b.txt", "b1\n").await;
+        let c2 = e.commit("C2 add b").await;
+        let r1 = revert(&e, &c2).await.unwrap()["new_sha"].as_str().unwrap().to_string();
+        revert(&e, &r1).await.unwrap();
+
+        let commits = e.log_commits("main").await;
+        assert_eq!(commits.len(), 4, "{commits:?}");
+        let messages: Vec<&str> = commits.iter().map(|c| c["message"].as_str().unwrap()).collect();
+        assert_eq!(
+            messages,
+            ["Revert \"Revert \\\"C2 add b\\\"\"", "Revert \"C2 add b\"", "C2 add b", "C1 base"]
+        );
+        let shas: HashSet<&str> = commits.iter().map(|c| c["sha"].as_str().unwrap()).collect();
+        assert_eq!(shas.len(), 4, "four distinct shas");
+        assert_eq!(commits[2]["sha"], json!(c2), "the original object, not a copy");
+        for c in &commits[..3] {
+            assert_eq!(c["parents"].as_array().unwrap().len(), 1, "{c}");
+        }
+        assert_eq!(commits[3]["parents"].as_array().unwrap().len(), 0, "{}", commits[3]);
+        let shown = show(&e, &c2).await.unwrap();
+        assert!(shown["diff"].as_str().unwrap().contains("b1"), "{shown}");
+    }
+
+    /// E2E-NEW-922: FR-NEW-264/171, a conflicted revert creates no commit and
+    /// leaves the volume byte identical.
+    #[tokio::test]
+    async fn e2e_new_922_a_conflicted_revert_creates_no_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a1\n").await;
+        e.commit("C1 base").await;
+        e.write("/a.txt", "a1\na2\n").await;
+        let c2 = e.commit("C2 edit a").await;
+        e.write("/a.txt", "a1\nREWRITTEN\n").await;
+        let c3 = e.commit("C3 rewrite a").await;
+        let before_bytes = e.bytes_written();
+        let before = e.byte_map().await;
+        let before_log = e.log_shas("main").await;
+
+        let out = revert(&e, &c2).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "revert", "{out}");
+        assert_eq!(conflict_paths(&out), ["/a.txt"], "{out}");
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c3.as_str()));
+        assert_eq!(e.log_shas("main").await, before_log);
+        assert_eq!(e.read_bytes("/a.txt").await, b"a1\nREWRITTEN\n");
+        assert_eq!(e.byte_map().await, before);
+        assert_no_conflict_markers(&e.byte_map().await);
+        assert_eq!(e.bytes_written(), before_bytes);
+        assert_eq!(e.ops().await, 1);
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Revert);
+
+        revert_abort(&e).await.unwrap();
+    }
+
+    /// FX-CFG: `/cfg.txt` rewritten by each of three commits, so the inverse
+    /// of C2 cannot apply over C3.
+    async fn seed_fx_cfg(e: &Env) -> (String, String) {
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/cfg.txt", "mode=a\n").await;
+        e.commit("C1 cfg a").await;
+        e.write("/cfg.txt", "mode=b\n").await;
+        let c2 = e.commit("C2 cfg b").await;
+        e.write("/cfg.txt", "mode=c\n").await;
+        let c3 = e.commit("C3 cfg c").await;
+        (c2, c3)
+    }
+
+    /// E2E-NEW-954: FR-NEW-266/264, continue completes a conflicted revert.
+    #[tokio::test]
+    async fn e2e_new_954_revert_continue_completes_a_conflicted_revert() {
+        let e = Env::new().await;
+        let (c2, c3) = seed_fx_cfg(&e).await;
+        let out = revert(&e, &c2).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(conflict_paths(&out), ["/cfg.txt"], "{out}");
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Revert);
+
+        let out = revert_continue(&e, json!([{"path": "/cfg.txt", "content": "mode=a\n"}]))
+            .await
+            .unwrap();
+
+        assert_eq!(out["status"], "committed", "{out}");
+        let new_sha = out["new_sha"].as_str().unwrap();
+        let (parents, files) = e.commit_shape(new_sha).await;
+        assert_eq!(parents, std::slice::from_ref(&c3));
+        assert_eq!(files, ["cfg.txt"], "the tree carries the path without its leading slash");
+        assert_eq!(e.read_bytes("/cfg.txt").await, b"mode=a\n");
+        assert_eq!(e.ops().await, 0);
+        assert!(e.log_shas("main").await.contains(&c2), "C2 is still reachable");
+    }
+
+    /// E2E-NEW-955: FR-NEW-266/171, abort restores the tip and every byte.
+    #[tokio::test]
+    async fn e2e_new_955_revert_abort_restores_the_tip_and_every_byte() {
+        let e = Env::new().await;
+        let (c2, c3) = seed_fx_cfg(&e).await;
+        let before = e.byte_map().await;
+        let log_before = e.log_shas("main").await;
+        assert_eq!(revert(&e, &c2).await.unwrap()["status"], "conflict");
+
+        revert_abort(&e).await.unwrap();
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(c3.as_str()));
+        let after = e.byte_map().await;
+        assert_eq!(after.len(), before.len());
+        for (path, bytes) in &before {
+            assert_eq!(after.get(path), Some(bytes), "{path} differs");
+        }
+        assert_eq!(e.ops().await, 0);
+        assert_eq!(e.log_shas("main").await, log_before);
+    }
+
+    /// E2E-NEW-956: FR-NEW-266, continue with nothing in progress.
+    #[tokio::test]
+    async fn e2e_new_956_revert_continue_with_no_revert_in_progress() {
+        let e = Env::new().await;
+        let (_c2, _c3) = seed_fx_cfg(&e).await;
+
+        let err = revert_continue(&e, json!([])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("no revert is in progress"), "{}", err.message);
+        assert_eq!(e.ops().await, 0);
+    }
+
+    /// E2E-NEW-952: FR-NEW-241/225, `git.revert_continue` never advances a
+    /// paused rebase.
+    #[tokio::test]
+    async fn e2e_new_952_revert_continue_is_rejected_while_a_rebase_is_paused() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        let before = e.op_row().await.unwrap();
+        let log_before = e.log_shas("feature").await;
+
+        let err = revert_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        let after = e.op_row().await.unwrap();
+        assert_eq!(after.op_type, crate::git::db::GitOpType::Rebase);
+        assert_eq!(after.current_step, before.current_step);
+        assert_eq!(e.log_shas("feature").await, log_before);
+
+        rebase_abort(&e).await.unwrap();
+    }
+
+    /// E2E-NEW-953: FR-NEW-241/170, the conflict response names exactly one
+    /// completion pair per operation type, that pair advances the operation,
+    /// and no other pair does.
+    #[tokio::test]
+    async fn e2e_new_953_the_conflict_response_names_the_correct_completion_pair() {
+        // merge.
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["continue_with"], "git.merge_resolve", "{out}");
+        assert_eq!(out["abort_with"], "git.merge_abort", "{out}");
+        let err = revert_continue(&e, json!([res(CFG, "ours")])).await.unwrap_err();
+        assert!(err.message.contains("merge"), "{}", err.message);
+        assert!(err.message.contains("git.merge_resolve"), "{}", err.message);
+        assert_eq!(e.resolve(json!([res(CFG, "ours")])).await.unwrap()["status"], "merged");
+
+        // stash pop, which the merge pair also completes.
+        let e = Env::new().await;
+        let id = conflicting_stash(&e).await;
+        let out = stash_pop(&e, &id).await.unwrap();
+        assert_eq!(out["continue_with"], "git.merge_resolve", "{out}");
+        assert_eq!(out["abort_with"], "git.merge_abort", "{out}");
+        let err = revert_continue(&e, json!([res("/src/lib.rs", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("stash_pop"), "{}", err.message);
+        e.abort().await.unwrap();
+
+        // rebase.
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+        assert_eq!(out["continue_with"], "git.rebase_continue", "{out}");
+        assert_eq!(out["abort_with"], "git.rebase_abort", "{out}");
+        let err = revert_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(err.message.contains("git.rebase_continue"), "{}", err.message);
+        assert_eq!(
+            rebase_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap()["status"],
+            "completed"
+        );
+
+        // cherry-pick.
+        let e = Env::new().await;
+        let (_c1, _c2, f1, _f2) = seed_cp_conflict(&e).await;
+        let out = cherry_pick(&e, &f1).await.unwrap();
+        assert_eq!(out["continue_with"], "git.cherry_pick_continue", "{out}");
+        assert_eq!(out["abort_with"], "git.cherry_pick_abort", "{out}");
+        let err = revert_continue(&e, json!([res("/a.txt", "ours")])).await.unwrap_err();
+        assert!(err.message.contains("cherry_pick"), "{}", err.message);
+        assert!(err.message.contains("git.cherry_pick_continue"), "{}", err.message);
+        assert_eq!(
+            cherry_pick_continue(&e, json!([res("/a.txt", "theirs")])).await.unwrap()["status"],
+            "committed"
+        );
+
+        // revert, which none of the other three pairs may advance.
+        let e = Env::new().await;
+        let (c2, _c3) = seed_fx_cfg(&e).await;
+        let out = revert(&e, &c2).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(out["operation"], "revert", "{out}");
+        assert_eq!(out["continue_with"], "git.revert_continue", "{out}");
+        assert_eq!(out["abort_with"], "git.revert_abort", "{out}");
+        for err in [
+            e.resolve(json!([res("/cfg.txt", "ours")])).await.unwrap_err(),
+            rebase_continue(&e, json!([res("/cfg.txt", "ours")])).await.unwrap_err(),
+            cherry_pick_continue(&e, json!([res("/cfg.txt", "ours")])).await.unwrap_err(),
+        ] {
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert!(err.message.contains("revert"), "{}", err.message);
+            assert!(err.message.contains("git.revert_continue"), "{}", err.message);
+        }
+        assert_eq!(e.op_row().await.unwrap().op_type, crate::git::db::GitOpType::Revert);
+        assert_eq!(
+            revert_continue(&e, json!([res("/cfg.txt", "theirs")])).await.unwrap()["status"],
+            "committed"
+        );
+        assert_eq!(e.ops().await, 0);
+    }
+
+    // ── US-020: git.remote_add, git.remote_remove and git.remote_list ──────
+
+    const ORIGIN_URL: &str = "https://github.com/o/r.git";
+    const UPSTREAM_URL: &str = "https://github.ibm.com/team/r.git";
+
+    /// An initialized volume with the reference `git.hosts` map published, the
+    /// starting point of every remote management test: `git.remote_add`
+    /// requires the host to be declared, exactly like every other remote tool.
+    async fn remote_env() -> Env {
+        let e = Env::with_hosts(REFERENCE_HOSTS).await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e
+    }
+
+    async fn add_remote(e: &Env, name: &str, url: &str) -> Result<Value> {
+        e.call("git.remote_add", json!({"mount_id": MOUNT, "name": name, "url": url})).await
+    }
+
+    async fn remove_remote(e: &Env, name: &str) -> Result<Value> {
+        e.call("git.remote_remove", json!({"mount_id": MOUNT, "name": name})).await
+    }
+
+    async fn list_remotes_tool(e: &Env) -> Result<Value> {
+        e.call("git.remote_list", json!({"mount_id": MOUNT})).await
+    }
+
+    /// The `git_remotes` rows themselves, bypassing the tool: what proves a
+    /// rejected add wrote nothing and a rejected remove deleted nothing.
+    async fn db_remotes(e: &Env) -> Vec<(String, String)> {
+        e.entry().await.db.list_remotes().await.unwrap()
+    }
+
+    async fn seed_remote_row(e: &Env, name: &str, url: &str) {
+        e.entry().await.db.add_remote(name, url).await.unwrap();
+    }
+
+    /// E2E-NEW-471: FR-NEW-140/144, an added remote is recorded and listed
+    /// next to the one already there, ordered by name, and the add is audited.
+    #[test]
+    fn e2e_new_471_remote_add_then_remote_list() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+
+            let out = add_remote(&e, "upstream", UPSTREAM_URL).await.unwrap();
+            assert_eq!(out["name"], "upstream");
+            assert_eq!(out["url"], UPSTREAM_URL);
+            assert_eq!(out["host"], "github.ibm.com");
+            assert_eq!(out["provider"], "github");
+
+            assert_eq!(
+                db_remotes(&e).await,
+                vec![
+                    ("origin".to_string(), ORIGIN_URL.to_string()),
+                    ("upstream".to_string(), UPSTREAM_URL.to_string()),
+                ]
+            );
+
+            let listed = list_remotes_tool(&e).await.unwrap();
+            assert_eq!(
+                listed["remotes"],
+                json!([
+                    {"name": "origin", "url": ORIGIN_URL, "host": "github.com",
+                     "provider": "github"},
+                    {"name": "upstream", "url": UPSTREAM_URL, "host": "github.ibm.com",
+                     "provider": "github"},
+                ])
+            );
+            assert_eq!(listed["count"], 2);
+
+            let log = e.f.state.safety.audit(OWNER, MOUNT);
+            let last = log.last().unwrap();
+            assert_eq!(last.op, "git.remote_add");
+            assert!(last.detail.contains("upstream"), "{}", last.detail);
+        });
+    }
+
+    /// E2E-NEW-472: FR-NEW-141, a duplicate name is refused and the stored URL
+    /// survives. `RelationalGitDb::add_remote` is an upsert, so this is the
+    /// guard against calling it blindly.
+    ///
+    /// The code asserted is `ERR_INVALID_ARGUMENT`, per FR-NEW-141, whose EARS
+    /// statement is normative and which E2E-NEW-900 also asserts; the
+    /// `ERR_NO_CLOBBER` in this test's own prose contradicts both.
+    #[test]
+    fn e2e_new_472_a_duplicate_remote_name_is_refused_not_upserted() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+
+            let err = add_remote(&e, "origin", "https://evil.test/x/y.git").await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+            assert!(err.message.contains("remote 'origin' already exists"), "{}", err.message);
+            assert_eq!(db_remotes(&e).await, vec![("origin".to_string(), ORIGIN_URL.to_string())]);
+        });
+    }
+
+    /// E2E-NEW-473: FR-NEW-140, every non-https form is refused by the single
+    /// existing validator, each error naming its own scheme.
+    #[test]
+    fn e2e_new_473_non_https_remote_urls_are_refused() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            for (name, url, scheme) in [
+                ("r1", "ssh://git@github.com/o/r.git", "ssh"),
+                ("r2", "git://github.com/o/r.git", "git"),
+                ("r3", "http://github.com/o/r.git", "http"),
+                ("r4", "file:///tmp/bare", "file"),
+            ] {
+                let err = add_remote(&e, name, url).await.unwrap_err();
+                assert_eq!(err.code, code::INVALID_ARGUMENT, "{url}: {}", err.message);
+                assert!(err.message.contains("only https is accepted"), "{}", err.message);
+                assert!(err.message.contains(scheme), "{url}: {}", err.message);
+            }
+
+            let err = add_remote(&e, "r5", "git@github.com:o/r.git").await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+            assert!(err.message.contains("scp-style shorthand"), "{}", err.message);
+
+            assert!(db_remotes(&e).await.is_empty());
+        });
+    }
+
+    /// E2E-NEW-474: FR-NEW-140/145, a URL carrying userinfo is refused without
+    /// the secret appearing in the message or in the audit log.
+    #[test]
+    fn e2e_new_474_a_credentialed_url_is_refused_without_echoing_the_secret() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            let err = add_remote(&e, "leaky", "https://alice:ghp_secret@github.com/o/r.git")
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+            assert!(!err.message.contains("ghp_secret"), "{}", err.message);
+            assert!(!err.message.contains("alice:ghp_secret"), "{}", err.message);
+            assert!(db_remotes(&e).await.is_empty());
+            for entry in e.f.state.safety.audit(OWNER, MOUNT) {
+                assert!(!entry.detail.contains("ghp_secret"), "{}", entry.detail);
+            }
+        });
+    }
+
+    /// E2E-NEW-475: FR-NEW-140/141, every rejected add of E2E-NEW-472 and
+    /// E2E-NEW-473 run in one volume leaves the single original row intact.
+    #[test]
+    fn e2e_new_475_rejected_adds_write_no_row() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+
+            assert!(add_remote(&e, "origin", "https://evil.test/x/y.git").await.is_err());
+            for (name, url) in [
+                ("r1", "ssh://git@github.com/o/r.git"),
+                ("r2", "git://github.com/o/r.git"),
+                ("r3", "http://github.com/o/r.git"),
+                ("r4", "file:///tmp/bare"),
+                ("r5", "git@github.com:o/r.git"),
+            ] {
+                assert!(add_remote(&e, name, url).await.is_err(), "{url} was accepted");
+            }
+
+            assert_eq!(db_remotes(&e).await, vec![("origin".to_string(), ORIGIN_URL.to_string())]);
+            let listed = list_remotes_tool(&e).await.unwrap();
+            assert_eq!(listed["remotes"].as_array().unwrap().len(), 1);
+            assert_eq!(listed["count"], 1);
+        });
+    }
+
+    /// E2E-NEW-476: FR-NEW-140, a name git itself would refuse is refused here.
+    #[test]
+    fn e2e_new_476_an_invalid_remote_name_is_refused() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            let long = "a".repeat(256);
+            for name in ["", "has space", "with/slash", "-leading", long.as_str()] {
+                let err = add_remote(&e, name, ORIGIN_URL).await.unwrap_err();
+                assert_eq!(err.code, code::INVALID_ARGUMENT, "{name}: {}", err.message);
+                assert!(
+                    err.message.contains("is not a valid remote name"),
+                    "{name}: {}",
+                    err.message
+                );
+            }
+            assert!(db_remotes(&e).await.is_empty());
+        });
+    }
+
+    /// E2E-NEW-477: FR-NEW-142, a remove deletes exactly that row and is
+    /// audited.
+    #[test]
+    fn e2e_new_477_remote_remove_deletes_the_row() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+            seed_remote_row(&e, "upstream", UPSTREAM_URL).await;
+
+            let out = remove_remote(&e, "upstream").await.unwrap();
+            assert_eq!(out["name"], "upstream");
+            assert_eq!(out["removed"], true);
+            assert_eq!(db_remotes(&e).await, vec![("origin".to_string(), ORIGIN_URL.to_string())]);
+
+            let log = e.f.state.safety.audit(OWNER, MOUNT);
+            let last = log.last().unwrap();
+            assert_eq!(last.op, "git.remote_remove");
+            assert!(last.detail.contains("upstream"), "{}", last.detail);
+        });
+    }
+
+    /// E2E-NEW-478: FR-NEW-143, removing an unknown remote is a not found
+    /// error, not the silent no-op the unconditional DELETE would give.
+    #[test]
+    fn e2e_new_478_removing_an_unknown_remote_is_not_found() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+
+            let err = remove_remote(&e, "upstream").await.unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{}", err.message);
+            assert!(err.message.contains("remote 'upstream'"), "{}", err.message);
+            assert_eq!(db_remotes(&e).await, vec![("origin".to_string(), ORIGIN_URL.to_string())]);
+        });
+    }
+
+    /// E2E-NEW-480: FR-NEW-144, a volume with no remote lists an empty array.
+    #[test]
+    fn e2e_new_480_remote_list_with_no_remotes() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            assert!(db_remotes(&e).await.is_empty());
+            let out = list_remotes_tool(&e).await.unwrap();
+            assert_eq!(out["mount_id"], MOUNT);
+            assert_eq!(out["remotes"], json!([]));
+            assert_eq!(out["count"], 0);
+        });
+    }
+
+    /// E2E-NEW-826: FR-NEW-141/143, remote names are case sensitive: `Origin`
+    /// is neither removable nor a duplicate of `origin`.
+    #[test]
+    fn e2e_new_826_remote_names_are_case_sensitive() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+
+            let err = remove_remote(&e, "Origin").await.unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{}", err.message);
+            assert!(err.message.contains("Origin"), "{}", err.message);
+            assert_eq!(db_remotes(&e).await, vec![("origin".to_string(), ORIGIN_URL.to_string())]);
+
+            add_remote(&e, "Origin", ORIGIN_URL).await.unwrap();
+            let rows = db_remotes(&e).await;
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert!(rows.iter().any(|(n, _)| n == "origin"));
+            assert!(rows.iter().any(|(n, _)| n == "Origin"));
+        });
+    }
+
+    /// E2E-NEW-827: FR-NEW-142/143, a failed remove runs no ref sweep at all:
+    /// the tracking refs of the remote that does exist are untouched, and
+    /// nothing is audited.
+    #[test]
+    fn e2e_new_827_a_failed_remove_leaves_the_tracking_refs_intact() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+            let sha_r1 = "1".repeat(40);
+            e.entry().await.db.set_ref("refs/remotes/origin/main", &sha_r1, false).await.unwrap();
+            let before: Vec<(String, String)> = e
+                .entry()
+                .await
+                .db
+                .list_refs()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.name, r.target))
+                .collect();
+
+            let err = remove_remote(&e, "upstream").await.unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{}", err.message);
+            assert!(err.message.contains("upstream"), "{}", err.message);
+
+            let row = e.entry().await.db.get_ref("refs/remotes/origin/main").await.unwrap();
+            assert_eq!(row.unwrap().target, sha_r1);
+            let after: Vec<(String, String)> = e
+                .entry()
+                .await
+                .db
+                .list_refs()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.name, r.target))
+                .collect();
+            assert_eq!(before, after);
+            assert!(
+                e.f.state.safety.audit(OWNER, MOUNT).iter().all(|a| a.op != "git.remote_remove")
+            );
+        });
+    }
+
+    /// E2E-NEW-900: FR-NEW-141, re-adding the byte identical name and URL is
+    /// still a duplicate, so "it is idempotent" is not an escape from the
+    /// upsert guard.
+    #[test]
+    fn e2e_new_900_re_adding_an_identical_remote_is_still_a_duplicate() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+
+            let err = add_remote(&e, "origin", ORIGIN_URL).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+            assert!(err.message.contains("origin"), "{}", err.message);
+            assert!(err.message.contains(ORIGIN_URL), "{}", err.message);
+
+            let near = ORIGIN_URL.trim_end_matches(".git");
+            let err = add_remote(&e, "origin", near).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{}", err.message);
+
+            assert_eq!(db_remotes(&e).await.len(), 1);
+            assert!(e.f.state.safety.audit(OWNER, MOUNT).iter().all(|a| a.op != "git.remote_add"));
+        });
+    }
+
+    /// E2E-NEW-901: FR-NEW-142, the ref sweep is scoped to the removed
+    /// remote's own namespace and touches neither the other remote's tracking
+    /// refs, nor the branches, nor the volume, nor the object index.
+    #[test]
+    fn e2e_new_901_remote_remove_deletes_only_that_remotes_tracking_refs() {
+        with_git_hosts_lock(async {
+            let e = remote_env().await;
+            e.write("/a.txt", "v1\n").await;
+            let head = e.commit("c1").await;
+            seed_remote_row(&e, "origin", ORIGIN_URL).await;
+            seed_remote_row(&e, "upstream", UPSTREAM_URL).await;
+
+            let sha_u1 = head.clone();
+            let entry = e.entry().await;
+            for name in [
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/dev",
+                "refs/remotes/upstream/main",
+                "refs/remotes/upstream/dev",
+            ] {
+                entry.db.set_ref(name, &sha_u1, false).await.unwrap();
+            }
+            let head_before = entry.db.get_ref("HEAD").await.unwrap().unwrap();
+            let main_before = entry.db.get_ref("refs/heads/main").await.unwrap().unwrap();
+
+            remove_remote(&e, "upstream").await.unwrap();
+
+            assert_eq!(db_remotes(&e).await, vec![("origin".to_string(), ORIGIN_URL.to_string())]);
+            let refs = entry.db.list_refs().await.unwrap();
+            for name in ["refs/remotes/origin/main", "refs/remotes/origin/dev"] {
+                let r = refs.iter().find(|r| r.name == name).expect(name);
+                assert_eq!(r.target, sha_u1);
+            }
+            assert!(refs.iter().all(|r| !r.name.starts_with("refs/remotes/upstream/")), "{refs:?}");
+            assert_eq!(entry.db.get_ref("HEAD").await.unwrap().unwrap().target, head_before.target);
+            assert_eq!(
+                entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target,
+                main_before.target
+            );
+            assert_eq!(e.read("/a.txt").await, "v1\n");
+            assert!(entry.db.object_exists(&sha_u1).await.unwrap());
+        });
+    }
+
+    /// A `MakeWriter` collecting every formatted tracing event, so
+    /// E2E-NEW-903 can assert on what the remote tools actually emitted.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// E2E-NEW-903: FR-NEW-145, with a real token stored for the host, no
+    /// remote tool response, error message or log line mentions it.
+    #[test]
+    fn e2e_new_903_remote_tools_stay_silent_about_a_stored_token() {
+        with_git_hosts_lock(async {
+            const SECRET: &str = "ghp_SECRET_VALUE_zzz";
+            let e = Env::with_hosts(&[("github.com", "github")]).await;
+            e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github.com",
+                    "github",
+                    SECRET,
+                    vec!["repo".into()],
+                    Some(future_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            seed_remote_row(&e, "origin", "https://github.com/acme/api.git").await;
+
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            let mut observed = Vec::new();
+            observed.push(list_remotes_tool(&e).await.unwrap().to_string());
+            let dup = add_remote(&e, "origin", "https://github.com/acme/api.git").await;
+            observed.push(dup.unwrap_err().message);
+            let traversal = add_remote(&e, "bad", "https://github.com/acme/../../x").await;
+            observed.push(match traversal {
+                Ok(v) => v.to_string(),
+                Err(err) => err.message,
+            });
+            drop(guard);
+
+            observed.push(captured.text());
+            for text in observed {
+                assert!(!text.contains("ghp_"), "token prefix leaked: {text}");
+                assert!(!text.contains(SECRET), "token leaked: {text}");
+            }
+        });
+    }
+
+    // ── US-021: named remotes on push, fetch and pull ────────────────────────
+
+    /// SEED-R: a bare remote holding `<sha-R1>` on `main` with `/README.md` =
+    /// `"alpha\n"`, cloned into the volume, then one local commit `<sha-C2>`
+    /// adding `/src/lib.rs`. Returns `(url, sha_r1, sha_c2)`.
+    async fn seed_r(e: &Env, remote_dir: &std::path::Path) -> (String, String, String) {
+        let url = seed_bare_remote(remote_dir, "alpha\n");
+        call_clone_and_import(e, &url, "anonymous").await.unwrap();
+        let sha_r1 = e.ref_sha("refs/heads/main").await.unwrap();
+        e.write("/src/lib.rs", "fn a() {}\n").await;
+        let sha_c2 = e.commit("C2").await;
+        (url, sha_r1, sha_c2)
+    }
+
+    /// An empty bare repository to play a second remote, declared under
+    /// `name`: real git mechanics over `file://`, no network.
+    async fn declare_empty_remote(e: &Env, dir: &std::path::Path, name: &str) -> String {
+        git2::Repository::init_bare(dir).unwrap();
+        let url = format!("file://{}", dir.display());
+        e.entry().await.db.add_remote(name, &url).await.unwrap();
+        url
+    }
+
+    /// Every ref name the bare repository currently holds, read off disk.
+    fn bare_ref_names(dir: &std::path::Path) -> Vec<String> {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let mut names: Vec<String> = repo
+            .references()
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.name().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// E2E-NEW-479: with `origin` removed, a push naming no remote fails on the
+    /// absent `origin` and audits exactly once.
+    #[tokio::test]
+    async fn e2e_new_479_removing_origin_makes_push_report_no_origin_remote() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-479");
+        seed_r(&e, &remote_dir).await;
+
+        remove_remote(&e, "origin").await.unwrap();
+        assert!(db_remotes(&e).await.is_empty(), "the remove left a row behind");
+
+        let err = e
+            .call("git.remote_push", json!({"mount_id": MOUNT, "branch": "main"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert!(err.message.contains("has no origin remote"), "got {}", err.message);
+
+        let pushes: Vec<_> = e.audit().into_iter().filter(|a| a.op == "git.remote_push").collect();
+        assert_eq!(pushes.len(), 1, "exactly one audit entry per remote call");
+        assert!(pushes[0].detail.contains("outcome error"), "got {}", pushes[0].detail);
+    }
+
+    /// E2E-NEW-481: a fetch against the declared `upstream` updates
+    /// `refs/remotes/upstream/main`.
+    #[tokio::test]
+    async fn e2e_new_481_fetching_a_named_remote() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-481-origin");
+        seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-481-upstream");
+        let url2 = seed_bare_remote(&remote_dir2, "upstream\n");
+        e.entry().await.db.add_remote("upstream", &url2).await.unwrap();
+        let sha_u2 = advance_bare_remote(&remote_dir2, "refs/heads/main", "upstream2\n");
+
+        let out = fetch_branch_inner(
+            e.git.clone(),
+            MOUNT,
+            "upstream",
+            &url2,
+            None,
+            "anonymous".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let updates = out["refs_updated"].as_array().unwrap();
+        assert!(
+            updates.iter().any(|u| u["ref"] == "refs/remotes/upstream/main"),
+            "got {updates:?}"
+        );
+        assert!(out["objects_fetched"].as_i64().unwrap() > 0);
+        assert_eq!(e.ref_sha("refs/remotes/upstream/main").await.as_deref(), Some(sha_u2.as_str()));
+    }
+
+    /// E2E-NEW-482: the named fetch touched no other remote's namespace, no
+    /// local branch and no volume file.
+    #[tokio::test]
+    async fn e2e_new_482_a_named_fetch_touches_only_that_remotes_namespace() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-482-origin");
+        let (_url, sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-482-upstream");
+        let url2 = seed_bare_remote(&remote_dir2, "upstream\n");
+        e.entry().await.db.add_remote("upstream", &url2).await.unwrap();
+        advance_bare_remote(&remote_dir2, "refs/heads/main", "upstream2\n");
+
+        let entry = e.entry().await;
+        entry.db.set_ref("refs/remotes/origin/main", &sha_r1, false).await.unwrap();
+        let before_bytes = e.bytes_written();
+
+        fetch_branch_inner(e.git.clone(), MOUNT, "upstream", &url2, None, "anonymous".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_r1.as_str()));
+        let origin_refs: Vec<String> = entry
+            .db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .filter(|n| n.starts_with("refs/remotes/origin/"))
+            .collect();
+        assert_eq!(origin_refs, vec!["refs/remotes/origin/main".to_string()]);
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha_c2.as_str()));
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert_eq!(e.bytes_written(), before_bytes, "a fetch charges no quota");
+    }
+
+    /// E2E-NEW-483: fetching a remote name that was never declared fails
+    /// `ERR_NOT_FOUND`, before any connection, and audits exactly once.
+    #[tokio::test]
+    async fn e2e_new_483_fetching_an_undeclared_remote_name() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-483");
+        seed_r(&e, &remote_dir).await;
+
+        let err = e
+            .call("git.remote_fetch", json!({"mount_id": MOUNT, "remote": "upstream"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(err.message.contains("remote 'upstream'"), "got {}", err.message);
+        assert!(err.message.contains(MOUNT), "got {}", err.message);
+
+        let entry = e.entry().await;
+        assert!(
+            !entry
+                .db
+                .list_refs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.name.starts_with("refs/remotes/upstream/")),
+            "an unknown remote created a tracking ref"
+        );
+        let fetches: Vec<_> =
+            e.audit().into_iter().filter(|a| a.op == "git.remote_fetch").collect();
+        assert_eq!(fetches.len(), 1, "exactly one audit entry per remote call");
+        assert!(fetches[0].detail.contains("outcome error"), "got {}", fetches[0].detail);
+    }
+
+    /// E2E-NEW-484: `remote_branch` pushes the local branch under a different
+    /// name on the remote, leaving the remote's own `main` where it was.
+    #[tokio::test]
+    async fn e2e_new_484_pushing_with_remote_branch_creates_a_differently_named_branch() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-484");
+        let (url, sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+
+        let out = call_push_branch_to(&e, "origin", &url, "main", Some("sandbox"), "anonymous")
+            .await
+            .unwrap();
+        assert_eq!(out["branch"], "main");
+        assert_eq!(out["remote_branch"], "sandbox");
+        assert_eq!(out["created"], true);
+        assert_eq!(out["up_to_date"], false);
+        assert_eq!(out["remote_sha"], sha_c2.clone());
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/sandbox"), Some(sha_c2));
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+    }
+
+    /// E2E-NEW-485: the tracking ref follows the REMOTE side's name, and the
+    /// local branch and the volume are untouched.
+    #[tokio::test]
+    async fn e2e_new_485_the_tracking_ref_follows_the_remote_side_name() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-485");
+        let (url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let before_bytes = e.bytes_written();
+
+        call_push_branch_to(&e, "origin", &url, "main", Some("sandbox"), "anonymous")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/sandbox").await.as_deref(),
+            Some(sha_c2.as_str()),
+            "the tracking ref must carry the remote-side name"
+        );
+        assert_eq!(
+            e.ref_sha("refs/remotes/origin/main").await,
+            None,
+            "no tracking ref under the local branch's name"
+        );
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha_c2.as_str()));
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        assert_eq!(e.bytes_written(), before_bytes, "a push charges no quota");
+    }
+
+    /// E2E-NEW-486: pushing to a remote name that was never declared fails
+    /// `ERR_NOT_FOUND` and creates nothing anywhere.
+    #[tokio::test]
+    async fn e2e_new_486_pushing_to_an_undeclared_remote_name() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-486");
+        let (_url, sha_r1, _sha_c2) = seed_r(&e, &remote_dir).await;
+
+        let err = e
+            .call(
+                "git.remote_push",
+                json!({"mount_id": MOUNT, "branch": "main", "remote": "upstream"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(err.message.contains("remote 'upstream'"), "got {}", err.message);
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1));
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/upstream"), None);
+        let entry = e.entry().await;
+        assert!(
+            !entry
+                .db
+                .list_refs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.name.starts_with("refs/remotes/upstream/"))
+        );
+    }
+
+    /// E2E-NEW-487: `remote` omitted means `origin`, in the generated schema of
+    /// all three tools and in the push that really lands.
+    #[tokio::test]
+    async fn e2e_new_487_remote_omitted_defaults_to_origin() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-487-origin");
+        let (url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-487-upstream");
+        let url2 = seed_bare_remote(&remote_dir2, "upstream\n");
+        let sha_u1 = bare_ref_sha(&remote_dir2, "refs/heads/main").unwrap();
+        e.entry().await.db.add_remote("upstream", &url2).await.unwrap();
+
+        call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_c2.clone()));
+        assert_eq!(bare_ref_sha(&remote_dir2, "refs/heads/main"), Some(sha_u1));
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_c2.as_str()));
+        assert_eq!(e.ref_sha("refs/remotes/upstream/main").await, None);
+
+        let mut r = ToolRegistry::new();
+        register(&mut r);
+        for tool in ["git.remote_push", "git.remote_fetch", "git.remote_pull"] {
+            let schema = r.resolve(tool).unwrap().schema.input_schema();
+            assert_eq!(
+                schema["properties"]["remote"]["default"], "origin",
+                "{tool} must default remote to origin"
+            );
+            assert!(
+                !schema["required"].as_array().unwrap().iter().any(|v| v == "remote"),
+                "{tool} must keep remote optional"
+            );
+        }
+    }
+
+    /// E2E-NEW-872: a fetch runs during a paused merge, updating only the
+    /// tracking ref and leaving the pause completable.
+    #[tokio::test]
+    async fn e2e_new_872_fetch_during_a_paused_merge_updates_only_tracking_refs() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let remote_dir = e.f.dir.path().join("remote-872");
+        let url = seed_bare_remote(&remote_dir, "remote\n");
+        e.entry().await.db.add_remote("origin", &url).await.unwrap();
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "r2\n");
+
+        let paused = e.merge("feature").await.unwrap();
+        assert_eq!(paused["status"], "conflict");
+        let local_main = e.ref_sha("refs/heads/main").await.unwrap();
+        let row_before = e.op_row().await.unwrap();
+        let cfg_before = e.read(CFG).await;
+
+        fetch_branch_inner(e.git.clone(), MOUNT, "origin", &url, None, "anonymous".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_r2.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(local_main.as_str()));
+        assert_eq!(e.read(CFG).await, cfg_before);
+        assert_eq!(e.read(CFG).await.split('\n').nth(1).unwrap(), "port = 8000");
+        assert_eq!(e.op_row().await.unwrap(), row_before, "the paused merge row must be untouched");
+
+        let done = e.resolve(json!([{"path": CFG, "strategy": "ours"}])).await.unwrap();
+        assert_eq!(done["status"], "merged");
+    }
+
+    /// E2E-NEW-890: pushing to `upstream` leaves `origin`'s tracking ref alone,
+    /// and the audit entry names the remote actually used.
+    #[tokio::test]
+    async fn e2e_new_890_pushing_to_upstream_leaves_origins_tracking_ref_alone() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-890-o");
+        let (url, sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-890-up");
+        let url2 = declare_empty_remote(&e, &remote_dir2, "upstream").await;
+
+        // Both tracking refs exist before the push: origin's from a real fetch.
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_r1.as_str()));
+
+        call_push_branch_to(&e, "upstream", &url2, "main", None, "anonymous").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&remote_dir2, "refs/heads/main"), Some(sha_c2.clone()));
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/main"), Some(sha_r1.clone()));
+        assert_eq!(e.ref_sha("refs/remotes/upstream/main").await.as_deref(), Some(sha_c2.as_str()));
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_r1.as_str()));
+
+        let pushes: Vec<_> = e.audit().into_iter().filter(|a| a.op == "git.remote_push").collect();
+        assert_eq!(pushes.len(), 1);
+        assert!(pushes[0].detail.contains("upstream"), "got {}", pushes[0].detail);
+        assert!(!pushes[0].detail.contains("origin"), "got {}", pushes[0].detail);
+    }
+
+    /// FR-NEW-199: the response states which remote was pushed to. Now that
+    /// `remote` is a caller-supplied parameter defaulting to `origin`
+    /// (FR-MOD-101), a caller pushing to `upstream` cannot otherwise tell from
+    /// the response which remote actually received the branch, and a default
+    /// push must report `origin` for the key to be readable unconditionally.
+    #[tokio::test]
+    async fn the_push_response_reports_the_remote_it_pushed_to() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-199-o");
+        let (url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-199-up");
+        let url2 = declare_empty_remote(&e, &remote_dir2, "upstream").await;
+
+        let named =
+            call_push_branch_to(&e, "upstream", &url2, "main", None, "anonymous").await.unwrap();
+        assert_eq!(named["remote"], "upstream", "{named}");
+        assert_eq!(named["remote_sha"], sha_c2.clone(), "{named}");
+
+        let default = call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(default["remote"], "origin", "{default}");
+    }
+
+    /// E2E-NEW-891: an invalid `remote_branch` is refused by the same rule a
+    /// local branch name obeys, before the remote is contacted and with no
+    /// audit entry.
+    #[tokio::test]
+    async fn e2e_new_891_an_invalid_remote_branch_name_is_refused_before_the_remote() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-891");
+        seed_r(&e, &remote_dir).await;
+        let refs_before = bare_ref_names(&remote_dir);
+
+        for bad in ["bad..name", "has space", "trailing/", "tip.lock"] {
+            let err = e
+                .call(
+                    "git.remote_push",
+                    json!({"mount_id": MOUNT, "branch": "main", "remote_branch": bad}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{bad}");
+            assert!(err.message.contains("is not a valid branch name"), "{bad}: {}", err.message);
+        }
+
+        assert_eq!(bare_ref_names(&remote_dir), refs_before);
+        assert!(
+            !e.audit().iter().any(|a| a.op == "git.remote_push"),
+            "a rejected argument must not be audited as a remote operation"
+        );
+    }
+
+    /// E2E-NEW-892: a pull naming `upstream` fast-forwards from upstream and
+    /// leaves origin's tracking ref where it was.
+    #[tokio::test]
+    async fn e2e_new_892_pull_from_a_named_remote_leaves_origin_untouched() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-892-o");
+        let (url, sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-892-up");
+        let url2 = declare_empty_remote(&e, &remote_dir2, "upstream").await;
+
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        call_push_branch_to(&e, "upstream", &url2, "main", None, "anonymous").await.unwrap();
+        let sha_u2 = advance_bare_remote_write(&remote_dir2, "refs/heads/main", "up.txt", "up\n");
+
+        let out = call_pull_branch_from(&e, "upstream", &url2, "main", "anonymous").await.unwrap();
+        assert_eq!(out["merged"], false);
+        assert_eq!(out["new_sha"], sha_u2.clone());
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha_u2.as_str()));
+        assert_eq!(e.ref_sha("refs/remotes/upstream/main").await.as_deref(), Some(sha_u2.as_str()));
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_r1.as_str()));
+        assert_eq!(e.read_bytes("/up.txt").await, b"up\n");
+        assert_ne!(sha_u2, sha_c2);
+    }
+
+    /// E2E-NEW-904: a fetch leaves every local branch, HEAD and volume file
+    /// byte-identical, and the fetched file never reaches the volume.
+    #[tokio::test]
+    async fn e2e_new_904_a_fetch_leaves_local_branches_and_the_volume_identical() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-904");
+        let (url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let sha_r2 =
+            advance_bare_remote_write(&remote_dir, "refs/heads/main", "hello.txt", "remote-2\n");
+
+        let entry = e.entry().await;
+        let before_refs: BTreeMap<String, String> =
+            entry.db.list_refs().await.unwrap().into_iter().map(|r| (r.name, r.target)).collect();
+        let before_bytes = e.bytes_written();
+
+        fetch_branch_inner(e.git.clone(), MOUNT, "origin", &url, None, "anonymous".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(e.ref_sha("refs/remotes/origin/main").await.as_deref(), Some(sha_r2.as_str()));
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha_c2.as_str()));
+        let after_refs: BTreeMap<String, String> =
+            entry.db.list_refs().await.unwrap().into_iter().map(|r| (r.name, r.target)).collect();
+        let changed: Vec<&String> = after_refs
+            .iter()
+            .filter(|(name, sha)| before_refs.get(*name) != Some(*sha))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(changed, vec!["refs/remotes/origin/main"]);
+
+        assert_eq!(e.read("/README.md").await, "alpha\n");
+        assert_eq!(e.read("/src/lib.rs").await, "fn a() {}\n");
+        let missing = e.read_bytes_result("/hello.txt").await.unwrap_err();
+        assert_eq!(missing.code, code::NOT_FOUND);
+        assert_eq!(e.bytes_written(), before_bytes);
+    }
+
+    // ── git.remote_push response shape, pinned on every conditional case ────
+    //
+    // `e2e_new_074_209_210_response_shape_and_idempotency` already pins the
+    // default push with a full-object `assert_eq!`. The tests below extend
+    // that strength to the cases that carry conditional keys, where a subset
+    // assertion would let an unexpected extra key ride along unseen.
+    //
+    // Two assertions per case, because one alone is not enough: `Value`'s
+    // `Map` is an `IndexMap` under serde_json's `preserve_order`, and
+    // `IndexMap`'s `PartialEq` ignores order. So `assert_eq!` pins the key SET
+    // and every value, while `push_keys` pins the EMISSION order, which is
+    // what an LLM reading the response top to bottom actually sees.
+
+    /// The response's keys in emission order, which `assert_eq!` on the whole
+    /// object cannot check (see the block comment above).
+    fn push_keys(out: &Value) -> Vec<&str> {
+        out.as_object()
+            .expect("the push response is an object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The 7 keys every push emits, in emission order.
+    const PUSH_BASE_KEYS: [&str; 7] =
+        ["branch", "remote", "created", "up_to_date", "remote_sha", "auth", "forced"];
+
+    /// A push to a named, non-default remote emits exactly the 7 base keys,
+    /// nothing more: only `remote`'s value differs from a default push.
+    #[tokio::test]
+    async fn a_named_remote_push_emits_exactly_the_base_response_keys() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-shape-named-o");
+        let (_url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+        let remote_dir2 = e.f.dir.path().join("remote-shape-named-up");
+        let url2 = declare_empty_remote(&e, &remote_dir2, "upstream").await;
+
+        let out =
+            call_push_branch_to(&e, "upstream", &url2, "main", None, "anonymous").await.unwrap();
+
+        // sha_c2 comes from the local commit seed_r made, not from the
+        // response, so this compares the reported sha against an
+        // independently known value.
+        assert_eq!(
+            out,
+            json!({
+                "branch": "main", "remote": "upstream", "created": true, "up_to_date": false,
+                "remote_sha": sha_c2, "auth": "anonymous", "forced": false,
+            })
+        );
+        assert_eq!(push_keys(&out), PUSH_BASE_KEYS);
+    }
+
+    /// A forced push that really overwrote something emits the 7 base keys
+    /// then `overwritten_sha`, in that order, and nothing else.
+    #[tokio::test]
+    async fn a_forced_push_emits_the_base_keys_then_overwritten_sha() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-shape-forced").await;
+        let sha_r2 = advance_bare_remote(&remote_dir, "refs/heads/main", "remote-only\n");
+
+        let out = call_push_leased(&e, &url, "main", None, true, Some(&sha_r2)).await.unwrap();
+
+        // `local_tip` is the sha seed_r committed locally and `sha_r2` the sha
+        // advance_bare_remote wrote into the bare repo: both are known before
+        // the push, so neither is asserted against itself.
+        assert_eq!(
+            out,
+            json!({
+                "branch": "main", "remote": "origin", "created": false, "up_to_date": false,
+                "remote_sha": local_tip, "auth": "anonymous", "forced": true,
+                "overwritten_sha": sha_r2,
+            })
+        );
+        assert_eq!(push_keys(&out), [PUSH_BASE_KEYS.as_slice(), &["overwritten_sha"]].concat());
+    }
+
+    /// A forced push that CREATED the remote branch still emits
+    /// `overwritten_sha`, carrying the all-zero sha the caller leased rather
+    /// than null: the key is present on every forced push, without exception.
+    #[tokio::test]
+    async fn a_forced_create_emits_overwritten_sha_as_forty_zeros() {
+        let e = Env::new().await;
+        let (remote_dir, url, local_tip) = seed_r_at(&e, "remote-shape-forced-create").await;
+        // `fresh` does not exist on the remote, so the all-zero lease matches
+        // and the push creates it: `overwritten_sha` has no real prior sha to
+        // report. It reports the zeros anyway.
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/heads/fresh"), None);
+
+        let out =
+            call_push_leased(&e, &url, "main", Some("fresh"), true, Some(ZERO_SHA)).await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({
+                "branch": "main", "remote": "origin", "created": true, "up_to_date": false,
+                "remote_sha": local_tip, "auth": "anonymous", "forced": true,
+                "overwritten_sha": ZERO_SHA, "remote_branch": "fresh",
+            })
+        );
+        // Both conditional keys, in emission order: `overwritten_sha` is
+        // inserted before `remote_branch` because `force` is tested first.
+        assert_eq!(
+            push_keys(&out),
+            [PUSH_BASE_KEYS.as_slice(), &["overwritten_sha", "remote_branch"]].concat()
+        );
+    }
+
+    /// An unforced push under a different remote-side name emits the 7 base
+    /// keys then `remote_branch`, and no `overwritten_sha`.
+    #[tokio::test]
+    async fn a_renamed_remote_branch_push_emits_the_base_keys_then_remote_branch() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-shape-renamed");
+        let (url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+
+        let out = call_push_branch_to(&e, "origin", &url, "main", Some("sandbox"), "anonymous")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out,
+            json!({
+                "branch": "main", "remote": "origin", "created": true, "up_to_date": false,
+                "remote_sha": sha_c2, "auth": "anonymous", "forced": false,
+                "remote_branch": "sandbox",
+            })
+        );
+        assert_eq!(push_keys(&out), [PUSH_BASE_KEYS.as_slice(), &["remote_branch"]].concat());
+    }
+
+    /// `remote_branch` is emitted on a VALUE comparison, not on whether the
+    /// caller passed the parameter: passing it explicitly equal to the local
+    /// branch name yields the plain 7-key shape, with no `remote_branch` key.
+    /// Nothing else covers this, and it is the one sub-case where the response
+    /// cannot be predicted from the request's parameter list alone.
+    #[tokio::test]
+    async fn passing_remote_branch_equal_to_the_local_branch_omits_the_key() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-shape-same-name");
+        let (url, _sha_r1, sha_c2) = seed_r(&e, &remote_dir).await;
+
+        let out = call_push_branch_to(&e, "origin", &url, "main", Some("main"), "anonymous")
+            .await
+            .unwrap();
+
+        assert!(
+            out.get("remote_branch").is_none(),
+            "remote_branch must be absent when it equals the local branch: {out}"
+        );
+        assert_eq!(
+            out,
+            json!({
+                "branch": "main", "remote": "origin", "created": false, "up_to_date": false,
+                "remote_sha": sha_c2, "auth": "anonymous", "forced": false,
+            })
+        );
+        assert_eq!(push_keys(&out), PUSH_BASE_KEYS);
     }
 }

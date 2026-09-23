@@ -38,7 +38,7 @@ an LLM facing contract regardless of where it came from. It is frozen in two pla
 
 | File | Role |
 |---|---|
-| `TOOL_CONTRACT.txt` | human readable reference for the 63 tools, their parameters and return shapes |
+| `TOOL_CONTRACT.txt` | human readable reference for the 94 tools, their parameters and return shapes |
 | `tool-contract-golden.json` | machine checked snapshot: names, descriptions and `inputSchema`, compared on every test run |
 
 Three tests enforce it (`tools/mod.rs`, `tools/all.rs`, `tools/contract_golden.rs`),
@@ -171,6 +171,31 @@ one document.
   its sibling `axb`, so a subtree delete could remove unrelated rows. All three route
   through one `descendant_pattern` helper that escapes `\`, `%`, `_` and, on SQL Server,
   `[`.
+* A conflict is a SUCCESS, not an error. The pull's only conflict path used to be
+  `ToolError::internal("the merge left unresolved conflicts that 'ours'/'theirs' cannot
+  represent")`, so there was no conflict response to copy anywhere in the tree (DRIFT-001).
+  `git.merge` introduces it as new code: `Ok` carrying `status: "conflict"`, both sides'
+  content per file, and the completion pair named in the response, with nothing applied to
+  the volume. The pull keeps its own error until its rework.
+* Every combine response is a Rust type in `git/merge.rs`, never a hand built `json!` per
+  call site: the field names of the conflict response drifted four times between
+  requirements and tests before they were pinned, so a single serializer turns that class
+  of drift into a compile error. `conflicting_paths`, `resolve_with`, `step`, `target_ref`,
+  `present`, `size`, `commit_sha` and `parents` are emitted by no tool.
+* A refused atomic apply gives the write quota back (`merge::charge_and_apply`, 2026-09-22).
+  The charge has to come first so an over-quota operation is rejected before a byte moves,
+  but pass 1 of the apply pre-checks every target, so a refusal there provably wrote
+  nothing and must not consume quota: charge, apply, refund on error. `SafetyManager::
+  refund_write` is clamped at zero and is sound ONLY behind that pre-check.
+* `git.merge_resolve` writes every resolved path, including the ones whose resolved bytes
+  already equal the tip's (a `ours` strategy on a file only the other side changed), so
+  `files_changed` counts every file the resolution settled rather than only the volume
+  delta. The caller stated the final content of those files; the volume is made to match
+  it explicitly instead of trusted to already.
+* The `git_operations` row of a paused merge pins the SOURCE commit sha in `onto_sha`, not
+  the tip (which `original_tip_sha` already holds). The resolve happens in a later call,
+  possibly after a restart and after the source branch moved, and it must finish the merge
+  that was actually reported.
 * `fs.move` with `overwrite: true` replaces the destination and GCs what it referenced; the
   flag used to be dead code.
 * Listing a file is `ERR_INVALID_ARGUMENT`, because inventing an empty directory hides a
@@ -179,3 +204,22 @@ one document.
 * `is_owner` and `is_admin` are computed caselessly, matching the checks that authorize.
 * Generated `.docx` keeps numbered list markers and renders fenced code as monospaced
   paragraphs.
+* A cherry-pick reports `already_present` for BOTH ways a change can already be in the
+  branch: the commit is an ancestor (by sha) and replaying it yields the tree the branch
+  already has (by content). The story's own test bodies spelled those two as
+  `already_applied` and `empty` with a `message` key; the specification's response table
+  fixes the key set at `status`, `new_sha`, `source_sha` and the status set at `committed`,
+  `conflict`, `already_present`, and the table wins. Both cases mean the same thing to a
+  caller: no commit was created and none should be.
+* Resuming a conflicted `git.stash_apply` / `git.stash_pop` through `git.merge_resolve`
+  creates NO commit and moves NO ref (DRIFT 2026-09-22, closed 2026-09-23). Both stash op
+  types report `continue_with() == "git.merge_resolve"` because a stash application IS a
+  three way merge against HEAD, but that speaks to the ALGORITHM, not to committing the
+  result: a stash holds uncommitted work. The completion path therefore branches on
+  `row.op_type`, the value `require_merge_operation` already validated, so nothing new is
+  threaded through the pause and a restart mid conflict still resolves correctly. The
+  response stays `merge::ResolveResponse`: `status` is the `applied` the non conflicting
+  stash tools return, and `merge_commit` is null rather than a fabricated sha, which the
+  field already allowed since the partial response uses it. A resolved POP drops its entry
+  there, after every resolved byte has landed, which is the same charge, apply, drop order
+  the clean pop uses; the conflicted pop deliberately deferred that delete (E2E-NEW-463).

@@ -2,7 +2,7 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (63 tools: 35 `fs.*`, 10 `admin.*`, 14 `git.*`, 4 `git.auth*`;
+multi-project filesystem** (94 tools: 35 `fs.*`, 10 `admin.*`, 39 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
 + 4 `search.*` when search enabled),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/` with push,
@@ -78,14 +78,21 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
 - `tools/` : one module per family, each `register(&mut ToolRegistry)`. `all.rs` has
   `register_all`.
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
-- `git/` : `db.rs` (SQLite index), `odb.rs` (objects in the blob store under `git:{sha}`),
+- `git/` : `db.rs` (SQLite index, plus the `git_operations` row that persists a paused
+  combine operation), `merge.rs` (the shared merge engine: one three way merge, one atomic
+  volume apply, one quota charge, and the response TYPES every combine operation
+  serializes through, so a wire shape disagreement fails to compile),
+  `odb.rs` (objects in the blob store under `git:{sha}`),
   `repo.rs` (per project repository + write lock), `http/` (pkt-line, upload-pack,
-  receive-pack), `oauth/` (store, AES-GCM cipher, encrypted persistence, device flow).
+  receive-pack), `oauth/` (store, AES-GCM cipher, encrypted persistence, device flow),
+  `provider/` (the pull request seam: host to provider and API base resolution, the
+  injectable `ProviderClient`, the transport safety rules, and `model.rs`, the ONE
+  normalized pull request object every `git.pr_*` tool returns).
 - `crates/agent/` : the interactive CLI agent (an MCP **client**, not part of the server).
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 63 tool schemas and return shapes, human readable. **This is
+- `TOOL_CONTRACT.txt` : the 94 tool schemas and return shapes, human readable. **This is
   the authoritative contract.**
 - `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
   every name, description and `inputSchema` against it, serialized, so a reordered schema
@@ -147,16 +154,19 @@ in the push report, membership enforced on git routes, `max_pack_size_mb` enforc
 objects really indexed, no custom libgit2 ODB backend (blob store is the source of truth,
 bytes identical), `ERR_NOT_SUPPORTED` for an unsupported extraction format, numbered list
 markers kept in generated docx, `volume_id` multi tenancy, dialect binary typing for the
-OAuth token, and `TextKey(n)` bounded keys (SQL Server cannot index `NVARCHAR(MAX)`, so
+OAuth token, a merge conflict being an `Ok` response carrying `status: "conflict"` rather
+than an error (with every combine response serialized through the types in
+`git/merge.rs`, never a hand built `json!`), and `TextKey(n)` bounded keys (SQL Server cannot index `NVARCHAR(MAX)`, so
 keyed text has a length ceiling there).
 
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
-- `.agent_docs/tools.md` : the 63 tool reference (families, parameters, authorization).
+- `.agent_docs/tools.md` : the 94 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, the
   `git.hosts` host map, OAuth/PAT tokens (per person+host), the remote pipeline
-  (URL validation, credential supply, clone/push/fetch/pull), the `/app/tokens` screen.
+  (URL validation, credential supply, clone/push/fetch/pull), the `/app/tokens` screen,
+  the `git.pr_*` surface and the normalized pull request model.
 - `.agent_docs/config.md` : full YAML schema, backends and dsn, resolution order, secrets.
 - `.agent_docs/backends.md` : the relational layer, adding a backend, dialect checklist,
   and the SQL Server driver decision record (read before touching `rel/sqlserver.rs`).

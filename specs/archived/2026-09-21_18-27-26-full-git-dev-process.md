@@ -1394,13 +1394,14 @@ wins**, and the superseded text has been corrected in place.
 | `git.pr_create`, `git.pr_get`, `git.pr_merge`, `git.pr_review` | the normalized pull-request object of FR-NEW-317 |
 | `git.pr_list` | `pull_requests` (array of the FR-NEW-317 object minus `commits`, `changed_files`, `additions`, `deletions`, `mergeable`), `count` |
 | `git.pr_diff` | `pr_number`, `diff`, `truncated` |
-| `git.remote_push` | `branch`, `remote`, `remote_branch`, `created`, `up_to_date`, `forced`, `overwritten_sha`, `new_sha` |
+| `git.remote_push` | `branch`, `remote`, `remote_branch`, `created`, `up_to_date`, `forced`, `overwritten_sha`, `remote_sha`, `auth` |
 
 - **Business Rules:**
   - Any operation that can conflict returns, INSTEAD of the keys above, the conflict response of FR-NEW-186 when it conflicts. The two shapes are distinguished by `status`.
   - `status` values are closed per tool: `git.merge` is one of `merged`, `conflict`, `already_up_to_date`; `git.rebase` and `git.rebase_continue` are one of `completed`, `conflict`, `up_to_date`; `git.cherry_pick` and `git.revert` and their continuations are one of `committed`, `conflict`, `already_present`; `git.stash_apply` and `git.stash_pop` are one of `applied`, `conflict`; every abort tool returns exactly `aborted`.
   - `remaining_conflicts` is ALWAYS an array of path strings, never a count, in every tool and every object that carries it, including the `operation` object of FR-NEW-281.
-  - `overwritten_sha` is `null` unless the push was forced; `merge_commit` is `null` when `status` is `already_up_to_date`; `restored_sha` is the exact pre-operation tip an abort restored.
+  - AMENDED post-implementation: `git.remote_push` reports `remote_sha`, not `new_sha`. The name states whose sha it is and pairs with `overwritten_sha`; `new_sha` remains correct for the four local-history tools (`branch_reset`, `cherry_pick`, `reset`, `revert`), where the sha is newly created rather than observed on a remote. The response also carries `auth`, the credential CLASS used (`anonymous`, `github`, `gitlab`, `generic`, `unknown`), never a credential value. `remote_branch` and `overwritten_sha` are emitted only when applicable; `remote` is unconditional, since it always has a value (`origin` by default).
+  - `overwritten_sha` is OMITTED, not null, unless the push was forced: the shipped tools drop an inapplicable key rather than emitting a null, and `e2e_new_828`/`e2e_new_832` assert its absence. The same holds for `remote_branch`, omitted unless the effective remote branch differs from the local one. `merge_commit` IS null (not omitted) when `status` is `already_up_to_date`, and is null on a stash completion, which creates no commit. `restored_sha` is the exact pre-operation tip an abort restored.
   - The keys `commit_sha` and `parents` are emitted by no tool in this specification: a commit's parent count is asserted on the commit object read back through `git.show`, not on the operation's response.
   - This table is authoritative. Where any earlier Outputs line or any Section 12 assertion names a different key for one of these tools, this table wins and the other text is read as superseded.
 - **Priority:** Must-have
@@ -9219,5 +9220,5 @@ the conflict reporting is new code, not an extraction).
 - **Resolution during implementation:** build the conflict-success response once, as new code, per FR-NEW-186, and route all six combine operations through it. Do not treat `git.rs:1844` as a template: it is the error path being replaced. The three-way merge itself (`git.rs:1835-1839`) and `apply_pull_changes_atomically` (`:2079-2127`) are the reusable parts; the conflict reporting is not.
 - **Detected by:** `E2E-NEW-462` and every conflict test in band B fail against the current code, which returns `ERR_INTERNAL_ERROR` where the spec requires an `Ok` response carrying `status: "conflict"`.
 - **Blocks which requirement:** FR-NEW-170, FR-NEW-186, and every requirement depending on the conflict model.
-- **Status:** open
+- **Status:** resolved (`e2e_new_462_a_conflicting_stash_apply_writes_nothing`, green in the suite at commit e29e60e; the conflict-success response was built as new code in `crates/mcp-fs/src/git/merge.rs` as `ConflictResponse`, and the error path this entry warned against reusing is gone from the tree, 0 occurrences)
 

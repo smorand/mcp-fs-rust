@@ -1,4 +1,4 @@
-# Tool reference (63 tools)
+# Tool reference (94 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -154,13 +154,18 @@ rolls the ACL row back if provisioning fails. Deletion also purges
 `state/git/{id}.db` and the bare repo directory when git is enabled, so a
 recreated id never inherits stale refs.
 
-## git (14, registered only when `git.enabled`)
+## git (39, registered only when `git.enabled`)
 
 | Tool | Purpose | Parameters | Returns | Auth |
 |---|---|---|---|---|
 | `git.init` | make the volume a git repository | (`mount_id`) | `mount_id`, `initialized`, `message` | member |
-| `git.status` | HEAD, branch, refs | (`mount_id`) | `mount_id`, `head`, `branch`, `refs[{name, sha}]` | member |
-| `git.branches` | branches with their sha | (`mount_id`) | `mount_id`, `branches[{name, full_ref, sha}]` | member |
+| `git.status` | HEAD, branch, refs, in-progress operation | (`mount_id`) | `mount_id`, `head`, `branch`, `refs[{name, sha}]`, `operation` (null, or `{op_type, source_ref, current_step, total_steps, remaining_conflicts[], continue_with, abort_with}`) | member |
+| `git.branches` | branches with their sha, the current marker and the divergence against `refs/remotes/origin/{name}` | (`mount_id`) | `mount_id`, `branches[{name, full_ref, sha, current, upstream, ahead, behind}]` (`upstream`/`ahead`/`behind` are null with no tracking ref, never 0) | member |
+| `git.branch_create` | create a branch at a start point | `name`, `start_point=""`, `checkout:bool=false` | `branch`, `sha`, `checked_out` | member |
+| `git.branch_switch` | move HEAD to an existing branch and rewrite the volume to its tree; refuses a dirty volume | `name` | `branch`, `sha`, `changed`, `files_changed` | member |
+| `git.branch_delete` | remove `refs/heads/{name}`; refuses the checked-out branch, and an unmerged one without `force` | `name`, `force:bool=false` | `branch`, `sha`, `forced` | member |
+| `git.branch_reset` | force-move a branch pointer; rewrites the volume only for the checked-out branch | `name`, `target_commit`, `force:bool=false` | `branch`, `old_sha`, `new_sha`, `checked_out`, `files_changed` | member |
+| `git.reset` | move the CURRENT branch's pointer; `soft` moves the ref alone and never touches the volume (`hard` rewrites the volume, US-018) | `target_ref`, `mode` (`soft`\|`hard`, required, no `mixed`) | `mode`, `old_sha`, `new_sha`, `files_changed` (0 for soft) | member |
 | `git.tags` | tags | (`mount_id`) | `mount_id`, `tags[{name, full_ref, sha}]` | member |
 | `git.log` | commits from a ref | `ref_name=null`, `limit:int=20`, `path=null` | `mount_id`, `commits[]` | member |
 | `git.show` | one commit plus its diff | `commit_sha` | `commit{}`, `diff` | member |
@@ -168,10 +173,52 @@ recreated id never inherits stale refs.
 | `git.commit` | commit the current volume state | `message`, `author_name=null`, `author_email=null` | `commit_sha`, `message`, `author`, `timestamp` | member |
 | `git.checkout_file` | restore a file from a commit | `commit_sha`, `path` | `path`, `commit`, `size` | member |
 | `git.blame` | last change per line | `path`, `ref_name=null` | `path`, `lines[{line, commit, author, email, date}]` | member |
+| `git.merge` | merge a ref into the checked-out branch, surfacing conflicts | `source_ref`, `squash:bool=false`, `message=null` | `status` (`merged`\|`already_up_to_date`), `merge_commit`, `fast_forward`, `squashed`, `files_changed`; on a conflict the shape below instead | member |
+| `git.merge_resolve` | finish a conflicted merge, per file by strategy or by literal content | `resolutions[{path, strategy?, content?}]` | `status` (`merged`\|`conflict`), `merge_commit`, `remaining_conflicts[]`, `resolved_count`, `files_changed` | member |
+| `git.merge_abort` | abandon a conflicted merge, discarding every recorded resolution | (`mount_id`) | `status` (`aborted`), `operation` | member |
+| `git.rebase` | validate an interactive rebase plan and replay it onto another commit; the whole todo is checked before any commit is created | `onto`, `todo[{action, sha, message?}]` | `status` (`up_to_date`), `branch`, `new_tip`, `replayed`, `dropped`, `squashed` | member |
+| `git.rebase_continue` | resume the paused rebase once every conflicting path of the paused commit is resolved | `resolutions[{path, strategy?, content?}]?` | the `git.rebase` shape, or the conflict shape when it pauses again | member |
+| `git.rebase_abort` | abandon the paused rebase, restoring the branch exactly | (`mount_id`) | `status` (`aborted`), `operation` | member |
+| `git.cherry_pick` | apply one commit's change onto the checked-out branch as a NEW commit, keeping the original author | `commit_sha`, `mainline:int=0` | `status` (`committed`\|`already_present`), `new_sha` (null when nothing was created), `source_sha`; on a conflict the shared conflict shape instead | member |
+| `git.cherry_pick_continue` | finish the paused cherry-pick, per file by strategy or by literal content | `resolutions[{path, strategy?, content?}]?` | `status` (`committed`), `new_sha`, `source_sha` | member |
+| `git.cherry_pick_abort` | abandon the paused cherry-pick, restoring the branch and every byte | (`mount_id`) | `status` (`aborted`), `operation`, `restored_sha` | member |
+| `git.revert` | undo one commit by adding a NEW commit carrying the exact inverse change, leaving the original in history | `commit_sha`, `mainline:int=0` | `status` (`committed`\|`already_present`), `new_sha` (null when nothing was created), `reverted_sha`; on a conflict the shared conflict shape instead | member |
+| `git.revert_continue` | finish the paused revert, per file by strategy or by literal content | `resolutions[{path, strategy?, content?}]?` | `status` (`committed`), `new_sha`, `reverted_sha` | member |
+| `git.revert_abort` | abandon the paused revert, restoring the branch and every byte | (`mount_id`) | `status` (`aborted`), `operation`, `restored_sha` | member |
+| `git.stash_save` | snapshot the dirty volume as a commit under `refs/stash/*`, then revert the volume to HEAD's tree | `message=null` | `stash_id`, `sha`, `message`, `base_sha`, `branch`, `created_at`, `files_stashed` | member |
+| `git.stash_list` | every stash entry of the volume, newest first; read only, so it works while an operation is in progress | (`mount_id`) | `mount_id`, `stashes[{stash_id, message, base_sha, branch, created_at}]`, `count` | member |
+| `git.stash_drop` | delete one entry by id; the volume and the commit object are untouched | `stash_id` | `stash_id`, `dropped` | member |
+| `git.stash_apply` | replay one entry onto whatever is checked out now, keeping the entry | `stash_id` | `stash_id`, `status` (`applied`\|`conflict`), `files_changed`, `dropped` (always `false`); on a conflict the shared conflict shape carries those keys too | member |
+| `git.stash_pop` | the same replay, deleting the entry only once every byte has landed; a conflict keeps it and reports `dropped: false` | `stash_id` | `stash_id`, `status`, `files_changed`, `dropped` | member |
+| `git.remote_add` | record a named remote; https only, no embedded credential, host declared in `git.hosts`; a duplicate name is refused, never upserted | `name`, `url` | `name`, `url`, `host`, `provider` | member |
+| `git.remote_remove` | delete a remote and every ref under `refs/remotes/{name}/`; an unknown name is `ERR_NOT_FOUND`, never a silent no-op | `name` | `name`, `removed` | member |
+| `git.remote_list` | every remote of the volume, empty list when there is none; read-only, so it stays available while an operation is paused | (`mount_id`) | `mount_id`, `remotes[{name, url, host, provider}]`, `count` | member |
 | `git.remote_clone` | clone a remote into the volume | `url`, `branch=null`, `depth:int=0` | `mount_id`, `url`, `branch`, `commit`, `commit_message`, `files_imported`, `commits_imported`, `depth`, `auth`, `skipped?` | member |
-| `git.remote_push` | push a local branch to `origin`, fast-forward only, no force | `branch` | push outcome: remote sha, `created`, `up_to_date` | member |
+| `git.remote_push` | push a local branch to a named remote, fast-forward unless a lease is supplied | `branch`, `remote` (default `origin`), `remote_branch`, `force`, `expected_remote_sha` | `branch`, `remote`, `created`, `up_to_date`, `remote_sha`, `auth` (credential class, never a value), `forced`; plus `overwritten_sha` when forced and `remote_branch` when it differs from the local name | member |
 | `git.remote_fetch` | fetch objects, update `refs/remotes/origin/*` only, never a working file | (`mount_id`) | updated refs, `refs_stale[]`, objects downloaded | member |
-| `git.remote_pull` | fetch, then fast-forward or (with `on_conflict`) three-way merge the checked-out branch | `branch`, `on_conflict=null` (`ours`\|`theirs`) | fast-forward or merge outcome | member |
+| `git.remote_pull` | fetch, then fast-forward or three-way merge the checked-out branch; a conflict pauses as a `merge` | `branch` | fast-forward, merge outcome, or the shared conflict response | member |
+
+Every combine operation reports a conflict with one shape: `{status:
+"conflict", operation, operation_id, source_ref, current_step, total_steps,
+conflicts[{path, ours, theirs, base, binary, type_change}], continue_with,
+abort_with}`, where each of `ours`, `theirs` and `base` is `{exists, content}`
+and `content` is null for a deleted or binary side. `current_step` and
+`total_steps` are zero-based and null for a single step operation. A conflict
+applies nothing: no file, no commit, no ref move, and never a conflict marker
+in the volume.
+
+A conflict is finished with `git.merge_resolve` or abandoned with
+`git.merge_abort` (the pair `continue_with`/`abort_with` names). Each
+resolution carries exactly one of `strategy` (`ours`, the checked-out branch's
+side, or `theirs`, the side being merged in, each taken whole) or `content`
+(the literal bytes, which is how a caller merges the two sides itself); an
+empty `content` is a valid resolution to an empty file, a missing one is an
+error. A call is all-or-nothing: a path that is not in conflict, a duplicate
+path, an unknown strategy or an empty list rejects the whole call and changes
+nothing. Resolving only some paths keeps the operation in progress, records
+the decisions in the `git_operations` row (so they survive a restart) and
+writes nothing to the volume; resolving the last one charges the write quota,
+applies every resulting file atomically and only then advances the ref.
 
 A commit object is `{sha, short_sha, message, author, author_email, timestamp,
 date, parents[]}`. `git.remote_clone` uses the OAuth token stored for the
@@ -179,7 +226,7 @@ detected provider/host when there is one; an empty remote returns
 `{mount_id, url, files_imported: 0, message}`. `git.remote_push`,
 `git.remote_fetch` and `git.remote_pull` take no `url`: they resolve the
 volume's stored `origin`. See [`git.md`](git.md) for the full remote pipeline,
-the `git.hosts` host map and the `on_conflict` merge semantics.
+the `git.hosts` host map and the pull merge semantics.
 
 ## git.auth (4, registered only when `git.enabled`)
 
@@ -194,6 +241,27 @@ the `git.hosts` host map and the `on_conflict` merge semantics.
 polls the token endpoint, so the client waits by calling `git.auth_status`. A
 token belongs to a person plus host (not provider alone, and not a mount): see
 [`git.md`](git.md#token-identity-is-per-person-host).
+
+## git.pr (6, registered only when `git.enabled`)
+
+| Tool | Purpose | Parameters | Returns | Auth |
+|---|---|---|---|---|
+| `git.pr_create` | open a pull request (GitHub) or merge request (GitLab) on a declared remote | `mount_id`, `base`, `head`, `title`, `body=null`, `draft=false`, `remote=origin` | the normalized pull request (21 keys, see below) | member |
+| `git.pr_list` | list the pull requests of a declared remote, filtered by state | `mount_id`, `state=open` (`open`\|`closed`\|`merged`\|`all`), `remote=origin` | `pull_requests[]` of the normalized shape, plus `count` | member |
+| `git.pr_get` | read one pull request, enriched with its review state and its check state; an unknown state is a failure, never `none` | `mount_id`, `pr_number`, `remote=origin` | the normalized pull request | member |
+| `git.pr_diff` | read the unified diff of one pull request, bounded by `git.max_pr_diff_mb` | `mount_id`, `pr_number`, `remote=origin` | `diff`, `truncated`, plus the pull request identity | member |
+| `git.pr_merge` | merge a pull request on the provider with `merge`, `squash` or `rebase` | `mount_id`, `pr_number`, `strategy`, `commit_title=null`, `commit_message=null`, `remote=origin` | the normalized pull request in state `merged`, plus `note` naming `git.remote_fetch` | member |
+| `git.pr_review` | submit a review verdict: `approve`, `request_changes` or `comment`; a provider refusal is surfaced as the provider's own status and message | `mount_id`, `pr_number`, `verdict`, `body=null`, `remote=origin` | the submitted review, plus the pull request identity | member |
+
+Every `git.pr_*` tool returns ONE shape, defined once in
+`git/provider/model.rs` as `PullRequest`, in this key order: `provider`, `host`,
+`number`, `title`, `body`, `state` (`open`/`closed`/`merged`), `draft` (a
+separate boolean, never folded into `state`), `base`, `head`, `author`, `url`,
+`created_at`, `updated_at`, `commits`, `changed_files`, `additions`,
+`deletions`, `review_state`, `checks_state`, `mergeable` (tri state: `true`,
+`false`, `null` when the provider has not computed it), `raw` (the provider
+payload untouched, already scrubbed of the credential). Details and the mapping
+rules: [`git.md`](git.md#the-pull-request-surface-gitpr_-us-025).
 
 ## Authorization model
 
