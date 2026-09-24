@@ -1,11 +1,11 @@
 # User Stories Index
 
-> Source Specification: `specs/2026-09-21_18-27-26-full-git-dev-process.md`
-> Nature: FEAT
+> Source Specification: `specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md`
+> Nature: DEBT
 > Depth: L
-> Generated on: 2026-09-21
+> Generated on: 2026-09-24
 > Target tier: 2 (standard frontier), resolved from the default (no `--tier` flag, no `.spec.json`)
-> Total: 31 stories in 0 epics (epics collapse into the story at tier 2)
+> Total: 11 stories in 0 epics (epics collapse into the story at tier 2)
 
 ## Slicing Verdict
 
@@ -13,117 +13,101 @@
 |---|---|
 | Verdict | **SLICEABLE** |
 | Epics refused at this tier | none |
-| Carried drift entries | `DRIFT-001` homed into US-002, the story implementing the requirement it blocks, rather than a standalone head-of-backlog story (agreed with the user; a standalone drift story here would have nothing to verify) |
-| Source spec audit verdict | `NOT-IMPLEMENTABLE` at round 4, with all four findings closed and the root cause fixed by `FR-NEW-199`. See the concern note below. |
+| Carried drift entries | none — the spec's own drift register (`DDRIFT-001`) is already `Status: resolved` in the source spec; nothing open to carry |
 
 ## Implementation Order
 
-| Order | ID | Epic | Title | FRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
+| Order | ID | Epic | Title | DRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
 |-------|----|----|-------|-----|-----------|-------|-------|------------|----------|--------|
-| 1 | US-001 | n/a | git_operations table, state model and purge registration | 7 | 1 | 1 | 2 | — | 2 | done |
-| 2 | US-002 | n/a | Shared merge engine and git.merge, with the conflict response contract | 15 | 4 | 36 | 2 | US-001 | 2 | done |
-| 3 | US-003 | n/a | git.merge_resolve, git.merge_abort and resolution mechanics | 11 | 6 | 30 | 1 | US-002 | 2 | done |
-| 4 | US-004 | n/a | Conflict edge semantics: delete/modify, both-deleted, binary, type change | 4 | 2 | 13 | 1 | US-003 | 2 | done |
-| 5 | US-005 | n/a | In-progress guard and git.status operation reporting | 5 | 2 | 8 | 2 | US-003 | 2 | done |
-| 6 | US-006 | n/a | Squash merge | 1 | 1 | 5 | 1 | US-002 | 2 | done |
-| 7 | US-007 | n/a | git.remote_pull on the shared conflict model, on_conflict removed | 3 | 4 | 22 | 2 | US-003, US-004 | 2 | done |
-| 8 | US-008 | n/a | Branch creation and ref-name validation | 7 | 1 | 11 | 1 | US-005 | 2 | done |
-| 9 | US-009 | n/a | Branch switch and the dirty-volume guard | 3 | 2 | 14 | 1 | US-008 | 2 | done |
-| 10 | US-010 | n/a | Branch delete, branch_reset and tracking divergence | 8 | 2 | 14 | 1 | US-009 | 2 | done |
-| 11 | US-011 | n/a | Stash save, list and drop | 8 | 1 | 20 | 2 | US-009 | 2 | done |
-| 12 | US-012 | n/a | Stash apply and pop, with the conflict path | 5 | 2 | 13 | 1 | US-003, US-011 | 2 | done |
-| 13 | US-013 | n/a | Rebase todo validation and planning | 5 | 3 | 25 | 2 | US-005 | 2 | done |
-| 14 | US-014 | n/a | Rebase execution: pick, squash, drop, reword | 5 | 4 | 15 | 1 | US-013 | 2 | done |
-| 15 | US-015 | n/a | Rebase pause, continue and abort | 7 | 5 | 23 | 1 | US-003, US-014 | 2 | done |
-| 16 | US-016 | n/a | Cherry-pick with continue and abort | 6 | 3 | 27 | 1 | US-003, US-015 | 2 | done |
-| 17 | US-017 | n/a | git.reset soft: pointer-only move | 4 | 4 | 10 | 1 | US-005 | 2 | done |
-| 18 | US-018 | n/a | git.reset hard: volume rewrite and orphaning | 2 | 6 | 16 | 1 | US-017 | 2 | done |
-| 19 | US-019 | n/a | git.revert, including merge commits and the conflict path | 7 | 4 | 25 | 1 | US-003, US-017 | 2 | done |
-| 20 | US-020 | n/a | Remote add, remove and list | 6 | 1 | 14 | 2 | US-005 | 2 | done |
-| 21 | US-021 | n/a | Named remotes on push, fetch and pull, with local:remote refspec | 5 | 3 | 13 | 2 | US-020 | 2 | done |
-| 22 | US-022 | n/a | Force push with a mandatory lease | 6 | 6 | 28 | 2 | US-021 | 2 | done |
-| 23 | US-023 | n/a | OAuth scope request, validation and reporting | 7 | 5 | 17 | 4 | — | 2 | done |
-| 24 | US-024 | n/a | Provider client seam, base URL resolution and transport safety | 6 | 3 | 14 | 4 | US-023 | 2 | done |
-| 25 | US-025 | n/a | git.pr_create and the normalized pull-request model | 4 | 2 | 18 | 2 | US-024 | 2 | done |
-| 26 | US-026 | n/a | git.pr_list with state filtering | 1 | 2 | 15 | 2 | US-025 | 2 | done |
-| 27 | US-027 | n/a | git.pr_get and git.pr_diff | 3 | 1 | 14 | 2 | US-025 | 2 | done |
-| 28 | US-028 | n/a | git.pr_merge with provider refusals surfaced | 2 | 3 | 19 | 2 | US-027 | 2 | done |
-| 29 | US-029 | n/a | git.pr_review | 2 | 3 | 17 | 2 | US-027 | 2 | done |
-| 30 | US-030 | n/a | Tool registration, frozen contract and count assertions | 4 | 4 | 15 | 4 | US-029 | 2 | done |
-| 31 | US-031 | n/a | Blanket authorization coverage and documentation parity | 3 | 11 | 24 | 4 | US-030 | 2 | done |
+| 1 | US-001 | n/a | Tool annotations schema infrastructure | DR-006, DR-007 | n/a | DT-001, DT-002 | 1 | — | 2 | todo |
+| 2 | US-002 | n/a | Contract golden annotation awareness | DR-008 | n/a | DT-005 (prepared) | 1 | US-001 | 2 | todo |
+| 3 | US-003 | n/a | Annotate admin, context7, db tools (17) | DR-001..005 (subset) | n/a | 1 | 3 | US-001 | 2 | todo |
+| 4 | US-004 | n/a | Annotate doc, document, edit tools (10) | DR-001..005 (subset) | n/a | 1 | 3 | US-001 | 2 | todo |
+| 5 | US-005 | n/a | Annotate editor, git_auth, git_pr tools (13) | DR-001..005 (subset) | n/a | 1 | 3 | US-001 | 2 | todo |
+| 6 | US-006 | n/a | Annotate listing, metadata, read tools (13) | DR-001, DR-005 | n/a | 1 | 3 | US-001 | 2 | todo |
+| 7 | US-007 | n/a | Annotate search, search_semantic, sqlite tools (16) | DR-001..005 (subset) | n/a | 1 | 3 | US-001 | 2 | todo |
+| 8 | US-008 | n/a | Annotate web, write, lifecycle tools (15) | DR-001..005 (subset) | n/a | 1 | 3 | US-001 | 2 | todo |
+| 9 | US-009 | n/a | Annotate git.rs tools (39) | DR-001..005 (subset) | n/a | 2 | 1 | US-001 | 2 | todo |
+| 10 | US-010 | n/a | Registry-wide annotation invariant tests | (test-only) | n/a | DT-003, DT-004 | 1 | US-003, US-004, US-005, US-006, US-007, US-008, US-009 | 2 | todo |
+| 11 | US-011 | n/a | Regenerate golden contract and update docs | DR-008 (completion) | n/a | DT-005 (completion) | 3 | US-010 | 2 | todo |
 
 ## Dependency Graph
 
 ```
-US-001 (git_operations table)
-  └─ US-002 (merge engine + git.merge + conflict contract)   <- carries DRIFT-001
-       ├─ US-003 (merge_resolve/abort + resolution mechanics)
-       │    ├─ US-004 (conflict edge semantics)
-       │    │    └─ US-007 (remote_pull rework, on_conflict removed)
-       │    └─ US-005 (in-progress guard + git.status)
-       │         ├─ US-008 -> US-009 -> US-010   (branch create / switch / delete+reset)
-       │         │                └─ US-011 -> US-012   (stash save-list-drop / apply-pop)
-       │         ├─ US-013 -> US-014 -> US-015 -> US-016 (rebase plan / exec / pause / cherry-pick)
-       │         ├─ US-017 -> US-018   (reset soft / reset hard)
-       │         │        └─ US-019   (revert)
-       │         └─ US-020 -> US-021 -> US-022   (remotes / named remotes / force-push lease)
-       └─ US-006 (squash merge)
-
-US-023 (OAuth scope)          <- second dependency-free entry point, parallel track
-  └─ US-024 (provider client seam)
-       └─ US-025 (pr_create + normalized model)
-            ├─ US-026 (pr_list)
-            └─ US-027 (pr_get + pr_diff)
-                 ├─ US-028 (pr_merge)
-                 └─ US-029 (pr_review)
-                      └─ US-030 (registration + contract + counts)
-                           └─ US-031 (blanket authz + docs parity)
+US-001 (schema infra)
+  ├── US-002 (contract golden awareness)
+  ├── US-003 (admin/context7/db)      ─┐
+  ├── US-004 (doc/document/edit)       │
+  ├── US-005 (editor/git_auth/git_pr)  ├── all feed → US-010 (registry-wide invariants)
+  ├── US-006 (listing/metadata/read)   │                  │
+  ├── US-007 (search/search_semantic/sqlite)              │
+  ├── US-008 (web/write/lifecycle)     │                  │
+  └── US-009 (git.rs)                 ─┘                  │
+                                                            ▼
+                                              US-011 (golden regen + docs)
+                                              [also depends on US-002 for
+                                               contract_golden.rs readiness]
 ```
-
-Two dependency-free entry points: **US-001** (git core) and **US-023** (OAuth/provider track). They
-touch disjoint files and can proceed in parallel; they converge only at US-030.
 
 ## Coverage Verification (Phase 5 gate)
 
-- Requirements in spec (`FR-`): **162** | assigned: **162** | unassigned: **none** | duplicated: **none**
-- Tests in spec (`E2E-`): **536** | assigned: **536** | unassigned: **none** | duplicated: **none**
-- Scenarios in spec: **30** | covered: **30** | uncovered: **none**
-- SC-orphan FRs homed: **18** (the wire-shape contract group added at audit, plus `FR-NEW-276`/`348`/`349`/`218`/`222`) — homed into US-001, US-002, US-003, US-030 and US-031, all ahead of their consumers
-- Matrix-unassigned tests homed: **143** (26% of the suite: the `E2E-MOD`/`E2E-DEL` delta set and the whole `E2E-NEW-800..961` gap-closure band)
-- Floor check: **0 violations** — no story's tests invoke a tool built by a later story
-- File budget (tier 2: 3-5): max **4**, no breach
+- Requirements in spec (`DR-`): 8 total (DR-001..DR-008).
+  - DR-006, DR-007 → US-001 (exactly one story each).
+  - DR-008 → US-002 (infrastructure) and US-011 (completion/exercise). This
+    single requirement spans two stories by design: US-002 prepares the
+    mechanism, US-011 is where the golden file is actually regenerated and the
+    gate turns green. Both stories cite DR-008's EARS text verbatim.
+  - DR-001, DR-002, DR-003, DR-004, DR-005 → these five rules are the
+    classification system applied identically across every one of the seven
+    tool-annotation stories (US-003 through US-009), because each rule spans
+    all 123 tools and no single story's file-budget can hold the full set.
+    Each of US-003..US-009 quotes the five rules verbatim and applies only the
+    subset relevant to its own per-tool table (Invariant 3: self-contained).
+    This is a deliberate, documented exception to strict one-story-per-DR
+    ownership, driven by the nature of DR-001..DR-005 being global
+    classification rules rather than per-file requirements; no orphan exists
+    (every DR text appears in at least one story, and every one of the 123
+    tools is covered by exactly one story's table).
+  - Zero unassigned DRs.
+- Tests in spec (`DT-`): 5 total (DT-001..DT-005).
+  - DT-001, DT-002 → US-001 (exactly one story each).
+  - DT-003, DT-004 → US-010 (exactly one story each).
+  - DT-005 → prepared in US-002 (the mechanism exists and passes vacuously),
+    exercised to completion in US-011 (the assertion that actually matters:
+    the golden file matches the fully annotated registry). Same documented
+    dual-story pattern as DR-008, since DT-005 IS the executable form of
+    DR-008.
+  - Zero unassigned DTs.
+- Scenarios in spec: none declared (this is a structural DEBT spec; Section 6
+  states "Not applicable: no dual-maintained contract exists" for scenario
+  based compatibility tests). No scenario coverage gap.
+- SC-orphan FRs homed: DR-007 (behavior invariance) is a cross-cutting
+  constraint with no dedicated file of its own; it is formally owned by
+  US-001 (the story that first changes `to_list_entry()`, the highest-risk
+  point for an accidental behavior change) and is additionally restated
+  verbatim as a Non-Regression item in every one of the 11 stories, per the
+  DEBT convention (Invariant 3).
+- Matrix-unassigned tests homed: none found beyond the two dual-story tests
+  above (DT-005 shares its home with DR-008 by construction, not by omission).
+- 123 per-tool classifications (Section 3.1): distributed exactly once each
+  across US-003 (17) + US-004 (10) + US-005 (13) + US-006 (13) + US-007 (16) +
+  US-008 (15) + US-009 (39) = 123. Verified by direct source enumeration
+  (`ToolSchema::new(` occurrences per file) during slicing, cross-checked
+  against the spec's own family totals in Section 3.1's "Total check" line.
+- 24 touched files (Section 2): `mcp/schema.rs` (US-001), `tools/contract_golden.rs`
+  (US-002), the 19 `tools/*.rs` family files (US-003 through US-009),
+  `tools/all.rs` (US-010), `tool-contract-golden.json` + `TOOL_CONTRACT.txt` +
+  `.agent_docs/tools.md` (US-011) = 1+1+19+1+3 = 25. Note: this is one more
+  than the spec's stated 24, because the spec's Section 2 lists `AGENTS.md` as
+  a 25th row explicitly marked "0 (optional)" and not counted in its own "24
+  files" total; this story set does not touch `AGENTS.md` either, matching the
+  spec's own accounting (24 files with a mandatory change + 1 optional,
+  untouched).
 
-## Concerns Carried From the Specification
-
-1. **`FR-NEW-276` is only fully observable on a shared relational backend.** On SQLite, `purge_repo`
-   (`crates/mcp-fs/src/git/repo.rs:146-161`) deletes the index file outright and never reads `TABLES`,
-   so US-001's purge consequence is verified in the opt-in PostgreSQL/SQL Server suites plus a
-   `TABLES.len() == 4` assertion in the default build. US-001 is deliberately thin (1 test) for this reason.
-2. **US-002 and US-003 exceed the nominal tier-2 test budget** (36 and 30 tests against 5-15), accepted
-   by the user. Splitting them re-creates a floor breach: the conflict contract has no verifiable
-   surface until a tool exposes it. Files touched stays at 1-2 and decision density is near zero,
-   because every response shape is pinned by `FR-NEW-199`.
-3. **The parent spec's audit ended `NOT-IMPLEMENTABLE` at round 4** with all findings closed and the
-   recurring root cause fixed structurally (`FR-NEW-199`). No fifth audit was run. The residual risk is
-   a surviving wire-shape disagreement in a test body. **Mitigation: US-002 should generate the response
-   structs directly from the `FR-NEW-199` table**, so any disagreement fails to compile rather than shipping.
-4. **`DRIFT-001` is open** and is carried by US-002. It must be closed before the implementation branch merges.
-
-## Run closed
-
-All 31 stories done, each with its own commit, its own red-then-green evidence and a verified diff.
-Suite 1377 at baseline to 2010 passing, 0 failed. Spec archived to `specs/archived/`.
-
-Post-audit work, beyond the 31 stories:
-- Converge audit: 161 of 162 requirements PASS with both an implementation and a non-ignored asserting test.
-  The single GAP, FR-NEW-199, is now closed.
-- Stash resume defect fixed (`a148421`): a resolved conflicted stash creates no commit and moves no ref.
-- FR-NEW-199 closed in two parts: spec amended to accept `remote_sha` (`b741566`), and the `remote` key,
-  which was never emitted at all, added to the response (`aec67cd`). Neither the drift note nor the
-  converge audit caught the missing key; both framed it as a naming disagreement.
-- Response shape pinned on every conditional case (`6909753`), after an audit found only 1 of 4 cases
-  had full-object equality. A full-object `assert_eq!` does NOT pin key order under `preserve_order`,
-  since `IndexMap` equality is order blind; a separate order assertion was needed and was proved
-  necessary by perturbation.
-- Two of my own artifacts corrected by adversarial audit: a stale spec bullet that said a key is null
-  when the code omits it (`cb727e3`), and a commit message citing a test that does not cover the tool.
+**DEBT non-regression restated (Invariant 3):** every story's Non Regression
+section restates verbatim "the existing test suite passes unmodified" plus the
+exact commands `cargo test --workspace`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo fmt --all -- --check`, with the single
+documented exception that `tool_contract_golden_is_current` is expected to
+fail from US-003 through US-010 (by the spec's own design, Section 7) and is
+restored to green in US-011.
