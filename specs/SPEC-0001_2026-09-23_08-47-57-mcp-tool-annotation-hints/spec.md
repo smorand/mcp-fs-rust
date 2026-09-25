@@ -1,15 +1,18 @@
 # MCP Tool Annotation Hints — Technical Debt Mini-Spec
 
 > Generated on: 2026-09-23
+> Id: SPEC-0001
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 22 modules touched (schema.rs, registry.rs, contract_golden.rs, 19
 > tools/*.rs family files including git_pr.rs, 1 golden JSON contract, 3
 > documentation files), 123 tool registrations annotated, public contract touched
 > (`tools/list` JSON-RPC response).
-> Type: Technical debt
 > Status: Draft
 > Behavior change: none (additive JSON field only, see Section 5)
+> From backlog: n/a
+> Split: not split
+> Depends on: none
 
 ## 1. Debt
 
@@ -89,6 +92,8 @@ are stated once here as `DR-001` through `DR-005`; each rule is EARS `[EARS-U]` 
 structural mapping, not a trigger/response), and Section 3.1 names every one of the
 123 tools against its rule so the mapping is checkable line by line.
 
+### 3.1 Structural
+
 #### DR-001 [EARS-U]: Pure read tools carry `readOnlyHint=true`
 > The `ToolSchema` for every tool classified "pure read" in Section 3.1 SHALL set
 > `annotations.read_only_hint` to `Some(true)` and SHALL NOT set
@@ -126,18 +131,13 @@ structural mapping, not a trigger/response), and Section 3.1 names every one of 
 > `openWorldHint`) omitting any hint whose value is `None`, and SHALL omit the
 > `annotations` key entirely from the rendered `Value` when every hint is `None`.
 
-#### DR-007 [EARS-UB]: Behavior invariance
-> The system SHALL NOT change the `name`, `description`, or `inputSchema` value of
-> any existing tool, and SHALL NOT change the JSON-RPC method dispatch, handler
-> signature, or runtime result of any tool call, as a result of this change.
-
 #### DR-008 [EARS-U]: Contract regeneration covers annotations
 > The `render()` function in `contract_golden.rs` SHALL include the `annotations`
 > field (when present) in every rendered tool entry, and the
 > `tool_contract_golden_is_current` test SHALL fail when a registered tool's
 > annotations differ from the frozen `tool-contract-golden.json` entry.
 
-### 3.1 Per-tool classification (123 tools)
+#### 3.1.1 Per-tool classification (123 tools)
 
 Legend: RO=readOnlyHint, D=destructiveHint, I=idempotentHint, OW=openWorldHint.
 "-" means the hint is omitted (`None`), matching MCP convention that
@@ -303,6 +303,22 @@ family convention, `DDEC-001`-adjacent, not independently re-verified against
 reconciling exactly with the Section 2 registry count and with the per-family totals
 in Section 2 (fs 35 = 19+11+5; admin 10 = 5+3+2; git 49 = 10+3+17+19; search 4 =
 2+1+1; sqlite 8 = 5+2+1; web 5 = 4+1; context7 2 = 2; db 5 = 4+1; doc 5 = 1+2+2).
+
+### 3.2 Invariance (MANDATORY)
+
+#### DR-007 [EARS-UB]: Behavior invariance
+> The system SHALL NOT change the `name`, `description`, or `inputSchema` value of
+> any existing tool, and SHALL NOT change the JSON-RPC method dispatch, handler
+> signature, or runtime result of any tool call, as a result of this change.
+
+### 3.3 Compatibility
+
+Not applicable as a per-requirement section: this change touches no dual-maintained
+public contract. `tools/list` gains a purely additive, optional `annotations` field
+(Section 4), so there is no old form and new form to reconcile, no precedence rule,
+and no deprecation window. DR-007 above is the compatibility guarantee this change
+relies on; Section 4's Compatibility Plan table is the authoritative statement of the
+contract and its (non-breaking) evolution.
 
 ## 4. Compatibility
 
@@ -480,37 +496,34 @@ be red (by design, tracking real progress); every other test stays green through
   this pass, since the field names were given directly as the task input rather than
   discovered from a dependency).
 
-## 9. Implementability Checklist
+## 9. Implementability Gate
 
-| # | Item | Verdict |
-|---|------|---------|
-| 1 | Perimeter is exhaustive | PASS — 24 files, exact counts cited, non-source occurrences confirmed absent |
-| 2 | Both sides of every rename spelled | N/A, no rename in this debt item |
-| 3 | Every public contract has a plan | PASS — Section 4, additive-only, no break |
-| 4 | Non-regression command is exact | PASS — Section 6.1 |
-| 5 | Unmodified-suite criterion stated, exceptions justified | PASS — Section 6.4, all 3 rows are data-file regenerations, not test weakenings |
-| 6 | Guardrail honesty | PASS — Section 6.1 cites 5+4+1+1(+94-assertion) existing tests covering the exact touched code paths |
-| 7 | No orphan decision | PASS — every `DDEC-XXX` cites the `DR-XXX`/table it implements |
-| 8 | No buried change | PASS — every structural change has its own `DR-XXX` |
-| 9 | Order stated | PASS — Section 7, with the golden-file red-then-green window explicitly called out |
-| 10 | No forced choice | PASS — Section 3.1 gives one classification per tool, no branching left to the implementer |
-| 11 | No out-of-spec prerequisite | PASS — no helper, fixture or dependency assumed beyond what DR-001–008 require |
-| 12 | EARS clean | PASS — DR-001 through DR-008, no forbidden modal, no nested condition, DR-007 is the invariance requirement |
-| 13 | Right tool | PASS — no behavior change beyond the declared additive field; nothing smuggled |
-| 14 | Length | Section 1–9 (excluding Section 10) is within the L budget ("as long as the remediation needs"); no upper bound violated |
-| 15 | Every claim about the code is cited | PASS — every git tool in Section 3.1 now carries a `file:LINE` citation from a direct read of `git.rs`/`git_auth.rs`/`git_pr.rs`, closing the gap `DDRIFT-001` recorded (see Section 10, resolved) |
-| 16 | No requirement rests on a missing capability | PASS — `ToolSchema`, `to_list_entry`, `render()`, `assert_family()` all exist today and are extended, not invented |
+Perimeter exhaustive (24 files, exact counts cited, non-source occurrences confirmed
+absent); every public contract has a plan (Section 4, additive-only, no break); the
+non-regression command is exact and its unmodified-suite criterion's 3 exceptions are
+data-file regenerations, not test weakenings (Section 6.1/6.4); every `DDEC-XXX`
+cites the `DR-XXX`/table it implements, no orphan; implementation order stated
+(Section 7); Section 3.1 gives one classification per tool, no forced choice left to
+the implementer; no out-of-spec prerequisite; EARS clean across DR-001 through
+DR-008, no forbidden modal; every claim about the code is cited, including every git
+tool's `file:LINE` citation from a direct read of `git.rs`/`git_auth.rs`/`git_pr.rs`;
+`ToolSchema`, `to_list_entry`, `render()`, `assert_family()` all exist today and are
+extended, not invented.
 
-| Verdict | **IMPLEMENTABLE** |
-|---|---|
-| Open F failures | 0 |
-| Registered drift | DDRIFT-001 (resolved) |
+| Round | F (functional, blocking) | A (drift, traced) | Verdict |
+|---|---|---|---|
+| 1 | 0 | 1 — DDRIFT-001, resolved before this document's `Status: Draft` was finalized | IMPLEMENTABLE |
+
+**Amendments applied:** DDRIFT-001 closed in place — all 49 `git.*`/`git.auth*`/
+`git.pr_*` tool names re-verified directly against `git.rs`/`git_auth.rs`/`git_pr.rs`
+and Section 3.1 corrected to the real 49-name set (see Section 10).
+**Drift registered:** none open (DDRIFT-001 `Status: resolved`, see Section 10).
 
 ## 10. Drift Register
 
 #### DDRIFT-001: the 49-tool git family was not individually named against source citations
 
-- **Doc said (as of 2026-09-23 08:51):** Section 3.1 listed git tool names drawn
+- **Doc says (as of 2026-09-23 08:51):** Section 3.1 listed git tool names drawn
   from plausible operation-family coverage, including 7 names that do not exist in
   the codebase (`git.reflog`, `git.rebase_status`, `git.merge_status`,
   `git.cherry_pick_status`, `git.bisect_status`, `git.worktree_list`,
@@ -531,7 +544,7 @@ be red (by design, tracking real progress); every other test stays green through
   branches which do have create/delete/reset).
 - **Nature:** false count / fabricated names at the leaf level, exactly as the prior
   revision suspected, not a missing capability.
-- **Resolution applied:** every one of the 49 real names was read from its handler
+- **Resolution during implementation:** every one of the 49 real names was read from its handler
   in `git.rs`/`git_auth.rs`/`git_pr.rs` and reclassified in Section 3.1 with a
   `file:LINE` citation, replacing the 7 fabricated names entirely. The aggregate
   reconciles at the corrected totals: 55 pure-read (was mis-stated at 55 with wrong

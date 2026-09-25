@@ -1,6 +1,7 @@
-# US-001: Tool annotations schema infrastructure
+# US-0001: Tool annotations schema infrastructure
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 1
@@ -94,7 +95,7 @@ The MCP wire layer (`crates/mcp-fs/src/mcp/`): schema construction and
   `to_list_entry()["annotations"] == {"destructiveHint":true,"readOnlyHint":false}`.
 - **Business Rules:** Key order in the emitted object does not matter here
   (unlike `inputSchema`, `annotations` is not covered by the property-key-order
-  golden assertion in this story; that assertion is added in US-002/US-011 once
+  golden assertion in this story; that assertion is added in US-0002/US-0011 once
   the golden file itself carries `annotations`). Add the four builder methods:
   ```rust
   pub fn destructive(mut self, v: bool) -> Self {

@@ -1,10 +1,11 @@
-# US-002: Contract golden annotation awareness
+# US-0002: Contract golden annotation awareness
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 2
-> Depends On: US-001
+> Depends On: US-0001
 > Complexity: S
 > min_tier: 2
 > Files touched: 1
@@ -12,7 +13,7 @@
 ## Objective
 Make the frozen tool contract machinery (`render()` and `assert_family()` in
 `contract_golden.rs`) aware of the new `annotations` field, so that once tool
-families start declaring hints (starting at US-003), the existing
+families start declaring hints (starting at US-0003), the existing
 `tool_contract_golden_is_current` test drifts honestly instead of silently
 ignoring the new data. At the end of this story, no tool yet has annotations,
 so the golden file is still unchanged and the test still passes.
@@ -63,7 +64,7 @@ assert_eq!(
 
 ### Data Model (excerpt)
 `render()`'s per-tool `Map` gains one more optional key, using
-`ToolSchema::to_list_entry()` added in US-001 as the source of truth rather
+`ToolSchema::to_list_entry()` added in US-0001 as the source of truth rather
 than re-deriving the shape by hand:
 ```rust
 if let Some(ann) = tool.schema.to_list_entry().get("annotations") {
@@ -95,7 +96,7 @@ touched.
   later story adds `.destructive(true)` to one tool: `render()`'s output for
   that tool gains an `"annotations"` key, and `assert_family()` must fail with
   a message identifying that the golden file is stale for that tool, until the
-  golden file is regenerated (US-011).
+  golden file is regenerated (US-0011).
 - **Business Rules:** `assert_family()` must add exactly one more `assert_eq!`
   comparing the annotations `Value` (or its absence) between the live registry
   and the frozen entry, following the existing pattern of one `assert_eq!` per
@@ -124,7 +125,7 @@ touched.
 - **Scenario:** n/a (structural test, DEBT spec)
 - **Requirements:** DR-008
 - **Preconditions:** `render()` and `assert_family()` updated per this story;
-  no tool has annotations set yet (US-003 through US-009 not yet run).
+  no tool has annotations set yet (US-0003 through US-0009 not yet run).
 - **Steps:** Given the current registry with zero annotated tools / When
   `cargo test -p mcp-fs --lib tool_contract_golden_is_current` runs / Then the
   test still passes, because `render()` emits no `annotations` key for any
@@ -150,7 +151,7 @@ None.
 
 ### Patterns to Avoid
 - Do not hand-construct the annotations JSON shape in `render()`; reuse
-  `ToolSchema::to_list_entry()` from US-001 as the single source of truth, so
+  `ToolSchema::to_list_entry()` from US-0001 as the single source of truth, so
   the golden file and the live `tools/list` response can never diverge in
   shape.
 

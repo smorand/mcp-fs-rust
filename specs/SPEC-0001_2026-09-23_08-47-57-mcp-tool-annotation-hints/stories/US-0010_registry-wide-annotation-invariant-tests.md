@@ -1,17 +1,18 @@
-# US-010: Registry-wide annotation invariant tests
+# US-0010: Registry-wide annotation invariant tests
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 10
-> Depends On: US-003, US-004, US-005, US-006, US-007, US-008, US-009
+> Depends On: US-0003, US-0004, US-0005, US-0006, US-0007, US-0008, US-0009
 > Complexity: S
 > min_tier: 2
 > Files touched: 1
 
 ## Objective
 Add DT-003 and DT-004 to `crates/mcp-fs/src/tools/all.rs`, once every tool
-family is annotated (US-003 through US-009 all merged), so these two
+family is annotated (US-0003 through US-0009 all merged), so these two
 structural gates pass immediately rather than failing on partial coverage:
 every registered tool has an explicit annotation, and no tool is both
 `readOnlyHint=true` and carries a `destructiveHint`.
@@ -113,13 +114,13 @@ conditionally on `pandoc` being in `PATH`, per the existing
 ### Test Data
 | Data | Description | Source | Status |
 |------|-------------|--------|--------|
-| fully annotated registry, all features on | `register_all` with every `EnabledFeatures` flag `true` | in-repo, after US-003..US-009 | ready |
+| fully annotated registry, all features on | `register_all` with every `EnabledFeatures` flag `true` | in-repo, after US-0003..US-0009 | ready |
 
 ### DT-003 (as an executable test)
 - **Category:** happy
 - **Scenario:** n/a (structural, DEBT spec)
 - **Requirements:** DT-003
-- **Preconditions:** every tool family annotated (US-003 through US-009 done).
+- **Preconditions:** every tool family annotated (US-0003 through US-0009 done).
 - **Steps:** Given `register_all` called with every feature flag `true` / When
   every registered tool's `to_list_entry()` is inspected / Then every one has
   an `"annotations"` key whose value is a JSON object (never absent, never
@@ -143,7 +144,7 @@ conditionally on `pandoc` being in `PATH`, per the existing
 ### Files Not to Touch
 - No `tools/<family>.rs` file: annotation values are not modified here, only
   asserted on.
-- `contract_golden.rs`: unchanged (already correct since US-002).
+- `contract_golden.rs`: unchanged (already correct since US-0002).
 
 ### Dependencies Not to Add
 None.
@@ -162,7 +163,7 @@ None.
 - Every existing `#[test]` in `all.rs`, unmodified.
 - `tool_contract_golden_is_current` (in `contract_golden.rs`) is **still
   expected to fail** at the end of this story: the golden file is not
-  regenerated until US-011.
+  regenerated until US-0011.
 - **The existing test suite passes unmodified**, except for the one
   documented, expected exception above. Run:
   ```

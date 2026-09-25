@@ -1,10 +1,11 @@
-# US-003: Annotate admin, context7 and db tool families
+# US-0003: Annotate admin, context7 and db tool families
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 3
-> Depends On: US-001
+> Depends On: US-0001
 > Complexity: M
 > min_tier: 2
 > Files touched: 3
@@ -18,7 +19,7 @@ are appended to each existing `ToolSchema::new(...)` chain.
 ## Technical Context
 
 ### Stack
-Rust 2024. Uses the four builder methods added in US-001
+Rust 2024. Uses the four builder methods added in US-0001
 (`crates/mcp-fs/src/mcp/schema.rs`): `.read_only(bool)`, `.destructive(bool)`,
 `.idempotent(bool)`, `.open_world(bool)`.
 
@@ -70,7 +71,7 @@ ToolSchema::new("admin.list_projects", "List projects the caller can access.")
 (no `.destructive(..)` call for pure-read tools, per DR-001.)
 
 ### Data Model (excerpt)
-No data model change; this story only calls builder methods added in US-001.
+No data model change; this story only calls builder methods added in US-0001.
 
 ### Decisions That Govern This Story
 None invented. DDEC-001 (open-world is worst-case, static per tool, not
@@ -152,8 +153,8 @@ interaction; annotate independently.
 This is verified manually per-tool during implementation (compile + read the
 generated JSON via a scratch `cargo test -p mcp-fs --lib tools::admin` run);
 the durable, committed assertion of "every tool has some annotation" is DT-003
-in US-010, and the durable per-tool value assertion is the regenerated golden
-file in US-011. This story's own gate is: it compiles, and
+in US-0010, and the durable per-tool value assertion is the regenerated golden
+file in US-0011. This story's own gate is: it compiles, and
 `tool_contract_golden_is_current` legitimately turns red (expected, see Non
 Regression) because these 17 tools now carry annotations the golden file does
 not yet have.
@@ -162,7 +163,7 @@ not yet have.
 
 ### Files Not to Touch
 - No other `tools/*.rs` file.
-- `contract_golden.rs`, `all.rs`: untouched (already prepared by US-001/US-002).
+- `contract_golden.rs`, `all.rs`: untouched (already prepared by US-0001/US-0002).
 
 ### Dependencies Not to Add
 None.
@@ -183,7 +184,7 @@ None.
   `crates/mcp-fs/src/tools/all.rs` except `tool_contract_golden_is_current`,
   which is **expected to fail** starting with this story (per spec Section 7:
   "the registry has annotations the golden file does not yet have") until
-  US-011 regenerates the golden file.
+  US-0011 regenerates the golden file.
 - **The existing test suite passes unmodified**, except for the one
   documented, expected exception above. Run:
   ```

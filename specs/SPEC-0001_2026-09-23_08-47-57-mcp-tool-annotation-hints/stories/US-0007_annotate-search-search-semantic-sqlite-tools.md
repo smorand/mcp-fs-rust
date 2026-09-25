@@ -1,10 +1,11 @@
-# US-007: Annotate search, search_semantic and sqlite tool families
+# US-0007: Annotate search, search_semantic and sqlite tool families
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 7
-> Depends On: US-001
+> Depends On: US-0001
 > Complexity: M
 > min_tier: 2
 > Files touched: 3
@@ -18,7 +19,7 @@ per-tool table below.
 ## Technical Context
 
 ### Stack
-Rust 2024. Builder methods from US-001.
+Rust 2024. Builder methods from US-0001.
 
 ### Relevant File Structure
 ```
@@ -143,7 +144,7 @@ None.
 ### Existing Tests That Must Pass
 - Every existing `#[test]` in these three files and in
   `crates/mcp-fs/src/tools/all.rs`, except `tool_contract_golden_is_current`,
-  which stays **expected to fail** (per spec Section 7) until US-011.
+  which stays **expected to fail** (per spec Section 7) until US-0011.
 - **The existing test suite passes unmodified**, except for the one
   documented, expected exception above. Run:
   ```

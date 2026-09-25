@@ -1,10 +1,11 @@
-# US-009: Annotate the git.rs tool family (39 tools)
+# US-0009: Annotate the git.rs tool family (39 tools)
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 9
-> Depends On: US-001
+> Depends On: US-0001
 > Complexity: L
 > min_tier: 2
 > Files touched: 1
@@ -20,7 +21,7 @@ push/reset semantics, the `*_abort` non-destructive policy).
 ## Technical Context
 
 ### Stack
-Rust 2024. Builder methods from US-001.
+Rust 2024. Builder methods from US-0001.
 
 ### Relevant File Structure
 ```
@@ -201,7 +202,7 @@ mutation).
 
 ### Files Not to Touch
 - No other `tools/*.rs` file, in particular not `git_auth.rs` or `git_pr.rs`
-  (US-005).
+  (US-0005).
 
 ### Dependencies Not to Add
 None.
@@ -225,7 +226,7 @@ None.
 ### Existing Tests That Must Pass
 - Every existing `#[test]` in `git.rs` and in `crates/mcp-fs/src/tools/all.rs`,
   except `tool_contract_golden_is_current`, which stays **expected to fail**
-  (per spec Section 7) until US-011. `the_git_families_add_forty_nine_tools`
+  (per spec Section 7) until US-0011. `the_git_families_add_forty_nine_tools`
   in `all.rs` must keep asserting `reg.len() == 10 + 39 + 4 + 6` unchanged.
 - **The existing test suite passes unmodified**, except for the one
   documented, expected exception above. Run:

@@ -1,10 +1,11 @@
-# US-011: Regenerate the golden contract and update TOOL_CONTRACT.txt / tools.md
+# US-0011: Regenerate the golden contract and update TOOL_CONTRACT.txt / tools.md
 
-> Parent Spec: specs/2026-09-23_08-47-57-mcp-tool-annotation-hints.md
+> Parent Spec: specs/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md
+> Spec ID: SPEC-0001
 > Epic: n/a
 > Status: ready
 > Priority: 11
-> Depends On: US-010
+> Depends On: US-0010
 > Complexity: M
 > min_tier: 2
 > Files touched: 3
@@ -47,7 +48,7 @@ admin.delete_project
 ```
 Only emit the hints that are actually set (mirroring `to_list_entry()`'s
 omit-when-`None` behavior); never invent a hint value not in the per-tool
-tables from US-003 through US-009.
+tables from US-0003 through US-0009.
 `.agent_docs/tools.md` header currently states "94 tools"; add an
 "Annotations" column (or a legend section) to its per-family reference tables,
 covering the same 123 tools this spec annotates.
@@ -59,8 +60,8 @@ fixture via the existing test harness, no new struct or function.
 ### Decisions That Govern This Story
 None invented. This story performs exactly the mechanical regeneration and
 documentation update the spec's Section 7 steps 4, 6 and 7 describe, with no
-new classification decision (every value was already decided in US-003
-through US-009's tables).
+new classification decision (every value was already decided in US-0003
+through US-0009's tables).
 
 ### Applicable NFRs
 None beyond DR-007 and DR-008.
@@ -93,14 +94,14 @@ Documentation and the frozen contract fixture; no source code.
 ### Test Data
 | Data | Description | Source | Status |
 |------|-------------|--------|--------|
-| fully annotated registry (all 123 tools, US-001 through US-010 merged) | live registry | in-repo | ready |
+| fully annotated registry (all 123 tools, US-0001 through US-0010 merged) | live registry | in-repo | ready |
 | pre-regeneration `tool-contract-golden.json` | 94 entries, no `annotations` key | repo fixture | ready |
 
 ### DT-005: contract golden regeneration is annotation-aware (completion)
 - **Category:** happy
 - **Scenario:** n/a (structural test, DEBT spec)
 - **Requirements:** DR-008
-- **Preconditions:** every tool family annotated (US-003 through US-009), DT-003/DT-004 in place (US-010).
+- **Preconditions:** every tool family annotated (US-0003 through US-0009), DT-003/DT-004 in place (US-0010).
 - **Steps:** Given the live registry with every tool annotated / When
   `MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current`
   is run / Then `tool-contract-golden.json` is rewritten with an
@@ -128,7 +129,7 @@ Documentation and the frozen contract fixture; no source code.
 
 ### Files Not to Touch
 - No `crates/mcp-fs/src/**/*.rs` file: every annotation value was already set
-  in US-001 through US-010. This story only regenerates the golden fixture
+  in US-0001 through US-0010. This story only regenerates the golden fixture
   and updates the two documentation files.
 
 ### Dependencies Not to Add
@@ -139,7 +140,7 @@ None.
   `MCPFS_REWRITE_TOOL_CONTRACT=1` command, and the diff is reviewed, not
   authored.
 - Do not add, remove, or reclassify any hint value in `TOOL_CONTRACT.txt` or
-  `.agent_docs/tools.md` beyond what US-003 through US-009's tables already
+  `.agent_docs/tools.md` beyond what US-0003 through US-0009's tables already
   fixed; this story documents, it does not decide.
 
 ### Scope Boundary
@@ -150,7 +151,7 @@ None.
 
 ### Existing Tests That Must Pass
 - `tool_contract_golden_is_current` passes at the end of this story (the one
-  test that was expected to be red throughout US-003 through US-010 is now
+  test that was expected to be red throughout US-0003 through US-0010 is now
   green, per spec Section 7's stated design).
 - Every other test in the workspace, unmodified and green.
 - **The existing test suite passes unmodified.** Run:
