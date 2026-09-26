@@ -190,7 +190,10 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
             .req_str("db_path", "Path to the .db file within the volume.")
             .req_str("sql", "SELECT or WITH statement to execute.")
             .opt_str_null("params", "JSON array of bind parameters.")
-            .opt_int("max_rows", 100, "Maximum rows to return (capped at config limit)."),
+            .opt_int("max_rows", 100, "Maximum rows to return (capped at config limit).")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx, a| async move {
             let sql = a.str("sql")?;
             require_select(&sql)?;
@@ -211,7 +214,11 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("db_path", "Path to the .db file within the volume.")
             .req_str("sql", "SQL statement to execute.")
-            .opt_str_null("params", "JSON array of bind parameters."),
+            .opt_str_null("params", "JSON array of bind parameters.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
         handler(move |ctx, a| async move {
             let sql = a.str("sql")?;
             let raw_params = parse_params(a.opt_str("params").as_deref())?;
@@ -264,7 +271,10 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
             "List tables and views in a SQLite database stored in a volume.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("db_path", "Path to the .db file within the volume."),
+        .req_str("db_path", "Path to the .db file within the volume.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let db_path = norm(&ctx, &a, "db_path")?;
@@ -290,7 +300,10 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("db_path", "Path to the .db file within the volume.")
-        .req_str("table", "Table name to inspect."),
+        .req_str("table", "Table name to inspect.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx, a| async move {
             let table = a.str("table")?;
             let (mount, client) = volume(&ctx, &a).await?;
@@ -314,7 +327,10 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
         ToolSchema::new("sqlite.list_indexes", "List indexes in a SQLite database stored in a volume.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("db_path", "Path to the .db file within the volume.")
-            .opt_str_null("table", "Filter to a specific table; omit for all indexes."),
+            .opt_str_null("table", "Filter to a specific table; omit for all indexes.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx, a| async move {
             let table = a.opt_str("table");
             let (mount, client) = volume(&ctx, &a).await?;
@@ -345,7 +361,11 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
             "Run VACUUM on a SQLite database stored in a volume to reclaim space.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("db_path", "Path to the .db file within the volume."),
+        .req_str("db_path", "Path to the .db file within the volume.")
+        .read_only(false)
+        .destructive(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let db_path = norm(&ctx, &a, "db_path")?;
@@ -377,7 +397,11 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
             true,
             "Create the table if it does not exist (infers schema from CSV header).",
         )
-        .opt_str(",", ",", "Column delimiter character."),
+        .opt_str(",", ",", "Column delimiter character.")
+        .read_only(false)
+        .destructive(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx, a| async move {
             let csv_path_raw = a.str("csv_path")?;
             let table = a.str("table")?;
@@ -449,7 +473,10 @@ pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
             .req_str("db_path", "Path to the source .db file within the volume.")
             .req_str("sql", "SELECT statement whose results will be exported.")
             .req_str("output_path", "Destination CSV path in the volume.")
-            .opt_str(",", ",", "Column delimiter character."),
+            .opt_str(",", ",", "Column delimiter character.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx, a| async move {
             let sql = a.str("sql")?;
             require_select(&sql)?;

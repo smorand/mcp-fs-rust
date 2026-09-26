@@ -82,10 +82,11 @@ pub fn register_with(
             "Host declared in git.hosts to authorize against; omit to use the provider's \
              canonical public host (github.com or gitlab.com).",
         )
-        .opt_str_null(
-            "instance_url",
-            "Optional self-hosted instance URL (e.g. GitLab Enterprise).",
-        ),
+        .opt_str_null("instance_url", "Optional self-hosted instance URL (e.g. GitLab Enterprise).")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (t, f) = (t.clone(), f.clone());
             async move {
@@ -115,7 +116,10 @@ pub fn register_with(
         .opt_str_null(
             "host",
             "Host to check; omit to report every host the caller holds a token for.",
-        ),
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
             async move {
@@ -134,7 +138,11 @@ pub fn register_with(
     reg.add(
         ToolSchema::new("git.auth_revoke", "Revoke the stored token for a provider.")
             .opt_str_null("provider", "Provider whose stored token is revoked: github or gitlab.")
-            .opt_str_null("host", "Host whose stored token is revoked."),
+            .opt_str_null("host", "Host whose stored token is revoked.")
+            .destructive(true)
+            .read_only(false)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
             async move {
@@ -162,7 +170,11 @@ pub fn register_with(
             "expires_at",
             "RFC 3339 timestamp the token expires at; omit or null for a token that never \
              expires.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
             async move {

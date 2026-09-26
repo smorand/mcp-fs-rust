@@ -48,7 +48,11 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
             "project_id",
             "New project id: 3 to 32 chars, lowercase letters, digits, hyphens, alphanumeric bounds.",
         )
-        .req_str("owner", "Person id who owns the new project."),
+        .req_str("owner", "Person id who owns the new project.")
+        .read_only(false)
+        .destructive(false)
+        .idempotent(false)
+        .open_world(false),
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             let owner = a.str("owner")?;
@@ -62,7 +66,11 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
             "admin.delete_project",
             "Delete a project and recursively tear down its volume (owner or platform admin).",
         )
-        .req_str("project_id", "Id of the project to delete."),
+        .req_str("project_id", "Id of the project to delete.")
+        .read_only(false)
+        .destructive(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let git = git_for_delete.clone();
             async move {
@@ -73,12 +81,18 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
     );
 
     reg.add(
-        ToolSchema::new("admin.list_projects", "List projects the caller can access."),
+        ToolSchema::new("admin.list_projects", "List projects the caller can access.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx: ToolCtx, _a| async move { list_projects(&ctx).await }),
     );
 
     reg.add(
-        ToolSchema::new("admin.list_all_projects", "List every project (platform admin only)."),
+        ToolSchema::new("admin.list_all_projects", "List every project (platform admin only).")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx: ToolCtx, _a| async move { list_all_projects(&ctx).await }),
     );
 
@@ -86,14 +100,21 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
         ToolSchema::new(
             "admin.list_users",
             "List every known person and platform admins (platform admin only).",
-        ),
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx: ToolCtx, _a| async move { list_users(&ctx).await }),
     );
 
     reg.add(
         ToolSchema::new("admin.add_member", "Add a person to a project (owner or platform admin).")
             .req_str("project_id", "Id of the project to add the member to.")
-            .req_str("person", "Person id to add as a member."),
+            .req_str("person", "Person id to add as a member.")
+            .read_only(false)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             let person = a.str("person")?;
@@ -107,7 +128,11 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
             "Remove a person from a project (owner or platform admin).",
         )
         .req_str("project_id", "Id of the project to remove the member from.")
-        .req_str("person", "Person id to remove from the project."),
+        .req_str("person", "Person id to remove from the project.")
+        .read_only(false)
+        .destructive(true)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             let person = a.str("person")?;
@@ -120,7 +145,10 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
             "admin.list_members",
             "List members of a project (member or platform admin).",
         )
-        .req_str("project_id", "Id of the project whose members are listed."),
+        .req_str("project_id", "Id of the project whose members are listed.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             list_members(&ctx, &project_id).await
@@ -142,7 +170,11 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
              embedding endpoint. Any change to a different mode wipes the current index \
              before rebuilding it, so setting the mode a project already has is a no-op \
              that keeps the index intact.",
-        ),
+        )
+        .read_only(false)
+        .destructive(true)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             let mode = a.str("mode")?;
@@ -155,7 +187,10 @@ pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
             "admin.get_index_mode",
             "Get the current search index mode for a project (member or platform admin).",
         )
-        .req_str("project_id", "Id of the project whose search index mode is read."),
+        .req_str("project_id", "Id of the project whose search index mode is read.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             get_index_mode(&ctx, &project_id).await

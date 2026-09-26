@@ -246,7 +246,10 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             "SQL query. The table name is the file stem lowercased \
              (e.g. /data/sales.csv maps to FROM sales).",
         )
-        .opt_int("max_rows", 100, "Maximum rows to return (capped at config limit)."),
+        .opt_int("max_rows", 100, "Maximum rows to return (capped at config limit).")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx, a| async move {
             let path_raw = a.str("path")?;
             let sql = a.str("sql")?;
@@ -285,7 +288,10 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
     reg.add(
         ToolSchema::new("db.schema", "Return the column schema of a CSV, Parquet, or JSON file stored in a volume.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("path", "Path to a CSV, Parquet, or JSON file."),
+            .req_str("path", "Path to a CSV, Parquet, or JSON file.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(true),
         handler(move |ctx, a| async move {
             let path_raw = a.str("path")?;
             let (_, client) = volume(&ctx, &a).await?;
@@ -335,7 +341,10 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             "Profile a CSV, Parquet, or JSON file stored in a volume: row count and per-column statistics (distinct, nulls, min, max). Capped at 20 columns.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("path", "Path to a CSV, Parquet, or JSON file."),
+        .req_str("path", "Path to a CSV, Parquet, or JSON file.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx, a| async move {
             let path_raw = a.str("path")?;
             let (_, client) = volume(&ctx, &a).await?;
@@ -439,7 +448,10 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
         ToolSchema::new("db.sample", "Return a sample of rows from a CSV, Parquet, or JSON file stored in a volume.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Path to a CSV, Parquet, or JSON file.")
-            .opt_int("n", 10, "Number of rows to return (capped at 1000)."),
+            .opt_int("n", 10, "Number of rows to return (capped at 1000).")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(true),
         handler(move |ctx, a| async move {
             let path_raw = a.str("path")?;
             let n = (a.int_or("n", 10) as usize).clamp(1, 1000);
@@ -485,7 +497,11 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
         .req_str(
             "dst_path",
             "Destination path; format inferred from extension (.csv, .parquet, .json, .ndjson).",
-        ),
+        )
+        .read_only(false)
+        .destructive(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx, a| async move {
             let src_raw = a.str("src_path")?;
             let dst_raw = a.str("dst_path")?;

@@ -12,7 +12,10 @@ pub fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.stat", "POSIX metadata for a path.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("path", "Absolute POSIX path within the volume."),
+            .req_str("path", "Absolute POSIX path within the volume.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -23,7 +26,10 @@ pub fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.exists", "Probe whether a path exists and its kind.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("path", "Absolute POSIX path to probe."),
+            .req_str("path", "Absolute POSIX path to probe.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -35,7 +41,10 @@ pub fn register(reg: &mut ToolRegistry) {
         ToolSchema::new("fs.hash", "Content hash (md5|sha1|sha256|sha512).")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
-            .opt_str("algo", "sha256", "Hash algorithm: md5, sha1, sha256, or sha512."),
+            .opt_str("algo", "sha256", "Hash algorithm: md5, sha1, sha256, or sha512.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;

@@ -24,7 +24,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 false,
                 "Allow overwriting an existing file (default no-clobber).",
             )
-            .opt_bool("create_parents", true, "Create missing parent directories."),
+            .opt_bool("create_parents", true, "Create missing parent directories.")
+            .destructive(true)
+            .read_only(false)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -51,7 +55,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_str("content", "Text content to append at the end of the file.")
-            .opt_bool("create", false, "Create the file if it does not exist."),
+            .opt_bool("create", false, "Create the file if it does not exist.")
+            .destructive(false)
+            .read_only(false)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -75,7 +83,11 @@ pub fn register(reg: &mut ToolRegistry) {
         ToolSchema::new("fs.create_empty", "Create an empty file (touch).")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path of the file to create.")
-            .opt_bool("exist_ok", false, "Succeed silently if the file already exists."),
+            .opt_bool("exist_ok", false, "Succeed silently if the file already exists.")
+            .destructive(false)
+            .read_only(false)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -107,7 +119,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 false,
                 "Also generate the Markdown companion (path.md) through the configured \
                  document service. Supported for PowerPoint, Word, PDF, audio and video only.",
-            ),
+            )
+            .destructive(true)
+            .read_only(false)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;

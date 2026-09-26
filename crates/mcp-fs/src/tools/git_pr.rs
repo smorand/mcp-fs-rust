@@ -72,7 +72,11 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to open it on; defaults to origin.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
             async move {
@@ -131,7 +135,10 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to list from; defaults to origin.",
-        ),
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
             async move {
@@ -165,7 +172,10 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to read it from; defaults to origin.",
-        ),
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
             async move {
@@ -197,7 +207,10 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to read it from; defaults to origin.",
-        ),
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
             async move {
@@ -244,11 +257,11 @@ pub fn register_with(
             "commit_message",
             "Body of the resulting commit; the provider's own default is used when absent.",
         )
-        .opt_str(
-            "remote",
-            "origin",
-            "Name of the declared remote to merge on; defaults to origin.",
-        ),
+        .opt_str("remote", "origin", "Name of the declared remote to merge on; defaults to origin.")
+        .destructive(true)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
             async move {
@@ -307,7 +320,11 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to review on; defaults to origin.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
             async move {

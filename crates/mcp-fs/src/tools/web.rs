@@ -30,7 +30,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         )
         .req_str("query", "Search query.")
         .opt_int("max_results", 10, "Maximum number of results to return (capped at 50).")
-        .opt_str("safe_search", "moderate", "Safe search level: off, moderate, or strict."),
+        .opt_str("safe_search", "moderate", "Safe search level: off, moderate, or strict.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(|_ctx, a| async move {
             let query = a.str("query")?;
             let max = cap_results(a.int_or("max_results", 0), 10);
@@ -46,7 +49,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
             .opt_str_null(
                 "time_range",
                 "Time range filter: d (day), w (week), m (month), y (year).",
-            ),
+            )
+            .read_only(true)
+            .idempotent(true)
+            .open_world(true),
         handler(|_ctx, a| async move {
             let query = a.str("query")?;
             let max = cap_results(a.int_or("max_results", 0), 10);
@@ -75,7 +81,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         .opt_str_null(
             "save_path",
             "Absolute POSIX destination path within the volume (requires mount_id).",
-        ),
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(|ctx, a| async move {
             let url = a.str("url")?;
             let timeout = a.int_or("timeout_secs", 10).clamp(1, 30) as u64;
@@ -120,7 +129,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         .req_str("url", "URL to download (must start with http:// or https://).")
         .req_str("mount_id", "Project/volume id to write into.")
         .req_str("path", "Absolute POSIX destination path within the volume.")
-        .opt_int("timeout_secs", 30, "Request timeout in seconds (capped at 120)."),
+        .opt_int("timeout_secs", 30, "Request timeout in seconds (capped at 120).")
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(true),
         handler(|ctx, a| async move {
             let url = a.str("url")?;
             if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -153,7 +166,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
             "web.suggestions",
             "Get search query autocomplete suggestions from DuckDuckGo.",
         )
-        .req_str("query", "Partial query to complete."),
+        .req_str("query", "Partial query to complete.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(|_ctx, a| async move {
             let query = a.str("query")?;
             web_suggestions(&query).await

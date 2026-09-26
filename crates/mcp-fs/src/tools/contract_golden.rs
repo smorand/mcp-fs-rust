@@ -76,6 +76,12 @@ pub(crate) fn assert_family(
             serde_json::to_string(&tool["inputSchema"]).unwrap(),
             "property key order drift on {name}"
         );
+        let mine_entry = mine.schema.to_list_entry();
+        assert_eq!(
+            mine_entry.get("annotations"),
+            tool.get("annotations"),
+            "annotations drift on {name}"
+        );
     }
     assert_eq!(compared, expected, "the contract must cover all {expected} {what}");
 }
@@ -106,6 +112,9 @@ fn render(reg: &ToolRegistry) -> String {
             entry.insert("name".into(), Value::String((*name).to_string()));
             entry.insert("description".into(), Value::String(tool.schema.description.clone()));
             entry.insert("inputSchema".into(), tool.schema.input_schema());
+            if let Some(ann) = tool.schema.to_list_entry().get("annotations") {
+                entry.insert("annotations".into(), ann.clone());
+            }
             Value::Object(entry)
         })
         .collect();

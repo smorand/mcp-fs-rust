@@ -15,7 +15,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
             .opt_int("offset_lines", 0, "0-based line offset to start reading from.")
             .opt_int("limit_lines", 2000, "Maximum number of lines to return.")
-            .opt_bool("line_numbered", true, "Prefix each line with its 1-based line number."),
+            .opt_bool("line_numbered", true, "Prefix each line with its 1-based line number.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -38,7 +41,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
             .opt_int("offset_bytes", 0, "0-based byte offset to start reading from.")
-            .opt_int("length_bytes", 65536, "Maximum number of bytes to return."),
+            .opt_int("length_bytes", 65536, "Maximum number of bytes to return.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -60,7 +66,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_int("start_line", "First 1-based line to return (inclusive).")
-            .req_int("end_line", "Last 1-based line to return (inclusive)."),
+            .req_int("end_line", "Last 1-based line to return (inclusive).")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -82,7 +91,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_int("anchor_line", "1-based line whose indentation block is returned.")
-            .opt_int("max_lines", 200, "Maximum number of lines to return for the block."),
+            .opt_int("max_lines", 200, "Maximum number of lines to return for the block.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -103,7 +115,10 @@ pub fn register(reg: &mut ToolRegistry) {
         ToolSchema::new("fs.read_many", "Batch read several files with per-file error isolation.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str_array("paths", "Absolute POSIX paths to read, one entry per file.")
-            .opt_int("per_file_cap_lines", 500, "Maximum number of lines returned per file."),
+            .opt_int("per_file_cap_lines", 500, "Maximum number of lines returned per file.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             // The paths stay raw here on purpose: the engine normalizes each one
@@ -126,7 +141,10 @@ pub fn register(reg: &mut ToolRegistry) {
         ToolSchema::new("fs.head", "First N lines of a file.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
-            .opt_int("lines", 20, "Number of leading lines to return."),
+            .opt_int("lines", 20, "Number of leading lines to return.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -146,7 +164,10 @@ pub fn register(reg: &mut ToolRegistry) {
         ToolSchema::new("fs.tail", "Last N lines of a file.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
-            .opt_int("lines", 20, "Number of trailing lines to return."),
+            .opt_int("lines", 20, "Number of trailing lines to return.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -165,7 +186,10 @@ pub fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.count_lines", "Count lines without returning content.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("path", "Absolute POSIX path within the volume."),
+            .req_str("path", "Absolute POSIX path within the volume.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;

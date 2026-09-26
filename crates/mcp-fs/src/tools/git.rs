@@ -65,7 +65,11 @@ pub fn register_with(
     let g = git.clone();
     reg.add(
         ToolSchema::new("git.init", "Initialize the volume as a git repository.")
-            .req_str("mount_id", "Project/volume id the operation targets."),
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .destructive(false)
+            .read_only(false)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -84,7 +88,10 @@ pub fn register_with(
     let g = git.clone();
     reg.add(
         ToolSchema::new("git.status", "Show HEAD, current branch, and all refs.")
-            .req_str("mount_id", "Project/volume id the operation targets."),
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -98,7 +105,10 @@ pub fn register_with(
     let g = git.clone();
     reg.add(
         ToolSchema::new("git.branches", "List all branches with their SHA.")
-            .req_str("mount_id", "Project/volume id the operation targets."),
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -130,7 +140,11 @@ pub fn register_with(
             false,
             "Check the new branch out, moving HEAD onto it and updating the volume's files to \
              match; false leaves HEAD and every file untouched.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -167,7 +181,11 @@ pub fn register_with(
             "Switch HEAD to an existing branch, rewriting the volume to match its commit.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("name", "Name of the branch to switch to, without the refs/heads/ prefix."),
+        .req_str("name", "Name of the branch to switch to, without the refs/heads/ prefix.")
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -202,7 +220,11 @@ pub fn register_with(
             false,
             "Delete the branch even when it holds commits reachable from no other ref, leaving \
              them unreachable.",
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -239,7 +261,11 @@ pub fn register_with(
             false,
             "Move the branch even when the move is not a fast-forward, leaving the commits only \
              the old tip reached orphaned.",
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -282,7 +308,11 @@ pub fn register_with(
             "mode",
             "'soft' to move the pointer only, leaving the volume untouched, or 'hard' to also \
              rewrite the volume to the target commit's tree, discarding uncommitted changes.",
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -305,7 +335,10 @@ pub fn register_with(
     let g = git.clone();
     reg.add(
         ToolSchema::new("git.tags", "List all tags.")
-            .req_str("mount_id", "Project/volume id the operation targets."),
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -326,7 +359,10 @@ pub fn register_with(
                 "Ref, branch, tag, or commit to start from; defaults to HEAD.",
             )
             .opt_int("limit", 20, "Maximum number of commits to return.")
-            .opt_str_null("path", "Optional path filter; only commits touching it are returned."),
+            .opt_str_null("path", "Optional path filter; only commits touching it are returned.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -347,7 +383,10 @@ pub fn register_with(
     reg.add(
         ToolSchema::new("git.show", "Show details and diff of a commit.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("commit_sha", "Commit SHA to show details and diff for."),
+            .req_str("commit_sha", "Commit SHA to show details and diff for.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -368,7 +407,10 @@ pub fn register_with(
                 "to_ref",
                 "Target ref or commit to diff to; omit to diff against the working tree.",
             )
-            .opt_str_null("path", "Optional path filter limiting the diff."),
+            .opt_str_null("path", "Optional path filter limiting the diff.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -394,7 +436,11 @@ pub fn register_with(
             .opt_str_null(
                 "author_email",
                 "Optional author email; defaults to the caller person id.",
-            ),
+            )
+            .destructive(false)
+            .read_only(false)
+            .idempotent(false)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -419,7 +465,11 @@ pub fn register_with(
         ToolSchema::new("git.checkout_file", "Restore a file from a commit into the volume.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("commit_sha", "Commit SHA to restore the file from.")
-            .req_str("path", "Absolute POSIX path of the file to restore into the volume."),
+            .req_str("path", "Absolute POSIX path of the file to restore into the volume.")
+            .destructive(true)
+            .read_only(false)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -456,7 +506,10 @@ pub fn register_with(
         ToolSchema::new("git.blame", "Show who last modified each line of a file.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path of the file to blame.")
-            .opt_str_null("ref_name", "Ref or commit to blame from; defaults to HEAD."),
+            .opt_str_null("ref_name", "Ref or commit to blame from; defaults to HEAD.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -484,7 +537,11 @@ pub fn register_with(
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("name", "Name of the remote, for example origin or upstream.")
-        .req_str("url", "HTTPS URL of the remote repository, without embedded credentials."),
+        .req_str("url", "HTTPS URL of the remote repository, without embedded credentials.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -507,7 +564,11 @@ pub fn register_with(
              are kept. A name matching no remote is an error, never a silent no-op.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("name", "Name of the remote to delete; matched case-sensitively."),
+        .req_str("name", "Name of the remote to delete; matched case-sensitively.")
+        .destructive(true)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -527,7 +588,10 @@ pub fn register_with(
             "List every remote recorded for the volume with its resolved host and provider. \
              A volume with no remote returns an empty list. No credential is ever included.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -558,7 +622,11 @@ pub fn register_with(
         .req_str("mount_id", "Project/volume id the clone is imported into.")
         .req_str("url", "Remote git repository URL (GitHub, GitLab, or any HTTPS URL).")
         .opt_str_null("branch", "Branch to clone; omit to use the remote default branch.")
-        .opt_int("depth", 0, "Shallow clone depth; 0 clones the full history."),
+        .opt_int("depth", 0, "Shallow clone depth; 0 clones the full history.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
             async move {
@@ -601,7 +669,11 @@ pub fn register_with(
             "The 40 character sha the remote branch is expected to be at right now, or 40 \
              zeros when the branch must not exist there yet. Mandatory with force, refused \
              without it: the push is rejected when the remote has moved since.",
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
             async move {
@@ -656,7 +728,11 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to fetch from; defaults to origin.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
             async move {
@@ -682,7 +758,11 @@ pub fn register_with(
         .opt_str_null(
             "message",
             "Message describing the stashed work; defaults to 'WIP on {current_branch}'.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -710,7 +790,10 @@ pub fn register_with(
              not per branch: an entry taken on one branch is listed whatever branch is checked \
              out, and base_sha names the commit it was taken against.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -729,7 +812,11 @@ pub fn register_with(
              entry in place. Removes the ref only: the commit stays in the object store.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
-        .req_str("stash_id", "Id of the stash entry to delete, as returned by git.stash_save."),
+        .req_str("stash_id", "Id of the stash entry to delete, as returned by git.stash_save.")
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -778,7 +865,11 @@ pub fn register_with(
                 .req_str(
                     "stash_id",
                     "Id of the stash entry to apply, as returned by git.stash_save.",
-                ),
+                )
+                .destructive(true)
+                .read_only(false)
+                .idempotent(false)
+                .open_world(false),
             handler(move |ctx: ToolCtx, a| {
                 let g = g.clone();
                 async move {
@@ -822,7 +913,11 @@ pub fn register_with(
             "message",
             "Commit message for the merge commit; defaults to 'Merge {source_ref} into \
              {current_branch}'.",
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -859,7 +954,11 @@ pub fn register_with(
             "One entry per conflicting path to resolve: path, plus exactly one of strategy \
              ('ours' or 'theirs') or content (the literal bytes to use).",
             RESOLUTION_ITEMS,
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -879,7 +978,11 @@ pub fn register_with(
              every resolution recorded so far and leaving HEAD and every volume file exactly \
              as they were before the merge started.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -910,7 +1013,11 @@ pub fn register_with(
             "Ordered plan, one entry per commit of the range between onto and the branch tip: \
              sha, action ('pick', 'squash', 'drop' or 'reword'), and message for a reword.",
             TODO_ITEMS,
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -949,7 +1056,11 @@ pub fn register_with(
             "One entry per conflicting path to resolve: path, plus exactly one of strategy \
              ('ours' or 'theirs') or content (the literal bytes to use).",
             RESOLUTION_ITEMS,
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -970,7 +1081,11 @@ pub fn register_with(
              and every resolution recorded, and leaving the branch and every volume file exactly \
              as they were before the rebase started.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1005,7 +1120,11 @@ pub fn register_with(
             0,
             "For a merge commit only: the 1-based index of the parent the picked change is taken \
              relative to. Omit it for an ordinary commit.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1043,7 +1162,11 @@ pub fn register_with(
             "One entry per conflicting path to resolve: path, plus exactly one of strategy \
              ('ours' or 'theirs') or content (the literal bytes to use).",
             RESOLUTION_ITEMS,
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1067,7 +1190,11 @@ pub fn register_with(
              recorded, and leaving the branch and every volume file exactly as they were before \
              the pick started.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1104,7 +1231,11 @@ pub fn register_with(
             "For a merge commit only: the 1-based index of the parent the revert is computed \
              against, so the other parents' contribution is what gets removed. Omit it for an \
              ordinary commit.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1142,7 +1273,11 @@ pub fn register_with(
             "One entry per conflicting path to resolve: path, plus exactly one of strategy \
              ('ours' or 'theirs') or content (the literal bytes to use).",
             RESOLUTION_ITEMS,
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1163,7 +1298,11 @@ pub fn register_with(
              leaving the branch and every volume file exactly as they were before the revert \
              started.",
         )
-        .req_str("mount_id", "Project/volume id the operation targets."),
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
@@ -1193,7 +1332,11 @@ pub fn register_with(
             "remote",
             "origin",
             "Name of the declared remote to pull from; defaults to origin.",
-        ),
+        )
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), tokens.clone());
             async move {

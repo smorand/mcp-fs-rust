@@ -31,7 +31,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 false,
                 "Replace every occurrence instead of requiring a unique match.",
             )
-            .opt_bool("dry_run", false, "Return the diff without writing changes."),
+            .opt_bool("dry_run", false, "Return the diff without writing changes.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -64,7 +68,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 "Ordered edits (old_string, new_string, replace_all) applied atomically.",
                 EDIT_ITEMS,
             )
-            .opt_bool("dry_run", false, "Return the diff without writing changes."),
+            .opt_bool("dry_run", false, "Return the diff without writing changes.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -93,11 +101,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_str("search_block", "Multi-line block of text to locate.")
             .req_str("replace_block", "Multi-line block that replaces search_block.")
-            .opt_bool(
-                "fuzzy",
-                false,
-                "Allow whitespace tolerant (fuzzy) matching of search_block.",
-            ),
+            .opt_bool("fuzzy", false, "Allow whitespace tolerant (fuzzy) matching of search_block.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -122,7 +130,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path within the volume.")
             .req_int("line", "1-based line number to insert content before.")
-            .req_str("content", "Text content to insert."),
+            .req_str("content", "Text content to insert.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -144,7 +156,11 @@ pub fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.apply_patch", "Apply a multi-file V4A patch within one volume.")
             .req_str("mount_id", "Project/volume id the operation targets.")
-            .req_str("patch_text", "Multi-file V4A patch text to apply within the volume."),
+            .req_str("patch_text", "Multi-file V4A patch text to apply within the volume.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let out = fs_ops::apply_patch(

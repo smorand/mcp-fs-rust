@@ -114,7 +114,11 @@ pub fn register(reg: &mut ToolRegistry) {
         .req_str(
             "mode",
             "Editor mode: 'doc' for a document (CMS-like) or 'slides' for a slide deck.",
-        ),
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
         handler(|ctx, a| async move {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;
@@ -136,7 +140,11 @@ pub fn register(reg: &mut ToolRegistry) {
             "doc.close_editor",
             "Stop the editor server for the given editor_id and release its port.",
         )
-        .req_str("editor_id", "ID returned by doc.open_editor."),
+        .req_str("editor_id", "ID returned by doc.open_editor.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx, a| async move {
             let id = a.str("editor_id")?;
             let mut map = ctx.state.editors.editors.lock().await;
@@ -150,7 +158,10 @@ pub fn register(reg: &mut ToolRegistry) {
     );
 
     reg.add(
-        ToolSchema::new("doc.list_editors", "List all active HTML editors and their URLs."),
+        ToolSchema::new("doc.list_editors", "List all active HTML editors and their URLs.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, _a| async move {
             let map = ctx.state.editors.editors.lock().await;
             let editors: Vec<_> = map

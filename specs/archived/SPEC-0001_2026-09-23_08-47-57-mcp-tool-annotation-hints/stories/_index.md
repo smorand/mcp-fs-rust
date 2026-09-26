@@ -20,17 +20,17 @@
 
 | Order | ID | Epic | Title | DRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
 |-------|----|----|-------|-----|-----------|-------|-------|------------|----------|--------|
-| 1 | US-0001 | n/a | Tool annotations schema infrastructure | DR-006, DR-007 | n/a | DT-001, DT-002 | 1 | — | 2 | todo |
-| 2 | US-0002 | n/a | Contract golden annotation awareness | DR-008 | n/a | DT-005 (prepared) | 1 | US-0001 | 2 | todo |
-| 3 | US-0003 | n/a | Annotate admin, context7, db tools (17) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | todo |
-| 4 | US-0004 | n/a | Annotate doc, document, edit tools (10) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | todo |
-| 5 | US-0005 | n/a | Annotate editor, git_auth, git_pr tools (13) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | todo |
-| 6 | US-0006 | n/a | Annotate listing, metadata, read tools (13) | DR-001, DR-005 | n/a | 1 | 3 | US-0001 | 2 | todo |
-| 7 | US-0007 | n/a | Annotate search, search_semantic, sqlite tools (16) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | todo |
-| 8 | US-0008 | n/a | Annotate web, write, lifecycle tools (15) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | todo |
-| 9 | US-0009 | n/a | Annotate git.rs tools (39) | DR-001..005 (subset) | n/a | 2 | 1 | US-0001 | 2 | todo |
-| 10 | US-0010 | n/a | Registry-wide annotation invariant tests | (test-only) | n/a | DT-003, DT-004 | 1 | US-0003, US-0004, US-0005, US-0006, US-0007, US-0008, US-0009 | 2 | todo |
-| 11 | US-0011 | n/a | Regenerate golden contract and update docs | DR-008 (completion) | n/a | DT-005 (completion) | 3 | US-0010 | 2 | todo |
+| 1 | US-0001 | n/a | Tool annotations schema infrastructure | DR-006, DR-007 | n/a | DT-001, DT-002 | 1 | — | 2 | done |
+| 2 | US-0002 | n/a | Contract golden annotation awareness | DR-008 | n/a | DT-005 (prepared) | 1 | US-0001 | 2 | done |
+| 3 | US-0003 | n/a | Annotate admin, context7, db tools (17) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | done |
+| 4 | US-0004 | n/a | Annotate doc, document, edit tools (10) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | done |
+| 5 | US-0005 | n/a | Annotate editor, git_auth, git_pr tools (13) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | done |
+| 6 | US-0006 | n/a | Annotate listing, metadata, read tools (13) | DR-001, DR-005 | n/a | 1 | 3 | US-0001 | 2 | done |
+| 7 | US-0007 | n/a | Annotate search, search_semantic, sqlite tools (16) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | done |
+| 8 | US-0008 | n/a | Annotate web, write, lifecycle tools (15) | DR-001..005 (subset) | n/a | 1 | 3 | US-0001 | 2 | done |
+| 9 | US-0009 | n/a | Annotate git.rs tools (39) | DR-001..005 (subset) | n/a | 2 | 1 | US-0001 | 2 | done |
+| 10 | US-0010 | n/a | Registry-wide annotation invariant tests | (test-only) | n/a | DT-003, DT-004 | 1 | US-0003, US-0004, US-0005, US-0006, US-0007, US-0008, US-0009 | 2 | done |
+| 11 | US-0011 | n/a | Regenerate golden contract and update docs | DR-008 (completion) | n/a | DT-005 (completion) | 3 | US-0010 | 2 | done |
 
 ## Dependency Graph
 
@@ -112,3 +112,9 @@ exact commands `cargo test --workspace`, `cargo clippy --all-targets
 documented exception that `tool_contract_golden_is_current` is expected to
 fail from US-0003 through US-0010 (by the spec's own design, Section 7) and is
 restored to green in US-0011.
+
+## Converge stories (Phase 4.6)
+
+| Order | ID | Title | Gap | Status |
+|-------|----|----|-----|--------|
+| 12 | US-0012 | Fix 4 destructiveHint misclassifications in git.rs found by CONVERGE audit | DR-003/DR-004: git.merge_resolve, git.rebase, git.rebase_continue need destructive(true); git.cherry_pick needs destructive(false), per spec Section 3.1 | done |

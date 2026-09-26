@@ -2,229 +2,284 @@ admin.add_member
   desc: Add a person to a project (owner or platform admin).
   params: project_id:string, person:string
   required: ['project_id', 'person']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 admin.create_project
   desc: Create a project for a designated owner and provision its volume (platform admin only).
   params: project_id:string, owner:string
   required: ['project_id', 'owner']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 admin.delete_project
   desc: Delete a project and recursively tear down its volume (owner or platform admin).
   params: project_id:string
   required: ['project_id']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 admin.get_index_mode
   desc: Get the current search index mode for a project (member or platform admin).
   params: project_id:string
   required: ['project_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.list_all_projects
   desc: List every project (platform admin only).
   params: (none)
   required: []
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.list_members
   desc: List members of a project (member or platform admin).
   params: project_id:string
   required: ['project_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.list_projects
   desc: List projects the caller can access.
   params: (none)
   required: []
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.list_users
   desc: List every known person and platform admins (platform admin only).
   params: (none)
   required: []
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.remove_member
   desc: Remove a person from a project (owner or platform admin).
   params: project_id:string, person:string
   required: ['project_id', 'person']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 admin.set_index_mode
   desc: Set the search index mode for a project (owner or platform admin). none=no index, bm25=full-text only, rag=vector only, both=full-text and vector. Switching to an active mode triggers an initial full index of existing files in the background. Switching to none wipes the index immediately.
   params: project_id:string, mode:string
   required: ['project_id', 'mode']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 fs.append
   desc: Append content to a file (optionally create it).
   params: mount_id:string, path:string, content:string, create:boolean=false
   required: ['mount_id', 'path', 'content']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.apply_patch
   desc: Apply a multi-file V4A patch within one volume.
   params: mount_id:string, patch_text:string
   required: ['mount_id', 'patch_text']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.audit_log
   desc: Recent mutations performed in this session.
   params: mount_id:string, since:number|null=null, limit:integer=20
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.copy
   desc: Copy a file or tree (no-clobber by default).
   params: mount_id:string, source:string, destination:string, overwrite:boolean=false, recursive:boolean=false
   required: ['mount_id', 'source', 'destination']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.count_lines
   desc: Count lines without returning content.
   params: mount_id:string, path:string
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.create_empty
   desc: Create an empty file (touch).
   params: mount_id:string, path:string, exist_ok:boolean=false
   required: ['mount_id', 'path']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 fs.delete
   desc: Delete a path (moves to trash by default).
   params: mount_id:string, path:string, recursive:boolean=false, trash:boolean=true
   required: ['mount_id', 'path']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 fs.documentize
   desc: Generate the Markdown companion of a stored document.
   params: mount_id:string, path:string, overwrite:boolean=false
   required: ['mount_id', 'path']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 fs.edit
   desc: Replace a unique string; dry_run returns the diff.
   params: mount_id:string, path:string, old_string:string, new_string:string, replace_all:boolean=false, dry_run:boolean=false
   required: ['mount_id', 'path', 'old_string', 'new_string']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.exists
   desc: Probe whether a path exists and its kind.
   params: mount_id:string, path:string
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.extract_text
   desc: Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it 
   params: mount_id:string, path:string, max_chars:integer=200000, preview_chars:integer=4000, ocr:boolean=true, refresh:boolean=false
   required: ['mount_id', 'path']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 fs.find_definition
   desc: Find a symbol definition (language-aware).
   params: mount_id:string, name:string, root:string="/", kind:string=null
   required: ['mount_id', 'name']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.find_references
   desc: Find identifier references (language-aware).
   params: mount_id:string, name:string, root:string="/"
   required: ['mount_id', 'name']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.glob
   desc: Find files by glob pattern, newest first (cap 100).
   params: mount_id:string, pattern:string, root:string="/", exclude_patterns:<untyped>=null
   required: ['mount_id', 'pattern']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.grep
   desc: Search file contents (files|content|count modes).
   params: mount_id:string, pattern:string, root:string="/", include_glob:string=null, exclude_glob:string=null, regex:boolean=true, case_sensitive:boolean=true, output_mode:string="content", context_lines:integer=0, max_matches:integer=100
   required: ['mount_id', 'pattern']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.hash
   desc: Content hash (md5|sha1|sha256|sha512).
   params: mount_id:string, path:string, algo:string="sha256"
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.head
   desc: First N lines of a file.
   params: mount_id:string, path:string, lines:integer=20
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.insert_at_line
   desc: Insert content before a 1-based line number.
   params: mount_id:string, path:string, line:integer, content:string
   required: ['mount_id', 'path', 'line', 'content']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.list_allowed_roots
   desc: List the volume roots the caller can access.
   params: mount_id:string
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.list_dir
   desc: Flat directory listing with kinds and optional sizes.
   params: mount_id:string, path:string="/", include_hidden:boolean=false, sort_by:string="name", with_sizes:boolean=false
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.mkdir
   desc: Create a directory (parents by default).
   params: mount_id:string, path:string, parents:boolean=true, exist_ok:boolean=true
   required: ['mount_id', 'path']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 fs.move
   desc: Rename or relocate a path (no-clobber by default).
   params: mount_id:string, source:string, destination:string, overwrite:boolean=false
   required: ['mount_id', 'source', 'destination']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.multi_edit
   desc: Apply several edits atomically (all or nothing).
   params: mount_id:string, path:string, edits:array, dry_run:boolean=false
   required: ['mount_id', 'path', 'edits']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.read
   desc: Read a text file with line-numbered, paged output.
   params: mount_id:string, path:string, offset_lines:integer=0, limit_lines:integer=2000, line_numbered:boolean=true
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.read_bytes
   desc: Read raw bytes (base64) with MIME type.
   params: mount_id:string, path:string, offset_bytes:integer=0, length_bytes:integer=65536
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.read_lines
   desc: Read an inclusive line range [start_line, end_line].
   params: mount_id:string, path:string, start_line:integer, end_line:integer
   required: ['mount_id', 'path', 'start_line', 'end_line']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.read_many
   desc: Batch read several files with per-file error isolation.
   params: mount_id:string, paths:array, per_file_cap_lines:integer=500
   required: ['mount_id', 'paths']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.read_section
   desc: Read the indentation block around an anchor line.
   params: mount_id:string, path:string, anchor_line:integer, max_lines:integer=200
   required: ['mount_id', 'path', 'anchor_line']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.search_replace
   desc: Replace a multi-line block (optional fuzzy match).
   params: mount_id:string, path:string, search_block:string, replace_block:string, fuzzy:boolean=false
   required: ['mount_id', 'path', 'search_block', 'replace_block']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.stat
   desc: POSIX metadata for a path.
   params: mount_id:string, path:string
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.tail
   desc: Last N lines of a file.
   params: mount_id:string, path:string, lines:integer=20
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.tree
   desc: Recursive JSON tree to a maximum depth.
   params: mount_id:string, path:string="/", max_depth:integer=3, exclude_patterns:<untyped>=null, with_sizes:boolean=false
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.write
   desc: Create or overwrite a file (no-clobber by default, atomic).
   params: mount_id:string, path:string, content:string, overwrite:boolean=false, create_parents:boolean=true
   required: ['mount_id', 'path', 'content']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.write_bytes
   desc: Write raw bytes (base64) to a file.
   params: mount_id:string, path:string, base64:string, overwrite:boolean=false, create_parents:boolean=true, trigger_documentation_service:boolean=false
   required: ['mount_id', 'path', 'base64']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.write_docx
   desc: Render Markdown into a .docx Word document and write it to the volume.
   params: mount_id:string, path:string, markdown:string, title:string=null, overwrite:boolean=false
   required: ['mount_id', 'path', 'markdown']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.auth
   desc: Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.
   params: provider:string, host:string=null, instance_url:string=null
   required: ['provider']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=true
 git.auth_revoke
   desc: Revoke the stored token for a provider.
   params: provider:string=null, host:string=null
   required: []
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.auth_status
   desc: Check authentication status for a provider (or all providers).
   params: provider:string=null, host:string=null
   required: []
   returns: {"statuses": [{"host": "gitlab.com", "provider": "gitlab", "validity": "valid", "expires_at": "<iso>|null", "scopes": ["api"], "pr_read": true, "pr_write": true, "pr_capable": true, "missing_scopes": []}]}
            pr_read/pr_write/pr_capable are null when the recorded scope set is empty or the provider's vocabulary is unknown
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.blame
   desc: Show who last modified each line of a file.
   params: mount_id:string, path:string, ref_name:string=null
   required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.branch_create
   desc: Create a branch at a start point, optionally checking it out.
   params: mount_id:string, name:string, start_point:string="", checkout:boolean=false
   required: ['mount_id', 'name']
   returns: {"branch": "feature/login", "sha": "<sha>", "checked_out": false}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.branch_delete
   desc: Delete a branch. Refuses the branch currently checked out, and refuses a branch holding commits reachable from no other ref unless force is true. Removes the ref only: every commit stays in the object store, so a mistaken delete is undone by recreating the branch at the reported sha with git.branch_create.
   params: mount_id:string, name:string, force:boolean=false
   required: ['mount_id', 'name']
   returns: {"branch": "feature/merged", "sha": "<sha>", "forced": false}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.branch_reset
   desc: Move a branch pointer to another commit, the equivalent of git branch -f. Refuses a move that is not a fast-forward unless force is true, and always reports old_sha so a mistaken move is undone by moving back to it. On the branch currently checked out it also rewrites the volume to the target commit's tree, discarding uncommitted changes; on any other branch it moves the ref and leaves every file alone.
   params: mount_id:string, name:string, target_commit:string, force:boolean=false
   required: ['mount_id', 'name', 'target_commit']
   returns: {"branch": "main", "old_sha": "<sha>", "new_sha": "<sha>", "checked_out": true, "files_changed": 1}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.branch_switch
   desc: Switch HEAD to an existing branch, rewriting the volume to match its commit.
   params: mount_id:string, name:string
   required: ['mount_id', 'name']
   returns: {"branch": "release/1.0", "sha": "<sha>", "changed": true, "files_changed": 2}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.branches
   desc: List all branches with their SHA.
   params: mount_id:string
   required: ['mount_id']
   returns: {"mount_id": "proj", "branches": [{"name": "main", "full_ref": "refs/heads/main", "sha": "<sha>", "current": true, "upstream": "refs/remotes/origin/main|null", "ahead": 3, "behind": 1}]} (ahead/behind are null, not 0, with no tracking ref)
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.checkout_file
   desc: Restore a file from a commit into the volume.
   params: mount_id:string, commit_sha:string, path:string
   required: ['mount_id', 'commit_sha', 'path']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.cherry_pick
   desc: Apply the change one commit made onto the checked-out branch, as a NEW commit with a new sha that keeps the original author and records you as the committer. A commit already in the branch's history, or whose change the branch already carries, is reported as already_present and never duplicated. A conflicting pick applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.cherry_pick_continue or abandoned with git.cherry_pick_abort. A merge commit needs mainline, the parent its change is taken relative to. Refuses a dirty volume (commit or stash first).
   params: mount_id:string, commit_sha:string, mainline:integer=0
@@ -232,43 +287,52 @@ git.cherry_pick
   returns: {"status": "committed", "new_sha": "<sha>", "source_sha": "<sha>"}
   returns (already in this branch, by sha or by content): {"status": "already_present", "new_sha": null, "source_sha": "<sha>"}
   returns (conflicting): conflict response with null current_step/total_steps, continue_with git.cherry_pick_continue, abort_with git.cherry_pick_abort
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.cherry_pick_abort
   desc: Abandon the cherry-pick paused by git.cherry_pick, discarding every resolution recorded, and leaving the branch and every volume file exactly as they were before the pick started.
   params: mount_id:string
   required: ['mount_id']
   returns: {"status": "aborted", "operation": "cherry_pick", "restored_sha": "<sha>"}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.cherry_pick_continue
   desc: Resume the cherry-pick paused by git.cherry_pick on a conflicting file. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the branch the commit is being applied onto, 'theirs' for the commit being picked, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the pick stays paused and nothing is written. Once every path is resolved the commit is created. A path that is not in conflict rejects the whole call, and so does a call made while something other than a cherry-pick is in progress.
   params: mount_id:string, resolutions:array[{path:string, strategy:string, content:string}]=null
   required: ['mount_id']
   returns: {"status": "committed", "new_sha": "<sha>", "source_sha": "<sha>"}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.commit
   desc: Create a commit from the current state of the volume.
   params: mount_id:string, message:string, author_name:string=null, author_email:string=null
   required: ['mount_id', 'message']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.diff
   desc: Show diff between two refs or a ref and working tree.
   params: mount_id:string, from_ref:string, to_ref:string=null, path:string=null
   required: ['mount_id', 'from_ref']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.init
   desc: Initialize the volume as a git repository.
   params: mount_id:string
   required: ['mount_id']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.log
   desc: List commits. ref_name defaults to HEAD.
   params: mount_id:string, ref_name:string=null, limit:integer=20, path:string=null
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.merge
   desc: Merge a branch, tag or commit into the checked-out branch. An already merged source is reported as already_up_to_date and changes nothing. A source the current branch is an ancestor of fast-forwards. Anything else is a three-way merge: a clean one creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or stash first).
   params: mount_id:string, source_ref:string, squash:boolean=false, message:string=null
   required: ['mount_id', 'source_ref']
   returns: {"status": "merged|already_up_to_date", "merge_commit": "<sha>|null", "fast_forward": bool, "squashed": bool, "files_changed": int}
   returns (conflict): {"status": "conflict", "operation": "merge", "operation_id": "<id>", "source_ref": "feature", "current_step": null, "total_steps": null, "conflicts": [{"path": "/a.txt", "ours": {"exists": true, "content": "..."}, "theirs": {...}, "base": {...}, "binary": false, "type_change": false}], "continue_with": "git.merge_resolve", "abort_with": "git.merge_abort"}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.merge_abort
   desc: Abandon the merge left in conflict by git.merge or git.remote_pull, discarding every resolution recorded so far and leaving HEAD and every volume file exactly as they were before the merge started.
   params: mount_id:string
   required: ['mount_id']
   returns: {"status": "aborted", "operation": "merge|stash_apply|stash_pop"}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.merge_resolve
   desc: Finish a merge left in conflict by git.merge or git.remote_pull. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the checked-out branch's side, 'theirs' for the side being merged in, both taken whole) or content (the exact bytes to use, which is how a caller merges the two sides itself). Paths may be resolved over several calls: until the last one is resolved the merge stays in progress and nothing is written, and once it is the merge commit is created and every resulting file written to the volume as one all-or-nothing unit. A path that is not in conflict rejects the whole call.
   params: mount_id:string, resolutions:array[{path:string, strategy:string, content:string}]
@@ -276,22 +340,26 @@ git.merge_resolve
   returns: {"status": "merged", "merge_commit": "<sha>", "remaining_conflicts": [], "resolved_count": int, "files_changed": int}
   returns (partial): {"status": "conflict", "merge_commit": null, "remaining_conflicts": ["/a.txt"], "resolved_count": int, "files_changed": 0}
   returns (stash completion): {"status": "applied", "merge_commit": null, "remaining_conflicts": [], "resolved_count": int, "files_changed": int}; a git.stash_apply or git.stash_pop left in conflict is a working tree operation: the resolved files are written, no commit is created, the branch tip does not move, and a pop drops its entry here
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.pr_create
   desc: Open a pull request on GitHub, or a merge request on GitLab, for a declared remote. Fails before contacting the provider when the head branch is not on the remote yet.
   params: mount_id:string, base:string, head:string, title:string, body:string=null, draft:boolean=false, remote:string=origin
   required: ['mount_id', 'base', 'head', 'title']
   returns: the normalized pull request: {"provider": "github|gitlab", "host": "github.com", "number": 42, "title": "...", "body": "...", "state": "open|closed|merged", "draft": false, "base": "main", "head": "feature/x", "author": "login", "url": "...", "created_at": "2026-09-01T10:00:00+00:00", "updated_at": "...", "commits": int, "changed_files": int, "additions": int, "deletions": int, "review_state": "approved|none|...", "checks_state": "success|unknown|...", "mergeable": true|false|null, "raw": {provider payload, untouched}}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=true
 git.pr_diff
   desc: Read the unified diff of one pull request on GitHub, or one merge request on GitLab. The answer is bounded by git.max_pr_diff_mb; a larger diff is returned truncated, with truncated set to true.
   params: mount_id:string, pr_number:integer, remote:string=origin
   required: ['mount_id', 'pr_number']
   returns: {"pr_number": 42, "diff": "<unified diff>", "bytes": int, "truncated": false}
   returns (truncated): {"pr_number": 42, "diff": "<prefix>", "bytes": int, "truncated": true, "note": "diff truncated at 12 MiB; fetch the branch with git.remote_fetch for the full change"}
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=true
 git.pr_get
   desc: Read one pull request on GitHub, or one merge request on GitLab, normalized to one shape and enriched with its review state and its check state. Fails rather than reporting an unknown review or check state as none.
   params: mount_id:string, pr_number:integer, remote:string=origin
   required: ['mount_id', 'pr_number']
   returns: the normalized pull request, with review_state one of approved|changes_requested|review_required|none and checks_state one of success|failure|pending|none
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=true
 git.pr_list
   desc: List the pull requests of a declared remote on GitHub, or its merge requests on GitLab, filtered by state and normalized to one shape.
   params: mount_id:string, state:string=open, remote:string=origin
@@ -299,6 +367,7 @@ git.pr_list
   returns: {"pull_requests": [list item], "count": int}
   list item: the normalized pull request MINUS commits, changed_files, additions, deletions and mergeable, so sixteen keys in the same order, raw included: {"provider", "host", "number", "title", "body", "state", "draft", "base", "head", "author", "url", "created_at", "updated_at", "review_state", "checks_state", "raw"}
   state: one of open, closed, merged, all; anything else is rejected before the provider is contacted. An empty result is [] with count 0, never an error.
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=true
 git.pr_merge
   desc: Merge a pull request on GitHub, or a merge request on GitLab, with the chosen strategy. The merge happens on the provider: no local ref and no remote-tracking ref is updated, so git.remote_fetch is required to observe it locally. A refusal by the provider (failing checks, missing reviews, a protected branch, a strategy disabled for that repository, an already merged or closed pull request) is reported as the provider's own status and message, never as a success.
   params: mount_id:string, pr_number:integer, strategy:string, commit_title:string=null, commit_message:string=null, remote:string=origin
@@ -306,6 +375,7 @@ git.pr_merge
   returns: the normalized pull request with state "merged", plus "note": "merged on host '<host>' with strategy '<strategy>'; no local ref and no remote-tracking ref was updated, run git.remote_fetch to observe the merge locally"
   strategy: one of merge, squash, rebase; anything else is rejected before the provider is contacted. GitHub receives it as merge_method; GitLab receives squash true/false, and a rebase is its own endpoint run before the merge.
   raw (GitHub): the pull request as it was read, with the merge result keys (sha, merged, message) folded in. raw (GitLab): the merge request the merge call returned.
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=true
 git.pr_review
   desc: Submit a review verdict on a pull request on GitHub, or on a merge request on GitLab: approve it, request changes, or comment. On GitLab, which has no review verdict, approve uses the approve endpoint while the other two leave a note. A refusal by the provider (reviewing one's own pull request, a token the provider no longer accepts) is reported as the provider's own status and message, never as a success.
   params: mount_id:string, pr_number:integer, verdict:string, body:string=null, remote:string=origin
@@ -313,6 +383,7 @@ git.pr_review
   returns: {"pr_number": int, "provider": "github"|"gitlab", "host": "<host>", "verdict": "<verdict>", "review_state": "approved"|"changes_requested"|"review_required", "raw": {...}}
   verdict: one of approve, request_changes, comment; anything else is rejected before the provider is contacted. request_changes and comment require a non-empty body; approve does not.
   GitHub: one POST to /pulls/{n}/reviews with {"event": APPROVE|REQUEST_CHANGES|COMMENT} plus body when supplied. GitLab: approve is POST .../approve then a read of .../approvals; request_changes is POST .../unapprove then POST .../notes; comment is POST .../notes alone.
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=true
 git.rebase
   desc: Replay the checked-out branch's commits onto another commit, following an explicit todo list. Each entry names one commit of the range between onto and the branch tip and one action: pick replays it, drop leaves it out, reword replays it with a new message, squash folds it into the entry above it. The whole todo is checked before anything is replayed: an unknown sha, a commit outside the range, a commit of the range left out, a duplicate sha, an unknown action, a leading squash or a blank reword message rejects the call and changes nothing. A branch that already contains onto is reported as up_to_date. Refuses a dirty volume (commit or stash first).
   params: mount_id:string, onto:string, todo:array[{action:string, sha:string, message:string}]
@@ -320,54 +391,65 @@ git.rebase
   returns: {"status": "completed", "branch": "feature", "new_tip": "<sha>", "replayed": int, "dropped": int, "squashed": int}
   returns (conflicting step): conflict response with top-level current_step/total_steps (zero based), continue_with git.rebase_continue, abort_with git.rebase_abort
   returns (nothing to replay): {"status": "up_to_date", "branch": "feature", "new_tip": "<sha>", "replayed": 0, "dropped": 0, "squashed": 0}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.rebase_abort
   desc: Abandon the rebase paused by git.rebase, discarding every commit replayed so far and every resolution recorded, and leaving the branch and every volume file exactly as they were before the rebase started.
   params: mount_id:string
   required: ['mount_id']
   returns: {"status": "aborted", "operation": "rebase"}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.rebase_continue
   desc: Resume the rebase paused by git.rebase on a conflicting commit. Each resolution names one conflicting path of the paused commit and carries exactly one of strategy ('ours' for the side already replayed onto, 'theirs' for the commit being replayed, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the rebase stays paused at the same commit and nothing is written. Once every path is resolved that commit is replayed and the remaining todo entries follow, until the list is exhausted or a further conflict pauses it again. A path that is not in conflict rejects the whole call, and so does a call made while something other than a rebase is in progress.
   params: mount_id:string, resolutions:array[{path:string, strategy:string, content:string}]=null
   required: ['mount_id']
   returns: {"status": "completed", "branch": "feature", "new_tip": "<sha>", "replayed": int, "dropped": int, "squashed": int}
   returns (paused again): conflict response with top-level current_step/total_steps (zero based), continue_with git.rebase_continue, abort_with git.rebase_abort
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.remote_add
   desc: Record a named remote for the volume, so more than one repository can be pushed to, fetched from or pulled from. The URL must be https, must not embed credentials, and its host must be declared in git.hosts; store the credential with git.auth instead. A name already in use is refused rather than overwritten.
   params: mount_id:string, name:string, url:string
   required: ['mount_id', 'name', 'url']
   returns: {"name": "upstream", "url": "https://github.com/o/r.git", "host": "github.com", "provider": "github"}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.remote_clone
   desc: Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. Uses the OAuth token stored by git.auth 
   params: mount_id:string, url:string, branch:string=null, depth:integer=0
   required: ['mount_id', 'url']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=true
 git.remote_fetch
   desc: Fetch objects and update refs/remotes/{remote}/* from a declared remote. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.
   params: mount_id:string, remote:string=origin
   required: ['mount_id']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 git.remote_list
   desc: List every remote recorded for the volume with its resolved host and provider. A volume with no remote returns an empty list. No credential is ever included.
   params: mount_id:string
   required: ['mount_id']
   returns: {"mount_id": "proj", "remotes": [{"name": "origin", "url": "https://github.com/o/r.git", "host": "github.com", "provider": "github"}], "count": 1}
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.remote_pull
   desc: Fetch from a declared remote, then advance the checked-out branch to the remote tip and update the volume's files to match. A fast-forward applies directly. A diverged history is merged: a clean three-way merge creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or discard first) and refuses any branch other than the one currently checked out.
   params: mount_id:string, branch:string, remote:string=origin
   required: ['mount_id', 'branch']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 git.remote_push
   desc: Push a local branch to a declared remote, under the same name unless remote_branch names another one. Creates the branch on the remote when it is absent there. Fails if the push is not a fast-forward, unless force is true, which requires expected_remote_sha to state the remote sha being overwritten.
   params: mount_id:string, branch:string, remote:string=origin, remote_branch:string=null, force:boolean=false, expected_remote_sha:string=null
   required: ['mount_id', 'branch']
   returns: {"branch": "main", "remote": "origin", "created": true, "up_to_date": false, "remote_sha": "<sha>", "auth": "github", "forced": false, "remote_branch": "sandbox" (only when remote_branch was supplied), "overwritten_sha": "<sha>" (only when forced; 40 zeros when the branch was created)}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 git.remote_remove
   desc: Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op.
   params: mount_id:string, name:string
   required: ['mount_id', 'name']
   returns: {"name": "upstream", "removed": true}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.reset
   desc: Move the current branch's pointer to another commit, the equivalent of git reset. Mode soft moves the pointer alone and leaves every volume file exactly as it is, so the changes of the commits left behind stay in the volume ready to be committed again. Mode hard also rewrites the volume to the target commit's tree, discarding uncommitted changes. There is no mixed mode. Commits the branch no longer reaches are orphaned, never deleted, so a mistaken reset is undone by resetting back to the reported old_sha.
   params: mount_id:string, target_ref:string, mode:string
   required: ['mount_id', 'target_ref', 'mode']
   returns: {"mode": "soft", "old_sha": "<sha>", "new_sha": "<sha>", "files_changed": 0}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.revert
   desc: Undo what one commit did by adding a NEW commit on the checked-out branch whose change is the exact inverse, leaving the original commit in history untouched. The default message is Revert followed by the original subject in quotes. Reverting a revert restores the change. Reverting the very first commit of a history removes everything it added. A conflicting revert applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.revert_continue or abandoned with git.revert_abort. A merge commit needs mainline, the parent the revert is computed against. Refuses a dirty volume (commit or stash first).
   params: mount_id:string, commit_sha:string, mainline:integer=0
@@ -375,75 +457,91 @@ git.revert
   returns: {"status": "committed", "new_sha": "<sha>", "reverted_sha": "<sha>"}
   returns (the change is already undone): {"status": "already_present", "new_sha": null, "reverted_sha": "<sha>"}
   returns (conflicting): conflict response with null current_step/total_steps, continue_with git.revert_continue, abort_with git.revert_abort
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.revert_abort
   desc: Abandon the revert paused by git.revert, discarding every resolution recorded, and leaving the branch and every volume file exactly as they were before the revert started.
   params: mount_id:string
   required: ['mount_id']
   returns: {"status": "aborted", "operation": "revert", "restored_sha": "<sha>"}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.revert_continue
   desc: Resume the revert paused by git.revert on a conflicting file. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the branch the revert is being made on, 'theirs' for the state the reverted commit is being undone back to, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the revert stays paused and nothing is written. Once every path is resolved the inverse commit is created. A path that is not in conflict rejects the whole call, and so does a call made while something other than a revert is in progress.
   params: mount_id:string, resolutions:array[object]
   required: ['mount_id']
   returns: {"status": "committed", "new_sha": "<sha>", "reverted_sha": "<sha>"}
   returns (still conflicting): conflict response with null current_step/total_steps, continue_with git.revert_continue, abort_with git.revert_abort
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.show
   desc: Show details and diff of a commit.
   params: mount_id:string, commit_sha:string
   required: ['mount_id', 'commit_sha']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.stash_apply
   desc: Apply one stash entry's changes onto the current volume state, keeping the entry listed so it can be applied again. The entry applies onto whatever branch is checked out now, even one that did not exist when it was taken. A conflicting application writes nothing to the volume and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort.
   params: mount_id:string, stash_id:string
   required: ['mount_id', 'stash_id']
   returns: {"stash_id": "<sha>", "status": "applied", "files_changed": int, "dropped": false} | conflict response + {"stash_id": "<sha>", "files_changed": 0, "dropped": false}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.stash_drop
   desc: Delete one stash entry by id, leaving every volume file untouched and every other entry in place. Removes the ref only: the commit stays in the object store.
   params: mount_id:string, stash_id:string
   required: ['mount_id', 'stash_id']
   returns: {"stash_id": "<sha>", "dropped": true}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.stash_list
   desc: List every stash entry of the volume, most recent first. The pool is per volume, not per branch: an entry taken on one branch is listed whatever branch is checked out, and base_sha names the commit it was taken against.
   params: mount_id:string
   required: ['mount_id']
   returns: {"mount_id": "proj", "stashes": [{"stash_id": "<sha>", "message": "wip", "base_sha": "<sha>", "branch": "main", "created_at": 1750000000000}], "count": int}
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.stash_pop
   desc: Apply one stash entry's changes onto the current volume state and delete the entry, but only once the application has fully succeeded: an application that ends in conflict reports status conflict with dropped false and keeps the entry, so no work is lost. The entry applies onto whatever branch is checked out now, even one that did not exist when it was taken. A conflicting application writes nothing to the volume and is finished with git.merge_resolve or abandoned with git.merge_abort.
   params: mount_id:string, stash_id:string
   required: ['mount_id', 'stash_id']
   returns: {"stash_id": "<sha>", "status": "applied", "files_changed": int, "dropped": true} | conflict response + {"stash_id": "<sha>", "files_changed": 0, "dropped": false}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.stash_save
   desc: Set the volume's uncommitted changes aside as a stash entry and rewrite the volume back to HEAD's tree. The entry is a commit holding the exact state the volume was in, identified by an opaque stash_id, and it survives deletion of the branch it was taken from. Refuses a volume that has no uncommitted changes, and refuses once the volume holds git.max_stash_entries entries.
   params: mount_id:string, message:string=null
   required: ['mount_id']
   returns: {"stash_id": "<sha>", "sha": "<sha>", "message": "wip", "base_sha": "<sha>", "branch": "main", "created_at": 1750000000000, "files_stashed": int}
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.status
   desc: Show HEAD, current branch, and all refs.
   params: mount_id:string
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.tags
   desc: List all tags.
   params: mount_id:string
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.token_set
   desc: Seed a personal access token you already hold for a host declared in git.hosts, without the interactive device flow. The token is never echoed back.
   params: host:string, token:string, expires_at:string=null
   required: ['host', 'token']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 
 search.delete
   desc: Remove a path from the search index.
   params: mount_id:string, path:string, recursive:boolean=false
   required: ['mount_id', 'path']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 search.index
   desc: Index a file or directory into the search engine for this volume.
   params: mount_id:string, path:string, chunk_overlap:integer=100, chunk_size:integer=1000, recursive:boolean=false
   required: ['mount_id', 'path']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 search.query
   desc: Search indexed content. mode overrides the server default (bm25, rag, both).
   params: mount_id:string, query:string, mode:string=null, rerank:boolean=true, top_k:integer=10
   required: ['mount_id', 'query']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 search.status
   desc: Report index statistics for this volume.
   params: mount_id:string
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 
 
 === EXACT RETURN SHAPES (the contract this server keeps; sample values are illustrative) ===

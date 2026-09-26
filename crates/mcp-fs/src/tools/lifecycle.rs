@@ -18,7 +18,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path of the directory to create.")
             .opt_bool("parents", true, "Create missing parent directories.")
-            .opt_bool("exist_ok", true, "Succeed silently if the directory already exists."),
+            .opt_bool("exist_ok", true, "Succeed silently if the directory already exists.")
+            .destructive(false)
+            .read_only(false)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -40,7 +44,11 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path to delete.")
             .opt_bool("recursive", false, "Required to delete a non-empty directory.")
-            .opt_bool("trash", true, "Move to trash instead of hard deleting."),
+            .opt_bool("trash", true, "Move to trash instead of hard deleting.")
+            .destructive(true)
+            .read_only(false)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -72,7 +80,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 "overwrite",
                 false,
                 "Allow overwriting an existing destination (default no-clobber).",
-            ),
+            )
+            .destructive(true)
+            .read_only(false)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let src = norm(&ctx, &a, "source")?;
@@ -109,7 +121,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 false,
                 "Allow overwriting an existing destination (default no-clobber).",
             )
-            .opt_bool("recursive", false, "Required to copy a directory tree."),
+            .opt_bool("recursive", false, "Required to copy a directory tree.")
+            .destructive(true)
+            .read_only(false)
+            .idempotent(false)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let src = norm(&ctx, &a, "source")?;
@@ -132,7 +148,10 @@ pub fn register(reg: &mut ToolRegistry) {
 
     reg.add(
         ToolSchema::new("fs.list_allowed_roots", "List the volume roots the caller can access.")
-            .req_str("mount_id", "Project/volume id the operation targets."),
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let _mount = authorize_only(&ctx, &a).await?;
             list_allowed_roots(&ctx).await
@@ -146,7 +165,10 @@ pub fn register(reg: &mut ToolRegistry) {
                 "since",
                 "Only return entries at or after this Unix timestamp (seconds).",
             )
-            .opt_int("limit", 20, "Maximum number of recent entries to return."),
+            .opt_int("limit", 20, "Maximum number of recent entries to return.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let mount = authorize_only(&ctx, &a).await?;
             Ok(audit_log(&ctx, &a, &mount))

@@ -154,6 +154,57 @@ mod tests {
         assert!(reg.resolve("search.status").is_some());
     }
 
+    #[test]
+    fn every_registered_tool_has_an_explicit_annotation() {
+        let mut reg = ToolRegistry::new();
+        let features = EnabledFeatures {
+            git: true,
+            web: true,
+            context7: true,
+            sqlite: true,
+            db: true,
+            doc: true,
+            search: true,
+        };
+        let config = crate::config::ServerConfig::default();
+        super::register_all(&mut reg, &features, &config);
+        for name in reg.names() {
+            let tool = reg.resolve(name).unwrap();
+            let entry = tool.schema.to_list_entry();
+            assert!(
+                entry.get("annotations").is_some_and(|a| a.is_object()),
+                "{name} has no annotations set"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_tools_never_carry_a_destructive_hint() {
+        let mut reg = ToolRegistry::new();
+        let features = EnabledFeatures {
+            git: true,
+            web: true,
+            context7: true,
+            sqlite: true,
+            db: true,
+            doc: true,
+            search: true,
+        };
+        let config = crate::config::ServerConfig::default();
+        super::register_all(&mut reg, &features, &config);
+        for name in reg.names() {
+            let tool = reg.resolve(name).unwrap();
+            let entry = tool.schema.to_list_entry();
+            let ann = &entry["annotations"];
+            if ann["readOnlyHint"] == serde_json::json!(true) {
+                assert!(
+                    ann.get("destructiveHint").is_none(),
+                    "{name} is readOnlyHint=true but also carries destructiveHint"
+                );
+            }
+        }
+    }
+
     /// Whole surface gate for the admin and git tools of this agent: every `admin.*`,
     /// `git.*` and `git.auth*` schema and description is compared to the frozen
     /// contract, the serialized string included, so a property key ORDER change

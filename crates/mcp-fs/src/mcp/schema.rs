@@ -46,17 +46,49 @@ struct Param {
     default: Option<Value>,
 }
 
+/// Behavior hints attached to a tool, surfaced in `tools/list` as `annotations`.
+#[derive(Debug, Clone, Default)]
+pub struct ToolAnnotations {
+    pub destructive_hint: Option<bool>,
+    pub read_only_hint: Option<bool>,
+    pub idempotent_hint: Option<bool>,
+    pub open_world_hint: Option<bool>,
+}
+
 /// Builder producing a tool's name, description and argument JSON Schema.
 #[derive(Debug, Clone)]
 pub struct ToolSchema {
     pub name: &'static str,
     pub description: String,
     params: Vec<Param>,
+    annotations: ToolAnnotations,
 }
 
 impl ToolSchema {
     pub fn new(name: &'static str, description: impl Into<String>) -> Self {
-        Self { name, description: description.into(), params: Vec::new() }
+        Self {
+            name,
+            description: description.into(),
+            params: Vec::new(),
+            annotations: ToolAnnotations::default(),
+        }
+    }
+
+    pub fn destructive(mut self, v: bool) -> Self {
+        self.annotations.destructive_hint = Some(v);
+        self
+    }
+    pub fn read_only(mut self, v: bool) -> Self {
+        self.annotations.read_only_hint = Some(v);
+        self
+    }
+    pub fn idempotent(mut self, v: bool) -> Self {
+        self.annotations.idempotent_hint = Some(v);
+        self
+    }
+    pub fn open_world(mut self, v: bool) -> Self {
+        self.annotations.open_world_hint = Some(v);
+        self
     }
 
     fn push(
@@ -171,11 +203,32 @@ impl ToolSchema {
 
     /// The `tools/list` entry for this tool.
     pub fn to_list_entry(&self) -> Value {
-        json!({
-            "name": self.name,
-            "description": self.description,
-            "inputSchema": self.input_schema(),
-        })
+        let mut entry = Map::new();
+        entry.insert("name".into(), json!(self.name));
+        entry.insert("description".into(), json!(self.description));
+        entry.insert("inputSchema".into(), self.input_schema());
+        let a = &self.annotations;
+        if a.destructive_hint.is_some()
+            || a.read_only_hint.is_some()
+            || a.idempotent_hint.is_some()
+            || a.open_world_hint.is_some()
+        {
+            let mut ann = Map::new();
+            if let Some(v) = a.destructive_hint {
+                ann.insert("destructiveHint".into(), json!(v));
+            }
+            if let Some(v) = a.read_only_hint {
+                ann.insert("readOnlyHint".into(), json!(v));
+            }
+            if let Some(v) = a.idempotent_hint {
+                ann.insert("idempotentHint".into(), json!(v));
+            }
+            if let Some(v) = a.open_world_hint {
+                ann.insert("openWorldHint".into(), json!(v));
+            }
+            entry.insert("annotations".into(), Value::Object(ann));
+        }
+        Value::Object(entry)
     }
 }
 
@@ -256,5 +309,21 @@ mod tests {
         let v = s.input_schema();
         assert_eq!(v["properties"]["paths"]["type"], json!("array"));
         assert_eq!(v["properties"]["paths"]["items"], json!({"type":"string"}));
+    }
+
+    #[test]
+    fn to_list_entry_omits_annotations_when_unset() {
+        let s = ToolSchema::new("t.probe", "d");
+        let v = s.to_list_entry();
+        assert!(v.get("annotations").is_none());
+    }
+
+    #[test]
+    fn to_list_entry_serializes_present_hints_camel_case() {
+        let s = ToolSchema::new("t.probe", "d").destructive(true).read_only(false);
+        let v = s.to_list_entry();
+        assert_eq!(v["annotations"], json!({"destructiveHint": true, "readOnlyHint": false}));
+        assert!(v["annotations"].get("idempotentHint").is_none());
+        assert!(v["annotations"].get("openWorldHint").is_none());
     }
 }

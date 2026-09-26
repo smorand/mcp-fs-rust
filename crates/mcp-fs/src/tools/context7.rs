@@ -16,7 +16,10 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::Context7Config) 
             "context7.resolve_library_id",
             "Resolve a library name to its Context7 library ID. Use this before calling context7.get_library_docs.",
         )
-        .req_str("library_name", "Library name to search for (e.g. 'react', 'tokio', 'numpy')."),
+        .req_str("library_name", "Library name to search for (e.g. 'react', 'tokio', 'numpy').")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |_ctx, a| {
             let cfg = cfg1.clone();
             async move {
@@ -41,7 +44,10 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::Context7Config) 
             "Context7 library ID as returned by context7.resolve_library_id (e.g. '/facebook/react').",
         )
         .opt_str_null("topic", "Topic or section to focus on (e.g. 'hooks', 'routing').")
-        .opt_int("tokens", 10_000, "Maximum number of tokens to return (capped at 50000)."),
+        .opt_int("tokens", 10_000, "Maximum number of tokens to return (capped at 50000).")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(true),
         handler(move |_ctx, a| {
             let cfg = cfg2.clone();
             async move {

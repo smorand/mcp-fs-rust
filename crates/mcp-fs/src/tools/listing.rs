@@ -17,7 +17,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .opt_str("path", "/", "Absolute POSIX directory to list.")
             .opt_bool("include_hidden", false, "Include dotfiles (names starting with a period).")
             .opt_str("sort_by", "name", "Sort order: name or size.")
-            .opt_bool("with_sizes", false, "Include size and mtime for each entry."),
+            .opt_bool("with_sizes", false, "Include size and mtime for each entry.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let path = norm_or(&ctx, &a, "path", "/")?;
@@ -41,7 +44,10 @@ pub fn register(reg: &mut ToolRegistry) {
                 "exclude_patterns",
                 "Glob patterns whose matches are pruned from the tree.",
             )
-            .opt_bool("with_sizes", false, "Include size for each file node."),
+            .opt_bool("with_sizes", false, "Include size for each file node.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let path = norm_or(&ctx, &a, "path", "/")?;

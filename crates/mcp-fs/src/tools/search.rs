@@ -24,7 +24,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .opt_flexible_str_array(
                 "exclude_patterns",
                 "Glob patterns whose matches are excluded from results.",
-            ),
+            )
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;
@@ -44,7 +47,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .opt_bool("case_sensitive", true, "Match case sensitively.")
             .opt_str("output_mode", "content", "Output mode: files, content, or count.")
             .opt_int("context_lines", 0, "Lines of context around each match (content mode).")
-            .opt_int("max_matches", 100, "Maximum number of matches to return."),
+            .opt_int("max_matches", 100, "Maximum number of matches to return.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;
@@ -69,7 +75,10 @@ pub fn register(reg: &mut ToolRegistry) {
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("name", "Symbol name to locate the definition of.")
             .opt_str("root", "/", "Absolute POSIX directory to search under.")
-            .opt_str_null("kind", "Optional symbol kind filter, e.g. function, class, method."),
+            .opt_str_null("kind", "Optional symbol kind filter, e.g. function, class, method.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;
@@ -82,7 +91,10 @@ pub fn register(reg: &mut ToolRegistry) {
         ToolSchema::new("fs.find_references", "Find identifier references (language-aware).")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("name", "Identifier name to find references to.")
-            .opt_str("root", "/", "Absolute POSIX directory to search under."),
+            .opt_str("root", "/", "Absolute POSIX directory to search under.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let (_mount, client) = volume(&ctx, &a).await?;
             let root = norm_or(&ctx, &a, "root", "/")?;

@@ -30,7 +30,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 "refresh",
                 false,
                 "Force re-extraction even if the companion .md is up to date.",
-            ),
+            )
+            .read_only(false)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(true),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -63,11 +67,11 @@ pub fn register(reg: &mut ToolRegistry) {
         .req_str("path", "Absolute POSIX path of the .docx file to write.")
         .req_str("markdown", "Markdown source rendered into the Word document.")
         .opt_str_null("title", "Optional document title.")
-        .opt_bool(
-            "overwrite",
-            false,
-            "Allow overwriting an existing file (default no-clobber).",
-        ),
+        .opt_bool("overwrite", false, "Allow overwriting an existing file (default no-clobber).")
+        .read_only(false)
+        .destructive(true)
+        .idempotent(false)
+        .open_world(false),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
@@ -102,7 +106,11 @@ pub fn register(reg: &mut ToolRegistry) {
                 "overwrite",
                 false,
                 "Allow overwriting an existing companion .md (default no-clobber).",
-            ),
+            )
+            .read_only(false)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(true),
         handler(|ctx, a| async move {
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;

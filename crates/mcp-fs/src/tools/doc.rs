@@ -65,7 +65,11 @@ pub fn register(reg: &mut ToolRegistry, config: &DocConfig) {
                 "overwrite",
                 false,
                 "Allow overwriting an existing file (default no-clobber).",
-            ),
+            )
+            .read_only(false)
+            .destructive(true)
+            .idempotent(true)
+            .open_world(true),
         handler({
             let pandoc = pandoc.clone();
             move |ctx, a| {
@@ -108,7 +112,11 @@ pub fn register(reg: &mut ToolRegistry, config: &DocConfig) {
                 "overwrite",
                 false,
                 "Allow overwriting an existing file (default no-clobber).",
-            ),
+            )
+            .read_only(false)
+            .destructive(true)
+            .idempotent(true)
+            .open_world(true),
         handler({
             let pandoc = pandoc.clone();
             move |ctx, a| {

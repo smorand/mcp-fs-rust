@@ -28,7 +28,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
         .req_str("path", "Absolute POSIX path to index (file or directory).")
         .opt_bool("recursive", false, "Recurse into subdirectories when path is a directory.")
         .opt_int("chunk_size", 1000, "Maximum character size of each indexed chunk.")
-        .opt_int("chunk_overlap", 100, "Character overlap between consecutive chunks."),
+        .opt_int("chunk_overlap", 100, "Character overlap between consecutive chunks.")
+        .read_only(false)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx, a| async move {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;
@@ -96,7 +100,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
         .req_str("query", "Search query text.")
         .opt_str_null("mode", "Query mode: bm25, rag, or both. Defaults to server config.")
         .opt_int("top_k", 10, "Maximum number of results to return.")
-        .opt_bool("rerank", true, "Apply reranking when configured and available."),
+        .opt_bool("rerank", true, "Apply reranking when configured and available.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(|ctx, a| async move {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;
@@ -187,7 +194,11 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
         ToolSchema::new("search.delete", "Remove a path from the search index.")
             .req_str("mount_id", "Project/volume id the operation targets.")
             .req_str("path", "Absolute POSIX path to remove from the index.")
-            .opt_bool("recursive", false, "Recurse into subdirectories when path is a directory."),
+            .opt_bool("recursive", false, "Recurse into subdirectories when path is a directory.")
+            .read_only(false)
+            .destructive(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;
@@ -209,7 +220,10 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
 
     reg.add(
         ToolSchema::new("search.status", "Report index statistics for this volume.")
-            .req_str("mount_id", "Project/volume id the operation targets."),
+            .req_str("mount_id", "Project/volume id the operation targets.")
+            .read_only(true)
+            .idempotent(true)
+            .open_world(false),
         handler(|ctx, a| async move {
             let mount = a.str("mount_id")?;
             ctx.state.authorize(&mount, &ctx.person).await?;

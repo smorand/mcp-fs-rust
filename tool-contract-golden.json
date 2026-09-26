@@ -21,6 +21,12 @@
           "project_id",
           "person"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -42,6 +48,12 @@
           "project_id",
           "owner"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -58,6 +70,12 @@
         "required": [
           "project_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -74,6 +92,11 @@
         "required": [
           "project_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -82,6 +105,11 @@
       "inputSchema": {
         "type": "object",
         "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -98,6 +126,11 @@
         "required": [
           "project_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -106,6 +139,11 @@
       "inputSchema": {
         "type": "object",
         "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -114,6 +152,11 @@
       "inputSchema": {
         "type": "object",
         "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -135,6 +178,12 @@
           "project_id",
           "person"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -156,6 +205,12 @@
           "project_id",
           "mode"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -187,6 +242,12 @@
           "path",
           "content"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -208,6 +269,12 @@
           "mount_id",
           "patch_text"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -237,6 +304,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -273,6 +345,12 @@
           "source",
           "destination"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -294,6 +372,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -320,6 +403,12 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -351,6 +440,12 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -377,6 +472,12 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -418,6 +519,12 @@
           "old_string",
           "new_string"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -439,6 +546,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -480,6 +592,12 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -511,6 +629,11 @@
           "mount_id",
           "name"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -537,6 +660,11 @@
           "mount_id",
           "name"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -567,6 +695,11 @@
           "mount_id",
           "pattern"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -628,6 +761,11 @@
           "mount_id",
           "pattern"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -654,6 +792,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -680,6 +823,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -711,6 +859,12 @@
           "line",
           "content"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -727,6 +881,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -763,6 +922,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -794,6 +958,12 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -825,6 +995,12 @@
           "source",
           "destination"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -870,6 +1046,12 @@
           "path",
           "edits"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -906,6 +1088,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -937,6 +1124,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -968,6 +1160,11 @@
           "start_line",
           "end_line"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -997,6 +1194,11 @@
           "mount_id",
           "paths"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1028,6 +1230,11 @@
           "path",
           "anchor_line"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1064,6 +1271,12 @@
           "search_block",
           "replace_block"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1085,6 +1298,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1111,6 +1329,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1146,6 +1369,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1182,6 +1410,12 @@
           "path",
           "content"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1223,6 +1457,12 @@
           "path",
           "base64"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1259,6 +1499,12 @@
           "path",
           "markdown"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1285,6 +1531,12 @@
         "required": [
           "provider"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
       }
     },
     {
@@ -1304,6 +1556,12 @@
             "default": null
           }
         }
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1323,6 +1581,11 @@
             "default": null
           }
         }
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1349,6 +1612,11 @@
           "mount_id",
           "path"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1380,6 +1648,12 @@
           "mount_id",
           "name"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1406,6 +1680,12 @@
           "mount_id",
           "name"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1437,6 +1717,12 @@
           "name",
           "target_commit"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1458,6 +1744,12 @@
           "mount_id",
           "name"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1474,6 +1766,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1500,6 +1797,12 @@
           "commit_sha",
           "path"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1526,6 +1829,12 @@
           "mount_id",
           "commit_sha"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1542,6 +1851,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1580,6 +1895,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1611,6 +1932,12 @@
           "mount_id",
           "message"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1642,6 +1969,11 @@
           "mount_id",
           "from_ref"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1658,6 +1990,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1689,6 +2027,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1720,6 +2063,12 @@
           "mount_id",
           "source_ref"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -1736,6 +2085,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1774,6 +2129,12 @@
           "mount_id",
           "resolutions"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -1820,6 +2181,12 @@
           "head",
           "title"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
       }
     },
     {
@@ -1846,6 +2213,11 @@
           "mount_id",
           "pr_number"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -1872,6 +2244,11 @@
           "mount_id",
           "pr_number"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -1898,6 +2275,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -1939,6 +2321,12 @@
           "pr_number",
           "strategy"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
       }
     },
     {
@@ -1975,6 +2363,12 @@
           "pr_number",
           "verdict"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
       }
     },
     {
@@ -2019,6 +2413,12 @@
           "onto",
           "todo"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2035,6 +2435,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2073,6 +2479,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2099,6 +2511,12 @@
           "name",
           "url"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2130,6 +2548,12 @@
           "mount_id",
           "url"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
       }
     },
     {
@@ -2151,6 +2575,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -2167,6 +2597,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2193,6 +2628,12 @@
           "mount_id",
           "branch"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -2234,6 +2675,12 @@
           "mount_id",
           "branch"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     },
     {
@@ -2255,6 +2702,12 @@
           "mount_id",
           "name"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2281,6 +2734,12 @@
           "target_ref",
           "mode"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2307,6 +2766,12 @@
           "mount_id",
           "commit_sha"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2323,6 +2788,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2361,6 +2832,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2382,6 +2859,11 @@
           "mount_id",
           "commit_sha"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2403,6 +2885,12 @@
           "mount_id",
           "stash_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2424,6 +2912,12 @@
           "mount_id",
           "stash_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2440,6 +2934,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2461,6 +2960,12 @@
           "mount_id",
           "stash_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2482,6 +2987,12 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
       }
     },
     {
@@ -2498,6 +3009,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2514,6 +3030,11 @@
         "required": [
           "mount_id"
         ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     },
     {
@@ -2540,6 +3061,12 @@
           "host",
           "token"
         ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
       }
     }
   ]
