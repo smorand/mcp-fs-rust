@@ -551,7 +551,7 @@ and Section 3.1 corrected to the real 49-name set (see Section 10).
   membership), 38 overwrite/delete (was 29), 30 additive (was 25). The `DDEC-005`
   entry in Section 8 was added during this resolution to state the `*_abort`-family
   policy explicitly, which the fabricated names had let go unstated. This drift was
-  discovered and closed while updating `specs/2026-09-18_19-45-00-git.md`
+  discovered and closed while updating `specs/SPEC-0007_2026-09-18_19-45-00-git/spec.md`
   (`DRIFT-6-01` there) for the same underlying staleness: this document's author had
   the same incomplete picture of the git tool surface that S6 itself had gone stale
   on, for the same root cause (the surface grew after both documents were drafted).

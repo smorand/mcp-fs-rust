@@ -1,0 +1,1026 @@
+# mcp-fs Git — Specification Document
+
+> Generated on: 2026-09-18
+> Project: mcp-fs (Rust)
+> Version: 1.0
+> Status: Draft
+> Type: Evolution Specification (retro-specification of shipped behaviour)
+
+**ID convention.** S6 of eight. S6 owns the `6xx` block: `SC-6xx`, `FR-6xx`, `E2E-6xx`, `DEC-6xx`, `EXC-6xx`.
+
+## 1. Executive Summary
+
+This document specifies the git capability as it stood on 2026-09-18: **14 MCP tools** (11 `git.*`, 3 `git.auth*`), a **blob-backed object database**, a **git smart HTTP server** at `/git/{mount_id}/` that a real `git` CLI can clone from and push to, and an **OAuth device flow** for GitHub and GitLab so a project can clone from a private remote.
+
+**Superseded tool count, current as of 2026-09-23.** Since this document was written, `specs/archived/SPEC-0011_2026-09-21_18-27-26-full-git-dev-process/spec.md` specified and `b1c0275` shipped 35 additional tools: branch lifecycle (`branch_create/switch/delete/reset`), `reset`, stash (`stash_save/list/drop/pop/apply`), merge and squash (`merge/merge_resolve/merge_abort`), interactive rebase (`rebase/rebase_continue/rebase_abort`), cherry-pick (`cherry_pick/cherry_pick_continue/cherry_pick_abort`), revert (`revert/revert_continue/revert_abort`), named remotes with force-push-with-lease (`remote_add/remote_remove/remote_list/remote_push/remote_fetch/remote_pull`), a token-seeding shortcut (`git.token_set`), and a full pull-request surface for GitHub and GitLab (`git.pr_create/list/get/diff/merge/review`). The git tool surface is now **49 tools**: 39 `git.*` (`crates/mcp-fs/src/tools/git.rs`), 4 `git.auth*`+`git.token_set` (`crates/mcp-fs/src/tools/git_auth.rs`), 6 `git.pr_*` (`crates/mcp-fs/src/tools/git_pr.rs`), confirmed by the passing test `tools::all::tests::the_git_families_add_forty_nine_tools` (`crates/mcp-fs/src/tools/all.rs:80`). This section, and Sections 2 and 3, are updated in place to reflect that; Sections 6, 11 and 12 are **not** duplicated here for the 35 additive tools — their 162 functional requirements and 536 tests live in the dev-process spec, under its own `FR-NEW-*`/`FR-MOD-*`/`FR-DEL-*`/`E2E-NEW-*` namespace, disjoint from this document's `6xx` block. See Section 19 for the drift this update closes.
+
+One structural decision shapes the whole layer. Git objects live in the volume's blob store under `git:{sha}`, keyed by content exactly as files are. libgit2 cannot be pointed at that store, because `git2` does not expose a custom ODB backend and writing one means unsafe C glue. So the on-disk bare repository becomes a **rebuildable cache**: objects are exported into it before libgit2 reads, and imported back after libgit2 writes. The stored bytes are identical to what any git implementation would store; only the plumbing differs. The 35 additive tools reuse this same object database and repository store unchanged; the merge/rebase/cherry-pick/revert family adds one new component of its own, a shared conflict-resolution engine (`crates/mcp-fs/src/git/merge.rs`), and named remotes add `crates/mcp-fs/src/git/remote.rs` plus a provider REST client (`crates/mcp-fs/src/git/provider/`) for the PR surface.
+
+Three behaviours are deliberately stricter or more correct than the C# original this began as: project membership is enforced on every git route, `max_pack_size_mb` is actually enforced, and the receive-pack report sends the `unpack ok` line that git requires, without which a real push reports failure even when the refs update correctly.
+
+Retro-specification of shipped behaviour; every claim carries a `file:LINE` citation. Claims dated 2026-09-18 describe the original 14-tool surface; claims added 2026-09-23 are marked as such.
+
+## 2. Current State Analysis
+
+### 2.1 Project Overview
+
+`git/` was 4712 lines on 2026-09-18: `http/mod.rs` (1372), `oauth/device_flow.rs` (744), `odb.rs` (507), `db.rs` (464), `oauth/persistence.rs` (372), `oauth/store.rs` (361), `repo.rs` (357), `http/pktline.rs` (275), `oauth/cipher.rs` (209). The whole family is gated behind `git.enabled`.
+
+**Current as of 2026-09-23:** `git/` is 9725 lines, plus `tools/git.rs` (22994), `tools/git_auth.rs` (2328) and `tools/git_pr.rs` (1502, new file). Growth beyond the 2026-09-18 figure: `git/merge.rs` (867, new — the shared conflict-resolution engine every combining operation uses), `git/remote.rs` (1293, new — named remotes, force-push-with-lease, fetch/pull), `git/provider/` (1309 across `mod.rs`, `model.rs`, `tests.rs`, new — the GitHub/GitLab REST client behind `git.pr_*`), `git/oauth/scopes.rs` (243, new — the `api` scope the PR surface needs), and growth in `git/db.rs` (830, was 464 — the `git_operations` table that lets a paused merge/rebase/cherry-pick/revert survive a restart) and `git/oauth/store.rs` (1114, was 361 — the PR credential scope gate). `git/odb.rs`, `git/repo.rs` and `git/http/` are line-for-line what they were on 2026-09-18; the object database, the smart HTTP server and the OAuth device flow are unchanged by the dev-process expansion (verified: `wc -l` against the values this section originally recorded).
+
+### 2.2 Existing Specifications
+
+- **S1**: the membership gate (FR-021, FR-022) that the git routes and tools reuse, the error vocabulary, the storage seam, and the tool registration gating that keeps the git families out of the catalogue when git is disabled.
+- **S4**: the relational seam the git index sits on, and the migration that copies the git tables (FR-420) while deliberately skipping OAuth tokens (FR-424).
+- **S2**: content addressing in the blob store, which the object database reuses with a `git:` key prefix.
+- **`specs/archived/SPEC-0011_2026-09-21_18-27-26-full-git-dev-process/spec.md`** (2026-09-21, shipped `b1c0275`): postdates this document. Specifies and owns the 35 additive tools named in Section 1, the `git_operations` table, the shared conflict-resolution model, and the GitLab OAuth scope extension to `api`. Uses its own `FR-NEW-*`/`FR-MOD-*`/`FR-DEL-*`/`E2E-NEW-*` IDs, deliberately disjoint from this document's `6xx` block, so an `FR-MOD-*` there that touches behaviour this document specifies (for example `FR-DEL-101`, which removes a parameter `git.remote_pull` never had under this spec — `remote_pull` itself is one of the 35 additive tools) modifies the *dev-process* spec's own prior draft, never this one. This document's `FR-6xx`/`E2E-6xx` content for the original 14 tools and the object DB / HTTP / OAuth infrastructure remains authoritative and unmodified by that spec.
+
+### 2.3 Relevant Architecture
+
+- **Tools, as of 2026-09-18**: `tools/git.rs` (11 tools), `tools/git_auth.rs` (3 tools).
+- **Tools, current as of 2026-09-23**: `tools/git.rs` (39 tools: the original 11 plus `branch_create/switch/delete/reset`, `reset`, `stash_save/list/drop/pop/apply`, `merge/merge_resolve/merge_abort`, `rebase/rebase_continue/rebase_abort`, `cherry_pick/cherry_pick_continue/cherry_pick_abort`, `revert/revert_continue/revert_abort`, `remote_add/remote_remove/remote_list/remote_push/remote_fetch/remote_pull`), `tools/git_auth.rs` (4 tools: the original 3 plus `token_set`), `tools/git_pr.rs` (6 tools, new file: `pr_create/list/get/diff/merge/review`).
+- **Object database**: `git/odb.rs`, key layout and the export/import pair (`:1-30`). Unchanged by the dev-process expansion; every additive tool that touches history reuses it as-is.
+- **Index**: `git/db.rs`, three tables `git_objects`, `git_refs`, `git_remotes` on 2026-09-18 (`:42`); a fourth table `git_operations` was added for the dev-process expansion so a paused merge/rebase/cherry-pick/revert survives a server restart (specified in the dev-process spec, not here).
+- **Repository store**: `git/repo.rs`, one entry per project, `state/git/{id}.db` plus `state/git-repos/{id}/` (`:1-13`). Unchanged.
+- **Smart HTTP**: `git/http/mod.rs`, four routes (`:9-14`), pkt-line framing in `http/pktline.rs`. Unchanged; `git.remote_push`/`fetch`/`pull` are a *new, separate* client-side path over the provider's own smart HTTP endpoint, not a change to this server's own smart HTTP routes.
+- **OAuth**: `git/oauth/device_flow.rs` (RFC 8628), `store.rs`, `cipher.rs` (AES-256-GCM), `persistence.rs`. `store.rs` grew (361 → 1114 lines) to add the PR credential scope gate (`OAuthTokenStore::require_pr_credential`, `git/oauth/scopes.rs`, new) that every `git.pr_*` tool calls before any network request.
+
+## 3. Scope
+
+### 3.1 In Scope
+
+**As specified in this document (2026-09-18), and still fully authoritative:**
+
+- The 11 `git.*` tools: `init`, `status`, `branches`, `tags`, `log`, `show`, `diff`, `commit`, `checkout_file`, `blame`, `remote_clone`.
+- The 3 `git.auth*` tools: `auth`, `auth_status`, `auth_revoke`.
+- The blob-backed object database: key layout, the index tables, export and import, prefix lookup.
+- The per-project repository store and its on-disk layout.
+- The smart HTTP server: the four routes, ref advertisement, upload-pack, receive-pack, pkt-line framing, capabilities, the report-status reply, body limits, and the authentication challenge.
+- The OAuth device flow for GitHub and GitLab, token storage, encryption at rest, and the lifecycle of a pending authorization.
+- Authorization rules specific to git, including the difference between tool access and route access.
+
+**Shipped since, in scope of the codebase but specified in `specs/archived/SPEC-0011_2026-09-21_18-27-26-full-git-dev-process/spec.md`, not here** (listed for completeness so this document's own scope statement is not misread as exhaustive):
+
+- Branch lifecycle (`branch_create`, `branch_switch`, `branch_delete`, `branch_reset`), `reset`.
+- Stash (`stash_save`, `stash_list`, `stash_drop`, `stash_pop`, `stash_apply`).
+- Merge and squash-merge (`merge`, `merge_resolve`, `merge_abort`), the shared conflict-resolution model those and every other combining operation use.
+- Interactive rebase (`rebase`, `rebase_continue`, `rebase_abort`).
+- Cherry-pick (`cherry_pick`, `cherry_pick_continue`, `cherry_pick_abort`) and revert (`revert`, `revert_continue`, `revert_abort`).
+- Named remotes (`remote_add`, `remote_remove`, `remote_list`), force-push with a mandatory lease (`remote_push`), and `remote_fetch`/`remote_pull`.
+- Token seeding without the device flow (`git.token_set`).
+- The pull-request surface for GitHub and GitLab (`git.pr_create`, `pr_list`, `pr_get`, `pr_diff`, `pr_merge`, `pr_review`), the provider REST client, and the `api` OAuth scope it needs.
+
+### 3.2 Out of Scope (Non-Goals)
+
+- Everything S1 owns: identity, the membership gate's implementation, the error vocabulary.
+- The relational seam (S4). The git index is a store like any other.
+- Real have/want negotiation. The pack is always full; this is specified as current behaviour, not designed here.
+- Git hooks, submodules, LFS, sparse checkout. None exists as of 2026-09-23.
+- ~~Merge and rebase. None exists.~~ **No longer true as of 2026-09-23**: both exist, specified in `specs/archived/SPEC-0011_2026-09-21_18-27-26-full-git-dev-process/spec.md` (out of scope of *this* document only in the sense that its FR/E2E detail lives there, not here — see Section 3.1).
+- Any web UI for browsing history.
+
+## 4. User Personas & Actors
+
+| Actor | Description |
+|---|---|
+| **LLM agent** | Reads history and diffs through the `git.*` tools, and commits changes it made through `fs.*`. |
+| **Developer with a git CLI** | Clones and pushes over HTTP against `/git/{mount_id}/`. Needs the protocol to be correct, not approximately correct. |
+| **Project member** | The authenticated identity behind both. Membership, not platform administration, is what grants access. |
+| **Operator** | Enables git, sets `max_pack_size_mb`, decides on anonymous read, and provides OAuth client credentials through the environment. |
+| **Remote provider** | GitHub or GitLab, reached by the device flow. |
+
+## 4.5 Bounded Contexts
+
+| Context | Scope | Key entities |
+|---|---|---|
+| **Object store** | Git objects as content-addressed blobs plus their index. | object, sha, type, size |
+| **Repository** | Per-project refs, HEAD, the bare directory, the write lock. | ref, branch, tag, commit |
+| **Wire** | The smart HTTP protocol: framing, advertisement, packs, reports. | pkt-line, capability, pack, report |
+| **Authorization (git)** | Who may read or write a project's history. | membership, anonymous read, bearer |
+| **Device flow** | Obtaining and holding a provider token on a person's behalf. | device code, user code, access token |
+
+An "object" in the Object store context is a git object; a "blob" there is the git blob type, while a "blob" in S1's Volume context is stored bytes. This spec uses "git object" and "stored blob" where the two could be confused.
+
+## 5. Usage Scenarios
+
+### SC-601: Agent initializes a repository and commits work
+
+**Actor:** LLM agent
+**Preconditions:** `git.enabled` true; the caller is a project member.
+**Flow:**
+1. Agent calls `git.init` for the project.
+2. The repository store creates `state/git/{id}.db` and the bare directory `state/git-repos/{id}/` lazily, caching the entry in process (`git/repo.rs:5-10`).
+3. Agent edits files through `fs.*` tools (S2).
+4. Agent calls `git.commit`; libgit2 creates the commit on disk, and the new objects are imported back into the blob store and the index (`git/odb.rs:26-28`).
+5. Agent calls `git.status`, `git.log` and `git.show` to verify.
+
+**Postconditions:** the commit exists in the blob store as the authoritative copy; the on-disk object directory holds a rebuildable cache of the same bytes.
+**Exceptions:**
+- EXC-601a: git disabled → the tools are absent from the catalogue entirely, so the call is an unknown-tool protocol error
+- EXC-601b: the caller is not a member → `ERR_FORBIDDEN`, including for a platform admin
+- EXC-601c: a read tool called before any commit → an empty history rather than an error
+- EXC-601d: the process restarted since `git.init` → the store opens the project on demand from the intact on-disk state rather than reporting "not initialized" (`git/repo.rs:17-19`)
+
+### SC-602: Agent inspects history
+
+**Actor:** LLM agent
+**Preconditions:** member; the repository has commits.
+**Flow:**
+1. Agent calls `git.log`, `git.show`, `git.diff`, `git.blame`, `git.branches` or `git.tags`.
+2. Before any libgit2 read, the blob-backed objects are exported into the bare repository's on-disk ODB (`git/odb.rs:23-25`).
+3. libgit2 answers from the hydrated directory.
+4. `git.checkout_file` restores one file's content from history into the volume.
+
+**Postconditions:** the agent holds the requested history; the on-disk cache now holds the objects it needed.
+**Exceptions:**
+- EXC-602a: an unknown revision → an error naming it
+- EXC-602b: a short sha → resolved by prefix lookup against the index (`git/odb.rs:5-6`)
+- EXC-602c: `git.checkout_file` writing into the volume → charged and audited like any write
+
+### SC-603: Developer clones and pushes over HTTP
+
+**Actor:** Developer with a git CLI
+**Preconditions:** `git.enabled`; a credential the git CLI can present; the caller is a member.
+**Flow:**
+1. `git clone http://host/git/{mount_id}/` issues `GET /git/{mount_id}/info/refs?service=git-upload-pack`.
+2. The server answers a ref advertisement with its capability string.
+3. The CLI POSTs to `/git/{mount_id}/git-upload-pack`; the server pushes every wanted tip onto a revwalk, builds a **full** pack, and sends a NAK (`git/http/mod.rs:21-24`).
+4. The developer commits locally and pushes; the CLI POSTs to `/git/{mount_id}/git-receive-pack`.
+5. The incoming pack is indexed, its objects are imported into the blob store, refs are updated, and a report-status reply is sent beginning with `unpack ok` (`git/http/mod.rs:579`).
+
+**Postconditions:** the clone contains the project's history; the push has updated refs and the pushed objects are really indexed rather than only written to disk.
+**Exceptions:**
+- EXC-603a: no credential → 401 carrying `WWW-Authenticate: Bearer realm="mcp-fs"`; note the git CLI prompts only on a `Basic` challenge, so anonymous CLI use needs `git.anonymous_read` or an explicit credential helper (`git/http/mod.rs:30-32`)
+- EXC-603b: a verified token whose owner is not a member → refused; membership is enforced on git routes (`git/http/mod.rs:36-37`)
+- EXC-603c: a push body over `git.max_pack_size_mb` → 413 (`git/http/mod.rs:38,195-202`)
+- EXC-603d: an unknown project → refused before any protocol work
+
+### SC-604: Agent clones from a private remote after authorizing
+
+**Actor:** LLM agent, then a human at a browser
+**Preconditions:** `git.enabled`; OAuth client credentials in the environment.
+**Flow:**
+1. Agent calls `git.auth` naming the provider.
+2. The server requests a device code and returns as soon as the provider hands out a user code, without waiting (`tools/git_auth.rs:6-8`).
+3. A background task polls the token endpoint; `authorization_pending` or `slow_down` means keep polling.
+4. The human enters the user code in a browser and approves.
+5. The agent polls `git.auth_status` until the token is stored, then calls `git.remote_clone`.
+6. The clone's objects are imported directly into the blob store.
+
+**Postconditions:** the token is held for that `(person, provider)` pair and, when `MCPFS_TOKEN_KEY` is set, is persisted encrypted; the remote's history is in the project.
+**Exceptions:**
+- EXC-604a: the human denies → `access_denied` ends the poll
+- EXC-604b: the device code expires → the pending authorization ends
+- EXC-604c: no `MCPFS_TOKEN_KEY` → the store is memory-only and tokens are lost on restart (`git/oauth/persistence.rs:7-8`)
+- EXC-604d: `git.auth_revoke` → the stored token is removed
+
+### SC-605: Operator moves a deployment or deletes a project
+
+**Actor:** Operator or platform admin
+**Preconditions:** a deployment with git state.
+**Flow:**
+1. Deleting a project tears down the volume, then purges the project's git rows and on-disk state, then removes the ACL row (S1 FR-027).
+2. Migrating a deployment copies the three git tables along with everything else (S4 FR-420), and skips OAuth tokens (S4 FR-424).
+
+**Postconditions:** a project recreated under the same id inherits no stale refs; a migrated deployment has its git history and needs its OAuth authorizations re-established.
+**Exceptions:**
+- EXC-605a: git disabled at deletion time → the git purge is skipped
+- EXC-605b: on-disk git state left behind → the C# behaviour, corrected here by `purge_repo` (`git/repo.rs:20-21`)
+
+## 6. Functional Requirements
+
+### Object storage
+
+#### FR-601 [EARS-U]: Git objects are content-addressed stored blobs
+> Git objects SHALL be stored in the volume's blob backend under the key `git:{sha}`, holding the canonical git object bytes `{type} {len}\0{payload}`.
+
+- **Inputs:** a git object.
+- **Outputs:** a stored blob plus an index row (`git/odb.rs:3-7`).
+- **Business Rules:** the key layout is a stable on-disk contract, so an existing deployment's git objects stay readable across upgrades. The stored bytes are exactly what any git implementation stores, so the difference from a normal repository is where the bytes live, not what they are.
+- **Priority:** Must-have
+
+#### FR-602 [EARS-U]: The object index
+> Each stored git object SHALL carry a `(hash, type, size)` row in the git index, scoped by `volume_id`.
+
+- **Inputs:** the object's metadata.
+- **Outputs:** a `git_objects` row (`git/db.rs:42-53`).
+- **Business Rules:** the index exists to support enumeration and short-sha prefix lookup, neither of which a content-addressed key alone supports (`git/odb.rs:5-6`). The three tables are `git_objects`, `git_refs` and `git_remotes` (`git/db.rs:42`). `volume_id` is `TextKey`-bounded, per S4 FR-407.
+- **Priority:** Must-have
+
+#### FR-603 [EARS-UB]: No custom libgit2 object database backend
+> The server SHALL NOT register a custom libgit2 ODB backend.
+
+- **Inputs:** the repository handle.
+- **Outputs:** an unmodified libgit2 object database (`git/odb.rs:9-18`).
+- **Business Rules:** `git2` exposes only `add_disk_alternate` and `add_new_mempack_backend`; a real `git_odb_backend` means hand-rolled C function pointers and manual `git_odb_backend_malloc` lifetime management through `git2-sys`, which cannot be done from safe Rust and is untestable unsafe glue. The export/import pair replaces it.
+- **Priority:** Must-have
+
+#### FR-604 [EARS-E]: Export before every libgit2 read
+> WHEN an operation needs libgit2 to read objects THE server SHALL first export the blob-backed objects into the bare repository's on-disk object database.
+
+- **Inputs:** the operation about to run: log, show, diff, blame, checkout_file, or pack building for a fetch.
+- **Outputs:** a hydrated on-disk ODB (`git/odb.rs:23-25`).
+- **Business Rules:** `state/git-repos/{project}/objects/` is therefore a rebuildable cache, never the source of truth. Deleting it loses nothing.
+- **Priority:** Must-have
+
+#### FR-605 [EARS-E]: Import after every libgit2 write
+> WHEN libgit2 has written objects THE server SHALL import them back into the blob store and the index.
+
+- **Inputs:** a commit created by a tool, or an indexed incoming packfile from a push.
+- **Outputs:** stored blobs plus index rows (`git/odb.rs:26-28`).
+- **Business Rules:** without the import the blob store, which is the source of truth, misses objects that exist only on disk. `git.remote_clone` imports the temporary clone's objects directly through the same path rather than adding the temp directory as a `file://` remote and fetching from it (`tools/git.rs:16-18`).
+- **Priority:** Must-have
+
+#### FR-606 [EARS-E]: Short sha resolution
+> WHEN an object is requested by a sha prefix THE server SHALL resolve it against the index.
+
+- **Inputs:** a prefix.
+- **Outputs:** the full object, or an ambiguity or not-found error (`git/odb.rs:5-6`).
+- **Priority:** Must-have
+
+### Repository
+
+#### FR-607 [EARS-U]: One repository per project, opened lazily
+> Each project SHALL have at most one git repository, created on demand and cached in process.
+
+- **Inputs:** the project id.
+- **Outputs:** the entry, with `state/git/{project_id}.db` and `state/git-repos/{project_id}/` (`git/repo.rs:1-13`).
+- **Business Rules:** the bare directory holds libgit2 bookkeeping, HEAD, config and hooks, plus the rebuildable object cache.
+- **Priority:** Must-have
+
+#### FR-608 [EARS-O]: A cold cache opens from disk rather than failing
+> IF the in-process repository map has no entry for a project whose on-disk state exists THEN the store SHALL open it rather than report that the repository is not initialized.
+
+- **Inputs:** a request after a restart.
+- **Outputs:** the opened entry (`git/repo.rs:17-19`).
+- **Business Rules:** the original threw after a restart even though the on-disk state was intact, which made `git.init` appear to be required again.
+- **Priority:** Must-have
+
+#### FR-609 [EARS-U]: Writes are serialized per repository
+> The server SHALL hold a per-repository write lock for every mutating git operation.
+
+- **Inputs:** a commit, a push, a clone.
+- **Outputs:** serialized access (`git/repo.rs`).
+- **Business Rules:** `git2::Repository` is `Send` but not `Sync`, so a future holding a reference across an await is not permitted; the lock is what makes concurrent tool calls safe.
+- **Priority:** Must-have
+
+#### FR-610 [EARS-E]: Project deletion purges git state
+> WHEN a project is deleted and git is enabled THE server SHALL purge that project's git rows and on-disk repository.
+
+- **Inputs:** the project id.
+- **Outputs:** removed rows and directory (`git/repo.rs:20-21`, `tools/admin.rs:297-303`).
+- **Business Rules:** without the purge, `state/git/{id}.db` survives and a project recreated under the same id inherits stale refs. This restates S1 FR-027's git clause from the git side.
+- **Priority:** Must-have
+
+### Tools
+
+#### FR-611 [EARS-U]: The git families register only when git is enabled
+> The 11 `git.*` and 3 `git.auth*` tools SHALL be registered only when `git.enabled` is true.
+
+- **Inputs:** the config flag or the `--git` CLI override.
+- **Outputs:** 14 additional tools, or none (`tools/all.rs:33-36`).
+- **Business Rules:** an LLM must not see a tool it cannot call, so the tools are absent rather than present and failing. S1's registry tests pin the count at 10 admin + 11 git + 3 git auth.
+- **Priority:** Must-have
+
+#### FR-612 [EARS-U]: Git tools are gated by membership, never by platform admin
+> Every `git.*` tool SHALL authorize by project membership and SHALL NOT admit a caller on the basis of the platform admin role.
+
+- **Inputs:** `mount_id` and the caller identity.
+- **Outputs:** the operation, or `ERR_FORBIDDEN` (`tools/git.rs:6-8`).
+- **Business Rules:** administering the platform is not the same as reading a project's source history. This is S1 FR-022 restated for this family.
+- **Priority:** Must-have
+
+#### FR-613 [EARS-U]: The auth tools are gated by authentication alone
+> The three `git.auth*` tools SHALL require an authenticated caller and SHALL NOT require project membership.
+
+- **Inputs:** the caller identity.
+- **Outputs:** the device flow operation (`tools/git_auth.rs:5-7`).
+- **Business Rules:** no project is involved: a provider token belongs to the person, not to a mount. The store is a process singleton so that `git.remote_clone` reads the token `git.auth` obtained.
+- **Priority:** Must-have
+
+#### FR-614 [EARS-E]: History and inspection tools
+> WHEN a history tool is called THE server SHALL answer from the repository after hydrating the on-disk object database.
+
+- **Inputs:** per tool: a revision, a path, a branch name.
+- **Outputs:** the tool's documented shape.
+- **Business Rules:** the 11 tools are `init`, `status`, `branches`, `tags`, `log`, `show`, `diff`, `commit`, `checkout_file`, `blame` and `remote_clone` (`tools/git.rs:1-2`). `checkout_file` writes into the volume and is therefore charged and audited like any write.
+- **Priority:** Must-have
+
+### Smart HTTP
+
+#### FR-615 [EARS-U]: Four routes
+> The server SHALL serve `GET /git/{mount_id}/info/refs` with a `service` query parameter, `POST /git/{mount_id}/git-upload-pack` and `POST /git/{mount_id}/git-receive-pack`.
+
+- **Inputs:** git CLI requests.
+- **Outputs:** protocol responses (`git/http/mod.rs:9-14,96-100`).
+- **Business Rules:** the advertisement route serves both services, selected by the query parameter. Protocol version 0, the dumb-prefix advertisement form.
+- **Priority:** Must-have
+
+#### FR-616 [EARS-U]: Membership is enforced on git routes
+> Every git HTTP route SHALL require the caller to be a member of the project.
+
+- **Inputs:** the bearer and the mount id.
+- **Outputs:** the operation, or a refusal (`git/http/mod.rs:36-37,236,260`).
+- **Business Rules:** the original checked only that the repository existed, which left any verified token able to read or write any project. Git traffic is project data, so it needs membership. This is stricter than the reference on purpose.
+- **Priority:** Must-have
+
+#### FR-617 [EARS-O]: Authentication challenge
+> IF a git route is called without an acceptable credential THEN the server SHALL answer 401 carrying `WWW-Authenticate: Bearer realm="mcp-fs"`.
+
+- **Inputs:** the missing or invalid credential.
+- **Outputs:** the 401 (`git/http/mod.rs:30-32`).
+- **Business Rules:** the git CLI prompts for credentials only on a `Basic` challenge, so anonymous CLI use needs `git.anonymous_read` or an explicit credential helper. S1 FR-007 accepts `Basic` where the password is the token, which is what makes a credential helper work.
+- **Priority:** Must-have
+
+#### FR-618 [EARS-E]: Ref advertisement and capabilities
+> WHEN an advertisement is requested THE server SHALL answer with the service header, the refs, and the capability string for that service.
+
+- **Inputs:** the `service` parameter.
+- **Outputs:** pkt-line framed advertisement (`git/http/mod.rs:17-20`).
+- **Business Rules:** capabilities match the reference byte for byte, including `agent=mcp-fs/0.1.0`, with one addition: `multi_ack_detailed` on upload-pack, which git requires over smart HTTP.
+- **Priority:** Must-have
+
+#### FR-619 [EARS-E]: Packs are always full
+> WHEN a fetch is served THE server SHALL push every wanted tip onto a revwalk, build a pack carrying those tips and their whole ancestry, and answer NAK.
+
+- **Inputs:** the want lines.
+- **Outputs:** the pack (`git/http/mod.rs:21-24`).
+- **Business Rules:** there is no real have/want negotiation, so an incremental fetch transfers as much as a full clone. A want that is not a commit, such as a tag or a bare tree, is handled by recursive insertion rather than by the revwalk.
+- **Priority:** Must-have
+
+#### FR-620 [EARS-E]: The receive-pack report includes unpack ok
+> WHEN a push completes THE server SHALL send a report-status reply beginning with `unpack ok`, followed by per-ref `ok` or `ng` lines and the framing git expects.
+
+- **Inputs:** the indexed pack and the ref updates.
+- **Outputs:** the report (`git/http/mod.rs:25-29,579`).
+- **Business Rules:** the C# omitted this line, which makes a real `git push` report a failure even though the refs update correctly. Reproducing a protocol bug that breaks a documented feature is not useful parity, so this is a deliberate divergence. Everything else about the report is unchanged.
+- **Priority:** Must-have
+
+#### FR-621 [EARS-E]: Pushed objects are really indexed
+> WHEN a pack is received THE server SHALL index its objects into the blob store and the git index, not merely write them to disk.
+
+- **Inputs:** the incoming pack.
+- **Outputs:** stored blobs and index rows (`git/odb.rs:26-28`).
+- **Business Rules:** without this, a pushed object exists only in the rebuildable cache and is lost when that cache is cleared.
+- **Priority:** Must-have
+
+#### FR-622 [EARS-O]: Pack size limit
+> IF a push body exceeds `git.max_pack_size_mb` THEN the server SHALL refuse it with 413.
+
+- **Inputs:** the request body.
+- **Outputs:** the refusal (`git/http/mod.rs:38,92-100,195-202`).
+- **Business Rules:** the limit is applied twice, as a body-limit layer on the route and as an explicit check, both derived from the same setting (`git/http/mod.rs:92-93,111-113`). The C# parsed the setting and never used it.
+- **Priority:** Must-have
+
+#### FR-623 [EARS-U]: pkt-line framing
+> The server SHALL frame every protocol message as pkt-lines.
+
+- **Inputs:** protocol payloads.
+- **Outputs:** framed bytes (`git/http/pktline.rs`).
+- **Business Rules:** framing includes flush packets and the side-band used to carry the report; band 1 carries the report-status reply (`git/http/mod.rs:915`).
+- **Priority:** Must-have
+
+### OAuth device flow
+
+#### FR-624 [EARS-E]: Device authorization
+> WHEN `git.auth` is called THE server SHALL request a device code from the provider and return as soon as a user code is available, then poll the token endpoint in the background.
+
+- **Inputs:** the provider, `github` or `gitlab`, and an optional self-hosted GitLab base URL.
+- **Outputs:** the user code and verification information (`git/oauth/device_flow.rs:6-7,47-56`).
+- **Business Rules:** GitHub's endpoints are `https://github.com/login/device/code` and `https://github.com/login/oauth/access_token` (`git/oauth/device_flow.rs:31-32`). The flow is RFC 8628. Returning before the token arrives is what keeps the tool call from blocking for as long as a human takes.
+- **Priority:** Must-have
+
+#### FR-625 [EARS-E]: Poll outcomes
+> WHEN the token endpoint is polled THE server SHALL treat `authorization_pending` and `slow_down` as continue, and `access_denied` and expiry as terminal.
+
+- **Inputs:** the provider's error field.
+- **Outputs:** continued polling, a stored token, or an ended authorization (`git/oauth/device_flow.rs:75-82`).
+- **Business Rules:** a provider that omits or zeroes `interval` gets a fallback poll interval (`git/oauth/device_flow.rs:41`).
+- **Priority:** Must-have
+
+#### FR-626 [EARS-U]: Client secrets are read at call time
+> The server SHALL read an OAuth client secret from the environment variable named by `github_client_secret_env` or `gitlab_client_secret_env` at call time, and SHALL NOT hold it in a field.
+
+- **Inputs:** the configured variable name.
+- **Outputs:** the secret, used and dropped (`git/oauth/device_flow.rs:13-14`).
+- **Business Rules:** never holding it in a field means it cannot leak through a `Debug` rendering of a long-lived struct.
+- **Priority:** Must-have
+
+#### FR-627 [EARS-U]: Tokens are encrypted at rest
+> WHEN a token is persisted THE server SHALL encrypt it with AES-256-GCM, storing `nonce(12) || tag(16) || ciphertext(n)`.
+
+- **Inputs:** the token and `MCPFS_TOKEN_KEY`.
+- **Outputs:** the stored ciphertext (`git/oauth/cipher.rs:1-12`).
+- **Business Rules:** the key must decode to exactly 32 bytes. GCM gives confidentiality plus integrity, so a tampered ciphertext or a wrong key fails to decrypt rather than yielding garbage. The blob layout matches the C# exactly, so a database written by either implementation decrypts with the other.
+- **Priority:** Must-have
+
+#### FR-628 [EARS-O]: Persistence is conditional on the key
+> IF `MCPFS_TOKEN_KEY` is not set THEN the token store SHALL be memory-only and tokens SHALL be lost on restart.
+
+- **Inputs:** the environment.
+- **Outputs:** a persistent or a volatile store (`git/oauth/persistence.rs:7-8`).
+- **Business Rules:** one row per `(person, provider)`. Only the bearer token is encrypted; the metadata is stored in clear because none of it is a secret and it has to be queryable (`git/oauth/persistence.rs:3-5`).
+- **Priority:** Must-have
+
+#### FR-629 [EARS-E]: Authorization status and revocation
+> WHEN `git.auth_status` is called THE server SHALL report whether a token is held for that caller and provider, and WHEN `git.auth_revoke` is called THE server SHALL remove it.
+
+- **Inputs:** the provider.
+- **Outputs:** the status, or the removal (`tools/git_auth.rs:1-9`).
+- **Business Rules:** status is how an agent learns the human has finished approving, since `git.auth` returned before that happened.
+- **Priority:** Must-have
+
+## 7. Non-Functional Requirements
+
+### 7.1 Performance
+- Packs are always full (FR-619), so an incremental fetch costs as much as a clone. This is the layer's main performance limitation and is recorded as TBD-601.
+- The on-disk object cache means a repeated history read does not re-export objects already present.
+- `max_pack_size_mb` bounds the memory and time a single push can consume (FR-622).
+
+### 7.2 Security
+- Membership is enforced on both the tools and the HTTP routes (FR-612, FR-616), and platform administration grants nothing.
+- OAuth client secrets are read at call time and never held (FR-626).
+- Tokens are encrypted at rest with an authenticated cipher (FR-627).
+- The migration deliberately does not carry tokens between deployments (S4 FR-424).
+- `git.anonymous_read`, when enabled, is a deliberate relaxation an operator chooses; it is the only way the git CLI works without a credential helper (FR-617).
+
+### 7.3 Usability
+- `git.auth` returns immediately with a user code rather than blocking for a human (FR-624).
+- A cold process opens an existing repository rather than demanding `git.init` again (FR-608).
+- The `unpack ok` line means a real `git push` reports success when it succeeded (FR-620).
+- Tools are absent rather than present-and-failing when git is disabled (FR-611).
+
+### 7.4 Reliability
+- The blob store is the source of truth and the on-disk directory is rebuildable (FR-601, FR-604), so losing the cache loses nothing.
+- Pushed objects are indexed rather than left on disk (FR-621).
+- Per-repository write locks serialize mutation (FR-609).
+- Project deletion purges git state so a recreated project starts clean (FR-610).
+
+### 7.5 Observability
+Unchanged from S1 §7.5. Git operations are not separately instrumented: there is no per-operation timing, no pack size metric and no counter for export or import volume. For a layer whose main performance issue is full packs, that absence is notable; recorded as TBD-602.
+
+### 7.6 Deployment
+- `git.enabled` off by default; `--git` forces it on.
+- `git.max_pack_size_mb` bounds push bodies.
+- `git.anonymous_read` governs unauthenticated reads.
+- `MCPFS_TOKEN_KEY` must be a 32-byte key, base64 or hex decoded, for token persistence.
+- OAuth client id and the name of the secret's environment variable are configured per provider.
+- On-disk state lives under `state/git/` and `state/git-repos/`.
+
+### 7.7 Scalability
+- One bare directory and one index database per project, so project count costs directories and files.
+- The object cache grows without bound; nothing prunes `state/git-repos/{id}/objects/`. Since it is rebuildable, pruning is safe, and nothing does it. Recorded as TBD-603.
+- Full packs mean fetch cost grows with history size rather than with the delta.
+
+## 8. Data Model
+
+| Table | Key | Fields | Home |
+|---|---|---|---|
+| `git_objects` | `(volume_id, hash)` | `hash`, `type`, `size` | `git/db.rs:49-53` |
+| `git_refs` | `(volume_id, name)` | ref name and target | `git/db.rs:42` |
+| `git_remotes` | `(volume_id, name)` | remote name and URL | `git/db.rs:42` |
+| OAuth session | `(person, provider)` | encrypted token, clear metadata, `expires_at` | `git/oauth/persistence.rs:3-5` |
+
+Stored git object: blob key `git:{sha}`, content `{type} {len}\0{payload}` (`git/odb.rs:3-4`). On-disk layout: `state/git/{project_id}.db`, `state/git-repos/{project_id}/` (`git/repo.rs:6-8`).
+
+## 9. Impact Analysis
+
+### 9.1 Affected Components
+
+| File/Module | Impact Type | Description |
+|---|---|---|
+| `crates/mcp-fs/src/git/odb.rs` | Specified, unchanged | FR-601, FR-603..FR-606 |
+| `crates/mcp-fs/src/git/db.rs` | Specified; grown since (`git_operations` table) | FR-602; the new table is out of scope of FR-602, specified in the dev-process spec |
+| `crates/mcp-fs/src/git/repo.rs` | Specified, unchanged | FR-607..FR-610 |
+| `crates/mcp-fs/src/git/http/` | Specified, unchanged | FR-615..FR-623 |
+| `crates/mcp-fs/src/git/oauth/` | Specified; grown since (PR scope gate, `scopes.rs`) | FR-624..FR-629; the PR credential gate is out of scope, specified in the dev-process spec |
+| `crates/mcp-fs/src/tools/git.rs`, `git_auth.rs` | Specified for the original 14 tools, unchanged; 35 tools added since (out of scope here) | FR-611..FR-614 |
+| `crates/mcp-fs/src/git/merge.rs`, `remote.rs`, `provider/`, `tools/git_pr.rs` | New since 2026-09-18, out of scope of this document | Specified in `specs/archived/SPEC-0011_2026-09-21_18-27-26-full-git-dev-process/spec.md` |
+
+### 9.2 Affected Requirements
+
+S1 FR-022 (admin confers no data access) and FR-027 (deletion cascade) are restated for git as FR-612 and FR-610. S4 FR-420 and FR-424 govern how git state and tokens behave under migration. Nothing is modified.
+
+### 9.3 Affected Tests
+
+| Test location | Coverage today | Action |
+|---|---|---|
+| `crates/mcp-fs/src/git/http/mod.rs` `#[cfg(test)]:915-951` | report-status framing, `unpack ok` | Keep; annotate |
+| `crates/mcp-fs/src/git/odb.rs` `#[cfg(test)]` | key layout, export/import | Keep; annotate |
+| `crates/mcp-fs/src/git/oauth/cipher.rs` `#[cfg(test)]` | round-trip, tamper detection | Keep; annotate |
+| `crates/mcp-fs/src/git/oauth/device_flow.rs` `#[cfg(test)]` | poll outcomes with a fake client | Keep; annotate |
+| `tests/functional/scenarios/09_git.sh` | git tools over HTTP | Extend |
+
+### 9.4 Affected Documentation
+
+| Document | Section | Action |
+|---|---|---|
+| `AGENTS.md` | documentation index, behaviour list | Reference this spec |
+| `.agent_docs/git.md` | objects in the blob store, smart HTTP, OAuth | Cross-reference §6 |
+
+### 9.5 Dependencies & Risks
+
+1. **Full packs** (FR-619) make every fetch cost a clone. Acceptable for a project-scale repository, poor for a large one.
+2. **The object cache is unbounded** (TBD-603).
+3. **`git2` constrains the design** (FR-603). If `git2` ever exposes ODB backends, the export/import pair becomes removable, and that would be a significant simplification rather than a routine change.
+4. **A real `git` CLI is needed to test the wire protocol properly.** Unit tests cover framing; only an end-to-end clone and push prove interoperability, which is why E2E-615 and E2E-616 are the most valuable tests here.
+
+## 10. Documentation Requirements
+
+### 10.1 README.md
+State that git is off by default and what `--git` enables.
+
+### 10.2 AGENTS.md & .agent_docs/
+- `AGENTS.md`: add this spec to the index; its "behaviour worth knowing" list already names `unpack ok`, membership on git routes, `max_pack_size_mb` and the absent ODB backend, and should point here.
+- `.agent_docs/git.md`: cross-reference §6.
+
+### 10.3 docs/*
+None required.
+
+## 11. Traceability Matrix
+
+| Scenario | Functional Req | E2E Tests (Happy) | E2E Tests (Failure) | E2E Tests (Edge) |
+|---|---|---|---|---|
+| SC-601 | FR-601, FR-602, FR-605, FR-607, FR-611 | E2E-601, E2E-602 | E2E-603, E2E-604, E2E-605 | E2E-606, E2E-607, E2E-608 |
+| SC-602 | FR-603, FR-604, FR-606, FR-614 | E2E-609, E2E-610 | E2E-611, E2E-612 | E2E-613, E2E-614 |
+| SC-603 | FR-615, FR-616, FR-617, FR-618, FR-619, FR-620, FR-621, FR-622, FR-623 | E2E-615, E2E-616 | E2E-617, E2E-618, E2E-619, E2E-620, E2E-621 | E2E-622, E2E-623, E2E-624, E2E-625, E2E-626 |
+| SC-604 | FR-613, FR-624, FR-625, FR-626, FR-627, FR-628, FR-629 | E2E-627, E2E-628 | E2E-629, E2E-630, E2E-631, E2E-632 | E2E-633, E2E-634, E2E-635 |
+| SC-605 | FR-608, FR-609, FR-610, FR-612 | E2E-636 | E2E-637, E2E-638, E2E-639 | E2E-640, E2E-641 |
+
+Per-FR coverage:
+
+| FR | Tests | FR | Tests |
+|---|---|---|---|
+| FR-601 | E2E-601, E2E-603, E2E-606 | FR-616 | E2E-617, E2E-622, E2E-637 |
+| FR-602 | E2E-602, E2E-604, E2E-607 | FR-617 | E2E-618, E2E-622, E2E-623 |
+| FR-603 | E2E-609, E2E-611, E2E-613 | FR-618 | E2E-615, E2E-619, E2E-624 |
+| FR-604 | E2E-609, E2E-613, E2E-614 | FR-619 | E2E-616, E2E-619, E2E-624 |
+| FR-605 | E2E-601, E2E-605, E2E-608 | FR-620 | E2E-616, E2E-620, E2E-625 |
+| FR-606 | E2E-610, E2E-612, E2E-614 | FR-621 | E2E-616, E2E-620, E2E-626 |
+| FR-607 | E2E-602, E2E-606, E2E-608 | FR-622 | E2E-621, E2E-625, E2E-626 |
+| FR-608 | E2E-636, E2E-640, E2E-641 | FR-623 | E2E-615, E2E-621, E2E-623 |
+| FR-609 | E2E-637, E2E-638, E2E-640 | FR-624 | E2E-627, E2E-629, E2E-633 |
+| FR-610 | E2E-636, E2E-639, E2E-641 | FR-625 | E2E-628, E2E-630, E2E-633 |
+| FR-611 | E2E-603, E2E-605, E2E-607 | FR-626 | E2E-629, E2E-631, E2E-634 |
+| FR-612 | E2E-638, E2E-639, E2E-640 | FR-627 | E2E-627, E2E-631, E2E-635 |
+| FR-613 | E2E-628, E2E-632, E2E-634 | FR-628 | E2E-630, E2E-632, E2E-635 |
+| FR-614 | E2E-610, E2E-611, E2E-612 | FR-629 | E2E-628, E2E-632, E2E-634 |
+| FR-615 | E2E-615, E2E-617, E2E-622 | | |
+
+## 12. End-to-End Test Suite
+
+**Placement.** Protocol framing, object database and cipher tests are Rust tests in the `#[cfg(test)]` modules of `git/http/mod.rs`, `git/odb.rs`, `git/oauth/cipher.rs` and `git/oauth/device_flow.rs`. Tool-level and wire-level tests extend `tests/functional/scenarios/09_git.sh`. The wire tests that matter most drive a **real `git` CLI** against a running server; they skip with a message when `git` is absent.
+
+**Fixtures:** project `spec-git` with `ALICE` as owner and member, `BOB` authenticated but not a member, `ADMIN` a platform admin and not a member. A seeded volume with `/src/app.py` and `/README.md`. A fake device-flow client for the OAuth tests, so no test talks to github.com.
+
+### 12.1 Test Summary
+
+| Test ID | Action | Category | Scenario | FR refs | Priority |
+|---|---|---|---|---|---|
+| E2E-601 | Existing | Core Journey | SC-601 | FR-601, FR-605 | Critical |
+| E2E-602 | Existing | Feature | SC-601 | FR-602, FR-607 | Critical |
+| E2E-603 | New | Error | SC-601 | FR-601, FR-611 | High |
+| E2E-604 | New | Error | SC-601 | FR-602 | High |
+| E2E-605 | New | Error | SC-601 | FR-605, FR-611 | Critical |
+| E2E-606 | New | Edge | SC-601 | FR-601, FR-607 | Critical |
+| E2E-607 | New | Edge | SC-601 | FR-602, FR-611 | High |
+| E2E-608 | New | Edge | SC-601 | FR-605, FR-607 | High |
+| E2E-609 | Existing | Core Journey | SC-602 | FR-603, FR-604 | Critical |
+| E2E-610 | Existing | Feature | SC-602 | FR-606, FR-614 | High |
+| E2E-611 | Existing | Error | SC-602 | FR-603, FR-614 | High |
+| E2E-612 | New | Error | SC-602 | FR-606, FR-614 | High |
+| E2E-613 | New | Edge | SC-602 | FR-603, FR-604 | Critical |
+| E2E-614 | New | Edge | SC-602 | FR-604, FR-606 | High |
+| E2E-615 | New | Core Journey | SC-603 | FR-615, FR-618, FR-623 | Critical |
+| E2E-616 | New | Core Journey | SC-603 | FR-619, FR-620, FR-621 | Critical |
+| E2E-617 | Existing | Security | SC-603 | FR-615, FR-616 | Critical |
+| E2E-618 | Existing | Security | SC-603 | FR-617 | Critical |
+| E2E-619 | New | Error | SC-603 | FR-618, FR-619 | High |
+| E2E-620 | Existing | Error | SC-603 | FR-620, FR-621 | Critical |
+| E2E-621 | New | Error | SC-603 | FR-622, FR-623 | High |
+| E2E-622 | New | Edge | SC-603 | FR-615, FR-616, FR-617 | Critical |
+| E2E-623 | New | Edge | SC-603 | FR-617, FR-623 | High |
+| E2E-624 | Existing | Edge | SC-603 | FR-618, FR-619 | High |
+| E2E-625 | Existing | Edge | SC-603 | FR-620, FR-622 | Critical |
+| E2E-626 | New | Edge | SC-603 | FR-621, FR-622 | High |
+| E2E-627 | Existing | Feature | SC-604 | FR-624, FR-627 | Critical |
+| E2E-628 | New | Feature | SC-604 | FR-613, FR-625, FR-629 | Critical |
+| E2E-629 | Existing | Error | SC-604 | FR-624, FR-626 | High |
+| E2E-630 | Existing | Error | SC-604 | FR-625, FR-628 | High |
+| E2E-631 | Existing | Security | SC-604 | FR-626, FR-627 | Critical |
+| E2E-632 | New | Error | SC-604 | FR-613, FR-628, FR-629 | High |
+| E2E-633 | New | Edge | SC-604 | FR-624, FR-625 | High |
+| E2E-634 | New | Edge | SC-604 | FR-613, FR-626, FR-629 | High |
+| E2E-635 | Existing | Edge | SC-604 | FR-627, FR-628 | Critical |
+| E2E-636 | New | Core Journey | SC-605 | FR-608, FR-610 | Critical |
+| E2E-637 | New | Security | SC-605 | FR-609, FR-616 | Critical |
+| E2E-638 | New | Error | SC-605 | FR-609, FR-612 | Critical |
+| E2E-639 | New | Error | SC-605 | FR-610, FR-612 | High |
+| E2E-640 | New | Edge | SC-605 | FR-608, FR-609, FR-612 | High |
+| E2E-641 | New | Edge | SC-605 | FR-608, FR-610 | Critical |
+
+**Coverage Statistics** (41 tests):
+- Happy path (Core Journey + Feature): 11
+- Failure/error (Error + Security): 18
+- Edge cases: 12
+- Happy:Failure ratio: 1:1.64
+
+### 12.2 New Test Specifications
+
+#### E2E-603: Git tools are absent when git is disabled
+- **Category:** Error | **Scenario:** SC-601 | **Requirements:** FR-601, FR-611
+- **Preconditions:** a server started with `git.enabled: false` and no `--git`.
+- **Steps:**
+  - Given that server
+  - When `tools/list` is called
+  - Then no returned name begins with `git.`
+  - And the total tool count is 45
+  - And `tools/call` for `git.init` returns the JSON-RPC error `-32602` with message `Unknown tool: 'git.init'`
+  - And `GET /git/spec-git/info/refs?service=git-upload-pack` is not routed
+- **Cleanup:** stop the server
+- **Priority:** High
+
+#### E2E-604: Every stored object carries an index row
+- **Category:** Error | **Scenario:** SC-601 | **Requirements:** FR-602
+- **Preconditions:** a project with one commit.
+- **Steps:**
+  - Given a commit created through `git.commit`
+  - When the `git_objects` table is queried for that volume
+  - Then it holds one row per object the commit introduced, each with a `hash`, a `type` and a `size`
+  - And every row's `volume_id` equals the project id
+  - And a second project's commit adds no row visible under the first project's `volume_id`
+- **Priority:** High
+
+#### E2E-605: A commit's objects reach the blob store, not only the disk cache
+- **Category:** Error | **Scenario:** SC-601 | **Requirements:** FR-605, FR-611
+- **Preconditions:** a project with one commit.
+- **Steps:**
+  - Given a commit created through `git.commit`
+  - When the on-disk directory `state/git-repos/spec-git/objects/` is deleted entirely
+  - Then `git.log` still returns the commit, because the objects are exported again from the blob store
+  - And `git.show` for that commit still returns its content
+- **Cleanup:** none
+- **Priority:** Critical
+
+#### E2E-606: The object key layout is exactly git:{sha}
+- **Category:** Edge | **Scenario:** SC-601 | **Requirements:** FR-601, FR-607
+- **Preconditions:** a project with one commit.
+- **Steps:**
+  - Given a commit whose sha is known
+  - When the blob store is inspected
+  - Then a blob exists under the key `git:{sha}`
+  - And its bytes begin with the object type name followed by a space, the decimal length and a NUL byte
+  - And the sha of the canonical bytes equals the key's suffix
+- **Priority:** Critical
+
+#### E2E-607: The three git tables exist and are volume-scoped
+- **Category:** Edge | **Scenario:** SC-601 | **Requirements:** FR-602, FR-611
+- **Steps:**
+  - Given a git-enabled server and an initialized project
+  - When the git schema is inspected
+  - Then exactly the tables `git_objects`, `git_refs` and `git_remotes` exist
+  - And each has `volume_id` in its primary key
+- **Priority:** High
+
+#### E2E-608: A repository is created lazily on first use
+- **Category:** Edge | **Scenario:** SC-601 | **Requirements:** FR-605, FR-607
+- **Preconditions:** a project created but with no git call yet.
+- **Steps:**
+  - Given a fresh project
+  - When the filesystem is inspected before any git call
+  - Then `state/git-repos/spec-git/` does not exist
+  - And after `git.init` both `state/git/spec-git.db` and `state/git-repos/spec-git/` exist
+- **Priority:** High
+
+#### E2E-612: An ambiguous short sha is reported as such
+- **Category:** Error | **Scenario:** SC-602 | **Requirements:** FR-606, FR-614
+- **Preconditions:** a repository containing at least two objects sharing a 4-character sha prefix.
+- **Steps:**
+  - Given that prefix
+  - When `git.show` is called with it
+  - Then the call fails with an error naming the ambiguity
+  - And when called with a prefix long enough to be unique, it succeeds
+  - And when called with a prefix matching nothing, it fails with a not-found error
+- **Priority:** High
+
+#### E2E-613: History reads work from a cold object cache
+- **Category:** Edge | **Scenario:** SC-602 | **Requirements:** FR-603, FR-604
+- **Preconditions:** a repository with three commits touching `/src/app.py`.
+- **Steps:**
+  - Given the on-disk object directory deleted
+  - When `git.log`, `git.show`, `git.diff` and `git.blame` are each called
+  - Then all four succeed
+  - And `git.blame` attributes the expected lines
+  - And the on-disk object directory exists again afterwards, holding the rebuilt cache
+- **Priority:** Critical
+
+#### E2E-614: checkout_file restores content and is audited
+- **Category:** Edge | **Scenario:** SC-602 | **Requirements:** FR-604, FR-606
+- **Preconditions:** `/src/app.py` committed, then modified in the working volume.
+- **Steps:**
+  - Given a modified working copy
+  - When `git.checkout_file` is called for `/src/app.py` at the committed revision
+  - Then `fs.read` returns the committed content
+  - And `fs.audit_log` contains an entry for that path, proving the write went through the engine's accounting
+- **Cleanup:** none
+- **Priority:** High
+
+#### E2E-615: A real git CLI clones over HTTP
+- **Category:** Core Journey | **Scenario:** SC-603 | **Requirements:** FR-615, FR-618, FR-623
+- **Preconditions:** `git` available on the test host; a running server; a project with two commits; a credential helper supplying `ALICE`'s token.
+- **Steps:**
+  - Given the repository URL `http://127.0.0.1:{port}/git/spec-git/`
+  - When `git clone` is run against it
+  - Then the command exits 0
+  - And the clone's `git log` shows both commits with their original messages and authors
+  - And the cloned working tree contains `/src/app.py` with its committed content
+  - And the advertisement response carries the capability `multi_ack_detailed` and an `agent=` token
+- **Cleanup:** remove the clone
+- **Priority:** Critical
+
+#### E2E-616: A real git CLI pushes and the push is reported as success
+- **Category:** Core Journey | **Scenario:** SC-603 | **Requirements:** FR-619, FR-620, FR-621
+- **Preconditions:** the clone from E2E-615.
+- **Steps:**
+  - Given a new local commit in the clone
+  - When `git push` is run
+  - Then the command exits 0 and its output reports success rather than a failure
+  - And `git.log` on the server shows the pushed commit
+  - And the pushed objects are present in the blob store under `git:{sha}` keys, not only on disk
+  - And deleting the on-disk object cache and calling `git.show` for the pushed commit still succeeds
+- **Cleanup:** none
+- **Priority:** Critical
+
+#### E2E-619: A fetch transfers full history rather than a delta
+- **Category:** Error | **Scenario:** SC-603 | **Requirements:** FR-618, FR-619
+- **Preconditions:** a clone that is one commit behind.
+- **Steps:**
+  - Given a clone already holding commit A and the server holding A and B
+  - When `git fetch` is run
+  - Then it succeeds
+  - And the transferred pack contains objects for both A and B, documenting that negotiation is absent
+  - And the response ends with a NAK rather than an ACK line
+- **Priority:** High
+
+#### E2E-621: An oversized push is refused with 413
+- **Category:** Error | **Scenario:** SC-603 | **Requirements:** FR-622, FR-623
+- **Preconditions:** a server with `git.max_pack_size_mb` set to 1.
+- **Steps:**
+  - Given a local commit containing a 2 MiB file
+  - When `git push` is run
+  - Then the HTTP response status is 413
+  - And the server's refs are unchanged, confirmed by `git.branches`
+  - And the error names the configured limit in megabytes
+- **Cleanup:** stop the server
+- **Priority:** High
+
+#### E2E-622: Git routes refuse a non-member and a platform admin alike
+- **Category:** Edge | **Scenario:** SC-603 | **Requirements:** FR-615, FR-616, FR-617
+- **Preconditions:** `BOB` authenticated and not a member; `ADMIN` a platform admin and not a member.
+- **Steps:**
+  - Given `BOB`'s bearer
+  - When `GET /git/spec-git/info/refs?service=git-upload-pack` is issued
+  - Then the response is a refusal rather than an advertisement
+  - And the same request with `ADMIN`'s bearer is refused identically
+  - And with `ALICE`'s bearer it succeeds
+- **Priority:** Critical
+
+#### E2E-623: An unauthenticated git request carries the bearer challenge
+- **Category:** Edge | **Scenario:** SC-603 | **Requirements:** FR-617, FR-623
+- **Preconditions:** `git.anonymous_read` false.
+- **Steps:**
+  - Given no credential
+  - When `GET /git/spec-git/info/refs?service=git-upload-pack` is issued
+  - Then the status is 401
+  - And the `WWW-Authenticate` header equals `Bearer realm="mcp-fs"`
+  - And with `git.anonymous_read` true the same request succeeds
+- **Cleanup:** stop the second server
+- **Priority:** High
+
+#### E2E-626: A rejected push leaves no partial state
+- **Category:** Edge | **Scenario:** SC-603 | **Requirements:** FR-621, FR-622
+- **Preconditions:** a server with a 1 MB pack limit.
+- **Steps:**
+  - Given a push that exceeds the limit
+  - When it is refused
+  - Then the `git_objects` table gains no row for the rejected pack's objects
+  - And the blob store holds no `git:` key for them
+  - And a subsequent push within the limit succeeds
+- **Priority:** High
+
+#### E2E-628: Status reports the token once the flow completes
+- **Category:** Feature | **Scenario:** SC-604 | **Requirements:** FR-613, FR-625, FR-629
+- **Preconditions:** a fake device-flow client that returns `authorization_pending` twice and then a token.
+- **Steps:**
+  - Given `git.auth` called for `github`
+  - Then it returns immediately with a user code and a verification URL
+  - And `git.auth_status` initially reports no token held
+  - And after the fake client yields the token, `git.auth_status` reports one held for `(caller, github)`
+  - And `git.auth_revoke` removes it, after which status reports none again
+- **Priority:** Critical
+
+#### E2E-632: The auth tools need authentication but not membership
+- **Category:** Error | **Scenario:** SC-604 | **Requirements:** FR-613, FR-628, FR-629
+- **Preconditions:** `BOB` authenticated and a member of no project.
+- **Steps:**
+  - Given `BOB`'s bearer
+  - When `git.auth_status` is called
+  - Then it succeeds, reporting no token, rather than failing with `ERR_FORBIDDEN`
+  - And the same call with no bearer fails with 401
+  - And two different callers hold independent tokens for the same provider
+- **Priority:** High
+
+#### E2E-633: Poll outcomes are classified correctly
+- **Category:** Edge | **Scenario:** SC-604 | **Requirements:** FR-624, FR-625
+- **Preconditions:** a fake client scripted per case.
+- **Steps:**
+  - Given a fake client returning `authorization_pending`
+  - Then polling continues
+  - And given `slow_down`, polling continues with a longer interval
+  - And given `access_denied`, the pending authorization ends and no token is stored
+  - And given a response omitting `interval`, the fallback interval is used rather than zero
+- **Priority:** High
+
+#### E2E-634: The client secret is read from the environment at call time
+- **Category:** Edge | **Scenario:** SC-604 | **Requirements:** FR-613, FR-626, FR-629
+- **Steps:**
+  - Given `github_client_secret_env` naming a variable that is unset
+  - When `git.auth` is called
+  - Then the call fails with an error naming the missing configuration
+  - And after the variable is set in the environment, a fresh call succeeds without restarting the server
+  - And no `Debug` rendering of the device-flow client contains the secret value
+- **Priority:** High
+
+#### E2E-636: A restart does not lose an initialized repository
+- **Category:** Core Journey | **Scenario:** SC-605 | **Requirements:** FR-608, FR-610
+- **Preconditions:** a project with one commit; the server restarted since.
+- **Steps:**
+  - Given a freshly restarted server with a cold in-process map
+  - When `git.log` is called without calling `git.init` again
+  - Then it succeeds and returns the commit
+  - And `git.status` also succeeds
+- **Priority:** Critical
+
+#### E2E-637: Concurrent writes to one repository are serialized
+- **Category:** Security | **Scenario:** SC-605 | **Requirements:** FR-609, FR-616
+- **Steps:**
+  - Given ten concurrent `git.commit` calls against one project
+  - When they all complete
+  - Then every call either succeeded or failed with a clear error, with no panic and no corrupted repository
+  - And `git.log` afterwards shows a consistent linear history
+  - And the object index contains no orphan row referencing a missing blob
+- **Priority:** Critical
+
+#### E2E-638: A non-member cannot commit
+- **Category:** Error | **Scenario:** SC-605 | **Requirements:** FR-609, FR-612
+- **Preconditions:** `BOB` not a member.
+- **Steps:**
+  - Given `BOB`'s bearer
+  - When `git.commit` is called for `spec-git`
+  - Then the call fails with `ERR_FORBIDDEN`
+  - And `git.log` with the same bearer fails identically
+  - And the repository is unchanged
+- **Priority:** Critical
+
+#### E2E-639: Deleting a project purges its git state
+- **Category:** Error | **Scenario:** SC-605 | **Requirements:** FR-610, FR-612
+- **Preconditions:** `spec-git` with commits; git enabled.
+- **Steps:**
+  - Given a project with history
+  - When `admin.delete_project` is called
+  - Then `state/git/spec-git.db` no longer exists
+  - And `state/git-repos/spec-git/` no longer exists
+  - And a project recreated under the same id reports an empty history from `git.log`
+- **Priority:** High
+
+#### E2E-640: A platform admin is refused on both the tools and the routes
+- **Category:** Edge | **Scenario:** SC-605 | **Requirements:** FR-608, FR-609, FR-612
+- **Preconditions:** `ADMIN` is a platform admin and not a member of `spec-git`.
+- **Steps:**
+  - Given `ADMIN`'s bearer
+  - When `git.log` is called
+  - Then it fails with `ERR_FORBIDDEN`
+  - And `GET /git/spec-git/info/refs?service=git-upload-pack` is refused with the same authority rule
+  - And `ADMIN` can still call `admin.list_all_projects` successfully
+- **Priority:** High
+
+#### E2E-641: Recreating a project after deletion inherits nothing
+- **Category:** Edge | **Scenario:** SC-605 | **Requirements:** FR-608, FR-610
+- **Preconditions:** a deleted project that previously had a branch `feature-x`.
+- **Steps:**
+  - Given the project recreated under the same id
+  - When `git.branches` is called
+  - Then no branch named `feature-x` is returned
+  - And `git.log` returns an empty history
+  - And the `git_objects` table holds no row for that volume
+- **Priority:** Critical
+
+### 12.3 Modified Test Specifications
+
+None.
+
+### 12.4 Removed Tests
+
+None.
+
+## 13. Consistency Notes
+
+1. **Two senses of "blob".** A git blob is an object type; a stored blob is S1's content-addressed byte storage. §4.5 names the collision and this document says "git object" and "stored blob" where confusion is possible.
+2. **S1 FR-027 and S6 FR-610 describe the same deletion cascade** from the admin side and the git side. Neither supersedes the other.
+3. **The `unpack ok` divergence** (FR-620) is one of three places this implementation deliberately departs from its C# origin; the others are membership enforcement (FR-616) and the pack size limit (FR-622). All three are recorded in `AGENTS.md`'s behaviour list and are specified here as requirements rather than as notes.
+4. **`agent=mcp-fs/0.1.0`** appears in the capability string (`git/http/mod.rs:18`). It carries a hardcoded version that does not track the crate version; whether it should is an open question rather than an assertion. See TBD-604.
+
+## 14. Migration & Implementation Notes
+
+No production code change. Test work, in order:
+
+1. **Annotate existing tests** in `git/http/mod.rs`, `git/odb.rs`, `git/oauth/*.rs` and `09_git.sh`.
+2. **Add the object-store tests first** (E2E-604, E2E-606, E2E-607, E2E-608): they need a volume and no network.
+3. **Add the cold-cache tests** (E2E-605, E2E-613, E2E-636, E2E-641), which are the ones that actually prove the blob store is the source of truth. They delete `state/git-repos/{id}/objects/` between steps, so they must not run concurrently with other git tests against the same project.
+4. **Add the OAuth tests** (E2E-628, E2E-632, E2E-633, E2E-634) using the fake device-flow client. **No test may talk to github.com.** E2E-634 manipulates an environment variable, so it must not run in parallel with other OAuth tests.
+5. **Add the real-CLI wire tests last** (E2E-615, E2E-616, E2E-619, E2E-621, E2E-623, E2E-626). They need `git` on the host and a credential helper; each skips with a message when `git` is absent. E2E-615 must run before E2E-616, which reuses its clone.
+6. **E2E-621 and E2E-626 need a 1 MB pack limit**, so they start their own server.
+
+## 15. Open Questions & TBDs
+
+- **TBD-601:** Packs are always full (FR-619). For a repository with substantial history every fetch is a clone. Implementing have/want negotiation is a real feature, not a fix, and is undecided.
+- **TBD-602:** No git-specific instrumentation exists (§7.5). Pack size, export volume and operation duration are all invisible.
+- **TBD-603:** Nothing prunes the on-disk object cache (§7.7). It is rebuildable, so pruning is safe and simply absent.
+- **TBD-604:** The advertised agent string carries a hardcoded `0.1.0` rather than the crate version (§13 item 4). Whether that matters to any client is unknown.
+
+## 16. Glossary
+
+| Term | Definition | Context |
+|---|---|---|
+| **Git object** | A commit, tree, tag or git blob, stored as bytes `{type} {len}\0{payload}`. | Object store |
+| **Stored blob** | S1's content-addressed byte storage, which holds git objects under `git:{sha}` keys. | Object store |
+| **Object index** | The `git_objects` rows supporting enumeration and prefix lookup. | Object store |
+| **Export** | Hydrating the on-disk object database from the stored blobs before libgit2 reads. | Object store |
+| **Import** | Copying objects libgit2 wrote on disk back into the stored blobs and the index. | Object store |
+| **Bare directory** | `state/git-repos/{id}/`, holding libgit2 bookkeeping and a rebuildable object cache. | Repository |
+| **Write lock** | The per-repository lock serializing mutating operations. | Repository |
+| **pkt-line** | The git wire framing carrying every protocol message. | Wire |
+| **Ref advertisement** | The response listing refs and capabilities at the start of a clone or push. | Wire |
+| **upload-pack** | The service serving a clone or fetch. | Wire |
+| **receive-pack** | The service accepting a push. | Wire |
+| **report-status** | The push reply beginning with `unpack ok` and carrying per-ref results. | Wire |
+| **Full pack** | A pack carrying the wanted tips and their whole ancestry, with no negotiation. | Wire |
+| **Anonymous read** | The operator-enabled relaxation letting an unauthenticated client read. | Authorization (git) |
+| **Device flow** | The RFC 8628 grant used to obtain a provider token with a user code. | Device flow |
+| **User code** | The short string a human enters in a browser to approve an authorization. | Device flow |
+
+## 17. Interview Decisions Log
+
+Produced non-interactively from the code.
+
+- **DEC-601:** The absent libgit2 ODB backend is specified as an unwanted-behaviour requirement (FR-603) rather than left as a comment. **Rationale:** it is the reason the export/import pair exists, and a future contributor who "fixed" it by adding a backend would break the invariant that the blob store is the source of truth. **Alternatives considered:** documenting it only in the module comment, which is where it lives today. **Implemented by:** FR-603, FR-604, FR-605. **Round:** n/a. **Code evidence:** `crates/mcp-fs/src/git/odb.rs:9-18`.
+- **DEC-602:** The three deliberate divergences from the C# original are specified as requirements. **Rationale:** each is a place where matching the reference would have been wrong; leaving them as prose invites a future parity pass to undo them. **Alternatives considered:** recording them only in `AGENTS.md`. **Implemented by:** FR-616, FR-620, FR-622. **Round:** n/a. **Code evidence:** `crates/mcp-fs/src/git/http/mod.rs:25-38`.
+- **DEC-603:** Full packs are specified as current behaviour with a TBD rather than as a defect. **Rationale:** negotiation is a feature to build, not a bug to fix, and the spec's job is to say what is true. **Alternatives considered:** specifying negotiation and registering the gap as drift, which would make this an implementation project. **Implemented by:** FR-619, E2E-619, TBD-601. **Round:** n/a. **Code evidence:** `crates/mcp-fs/src/git/http/mod.rs:21-24`.
+- **DEC-604:** The most valuable tests here drive a real `git` CLI. **Rationale:** unit tests over pkt-line framing prove the framing, not interoperability; only a real clone and push prove the protocol. **Alternatives considered:** asserting byte sequences against recorded fixtures, which pins current output without proving a client accepts it. **Implemented by:** E2E-615, E2E-616, §14 step 5. **Round:** n/a. **Code evidence:** `crates/mcp-fs/src/git/http/mod.rs:1-14`.
+- **DEC-605:** The cold-cache tests are treated as the load-bearing proof of the storage design. **Rationale:** the claim "the blob store is the source of truth and the directory is a cache" is only meaningful if deleting the directory changes nothing, and that is directly testable. **Alternatives considered:** asserting the key layout only. **Implemented by:** FR-601, FR-604, E2E-605, E2E-613, E2E-641. **Round:** n/a. **Code evidence:** `crates/mcp-fs/src/git/odb.rs:30`.
+
+## 18. Implementability Audit
+
+Audited as part of the cross-spec audit of S1 through S8 on 2026-09-18; see
+`specs/AUDIT.md` for the method, the full findings and the limitations. Sub-agent
+execution was unavailable (provider budget error), so the contract's fresh-context
+auditor was replaced by mechanical verification plus a targeted reading pass. That
+substitution is weaker in one specific respect, recorded in `AUDIT.md`.
+
+| Round | F (functional, blocking) | A (drift, traced) | Verdict |
+|-------|--------------------------|-------------------|---------|
+| 1 | 0 | 0 | IMPLEMENTABLE-WITH-DRIFT |
+
+**Amendments applied:** none required
+**Drift registered:** none. Every A finding was evident and amended in place, which
+the contract prefers to a register entry.
+
+## 19. Implementation Drift Register
+
+Empty as of the original 2026-09-18 cross-spec audit: all A findings from that audit
+were evident corrections applied in place rather than drift to resolve during
+implementation. See `specs/AUDIT.md` for each finding and its evidence.
+
+**DRIFT-6-01 (opened and resolved 2026-09-23):** this document's Executive Summary,
+Section 2 (Current State Analysis) and Section 3 (Scope) stated "14 MCP tools" and
+listed only the original 11 `git.*` + 3 `git.auth*` tools, while the codebase had
+grown to 49 tools via `specs/archived/SPEC-0011_2026-09-21_18-27-26-full-git-dev-process/spec.md`
+(commit `962a75b`) shipped in commit `b1c0275`. Discovered while closing `DDRIFT-001`
+of `specs/archived/SPEC-0001_2026-09-23_08-47-57-mcp-tool-annotation-hints/spec.md`, which needed this
+document's tool inventory to classify every `git.*` tool for MCP annotation hints and
+found it stale. **Nature:** false count / stale current-state claim, not a missing
+capability — the 35 additive tools are fully specified, just in a different document
+this one predates. **Resolution:** Sections 1, 2.1, 2.2, 2.3, 3.1, 3.2 and 9.1 above
+were updated in place to state both the 2026-09-18 baseline (kept, since it is still
+the accurate description of the original 14 tools and the shared infrastructure) and
+the 2026-09-23 current state, with an explicit cross-reference to the dev-process
+spec rather than a duplicated copy of its 162 requirements and 536 tests. No `FR-6xx`,
+`E2E-6xx`, `SC-6xx`, `DEC-6xx` or `EXC-6xx` entry was found to be factually wrong
+about the original 14 tools or the object DB / HTTP / OAuth infrastructure; Sections
+5 through 8, 10 through 18 were left unmodified because nothing in them was found
+incorrect, only silent about tools added after they were written, which the updated
+Section 3.1 now makes explicit rather than silent. **Detected by:** cross-document
+inconsistency surfaced while writing a dependent document (the annotation spec), not
+by a test or a build failure — there is no automated check that a retro-spec's tool
+count matches the live registry, which is itself worth noting as a gap but is not
+this drift entry's concern to fix. **Status:** resolved.

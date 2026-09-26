@@ -21,7 +21,7 @@ of shipped behaviour. Writing OTel requirements into it would convert a document
 describes the system into a document that changes it, and would put a large new dependency
 surface inside a spec whose value is that it asserts nothing untrue about the code.
 
-**Suggested by.** `2026-09-18_17-37-46-platform-foundation.md`, §7.5, DEC-005.
+**Suggested by.** `SPEC-0002_2026-09-18_17-37-46-platform-foundation/spec.md`, §7.5, DEC-005.
 
 ## BL-002: Specification of the `crates/agent` CLI client
 
@@ -61,7 +61,7 @@ replica and enforced on another.
 topology, not a defect in the current single-process design. Recorded as TBD-001 in the
 platform foundation spec rather than solved there.
 
-**Suggested by.** `2026-09-18_17-37-46-platform-foundation.md`, §15 TBD-001.
+**Suggested by.** `SPEC-0002_2026-09-18_17-37-46-platform-foundation/spec.md`, §15 TBD-001.
 
 ### BL-014: Horizontal scaling readiness (multiple server replicas)
 
@@ -185,7 +185,7 @@ flag that is off by default, so a deployment must opt in before any caller can u
 **Rationale for deferral.** Deliberate scope exclusion at interview (DEC-013). The recovery
 paths that make force safe are themselves a body of work.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-013.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-013.
 
 ### BL-005: Pull request creation
 
@@ -198,7 +198,7 @@ outbound traffic is the git transport.
 read/write, and a result model that differs between GitHub and GitLab. Out of scope at
 interview.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014 discussion.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-014 discussion.
 
 ### BL-006: Squash merge
 
@@ -210,7 +210,7 @@ parents (FR-NEW-034).
 **Rationale for deferral.** Out of scope at interview. Interacts with BL-005, since squash is
 usually a property of how a pull request is merged rather than of a local operation.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014 discussion.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-014 discussion.
 
 ### BL-007: Real merge conflict resolution
 
@@ -225,7 +225,7 @@ to every conflict (FR-NEW-031). Conflict markers are prohibited from entering th
 an unresolved conflict requires deciding what a half-merged simulated filesystem looks like to
 `fs.read`, `fs.write` and `git.status`. That is a subsystem, not a parameter.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-024.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-024.
 
 ### BL-008: Remote management tools
 
@@ -244,7 +244,7 @@ fetch or pull at all. Its only route to a remote is to be cloned instead.
 **Rationale for deferral.** Excluded at interview (DEC-021) to keep the remote surface to one
 unambiguous target.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-021.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-021.
 
 ### BL-009: Remote branch name distinct from the local branch
 
@@ -255,7 +255,7 @@ refspecs.
 
 **Rationale for deferral.** Deferred at interview as a later refinement.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-014.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-014.
 
 ### BL-010: `git.discard_changes`
 
@@ -271,7 +271,7 @@ the volume added.
 **Rationale for deferral.** Once `on_conflict` merge existed (DEC-024), committing became a
 working escape, so discard stopped being the only way out of a dirty volume. Still worth having.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-025.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-025.
 
 ### BL-011: Pluggable credential providers
 
@@ -287,7 +287,7 @@ implementations that all return the identical credential is indirection with no 
 It becomes worthwhile the moment a second credential shape genuinely exists, which is the same
 moment BL-012 becomes relevant.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-034.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-034.
 
 ### BL-012: Azure DevOps support
 
@@ -300,7 +300,7 @@ and would work today as a `generic` host if its credential convention matched.
 **Rationale for deferral.** Azure DevOps expects the PAT as the password with an arbitrary or
 empty username, not the literal `oauth2`. Supporting it properly means BL-011 first.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, DEC-002.
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, DEC-002.
 
 ### BL-013: Divergences from standard git, for review
 
@@ -334,5 +334,5 @@ they define what "git support" means here.
 whether the set is coherent, and which gaps matter enough to close. That is a product
 conversation, not a defect.
 
-**Suggested by.** `2026-09-21_00-34-13-github-enterprise-and-token-store.md`, user request during
+**Suggested by.** `archived/SPEC-0010_2026-09-21_00-34-13-github-enterprise-and-token-store/spec.md`, user request during
 Round 2b.

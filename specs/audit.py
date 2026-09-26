@@ -84,13 +84,14 @@ def line_count(path):
 
 
 def spec_files():
+    # Each spec lives at specs/SPEC-NNNN_<timestamp>-<slug>/spec.md (protocol layout).
+    # Archived specs are excluded: they are out of active scope, same as the original
+    # flat-file listing never re-scanned specs it had already closed out.
     out = []
     for name in sorted(os.listdir(SPECS)):
-        # AUDIT.md quotes the incorrect citations it corrected, so scanning it
-        # would re-report exactly the findings it closed.
-        if not name.endswith('.md') or name in ('BACKLOG.md', 'AUDIT.md'):
-            continue
-        out.append(os.path.join(SPECS, name))
+        spec_path = os.path.join(SPECS, name, 'spec.md')
+        if os.path.isfile(spec_path):
+            out.append(spec_path)
     return out
 
 
@@ -98,7 +99,7 @@ def audit_citations(files):
     bad_path, bad_line, ok = [], [], 0
     counts = defaultdict(int)
     for path in files:
-        name = os.path.basename(path)
+        name = os.path.basename(os.path.dirname(path))
         text = open(path).read()
         for m in CITE.finditer(text):
             cited, start, end = m.group(1), int(m.group(2)), m.group(3)
@@ -123,7 +124,7 @@ def audit_ids(files):
     owner = {}
     dupes = []
     for path in files:
-        name = os.path.basename(path)
+        name = os.path.basename(os.path.dirname(path))
         text = open(path).read()
         ids = set()
         ids |= set(re.findall(r'^### (SC-\d{3})', text, re.M))
