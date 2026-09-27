@@ -5,5 +5,5 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    mcp_fs::cli::run().await
+    mcp_fs_core::cli::run().await
 }

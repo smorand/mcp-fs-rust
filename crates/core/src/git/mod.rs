@@ -14,7 +14,7 @@
 //! Wiring (the composition root owns this, see [`http::router`]):
 //!
 //! ```ignore
-//! use mcp_fs::git;
+//! use mcp_fs_core::git;
 //!
 //! let git_store = git::GitRepoStore::shared(state.config.clone());
 //! let tokens = git::OAuthTokenStore::from_env(&state.config, state.stores.relational())?;

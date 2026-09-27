@@ -82,9 +82,9 @@ pub struct GitHttpState {
 /// The git smart HTTP router, ready to `merge` into the main app.
 ///
 /// ```ignore
-/// let git = mcp_fs::git::repo::GitRepoStore::shared(state.config.clone());
+/// let git = mcp_fs_core::git::repo::GitRepoStore::shared(state.config.clone());
 /// if state.config.git.enabled {
-///     app = app.merge(mcp_fs::git::http::router(state.clone(), git));
+///     app = app.merge(mcp_fs_core::git::http::router(state.clone(), git));
 /// }
 /// ```
 pub fn router(app: Arc<AppState>, git: Arc<GitRepoStore>) -> Router {

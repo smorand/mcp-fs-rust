@@ -570,7 +570,11 @@ fact to get wrong.
 - **Detected by:** `cargo build --workspace` fails immediately if an unresolvable or yanked version
   is named; `cargo deny check` (DBT-004, already in this same lot) fails on a yanked crate the
   moment it is added.
-- **Status:** open
+- **Status:** resolved (`etcetera = "0.11"` pinned to the minor series via crates.io/context7,
+  `cargo build --workspace` and `cargo deny check` both green — commit "Swap XDG config resolution
+  to etcetera (DR-005, partial)". `figment` was added the same way, then removed: see DDRIFT-002 in
+  `drift/2026-09-26_17-19-40.md`, discovered while implementing DR-005 — it is not a version-pinning
+  concern, so it does not reopen this entry.)
 
 ---
 

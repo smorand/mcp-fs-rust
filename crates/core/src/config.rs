@@ -869,6 +869,16 @@ impl ServerConfig {
     }
 
     pub fn from_yaml(raw: &str) -> Result<Self> {
+        // Still `serde_yaml::from_str`, not `figment::providers::Yaml` (DR-005 asked
+        // for the swap; DDRIFT-002 records why it is not made: figment always
+        // materializes an intermediate keyed `Value` before calling the target's
+        // `Deserialize`, which silently collapses a duplicate YAML mapping key
+        // before `HostMap`'s custom `Visitor` (crates/core/src/git/remote.rs:52-76)
+        // ever sees it, defeating the explicit duplicate-host rejection that
+        // `a_duplicate_git_hosts_key_in_yaml_fails_boot` (below) and
+        // `e2e_new_006_duplicate_host_fails_boot` (git/remote.rs) assert. That is a
+        // structural property of any Value-merging config library, not a figment
+        // bug, and it was undetectable before implementation: see the drift entry.
         let expanded = expand_env(raw);
         let config: Self = serde_yaml::from_str(&expanded)
             .map_err(|e| ToolError::invalid_argument(format!("invalid config: {e}")))?;

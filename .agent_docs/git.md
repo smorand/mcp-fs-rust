@@ -550,7 +550,7 @@ access, so a token without `api` cannot reach the merge request surface
 
 ### The pull request scope gate
 
-`crates/mcp-fs/src/git/oauth/scopes.rs` judges the scope set recorded with a
+`crates/core/src/git/oauth/scopes.rs` judges the scope set recorded with a
 token: `Capable`, `Insufficient { missing }`, or `Unknown`.
 `OAuthTokenStore::require_pr_credential` is the single gate a `git.pr_*` tool
 calls: presence and expiry first (so an expired *and* narrow token reports

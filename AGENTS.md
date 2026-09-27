@@ -36,6 +36,9 @@ and sqlite-vec (SQLite) for vector search; it implies `postgres`.
 
 ## Key commands
 ```
+make build | make test | make run       same as ./build.sh / ./test.sh / ./run.sh
+make check                            format-check + lint + typecheck + security + test
+make help                             list every target
 ./build.sh                            cargo build --release
 ./test.sh                             cargo test --workspace
 ./run.sh                              .env + config bootstrap + keys + build + serve :5002
@@ -51,7 +54,13 @@ python3 scripts/pty_check.py          agent line editor checks on a real pty
 ```
 
 ## Project structure
-- `crates/mcp-fs/src/main.rs`, `cli.rs` : clap verbs (serve/keys/token/version), config path resolution.
+All logic lives in the library crate `crates/core` (package `mcp-fs-core`, crate name
+`mcp_fs_core`; the directory is `crates/core`, not `crates/mcp-fs-core`, to match the skill's
+mandated layout while keeping the Cargo package/crate name off the language's own `core`
+sysroot crate). `crates/mcp-fs` keeps only `src/main.rs` (9 lines) and a path dependency on
+`mcp-fs-core`; its `postgres`/`sqlserver`/`rag`/`all-backends` features forward to the same
+features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unless noted.
+- `cli.rs` : clap verbs (serve/keys/token/version), config path resolution.
 - `app.rs` : axum Router assembly, shared state, the MCP endpoint, `/health`.
 - `mcp/` : the hand-rolled MCP layer. `mod.rs` (JSON-RPC + SSE framing, result/error helpers),
   `registry.rs` (name -> schema + handler, dot/underscore tolerant resolve), `schema.rs`

@@ -6,110 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Streamable-HTTP MCP server exposing a simulated multi-project filesystem (Rust port)"
+publish = false
 
 [[bin]]
 name = "mcp-fs"
 path = "src/main.rs"
 
-[lib]
-name = "mcp_fs"
-path = "src/lib.rs"
-
 [features]
 default = []
-# A relational backend other than SQLite is opt in, so the default build keeps
-# the zero external service posture and gains no dependency surface.
-postgres = ["dep:sqlx"]
-# SQL Server through tiberius-ng plus a bb8 pool. Off by default: the fork is
-# young and a default build must carry neither it nor its TLS stack.
-sqlserver = ["dep:tiberius-ng", "dep:bb8", "dep:tokio-util"]
-# RAG: pgvector (PostgreSQL) and sqlite-vec (SQLite) vector search. Implies postgres
-# so --features rag alone is sufficient for a PostgreSQL+vector build.
-rag = ["postgres", "dep:sqlite-vec", "dep:zerocopy"]
-# Every relational backend at once, for CI and for the quality gate.
-all-backends = ["postgres", "sqlserver", "rag"]
+postgres = ["mcp-fs-core/postgres"]
+sqlserver = ["mcp-fs-core/sqlserver"]
+rag = ["mcp-fs-core/rag"]
+all-backends = ["mcp-fs-core/all-backends"]
 
 [dependencies]
 tokio = { workspace = true }
-axum = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-http = { workspace = true }
-bytes = { workspace = true }
-
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-schemars = { workspace = true }
-
-rusqlite = { workspace = true }
-sqlx = { workspace = true, optional = true }
-tiberius-ng = { workspace = true, optional = true }
-bb8 = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
-aws-sdk-s3 = { workspace = true }
-aws-config = { workspace = true }
-aws-credential-types = { workspace = true }
-sha2 = { workspace = true }
-md-5 = { workspace = true }
-sha1 = { workspace = true }
-hex = { workspace = true }
-
-jsonwebtoken = { workspace = true }
-rsa = { workspace = true }
-rand = { workspace = true }
-
-git2 = { workspace = true }
-url = { workspace = true }
-
-regex = { workspace = true }
-globset = { workspace = true }
-similar = { workspace = true }
-zip = { workspace = true }
-
-aes-gcm = { workspace = true }
-base64 = { workspace = true }
-
-reqwest = { workspace = true }
-
-utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
-
-clap = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }
-tempfile = { workspace = true }
-
-datafusion = { workspace = true }
-arrow = { workspace = true }
-parquet = { workspace = true }
-
-which = { workspace = true }
-
-# ── document extraction / code symbols (docs module) ───────────────────────────
-pdf-extract = { workspace = true }
-quick-xml = { workspace = true }
-tree-sitter = { workspace = true }
-tree-sitter-python = { workspace = true }
-tree-sitter-rust = { workspace = true }
-tree-sitter-javascript = { workspace = true }
-tree-sitter-typescript = { workspace = true }
-tree-sitter-go = { workspace = true }
-tree-sitter-java = { workspace = true }
-tree-sitter-c = { workspace = true }
-tree-sitter-cpp = { workspace = true }
-tree-sitter-ruby = { workspace = true }
-tantivy = { workspace = true }
-sqlite-vec = { workspace = true, optional = true }
-zerocopy = { workspace = true, optional = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
-reqwest = { workspace = true }
-tokio-tungstenite = "0.30.0"
+mcp-fs-core = { path = "../core" }

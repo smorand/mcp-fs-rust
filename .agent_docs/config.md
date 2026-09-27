@@ -366,9 +366,16 @@ Cases 1 and 2 are explicit, so a missing file is reported by the name you gave. 
 and 4 are probed, and when neither exists the error lists every path tried rather than
 naming just one.
 
-Step 3 honours `$XDG_CONFIG_HOME` when it is set and falls back to `$HOME/.config`. It
-is new, and because it only applies when the file exists it cannot disturb a checkout
-that relies on the working directory relative `config/local.yaml`.
+Step 3 honours `$XDG_CONFIG_HOME` when it is set and falls back to `$HOME/.config`,
+resolved through `etcetera::choose_base_strategy()` rather than a hand-rolled lookup
+(SPEC-0012, DR-005). Because it only applies when the file exists it cannot disturb a
+checkout that relies on the working directory relative `config/local.yaml`.
+
+The YAML parse itself is still `serde_yaml::from_str`, not `figment`: figment would
+collapse a duplicate `git.hosts` key before the deliberately duplicate-preserving
+`HostMap` parser could reject it (see `.agent_docs/git.md`'s host map section and
+`specs/archived/SPEC-0012_2026-09-26_16-04-00-rust-skill-compliance-debt/drift/2026-09-26_17-19-40.md`,
+DDRIFT-002).
 
 A missing or unreadable file is `ERR_INVALID_ARGUMENT`; a YAML error reports the parse
 failure. The keypair is unrelated to this resolution: `mcp-fs keys --dir .keys` writes

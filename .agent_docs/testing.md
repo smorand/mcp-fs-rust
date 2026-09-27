@@ -112,7 +112,7 @@ a dedicated, freshly built **single threaded** runtime (`with_git_hosts_lock` in
 `spawn_blocking` closure awaited from that same task, opens and closes its lifecycle on
 that one OS thread. `lock_for_test()` sets the flag on ITS calling thread only; every
 other test's spans fire on their own OS thread, where the flag was never set, and
-`CaptureLayer` drops them instead of recording them. Read `crates/mcp-fs/src/logging.rs`
+`CaptureLayer` drops them instead of recording them. Read `crates/core/src/logging.rs`
 before adding a third capturing test: the isolation only holds if that test also runs on
 a dedicated single threaded runtime, the same way the first two do.
 

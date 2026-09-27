@@ -252,6 +252,16 @@ client's read timeout accordingly.
 ## Build and test
 
 ```bash
+make build                       # ./build.sh -> cargo build --release
+make test                        # ./test.sh -> cargo test --workspace
+make lint                        # cargo clippy --all-targets --all-features -- -D warnings
+make check                       # format-check + lint + typecheck + security + test
+```
+
+`make` wraps the existing scripts unchanged (`make help` lists every target); the scripts
+themselves still work exactly as before for anyone who prefers them directly:
+
+```bash
 ./build.sh                       # cargo build --release
 ./test.sh                        # cargo test --workspace
 cargo clippy --all-targets --all-features -- -D warnings

@@ -11,6 +11,7 @@ use crate::config::ServerConfig;
 use crate::errors::ToolError;
 use crate::keys;
 use clap::{Parser, Subcommand};
+use etcetera::BaseStrategy;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -233,7 +234,27 @@ async fn cmd_serve(
 pub fn resolve_config_path(
     explicit: Option<&std::path::Path>,
 ) -> std::result::Result<PathBuf, Vec<PathBuf>> {
-    resolve_config_path_with(explicit, |k| std::env::var(k).ok(), |p| p.exists())
+    // The XDG base directory is resolved through `etcetera` (DR-005) rather than
+    // the hand-rolled $XDG_CONFIG_HOME-or-$HOME/.config fallback: `config_dir()`
+    // already implements that exact precedence, so folding its result into the
+    // env closure below keeps `resolve_config_path_with`'s generic, independently
+    // tested precedence logic untouched while the real base-directory computation
+    // goes through the library. `HOME` (checked directly below, unconditionally on
+    // `etcetera` succeeding) is only relevant if `etcetera::choose_base_strategy`
+    // itself fails to locate a home directory, which the hand-rolled code treated
+    // as "no XDG candidate" rather than an error.
+    let xdg_config_home =
+        etcetera::choose_base_strategy().ok().map(|s| s.config_dir().display().to_string());
+    resolve_config_path_with(
+        explicit,
+        |k| {
+            if k == ENV_XDG_CONFIG_HOME {
+                return xdg_config_home.clone();
+            }
+            std::env::var(k).ok()
+        },
+        |p| p.exists(),
+    )
 }
 
 /// Same resolution with an injectable environment and an injectable existence

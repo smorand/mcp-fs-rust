@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mcp-fs", "crates/agent"]
+members = ["crates/mcp-fs", "crates/core", "crates/agent"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +24,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 schemars = "1"
+# XDG base directories (config resolution, DR-005). Version resolved via
+# crates.io at implementation time, pinned to the minor series like every
+# other dependency here (DDRIFT-001). No `figment` dependency: see DDRIFT-002.
+etcetera = "0.11"
 
 # ── storage ────────────────────────────────────────────────────────────────────
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -50,7 +54,7 @@ tiberius-ng = { version = "=0.13.1", default-features = false, features = [
 # already the pool behind several tokio ecosystem drivers.
 bb8 = "0.9"
 tokio-util = { version = "0.7", features = ["compat"] }
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
 aws-config = "1"
 aws-credential-types = "1"
 sha2 = "0.10"
