@@ -1,4 +1,4 @@
-.PHONY: sync build release test lint lint-fix format format-check typecheck security check run run-dev clean help
+.PHONY: sync build release test test-e2e-full lint lint-fix format format-check typecheck security check run run-dev clean help
 
 ## sync: Fetch dependencies and build the workspace
 sync:
@@ -15,6 +15,12 @@ release: build
 ## test: Full test suite (delegates to test.sh, unmodified)
 test:
 	./test.sh
+
+## test-e2e-full: Full-stack e2e (clone/write/push/pull) against a REAL PostgreSQL + MinIO
+# Mandatory infra, never skipped: set MCPFS_TEST_PG_DSN and MCPFS_MINIO_SECRET_KEY first.
+# See crates/core/tests/full_stack_e2e.rs's module docs for the full env var list.
+test-e2e-full:
+	cargo test -p mcp-fs-core --all-features --test full_stack_e2e -- --ignored --nocapture
 
 ## lint: Clippy, deny warnings
 lint:

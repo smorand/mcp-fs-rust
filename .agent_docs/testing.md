@@ -197,6 +197,54 @@ MCPFS_MINIO_SECRET_KEY=secret \
 Without the service the test does not run at all (`--ignored` is required), which
 is why `./test.sh` is green on a machine with nothing installed.
 
+## Full-stack end to end: real PostgreSQL, real MinIO, real `git`, real HTTP
+
+`crates/core/tests/full_stack_e2e.rs`'s `full_stack_lifecycle` is the one test in the
+workspace that drives the whole product from the outside: it boots the real axum server
+(`app::build`, not a tool-registry harness) on an ephemeral port, backed by a real
+PostgreSQL (`infra.meta`, `infra.admin`, `infra.git`, one throwaway schema) and a real
+MinIO (`infra.blob`, one throwaway bucket), then talks to it exactly like an external
+caller: MCP JSON-RPC over HTTP for `admin.create_project`/`git.init`/`git.commit`/
+`git.log`, the REST `/api/fs` plane for every write shape it exposes (`write`,
+`write-bytes`, `write-docx`, multipart `upload`) and every read shape (`read`,
+`read-bytes`, `glob`, `grep`), and three real `git` CLI subprocesses (`clone`, `add`,
+`rm`, `commit`, `push`) authenticated with `-c http.extraHeader="Authorization: Bearer
+..."`. It deliberately also asserts the one behavior a git-only or fs-only test would
+never exercise: a push updates the git object store but never checks the result out onto
+the volume, so `fs.read` on a file removed by a pushed commit must still succeed
+(`.agent_docs/git.md`, no working tree).
+
+Unlike every other opt-in test in this file, it is not a soft skip. `MCPFS_TEST_PG_DSN`
+and `MCPFS_MINIO_SECRET_KEY` are `.expect()`ed, not `.ok()`ed: the whole point of this
+test is proving the postgres/minio backends work end to end, so degrading to SQLite/local
+when they are absent would test nothing this file's other opt-in tests do not already
+cover. It stays `#[ignore]`d so `cargo test --workspace` is unaffected either way.
+
+```bash
+export MCPFS_TEST_PG_DSN=postgres://<user>@127.0.0.1:5432/postgres
+export MCPFS_MINIO_SECRET_KEY=<your MinIO/S3 secret key>
+make test-e2e-full
+```
+
+Setup provisions nothing ahead of time: the fresh schema and bucket are created lazily by
+the server itself, the same code path a real deployment's first volume goes through.
+Teardown is a `Drop` guard, not a final statement, so a leftover schema or bucket from a
+run that panicked mid-scenario is still removed; verified by re-listing both after an
+intentionally failing run during development (`select schema_name ... where schema_name
+like 'e2e_%'` empty, `mc ls local/ | grep mcpfs-e2e` empty).
+
+This test is also how `S3BlobStore::exists`/`get`'s 404 classification bug
+(`storage/blob/s3.rs`) was found: a HEAD 404 carries no XML error body, so the AWS SDK
+cannot classify it into a named error variant the way a GET 404 can, and `e.to_string()`
+rendered as the generic "service error" against this MinIO/SDK version pairing, with none
+of "NotFound"/"NoSuchKey"/"404" as a substring. Every ordinary cache miss on `git.commit`
+(checking whether a git object needs uploading) was silently promoted to
+`ERR_INTERNAL_ERROR`. Fixed by reading `e.raw_response()`'s real HTTP status instead of
+string-matching `Display`. No unit test isolated this path before (`exists()` was only
+exercised indirectly, after a `delete()`, in `integration_put_get_range_delete`, whose own
+`#[ignore]` meant nobody had run it in a while); this is the gap a black-box, all-real-
+dependencies test closes that a mocked or SQLite-backed one cannot.
+
 ## Functional scenarios
 
 `tests/functional/run_all.sh [--user NAME] [FILTER]` sources every

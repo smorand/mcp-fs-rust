@@ -68,8 +68,10 @@ impl BlobBackend for S3BlobStore {
             req = req.range(range);
         }
         let out = req.send().await.map_err(|e| {
-            let s = e.to_string();
-            if s.contains("NoSuchKey") || s.contains("NotFound") || s.contains("404") {
+            // Same classification as `exists`: the real HTTP status, not a
+            // `Display` substring match, is what tells a genuine 404 apart from
+            // every other failure the SDK folds into the same generic message.
+            if e.raw_response().map(|r| r.status().as_u16()) == Some(404) {
                 ToolError::not_found(format!("blob '{sha256}' not found"))
             } else {
                 ToolError::internal(format!("s3 get '{sha256}': {e}"))
@@ -87,8 +89,14 @@ impl BlobBackend for S3BlobStore {
         match self.client.head_object().bucket(&self.bucket).key(sha256).send().await {
             Ok(_) => Ok(true),
             Err(e) => {
-                let s = e.to_string();
-                if s.contains("NotFound") || s.contains("NoSuchKey") || s.contains("404") {
+                // A HEAD 404 carries no XML error body, so the SDK cannot classify
+                // it into a named error variant the way a GET/PUT 404 can: `e`'s
+                // `Display` renders as the generic "service error" with none of
+                // "NotFound"/"NoSuchKey"/"404" as a substring, which silently
+                // turned every ordinary cache miss into ERR_INTERNAL_ERROR against
+                // MinIO. `raw_response()` reads the real HTTP status directly,
+                // which is the only classification a bodyless HEAD response gives.
+                if e.raw_response().map(|r| r.status().as_u16()) == Some(404) {
                     Ok(false)
                 } else {
                     Err(ToolError::internal(format!("s3 head '{sha256}': {e}")))
