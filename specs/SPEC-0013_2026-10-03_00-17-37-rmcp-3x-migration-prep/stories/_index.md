@@ -18,7 +18,7 @@
 | Order | ID | Epic | Title | FRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
 |-------|----|----|-------|-----|-----------|-------|-------|------------|----------|--------|
 | 1 | US-0001 | n/a | Verify rmcp 3.5.0 API claims before proceeding (DDRIFT-001) | DDRIFT-001, DR-004 | n/a | DT-DRIFT-001 | 0 | none | 2 | done |
-| 2 | US-0002 | n/a | Add rmcp 3.5.0 dependency | DR-001 | n/a | DT-DEP-001, DT-DEP-002 | 2 | US-0001 | 2 | todo |
+| 2 | US-0002 | n/a | Add rmcp 3.5.0 dependency | DR-001 | n/a | DT-DEP-001, DT-DEP-002 | 2 | US-0001 | 2 | done |
 | 3 | US-0003 | n/a | Migrate fs.* tools (35) to #[tool] methods | DR-002, DR-006, DR-007 | n/a | E2E-FS-001..003 | 1-2 | US-0002 | 2 | todo |
 | 4 | US-0004 | n/a | Migrate admin.* (10) + search.* (4) tools | DR-002 | n/a | E2E-ADM-001..003 | 1 | US-0002 | 2 | todo |
 | 5 | US-0005 | n/a | Migrate git.* core tools (39) | DR-002 | n/a | E2E-GIT-001..003 | 1 | US-0002 | 2 | todo |
