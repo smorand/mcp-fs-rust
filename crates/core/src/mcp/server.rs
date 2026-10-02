@@ -20,12 +20,14 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::fs_ops;
 use crate::errors::ToolError;
 use crate::git::GitRepoStore;
+use crate::mcp::Args;
+use crate::mcp::registry::ToolCtx;
 use crate::search::fusion::rrf_merge;
 use crate::search::indexer;
 use crate::state::AppState;
@@ -60,11 +62,33 @@ pub struct McpServer {
     state: Arc<AppState>,
     person: String,
     tool_router: ToolRouter<Self>,
+    /// The old hand-rolled `git.*` registry, built once and reused.
+    ///
+    /// `git.*` handlers are private free functions inside `crate::tools::git`
+    /// (status/branches/commit/merge/...), unlike `fs.*`/`admin.*` which call a
+    /// shared public engine (`core::fs_ops`). Rather than duplicating that
+    /// private logic here, each `git.*` `#[tool]` method below re-dispatches
+    /// into this registry by name: it runs the exact same handler code (same
+    /// authorize, same `on_git_thread`, same `git::repo`/`git::merge`/`git::odb`
+    /// calls), nothing reimplemented.
+    git_tools: Arc<crate::mcp::ToolRegistry>,
 }
 
 impl McpServer {
     pub fn new(state: Arc<AppState>, person: String) -> Self {
-        Self { state, person, tool_router: Self::tool_router() }
+        let mut git_tools = crate::mcp::ToolRegistry::new();
+        crate::tools::git::register(&mut git_tools);
+        Self { state, person, tool_router: Self::tool_router(), git_tools: Arc::new(git_tools) }
+    }
+
+    /// Dispatch a `git.*` call through the old registry: same handler, same
+    /// authorize/normalize/engine call, just reached through a new transport.
+    async fn call_git(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+        let ctx = ToolCtx { person: self.person.clone(), state: self.state.clone() };
+        self.git_tools
+            .call(name, ctx, Args::new(args))
+            .await
+            .unwrap_or_else(|| Err(ToolError::not_found(format!("tool '{name}' not found"))))
     }
 
     /// Port of `crate::tools::volume`: authorize, then open the volume.
@@ -510,10 +534,320 @@ pub struct CopyArgs {
     pub recursive: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MountOnlyArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
+}
+
+// ── git.* parameter structs ──────────────────────────────────────────
+
+fn def_origin() -> String {
+    "origin".to_string()
+}
+fn def_mainline0() -> i64 {
+    0
+}
+fn def_log_limit() -> i64 {
+    20
+}
+fn def_depth0() -> i64 {
+    0
+}
+
+/// One conflict resolution, round-tripped untouched into the old handler's
+/// `resolutions` argument: `path` plus exactly one of `strategy` or `content`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ResolutionArg {
+    pub path: String,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RebaseTodoItem {
+    pub action: String,
+    pub sha: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitBlameArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path of the file to blame.
+    pub path: String,
+    /// Ref or commit to blame from; defaults to HEAD.
+    #[serde(default)]
+    pub ref_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitBranchCreateArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the branch to create, without the refs/heads/ prefix.
+    pub name: String,
+    /// Ref name, branch, tag or commit sha the new branch starts at; defaults to the currently
+    /// checked-out commit.
+    #[serde(default)]
+    pub start_point: String,
+    /// Check the new branch out, moving HEAD onto it and updating the volume's files to match;
+    /// false leaves HEAD and every file untouched.
+    #[serde(default)]
+    pub checkout: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitBranchDeleteArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the branch to delete, without the refs/heads/ prefix.
+    pub name: String,
+    /// Delete the branch even when it holds commits reachable from no other ref, leaving them
+    /// unreachable.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitBranchResetArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the branch to move, without the refs/heads/ prefix.
+    pub name: String,
+    /// Ref name, branch, tag or commit sha the branch is moved to.
+    pub target_commit: String,
+    /// Move the branch even when the move is not a fast-forward, leaving the commits only the
+    /// old tip reached orphaned.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitBranchSwitchArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the branch to switch to, without the refs/heads/ prefix.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitCheckoutFileArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Commit SHA to restore the file from.
+    pub commit_sha: String,
+    /// Absolute POSIX path of the file to restore into the volume.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitCherryPickArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Commit SHA to cherry-pick.
+    pub commit_sha: String,
+    /// For a merge commit, the parent its change is taken relative to.
+    #[serde(default = "def_mainline0")]
+    pub mainline: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitResolutionsArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// One resolution per conflicting path.
+    #[serde(default)]
+    pub resolutions: Option<Vec<ResolutionArg>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitCommitArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Commit message.
+    pub message: String,
+    /// Optional author name; defaults to the caller.
+    #[serde(default)]
+    pub author_name: Option<String>,
+    /// Optional author email; defaults to the caller person id.
+    #[serde(default)]
+    pub author_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitDiffArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Base ref or commit to diff from.
+    pub from_ref: String,
+    /// Target ref or commit to diff to; omit to diff against the working tree.
+    #[serde(default)]
+    pub to_ref: Option<String>,
+    /// Optional path filter limiting the diff.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitLogArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Ref, branch, tag, or commit to start from; defaults to HEAD.
+    #[serde(default)]
+    pub ref_name: Option<String>,
+    /// Maximum number of commits to return.
+    #[serde(default = "def_log_limit")]
+    pub limit: i64,
+    /// Optional path filter; only commits touching it are returned.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitMergeArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Branch, tag or commit to merge into the checked-out branch.
+    pub source_ref: String,
+    #[serde(default)]
+    pub squash: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitMergeResolveArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// One resolution per conflicting path.
+    pub resolutions: Vec<ResolutionArg>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRebaseArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Commit the checked-out branch's commits are replayed onto.
+    pub onto: String,
+    /// The explicit todo list, one entry per commit of the range.
+    pub todo: Vec<RebaseTodoItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemoteAddArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the remote, for example origin or upstream.
+    pub name: String,
+    /// HTTPS URL of the remote repository, without embedded credentials.
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemoteCloneArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// HTTPS URL of the repository to clone.
+    pub url: String,
+    /// Branch to check out after cloning; defaults to the remote's default branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Shallow clone depth; 0 for a full clone.
+    #[serde(default = "def_depth0")]
+    pub depth: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemoteFetchArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemotePullArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Branch to pull; must be the one currently checked out.
+    pub branch: String,
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemotePushArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Local branch to push.
+    pub branch: String,
+    #[serde(default = "def_origin")]
+    pub remote: String,
+    /// Name the branch is pushed as on the remote; defaults to `branch`.
+    #[serde(default)]
+    pub remote_branch: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+    /// Required with force: the remote sha believed to be overwritten.
+    #[serde(default)]
+    pub expected_remote_sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemoteRemoveArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the remote to delete; matched case-sensitively.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitResetArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Ref name, branch, tag or commit sha the current branch is moved to.
+    pub target_ref: String,
+    /// 'soft' to move the pointer only, or 'hard' to also rewrite the volume.
+    pub mode: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRevertArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Commit SHA to revert.
+    pub commit_sha: String,
+    /// For a merge commit, the parent the revert is computed against.
+    #[serde(default = "def_mainline0")]
+    pub mainline: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitShowArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Commit SHA to show details and diff for.
+    pub commit_sha: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitStashIdArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    pub stash_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitStashSaveArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1984,11 +2318,508 @@ impl McpServer {
         .await;
         to_call_result("search.status", out)
     }
+
+    // ── git.* core family (39 tools) ──────────────────────────────────────
+
+    #[tool(name = "git.init", description = "Initialize the volume as a git repository.")]
+    async fn git_init(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.init", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.init", out)
+    }
+
+    #[tool(name = "git.status", description = "Show HEAD, current branch, and all refs.")]
+    async fn git_status(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.status", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.status", out)
+    }
+
+    #[tool(name = "git.branches", description = "List all branches with their SHA.")]
+    async fn git_branches(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.branches", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.branches", out)
+    }
+
+    #[tool(
+        name = "git.branch_create",
+        description = "Create a branch at a start point, optionally checking it out."
+    )]
+    async fn git_branch_create(
+        &self,
+        Parameters(a): Parameters<GitBranchCreateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.branch_create", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.branch_create", out)
+    }
+
+    #[tool(
+        name = "git.branch_switch",
+        description = "Switch HEAD to an existing branch, rewriting the volume to match its commit."
+    )]
+    async fn git_branch_switch(
+        &self,
+        Parameters(a): Parameters<GitBranchSwitchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.branch_switch", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.branch_switch", out)
+    }
+
+    #[tool(
+        name = "git.branch_delete",
+        description = "Delete a branch. Refuses the branch currently checked out, and refuses a branch holding commits reachable from no other ref unless force is true. Removes the ref only: every commit stays in the object store, so a mistaken delete is undone by recreating the branch at the reported sha with git.branch_create."
+    )]
+    async fn git_branch_delete(
+        &self,
+        Parameters(a): Parameters<GitBranchDeleteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.branch_delete", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.branch_delete", out)
+    }
+
+    #[tool(
+        name = "git.branch_reset",
+        description = "Move a branch pointer to another commit, the equivalent of git branch -f. Refuses a move that is not a fast-forward unless force is true, and always reports old_sha so a mistaken move is undone by moving back to it. On the branch currently checked out it also rewrites the volume to the target commit's tree, discarding uncommitted changes; on any other branch it moves the ref and leaves every file alone."
+    )]
+    async fn git_branch_reset(
+        &self,
+        Parameters(a): Parameters<GitBranchResetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.branch_reset", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.branch_reset", out)
+    }
+
+    #[tool(
+        name = "git.reset",
+        description = "Move the current branch's pointer to another commit, the equivalent of git reset. Mode soft moves the pointer alone and leaves every volume file exactly as it is, so the changes of the commits left behind stay in the volume ready to be committed again. Mode hard also rewrites the volume to the target commit's tree, discarding uncommitted changes. There is no mixed mode. Commits the branch no longer reaches are orphaned, never deleted, so a mistaken reset is undone by resetting back to the reported old_sha."
+    )]
+    async fn git_reset(
+        &self,
+        Parameters(a): Parameters<GitResetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.reset", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.reset", out)
+    }
+
+    #[tool(name = "git.tags", description = "List all tags.")]
+    async fn git_tags(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.tags", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.tags", out)
+    }
+
+    #[tool(name = "git.log", description = "List commits. ref_name defaults to HEAD.")]
+    async fn git_log(
+        &self,
+        Parameters(a): Parameters<GitLogArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.log", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.log", out)
+    }
+
+    #[tool(name = "git.show", description = "Show details and diff of a commit.")]
+    async fn git_show(
+        &self,
+        Parameters(a): Parameters<GitShowArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.show", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.show", out)
+    }
+
+    #[tool(
+        name = "git.diff",
+        description = "Show diff between two refs or a ref and working tree."
+    )]
+    async fn git_diff(
+        &self,
+        Parameters(a): Parameters<GitDiffArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.diff", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.diff", out)
+    }
+
+    #[tool(
+        name = "git.commit",
+        description = "Create a commit from the current state of the volume."
+    )]
+    async fn git_commit(
+        &self,
+        Parameters(a): Parameters<GitCommitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.commit", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.commit", out)
+    }
+
+    #[tool(
+        name = "git.checkout_file",
+        description = "Restore a file from a commit into the volume."
+    )]
+    async fn git_checkout_file(
+        &self,
+        Parameters(a): Parameters<GitCheckoutFileArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.checkout_file", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.checkout_file", out)
+    }
+
+    #[tool(name = "git.blame", description = "Show who last modified each line of a file.")]
+    async fn git_blame(
+        &self,
+        Parameters(a): Parameters<GitBlameArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.blame", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.blame", out)
+    }
+
+    #[tool(
+        name = "git.remote_add",
+        description = "Record a named remote for the volume, so more than one repository can be pushed to, fetched from or pulled from. The URL must be https, must not embed credentials, and its host must be declared in git.hosts; store the credential with git.auth instead. A name already in use is refused rather than overwritten."
+    )]
+    async fn git_remote_add(
+        &self,
+        Parameters(a): Parameters<GitRemoteAddArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_add", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_add", out)
+    }
+
+    #[tool(
+        name = "git.remote_remove",
+        description = "Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op."
+    )]
+    async fn git_remote_remove(
+        &self,
+        Parameters(a): Parameters<GitRemoteRemoveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_remove", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_remove", out)
+    }
+
+    #[tool(
+        name = "git.remote_list",
+        description = "List every remote recorded for the volume with its resolved host and provider. A volume with no remote returns an empty list. No credential is ever included."
+    )]
+    async fn git_remote_list(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_list", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_list", out)
+    }
+
+    #[tool(
+        name = "git.remote_clone",
+        description = "Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. Uses the OAuth token stored by git.auth "
+    )]
+    async fn git_remote_clone(
+        &self,
+        Parameters(a): Parameters<GitRemoteCloneArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_clone", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_clone", out)
+    }
+
+    #[tool(
+        name = "git.remote_fetch",
+        description = "Fetch objects and update refs/remotes/{remote}/* from a declared remote. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally."
+    )]
+    async fn git_remote_fetch(
+        &self,
+        Parameters(a): Parameters<GitRemoteFetchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_fetch", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_fetch", out)
+    }
+
+    #[tool(
+        name = "git.remote_pull",
+        description = "Fetch from a declared remote, then advance the checked-out branch to the remote tip and update the volume's files to match. A fast-forward applies directly. A diverged history is merged: a clean three-way merge creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or discard first) and refuses any branch other than the one currently checked out."
+    )]
+    async fn git_remote_pull(
+        &self,
+        Parameters(a): Parameters<GitRemotePullArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_pull", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_pull", out)
+    }
+
+    #[tool(
+        name = "git.remote_push",
+        description = "Push a local branch to a declared remote, under the same name unless remote_branch names another one. Creates the branch on the remote when it is absent there. Fails if the push is not a fast-forward, unless force is true, which requires expected_remote_sha to state the remote sha being overwritten."
+    )]
+    async fn git_remote_push(
+        &self,
+        Parameters(a): Parameters<GitRemotePushArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.remote_push", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.remote_push", out)
+    }
+
+    #[tool(
+        name = "git.merge",
+        description = "Merge a branch, tag or commit into the checked-out branch. An already merged source is reported as already_up_to_date and changes nothing. A source the current branch is an ancestor of fast-forwards. Anything else is a three-way merge: a clean one creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or stash first)."
+    )]
+    async fn git_merge(
+        &self,
+        Parameters(a): Parameters<GitMergeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.merge", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.merge", out)
+    }
+
+    #[tool(
+        name = "git.merge_abort",
+        description = "Abandon the merge left in conflict by git.merge or git.remote_pull, discarding every resolution recorded so far and leaving HEAD and every volume file exactly as they were before the merge started."
+    )]
+    async fn git_merge_abort(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.merge_abort", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.merge_abort", out)
+    }
+
+    #[tool(
+        name = "git.merge_resolve",
+        description = "Finish a merge left in conflict by git.merge or git.remote_pull. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the checked-out branch's side, 'theirs' for the side being merged in, both taken whole) or content (the exact bytes to use, which is how a caller merges the two sides itself). Paths may be resolved over several calls: until the last one is resolved the merge stays in progress and nothing is written, and once it is the merge commit is created and every resulting file written to the volume as one all-or-nothing unit. A path that is not in conflict rejects the whole call."
+    )]
+    async fn git_merge_resolve(
+        &self,
+        Parameters(a): Parameters<GitMergeResolveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.merge_resolve", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.merge_resolve", out)
+    }
+
+    #[tool(
+        name = "git.cherry_pick",
+        description = "Apply the change one commit made onto the checked-out branch, as a NEW commit with a new sha that keeps the original author and records you as the committer. A commit already in the branch's history, or whose change the branch already carries, is reported as already_present and never duplicated. A conflicting pick applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.cherry_pick_continue or abandoned with git.cherry_pick_abort. A merge commit needs mainline, the parent its change is taken relative to. Refuses a dirty volume (commit or stash first)."
+    )]
+    async fn git_cherry_pick(
+        &self,
+        Parameters(a): Parameters<GitCherryPickArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.cherry_pick", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.cherry_pick", out)
+    }
+
+    #[tool(
+        name = "git.cherry_pick_abort",
+        description = "Abandon the cherry-pick paused by git.cherry_pick, discarding every resolution recorded, and leaving the branch and every volume file exactly as they were before the pick started."
+    )]
+    async fn git_cherry_pick_abort(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .call_git("git.cherry_pick_abort", serde_json::to_value(&a).expect("serialize"))
+            .await;
+        to_call_result("git.cherry_pick_abort", out)
+    }
+
+    #[tool(
+        name = "git.cherry_pick_continue",
+        description = "Resume the cherry-pick paused by git.cherry_pick on a conflicting file. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the branch the commit is being applied onto, 'theirs' for the commit being picked, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the pick stays paused and nothing is written. Once every path is resolved the commit is created. A path that is not in conflict rejects the whole call, and so does a call made while something other than a cherry-pick is in progress."
+    )]
+    async fn git_cherry_pick_continue(
+        &self,
+        Parameters(a): Parameters<GitResolutionsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .call_git("git.cherry_pick_continue", serde_json::to_value(&a).expect("serialize"))
+            .await;
+        to_call_result("git.cherry_pick_continue", out)
+    }
+
+    #[tool(
+        name = "git.revert",
+        description = "Undo what one commit did by adding a NEW commit on the checked-out branch whose change is the exact inverse, leaving the original commit in history untouched. The default message is Revert followed by the original subject in quotes. Reverting a revert restores the change. Reverting the very first commit of a history removes everything it added. A conflicting revert applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.revert_continue or abandoned with git.revert_abort. A merge commit needs mainline, the parent the revert is computed against. Refuses a dirty volume (commit or stash first)."
+    )]
+    async fn git_revert(
+        &self,
+        Parameters(a): Parameters<GitRevertArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.revert", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.revert", out)
+    }
+
+    #[tool(
+        name = "git.revert_abort",
+        description = "Abandon the revert paused by git.revert, discarding every resolution recorded, and leaving the branch and every volume file exactly as they were before the revert started."
+    )]
+    async fn git_revert_abort(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.revert_abort", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.revert_abort", out)
+    }
+
+    #[tool(
+        name = "git.revert_continue",
+        description = "Resume the revert paused by git.revert on a conflicting file. Each resolution names one conflicting path and carries exactly one of strategy ('ours' for the branch the revert is being made on, 'theirs' for the state the reverted commit is being undone back to, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the revert stays paused and nothing is written. Once every path is resolved the inverse commit is created. A path that is not in conflict rejects the whole call, and so does a call made while something other than a revert is in progress."
+    )]
+    async fn git_revert_continue(
+        &self,
+        Parameters(a): Parameters<GitResolutionsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .call_git("git.revert_continue", serde_json::to_value(&a).expect("serialize"))
+            .await;
+        to_call_result("git.revert_continue", out)
+    }
+
+    #[tool(
+        name = "git.rebase",
+        description = "Replay the checked-out branch's commits onto another commit, following an explicit todo list. Each entry names one commit of the range between onto and the branch tip and one action: pick replays it, drop leaves it out, reword replays it with a new message, squash folds it into the entry above it. The whole todo is checked before anything is replayed: an unknown sha, a commit outside the range, a commit of the range left out, a duplicate sha, an unknown action, a leading squash or a blank reword message rejects the call and changes nothing. A branch that already contains onto is reported as up_to_date. Refuses a dirty volume (commit or stash first)."
+    )]
+    async fn git_rebase(
+        &self,
+        Parameters(a): Parameters<GitRebaseArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.rebase", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.rebase", out)
+    }
+
+    #[tool(
+        name = "git.rebase_abort",
+        description = "Abandon the rebase paused by git.rebase, discarding every commit replayed so far and every resolution recorded, and leaving the branch and every volume file exactly as they were before the rebase started."
+    )]
+    async fn git_rebase_abort(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.rebase_abort", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.rebase_abort", out)
+    }
+
+    #[tool(
+        name = "git.rebase_continue",
+        description = "Resume the rebase paused by git.rebase on a conflicting commit. Each resolution names one conflicting path of the paused commit and carries exactly one of strategy ('ours' for the side already replayed onto, 'theirs' for the commit being replayed, both taken whole) or content (the exact bytes to use). Paths may be resolved over several calls: until the last one is resolved the rebase stays paused at the same commit and nothing is written. Once every path is resolved that commit is replayed and the remaining todo entries follow, until the list is exhausted or a further conflict pauses it again. A path that is not in conflict rejects the whole call, and so does a call made while something other than a rebase is in progress."
+    )]
+    async fn git_rebase_continue(
+        &self,
+        Parameters(a): Parameters<GitResolutionsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .call_git("git.rebase_continue", serde_json::to_value(&a).expect("serialize"))
+            .await;
+        to_call_result("git.rebase_continue", out)
+    }
+
+    #[tool(
+        name = "git.stash_save",
+        description = "Set the volume's uncommitted changes aside as a stash entry and rewrite the volume back to HEAD's tree. The entry is a commit holding the exact state the volume was in, identified by an opaque stash_id, and it survives deletion of the branch it was taken from. Refuses a volume that has no uncommitted changes, and refuses once the volume holds git.max_stash_entries entries."
+    )]
+    async fn git_stash_save(
+        &self,
+        Parameters(a): Parameters<GitStashSaveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.stash_save", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.stash_save", out)
+    }
+
+    #[tool(
+        name = "git.stash_list",
+        description = "List every stash entry of the volume, most recent first. The pool is per volume, not per branch: an entry taken on one branch is listed whatever branch is checked out, and base_sha names the commit it was taken against."
+    )]
+    async fn git_stash_list(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.stash_list", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.stash_list", out)
+    }
+
+    #[tool(
+        name = "git.stash_apply",
+        description = "Apply one stash entry's changes onto the current volume state, keeping the entry listed so it can be applied again. The entry applies onto whatever branch is checked out now, even one that did not exist when it was taken. A conflicting application writes nothing to the volume and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort."
+    )]
+    async fn git_stash_apply(
+        &self,
+        Parameters(a): Parameters<GitStashIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.stash_apply", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.stash_apply", out)
+    }
+
+    #[tool(
+        name = "git.stash_pop",
+        description = "Apply one stash entry's changes onto the current volume state and delete the entry, but only once the application has fully succeeded: an application that ends in conflict reports status conflict with dropped false and keeps the entry, so no work is lost. The entry applies onto whatever branch is checked out now, even one that did not exist when it was taken. A conflicting application writes nothing to the volume and is finished with git.merge_resolve or abandoned with git.merge_abort."
+    )]
+    async fn git_stash_pop(
+        &self,
+        Parameters(a): Parameters<GitStashIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.stash_pop", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.stash_pop", out)
+    }
+
+    #[tool(
+        name = "git.stash_drop",
+        description = "Delete one stash entry by id, leaving every volume file untouched and every other entry in place. Removes the ref only: the commit stays in the object store."
+    )]
+    async fn git_stash_drop(
+        &self,
+        Parameters(a): Parameters<GitStashIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.stash_drop", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.stash_drop", out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::admin::test_support::Fixture;
+
+    /// Pulls the JSON payload out of a successful `CallToolResult`, panicking
+    /// on an error result (callers assert the happy path, or inspect the raw
+    /// result themselves for the conflict/error cases).
+    fn ok_json(r: Result<CallToolResult, ErrorData>) -> Value {
+        let r = r.expect("ErrorData (protocol error), not a tool error");
+        assert_ne!(r.is_error, Some(true), "tool returned an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        serde_json::from_str(&text).expect("tool result must be JSON")
+    }
 
     const NAMES: &[(&str, &str)] = &[
         ("fs.read", "Read a text file with line-numbered, paged output."),
@@ -2007,6 +2838,11 @@ mod tests {
         ),
         ("search.index", "Index a file or directory into the search engine for this volume."),
         ("search.status", "Report index statistics for this volume."),
+        ("git.init", "Initialize the volume as a git repository."),
+        ("git.status", "Show HEAD, current branch, and all refs."),
+        ("git.log", "List commits. ref_name defaults to HEAD."),
+        ("git.show", "Show details and diff of a commit."),
+        ("git.tags", "List all tags."),
     ];
 
     #[test]
@@ -2022,17 +2858,183 @@ mod tests {
     }
 
     #[test]
-    fn total_tool_count_is_forty_nine() {
+    fn total_tool_count_is_eighty_eight() {
         let router = McpServer::tool_router();
         let names: Vec<String> =
             router.list_all().into_iter().map(|t| t.name.to_string()).collect();
         let fs_count = names.iter().filter(|n| n.starts_with("fs.")).count();
         let admin_count = names.iter().filter(|n| n.starts_with("admin.")).count();
         let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
+        let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
         assert_eq!(fs_count, 35, "got: {names:?}");
         assert_eq!(admin_count, 10, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
-        assert_eq!(names.len(), 49, "got: {names:?}");
+        assert_eq!(git_count, 39, "got: {names:?}");
+        assert_eq!(names.len(), 88, "got: {names:?}");
+    }
+
+    #[test]
+    fn every_core_git_tool_is_registered() {
+        const ALL_GIT_TOOLS: [&str; 39] = [
+            "git.init",
+            "git.status",
+            "git.branches",
+            "git.branch_create",
+            "git.branch_switch",
+            "git.branch_delete",
+            "git.branch_reset",
+            "git.reset",
+            "git.tags",
+            "git.log",
+            "git.show",
+            "git.diff",
+            "git.commit",
+            "git.checkout_file",
+            "git.blame",
+            "git.merge",
+            "git.merge_resolve",
+            "git.merge_abort",
+            "git.rebase",
+            "git.rebase_continue",
+            "git.rebase_abort",
+            "git.cherry_pick",
+            "git.cherry_pick_continue",
+            "git.cherry_pick_abort",
+            "git.revert",
+            "git.revert_continue",
+            "git.revert_abort",
+            "git.stash_save",
+            "git.stash_list",
+            "git.stash_drop",
+            "git.stash_apply",
+            "git.stash_pop",
+            "git.remote_add",
+            "git.remote_remove",
+            "git.remote_list",
+            "git.remote_clone",
+            "git.remote_push",
+            "git.remote_fetch",
+            "git.remote_pull",
+        ];
+        let router = McpServer::tool_router();
+        let names: std::collections::HashSet<String> =
+            router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        for name in ALL_GIT_TOOLS {
+            assert!(names.contains(name), "{name} is missing from the router");
+        }
+    }
+
+    const OWNER: &str = "owner@test.com";
+    const MOUNT: &str = "gitproj";
+    const CFG: &str = "/src/config.toml";
+    const BASE_CFG: &str =
+        "[server]\nport = 8080\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    const MAIN_CFG: &str =
+        "[server]\nport = 8000\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+    const FEATURE_CFG_CONFLICT: &str =
+        "[server]\nport = 9090\nhost = \"0.0.0.0\"\nworkers = 4\ntimeout = 30\nretries = 2\n";
+
+    async fn git_env() -> (Fixture, McpServer) {
+        let f = Fixture::with_config(|c| c.git.enabled = true).await;
+        f.seed_project(MOUNT, OWNER).await;
+        let server = McpServer::new(f.state.clone(), OWNER.to_string());
+        (f, server)
+    }
+
+    async fn write(f: &Fixture, path: &str, content: &str) {
+        let client = f.state.stores.client(MOUNT).await.unwrap();
+        client.write_text_atomic(path, content).await.unwrap();
+    }
+
+    /// E2E-GIT-002: a genuine merge conflict (mirrors `tools::git`'s own
+    /// `seed_conflict`/`e2e_new_502_conflict_response_shape` fixture) produces
+    /// the exact same `status: "conflict"` shape through the new `#[tool]`
+    /// method, because it runs through the exact same handler.
+    #[tokio::test]
+    async fn git_merge_tool_reports_conflict_shape_like_the_old_handler() {
+        let (f, server) = git_env().await;
+
+        ok_json(server.git_init(Parameters(MountOnlyArgs { mount_id: MOUNT.to_string() })).await);
+        write(&f, CFG, BASE_CFG).await;
+        let c0 = ok_json(
+            server
+                .git_commit(Parameters(GitCommitArgs {
+                    mount_id: MOUNT.to_string(),
+                    message: "C0".to_string(),
+                    author_name: None,
+                    author_email: None,
+                }))
+                .await,
+        )["commit_sha"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        ok_json(
+            server
+                .git_branch_create(Parameters(GitBranchCreateArgs {
+                    mount_id: MOUNT.to_string(),
+                    name: "feature".to_string(),
+                    start_point: c0,
+                    checkout: true,
+                }))
+                .await,
+        );
+        write(&f, CFG, FEATURE_CFG_CONFLICT).await;
+        ok_json(
+            server
+                .git_commit(Parameters(GitCommitArgs {
+                    mount_id: MOUNT.to_string(),
+                    message: "C1".to_string(),
+                    author_name: None,
+                    author_email: None,
+                }))
+                .await,
+        );
+
+        ok_json(
+            server
+                .git_branch_switch(Parameters(GitBranchSwitchArgs {
+                    mount_id: MOUNT.to_string(),
+                    name: "main".to_string(),
+                }))
+                .await,
+        );
+        write(&f, CFG, MAIN_CFG).await;
+        ok_json(
+            server
+                .git_commit(Parameters(GitCommitArgs {
+                    mount_id: MOUNT.to_string(),
+                    message: "C2".to_string(),
+                    author_name: None,
+                    author_email: None,
+                }))
+                .await,
+        );
+
+        let out = ok_json(
+            server
+                .git_merge(Parameters(GitMergeArgs {
+                    mount_id: MOUNT.to_string(),
+                    source_ref: "feature".to_string(),
+                    squash: false,
+                    message: None,
+                }))
+                .await,
+        );
+
+        // Byte-for-byte the same conflict shape `tools::git`'s own
+        // `e2e_new_502_conflict_response_shape` asserts on the old handler.
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["operation"], "merge");
+        assert_eq!(out["source_ref"], "feature");
+        assert_eq!(out["current_step"], Value::Null);
+        assert_eq!(out["total_steps"], Value::Null);
+        assert_eq!(out["continue_with"], "git.merge_resolve");
+        assert_eq!(out["abort_with"], "git.merge_abort");
+        let conflicts = out["conflicts"].as_array().expect("conflicts array");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["path"], CFG);
     }
 
     #[test]
