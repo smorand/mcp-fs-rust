@@ -67,6 +67,9 @@ jsonwebtoken = "9"
 rsa = { version = "0.9", features = ["pem"] }
 rand = "0.8"
 
+# ── mcp ────────────────────────────────────────────────────────────────────────
+rmcp = { version = "3.5.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+
 # ── git ────────────────────────────────────────────────────────────────────────
 git2 = "0.20"
 # Host key validation and, later, remote URL parsing (git::remote). Was already

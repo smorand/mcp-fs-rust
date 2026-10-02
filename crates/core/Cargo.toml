@@ -60,6 +60,8 @@ rand = { workspace = true }
 git2 = { workspace = true }
 url = { workspace = true }
 
+rmcp = { workspace = true }
+
 regex = { workspace = true }
 globset = { workspace = true }
 similar = { workspace = true }
