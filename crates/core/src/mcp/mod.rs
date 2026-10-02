@@ -18,6 +18,7 @@
 pub mod args;
 pub mod registry;
 pub mod schema;
+pub mod server;
 
 pub use args::Args;
 pub use registry::{ToolHandler, ToolRegistry};
