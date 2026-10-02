@@ -25,9 +25,15 @@ use serde_json::Value;
 
 use crate::core::fs_ops;
 use crate::errors::ToolError;
+use crate::git::GitRepoStore;
+use crate::search::fusion::rrf_merge;
 use crate::search::indexer;
 use crate::state::AppState;
 use crate::storage::VolumeClient;
+use crate::storage::admin::validate_project_id;
+use crate::storage::traits::IndexMode;
+use crate::util::normalize_identity;
+use std::str::FromStr;
 
 /// Turn a tool's `Result<Value, ToolError>` into the two MCP outcomes, with the
 /// exact same error text the old SSE transport renders
@@ -571,6 +577,93 @@ pub struct DocumentizeArgs {
     /// Allow overwriting an existing companion .md (default no-clobber).
     #[serde(default)]
     pub overwrite: bool,
+}
+
+// ── admin.* parameter structs ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateProjectArgs {
+    /// New project id: 3 to 32 chars, lowercase letters, digits, hyphens, alphanumeric bounds.
+    pub project_id: String,
+    /// Person id who owns the new project.
+    pub owner: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectIdArgs {
+    /// Id of the project.
+    pub project_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectPersonArgs {
+    /// Id of the project.
+    pub project_id: String,
+    /// Person id.
+    pub person: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetIndexModeArgs {
+    /// Id of the project whose search index mode is set.
+    pub project_id: String,
+    /// New index mode: none, bm25, rag, or both.
+    pub mode: String,
+}
+
+// ── search.* parameter structs ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchIndexArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path to index (file or directory).
+    pub path: String,
+    /// Recurse into subdirectories when path is a directory.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Maximum character size of each indexed chunk.
+    #[serde(default = "def_chunk_size")]
+    pub chunk_size: i64,
+    /// Character overlap between consecutive chunks.
+    #[serde(default = "def_chunk_overlap")]
+    pub chunk_overlap: i64,
+}
+fn def_chunk_size() -> i64 {
+    1000
+}
+fn def_chunk_overlap() -> i64 {
+    100
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchQueryArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Search query text.
+    pub query: String,
+    /// Query mode: bm25, rag, or both. Defaults to server config.
+    pub mode: Option<String>,
+    /// Maximum number of results to return.
+    #[serde(default = "def_top_k")]
+    pub top_k: i64,
+    /// Apply reranking when configured and available.
+    #[serde(default = "def_true")]
+    pub rerank: bool,
+}
+fn def_top_k() -> i64 {
+    10
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchDeleteArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path to remove from the index.
+    pub path: String,
+    /// Recurse into subdirectories when path is a directory.
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 /// `fs.multi_edit`'s `edits` array as raw JSON, same shape the old handler reads.
@@ -1410,6 +1503,487 @@ impl McpServer {
         .await;
         to_call_result("fs.documentize", out)
     }
+
+    // ── admin.* family ────────────────────────────────────────────────
+
+    #[tool(
+        name = "admin.create_project",
+        description = "Create a project for a designated owner and provision its volume (platform admin only)."
+    )]
+    async fn admin_create_project(
+        &self,
+        Parameters(a): Parameters<CreateProjectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_admin(&self.person)?;
+            validate_project_id(&a.project_id)?;
+            if a.owner.trim().is_empty() {
+                return Err(ToolError::invalid_argument("owner is required"));
+            }
+            let project = self.state.admin.create_project(&a.project_id, &a.owner).await?;
+            if let Err(e) = self.state.stores.provision_volume(&a.project_id).await {
+                let _ = self.state.admin.delete_project(&a.project_id).await;
+                return Err(e);
+            }
+            Ok(serde_json::json!({
+                "project_id": project.id,
+                "owner": project.owner,
+                "created_at": project.created_at,
+            }))
+        }
+        .await;
+        to_call_result("admin.create_project", out)
+    }
+
+    #[tool(
+        name = "admin.delete_project",
+        description = "Delete a project and recursively tear down its volume (owner or platform admin)."
+    )]
+    async fn admin_delete_project(
+        &self,
+        Parameters(a): Parameters<ProjectIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
+            self.state.stores.teardown_volume(&a.project_id).await?;
+            if self.state.config.git.enabled {
+                let store = GitRepoStore::shared(
+                    self.state.config.clone(),
+                    self.state.stores.relational().clone(),
+                );
+                store.purge_repo(&a.project_id).await?;
+            }
+            self.state.admin.delete_project(&a.project_id).await?;
+            Ok(serde_json::json!({"project_id": a.project_id, "deleted": true}))
+        }
+        .await;
+        to_call_result("admin.delete_project", out)
+    }
+
+    #[tool(name = "admin.list_projects", description = "List projects the caller can access.")]
+    async fn admin_list_projects(&self) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            let person = normalize_identity(&self.person);
+            let projects = self.state.admin.list_projects_for(&self.person).await?;
+            let entries: Vec<Value> = projects
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "project_id": p.id,
+                        "owner": p.owner,
+                        "created_at": p.created_at,
+                        "index_mode": p.index_mode,
+                        "is_owner": normalize_identity(&p.owner) == person,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({"projects": entries}))
+        }
+        .await;
+        to_call_result("admin.list_projects", out)
+    }
+
+    #[tool(
+        name = "admin.list_all_projects",
+        description = "List every project (platform admin only)."
+    )]
+    async fn admin_list_all_projects(&self) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_admin(&self.person)?;
+            let projects = self.state.admin.list_all_projects().await?;
+            let entries: Vec<Value> = projects
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "project_id": p.id,
+                        "owner": p.owner,
+                        "created_at": p.created_at,
+                        "index_mode": p.index_mode,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({"projects": entries}))
+        }
+        .await;
+        to_call_result("admin.list_all_projects", out)
+    }
+
+    #[tool(
+        name = "admin.list_users",
+        description = "List every known person and platform admins (platform admin only)."
+    )]
+    async fn admin_list_users(&self) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_admin(&self.person)?;
+            let mut persons: std::collections::BTreeSet<String> =
+                self.state.admin.list_all_persons().await?.into_iter().collect();
+            for a in &self.state.config.auth.admins {
+                persons.insert(a.clone());
+            }
+            let users: Vec<Value> = persons
+                .into_iter()
+                .map(|p| {
+                    let is_admin = self.state.is_admin(&p);
+                    serde_json::json!({"person": p, "is_admin": is_admin})
+                })
+                .collect();
+            Ok(serde_json::json!({"users": users}))
+        }
+        .await;
+        to_call_result("admin.list_users", out)
+    }
+
+    #[tool(
+        name = "admin.add_member",
+        description = "Add a person to a project (owner or platform admin)."
+    )]
+    async fn admin_add_member(
+        &self,
+        Parameters(a): Parameters<ProjectPersonArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
+            let member =
+                self.state.admin.add_member(&a.project_id, &a.person, &self.person).await?;
+            Ok(serde_json::json!({
+                "project_id": a.project_id,
+                "person": member.person,
+                "role": member.role,
+            }))
+        }
+        .await;
+        to_call_result("admin.add_member", out)
+    }
+
+    #[tool(
+        name = "admin.remove_member",
+        description = "Remove a person from a project (owner or platform admin)."
+    )]
+    async fn admin_remove_member(
+        &self,
+        Parameters(a): Parameters<ProjectPersonArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
+            self.state.admin.remove_member(&a.project_id, &a.person).await?;
+            Ok(serde_json::json!({
+                "project_id": a.project_id,
+                "person": a.person,
+                "removed": true,
+            }))
+        }
+        .await;
+        to_call_result("admin.remove_member", out)
+    }
+
+    #[tool(
+        name = "admin.list_members",
+        description = "List members of a project (member or platform admin)."
+    )]
+    async fn admin_list_members(
+        &self,
+        Parameters(a): Parameters<ProjectIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            if self.state.is_admin(&self.person) {
+                if self.state.admin.get_project(&a.project_id).await?.is_none() {
+                    return Err(ToolError::project_not_found(&a.project_id));
+                }
+            } else {
+                self.state.admin.require_member(&a.project_id, &self.person).await?;
+            }
+            let members = self.state.admin.list_members(&a.project_id).await?;
+            let entries: Vec<Value> = members
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({"person": m.person, "role": m.role, "added_by": m.added_by})
+                })
+                .collect();
+            Ok(serde_json::json!({"project_id": a.project_id, "members": entries}))
+        }
+        .await;
+        to_call_result("admin.list_members", out)
+    }
+
+    #[tool(
+        name = "admin.set_index_mode",
+        description = "Set the search index mode for a project (owner or platform admin). \
+             none=no index, bm25=full-text only, rag=vector only, both=full-text and vector. \
+             Switching to an active mode triggers an initial full index of existing files in \
+             the background. Switching to none wipes the index immediately."
+    )]
+    async fn admin_set_index_mode(
+        &self,
+        Parameters(a): Parameters<SetIndexModeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
+            let new_mode = IndexMode::from_str(&a.mode)?;
+
+            let backend = self.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
+            if new_mode.needs_embedding() && self.state.config.search.embedding.endpoint.is_empty()
+            {
+                return Err(ToolError::invalid_argument(format!(
+                    "index mode '{new_mode}' requires search.embedding.endpoint to be configured"
+                )));
+            }
+
+            let old_mode = self.state.admin.get_index_mode(&a.project_id).await?;
+            self.state.admin.set_index_mode(&a.project_id, new_mode).await?;
+
+            let client = self.state.stores.client(&a.project_id).await?;
+            let reindex_started = crate::search::indexer::ProjectIndexer::new(backend)
+                .on_mode_change(&a.project_id, old_mode, new_mode, client)
+                .await?;
+
+            Ok(serde_json::json!({
+                "project_id": a.project_id,
+                "index_mode": new_mode,
+                "previous_mode": old_mode,
+                "reindex_started": reindex_started,
+            }))
+        }
+        .await;
+        to_call_result("admin.set_index_mode", out)
+    }
+
+    #[tool(
+        name = "admin.get_index_mode",
+        description = "Get the current search index mode for a project (member or platform admin)."
+    )]
+    async fn admin_get_index_mode(
+        &self,
+        Parameters(a): Parameters<ProjectIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            if self.state.is_admin(&self.person) {
+                if self.state.admin.get_project(&a.project_id).await?.is_none() {
+                    return Err(ToolError::project_not_found(&a.project_id));
+                }
+            } else {
+                self.state.admin.require_member(&a.project_id, &self.person).await?;
+            }
+            let mode = self.state.admin.get_index_mode(&a.project_id).await?;
+            Ok(serde_json::json!({"project_id": a.project_id, "index_mode": mode}))
+        }
+        .await;
+        to_call_result("admin.get_index_mode", out)
+    }
+
+    // ── search.* family ────────────────────────────────────────────
+
+    #[tool(
+        name = "search.index",
+        description = "Index a file or directory into the search engine for this volume."
+    )]
+    async fn search_index(
+        &self,
+        Parameters(a): Parameters<SearchIndexArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.authorize(&a.mount_id, &self.person).await?;
+            let path = self.norm(&a.path)?;
+            let chunk_size = a.chunk_size as usize;
+            let chunk_overlap = a.chunk_overlap as usize;
+
+            let backend = self.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
+
+            let client = self.state.stores.client(&a.mount_id).await?;
+
+            let mut indexed = 0usize;
+            let mut skipped = 0usize;
+
+            let paths_to_index: Vec<String> = if a.recursive {
+                fs_ops::iter_files(&client, &path, &[])
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(p, _mtime)| p)
+                    .collect()
+            } else {
+                vec![path.clone()]
+            };
+
+            for file_path in &paths_to_index {
+                match client.read_text(file_path).await {
+                    Ok(text) => {
+                        match backend
+                            .index_path(&a.mount_id, file_path, &text, chunk_size, chunk_overlap)
+                            .await
+                        {
+                            Ok(n) => indexed += n,
+                            Err(_) => skipped += 1,
+                        }
+                    }
+                    Err(_) => {
+                        skipped += 1;
+                    }
+                }
+            }
+
+            Ok(serde_json::json!({
+                "indexed": indexed,
+                "skipped": skipped,
+                "path": path,
+            }))
+        }
+        .await;
+        to_call_result("search.index", out)
+    }
+
+    #[tool(
+        name = "search.query",
+        description = "Search indexed content. mode overrides the server default (bm25, rag, both)."
+    )]
+    async fn search_query(
+        &self,
+        Parameters(a): Parameters<SearchQueryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.authorize(&a.mount_id, &self.person).await?;
+
+            let top_k = a.top_k as usize;
+            let _rerank = a.rerank;
+
+            let config_mode = &self.state.config.search.mode;
+            let mode = a.mode.clone().unwrap_or_else(|| config_mode.clone());
+
+            let backend = self.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
+
+            if matches!(mode.as_str(), "rag" | "both") {
+                if self.state.config.search.embedding.endpoint.is_empty() {
+                    return Err(ToolError::not_supported(
+                        "mode rag/both requires search.embedding.endpoint to be configured",
+                    ));
+                }
+                if !backend.supported_modes().contains(&mode.as_str()) {
+                    return Err(ToolError::not_supported(format!(
+                        "mode '{mode}' is not supported by the current search backend"
+                    )));
+                }
+            }
+
+            let (results, mode_used) = match mode.as_str() {
+                "bm25" => {
+                    let r = backend.query_bm25(&a.mount_id, &a.query, top_k).await?;
+                    (r, "bm25".to_string())
+                }
+                "rag" => {
+                    let r = backend.query_vector(&a.mount_id, &a.query, top_k).await?;
+                    (r, "rag".to_string())
+                }
+                "both" => {
+                    let bm25 =
+                        backend.query_bm25(&a.mount_id, &a.query, top_k).await.unwrap_or_default();
+                    let vec = backend
+                        .query_vector(&a.mount_id, &a.query, top_k)
+                        .await
+                        .unwrap_or_default();
+                    let merged = rrf_merge(&bm25, &vec);
+                    (merged, "both".to_string())
+                }
+                other => {
+                    return Err(ToolError::invalid_argument(format!(
+                        "unknown mode '{other}', expected bm25, rag, or both"
+                    )));
+                }
+            };
+
+            let warning: Option<&str> = if matches!(mode_used.as_str(), "bm25" | "both") {
+                match backend.stats(&a.mount_id).await {
+                    Ok(s) if !s.bm25_warm => {
+                        Some("BM25 index is not warm; run search.index to populate it")
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let result_values: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "path": r.path,
+                        "score": r.score,
+                        "chunk": r.chunk,
+                        "rank": r.rank,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::json!({
+                "results": result_values,
+                "mode_used": mode_used,
+                "warning": warning,
+            }))
+        }
+        .await;
+        to_call_result("search.query", out)
+    }
+
+    #[tool(name = "search.delete", description = "Remove a path from the search index.")]
+    async fn search_delete(
+        &self,
+        Parameters(a): Parameters<SearchDeleteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.authorize(&a.mount_id, &self.person).await?;
+            let path = self.norm(&a.path)?;
+            let _recursive = a.recursive;
+
+            let backend = self.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
+
+            let deleted = backend.delete_path(&a.mount_id, &path).await?;
+
+            Ok(serde_json::json!({ "deleted": deleted }))
+        }
+        .await;
+        to_call_result("search.delete", out)
+    }
+
+    #[tool(name = "search.status", description = "Report index statistics for this volume.")]
+    async fn search_status(
+        &self,
+        Parameters(a): Parameters<MountOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.authorize(&a.mount_id, &self.person).await?;
+
+            let backend = self.state.search.as_ref().ok_or_else(|| {
+                ToolError::not_supported(
+                    "search is not enabled; set search.enabled: true in config",
+                )
+            })?;
+
+            let stats = backend.stats(&a.mount_id).await?;
+
+            Ok(serde_json::json!({
+                "bm25_docs": stats.bm25_docs,
+                "vector_chunks": stats.vector_chunks,
+                "mode": stats.mode,
+                "bm25_warm": stats.bm25_warm,
+            }))
+        }
+        .await;
+        to_call_result("search.status", out)
+    }
 }
 
 #[cfg(test)]
@@ -1422,6 +1996,17 @@ mod tests {
         ("fs.glob", "Find files by glob pattern, newest first (cap 100)."),
         ("fs.grep", "Search file contents (files|content|count modes)."),
         ("fs.documentize", "Generate the Markdown companion of a stored document."),
+        (
+            "admin.create_project",
+            "Create a project for a designated owner and provision its volume (platform admin only).",
+        ),
+        ("admin.list_projects", "List projects the caller can access."),
+        (
+            "admin.get_index_mode",
+            "Get the current search index mode for a project (member or platform admin).",
+        ),
+        ("search.index", "Index a file or directory into the search engine for this volume."),
+        ("search.status", "Report index statistics for this volume."),
     ];
 
     #[test]
@@ -1434,6 +2019,20 @@ mod tests {
             .filter(|n| n.starts_with("fs."))
             .collect();
         assert_eq!(names.len(), 35, "got: {names:?}");
+    }
+
+    #[test]
+    fn total_tool_count_is_forty_nine() {
+        let router = McpServer::tool_router();
+        let names: Vec<String> =
+            router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let fs_count = names.iter().filter(|n| n.starts_with("fs.")).count();
+        let admin_count = names.iter().filter(|n| n.starts_with("admin.")).count();
+        let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
+        assert_eq!(fs_count, 35, "got: {names:?}");
+        assert_eq!(admin_count, 10, "got: {names:?}");
+        assert_eq!(search_count, 4, "got: {names:?}");
+        assert_eq!(names.len(), 49, "got: {names:?}");
     }
 
     #[test]
