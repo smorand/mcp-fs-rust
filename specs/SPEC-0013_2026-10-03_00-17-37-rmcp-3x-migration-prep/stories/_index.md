@@ -21,7 +21,7 @@
 | 2 | US-0002 | n/a | Add rmcp 3.5.0 dependency | DR-001 | n/a | DT-DEP-001, DT-DEP-002 | 2 | US-0001 | 2 | done |
 | 3 | US-0003 | n/a | Migrate fs.* tools (35) to #[tool] methods | DR-002, DR-006, DR-007 | n/a | E2E-FS-001..003 | 1-2 | US-0002 | 2 | done |
 | 4 | US-0004 | n/a | Migrate admin.* (10) + search.* (4) tools | DR-002 | n/a | E2E-ADM-001..003 | 1 | US-0002 | 2 | done |
-| 5 | US-0005 | n/a | Migrate git.* core tools (39) | DR-002 | n/a | E2E-GIT-001..003 | 1 | US-0002 | 2 | todo |
+| 5 | US-0005 | n/a | Migrate git.* core tools (39) | DR-002 | n/a | E2E-GIT-001..003 | 1 | US-0002 | 2 | done |
 | 6 | US-0006 | n/a | Migrate git.auth* (4) + git.pr_* (6) tools | DR-002 | n/a | E2E-GITAUTH-001..003 | 1 | US-0002 | 2 | todo |
 | 7 | US-0007 | n/a | Finalize tool surface: golden contract green, 94-tool list | DR-005 | n/a | DT-005, DT-007 | 2-3 | US-0003,US-0004,US-0005,US-0006 | 2 | todo |
 | 8 | US-0008 | n/a | Transport swap: rmcp StreamableHttpService + agent client + break tests | DR-008,DR-009,DR-010 | n/a | DT-001..004 + 18 existing-test verdicts | 4 | US-0007 | 2 | todo |
