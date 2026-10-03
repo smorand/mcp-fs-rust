@@ -64,6 +64,18 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::Context7Config) 
     );
 }
 
+/// Catalog-only, `ToolRegistry`-free view of the `context7.*` family.
+pub fn catalog(
+    config: &crate::config::Context7Config,
+) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Cap the token count: 0 or negative => default 10000, else min(n, 50000).

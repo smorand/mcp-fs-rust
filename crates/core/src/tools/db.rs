@@ -228,6 +228,16 @@ fn batches_to_ndjson(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Catalog-only, `ToolRegistry`-free view of the `db.*` family.
+pub fn catalog(config: &DbConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
+}
+
 pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
     let max_rows = config.max_result_rows;
     let max_file_bytes = config.max_file_bytes;

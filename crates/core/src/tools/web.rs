@@ -177,6 +177,17 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
     );
 }
 
+/// Catalog-only, `ToolRegistry`-free view of the `web.*` family, for consumers
+/// that only need name/description/schema/annotations (e.g. `/api/swagger.json`).
+pub fn catalog(config: &crate::config::WebConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Map safe_search string to the DuckDuckGo `kp` parameter value.

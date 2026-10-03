@@ -180,6 +180,16 @@ pub fn parse_csv(bytes: &[u8], delimiter: char) -> Result<(Vec<String>, Vec<Vec<
     Ok((headers, rows))
 }
 
+/// Catalog-only, `ToolRegistry`-free view of the `sqlite.*` family.
+pub fn catalog(config: &SqliteConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
+}
+
 pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
     let max_rows = config.max_result_rows;
 

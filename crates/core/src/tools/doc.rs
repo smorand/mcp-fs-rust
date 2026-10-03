@@ -38,6 +38,17 @@ fn resolve_pandoc(config: &DocConfig) -> Option<String> {
     which::which("pandoc").ok().map(|p| p.display().to_string())
 }
 
+/// Catalog-only, `ToolRegistry`-free view of the `doc.*` family. Mirrors
+/// `register`'s own conditional: empty when pandoc cannot be resolved.
+pub fn catalog(config: &DocConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
+}
+
 /// Register the `doc.*` family. Returns immediately without adding any tool if
 /// pandoc cannot be found, logging a warning for the operator.
 pub fn register(reg: &mut ToolRegistry, config: &DocConfig) {
