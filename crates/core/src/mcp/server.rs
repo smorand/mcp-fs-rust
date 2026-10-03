@@ -2521,12 +2521,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_init(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_init(self.git_ctx(), a, None).await;
         to_call_result("git.init", out)
     }
 
@@ -2535,12 +2530,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_status(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_status(self.git_ctx(), a, None).await;
         to_call_result("git.status", out)
     }
 
@@ -2549,12 +2539,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_branches(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_branches(self.git_ctx(), a, None).await;
         to_call_result("git.branches", out)
     }
 
@@ -2566,12 +2551,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitBranchCreateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_branch_create(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_branch_create(self.git_ctx(), a, None).await;
         to_call_result("git.branch_create", out)
     }
 
@@ -2583,12 +2563,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitBranchSwitchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_branch_switch(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_branch_switch(self.git_ctx(), a, None).await;
         to_call_result("git.branch_switch", out)
     }
 
@@ -2600,12 +2575,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitBranchDeleteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_branch_delete(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_branch_delete(self.git_ctx(), a, None).await;
         to_call_result("git.branch_delete", out)
     }
 
@@ -2617,12 +2587,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitBranchResetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_branch_reset(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_branch_reset(self.git_ctx(), a, None).await;
         to_call_result("git.branch_reset", out)
     }
 
@@ -2634,12 +2599,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitResetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_reset(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_reset(self.git_ctx(), a, None).await;
         to_call_result("git.reset", out)
     }
 
@@ -2648,12 +2608,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_tags(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_tags(self.git_ctx(), a, None).await;
         to_call_result("git.tags", out)
     }
 
@@ -2662,12 +2617,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitLogArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_log(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_log(self.git_ctx(), a, None).await;
         to_call_result("git.log", out)
     }
 
@@ -2676,12 +2626,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitShowArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_show(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_show(self.git_ctx(), a, None).await;
         to_call_result("git.show", out)
     }
 
@@ -2693,12 +2638,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitDiffArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_diff(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_diff(self.git_ctx(), a, None).await;
         to_call_result("git.diff", out)
     }
 
@@ -2710,12 +2650,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitCommitArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_commit(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_commit(self.git_ctx(), a, None).await;
         to_call_result("git.commit", out)
     }
 
@@ -2727,12 +2662,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitCheckoutFileArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_checkout_file(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_checkout_file(self.git_ctx(), a, None).await;
         to_call_result("git.checkout_file", out)
     }
 
@@ -2741,12 +2671,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitBlameArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_blame(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_blame(self.git_ctx(), a, None).await;
         to_call_result("git.blame", out)
     }
 
@@ -2758,12 +2683,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRemoteAddArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_add(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_add(self.git_ctx(), a, None).await;
         to_call_result("git.remote_add", out)
     }
 
@@ -2775,12 +2695,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRemoteRemoveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_remove(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_remove(self.git_ctx(), a, None).await;
         to_call_result("git.remote_remove", out)
     }
 
@@ -2792,12 +2707,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_list(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_list(self.git_ctx(), a, None).await;
         to_call_result("git.remote_list", out)
     }
 
@@ -2809,13 +2719,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRemoteCloneArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_clone(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_clone(self.git_ctx(), a, None, None).await;
         to_call_result("git.remote_clone", out)
     }
 
@@ -2827,13 +2731,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRemoteFetchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_fetch(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_fetch(self.git_ctx(), a, None, None).await;
         to_call_result("git.remote_fetch", out)
     }
 
@@ -2845,13 +2743,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRemotePullArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_pull(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_pull(self.git_ctx(), a, None, None).await;
         to_call_result("git.remote_pull", out)
     }
 
@@ -2863,13 +2755,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRemotePushArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_remote_push(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_remote_push(self.git_ctx(), a, None, None).await;
         to_call_result("git.remote_push", out)
     }
 
@@ -2881,12 +2767,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitMergeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_merge(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_merge(self.git_ctx(), a, None).await;
         to_call_result("git.merge", out)
     }
 
@@ -2898,12 +2779,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_merge_abort(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_merge_abort(self.git_ctx(), a, None).await;
         to_call_result("git.merge_abort", out)
     }
 
@@ -2915,12 +2791,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitMergeResolveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_merge_resolve(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_merge_resolve(self.git_ctx(), a, None).await;
         to_call_result("git.merge_resolve", out)
     }
 
@@ -2932,11 +2803,12 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitCherryPickArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_cherry_pick(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
+        let out = async {
+            let mainline_val = serde_json::to_value(a.mainline).expect("serialize");
+            let mainline =
+                crate::tools::git::parse_mainline("git.cherry_pick", Some(&mainline_val))?;
+            crate::tools::git::tool_cherry_pick(self.git_ctx(), a, mainline, None).await
+        }
         .await;
         to_call_result("git.cherry_pick", out)
     }
@@ -2949,12 +2821,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_cherry_pick_abort(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_cherry_pick_abort(self.git_ctx(), a, None).await;
         to_call_result("git.cherry_pick_abort", out)
     }
 
@@ -2966,12 +2833,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitResolutionsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_cherry_pick_continue(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_cherry_pick_continue(self.git_ctx(), a, None).await;
         to_call_result("git.cherry_pick_continue", out)
     }
 
@@ -2983,11 +2845,11 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRevertArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_revert(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
+        let out = async {
+            let mainline_val = serde_json::to_value(a.mainline).expect("serialize");
+            let mainline = crate::tools::git::parse_mainline("git.revert", Some(&mainline_val))?;
+            crate::tools::git::tool_revert(self.git_ctx(), a, mainline, None).await
+        }
         .await;
         to_call_result("git.revert", out)
     }
@@ -3000,12 +2862,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_revert_abort(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_revert_abort(self.git_ctx(), a, None).await;
         to_call_result("git.revert_abort", out)
     }
 
@@ -3017,12 +2874,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitResolutionsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_revert_continue(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_revert_continue(self.git_ctx(), a, None).await;
         to_call_result("git.revert_continue", out)
     }
 
@@ -3034,12 +2886,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitRebaseArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_rebase(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_rebase(self.git_ctx(), a, None).await;
         to_call_result("git.rebase", out)
     }
 
@@ -3051,12 +2898,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_rebase_abort(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_rebase_abort(self.git_ctx(), a, None).await;
         to_call_result("git.rebase_abort", out)
     }
 
@@ -3068,12 +2910,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitResolutionsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_rebase_continue(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_rebase_continue(self.git_ctx(), a, None).await;
         to_call_result("git.rebase_continue", out)
     }
 
@@ -3085,12 +2922,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitStashSaveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_stash_save(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_stash_save(self.git_ctx(), a, None).await;
         to_call_result("git.stash_save", out)
     }
 
@@ -3102,12 +2934,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_stash_list(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_stash_list(self.git_ctx(), a, None).await;
         to_call_result("git.stash_list", out)
     }
 
@@ -3121,7 +2948,7 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let out = crate::tools::git::tool_stash_apply_or_pop(
             self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
+            a,
             None,
             "git.stash_apply",
             false,
@@ -3140,7 +2967,7 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let out = crate::tools::git::tool_stash_apply_or_pop(
             self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
+            a,
             None,
             "git.stash_pop",
             true,
@@ -3157,12 +2984,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitStashIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git::tool_stash_drop(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git::tool_stash_drop(self.git_ctx(), a, None).await;
         to_call_result("git.stash_drop", out)
     }
 
@@ -3176,13 +2998,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitAuthArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_auth::tool_auth(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_auth::tool_auth(self.git_ctx(), a, None, None).await;
         to_call_result("git.auth", out)
     }
 
@@ -3191,12 +3007,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitAuthRevokeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_auth::tool_auth_revoke(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git_auth::tool_auth_revoke(self.git_ctx(), a, None).await;
         to_call_result("git.auth_revoke", out)
     }
 
@@ -3208,12 +3019,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitAuthStatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_auth::tool_auth_status(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git_auth::tool_auth_status(self.git_ctx(), a, None).await;
         to_call_result("git.auth_status", out)
     }
 
@@ -3225,12 +3031,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitTokenSetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_auth::tool_token_set(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-        )
-        .await;
+        let out = crate::tools::git_auth::tool_token_set(self.git_ctx(), a, None).await;
         to_call_result("git.token_set", out)
     }
 
@@ -3244,14 +3045,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitPrCreateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_pr::tool_pr_create(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_pr::tool_pr_create(self.git_ctx(), a, None, None, None).await;
         to_call_result("git.pr_create", out)
     }
 
@@ -3263,14 +3057,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitPrDiffArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_pr::tool_pr_diff(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_pr::tool_pr_diff(self.git_ctx(), a, None, None, None).await;
         to_call_result("git.pr_diff", out)
     }
 
@@ -3282,14 +3069,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitPrGetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_pr::tool_pr_get(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_pr::tool_pr_get(self.git_ctx(), a, None, None, None).await;
         to_call_result("git.pr_get", out)
     }
 
@@ -3301,14 +3081,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitPrListArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_pr::tool_pr_list(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_pr::tool_pr_list(self.git_ctx(), a, None, None, None).await;
         to_call_result("git.pr_list", out)
     }
 
@@ -3320,14 +3093,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitPrMergeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_pr::tool_pr_merge(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_pr::tool_pr_merge(self.git_ctx(), a, None, None, None).await;
         to_call_result("git.pr_merge", out)
     }
 
@@ -3339,14 +3105,7 @@ impl McpServer {
         &self,
         Parameters(a): Parameters<GitPrReviewArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = crate::tools::git_pr::tool_pr_review(
-            self.git_ctx(),
-            crate::tools::registry_support::Args::new(serde_json::to_value(&a).expect("serialize")),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let out = crate::tools::git_pr::tool_pr_review(self.git_ctx(), a, None, None, None).await;
         to_call_result("git.pr_review", out)
     }
 }

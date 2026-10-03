@@ -85,7 +85,11 @@ pub(crate) fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            tool_pr_create(ctx, a, g, t, c)
+            async move {
+                let a: crate::mcp::server::GitPrCreateArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+                tool_pr_create(ctx, a, g, t, c).await
+            }
         }),
     );
 
@@ -112,7 +116,11 @@ pub(crate) fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            tool_pr_list(ctx, a, g, t, c)
+            async move {
+                let a: crate::mcp::server::GitPrListArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+                tool_pr_list(ctx, a, g, t, c).await
+            }
         }),
     );
 
@@ -136,7 +144,11 @@ pub(crate) fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            tool_pr_get(ctx, a, g, t, c)
+            async move {
+                let a: crate::mcp::server::GitPrGetArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+                tool_pr_get(ctx, a, g, t, c).await
+            }
         }),
     );
 
@@ -160,7 +172,11 @@ pub(crate) fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            tool_pr_diff(ctx, a, g, t, c)
+            async move {
+                let a: crate::mcp::server::GitPrDiffArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+                tool_pr_diff(ctx, a, g, t, c).await
+            }
         }),
     );
 
@@ -197,7 +213,11 @@ pub(crate) fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            tool_pr_merge(ctx, a, g, t, c)
+            async move {
+                let a: crate::mcp::server::GitPrMergeArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+                tool_pr_merge(ctx, a, g, t, c).await
+            }
         }),
     );
 
@@ -235,26 +255,29 @@ pub(crate) fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            tool_pr_review(ctx, a, g, t, c)
+            async move {
+                let a: crate::mcp::server::GitPrReviewArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+                tool_pr_review(ctx, a, g, t, c).await
+            }
         }),
     );
 }
 
 pub(crate) async fn tool_pr_create(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitPrCreateArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let base = a.str("base")?;
-    let head = a.str("head")?;
-    let title = a.str("title")?;
-    let body = a.opt_str("body").unwrap_or_default();
-    let draft = a.bool_or("draft", false);
-    let remote =
-        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let mount_id = a.mount_id.clone();
+    let base = a.base.clone();
+    let head = a.head.clone();
+    let title = a.title.clone();
+    let body = a.body.clone().unwrap_or_default();
+    let draft = a.draft;
+    let remote = if a.remote.is_empty() { "origin".to_string() } else { a.remote.clone() };
     // Both refusals are pure argument checks, so they run before
     // anything is resolved and cost no call at all.
     if title.trim().is_empty() {
@@ -272,17 +295,16 @@ pub(crate) async fn tool_pr_create(
 
 pub(crate) async fn tool_pr_list(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitPrListArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let remote =
-        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let mount_id = a.mount_id.clone();
+    let remote = if a.remote.is_empty() { "origin".to_string() } else { a.remote.clone() };
     // A pure argument check, so an unsupported state costs no
     // lookup and no call at all (FR-NEW-306).
-    let state = PrState::parse(a.opt_str("state").as_deref().unwrap_or("open"))?;
+    let state = PrState::parse(&a.state)?;
     let call =
         PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_list", g, t, c).await?;
     call.list(state).await
@@ -290,15 +312,14 @@ pub(crate) async fn tool_pr_list(
 
 pub(crate) async fn tool_pr_get(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitPrGetArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let number = pr_number(&a)?;
-    let remote =
-        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let mount_id = a.mount_id.clone();
+    let number = pr_number(a.pr_number)?;
+    let remote = if a.remote.is_empty() { "origin".to_string() } else { a.remote.clone() };
     let call =
         PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_get", g, t, c).await?;
     call.get(number).await
@@ -306,15 +327,14 @@ pub(crate) async fn tool_pr_get(
 
 pub(crate) async fn tool_pr_diff(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitPrDiffArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let number = pr_number(&a)?;
-    let remote =
-        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let mount_id = a.mount_id.clone();
+    let number = pr_number(a.pr_number)?;
+    let remote = if a.remote.is_empty() { "origin".to_string() } else { a.remote.clone() };
     // Read before the gate order runs, so the cap is the deployment's
     // and never a caller supplied one.
     let cap = ctx.state.config.git.max_pr_diff_mb;
@@ -325,21 +345,20 @@ pub(crate) async fn tool_pr_diff(
 
 pub(crate) async fn tool_pr_merge(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitPrMergeArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let number = pr_number(&a)?;
+    let mount_id = a.mount_id.clone();
+    let number = pr_number(a.pr_number)?;
     // A pure argument check, exactly like the `state` filter of
     // git.pr_list: an unsupported strategy costs no lookup and no
     // call at all (FR-NEW-310).
-    let strategy = MergeStrategy::parse(&a.str("strategy")?)?;
-    let title = a.opt_str("commit_title").filter(|s| !s.is_empty());
-    let message = a.opt_str("commit_message").filter(|s| !s.is_empty());
-    let remote =
-        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let strategy = MergeStrategy::parse(&a.strategy)?;
+    let title = a.commit_title.clone().filter(|s| !s.is_empty());
+    let message = a.commit_message.clone().filter(|s| !s.is_empty());
+    let remote = if a.remote.is_empty() { "origin".to_string() } else { a.remote.clone() };
     let call =
         PrCall::open(&ctx, &mount_id, &remote, PrAccess::Write, "git.pr_merge", g, t, c).await?;
     call.merge(number, strategy, title.as_deref(), message.as_deref()).await
@@ -347,26 +366,25 @@ pub(crate) async fn tool_pr_merge(
 
 pub(crate) async fn tool_pr_review(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitPrReviewArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let number = pr_number(&a)?;
+    let mount_id = a.mount_id.clone();
+    let number = pr_number(a.pr_number)?;
     // Both checks are pure argument checks, exactly like the
     // `strategy` of git.pr_merge: an unsupported verdict and a
     // verdict with no reasoning cost no lookup and no call at all.
-    let verdict = Verdict::parse(&a.str("verdict")?)?;
-    let body = a.opt_str("body").unwrap_or_default();
+    let verdict = Verdict::parse(&a.verdict)?;
+    let body = a.body.clone().unwrap_or_default();
     if verdict.requires_body() && body.trim().is_empty() {
         return Err(ToolError::invalid_argument(format!(
             "verdict '{}' requires a non-empty body",
             verdict.label()
         )));
     }
-    let remote =
-        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let remote = if a.remote.is_empty() { "origin".to_string() } else { a.remote.clone() };
     let call =
         PrCall::open(&ctx, &mount_id, &remote, PrAccess::Write, "git.pr_review", g, t, c).await?;
     call.review(number, verdict, &body).await
@@ -374,8 +392,7 @@ pub(crate) async fn tool_pr_review(
 
 /// A pull request number is a positive integer: a zero or negative one names no
 /// pull request on either provider, so it is refused before any lookup.
-fn pr_number(a: &crate::tools::registry_support::Args) -> Result<u64> {
-    let raw = a.int("pr_number")?;
+fn pr_number(raw: i64) -> Result<u64> {
     u64::try_from(raw).ok().filter(|n| *n > 0).ok_or_else(|| {
         ToolError::invalid_argument(format!("pr_number must be a positive integer, got {raw}"))
     })

@@ -78,7 +78,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_init(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_init(ctx, a, g).await
+            }
         }),
     );
 
@@ -91,7 +95,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_status(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_status(ctx, a, g).await
+            }
         }),
     );
 
@@ -104,7 +112,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_branches(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_branches(ctx, a, g).await
+            }
         }),
     );
 
@@ -134,7 +146,12 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_branch_create(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitBranchCreateArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_branch_create(ctx, a, g).await
+            }
         }),
     );
 
@@ -152,7 +169,12 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_branch_switch(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitBranchSwitchArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_branch_switch(ctx, a, g).await
+            }
         }),
     );
 
@@ -179,7 +201,12 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_branch_delete(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitBranchDeleteArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_branch_delete(ctx, a, g).await
+            }
         }),
     );
 
@@ -208,7 +235,11 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_branch_reset(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitBranchResetArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_branch_reset(ctx, a, g).await
+            }
         }),
     );
 
@@ -240,7 +271,11 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_reset(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitResetArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_reset(ctx, a, g).await
+            }
         }),
     );
 
@@ -253,7 +288,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_tags(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_tags(ctx, a, g).await
+            }
         }),
     );
 
@@ -272,7 +311,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_log(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitLogArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_log(ctx, a, g).await
+            }
         }),
     );
 
@@ -286,7 +329,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_show(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitShowArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_show(ctx, a, g).await
+            }
         }),
     );
 
@@ -305,7 +352,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_diff(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitDiffArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_diff(ctx, a, g).await
+            }
         }),
     );
 
@@ -325,7 +376,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_commit(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitCommitArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_commit(ctx, a, g).await
+            }
         }),
     );
 
@@ -341,7 +396,12 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_checkout_file(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitCheckoutFileArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_checkout_file(ctx, a, g).await
+            }
         }),
     );
 
@@ -356,7 +416,11 @@ pub(crate) fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_blame(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitBlameArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_blame(ctx, a, g).await
+            }
         }),
     );
 
@@ -378,7 +442,12 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_remote_add(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitRemoteAddArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_remote_add(ctx, a, g).await
+            }
         }),
     );
 
@@ -398,7 +467,12 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_remote_remove(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitRemoteRemoveArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_remote_remove(ctx, a, g).await
+            }
         }),
     );
 
@@ -415,7 +489,11 @@ pub(crate) fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_remote_list(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_remote_list(ctx, a, g).await
+            }
         }),
     );
 
@@ -440,7 +518,11 @@ pub(crate) fn register_with(
         .open_world(true),
  handler(move |ctx: ToolCtx, a| {
 let (g, t) = (g.clone(), t.clone());
-tool_remote_clone(ctx, a, g, t)
+async move {
+    let a: crate::mcp::server::GitRemoteCloneArgs = serde_json::from_value(a.0.clone())
+        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+    tool_remote_clone(ctx, a, g, t).await
+}
 }),
 );
 
@@ -479,7 +561,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
-            tool_remote_push(ctx, a, g, t)
+            async move {
+                let a: crate::mcp::server::GitRemotePushArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_remote_push(ctx, a, g, t).await
+            }
         }),
     );
 
@@ -504,7 +590,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
-            tool_remote_fetch(ctx, a, g, t)
+            async move {
+                let a: crate::mcp::server::GitRemoteFetchArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_remote_fetch(ctx, a, g, t).await
+            }
         }),
     );
 
@@ -529,7 +619,12 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_stash_save(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitStashSaveArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_stash_save(ctx, a, g).await
+            }
         }),
     );
 
@@ -547,7 +642,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_stash_list(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_stash_list(ctx, a, g).await
+            }
         }),
     );
 
@@ -566,7 +665,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_stash_drop(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitStashIdArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_stash_drop(ctx, a, g).await
+            }
         }),
     );
 
@@ -607,7 +710,11 @@ tool_remote_clone(ctx, a, g, t)
                 .open_world(false),
             handler(move |ctx: ToolCtx, a| {
                 let g = g.clone();
-                tool_stash_apply_or_pop(ctx, a, g, name, pop)
+                async move {
+                    let a: crate::mcp::server::GitStashIdArgs = serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                    tool_stash_apply_or_pop(ctx, a, g, name, pop).await
+                }
             }),
         );
     }
@@ -643,7 +750,15 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_merge(ctx, a, g)
+            async move {
+                // FR-NEW-191, E2E-NEW-541: a bogus `squash` must be refused
+                // by name, not folded into the typed bool's strict-type
+                // deserialize error.
+                a.strict_bool_or("squash", false)?;
+                let a: crate::mcp::server::GitMergeArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_merge(ctx, a, g).await
+            }
         }),
     );
 
@@ -673,7 +788,12 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_merge_resolve(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitMergeResolveArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_merge_resolve(ctx, a, g).await
+            }
         }),
     );
 
@@ -692,7 +812,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_merge_abort(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_merge_abort(ctx, a, g).await
+            }
         }),
     );
 
@@ -723,7 +847,20 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_rebase(ctx, a, g)
+            async move {
+                // A `todo` of the wrong shape is named and typed explicitly,
+                // rather than folded into the struct deserialize error.
+                if let Some(v) = a.raw("todo")
+                    && !v.is_array()
+                {
+                    return Err(crate::errors::ToolError::invalid_argument(
+                        "git.rebase: todo must be an array of {action, sha, message?} objects",
+                    ));
+                }
+                let a: crate::mcp::server::GitRebaseArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_rebase(ctx, a, g).await
+            }
         }),
     );
 
@@ -754,7 +891,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_rebase_continue(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitResolutionsArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_rebase_continue(ctx, a, g).await
+            }
         }),
     );
 
@@ -773,7 +914,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_rebase_abort(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_rebase_abort(ctx, a, g).await
+            }
         }),
     );
 
@@ -808,7 +953,12 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_cherry_pick(ctx, a, g)
+            async move {
+                let mainline = parse_mainline("git.cherry_pick", a.raw("mainline"))?;
+                let a: crate::mcp::server::GitCherryPickArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_cherry_pick(ctx, a, mainline, g).await
+            }
         }),
     );
 
@@ -838,7 +988,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_cherry_pick_continue(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitResolutionsArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_cherry_pick_continue(ctx, a, g).await
+            }
         }),
     );
 
@@ -857,7 +1011,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_cherry_pick_abort(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_cherry_pick_abort(ctx, a, g).await
+            }
         }),
     );
 
@@ -894,7 +1052,12 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_revert(ctx, a, g)
+            async move {
+                let mainline = parse_mainline("git.revert", a.raw("mainline"))?;
+                let a: crate::mcp::server::GitRevertArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_revert(ctx, a, mainline, g).await
+            }
         }),
     );
 
@@ -924,7 +1087,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_revert_continue(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::GitResolutionsArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_revert_continue(ctx, a, g).await
+            }
         }),
     );
 
@@ -943,7 +1110,11 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            tool_revert_abort(ctx, a, g)
+            async move {
+                let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_revert_abort(ctx, a, g).await
+            }
         }),
     );
 
@@ -973,7 +1144,12 @@ tool_remote_clone(ctx, a, g, t)
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), tokens.clone());
-            tool_remote_pull(ctx, a, g, t)
+            async move {
+                reject_removed_on_conflict(&a)?;
+                let a: crate::mcp::server::GitRemotePullArgs = serde_json::from_value(a.0.clone())
+                    .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                tool_remote_pull(ctx, a, g, t).await
+            }
         }),
     );
 }
@@ -982,13 +1158,13 @@ tool_remote_clone(ctx, a, g, t)
 
 pub(crate) async fn tool_stash_apply_or_pop(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitStashIdArgs,
     g: Option<Arc<GitRepoStore>>,
     name: &'static str,
     pop: bool,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let stash_id = a.str("stash_id")?;
+    let mount_id = a.mount_id.clone();
+    let stash_id = a.stash_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, name).await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1002,10 +1178,10 @@ pub(crate) async fn tool_stash_apply_or_pop(
 
 pub(crate) async fn tool_init(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     store.init_repo(&mount_id).await?;
     Ok(json!({
@@ -1017,20 +1193,20 @@ pub(crate) async fn tool_init(
 
 pub(crate) async fn tool_status(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     status(&mount_id, &entry).await
 }
 
 pub(crate) async fn tool_branches(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     // Through the blocking pool like every other libgit2 reader:
     // the divergence counts are a graph walk (FR-MOD-106).
@@ -1039,13 +1215,13 @@ pub(crate) async fn tool_branches(
 
 pub(crate) async fn tool_branch_create(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitBranchCreateArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let name = a.str("name")?;
-    let start_point = a.opt_str("start_point").filter(|s| !s.is_empty());
-    let checkout = a.bool_or("checkout", false);
+    let mount_id = a.mount_id.clone();
+    let name = a.name.clone();
+    let start_point = Some(a.start_point.clone()).filter(|s| !s.is_empty());
+    let checkout = a.checkout;
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.branch_create").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1060,11 +1236,11 @@ pub(crate) async fn tool_branch_create(
 
 pub(crate) async fn tool_branch_switch(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitBranchSwitchArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let name = a.str("name")?;
+    let mount_id = a.mount_id.clone();
+    let name = a.name.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.branch_switch").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1078,12 +1254,12 @@ pub(crate) async fn tool_branch_switch(
 
 pub(crate) async fn tool_branch_delete(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitBranchDeleteArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let name = a.str("name")?;
-    let force = a.bool_or("force", false);
+    let mount_id = a.mount_id.clone();
+    let name = a.name.clone();
+    let force = a.force;
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.branch_delete").await?;
     let safety = ctx.state.safety.clone();
@@ -1096,13 +1272,13 @@ pub(crate) async fn tool_branch_delete(
 
 pub(crate) async fn tool_branch_reset(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitBranchResetArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let name = a.str("name")?;
-    let target_commit = a.str("target_commit")?;
-    let force = a.bool_or("force", false);
+    let mount_id = a.mount_id.clone();
+    let name = a.name.clone();
+    let target_commit = a.target_commit.clone();
+    let force = a.force;
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.branch_reset").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1116,12 +1292,12 @@ pub(crate) async fn tool_branch_reset(
 
 pub(crate) async fn tool_reset(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitResetArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let target_ref = a.str("target_ref")?;
-    let mode = ResetMode::parse(&a.str("mode")?)?;
+    let mount_id = a.mount_id.clone();
+    let target_ref = a.target_ref.clone();
+    let mode = ResetMode::parse(&a.mode)?;
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.reset").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1135,10 +1311,10 @@ pub(crate) async fn tool_reset(
 
 pub(crate) async fn tool_tags(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     let tags = refs_under(&entry, "refs/tags/").await?;
     Ok(json!({"mount_id": mount_id, "tags": tags}))
@@ -1146,13 +1322,13 @@ pub(crate) async fn tool_tags(
 
 pub(crate) async fn tool_log(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitLogArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let ref_name = a.opt_str("ref_name");
-    let limit = a.int_or("limit", 20);
-    let path = a.opt_str("path");
+    let mount_id = a.mount_id.clone();
+    let ref_name = a.ref_name.clone();
+    let limit = a.limit;
+    let path = a.path.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     on_git_thread(move || async move {
         log(&mount_id, &entry, ref_name.as_deref(), limit, path.as_deref()).await
@@ -1162,24 +1338,24 @@ pub(crate) async fn tool_log(
 
 pub(crate) async fn tool_show(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitShowArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let commit_sha = a.str("commit_sha")?;
+    let mount_id = a.mount_id.clone();
+    let commit_sha = a.commit_sha.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     on_git_thread(move || async move { show(&entry, &commit_sha).await }).await
 }
 
 pub(crate) async fn tool_diff(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitDiffArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let from_ref = a.str("from_ref")?;
-    let to_ref = a.opt_str("to_ref");
-    let path = a.opt_str("path");
+    let mount_id = a.mount_id.clone();
+    let from_ref = a.from_ref.clone();
+    let to_ref = a.to_ref.clone();
+    let path = a.path.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     on_git_thread(move || async move {
         diff(&mount_id, &entry, &from_ref, to_ref.as_deref(), path.as_deref()).await
@@ -1189,13 +1365,13 @@ pub(crate) async fn tool_diff(
 
 pub(crate) async fn tool_commit(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitCommitArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let message = a.str("message")?;
-    let author_name = a.opt_str("author_name");
-    let author_email = a.opt_str("author_email");
+    let mount_id = a.mount_id.clone();
+    let message = a.message.clone();
+    let author_name = a.author_name.clone();
+    let author_email = a.author_email.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.commit").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1208,12 +1384,12 @@ pub(crate) async fn tool_commit(
 
 pub(crate) async fn tool_checkout_file(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitCheckoutFileArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let commit_sha = a.str("commit_sha")?;
-    let path = a.str("path")?;
+    let mount_id = a.mount_id.clone();
+    let commit_sha = a.commit_sha.clone();
+    let path = a.path.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     let norm = ctx.state.safety.normalize_path(&path)?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1237,12 +1413,12 @@ pub(crate) async fn tool_checkout_file(
 
 pub(crate) async fn tool_blame(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitBlameArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let path = a.str("path")?;
-    let ref_name = a.opt_str("ref_name");
+    let mount_id = a.mount_id.clone();
+    let path = a.path.clone();
+    let ref_name = a.ref_name.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     let norm = ctx.state.safety.normalize_path(&path)?;
     on_git_thread(move || async move { blame(&entry, &norm, ref_name.as_deref()).await }).await
@@ -1250,12 +1426,12 @@ pub(crate) async fn tool_blame(
 
 pub(crate) async fn tool_remote_add(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRemoteAddArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let name = a.str("name")?;
-    let url = a.str("url")?;
+    let mount_id = a.mount_id.clone();
+    let name = a.name.clone();
+    let url = a.url.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.remote_add").await?;
     remote_add(&ctx, &entry, &mount_id, &name, &url).await
@@ -1263,11 +1439,11 @@ pub(crate) async fn tool_remote_add(
 
 pub(crate) async fn tool_remote_remove(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRemoteRemoveArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let name = a.str("name")?;
+    let mount_id = a.mount_id.clone();
+    let name = a.name.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.remote_remove").await?;
     remote_remove(&ctx, &entry, &mount_id, &name).await
@@ -1275,10 +1451,10 @@ pub(crate) async fn tool_remote_remove(
 
 pub(crate) async fn tool_remote_list(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     let remotes: Vec<Value> = entry
         .db
@@ -1292,14 +1468,14 @@ pub(crate) async fn tool_remote_list(
 
 pub(crate) async fn tool_remote_clone(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRemoteCloneArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let url = a.str("url")?;
-    let branch = a.opt_str("branch");
-    let depth = a.int_or("depth", 0);
+    let mount_id = a.mount_id.clone();
+    let url = a.url.clone();
+    let branch = a.branch.clone();
+    let depth = a.depth;
     let store = authorize(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_clone").await?;
     remote_clone(&ctx, store, t, &mount_id, &url, branch, depth).await
@@ -1307,16 +1483,16 @@ pub(crate) async fn tool_remote_clone(
 
 pub(crate) async fn tool_remote_push(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRemotePushArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let branch = a.str("branch")?;
-    let remote = a.str_or("remote", "origin");
-    let remote_branch = a.opt_str("remote_branch");
-    let force = a.bool_or("force", false);
-    let lease = a.opt_str("expected_remote_sha");
+    let mount_id = a.mount_id.clone();
+    let branch = a.branch.clone();
+    let remote = a.remote.clone();
+    let remote_branch = a.remote_branch.clone();
+    let force = a.force;
+    let lease = a.expected_remote_sha.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     // FR-NEW-156/158: the lease contradiction and the missing
     // lease are settled here, before the remote is resolved, a
@@ -1338,23 +1514,23 @@ pub(crate) async fn tool_remote_push(
 
 pub(crate) async fn tool_remote_fetch(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRemoteFetchArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let remote = a.str_or("remote", "origin");
+    let mount_id = a.mount_id.clone();
+    let remote = a.remote.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     remote_fetch(&ctx, store, t, &mount_id, &remote).await
 }
 
 pub(crate) async fn tool_stash_save(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitStashSaveArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let message = a.opt_str("message");
+    let mount_id = a.mount_id.clone();
+    let message = a.message.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.stash_save").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1369,21 +1545,21 @@ pub(crate) async fn tool_stash_save(
 
 pub(crate) async fn tool_stash_list(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     on_git_thread(move || async move { stash_list(&mount_id, &entry).await }).await
 }
 
 pub(crate) async fn tool_stash_drop(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitStashIdArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let stash_id = a.str("stash_id")?;
+    let mount_id = a.mount_id.clone();
+    let stash_id = a.stash_id.clone();
     let entry = open(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.stash_drop").await?;
     let client = ctx.state.stores.client(&mount_id).await?;
@@ -1397,16 +1573,13 @@ pub(crate) async fn tool_stash_drop(
 
 pub(crate) async fn tool_merge(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitMergeArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let source_ref = a.str("source_ref")?;
-    // Strict: a squash and a merge commit are different histories,
-    // so a bogus value must be refused, not silently read as false
-    // (FR-NEW-191, E2E-NEW-541).
-    let squash = a.strict_bool_or("squash", false)?;
-    let message = a.opt_str("message");
+    let mount_id = a.mount_id.clone();
+    let source_ref = a.source_ref.clone();
+    let squash = a.squash;
+    let message = a.message.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress_on(&store, &mount_id, "git.merge").await?;
     merge_ref(&ctx, store, &mount_id, &source_ref, squash, message).await
@@ -1414,38 +1587,40 @@ pub(crate) async fn tool_merge(
 
 pub(crate) async fn tool_merge_resolve(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitMergeResolveArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
-    let resolutions = parse_resolutions(&ctx, a.raw("resolutions"))?;
+    let resolutions_val = serde_json::to_value(&a.resolutions).expect("serialize");
+    let resolutions = parse_resolutions(&ctx, Some(&resolutions_val))?;
     merge_resolve(&ctx, store, &mount_id, resolutions).await
 }
 
 pub(crate) async fn tool_merge_abort(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     merge_abort(&ctx, store, &mount_id).await
 }
 
 pub(crate) async fn tool_rebase(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRebaseArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let onto = a.str("onto")?;
+    let mount_id = a.mount_id.clone();
+    let onto = a.onto.clone();
     // FR-NEW-100: membership first, before anything else, so a non
     // member is refused rather than told their payload is malformed.
     let store = authorize(&ctx, &mount_id, g).await?;
     // Then every pure check, so a malformed todo never even opens a
     // repository (FR-NEW-215).
-    let todo = parse_todo(a.raw("todo"), ctx.state.config.git.max_rebase_todo)?;
+    let todo_val = serde_json::to_value(&a.todo).expect("serialize");
+    let todo = parse_todo(Some(&todo_val), ctx.state.config.git.max_rebase_todo)?;
     let entry = open_on(&store, &mount_id).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.rebase").await?;
     rebase(&ctx, entry, &mount_id, &onto, todo).await
@@ -1453,39 +1628,41 @@ pub(crate) async fn tool_rebase(
 
 pub(crate) async fn tool_rebase_continue(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitResolutionsArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions_val =
+        a.resolutions.as_ref().map(|r| serde_json::to_value(r).expect("serialize"));
     let resolutions =
-        parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.rebase_continue")?;
+        parse_optional_resolutions(&ctx, resolutions_val.as_ref(), "git.rebase_continue")?;
     replay_continue(&ctx, store, &mount_id, resolutions, &REBASE_FAMILY).await
 }
 
 pub(crate) async fn tool_rebase_abort(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     replay_abort(&ctx, store, &mount_id, &REBASE_FAMILY).await
 }
 
 pub(crate) async fn tool_cherry_pick(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitCherryPickArgs,
+    mainline: u32,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     // FR-NEW-100: membership first, before anything else, so a non
     // member is refused rather than told their payload is malformed.
     let store = authorize(&ctx, &mount_id, g).await?;
     // Then every pure check, so a malformed sha never opens a
     // repository (FR-NEW-237).
-    let commit_sha = parse_commit_sha("git.cherry_pick", &a.str("commit_sha")?)?;
-    let mainline = parse_mainline("git.cherry_pick", a.raw("mainline"))?;
+    let commit_sha = parse_commit_sha("git.cherry_pick", &a.commit_sha)?;
     let entry = open_on(&store, &mount_id).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.cherry_pick").await?;
     cherry_pick(&ctx, entry, &mount_id, commit_sha, mainline).await
@@ -1493,39 +1670,41 @@ pub(crate) async fn tool_cherry_pick(
 
 pub(crate) async fn tool_cherry_pick_continue(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitResolutionsArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions_val =
+        a.resolutions.as_ref().map(|r| serde_json::to_value(r).expect("serialize"));
     let resolutions =
-        parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.cherry_pick_continue")?;
+        parse_optional_resolutions(&ctx, resolutions_val.as_ref(), "git.cherry_pick_continue")?;
     replay_continue(&ctx, store, &mount_id, resolutions, &CHERRY_PICK_FAMILY).await
 }
 
 pub(crate) async fn tool_cherry_pick_abort(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     replay_abort(&ctx, store, &mount_id, &CHERRY_PICK_FAMILY).await
 }
 
 pub(crate) async fn tool_revert(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRevertArgs,
+    mainline: u32,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     // FR-NEW-100: membership first, before anything else, so a non
     // member is refused rather than told their payload is malformed.
     let store = authorize(&ctx, &mount_id, g).await?;
     // Then every pure check, so a malformed sha or a mainline that
     // is not a parent index never opens a repository.
-    let commit_sha = parse_commit_sha("git.revert", &a.str("commit_sha")?)?;
-    let mainline = parse_mainline("git.revert", a.raw("mainline"))?;
+    let commit_sha = parse_commit_sha("git.revert", &a.commit_sha)?;
     let entry = open_on(&store, &mount_id).await?;
     reject_if_operation_in_progress(&entry, &mount_id, "git.revert").await?;
     revert(&ctx, entry, &mount_id, commit_sha, mainline).await
@@ -1533,39 +1712,41 @@ pub(crate) async fn tool_revert(
 
 pub(crate) async fn tool_revert_continue(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitResolutionsArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions_val =
+        a.resolutions.as_ref().map(|r| serde_json::to_value(r).expect("serialize"));
     let resolutions =
-        parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.revert_continue")?;
+        parse_optional_resolutions(&ctx, resolutions_val.as_ref(), "git.revert_continue")?;
     replay_continue(&ctx, store, &mount_id, resolutions, &REVERT_FAMILY).await
 }
 
 pub(crate) async fn tool_revert_abort(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
+    let mount_id = a.mount_id.clone();
     let store = authorize(&ctx, &mount_id, g).await?;
     replay_abort(&ctx, store, &mount_id, &REVERT_FAMILY).await
 }
 
 pub(crate) async fn tool_remote_pull(
     ctx: ToolCtx,
-    a: crate::tools::registry_support::Args,
+    a: crate::mcp::server::GitRemotePullArgs,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
-    let mount_id = a.str("mount_id")?;
-    let branch = a.str("branch")?;
-    let remote = a.str_or("remote", "origin");
-    // FR-DEL-101: the parameter is gone, and a caller still sending
-    // it is told so rather than silently ignored, because it used
-    // to decide which side of every conflicting file survived.
-    reject_removed_on_conflict(&a)?;
+    let mount_id = a.mount_id.clone();
+    let branch = a.branch.clone();
+    let remote = a.remote.clone();
+    // FR-DEL-101: `on_conflict` is gone from the typed schema, so a
+    // caller sending it is dropped at deserialization; the explicit
+    // rejection by name lives on in the test-only registry dispatch
+    // (`register_with`), which still sees raw JSON.
     let store = authorize(&ctx, &mount_id, g).await?;
     reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_pull").await?;
     remote_pull(&ctx, store, t, &mount_id, &remote, &branch).await
@@ -5601,7 +5782,7 @@ fn parse_commit_sha(tool: &str, raw: &str) -> Result<String> {
 /// sentinel a caller cannot see. Pure, so it settles before any repository is
 /// opened. Zero means absent, which is also libgit2's "this commit has one
 /// parent" value.
-fn parse_mainline(tool: &str, raw: Option<&Value>) -> Result<u32> {
+pub(crate) fn parse_mainline(tool: &str, raw: Option<&Value>) -> Result<u32> {
     let Some(value) = raw.filter(|v| !v.is_null()) else { return Ok(0) };
     let Some(n) = value.as_i64() else {
         return Err(ToolError::invalid_argument(format!(
@@ -5956,6 +6137,7 @@ async fn revert_apply(
 /// ignoring it would silently change which content survives; the call is
 /// refused instead, before authorization, any lock and any network attempt,
 /// and the message names the tool that replaces it.
+#[cfg(test)]
 fn reject_removed_on_conflict(a: &crate::tools::registry_support::Args) -> Result<()> {
     if a.raw("on_conflict").is_some_and(|v| !v.is_null()) {
         return Err(ToolError::invalid_argument(

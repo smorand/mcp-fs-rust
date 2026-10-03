@@ -17,18 +17,28 @@
 //! automatically after the server is ready, except during tests.
 
 use crate::errors::{Result, ToolError};
+#[cfg(test)]
 use crate::storage::VolumeClient;
+#[cfg(test)]
 use crate::tools::registry_support::ToolSchema;
+#[cfg(test)]
 use crate::tools::registry_support::{ToolRegistry, handler};
+#[cfg(test)]
 use axum::Router;
+#[cfg(test)]
 use axum::extract::State as AxumState;
+#[cfg(test)]
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+#[cfg(test)]
 use axum::response::IntoResponse;
+#[cfg(test)]
 use axum::routing::get;
+#[cfg(test)]
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast};
 
@@ -39,6 +49,11 @@ pub struct EditorRegistry {
 }
 
 /// What we keep per open editor.
+///
+/// Only ever constructed by [`open_editor`], which is test-only (the live MCP
+/// surface never routed `doc.open_editor`); kept compiled unconditionally so
+/// `EditorRegistry`'s field type is stable, hence the blanket allow.
+#[allow(dead_code)]
 struct EditorSlot {
     editor_id: String,
     mount: String,
@@ -59,6 +74,7 @@ pub enum EditorMode {
     Slides,
 }
 
+#[allow(dead_code)]
 impl EditorMode {
     fn as_str(&self) -> &'static str {
         match self {
@@ -100,6 +116,7 @@ impl EditorRegistry {
 
 // ── tool registration ─────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new(
@@ -182,6 +199,7 @@ pub fn register(reg: &mut ToolRegistry) {
 
 // ── open_editor core ──────────────────────────────────────────────────────────
 
+#[cfg(test)]
 async fn open_editor(
     registry: &Arc<EditorRegistry>,
     client: &Arc<VolumeClient>,
@@ -318,6 +336,7 @@ async fn open_editor(
 // ── mini-server state & handlers ─────────────────────────────────────────────
 
 #[derive(Clone)]
+#[cfg(test)]
 struct MiniServerState {
     client: Arc<VolumeClient>,
     path: String,
@@ -325,6 +344,7 @@ struct MiniServerState {
     reload_tx: broadcast::Sender<String>,
 }
 
+#[cfg(test)]
 async fn serve_editor_page(AxumState(s): AxumState<Arc<MiniServerState>>) -> impl IntoResponse {
     let content = match s.client.read_text(&s.path).await {
         Ok(html) => extract_content(&html).unwrap_or_else(|| "<p></p>".to_string()),
@@ -334,6 +354,7 @@ async fn serve_editor_page(AxumState(s): AxumState<Arc<MiniServerState>>) -> imp
     axum::response::Html(html)
 }
 
+#[cfg(test)]
 async fn ws_handler(
     ws: WebSocketUpgrade,
     AxumState(s): AxumState<Arc<MiniServerState>>,
@@ -341,6 +362,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, s))
 }
 
+#[cfg(test)]
 async fn handle_ws(mut socket: WebSocket, s: Arc<MiniServerState>) {
     let mut reload_rx = s.reload_tx.subscribe();
     loop {
@@ -371,6 +393,7 @@ async fn handle_ws(mut socket: WebSocket, s: Arc<MiniServerState>) {
     }
 }
 
+#[cfg(test)]
 async fn handle_ws_message(s: &MiniServerState, text: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
@@ -435,6 +458,7 @@ pub fn inject_content(html: &str, new_content: &str) -> String {
     format!("{before}{new_content}{after}")
 }
 
+#[cfg(test)]
 fn starter_html(mode: EditorMode, _path: &str) -> String {
     let content = match mode {
         EditorMode::Doc => "    <h1>Title</h1>\n    <p>Start writing here.</p>",
@@ -447,6 +471,7 @@ fn starter_html(mode: EditorMode, _path: &str) -> String {
 }
 
 /// Build the full editor shell page. All CSS and JS are inline.
+#[cfg(test)]
 fn build_editor_shell(content: &str, mode: EditorMode) -> String {
     let slide_nav = if mode == EditorMode::Slides {
         r#"<nav id="slide-nav" style="position:fixed;top:0;left:0;right:0;background:#222;color:#fff;padding:6px 12px;display:flex;align-items:center;gap:12px;z-index:100;font-family:sans-serif;font-size:14px">
@@ -562,6 +587,7 @@ body {{ {body_style} }}
 
 // ── browser opener ────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn open_browser(url: &str) {
     #[cfg(not(test))]
     {
