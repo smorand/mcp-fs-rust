@@ -25,12 +25,12 @@
 | 6 | US-0006 | n/a | Migrate git.auth* (4) + git.pr_* (6) tools | DR-002 | n/a | E2E-GITAUTH-001..003 | 1 | US-0002 | 2 | done |
 | 7 | US-0007 | n/a | Finalize tool surface: golden contract green, 94-tool list | DR-005 | n/a | DT-005, DT-007 | 2-3 | US-0003,US-0004,US-0005,US-0006 | 2 | done |
 | 8 | US-0008 | n/a | Transport swap: rmcp StreamableHttpService + agent client + break tests | DR-008,DR-009,DR-010 | n/a | DT-001..004 + 18 existing-test verdicts | 4 | US-0007 | 2 | done |
-| 9 | US-0009 | n/a | Delete old mcp layer + final suite/clippy/fmt gate | DR-003 | n/a | DT-006, DT-FINAL-001, DT-008 (ack) | 4 | US-0010,US-0011,US-0012,US-0013 | 2 | todo |
+| 9 | US-0009 | n/a | Delete old mcp layer + final suite/clippy/fmt gate | DR-003 | n/a | DT-006, DT-FINAL-001, DT-008 (ack) | 4 | US-0010,US-0011,US-0012,US-0013,US-0014 | 2 | done |
 | 10 | US-0010 | n/a | Wean fs.*/admin.*/search.* tool families off ToolRegistry (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | ~10 | US-0009-orig-attempt | 2 | done (partial, see report) |
 | 11 | US-0011 | n/a | Wean git.*/git_auth.*/git_pr.* tool families off ToolRegistry (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | 4 | US-0009-orig-attempt | 2 | done |
 | 12 | US-0012 | n/a | Replace web.*/context7.*/sqlite.*/db.*/doc.* ToolRegistry registration with a lightweight catalog-only structure (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | ~5 | US-0009-orig-attempt | 2 | done |
 | 13 | US-0013 | n/a | Rewire api/openapi.rs catalog onto McpServer's rmcp router + the new lightweight catalogs; remove AppState.registry/register_all/EnabledFeatures (discovered drift) | DR-003 (surplus) | n/a | none new, preserve openapi.rs output shape | 2 | US-0010,US-0011,US-0012 | 2 | done |
-| 14 | US-0014 | n/a | Fully decouple every tool family + testkit from ToolRegistry/ToolSchema/Args (literal DR-003 compliance) | DR-003 (surplus) | n/a | none new, preserve ~700 existing tests | 16 | US-0010,US-0011,US-0012 | 2 | todo |
+| 14 | US-0014 | n/a | Fully decouple every tool family + testkit from ToolRegistry/ToolSchema/Args (literal DR-003 compliance) | DR-003 (surplus) | n/a | none new, preserve ~700 existing tests | 16 | US-0010,US-0011,US-0012 | 2 | done |
 
 ## Dependency Graph
 ```
