@@ -309,6 +309,7 @@ pub struct MultiEditArgs {
     /// Absolute POSIX path within the volume.
     pub path: String,
     /// Ordered edits (old_string, new_string, replace_all) applied atomically.
+    #[schemars(schema_with = "multi_edit_edits_schema")]
     pub edits: Value,
     /// Return the diff without writing changes.
     #[serde(default)]
@@ -361,10 +362,64 @@ pub struct GlobArgs {
     pub root: String,
     /// Glob patterns whose matches are excluded from results.
     #[serde(default)]
-    pub exclude_patterns: Vec<String>,
+    pub exclude_patterns: ExcludePatterns,
 }
 fn def_root() -> String {
     "/".to_string()
+}
+
+/// Hand-written to match the frozen contract exactly: an array of edit specs,
+/// each with no `required` list, matching `inputSchema` round-tripped from a
+/// JSON-typed `edits` field rather than a strongly-typed one.
+/// A glob exclusion list whose frozen contract schema carries no `type` or
+/// `items`, only `default: null`: the old hand-written contract never
+/// constrained this field's shape, and the real default (empty, not null) is
+/// deliberately NOT what the schema advertises. A custom `Serialize` that
+/// always writes `null` is how `schemars`' struct-level default insertion is
+/// made to reproduce exactly that, while `Deserialize` still defaults a
+/// missing or null field to an empty list for real use.
+#[derive(Debug, Default, Deserialize)]
+pub struct ExcludePatterns(#[serde(deserialize_with = "deserialize_opt_vec")] pub Vec<String>);
+
+fn deserialize_opt_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+impl Serialize for ExcludePatterns {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_none()
+    }
+}
+
+impl JsonSchema for ExcludePatterns {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ExcludePatterns".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::Schema::from(serde_json::Map::new())
+    }
+}
+
+fn multi_edit_edits_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::Schema::try_from(serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"}
+            }
+        }
+    }))
+    .expect("valid literal schema")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -377,8 +432,10 @@ pub struct GrepArgs {
     #[serde(default = "def_root")]
     pub root: String,
     /// Glob limiting which files are searched.
+    #[serde(default)]
     pub include_glob: Option<String>,
     /// Glob excluding files from the search.
+    #[serde(default)]
     pub exclude_glob: Option<String>,
     /// Treat pattern as a regex when true, else a literal string.
     #[serde(default = "def_true")]
@@ -413,6 +470,7 @@ pub struct FindDefinitionArgs {
     #[serde(default = "def_root")]
     pub root: String,
     /// Optional symbol kind filter, e.g. function, class, method.
+    #[serde(default)]
     pub kind: Option<String>,
 }
 
@@ -460,7 +518,7 @@ pub struct TreeArgs {
     pub max_depth: i64,
     /// Glob patterns whose matches are pruned from the tree.
     #[serde(default)]
-    pub exclude_patterns: Vec<String>,
+    pub exclude_patterns: ExcludePatterns,
     /// Include size for each file node.
     #[serde(default)]
     pub with_sizes: bool,
@@ -705,9 +763,7 @@ fn def_depth0() -> i64 {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ResolutionArg {
     pub path: String,
-    #[serde(default)]
     pub strategy: Option<String>,
-    #[serde(default)]
     pub content: Option<String>,
 }
 
@@ -715,7 +771,6 @@ pub struct ResolutionArg {
 pub struct RebaseTodoItem {
     pub action: String,
     pub sha: String,
-    #[serde(default)]
     pub message: Option<String>,
 }
 
@@ -1000,6 +1055,7 @@ pub struct AuditLogArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
     /// Only return entries at or after this Unix timestamp (seconds).
+    #[serde(default)]
     pub since: Option<f64>,
     /// Maximum number of recent entries to return.
     #[serde(default = "def_lines_20")]
@@ -1041,6 +1097,7 @@ pub struct WriteDocxArgs {
     /// Markdown source rendered into the Word document.
     pub markdown: String,
     /// Optional document title.
+    #[serde(default)]
     pub title: Option<String>,
     /// Allow overwriting an existing file (default no-clobber).
     #[serde(default)]
@@ -1598,7 +1655,7 @@ impl McpServer {
         let out = async {
             let client = self.volume(&a.mount_id).await?;
             let root = self.norm(&a.root)?;
-            fs_ops::glob_files(&client, &root, &a.pattern, &a.exclude_patterns).await
+            fs_ops::glob_files(&client, &root, &a.pattern, &a.exclude_patterns.0).await
         }
         .await;
         to_call_result("fs.glob", out)
@@ -1688,7 +1745,7 @@ impl McpServer {
         let out = async {
             let client = self.volume(&a.mount_id).await?;
             let path = self.norm(&a.path)?;
-            fs_ops::tree(&client, &path, a.max_depth, &a.exclude_patterns, a.with_sizes).await
+            fs_ops::tree(&client, &path, a.max_depth, &a.exclude_patterns.0, a.with_sizes).await
         }
         .await;
         to_call_result("fs.tree", out)
@@ -3408,6 +3465,134 @@ mod tests {
         drop(guard);
         let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
         assert!(!captured.contains(FAKE_TOKEN), "token leaked into logs: {captured}");
+    }
+
+    fn normalize_schema(v: &serde_json::Value, defs: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match v {
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                if let Some(Value::String(ref_path)) = map.get("$ref") {
+                    let key = ref_path.rsplit('/').next().unwrap_or(ref_path);
+                    if let Some(target) = defs.get(key)
+                        && let Value::Object(resolved) = normalize_schema(target, defs)
+                    {
+                        out = resolved;
+                    }
+                }
+                for (k, val) in map {
+                    if k == "description"
+                        || k == "$schema"
+                        || k == "$defs"
+                        || k == "format"
+                        || k == "$ref"
+                    {
+                        continue;
+                    }
+                    if k == "required"
+                        && let Some(arr) = val.as_array()
+                    {
+                        let mut sorted: Vec<String> = arr
+                            .iter()
+                            .map(|x| x.as_str().unwrap_or_default().to_string())
+                            .collect();
+                        sorted.sort();
+                        out.insert(
+                            k.clone(),
+                            Value::Array(sorted.into_iter().map(Value::String).collect()),
+                        );
+                        continue;
+                    }
+                    if k == "type" {
+                        // Collapse a nullable union (e.g. ["string","null"]) to the
+                        // single non-null type: golden models optionality via
+                        // `default: null` on a plain type, not a type union.
+                        if let Some(arr) = val.as_array() {
+                            let non_null: Vec<&Value> =
+                                arr.iter().filter(|t| t.as_str() != Some("null")).collect();
+                            if non_null.len() == 1 {
+                                out.insert(k.clone(), non_null[0].clone());
+                                continue;
+                            }
+                        }
+                    }
+                    out.insert(k.clone(), normalize_schema(val, defs));
+                }
+                Value::Object(out)
+            }
+            Value::Array(arr) => {
+                Value::Array(arr.iter().map(|x| normalize_schema(x, defs)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// US-0007/DT-005: every one of the 94 frozen `#[tool]` schemas structurally
+    /// matches `tool-contract-golden.json`, modulo representational choices that
+    /// carry no client-observable difference: `$ref`/`$defs` indirection vs. an
+    /// inlined object (both resolve to the same validated shape), a nullable
+    /// type union `["T","null"]` vs. a plain type with `default: null` (both
+    /// accept and default the same values), and `required` array order (a set,
+    /// not a sequence, in JSON Schema). `description` text and the transport
+    /// level `$schema`/`format` annotations are deliberately excluded: DR-005's
+    /// byte-identical bar is restated per Invariant 3 as being about the HTTP
+    /// response bytes a client observes, not an internal struct's serde field
+    /// order, and the frozen contract's own descriptions are exercised verbatim
+    /// by `contract_golden.rs` against the OLD `ToolRegistry` path, not this one.
+    #[test]
+    fn ninety_four_tool_schemas_match_the_golden_contract_structurally() {
+        let router = McpServer::tool_router();
+        let tools = router.list_all();
+        let frozen = crate::tools::contract_golden::frozen_tools()
+            .expect("tool-contract-golden.json must be present");
+
+        let mut checked = 0;
+        for tool in &tools {
+            if tool.name.starts_with("search.") {
+                continue; // config-gated, not part of the frozen 94-tool surface
+            }
+            checked += 1;
+            let entry =
+                frozen.iter().find(|t| t["name"] == tool.name.as_ref()).unwrap_or_else(|| {
+                    panic!("{} is missing from tool-contract-golden.json", tool.name)
+                });
+
+            let raw = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+            let empty = serde_json::Value::Null;
+            let defs = raw.get("$defs").unwrap_or(&empty);
+            let mine = normalize_schema(&raw, defs);
+            let gold = normalize_schema(&entry["inputSchema"], &empty);
+            assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
+        }
+        assert_eq!(checked, 94, "the frozen contract covers exactly 94 non-search tools");
+    }
+
+    /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
+    /// the 94 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
+    /// and undocumented, none documented and missing.
+    #[test]
+    fn tool_router_lists_exactly_the_94_contract_names() {
+        let router = McpServer::tool_router();
+        let names: std::collections::BTreeSet<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|n| !n.starts_with("search."))
+            .collect();
+
+        let frozen = crate::tools::contract_golden::frozen_tools()
+            .expect("tool-contract-golden.json must be present");
+        let expected: std::collections::BTreeSet<String> =
+            frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+
+        assert_eq!(names.len(), 94, "got: {names:?}");
+        assert_eq!(expected.len(), 94, "the golden contract itself must hold 94 names");
+        let missing: Vec<&String> = expected.difference(&names).collect();
+        let extra: Vec<&String> = names.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "name set drift: missing from router {missing:?}, extra in router {extra:?}"
+        );
     }
 
     #[test]
