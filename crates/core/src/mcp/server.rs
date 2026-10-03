@@ -1203,7 +1203,10 @@ const EXTRACT_DESC: &str = "Extract a document to Markdown and store it as a com
 read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, \
 images (OCR via a configured multimodal provider) and text; audio/video unsupported.";
 
-#[tool_router(router = tool_router)]
+// `vis = "pub"` (US-0013): the REST `/api/swagger.json` catalog (`api/openapi.rs`)
+// needs the 94 contract tool schemas with no live session, and this static,
+// side-effect-free accessor is the cheapest way to get them.
+#[tool_router(router = tool_router, vis = "pub")]
 impl McpServer {
     // ── read family ──────────────────────────────────────────────────────────
 

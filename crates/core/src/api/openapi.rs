@@ -4,7 +4,10 @@
 //!
 //! Single source of truth: not one summary or parameter description is written on
 //! a REST endpoint. Every one of them is copied at request time from the MCP tool
-//! schemas held by [`crate::mcp::ToolRegistry`], matching route
+//! schemas exposed by [`crate::mcp::server::McpServer`]'s `rmcp` tool router (the
+//! 94 contract tools) plus each optional family's `catalog()` function (`web.*`,
+//! `context7.*`, `sqlite.*`, `db.*`, `doc.*`, gated the same way `register_all`
+//! gates them), matching route
 //! `/api/fs/{mount_id}/{sub}` to tool `fs.{sub_with_underscores}` (overrides:
 //! `list` to `fs.list_dir`, `roots` to `fs.list_allowed_roots`). Consequences,
 //! all deliberate and inherited from the C#:
@@ -115,35 +118,91 @@ struct ToolDoc {
     params: HashMap<String, String>,
 }
 
-/// Reflect the live tool registry into `tool name -> ToolDoc`.
+/// Reflect the live tool surface into `tool name -> ToolDoc`.
 ///
-/// An empty registry is not an error: every description simply stays absent,
-/// exactly as the C# leaves an operation blank when a tool has no `[Description]`.
+/// The 94 contract tools (`fs.*`, `admin.*`, `git.*`, `git.auth*`, `git.pr_*`) come
+/// from [`crate::mcp::server::McpServer`]'s `rmcp` tool router, which lists them
+/// statically with no live session required. The optional families not part of
+/// that contract (`web.*`, `context7.*`, `sqlite.*`, `db.*`, `doc.*`) are added
+/// from their own `catalog()` functions, gated by the same config flags
+/// `register_all` uses, so a server with a subsystem disabled documents exactly
+/// the tools it can serve. An absent tool is not an error: every description
+/// simply stays absent, exactly as the C# leaves an operation blank when a tool
+/// has no `[Description]`.
 fn catalog(state: &AppState) -> HashMap<String, ToolDoc> {
     let mut out = HashMap::new();
-    let payload = state.registry.list_payload();
-    let Some(tools) = payload.get("tools").and_then(Value::as_array) else {
-        return out;
-    };
-    for tool in tools {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else { continue };
-        let summary =
-            tool.get("description").and_then(Value::as_str).unwrap_or_default().to_string();
-        let mut params = HashMap::new();
-        if let Some(props) =
-            tool.get("inputSchema").and_then(|s| s.get("properties")).and_then(Value::as_object)
-        {
-            for (param, schema) in props {
-                if let Some(desc) = schema.get("description").and_then(Value::as_str)
-                    && !desc.is_empty()
-                {
-                    params.insert(param.clone(), desc.to_string());
-                }
+
+    for tool in crate::mcp::server::McpServer::tool_router().list_all() {
+        insert_tool_doc(
+            &mut out,
+            &tool.name,
+            tool.description.as_deref().unwrap_or_default(),
+            &*tool.input_schema,
+        );
+    }
+
+    let mut entries: Vec<crate::tools::catalog::ToolCatalogEntry> = Vec::new();
+    if state.config.web.enabled {
+        entries.extend(crate::tools::web::catalog(&state.config.web));
+    }
+    if state.config.context7.enabled {
+        entries.extend(crate::tools::context7::catalog(&state.config.context7));
+    }
+    if state.config.sqlite.enabled {
+        entries.extend(crate::tools::sqlite::catalog(&state.config.sqlite));
+    }
+    if state.config.db.enabled {
+        entries.extend(crate::tools::db::catalog(&state.config.db));
+    }
+    if state.config.doc.enabled {
+        entries.extend(crate::tools::doc::catalog(&state.config.doc));
+    }
+    for entry in &entries {
+        insert_tool_doc(&mut out, &entry.name, &entry.description, &entry.input_schema);
+    }
+
+    out
+}
+
+/// Record one tool's summary and per-parameter descriptions into the catalog map.
+///
+/// `input_schema` accepts anything exposing `properties.<name>.description`:
+/// the `rmcp::model::Tool`'s `Arc<JsonObject>` (an object Map, not a `Value`)
+/// and each `ToolCatalogEntry`'s plain `Value` both satisfy it.
+fn insert_tool_doc<S: ToolInputSchema>(
+    out: &mut HashMap<String, ToolDoc>,
+    name: &str,
+    summary: &str,
+    input_schema: &S,
+) {
+    let mut params = HashMap::new();
+    if let Some(props) = input_schema.properties() {
+        for (param, schema) in props {
+            if let Some(desc) = schema.get("description").and_then(Value::as_str)
+                && !desc.is_empty()
+            {
+                params.insert(param.clone(), desc.to_string());
             }
         }
-        out.insert(name.to_string(), ToolDoc { summary, params });
     }
-    out
+    out.insert(name.to_string(), ToolDoc { summary: summary.to_string(), params });
+}
+
+/// A JSON Schema object, in whichever of the two shapes a tool source hands us.
+trait ToolInputSchema {
+    fn properties(&self) -> Option<&Map<String, Value>>;
+}
+
+impl ToolInputSchema for Value {
+    fn properties(&self) -> Option<&Map<String, Value>> {
+        self.get("properties").and_then(Value::as_object)
+    }
+}
+
+impl ToolInputSchema for Map<String, Value> {
+    fn properties(&self) -> Option<&Map<String, Value>> {
+        self.get("properties").and_then(Value::as_object)
+    }
 }
 
 /// An operation with no documentation to inherit (the health probe, git routes).
@@ -1300,17 +1359,17 @@ mod tests {
     use super::*;
     use crate::api::dataplane::REST_ROUTES;
     use crate::config::ServerConfig;
-    use crate::mcp::ToolSchema;
-    use crate::mcp::registry::{ToolRegistry, handler};
     use crate::safety::SafetyManager;
     use axum::body::to_bytes;
     use axum::http::Request;
     use serde_json::json;
     use tower::ServiceExt;
 
-    /// A state whose registry holds a couple of real tool schemas, so the
-    /// inheritance path is exercised even before the tool families land.
-    async fn state_with_tools(dir: &std::path::Path, with_tools: bool, git: bool) -> Arc<AppState> {
+    /// A real `AppState`: tool descriptions now come from
+    /// [`crate::mcp::server::McpServer`]'s static tool router (the 94 contract
+    /// tools, always present) plus whichever optional families `git`/the other
+    /// flags enable, exactly like production.
+    async fn state_with_tools(dir: &std::path::Path, git: bool) -> Arc<AppState> {
         let mut config = ServerConfig::default();
         config.infra.meta.dir = dir.join("volumes").display().to_string();
         config.infra.blob.dir = dir.join("blobs").display().to_string();
@@ -1321,43 +1380,6 @@ mod tests {
         let registry = crate::storage::RelationalRegistry::new();
         let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
-
-        let mut registry = ToolRegistry::new();
-        if with_tools {
-            registry.add(
-                ToolSchema::new("fs.read", "Read a text file with line-numbered, paged output.")
-                    .req_str("mount_id", "Project/volume id the operation targets.")
-                    .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
-                    .opt_int("offset_lines", 0, "0-based line offset to start reading from.")
-                    .opt_int("limit_lines", 2000, "Maximum number of lines to return.")
-                    .opt_bool(
-                        "line_numbered",
-                        true,
-                        "Prefix each line with its 1-based line number.",
-                    ),
-                handler(|_c, _a| async move { Ok(json!({})) }),
-            );
-            registry.add(
-                ToolSchema::new(
-                    "fs.write",
-                    "Create or overwrite a file (no-clobber by default, atomic).",
-                )
-                .req_str("mount_id", "Project/volume id the operation targets.")
-                .req_str("path", "Absolute POSIX path within the volume, e.g. /src/app.py.")
-                .req_str("content", "Full text content to write to the file.")
-                .opt_bool(
-                    "overwrite",
-                    false,
-                    "Allow overwriting an existing file (default no-clobber).",
-                )
-                .opt_bool(
-                    "create_parents",
-                    true,
-                    "Create missing parent directories.",
-                ),
-                handler(|_c, _a| async move { Ok(json!({})) }),
-            );
-        }
 
         Arc::new(AppState {
             config: config.clone(),
@@ -1371,23 +1393,23 @@ mod tests {
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
             )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
-            registry: Arc::new(registry),
+            registry: Arc::default(),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
             search: None,
         })
     }
 
-    async fn doc(with_tools: bool, git: bool) -> Value {
+    async fn doc(git: bool) -> Value {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_tools(dir.path(), with_tools, git).await;
+        let state = state_with_tools(dir.path(), git).await;
         document(&state)
     }
 
     #[tokio::test]
     async fn swagger_json_is_public_and_well_formed() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_tools(dir.path(), true, false).await;
+        let state = state_with_tools(dir.path(), false).await;
         let response = openapi_router(state)
             .oneshot(
                 Request::builder()
@@ -1409,7 +1431,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_bearer_security_scheme_is_declared() {
-        let v = doc(true, false).await;
+        let v = doc(false).await;
         let bearer = &v["components"]["securitySchemes"]["Bearer"];
         assert_eq!(bearer["type"], "http");
         assert_eq!(bearer["scheme"], "bearer");
@@ -1419,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_route_of_the_data_plane_is_documented() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let paths = v["paths"].as_object().unwrap();
         for (method, sub) in REST_ROUTES {
             let op = OPERATIONS
@@ -1440,7 +1462,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_document_has_no_operation_outside_the_route_table() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         for path in v["paths"].as_object().unwrap().keys() {
             if path == "/health" || path.starts_with("/git/") {
                 continue;
@@ -1454,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn descriptions_are_inherited_from_the_tool_schemas() {
-        let v = doc(true, false).await;
+        let v = doc(false).await;
         let read = &v["paths"]["/api/fs/{mount_id}/read"]["get"];
         assert_eq!(read["summary"], "Read a text file with line-numbered, paged output.");
         assert_eq!(
@@ -1476,7 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_field_descriptions_are_inherited_too() {
-        let v = doc(true, false).await;
+        let v = doc(false).await;
         let schema = &v["components"]["schemas"]["WriteBody"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"], json!(["path", "content"]));
@@ -1492,23 +1514,75 @@ mod tests {
         );
     }
 
-    /// The audit value of the page: an undocumented tool parameter shows up blank
-    /// rather than getting invented text here.
+    /// The 94 contract tools are always registered in production (`register_fs`
+    /// and `admin::register` run unconditionally), so every REST route backed by
+    /// one is always documented: there is no server configuration that leaves
+    /// `fs.read` undocumented, unlike the optional families below it.
     #[tokio::test]
-    async fn an_empty_registry_leaves_tool_descriptions_blank() {
-        let v = doc(false, false).await;
+    async fn contract_tool_descriptions_are_always_present_regardless_of_config() {
+        let v = doc(false).await;
         let read = &v["paths"]["/api/fs/{mount_id}/read"]["get"];
-        assert!(read.get("summary").is_none());
-        assert!(read["parameters"][1].get("description").is_none());
-        // Structure survives regardless.
+        assert_eq!(read["summary"], "Read a text file with line-numbered, paged output.");
         assert_eq!(read["parameters"][1]["name"], "path");
+        assert!(
+            read["parameters"][1]["description"].as_str().unwrap().contains("Absolute POSIX path")
+        );
         assert_eq!(read["responses"]["200"]["description"], "OK");
+    }
+
+    /// US-0013: the catalog that `document()` inherits text from now comes from
+    /// `McpServer`'s `rmcp` tool router plus the optional families' own
+    /// `catalog()` functions, not the old tool registry. The REST surface itself
+    /// (routes, schemas, bodies) must render identically regardless, since none
+    /// of the `OPERATIONS` table's tools belong to an optional family.
+    #[tokio::test]
+    async fn the_document_is_unchanged_whether_optional_families_are_enabled_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_tools(dir.path(), false).await;
+        let all_off = document(&state);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.infra.meta.dir = dir2.path().join("volumes").display().to_string();
+        config.infra.blob.dir = dir2.path().join("blobs").display().to_string();
+        config.infra.admin.path = dir2.path().join("admin.db").display().to_string();
+        config.web.enabled = true;
+        config.context7.enabled = true;
+        config.sqlite.enabled = true;
+        config.db.enabled = true;
+        let config = Arc::new(config);
+        let registry = crate::storage::RelationalRegistry::new();
+        let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
+        admin.connect().await.unwrap();
+        let all_on = Arc::new(AppState {
+            config: config.clone(),
+            admin,
+            stores: Arc::new(crate::storage::StoreManager::new(
+                config.clone(),
+                crate::storage::test_registry(),
+            )),
+            safety: Arc::new(SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            )),
+            identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+            registry: Arc::default(),
+            editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
+            doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
+            search: None,
+        });
+        let all_on = document(&all_on);
+
+        assert_eq!(
+            all_off, all_on,
+            "the fs.*/admin.* REST surface must not depend on optional families"
+        );
     }
 
     /// The bytes plane has no tool, so its text comes from the explicit table.
     #[tokio::test]
     async fn tool_free_routes_keep_their_own_summaries() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let download = &v["paths"]["/api/fs/{mount_id}/download"]["get"];
         assert_eq!(download["summary"], "Download a single file's raw bytes as an attachment.");
         assert_eq!(
@@ -1532,7 +1606,7 @@ mod tests {
     /// included: a client that cannot see the field cannot use the feature.
     #[tokio::test]
     async fn the_upload_form_documents_its_fields_and_the_documentation_flag() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let form = &v["paths"]["/api/fs/{mount_id}/upload"]["post"]["requestBody"]["content"]["multipart/form-data"]
             ["schema"];
         assert_eq!(form["type"], "object");
@@ -1557,7 +1631,7 @@ mod tests {
     /// bodies, and the flag is declared on the JSON one too.
     #[tokio::test]
     async fn the_document_service_routes_are_documented() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         for (path, schema) in [
             ("/api/fs/{mount_id}/write-bytes", "WriteBytesBody"),
             ("/api/fs/{mount_id}/documentize", "DocumentizeBody"),
@@ -1577,7 +1651,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_bytes_documents_the_tool_parameter_names() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let names: Vec<&str> = v["paths"]["/api/fs/{mount_id}/read-bytes"]["get"]["parameters"]
             .as_array()
             .unwrap()
@@ -1589,7 +1663,7 @@ mod tests {
 
     #[tokio::test]
     async fn nullable_and_absent_defaults_render_as_the_csharp_does() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let grep = &v["paths"]["/api/fs/{mount_id}/grep"]["get"]["parameters"];
         let include =
             grep.as_array().unwrap().iter().find(|p| p["name"] == "include_glob").unwrap();
@@ -1614,7 +1688,7 @@ mod tests {
 
     #[tokio::test]
     async fn array_bodies_declare_their_item_schema() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let paths = &v["components"]["schemas"]["ReadManyBody"]["properties"]["paths"];
         assert_eq!(paths["type"], "array");
         assert_eq!(paths["items"]["type"], "string");
@@ -1627,7 +1701,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_body_reference_resolves() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let schemas = v["components"]["schemas"].as_object().unwrap();
         for op in OPERATIONS.iter().filter(|o| !o.body.is_empty()) {
             assert!(schemas.contains_key(op.body), "schema {} is missing", op.body);
@@ -1637,11 +1711,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_documented_and_git_follows_the_config() {
-        let without = doc(false, false).await;
+        let without = doc(false).await;
         assert!(without["paths"]["/health"]["get"]["responses"]["200"].is_object());
         assert!(without["paths"].get("/git/{mount_id}/info/refs").is_none());
 
-        let with = doc(false, true).await;
+        let with = doc(true).await;
         let refs = &with["paths"]["/git/{mount_id}/info/refs"]["get"];
         assert_eq!(refs["parameters"][0]["name"], "mount_id");
         assert_eq!(refs["parameters"][1]["name"], "service");
@@ -1650,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn roots_is_documented_even_though_it_takes_no_mount_id() {
-        let v = doc(false, false).await;
+        let v = doc(false).await;
         let roots = &v["paths"]["/api/fs/roots"]["get"];
         assert!(roots.is_object());
         assert!(roots.get("parameters").is_none());
@@ -1661,7 +1735,7 @@ mod tests {
     #[tokio::test]
     async fn docs_serves_html_without_auth() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_tools(dir.path(), false, false).await;
+        let state = state_with_tools(dir.path(), false).await;
         let response = openapi_router(state)
             .oneshot(Request::builder().uri("/api/docs").body(axum::body::Body::empty()).unwrap())
             .await
@@ -1682,7 +1756,7 @@ mod tests {
     #[tokio::test]
     async fn docs_assets_are_served_from_the_embedded_distribution() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_tools(dir.path(), false, false).await;
+        let state = state_with_tools(dir.path(), false).await;
         let app = openapi_router(state);
         let response = app
             .clone()
@@ -1714,7 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn the_trailing_slash_spelling_also_serves_the_page() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_tools(dir.path(), false, false).await;
+        let state = state_with_tools(dir.path(), false).await;
         let response = openapi_router(state)
             .oneshot(Request::builder().uri("/api/docs/").body(axum::body::Body::empty()).unwrap())
             .await
