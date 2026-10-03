@@ -29,7 +29,8 @@
 | 10 | US-0010 | n/a | Wean fs.*/admin.*/search.* tool families off ToolRegistry (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | ~10 | US-0009-orig-attempt | 2 | done (partial, see report) |
 | 11 | US-0011 | n/a | Wean git.*/git_auth.*/git_pr.* tool families off ToolRegistry (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | 4 | US-0009-orig-attempt | 2 | done |
 | 12 | US-0012 | n/a | Replace web.*/context7.*/sqlite.*/db.*/doc.* ToolRegistry registration with a lightweight catalog-only structure (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | ~5 | US-0009-orig-attempt | 2 | done |
-| 13 | US-0013 | n/a | Rewire api/openapi.rs catalog onto McpServer's rmcp router + the new lightweight catalogs; remove AppState.registry/register_all/EnabledFeatures (discovered drift) | DR-003 (surplus) | n/a | none new, preserve openapi.rs output shape | 2 | US-0010,US-0011,US-0012 | 2 | todo |
+| 13 | US-0013 | n/a | Rewire api/openapi.rs catalog onto McpServer's rmcp router + the new lightweight catalogs; remove AppState.registry/register_all/EnabledFeatures (discovered drift) | DR-003 (surplus) | n/a | none new, preserve openapi.rs output shape | 2 | US-0010,US-0011,US-0012 | 2 | done |
+| 14 | US-0014 | n/a | Fully decouple every tool family + testkit from ToolRegistry/ToolSchema/Args (literal DR-003 compliance) | DR-003 (surplus) | n/a | none new, preserve ~700 existing tests | 16 | US-0010,US-0011,US-0012 | 2 | todo |
 
 ## Dependency Graph
 ```
