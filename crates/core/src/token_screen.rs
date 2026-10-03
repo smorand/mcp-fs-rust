@@ -513,26 +513,81 @@ mod tests {
         out
     }
 
-    /// One JSON-RPC `tools/call`, decoded from the SSE frame the way `app.rs`'s
-    /// own tests do.
+    /// Build one `/mcp` POST request with the headers `rmcp`'s
+    /// `StreamableHttpService` requires (SPEC-0013/US-0008): a `Host` header
+    /// for its DNS-rebinding guard, and both `Accept` MIME types.
+    fn mcp_req(token: &str, session: Option<&str>, payload: &Value) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Host", "localhost")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json");
+        if let Some(s) = session {
+            b = b.header("Mcp-Session-Id", s);
+        }
+        b.body(Body::from(payload.to_string())).unwrap()
+    }
+
+    /// Last complete JSON `data:` frame in an SSE body (the migrated server
+    /// can prime the stream with a non-JSON `data:\nid: 0\nretry: ...`
+    /// frame ahead of the real one).
+    fn last_sse_json(body: &str) -> Value {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .filter_map(|p| serde_json::from_str::<Value>(p.trim()).ok())
+            .next_back()
+            .unwrap_or_else(|| panic!("no JSON data frame in SSE body: {body}"))
+    }
+
+    /// The `initialize` + `notifications/initialized` handshake
+    /// `LocalSessionManager` + `legacy_session_mode: true` now requires
+    /// (DR-010), returning the session id to reuse for `call_tool`.
+    async fn establish_session(app: &axum::Router, token: &str) -> String {
+        let init = json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "token-screen-test", "version": "0.0"},
+            },
+        });
+        let r = app.clone().oneshot(mcp_req(token, None, &init)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "initialize must succeed");
+        let session_id = r
+            .headers()
+            .get("Mcp-Session-Id")
+            .expect("initialize must return a session id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let notified = app
+            .clone()
+            .oneshot(mcp_req(
+                token,
+                Some(&session_id),
+                &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(notified.status(), StatusCode::ACCEPTED);
+        session_id
+    }
+
+    /// One JSON-RPC `tools/call`, over a freshly established session,
+    /// decoded from the SSE frame.
     async fn call_tool(app: axum::Router, token: &str, name: &str, args: Value) -> Value {
+        let session_id = establish_session(&app, token).await;
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {"name": name, "arguments": args},
         });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
-            .body(Body::from(payload.to_string()))
-            .unwrap();
-        let r = app.oneshot(req).await.unwrap();
+        let r = app.oneshot(mcp_req(token, Some(&session_id), &payload)).await.unwrap();
         let body = body_string(r).await;
-        let json_str = body.trim_start_matches("event: message\ndata: ").trim_end();
-        let v: Value = serde_json::from_str(json_str).unwrap();
+        let v = last_sse_json(&body);
         assert_ne!(v["result"]["isError"], Value::Bool(true), "tool call failed: {v}");
         let text = v["result"]["content"][0]["text"].as_str().expect("a text content block");
         serde_json::from_str(text).unwrap()

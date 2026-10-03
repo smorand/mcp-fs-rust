@@ -57,11 +57,13 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "crossterm",
  "futures",
  "libc",
+ "mcp-fs-core",
  "reqwest",
  "serde",
  "serde_json",

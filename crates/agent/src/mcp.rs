@@ -1,9 +1,15 @@
 //! A minimal MCP client over streamable HTTP.
 //!
-//! The server is stateless: it answers a bare `tools/list` or `tools/call` with no
-//! `initialize` handshake, so this client does not perform one. It accepts either a plain
-//! JSON body or an SSE framed one, because the server picks the framing from the `Accept`
-//! header and we advertise both.
+//! The migrated server (SPEC-0013/US-0008, `rmcp`'s `StreamableHttpService` with
+//! `LocalSessionManager` + `legacy_session_mode: true`) requires the standard MCP
+//! handshake: `initialize`, then `notifications/initialized`, before the first
+//! `tools/list` or `tools/call` (DR-010). This client performs that handshake lazily on
+//! first use (`ensure_session`), memoizing the `Mcp-Session-Id` the server issues and
+//! sending it on every later request on this connection. Empirically, every response from
+//! that configuration is SSE framed, including `initialize` itself (verified against a
+//! real `tower::ServiceExt::oneshot` request, see
+//! `specs/SPEC-0013_.../drift/2026-10-03_02-50-09.md`); `parse_body` still accepts a plain
+//! JSON body too, defensively, in case a future server configuration prefers it.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -32,6 +38,9 @@ pub struct McpClient {
     url: String,
     auth_header: String,
     token: String,
+    /// The `Mcp-Session-Id` the server issued on `initialize`, memoized so the
+    /// handshake runs once per connection (DR-010). `None` until the first call.
+    session: tokio::sync::Mutex<Option<String>>,
 }
 
 impl McpClient {
@@ -46,6 +55,7 @@ impl McpClient {
             url: url.to_string(),
             auth_header: auth_header.to_string(),
             token: token.to_string(),
+            session: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -89,19 +99,27 @@ impl McpClient {
     }
 
     /// One JSON-RPC round trip, returning the `result` object.
+    ///
+    /// Performs the `initialize`/`notifications/initialized` handshake first
+    /// (memoized by [`ensure_session`](Self::ensure_session)) unless `method`
+    /// IS that handshake, so every `tools/list`/`tools/call` the rest of this
+    /// client makes already carries a valid `Mcp-Session-Id` (DR-010).
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        let session_id =
+            if method == "initialize" { None } else { Some(self.ensure_session().await?) };
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let res = self
+        let mut req = self
             .http
             .post(&self.url)
             .header("Content-Type", "application/json")
             // Both framings are advertised, and `parse_body` handles whichever comes back.
             .header("Accept", "application/json, text/event-stream")
-            .header(&self.auth_header, format!("Bearer {}", self.token))
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {} failed", self.url))?;
+            .header(&self.auth_header, format!("Bearer {}", self.token));
+        if let Some(id) = &session_id {
+            req = req.header("Mcp-Session-Id", id);
+        }
+        let res =
+            req.json(&body).send().await.with_context(|| format!("POST {} failed", self.url))?;
 
         let status = res.status();
         let text = res.text().await.context("reading the response body")?;
@@ -119,12 +137,70 @@ impl McpClient {
             .cloned()
             .ok_or_else(|| anyhow!("{method} returned no result: {}", first_line(&text)))
     }
+
+    /// Run the `initialize` + `notifications/initialized` handshake
+    /// (DR-010) the migrated server now requires, once per connection, and
+    /// return the `Mcp-Session-Id` it issued.
+    async fn ensure_session(&self) -> Result<String> {
+        {
+            let held = self.session.lock().await;
+            if let Some(id) = held.as_ref() {
+                return Ok(id.clone());
+            }
+        }
+
+        let init_params = json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-fs-agent", "version": env!("CARGO_PKG_VERSION")},
+        });
+        let res = self
+            .http
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(&self.auth_header, format!("Bearer {}", self.token))
+            .json(
+                &json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": init_params}),
+            )
+            .send()
+            .await
+            .with_context(|| format!("initialize POST {} failed", self.url))?;
+        let status = res.status();
+        let session_id =
+            res.headers().get("Mcp-Session-Id").and_then(|v| v.to_str().ok()).map(str::to_string);
+        let text = res.text().await.context("reading the initialize response body")?;
+        if !status.is_success() {
+            bail!("initialize returned {status}: {}", first_line(&text));
+        }
+        let session_id = session_id
+            .ok_or_else(|| anyhow!("initialize did not return a Mcp-Session-Id header"))?;
+
+        // Notification: no `id`, no result to parse, just the 202 acknowledgement.
+        self.http
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header(&self.auth_header, format!("Bearer {}", self.token))
+            .header("Mcp-Session-Id", &session_id)
+            .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .context("notifications/initialized failed")?;
+
+        *self.session.lock().await = Some(session_id.clone());
+        Ok(session_id)
+    }
 }
 
 /// Accept a plain JSON body or an SSE stream, returning the JSON-RPC envelope.
 ///
-/// The SSE case can carry several `data:` lines; the last complete JSON object wins,
-/// which is the envelope for the request we just made.
+/// The SSE case can carry several `data:` lines (a priming event ahead of the real one,
+/// for instance); the last complete JSON object wins, which is the envelope for the
+/// request we just made. Empirically, the migrated server (see the module doc) always
+/// answers this way, never with a bare JSON body; the plain-JSON branch below stays as
+/// defensive support for a server configuration that might prefer it, not because the
+/// real server we talk to today ever takes it.
 fn parse_body(text: &str) -> Result<Value> {
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') {
@@ -192,6 +268,54 @@ pub fn resolve_name<'a>(tools: &'a BTreeMap<String, Tool>, wanted: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DT-002 (SPEC-0013/US-0008): boot the real migrated server in-process
+    /// on an ephemeral port and drive it with the real `McpClient`, exactly
+    /// as `./agent.sh`'s own startup sequence does (`McpClient::new` then
+    /// `list_tools`), proving the client's lazily-run `initialize` +
+    /// `notifications/initialized` handshake (DR-010) actually lets a bare
+    /// `tools/list` succeed against the server this story wires up.
+    #[tokio::test]
+    async fn agent_startup_completes_and_lists_all_94_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key_path, pub_path) =
+            mcp_fs_core::keys::write_keypair(dir.path().join("keys")).unwrap();
+        let token = mcp_fs_core::keys::mint_token_from_file(
+            &key_path,
+            "agent-e2e@test.com",
+            mcp_fs_core::keys::DEFAULT_ISSUER,
+            mcp_fs_core::keys::DEFAULT_CLAIM,
+            3600,
+        )
+        .unwrap();
+        let mut config = mcp_fs_core::config::ServerConfig::default();
+        config.auth.jwt.public_key_path = pub_path.display().to_string();
+        config.infra.meta.dir = dir.path().join("volumes").display().to_string();
+        config.infra.blob.dir = dir.path().join("blobs").display().to_string();
+        config.infra.admin.path = dir.path().join("admin.db").display().to_string();
+
+        let router = mcp_fs_core::app::build(config).await.expect("app::build");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let url = format!("http://127.0.0.1:{port}/mcp");
+
+        let client = McpClient::new(&url, "X-Forwarded-Authorization", &token).unwrap();
+        let tools = client.list_tools().await.expect("list_tools must succeed after the handshake");
+        // `McpServer::tool_router` always compiles in the 4 `search.*` tools
+        // regardless of runtime config (see
+        // `crates/core/src/mcp/server.rs::tool_router_lists_exactly_the_94_contract_names`,
+        // which excludes them the same way); the frozen, non-search contract
+        // this story's DT-002 means is the 94 count, not the raw catalogue
+        // size.
+        let non_search = tools.keys().filter(|n| !n.starts_with("search.")).count();
+        assert_eq!(non_search, 94, "expected the full 94-tool catalogue, got {:?}", tools.keys());
+        assert!(
+            tools.contains_key("fs.read_bytes"),
+            "fs.read_bytes must be present: {:?}",
+            tools.keys()
+        );
+    }
 
     fn catalogue(names: &[&str]) -> BTreeMap<String, Tool> {
         names

@@ -84,7 +84,17 @@ impl McpServer {
         crate::tools::git::register(&mut git_tools);
         crate::tools::git_auth::register(&mut git_tools);
         crate::tools::git_pr::register(&mut git_tools);
-        Self { state, person, tool_router: Self::tool_router(), git_tools: Arc::new(git_tools) }
+        #[allow(unused_mut)]
+        let mut tool_router = Self::tool_router();
+        // Test-only (US-0008, DT-004): the extra router lives in its own
+        // `#[cfg(test)]`-gated `impl` block below, so the whole item (macro
+        // expansion included) is absent from a non-test build, not merely
+        // the generated tool call branch.
+        #[cfg(test)]
+        {
+            tool_router += Self::test_tool_router();
+        }
+        Self { state, person, tool_router, git_tools: Arc::new(git_tools) }
     }
 
     /// Dispatch a `git.*` call through the old registry: same handler, same
@@ -3124,6 +3134,54 @@ impl McpServer {
         let out =
             self.call_git("git.pr_review", serde_json::to_value(&a).expect("serialize")).await;
         to_call_result("git.pr_review", out)
+    }
+}
+
+/// Test-only (US-0008, DT-004): one extra tool, `t.notifies_then_returns`,
+/// that emits a progress notification before returning, so the transport's
+/// SSE-on-notification path has something real to exercise. The whole
+/// `impl` block (including the `#[tool_router]` expansion) is behind
+/// `#[cfg(test)]`: in a shipped build this item does not exist, not merely
+/// an unreachable branch.
+#[cfg(test)]
+#[tool_router(router = test_tool_router)]
+impl McpServer {
+    #[tool(
+        name = "t.notifies_then_returns",
+        description = "Test-only tool: emits a progress notification before returning."
+    )]
+    async fn t_notifies_then_returns(
+        &self,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let notification = rmcp::model::ServerNotification::ProgressNotification(
+            rmcp::model::ProgressNotification::new(rmcp::model::ProgressNotificationParam::new(
+                rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(0)),
+                1.0,
+            )),
+        );
+        let _ = context.peer.send_notification(notification).await;
+        Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
+    }
+}
+
+/// Wiring required to serve [`McpServer`] over `rmcp`'s streamable HTTP
+/// transport (US-0008): the dispatch methods above are already complete
+/// (US-0007), but nothing yet told `rmcp` how to answer `initialize` or how
+/// to route a call through [`McpServer::tool_router`]. `#[tool_handler]`
+/// generates `call_tool`/`list_tools` from that router; only `get_info` is
+/// hand-written, to advertise the same server identity the old hand-rolled
+/// transport did.
+#[rmcp::tool_handler(router = self.tool_router)]
+impl rmcp::ServerHandler for McpServer {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            crate::mcp::SERVER_NAME,
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 }
 
