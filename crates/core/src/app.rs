@@ -30,7 +30,6 @@ use crate::config::ServerConfig;
 use crate::errors::ToolError;
 use crate::identity::IdentityResolver;
 use crate::logging;
-use crate::mcp::ToolRegistry;
 use crate::safety::SafetyManager;
 use crate::state::AppState;
 use crate::storage::StoreManager;
@@ -88,20 +87,6 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         );
     }
 
-    // The git, web, and context7 families are only registered when their subsystem
-    // is on, so a server with them disabled advertises exactly the tools it can serve.
-    let mut registry = ToolRegistry::new();
-    let features = crate::tools::all::EnabledFeatures {
-        git: config.git.enabled,
-        web: config.web.enabled,
-        context7: config.context7.enabled,
-        sqlite: config.sqlite.enabled,
-        db: config.db.enabled,
-        doc: config.doc.enabled,
-        search: config.search.enabled,
-    };
-    crate::tools::register_all(&mut registry, &features, &config);
-
     let mcp_path = config.server.mcp_path.clone();
     if !mcp_path.starts_with('/') {
         anyhow::bail!("server.mcp_path must start with '/' (got '{mcp_path}')");
@@ -125,7 +110,6 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         stores,
         safety,
         identity,
-        registry: Arc::new(registry),
         editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
         doc_service,
         search,
@@ -558,7 +542,7 @@ mod tests {
         // crate's control. Recorded as a discovered, not-pre-declared,
         // deviation (see this story's final report) — the error *code*
         // (-32602 / INVALID_PARAMS) is unchanged.
-        assert_eq!(v["error"]["code"], crate::mcp::rpc_error::INVALID_PARAMS);
+        assert_eq!(v["error"]["code"], -32602); // JSON-RPC INVALID_PARAMS
         assert_eq!(v["error"]["message"], "tool not found");
     }
 

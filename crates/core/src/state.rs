@@ -6,7 +6,6 @@ use crate::config::ServerConfig;
 use crate::docs::DocService;
 use crate::errors::{Result, ToolError};
 use crate::identity::IdentityResolver;
-use crate::mcp::ToolRegistry;
 use crate::safety::SafetyManager;
 use crate::search::SearchBackend;
 use crate::storage::StoreManager;
@@ -20,7 +19,6 @@ pub struct AppState {
     pub stores: Arc<StoreManager>,
     pub safety: Arc<SafetyManager>,
     pub identity: Arc<IdentityResolver>,
-    pub registry: Arc<ToolRegistry>,
     pub editors: Arc<EditorRegistry>,
     /// The external document to Markdown converter, `None` when `doc_service` is
     /// disabled. Built once at boot so its HTTP connection pool is reused.

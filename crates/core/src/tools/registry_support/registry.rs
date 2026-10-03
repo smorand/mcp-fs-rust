@@ -5,8 +5,8 @@
 //! dot/underscore tolerance the C# agent-side used to need (a client sending
 //! `admin_list_projects` still reaches `admin.list_projects`).
 
+use super::{Args, ToolSchema};
 use crate::errors::{Result, ToolError};
-use crate::mcp::{Args, ToolSchema};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;

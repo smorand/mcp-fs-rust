@@ -16,8 +16,8 @@
 
 use crate::core::fs_ops;
 use crate::errors::ToolError;
-use crate::mcp::registry::handler;
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::handler;
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::tools::{norm, volume};
 use serde_json::{Value, json};
 
@@ -97,7 +97,9 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
                 (Some(mid), Some(sp)) => {
                     // Write the raw bytes directly into the volume; the content never
                     // passes through the LLM context window.
-                    let fake_a = crate::mcp::Args::new(json!({"mount_id": mid, "path": sp}));
+                    let fake_a = crate::tools::registry_support::Args::new(
+                        json!({"mount_id": mid, "path": sp}),
+                    );
                     let (mount, client) = volume(&ctx, &fake_a).await?;
                     let path = norm(&ctx, &fake_a, "path")?;
                     let (bytes, _content_type) = fetch_raw(&url, timeout).await?;
@@ -455,7 +457,7 @@ fn urlencoding(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::WebConfig;
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
 
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();

@@ -6,13 +6,14 @@
 
 use crate::core::fs_ops;
 use crate::errors::Result;
-use crate::mcp::Args;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolCtx, ToolRegistry, handler};
+use crate::tools::registry_support::Args;
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolCtx, ToolRegistry, handler};
 use crate::tools::{authorize_only, norm, volume};
 use serde_json::{Value, json};
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.mkdir", "Create a directory (parents by default).")
             .req_str("mount_id", "Project/volume id the operation targets.")
@@ -207,11 +208,6 @@ fn audit_log(ctx: &ToolCtx, a: &Args, mount: &str) -> Value {
         })
         .collect();
     json!({"entries": recent})
-}
-
-/// Plain catalog view of this family, independent of `ToolRegistry`.
-pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
-    crate::tools::catalog::from_register(register)
 }
 
 #[cfg(test)]

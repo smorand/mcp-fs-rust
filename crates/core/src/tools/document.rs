@@ -7,8 +7,8 @@
 //! very path `fs.extract_text` reads, so the two never produce two files.
 
 use crate::core::fs_ops;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 
 /// The C# description is one concatenated string; it is the LLM facing doc for
@@ -18,7 +18,8 @@ const EXTRACT_DESC: &str = "Extract a document to Markdown and store it as a com
 read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, \
 images (OCR via a configured multimodal provider) and text; audio/video unsupported.";
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.extract_text", EXTRACT_DESC)
             .req_str("mount_id", "Project/volume id the operation targets.")
@@ -128,11 +129,6 @@ pub fn register(reg: &mut ToolRegistry) {
             Ok(out)
         }),
     );
-}
-
-/// Plain catalog view of this family, independent of `ToolRegistry`.
-pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
-    crate::tools::catalog::from_register(register)
 }
 
 #[cfg(test)]

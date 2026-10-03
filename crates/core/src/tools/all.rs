@@ -5,7 +5,12 @@
 //! enabled, and the optional web and context7 families last.
 
 /// Which optional tool families to register.
-pub struct EnabledFeatures {
+///
+/// Test-only: the live server no longer builds a `ToolRegistry` to dispatch
+/// through (`mcp::server::McpServer`'s `rmcp` tool router does that), so
+/// nothing outside `register_all`'s own tests constructs this anymore.
+#[cfg(test)]
+pub(crate) struct EnabledFeatures {
     pub git: bool,
     pub web: bool,
     pub context7: bool,
@@ -16,8 +21,11 @@ pub struct EnabledFeatures {
 }
 
 /// Register every tool: the fs.* families, then admin.*, then the optional families.
-pub fn register_all(
-    reg: &mut crate::mcp::ToolRegistry,
+///
+/// Test-only, same reason as [`EnabledFeatures`].
+#[cfg(test)]
+pub(crate) fn register_all(
+    reg: &mut crate::tools::registry_support::ToolRegistry,
     features: &EnabledFeatures,
     config: &crate::config::ServerConfig,
 ) {
@@ -51,7 +59,7 @@ pub fn register_all(
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
 
     use super::EnabledFeatures;
 

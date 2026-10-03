@@ -28,9 +28,9 @@
 
 use crate::errors::{Result, ToolError, code};
 use crate::identity::IdentityResolver;
-use crate::mcp::registry::ToolCtx;
 use crate::state::AppState;
 use crate::tools::git_auth;
+use crate::tools::registry_support::ToolCtx;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};

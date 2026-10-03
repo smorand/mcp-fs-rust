@@ -19,8 +19,8 @@ use super::*;
 use crate::errors::code;
 use crate::git::oauth::store::OAuthTokenStore;
 use crate::git::provider::model::{PrSignals, PullRequest};
-use crate::mcp::ToolRegistry;
 use crate::tools::admin::test_support::Fixture;
+use crate::tools::registry_support::ToolRegistry;
 
 const OWNER: &str = "owner@test.com";
 

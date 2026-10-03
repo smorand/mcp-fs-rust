@@ -21,24 +21,29 @@
 
 use crate::errors::{Result, ToolError};
 use crate::git::GitRepoStore;
-use crate::mcp::registry::{ToolCtx, handler};
-use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::storage::admin::validate_project_id;
 use crate::storage::traits::IndexMode;
+use crate::tools::registry_support::{ToolCtx, handler};
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::util::normalize_identity;
 use serde_json::{Value, json};
 use std::str::FromStr;
 use std::sync::Arc;
 
 /// Register the ten `admin.*` tools.
-pub fn register(reg: &mut ToolRegistry) {
+///
+/// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
+/// `rmcp` tool router, never through this registry.
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     register_with(reg, None);
 }
 
 /// Registration with an injected git store, used by tests (and by any caller that
 /// already owns a store). `None` resolves the process wide store lazily, and only
 /// when `git.enabled`, so a git free deployment never touches the git state dirs.
-pub fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
+#[cfg(test)]
+pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore>>) {
     reg.add(
         ToolSchema::new(
             "admin.create_project",
@@ -394,13 +399,13 @@ pub(crate) mod test_support {
     use crate::config::ServerConfig;
     use crate::errors::Result;
     use crate::identity::IdentityResolver;
-    use crate::mcp::registry::ToolCtx;
-    use crate::mcp::{Args, ToolRegistry};
     use crate::safety::SafetyManager;
     use crate::state::AppState;
     use crate::storage::StoreManager;
     use crate::storage::admin::RelationalAdminStore;
     use crate::storage::traits::AdminBackend;
+    use crate::tools::registry_support::ToolCtx;
+    use crate::tools::registry_support::{Args, ToolRegistry};
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -450,9 +455,6 @@ pub(crate) mod test_support {
                     crate::storage::meta::max_path_len(&config.infra.meta.backend),
                 )),
                 identity: Arc::new(IdentityResolver::new(&config.auth)),
-                // The tools never dispatch through the registry, so an empty one
-                // is enough here; tests keep their own registry to call into.
-                registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
                 doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
                 search,

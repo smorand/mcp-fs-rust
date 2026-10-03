@@ -11,11 +11,12 @@
 //! ever returns a typed `ToolError`, so there is nothing left to translate.
 
 use crate::core::fs_ops;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm_or, volume};
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.glob", "Find files by glob pattern, newest first (cap 100).")
             .req_str("mount_id", "Project/volume id the operation targets.")
@@ -101,11 +102,6 @@ pub fn register(reg: &mut ToolRegistry) {
             fs_ops::find_references(&client, &root, &a.str("name")?).await
         }),
     );
-}
-
-/// Plain catalog view of this family, independent of `ToolRegistry`.
-pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
-    crate::tools::catalog::from_register(register)
 }
 
 #[cfg(test)]

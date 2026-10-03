@@ -13,8 +13,9 @@ use crate::errors::{Result, ToolError};
 use crate::git::oauth::device_flow::{DeviceCode, DeviceFlowClient, HttpDeviceFlowClient};
 use crate::git::oauth::scopes::{PrAccess, pr_capability};
 use crate::git::oauth::store::OAuthTokenStore;
-use crate::mcp::registry::{ToolCtx, handler};
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::ToolCtx;
+#[cfg(test)]
+use crate::tools::registry_support::{ToolRegistry, ToolSchema, handler};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
@@ -59,19 +60,18 @@ fn device_flow(config: &ServerConfig) -> Result<Arc<dyn DeviceFlowClient>> {
 }
 
 /// Register the three `git.auth*` tools.
-pub fn register(reg: &mut ToolRegistry) {
+///
+/// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
+/// `rmcp` tool router, never through this registry.
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
-}
-
-/// The schema/annotation catalog for every `git.auth*`/`git.token_set` tool
-/// registered by [`register`].
-pub fn catalog() -> Vec<super::catalog::ToolCatalogEntry> {
-    super::catalog::from_register(register)
 }
 
 /// Registration with injected dependencies, for tests: a token store that is not
 /// the process singleton and a fake device flow that never reaches the network.
-pub fn register_with(
+#[cfg(test)]
+pub(crate) fn register_with(
     reg: &mut ToolRegistry,
     tokens: Option<Arc<OAuthTokenStore>>,
     flow: Option<Arc<dyn DeviceFlowClient>>,
@@ -167,7 +167,7 @@ pub fn register_with(
 
 pub(crate) async fn tool_auth(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     t: Option<Arc<OAuthTokenStore>>,
     f: Option<Arc<dyn DeviceFlowClient>>,
 ) -> Result<Value> {
@@ -184,7 +184,7 @@ pub(crate) async fn tool_auth(
 
 pub(crate) async fn tool_auth_status(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     t: Option<Arc<OAuthTokenStore>>,
 ) -> Result<Value> {
     let tokens = resolve_tokens(&ctx, t).await?;
@@ -193,7 +193,7 @@ pub(crate) async fn tool_auth_status(
 
 pub(crate) async fn tool_auth_revoke(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     t: Option<Arc<OAuthTokenStore>>,
 ) -> Result<Value> {
     let provider = a.opt_str("provider");
@@ -204,7 +204,7 @@ pub(crate) async fn tool_auth_revoke(
 
 pub(crate) async fn tool_token_set(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     t: Option<Arc<OAuthTokenStore>>,
 ) -> Result<Value> {
     let host = a.str("host")?;

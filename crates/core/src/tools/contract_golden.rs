@@ -15,7 +15,7 @@
 //! MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
 //! ```
 
-use crate::mcp::ToolRegistry;
+use crate::tools::registry_support::ToolRegistry;
 use serde_json::{Map, Value};
 
 /// Set to rewrite the contract from the live registry instead of checking it.
@@ -275,8 +275,8 @@ fn e2e_new_960_the_thirty_one_enumerated_names_are_exactly_the_new_tool_set() {
 fn e2e_new_961_registering_an_unlisted_git_tool_fails_the_enumeration() {
     let mut reg = contract_registry();
     reg.add(
-        crate::mcp::ToolSchema::new("git.rogue", "A tool nobody enumerated."),
-        crate::mcp::registry::handler(|_ctx, _args| async move {
+        crate::tools::registry_support::ToolSchema::new("git.rogue", "A tool nobody enumerated."),
+        crate::tools::registry_support::handler(|_ctx, _args| async move {
             Err(crate::errors::ToolError::not_supported("rogue"))
         }),
     );
@@ -484,8 +484,11 @@ fn e2e_new_958_the_documentation_lists_every_registered_git_tool() {
 fn e2e_new_959_a_tool_missing_from_the_documentation_fails_the_parity_test() {
     let mut reg = contract_registry();
     reg.add(
-        crate::mcp::ToolSchema::new("git.undocumented_probe", "A tool nobody documented."),
-        crate::mcp::registry::handler(|_ctx, _args| async move {
+        crate::tools::registry_support::ToolSchema::new(
+            "git.undocumented_probe",
+            "A tool nobody documented.",
+        ),
+        crate::tools::registry_support::handler(|_ctx, _args| async move {
             Err(crate::errors::ToolError::not_supported("probe"))
         }),
     );

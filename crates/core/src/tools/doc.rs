@@ -6,10 +6,10 @@
 
 use crate::config::DocConfig;
 use crate::errors::{Result, ToolError};
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 use serde_json::json;
 use std::sync::Arc;
@@ -159,8 +159,8 @@ pub fn register(reg: &mut ToolRegistry, config: &DocConfig) {
 
 /// Normalize an optional path parameter (returns `None` when the arg is absent/null).
 fn opt_norm(
-    ctx: &crate::mcp::registry::ToolCtx,
-    a: &crate::mcp::Args,
+    ctx: &crate::tools::registry_support::ToolCtx,
+    a: &crate::tools::registry_support::Args,
     key: &str,
 ) -> Result<Option<String>> {
     match a.opt_str(key) {

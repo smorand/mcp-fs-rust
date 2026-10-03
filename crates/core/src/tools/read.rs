@@ -4,11 +4,12 @@
 //! Port of the C# `Tools/ReadTools.cs`.
 
 use crate::core::fs_ops;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.read", "Read a text file with line-numbered, paged output.")
             .req_str("mount_id", "Project/volume id the operation targets.")
@@ -196,11 +197,6 @@ pub fn register(reg: &mut ToolRegistry) {
             fs_ops::count_lines(&client, &path).await
         }),
     );
-}
-
-/// Plain catalog view of this family, independent of `ToolRegistry`.
-pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
-    crate::tools::catalog::from_register(register)
 }
 
 #[cfg(test)]

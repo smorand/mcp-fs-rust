@@ -4,8 +4,8 @@
 //! required. Registered only when `context7.enabled` is true.
 
 use crate::errors::ToolError;
-use crate::mcp::registry::handler;
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::handler;
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use serde_json::Value;
 
 /// Register the two `context7.*` tools.
@@ -178,7 +178,7 @@ fn urlencoding(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Context7Config;
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
 
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();

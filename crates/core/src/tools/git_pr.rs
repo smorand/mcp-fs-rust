@@ -28,24 +28,24 @@ use crate::git::provider::{
     Credential, Method, PrProvider, ProviderClient, ProviderRequest, ProviderResponse,
     ProviderTarget, resolve_target, shared_client,
 };
-use crate::mcp::registry::{ToolCtx, handler};
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::ToolCtx;
+#[cfg(test)]
+use crate::tools::registry_support::{ToolRegistry, ToolSchema, handler};
 
 /// Register the `git.pr_*` tools.
-pub fn register(reg: &mut ToolRegistry) {
+///
+/// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
+/// `rmcp` tool router, never through this registry.
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None, None);
-}
-
-/// The schema/annotation catalog for every `git.pr_*` tool registered by
-/// [`register`].
-pub fn catalog() -> Vec<super::catalog::ToolCatalogEntry> {
-    super::catalog::from_register(register)
 }
 
 /// Registration with injected dependencies, for tests: a git store that is not
 /// the process singleton, a token store holding seeded credentials, and a fake
 /// provider API that returns canned JSON and never reaches the network.
-pub fn register_with(
+#[cfg(test)]
+pub(crate) fn register_with(
     reg: &mut ToolRegistry,
     git: Option<Arc<GitRepoStore>>,
     tokens: Option<Arc<OAuthTokenStore>>,
@@ -242,7 +242,7 @@ pub fn register_with(
 
 pub(crate) async fn tool_pr_create(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
@@ -272,7 +272,7 @@ pub(crate) async fn tool_pr_create(
 
 pub(crate) async fn tool_pr_list(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
@@ -290,7 +290,7 @@ pub(crate) async fn tool_pr_list(
 
 pub(crate) async fn tool_pr_get(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
@@ -306,7 +306,7 @@ pub(crate) async fn tool_pr_get(
 
 pub(crate) async fn tool_pr_diff(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
@@ -325,7 +325,7 @@ pub(crate) async fn tool_pr_diff(
 
 pub(crate) async fn tool_pr_merge(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
@@ -347,7 +347,7 @@ pub(crate) async fn tool_pr_merge(
 
 pub(crate) async fn tool_pr_review(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<OAuthTokenStore>>,
     c: Option<Arc<dyn ProviderClient>>,
@@ -374,7 +374,7 @@ pub(crate) async fn tool_pr_review(
 
 /// A pull request number is a positive integer: a zero or negative one names no
 /// pull request on either provider, so it is refused before any lookup.
-fn pr_number(a: &crate::mcp::args::Args) -> Result<u64> {
+fn pr_number(a: &crate::tools::registry_support::Args) -> Result<u64> {
     let raw = a.int("pr_number")?;
     u64::try_from(raw).ok().filter(|n| *n > 0).ok_or_else(|| {
         ToolError::invalid_argument(format!("pr_number must be a positive integer, got {raw}"))

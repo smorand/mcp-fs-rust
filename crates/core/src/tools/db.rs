@@ -10,8 +10,8 @@
 use crate::config::DbConfig;
 use crate::core::fs_ops;
 use crate::errors::{Result, ToolError};
-use crate::mcp::registry::handler;
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::handler;
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::tools::{norm, volume};
 use arrow::array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
@@ -585,7 +585,7 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
 mod tests {
     use super::*;
     use crate::config::DbConfig;
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
 
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();

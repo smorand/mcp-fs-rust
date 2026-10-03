@@ -26,10 +26,11 @@ use crate::errors::{Result, ToolError};
 use crate::git::db::RelationalGitDb;
 use crate::git::merge;
 use crate::git::{GitRepoEntry, GitRepoStore};
-use crate::mcp::registry::{ToolCtx, handler};
-use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
+use crate::tools::registry_support::ToolCtx;
+#[cfg(test)]
+use crate::tools::registry_support::{ToolRegistry, ToolSchema, handler};
 use chrono::{DateTime, FixedOffset, Utc};
 use git2::{DiffFormat, DiffOptions, Oid, Repository, Tree};
 use serde::Serialize;
@@ -49,22 +50,20 @@ const DIFF_CONTEXT_LINES: u32 = 3;
 
 /// Register the thirty-two `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
-pub fn register(reg: &mut ToolRegistry) {
+///
+/// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
+/// `rmcp` tool router, never through this registry.
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
-}
-
-/// The schema/annotation catalog for every `git.*` tool registered by
-/// [`register`], for consumers that need it without going through
-/// [`crate::mcp::ToolRegistry`] (e.g. the REST API docs catalog, US-0013).
-pub fn catalog() -> Vec<super::catalog::ToolCatalogEntry> {
-    super::catalog::from_register(register)
 }
 
 /// Registration with injected dependencies, for tests. `None` falls back to the
 /// process wide [`GitRepoStore`] and OAuth token store, which is what the server
 /// wants: the tools and the git HTTP routes must share repository handles and
 /// write locks, and `git.auth` must write the store `git.remote_clone` reads.
-pub fn register_with(
+#[cfg(test)]
+pub(crate) fn register_with(
     reg: &mut ToolRegistry,
     git: Option<Arc<GitRepoStore>>,
     tokens: Option<Arc<crate::git::OAuthTokenStore>>,
@@ -983,7 +982,7 @@ tool_remote_clone(ctx, a, g, t)
 
 pub(crate) async fn tool_stash_apply_or_pop(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     name: &'static str,
     pop: bool,
@@ -1003,7 +1002,7 @@ pub(crate) async fn tool_stash_apply_or_pop(
 
 pub(crate) async fn tool_init(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1018,7 +1017,7 @@ pub(crate) async fn tool_init(
 
 pub(crate) async fn tool_status(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1028,7 +1027,7 @@ pub(crate) async fn tool_status(
 
 pub(crate) async fn tool_branches(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1040,7 +1039,7 @@ pub(crate) async fn tool_branches(
 
 pub(crate) async fn tool_branch_create(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1061,7 +1060,7 @@ pub(crate) async fn tool_branch_create(
 
 pub(crate) async fn tool_branch_switch(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1079,7 +1078,7 @@ pub(crate) async fn tool_branch_switch(
 
 pub(crate) async fn tool_branch_delete(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1097,7 +1096,7 @@ pub(crate) async fn tool_branch_delete(
 
 pub(crate) async fn tool_branch_reset(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1117,7 +1116,7 @@ pub(crate) async fn tool_branch_reset(
 
 pub(crate) async fn tool_reset(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1136,7 +1135,7 @@ pub(crate) async fn tool_reset(
 
 pub(crate) async fn tool_tags(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1147,7 +1146,7 @@ pub(crate) async fn tool_tags(
 
 pub(crate) async fn tool_log(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1163,7 +1162,7 @@ pub(crate) async fn tool_log(
 
 pub(crate) async fn tool_show(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1174,7 +1173,7 @@ pub(crate) async fn tool_show(
 
 pub(crate) async fn tool_diff(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1190,7 +1189,7 @@ pub(crate) async fn tool_diff(
 
 pub(crate) async fn tool_commit(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1209,7 +1208,7 @@ pub(crate) async fn tool_commit(
 
 pub(crate) async fn tool_checkout_file(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1238,7 +1237,7 @@ pub(crate) async fn tool_checkout_file(
 
 pub(crate) async fn tool_blame(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1251,7 +1250,7 @@ pub(crate) async fn tool_blame(
 
 pub(crate) async fn tool_remote_add(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1264,7 +1263,7 @@ pub(crate) async fn tool_remote_add(
 
 pub(crate) async fn tool_remote_remove(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1276,7 +1275,7 @@ pub(crate) async fn tool_remote_remove(
 
 pub(crate) async fn tool_remote_list(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1293,7 +1292,7 @@ pub(crate) async fn tool_remote_list(
 
 pub(crate) async fn tool_remote_clone(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
@@ -1308,7 +1307,7 @@ pub(crate) async fn tool_remote_clone(
 
 pub(crate) async fn tool_remote_push(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
@@ -1339,7 +1338,7 @@ pub(crate) async fn tool_remote_push(
 
 pub(crate) async fn tool_remote_fetch(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
@@ -1351,7 +1350,7 @@ pub(crate) async fn tool_remote_fetch(
 
 pub(crate) async fn tool_stash_save(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1370,7 +1369,7 @@ pub(crate) async fn tool_stash_save(
 
 pub(crate) async fn tool_stash_list(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1380,7 +1379,7 @@ pub(crate) async fn tool_stash_list(
 
 pub(crate) async fn tool_stash_drop(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1398,7 +1397,7 @@ pub(crate) async fn tool_stash_drop(
 
 pub(crate) async fn tool_merge(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1415,7 +1414,7 @@ pub(crate) async fn tool_merge(
 
 pub(crate) async fn tool_merge_resolve(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1426,7 +1425,7 @@ pub(crate) async fn tool_merge_resolve(
 
 pub(crate) async fn tool_merge_abort(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1436,7 +1435,7 @@ pub(crate) async fn tool_merge_abort(
 
 pub(crate) async fn tool_rebase(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1454,7 +1453,7 @@ pub(crate) async fn tool_rebase(
 
 pub(crate) async fn tool_rebase_continue(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1466,7 +1465,7 @@ pub(crate) async fn tool_rebase_continue(
 
 pub(crate) async fn tool_rebase_abort(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1476,7 +1475,7 @@ pub(crate) async fn tool_rebase_abort(
 
 pub(crate) async fn tool_cherry_pick(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1494,7 +1493,7 @@ pub(crate) async fn tool_cherry_pick(
 
 pub(crate) async fn tool_cherry_pick_continue(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1506,7 +1505,7 @@ pub(crate) async fn tool_cherry_pick_continue(
 
 pub(crate) async fn tool_cherry_pick_abort(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1516,7 +1515,7 @@ pub(crate) async fn tool_cherry_pick_abort(
 
 pub(crate) async fn tool_revert(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1534,7 +1533,7 @@ pub(crate) async fn tool_revert(
 
 pub(crate) async fn tool_revert_continue(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1546,7 +1545,7 @@ pub(crate) async fn tool_revert_continue(
 
 pub(crate) async fn tool_revert_abort(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     let mount_id = a.str("mount_id")?;
@@ -1556,7 +1555,7 @@ pub(crate) async fn tool_revert_abort(
 
 pub(crate) async fn tool_remote_pull(
     ctx: ToolCtx,
-    a: crate::mcp::Args,
+    a: crate::tools::registry_support::Args,
     g: Option<Arc<GitRepoStore>>,
     t: Option<Arc<crate::git::OAuthTokenStore>>,
 ) -> Result<Value> {
@@ -4005,6 +4004,7 @@ async fn reject_if_operation_in_progress_on(
 /// The `todo` item schema. The action set is a runtime rule, not a JSON Schema
 /// enum, for the same reason as `RESOLUTION_ITEMS`: the generated schema shape
 /// is frozen by the tool contract.
+#[cfg(test)]
 const TODO_ITEMS: &str = r#"{"type":"object","properties":{"action":{"type":"string"},"sha":{"type":"string"},"message":{"type":"string"}},"required":["action","sha"]}"#;
 
 /// The spelling of every accepted action, in the order the refusal lists them.
@@ -4749,6 +4749,7 @@ fn validate_todo_against_range(todo: &[RebaseStep], range: &[String]) -> Result<
 /// The `resolutions` item schema: a path plus exactly one of `strategy` or
 /// `content`. The exclusivity is a runtime rule (FR-NEW-179), not a JSON Schema
 /// one, because the generated schema shape is frozen by the tool contract.
+#[cfg(test)]
 const RESOLUTION_ITEMS: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"strategy":{"type":"string"},"content":{"type":"string"}},"required":["path"]}"#;
 
 fn no_merge_in_progress(tool: &str, mount_id: &str) -> ToolError {
@@ -5955,7 +5956,7 @@ async fn revert_apply(
 /// ignoring it would silently change which content survives; the call is
 /// refused instead, before authorization, any lock and any network attempt,
 /// and the message names the tool that replaces it.
-fn reject_removed_on_conflict(a: &crate::mcp::args::Args) -> Result<()> {
+fn reject_removed_on_conflict(a: &crate::tools::registry_support::Args) -> Result<()> {
     if a.raw("on_conflict").is_some_and(|v| !v.is_null()) {
         return Err(ToolError::invalid_argument(
             "git.remote_pull: the on_conflict parameter was removed; a diverged pull now merges \

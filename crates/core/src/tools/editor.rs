@@ -17,9 +17,9 @@
 //! automatically after the server is ready, except during tests.
 
 use crate::errors::{Result, ToolError};
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::storage::VolumeClient;
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use axum::Router;
 use axum::extract::State as AxumState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};

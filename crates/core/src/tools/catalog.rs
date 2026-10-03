@@ -2,7 +2,7 @@
 //! consumers (e.g. the REST API docs catalog, US-0013) that need the schema
 //! and behaviour annotations without going through `mcp::ToolRegistry`.
 
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::ToolSchema;
 use serde_json::Value;
 
 /// One tool's name, description, JSON Schema and behaviour hints.
@@ -15,21 +15,6 @@ pub struct ToolCatalogEntry {
     pub idempotent: bool,
     pub open_world: bool,
     pub destructive: bool,
-}
-
-/// Build the catalog for a tool family by running its `register(&mut ToolRegistry)`
-/// function into a throwaway registry and reading back the schemas/annotations it
-/// produced, in registration order.
-pub fn from_register(f: impl FnOnce(&mut ToolRegistry)) -> Vec<ToolCatalogEntry> {
-    let mut reg = ToolRegistry::new();
-    f(&mut reg);
-    let payload = reg.list_payload();
-    payload["tools"]
-        .as_array()
-        .expect("list_payload always has a tools array")
-        .iter()
-        .map(entry_from_list_entry)
-        .collect()
 }
 
 /// Build a [`ToolCatalogEntry`] from a `tools/list` entry (`ToolSchema::to_list_entry`).

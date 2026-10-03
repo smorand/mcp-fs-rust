@@ -15,7 +15,7 @@ plane can never disagree.
 +------+--------------------------+----------------------------+-----------+
        |                          |                            |
 +------v---------+     +----------v-----------+     +----------v---------+
-| mcp::registry  |     | api::dataplane       |     | git::http          |
+| mcp::server    |     | api::dataplane       |     | git::http          |
 | 94 tools       |     | 38 routes            |     | smart protocol v0  |
 +------+---------+     +----------+-----------+     +----------+---------+
        |                          |                            |
@@ -146,8 +146,8 @@ reached 0.
 | Bearer extraction | `identity.rs`, configured header then `Authorization`, also Basic with the token as password | `ERR_UNAUTHENTICATED` |
 | RS256 verification | signature, `iss`, `exp`/`nbf`, 30s leeway, identity from `username_claim`, lowercased | HTTP 401 JSON `{error, detail}` |
 | Membership gate | `AppState::authorize` -> `AdminBackend::require_member` | `ERR_PROJECT_NOT_FOUND` (404) or `ERR_FORBIDDEN` (403) |
-| Tool dispatch | `mcp::registry`, exact name then a dot/underscore tolerant match | unknown tool: JSON-RPC `-32602` |
-| Argument parsing | `mcp::args`, tolerant accessors (string arrays accept an array, a bare string, or a comma separated string) | `ERR_INVALID_ARGUMENT` (400) |
+| Tool dispatch | `mcp::server::McpServer`'s `rmcp` tool router (`#[tool_router]`/`#[tool]`) | unknown tool: JSON-RPC `-32602` |
+| Argument parsing | `tools::registry_support::Args`, tolerant accessors (string arrays accept an array, a bare string, or a comma separated string) still used by the `git`/`git_auth`/`git_pr`/`doc` tool functions `McpServer` calls directly | `ERR_INVALID_ARGUMENT` (400) |
 
 The MCP endpoint is the only guarded route on the JSON-RPC side; `/health` and
 the OpenAPI pair are public by design. The REST plane verifies the bearer per
