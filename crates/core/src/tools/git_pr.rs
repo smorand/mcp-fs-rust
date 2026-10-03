@@ -36,6 +36,12 @@ pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None, None);
 }
 
+/// The schema/annotation catalog for every `git.pr_*` tool registered by
+/// [`register`].
+pub fn catalog() -> Vec<super::catalog::ToolCatalogEntry> {
+    super::catalog::from_register(register)
+}
+
 /// Registration with injected dependencies, for tests: a git store that is not
 /// the process singleton, a token store holding seeded credentials, and a fake
 /// provider API that returns canned JSON and never reaches the network.
@@ -79,42 +85,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let base = a.str("base")?;
-                let head = a.str("head")?;
-                let title = a.str("title")?;
-                let body = a.opt_str("body").unwrap_or_default();
-                let draft = a.bool_or("draft", false);
-                let remote = a
-                    .opt_str("remote")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "origin".to_string());
-                // Both refusals are pure argument checks, so they run before
-                // anything is resolved and cost no call at all.
-                if title.trim().is_empty() {
-                    return Err(ToolError::invalid_argument(
-                        "title must not be empty or whitespace-only",
-                    ));
-                }
-                if base == head {
-                    return Err(ToolError::invalid_argument(format!(
-                        "base and head must differ, both are '{base}'"
-                    )));
-                }
-                let call = PrCall::open(
-                    &ctx,
-                    &mount_id,
-                    &remote,
-                    PrAccess::Write,
-                    "git.pr_create",
-                    g,
-                    t,
-                    c,
-                )
-                .await?;
-                call.create(&base, &head, &title, &body, draft).await
-            }
+            tool_pr_create(ctx, a, g, t, c)
         }),
     );
 
@@ -141,20 +112,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let remote = a
-                    .opt_str("remote")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "origin".to_string());
-                // A pure argument check, so an unsupported state costs no
-                // lookup and no call at all (FR-NEW-306).
-                let state = PrState::parse(a.opt_str("state").as_deref().unwrap_or("open"))?;
-                let call =
-                    PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_list", g, t, c)
-                        .await?;
-                call.list(state).await
-            }
+            tool_pr_list(ctx, a, g, t, c)
         }),
     );
 
@@ -178,18 +136,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let number = pr_number(&a)?;
-                let remote = a
-                    .opt_str("remote")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "origin".to_string());
-                let call =
-                    PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_get", g, t, c)
-                        .await?;
-                call.get(number).await
-            }
+            tool_pr_get(ctx, a, g, t, c)
         }),
     );
 
@@ -213,21 +160,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let number = pr_number(&a)?;
-                let remote = a
-                    .opt_str("remote")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "origin".to_string());
-                // Read before the gate order runs, so the cap is the deployment's
-                // and never a caller supplied one.
-                let cap = ctx.state.config.git.max_pr_diff_mb;
-                let call =
-                    PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_diff", g, t, c)
-                        .await?;
-                call.diff(number, cap).await
-            }
+            tool_pr_diff(ctx, a, g, t, c)
         }),
     );
 
@@ -264,32 +197,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let number = pr_number(&a)?;
-                // A pure argument check, exactly like the `state` filter of
-                // git.pr_list: an unsupported strategy costs no lookup and no
-                // call at all (FR-NEW-310).
-                let strategy = MergeStrategy::parse(&a.str("strategy")?)?;
-                let title = a.opt_str("commit_title").filter(|s| !s.is_empty());
-                let message = a.opt_str("commit_message").filter(|s| !s.is_empty());
-                let remote = a
-                    .opt_str("remote")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "origin".to_string());
-                let call = PrCall::open(
-                    &ctx,
-                    &mount_id,
-                    &remote,
-                    PrAccess::Write,
-                    "git.pr_merge",
-                    g,
-                    t,
-                    c,
-                )
-                .await?;
-                call.merge(number, strategy, title.as_deref(), message.as_deref()).await
-            }
+            tool_pr_merge(ctx, a, g, t, c)
         }),
     );
 
@@ -327,39 +235,141 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t, c) = (g.clone(), t.clone(), c.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let number = pr_number(&a)?;
-                // Both checks are pure argument checks, exactly like the
-                // `strategy` of git.pr_merge: an unsupported verdict and a
-                // verdict with no reasoning cost no lookup and no call at all.
-                let verdict = Verdict::parse(&a.str("verdict")?)?;
-                let body = a.opt_str("body").unwrap_or_default();
-                if verdict.requires_body() && body.trim().is_empty() {
-                    return Err(ToolError::invalid_argument(format!(
-                        "verdict '{}' requires a non-empty body",
-                        verdict.label()
-                    )));
-                }
-                let remote = a
-                    .opt_str("remote")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "origin".to_string());
-                let call = PrCall::open(
-                    &ctx,
-                    &mount_id,
-                    &remote,
-                    PrAccess::Write,
-                    "git.pr_review",
-                    g,
-                    t,
-                    c,
-                )
-                .await?;
-                call.review(number, verdict, &body).await
-            }
+            tool_pr_review(ctx, a, g, t, c)
         }),
     );
+}
+
+pub(crate) async fn tool_pr_create(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<OAuthTokenStore>>,
+    c: Option<Arc<dyn ProviderClient>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let base = a.str("base")?;
+    let head = a.str("head")?;
+    let title = a.str("title")?;
+    let body = a.opt_str("body").unwrap_or_default();
+    let draft = a.bool_or("draft", false);
+    let remote =
+        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    // Both refusals are pure argument checks, so they run before
+    // anything is resolved and cost no call at all.
+    if title.trim().is_empty() {
+        return Err(ToolError::invalid_argument("title must not be empty or whitespace-only"));
+    }
+    if base == head {
+        return Err(ToolError::invalid_argument(format!(
+            "base and head must differ, both are '{base}'"
+        )));
+    }
+    let call =
+        PrCall::open(&ctx, &mount_id, &remote, PrAccess::Write, "git.pr_create", g, t, c).await?;
+    call.create(&base, &head, &title, &body, draft).await
+}
+
+pub(crate) async fn tool_pr_list(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<OAuthTokenStore>>,
+    c: Option<Arc<dyn ProviderClient>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let remote =
+        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    // A pure argument check, so an unsupported state costs no
+    // lookup and no call at all (FR-NEW-306).
+    let state = PrState::parse(a.opt_str("state").as_deref().unwrap_or("open"))?;
+    let call =
+        PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_list", g, t, c).await?;
+    call.list(state).await
+}
+
+pub(crate) async fn tool_pr_get(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<OAuthTokenStore>>,
+    c: Option<Arc<dyn ProviderClient>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let number = pr_number(&a)?;
+    let remote =
+        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let call =
+        PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_get", g, t, c).await?;
+    call.get(number).await
+}
+
+pub(crate) async fn tool_pr_diff(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<OAuthTokenStore>>,
+    c: Option<Arc<dyn ProviderClient>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let number = pr_number(&a)?;
+    let remote =
+        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    // Read before the gate order runs, so the cap is the deployment's
+    // and never a caller supplied one.
+    let cap = ctx.state.config.git.max_pr_diff_mb;
+    let call =
+        PrCall::open(&ctx, &mount_id, &remote, PrAccess::Read, "git.pr_diff", g, t, c).await?;
+    call.diff(number, cap).await
+}
+
+pub(crate) async fn tool_pr_merge(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<OAuthTokenStore>>,
+    c: Option<Arc<dyn ProviderClient>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let number = pr_number(&a)?;
+    // A pure argument check, exactly like the `state` filter of
+    // git.pr_list: an unsupported strategy costs no lookup and no
+    // call at all (FR-NEW-310).
+    let strategy = MergeStrategy::parse(&a.str("strategy")?)?;
+    let title = a.opt_str("commit_title").filter(|s| !s.is_empty());
+    let message = a.opt_str("commit_message").filter(|s| !s.is_empty());
+    let remote =
+        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let call =
+        PrCall::open(&ctx, &mount_id, &remote, PrAccess::Write, "git.pr_merge", g, t, c).await?;
+    call.merge(number, strategy, title.as_deref(), message.as_deref()).await
+}
+
+pub(crate) async fn tool_pr_review(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<OAuthTokenStore>>,
+    c: Option<Arc<dyn ProviderClient>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let number = pr_number(&a)?;
+    // Both checks are pure argument checks, exactly like the
+    // `strategy` of git.pr_merge: an unsupported verdict and a
+    // verdict with no reasoning cost no lookup and no call at all.
+    let verdict = Verdict::parse(&a.str("verdict")?)?;
+    let body = a.opt_str("body").unwrap_or_default();
+    if verdict.requires_body() && body.trim().is_empty() {
+        return Err(ToolError::invalid_argument(format!(
+            "verdict '{}' requires a non-empty body",
+            verdict.label()
+        )));
+    }
+    let remote =
+        a.opt_str("remote").filter(|s| !s.is_empty()).unwrap_or_else(|| "origin".to_string());
+    let call =
+        PrCall::open(&ctx, &mount_id, &remote, PrAccess::Write, "git.pr_review", g, t, c).await?;
+    call.review(number, verdict, &body).await
 }
 
 /// A pull request number is a positive integer: a zero or negative one names no

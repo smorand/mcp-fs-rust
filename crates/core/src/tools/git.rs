@@ -53,6 +53,13 @@ pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
 }
 
+/// The schema/annotation catalog for every `git.*` tool registered by
+/// [`register`], for consumers that need it without going through
+/// [`crate::mcp::ToolRegistry`] (e.g. the REST API docs catalog, US-0013).
+pub fn catalog() -> Vec<super::catalog::ToolCatalogEntry> {
+    super::catalog::from_register(register)
+}
+
 /// Registration with injected dependencies, for tests. `None` falls back to the
 /// process wide [`GitRepoStore`] and OAuth token store, which is what the server
 /// wants: the tools and the git HTTP routes must share repository handles and
@@ -72,16 +79,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                store.init_repo(&mount_id).await?;
-                Ok(json!({
-                    "mount_id": mount_id,
-                    "initialized": true,
-                    "message": "Git repository initialized",
-                }))
-            }
+            tool_init(ctx, a, g)
         }),
     );
 
@@ -94,11 +92,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                status(&mount_id, &entry).await
-            }
+            tool_status(ctx, a, g)
         }),
     );
 
@@ -111,13 +105,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                // Through the blocking pool like every other libgit2 reader:
-                // the divergence counts are a graph walk (FR-MOD-106).
-                on_git_thread(move || async move { branches(&mount_id, &entry).await }).await
-            }
+            tool_branches(ctx, a, g)
         }),
     );
 
@@ -147,30 +135,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let name = a.str("name")?;
-                let start_point = a.opt_str("start_point").filter(|s| !s.is_empty());
-                let checkout = a.bool_or("checkout", false);
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_create").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    branch_create(
-                        &entry,
-                        &client,
-                        &safety,
-                        &person,
-                        &name,
-                        start_point.as_deref(),
-                        checkout,
-                    )
-                    .await
-                })
-                .await
-            }
+            tool_branch_create(ctx, a, g)
         }),
     );
 
@@ -188,19 +153,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let name = a.str("name")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_switch").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    branch_switch(&entry, &client, &safety, &person, &name).await
-                })
-                .await
-            }
+            tool_branch_switch(ctx, a, g)
         }),
     );
 
@@ -227,19 +180,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let name = a.str("name")?;
-                let force = a.bool_or("force", false);
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_delete").await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    branch_delete(&entry, &safety, &person, &name, force).await
-                })
-                .await
-            }
+            tool_branch_delete(ctx, a, g)
         }),
     );
 
@@ -268,22 +209,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let name = a.str("name")?;
-                let target_commit = a.str("target_commit")?;
-                let force = a.bool_or("force", false);
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.branch_reset").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    branch_reset(&entry, &client, &safety, &person, &name, &target_commit, force)
-                        .await
-                })
-                .await
-            }
+            tool_branch_reset(ctx, a, g)
         }),
     );
 
@@ -315,20 +241,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let target_ref = a.str("target_ref")?;
-                let mode = ResetMode::parse(&a.str("mode")?)?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.reset").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    reset(&entry, &client, &safety, &person, &target_ref, mode).await
-                })
-                .await
-            }
+            tool_reset(ctx, a, g)
         }),
     );
 
@@ -341,12 +254,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                let tags = refs_under(&entry, "refs/tags/").await?;
-                Ok(json!({"mount_id": mount_id, "tags": tags}))
-            }
+            tool_tags(ctx, a, g)
         }),
     );
 
@@ -365,17 +273,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let ref_name = a.opt_str("ref_name");
-                let limit = a.int_or("limit", 20);
-                let path = a.opt_str("path");
-                let entry = open(&ctx, &mount_id, g).await?;
-                on_git_thread(move || async move {
-                    log(&mount_id, &entry, ref_name.as_deref(), limit, path.as_deref()).await
-                })
-                .await
-            }
+            tool_log(ctx, a, g)
         }),
     );
 
@@ -389,12 +287,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let commit_sha = a.str("commit_sha")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                on_git_thread(move || async move { show(&entry, &commit_sha).await }).await
-            }
+            tool_show(ctx, a, g)
         }),
     );
 
@@ -413,17 +306,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let from_ref = a.str("from_ref")?;
-                let to_ref = a.opt_str("to_ref");
-                let path = a.opt_str("path");
-                let entry = open(&ctx, &mount_id, g).await?;
-                on_git_thread(move || async move {
-                    diff(&mount_id, &entry, &from_ref, to_ref.as_deref(), path.as_deref()).await
-                })
-                .await
-            }
+            tool_diff(ctx, a, g)
         }),
     );
 
@@ -443,20 +326,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let message = a.str("message")?;
-                let author_name = a.opt_str("author_name");
-                let author_email = a.opt_str("author_email");
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.commit").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    commit(&entry, &client, &person, &message, author_name, author_email).await
-                })
-                .await
-            }
+            tool_commit(ctx, a, g)
         }),
     );
 
@@ -472,32 +342,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let commit_sha = a.str("commit_sha")?;
-                let path = a.str("path")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                let norm = ctx.state.safety.normalize_path(&path)?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let bytes = {
-                    let (entry, norm, commit_sha) = (entry, norm.clone(), commit_sha.clone());
-                    on_git_thread(move || async move {
-                        read_from_commit(&entry, &commit_sha, &norm).await
-                    })
-                    .await?
-                };
-                // A restore is a write, so it is charged like any other.
-                ctx.state.safety.charge_write(&ctx.person, &mount_id, bytes.len() as i64)?;
-                client.write_bytes_atomic(&norm, &bytes).await?;
-                ctx.state.safety.record_audit(
-                    &ctx.person,
-                    &mount_id,
-                    "git.checkout_file",
-                    &norm,
-                    &format!("from {commit_sha}"),
-                );
-                Ok(json!({"path": norm, "commit": commit_sha, "size": bytes.len()}))
-            }
+            tool_checkout_file(ctx, a, g)
         }),
     );
 
@@ -512,17 +357,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let path = a.str("path")?;
-                let ref_name = a.opt_str("ref_name");
-                let entry = open(&ctx, &mount_id, g).await?;
-                let norm = ctx.state.safety.normalize_path(&path)?;
-                on_git_thread(
-                    move || async move { blame(&entry, &norm, ref_name.as_deref()).await },
-                )
-                .await
-            }
+            tool_blame(ctx, a, g)
         }),
     );
 
@@ -544,14 +379,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let name = a.str("name")?;
-                let url = a.str("url")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.remote_add").await?;
-                remote_add(&ctx, &entry, &mount_id, &name, &url).await
-            }
+            tool_remote_add(ctx, a, g)
         }),
     );
 
@@ -571,13 +399,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let name = a.str("name")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.remote_remove").await?;
-                remote_remove(&ctx, &entry, &mount_id, &name).await
-            }
+            tool_remote_remove(ctx, a, g)
         }),
     );
 
@@ -594,24 +416,14 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                let remotes: Vec<Value> = entry
-                    .db
-                    .list_remotes()
-                    .await?
-                    .into_iter()
-                    .map(|(name, url)| remote_entry(name, url))
-                    .collect();
-                Ok(json!({"mount_id": mount_id, "remotes": remotes, "count": remotes.len()}))
-            }
+            tool_remote_list(ctx, a, g)
         }),
     );
 
     let g = git.clone();
     let t = tokens.clone();
     reg.add(
+
         ToolSchema::new(
             "git.remote_clone",
             "Clone a remote git repository (GitHub, GitLab, or any HTTPS URL) into a volume. \
@@ -627,19 +439,11 @@ pub fn register_with(
         .read_only(false)
         .idempotent(false)
         .open_world(true),
-        handler(move |ctx: ToolCtx, a| {
-            let (g, t) = (g.clone(), t.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let url = a.str("url")?;
-                let branch = a.opt_str("branch");
-                let depth = a.int_or("depth", 0);
-                let store = authorize(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_clone").await?;
-                remote_clone(&ctx, store, t, &mount_id, &url, branch, depth).await
-            }
-        }),
-    );
+ handler(move |ctx: ToolCtx, a| {
+let (g, t) = (g.clone(), t.clone());
+tool_remote_clone(ctx, a, g, t)
+}),
+);
 
     let g = git.clone();
     let t = tokens.clone();
@@ -676,41 +480,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let branch = a.str("branch")?;
-                let remote = a.str_or("remote", "origin");
-                let remote_branch = a.opt_str("remote_branch");
-                let force = a.bool_or("force", false);
-                let lease = a.opt_str("expected_remote_sha");
-                let store = authorize(&ctx, &mount_id, g).await?;
-                // FR-NEW-156/158: the lease contradiction and the missing
-                // lease are settled here, before the remote is resolved, a
-                // credential is looked up or a socket is opened, so neither
-                // can ever reach the network (E2E-NEW-489, E2E-NEW-829).
-                // `push_branch_inner` checks it again for its own callers;
-                // the check is a pure function of the two arguments.
-                let lease = validate_force_lease(force, lease.as_deref())?;
-                // FR-MOD-102 with FR-NEW-104: the remote side name obeys the
-                // same rule as a local one, checked here, before any remote is
-                // resolved or contacted, and deliberately outside the audited
-                // operation: a malformed argument is not a remote operation.
-                if let Some(name) = remote_branch.as_deref() {
-                    validate_branch_name(name)?;
-                }
-                remote_push(
-                    &ctx,
-                    store,
-                    t,
-                    &mount_id,
-                    &remote,
-                    &branch,
-                    remote_branch.as_deref(),
-                    force,
-                    lease,
-                )
-                .await
-            }
+            tool_remote_push(ctx, a, g, t)
         }),
     );
 
@@ -735,12 +505,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), t.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let remote = a.str_or("remote", "origin");
-                let store = authorize(&ctx, &mount_id, g).await?;
-                remote_fetch(&ctx, store, t, &mount_id, &remote).await
-            }
+            tool_remote_fetch(ctx, a, g, t)
         }),
     );
 
@@ -765,20 +530,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let message = a.opt_str("message");
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.stash_save").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                let max_entries = ctx.state.config.git.max_stash_entries;
-                on_git_thread(move || async move {
-                    stash_save(&entry, &client, &safety, &person, max_entries, message).await
-                })
-                .await
-            }
+            tool_stash_save(ctx, a, g)
         }),
     );
 
@@ -796,11 +548,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                on_git_thread(move || async move { stash_list(&mount_id, &entry).await }).await
-            }
+            tool_stash_list(ctx, a, g)
         }),
     );
 
@@ -819,19 +567,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let stash_id = a.str("stash_id")?;
-                let entry = open(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.stash_drop").await?;
-                let client = ctx.state.stores.client(&mount_id).await?;
-                let safety = ctx.state.safety.clone();
-                let person = ctx.person.clone();
-                on_git_thread(move || async move {
-                    stash_drop(&entry, &client, &safety, &person, &stash_id).await
-                })
-                .await
-            }
+            tool_stash_drop(ctx, a, g)
         }),
     );
 
@@ -872,19 +608,7 @@ pub fn register_with(
                 .open_world(false),
             handler(move |ctx: ToolCtx, a| {
                 let g = g.clone();
-                async move {
-                    let mount_id = a.str("mount_id")?;
-                    let stash_id = a.str("stash_id")?;
-                    let entry = open(&ctx, &mount_id, g).await?;
-                    reject_if_operation_in_progress(&entry, &mount_id, name).await?;
-                    let client = ctx.state.stores.client(&mount_id).await?;
-                    let safety = ctx.state.safety.clone();
-                    let person = ctx.person.clone();
-                    on_git_thread(move || async move {
-                        stash_apply(&entry, &client, &safety, &person, &stash_id, pop).await
-                    })
-                    .await
-                }
+                tool_stash_apply_or_pop(ctx, a, g, name, pop)
             }),
         );
     }
@@ -920,18 +644,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let source_ref = a.str("source_ref")?;
-                // Strict: a squash and a merge commit are different histories,
-                // so a bogus value must be refused, not silently read as false
-                // (FR-NEW-191, E2E-NEW-541).
-                let squash = a.strict_bool_or("squash", false)?;
-                let message = a.opt_str("message");
-                let store = authorize(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress_on(&store, &mount_id, "git.merge").await?;
-                merge_ref(&ctx, store, &mount_id, &source_ref, squash, message).await
-            }
+            tool_merge(ctx, a, g)
         }),
     );
 
@@ -961,12 +674,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                let resolutions = parse_resolutions(&ctx, a.raw("resolutions"))?;
-                merge_resolve(&ctx, store, &mount_id, resolutions).await
-            }
+            tool_merge_resolve(ctx, a, g)
         }),
     );
 
@@ -985,11 +693,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                merge_abort(&ctx, store, &mount_id).await
-            }
+            tool_merge_abort(ctx, a, g)
         }),
     );
 
@@ -1020,19 +724,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let onto = a.str("onto")?;
-                // FR-NEW-100: membership first, before anything else, so a non
-                // member is refused rather than told their payload is malformed.
-                let store = authorize(&ctx, &mount_id, g).await?;
-                // Then every pure check, so a malformed todo never even opens a
-                // repository (FR-NEW-215).
-                let todo = parse_todo(a.raw("todo"), ctx.state.config.git.max_rebase_todo)?;
-                let entry = open_on(&store, &mount_id).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.rebase").await?;
-                rebase(&ctx, entry, &mount_id, &onto, todo).await
-            }
+            tool_rebase(ctx, a, g)
         }),
     );
 
@@ -1063,13 +755,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                let resolutions =
-                    parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.rebase_continue")?;
-                replay_continue(&ctx, store, &mount_id, resolutions, &REBASE_FAMILY).await
-            }
+            tool_rebase_continue(ctx, a, g)
         }),
     );
 
@@ -1088,11 +774,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                replay_abort(&ctx, store, &mount_id, &REBASE_FAMILY).await
-            }
+            tool_rebase_abort(ctx, a, g)
         }),
     );
 
@@ -1127,19 +809,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                // FR-NEW-100: membership first, before anything else, so a non
-                // member is refused rather than told their payload is malformed.
-                let store = authorize(&ctx, &mount_id, g).await?;
-                // Then every pure check, so a malformed sha never opens a
-                // repository (FR-NEW-237).
-                let commit_sha = parse_commit_sha("git.cherry_pick", &a.str("commit_sha")?)?;
-                let mainline = parse_mainline("git.cherry_pick", a.raw("mainline"))?;
-                let entry = open_on(&store, &mount_id).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.cherry_pick").await?;
-                cherry_pick(&ctx, entry, &mount_id, commit_sha, mainline).await
-            }
+            tool_cherry_pick(ctx, a, g)
         }),
     );
 
@@ -1169,16 +839,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                let resolutions = parse_optional_resolutions(
-                    &ctx,
-                    a.raw("resolutions"),
-                    "git.cherry_pick_continue",
-                )?;
-                replay_continue(&ctx, store, &mount_id, resolutions, &CHERRY_PICK_FAMILY).await
-            }
+            tool_cherry_pick_continue(ctx, a, g)
         }),
     );
 
@@ -1197,11 +858,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                replay_abort(&ctx, store, &mount_id, &CHERRY_PICK_FAMILY).await
-            }
+            tool_cherry_pick_abort(ctx, a, g)
         }),
     );
 
@@ -1238,19 +895,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                // FR-NEW-100: membership first, before anything else, so a non
-                // member is refused rather than told their payload is malformed.
-                let store = authorize(&ctx, &mount_id, g).await?;
-                // Then every pure check, so a malformed sha or a mainline that
-                // is not a parent index never opens a repository.
-                let commit_sha = parse_commit_sha("git.revert", &a.str("commit_sha")?)?;
-                let mainline = parse_mainline("git.revert", a.raw("mainline"))?;
-                let entry = open_on(&store, &mount_id).await?;
-                reject_if_operation_in_progress(&entry, &mount_id, "git.revert").await?;
-                revert(&ctx, entry, &mount_id, commit_sha, mainline).await
-            }
+            tool_revert(ctx, a, g)
         }),
     );
 
@@ -1280,13 +925,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                let resolutions =
-                    parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.revert_continue")?;
-                replay_continue(&ctx, store, &mount_id, resolutions, &REVERT_FAMILY).await
-            }
+            tool_revert_continue(ctx, a, g)
         }),
     );
 
@@ -1305,11 +944,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                replay_abort(&ctx, store, &mount_id, &REVERT_FAMILY).await
-            }
+            tool_revert_abort(ctx, a, g)
         }),
     );
 
@@ -1339,20 +974,602 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (g, t) = (g.clone(), tokens.clone());
-            async move {
-                let mount_id = a.str("mount_id")?;
-                let branch = a.str("branch")?;
-                let remote = a.str_or("remote", "origin");
-                // FR-DEL-101: the parameter is gone, and a caller still sending
-                // it is told so rather than silently ignored, because it used
-                // to decide which side of every conflicting file survived.
-                reject_removed_on_conflict(&a)?;
-                let store = authorize(&ctx, &mount_id, g).await?;
-                reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_pull").await?;
-                remote_pull(&ctx, store, t, &mount_id, &remote, &branch).await
-            }
+            tool_remote_pull(ctx, a, g, t)
         }),
     );
+}
+
+// ── extracted tool handler functions (US-0011) ──────────────────────────────
+
+pub(crate) async fn tool_stash_apply_or_pop(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    name: &'static str,
+    pop: bool,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let stash_id = a.str("stash_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, name).await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(move || async move {
+        stash_apply(&entry, &client, &safety, &person, &stash_id, pop).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_init(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    store.init_repo(&mount_id).await?;
+    Ok(json!({
+        "mount_id": mount_id,
+        "initialized": true,
+        "message": "Git repository initialized",
+    }))
+}
+
+pub(crate) async fn tool_status(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    status(&mount_id, &entry).await
+}
+
+pub(crate) async fn tool_branches(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    // Through the blocking pool like every other libgit2 reader:
+    // the divergence counts are a graph walk (FR-MOD-106).
+    on_git_thread(move || async move { branches(&mount_id, &entry).await }).await
+}
+
+pub(crate) async fn tool_branch_create(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let name = a.str("name")?;
+    let start_point = a.opt_str("start_point").filter(|s| !s.is_empty());
+    let checkout = a.bool_or("checkout", false);
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.branch_create").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(move || async move {
+        branch_create(&entry, &client, &safety, &person, &name, start_point.as_deref(), checkout)
+            .await
+    })
+    .await
+}
+
+pub(crate) async fn tool_branch_switch(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let name = a.str("name")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.branch_switch").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(
+        move || async move { branch_switch(&entry, &client, &safety, &person, &name).await },
+    )
+    .await
+}
+
+pub(crate) async fn tool_branch_delete(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let name = a.str("name")?;
+    let force = a.bool_or("force", false);
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.branch_delete").await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(
+        move || async move { branch_delete(&entry, &safety, &person, &name, force).await },
+    )
+    .await
+}
+
+pub(crate) async fn tool_branch_reset(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let name = a.str("name")?;
+    let target_commit = a.str("target_commit")?;
+    let force = a.bool_or("force", false);
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.branch_reset").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(move || async move {
+        branch_reset(&entry, &client, &safety, &person, &name, &target_commit, force).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_reset(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let target_ref = a.str("target_ref")?;
+    let mode = ResetMode::parse(&a.str("mode")?)?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.reset").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(move || async move {
+        reset(&entry, &client, &safety, &person, &target_ref, mode).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_tags(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    let tags = refs_under(&entry, "refs/tags/").await?;
+    Ok(json!({"mount_id": mount_id, "tags": tags}))
+}
+
+pub(crate) async fn tool_log(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let ref_name = a.opt_str("ref_name");
+    let limit = a.int_or("limit", 20);
+    let path = a.opt_str("path");
+    let entry = open(&ctx, &mount_id, g).await?;
+    on_git_thread(move || async move {
+        log(&mount_id, &entry, ref_name.as_deref(), limit, path.as_deref()).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_show(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let commit_sha = a.str("commit_sha")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    on_git_thread(move || async move { show(&entry, &commit_sha).await }).await
+}
+
+pub(crate) async fn tool_diff(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let from_ref = a.str("from_ref")?;
+    let to_ref = a.opt_str("to_ref");
+    let path = a.opt_str("path");
+    let entry = open(&ctx, &mount_id, g).await?;
+    on_git_thread(move || async move {
+        diff(&mount_id, &entry, &from_ref, to_ref.as_deref(), path.as_deref()).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_commit(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let message = a.str("message")?;
+    let author_name = a.opt_str("author_name");
+    let author_email = a.opt_str("author_email");
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.commit").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let person = ctx.person.clone();
+    on_git_thread(move || async move {
+        commit(&entry, &client, &person, &message, author_name, author_email).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_checkout_file(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let commit_sha = a.str("commit_sha")?;
+    let path = a.str("path")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    let norm = ctx.state.safety.normalize_path(&path)?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let bytes = {
+        let (entry, norm, commit_sha) = (entry, norm.clone(), commit_sha.clone());
+        on_git_thread(move || async move { read_from_commit(&entry, &commit_sha, &norm).await })
+            .await?
+    };
+    // A restore is a write, so it is charged like any other.
+    ctx.state.safety.charge_write(&ctx.person, &mount_id, bytes.len() as i64)?;
+    client.write_bytes_atomic(&norm, &bytes).await?;
+    ctx.state.safety.record_audit(
+        &ctx.person,
+        &mount_id,
+        "git.checkout_file",
+        &norm,
+        &format!("from {commit_sha}"),
+    );
+    Ok(json!({"path": norm, "commit": commit_sha, "size": bytes.len()}))
+}
+
+pub(crate) async fn tool_blame(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let path = a.str("path")?;
+    let ref_name = a.opt_str("ref_name");
+    let entry = open(&ctx, &mount_id, g).await?;
+    let norm = ctx.state.safety.normalize_path(&path)?;
+    on_git_thread(move || async move { blame(&entry, &norm, ref_name.as_deref()).await }).await
+}
+
+pub(crate) async fn tool_remote_add(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let name = a.str("name")?;
+    let url = a.str("url")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.remote_add").await?;
+    remote_add(&ctx, &entry, &mount_id, &name, &url).await
+}
+
+pub(crate) async fn tool_remote_remove(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let name = a.str("name")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.remote_remove").await?;
+    remote_remove(&ctx, &entry, &mount_id, &name).await
+}
+
+pub(crate) async fn tool_remote_list(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    let remotes: Vec<Value> = entry
+        .db
+        .list_remotes()
+        .await?
+        .into_iter()
+        .map(|(name, url)| remote_entry(name, url))
+        .collect();
+    Ok(json!({"mount_id": mount_id, "remotes": remotes, "count": remotes.len()}))
+}
+
+pub(crate) async fn tool_remote_clone(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let url = a.str("url")?;
+    let branch = a.opt_str("branch");
+    let depth = a.int_or("depth", 0);
+    let store = authorize(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_clone").await?;
+    remote_clone(&ctx, store, t, &mount_id, &url, branch, depth).await
+}
+
+pub(crate) async fn tool_remote_push(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let branch = a.str("branch")?;
+    let remote = a.str_or("remote", "origin");
+    let remote_branch = a.opt_str("remote_branch");
+    let force = a.bool_or("force", false);
+    let lease = a.opt_str("expected_remote_sha");
+    let store = authorize(&ctx, &mount_id, g).await?;
+    // FR-NEW-156/158: the lease contradiction and the missing
+    // lease are settled here, before the remote is resolved, a
+    // credential is looked up or a socket is opened, so neither
+    // can ever reach the network (E2E-NEW-489, E2E-NEW-829).
+    // `push_branch_inner` checks it again for its own callers;
+    // the check is a pure function of the two arguments.
+    let lease = validate_force_lease(force, lease.as_deref())?;
+    // FR-MOD-102 with FR-NEW-104: the remote side name obeys the
+    // same rule as a local one, checked here, before any remote is
+    // resolved or contacted, and deliberately outside the audited
+    // operation: a malformed argument is not a remote operation.
+    if let Some(name) = remote_branch.as_deref() {
+        validate_branch_name(name)?;
+    }
+    remote_push(&ctx, store, t, &mount_id, &remote, &branch, remote_branch.as_deref(), force, lease)
+        .await
+}
+
+pub(crate) async fn tool_remote_fetch(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let remote = a.str_or("remote", "origin");
+    let store = authorize(&ctx, &mount_id, g).await?;
+    remote_fetch(&ctx, store, t, &mount_id, &remote).await
+}
+
+pub(crate) async fn tool_stash_save(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let message = a.opt_str("message");
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.stash_save").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    let max_entries = ctx.state.config.git.max_stash_entries;
+    on_git_thread(move || async move {
+        stash_save(&entry, &client, &safety, &person, max_entries, message).await
+    })
+    .await
+}
+
+pub(crate) async fn tool_stash_list(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    on_git_thread(move || async move { stash_list(&mount_id, &entry).await }).await
+}
+
+pub(crate) async fn tool_stash_drop(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let stash_id = a.str("stash_id")?;
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.stash_drop").await?;
+    let client = ctx.state.stores.client(&mount_id).await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(
+        move || async move { stash_drop(&entry, &client, &safety, &person, &stash_id).await },
+    )
+    .await
+}
+
+pub(crate) async fn tool_merge(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let source_ref = a.str("source_ref")?;
+    // Strict: a squash and a merge commit are different histories,
+    // so a bogus value must be refused, not silently read as false
+    // (FR-NEW-191, E2E-NEW-541).
+    let squash = a.strict_bool_or("squash", false)?;
+    let message = a.opt_str("message");
+    let store = authorize(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress_on(&store, &mount_id, "git.merge").await?;
+    merge_ref(&ctx, store, &mount_id, &source_ref, squash, message).await
+}
+
+pub(crate) async fn tool_merge_resolve(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions = parse_resolutions(&ctx, a.raw("resolutions"))?;
+    merge_resolve(&ctx, store, &mount_id, resolutions).await
+}
+
+pub(crate) async fn tool_merge_abort(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    merge_abort(&ctx, store, &mount_id).await
+}
+
+pub(crate) async fn tool_rebase(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let onto = a.str("onto")?;
+    // FR-NEW-100: membership first, before anything else, so a non
+    // member is refused rather than told their payload is malformed.
+    let store = authorize(&ctx, &mount_id, g).await?;
+    // Then every pure check, so a malformed todo never even opens a
+    // repository (FR-NEW-215).
+    let todo = parse_todo(a.raw("todo"), ctx.state.config.git.max_rebase_todo)?;
+    let entry = open_on(&store, &mount_id).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.rebase").await?;
+    rebase(&ctx, entry, &mount_id, &onto, todo).await
+}
+
+pub(crate) async fn tool_rebase_continue(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions =
+        parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.rebase_continue")?;
+    replay_continue(&ctx, store, &mount_id, resolutions, &REBASE_FAMILY).await
+}
+
+pub(crate) async fn tool_rebase_abort(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    replay_abort(&ctx, store, &mount_id, &REBASE_FAMILY).await
+}
+
+pub(crate) async fn tool_cherry_pick(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    // FR-NEW-100: membership first, before anything else, so a non
+    // member is refused rather than told their payload is malformed.
+    let store = authorize(&ctx, &mount_id, g).await?;
+    // Then every pure check, so a malformed sha never opens a
+    // repository (FR-NEW-237).
+    let commit_sha = parse_commit_sha("git.cherry_pick", &a.str("commit_sha")?)?;
+    let mainline = parse_mainline("git.cherry_pick", a.raw("mainline"))?;
+    let entry = open_on(&store, &mount_id).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.cherry_pick").await?;
+    cherry_pick(&ctx, entry, &mount_id, commit_sha, mainline).await
+}
+
+pub(crate) async fn tool_cherry_pick_continue(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions =
+        parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.cherry_pick_continue")?;
+    replay_continue(&ctx, store, &mount_id, resolutions, &CHERRY_PICK_FAMILY).await
+}
+
+pub(crate) async fn tool_cherry_pick_abort(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    replay_abort(&ctx, store, &mount_id, &CHERRY_PICK_FAMILY).await
+}
+
+pub(crate) async fn tool_revert(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    // FR-NEW-100: membership first, before anything else, so a non
+    // member is refused rather than told their payload is malformed.
+    let store = authorize(&ctx, &mount_id, g).await?;
+    // Then every pure check, so a malformed sha or a mainline that
+    // is not a parent index never opens a repository.
+    let commit_sha = parse_commit_sha("git.revert", &a.str("commit_sha")?)?;
+    let mainline = parse_mainline("git.revert", a.raw("mainline"))?;
+    let entry = open_on(&store, &mount_id).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.revert").await?;
+    revert(&ctx, entry, &mount_id, commit_sha, mainline).await
+}
+
+pub(crate) async fn tool_revert_continue(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    let resolutions =
+        parse_optional_resolutions(&ctx, a.raw("resolutions"), "git.revert_continue")?;
+    replay_continue(&ctx, store, &mount_id, resolutions, &REVERT_FAMILY).await
+}
+
+pub(crate) async fn tool_revert_abort(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    replay_abort(&ctx, store, &mount_id, &REVERT_FAMILY).await
+}
+
+pub(crate) async fn tool_remote_pull(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let mount_id = a.str("mount_id")?;
+    let branch = a.str("branch")?;
+    let remote = a.str_or("remote", "origin");
+    // FR-DEL-101: the parameter is gone, and a caller still sending
+    // it is told so rather than silently ignored, because it used
+    // to decide which side of every conflicting file survived.
+    reject_removed_on_conflict(&a)?;
+    let store = authorize(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress_on(&store, &mount_id, "git.remote_pull").await?;
+    remote_pull(&ctx, store, t, &mount_id, &remote, &branch).await
 }
 
 // ── gates and plumbing ──────────────────────────────────────────────────────

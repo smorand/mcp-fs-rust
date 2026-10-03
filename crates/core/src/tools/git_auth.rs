@@ -63,6 +63,12 @@ pub fn register(reg: &mut ToolRegistry) {
     register_with(reg, None, None);
 }
 
+/// The schema/annotation catalog for every `git.auth*`/`git.token_set` tool
+/// registered by [`register`].
+pub fn catalog() -> Vec<super::catalog::ToolCatalogEntry> {
+    super::catalog::from_register(register)
+}
+
 /// Registration with injected dependencies, for tests: a token store that is not
 /// the process singleton and a fake device flow that never reaches the network.
 pub fn register_with(
@@ -89,17 +95,7 @@ pub fn register_with(
         .open_world(true),
         handler(move |ctx: ToolCtx, a| {
             let (t, f) = (t.clone(), f.clone());
-            async move {
-                let provider = a.str("provider")?;
-                let host = a.opt_str("host");
-                let instance_url = a.opt_str("instance_url");
-                let tokens = resolve_tokens(&ctx, t).await?;
-                let flow = match f {
-                    Some(f) => f,
-                    None => device_flow(&ctx.state.config)?,
-                };
-                auth(&ctx, &provider, host, instance_url, tokens, flow).await
-            }
+            tool_auth(ctx, a, t, f)
         }),
     );
 
@@ -122,15 +118,7 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
-            async move {
-                let tokens = resolve_tokens(&ctx, t).await?;
-                auth_status(
-                    &ctx,
-                    a.opt_str("provider").as_deref(),
-                    a.opt_str("host").as_deref(),
-                    &tokens,
-                )
-            }
+            tool_auth_status(ctx, a, t)
         }),
     );
 
@@ -145,12 +133,7 @@ pub fn register_with(
             .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
-            async move {
-                let provider = a.opt_str("provider");
-                let host = a.opt_str("host");
-                let tokens = resolve_tokens(&ctx, t).await?;
-                auth_revoke(&ctx, provider.as_deref(), host.as_deref(), &tokens).await
-            }
+            tool_auth_revoke(ctx, a, t)
         }),
     );
 
@@ -177,23 +160,66 @@ pub fn register_with(
         .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let t = t.clone();
-            async move {
-                let host = a.str("host")?;
-                let token = a.str("token")?;
-                let expires_at = match a.raw("expires_at") {
-                    None => None,
-                    Some(Value::String(s)) => Some(s.clone()),
-                    Some(_) => {
-                        return Err(ToolError::invalid_argument(
-                            "argument 'expires_at' must be an RFC 3339 timestamp string",
-                        ));
-                    }
-                };
-                let tokens = resolve_tokens(&ctx, t).await?;
-                token_set(&ctx, &host, &token, expires_at, &tokens).await
-            }
+            tool_token_set(ctx, a, t)
         }),
     );
+}
+
+pub(crate) async fn tool_auth(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    t: Option<Arc<OAuthTokenStore>>,
+    f: Option<Arc<dyn DeviceFlowClient>>,
+) -> Result<Value> {
+    let provider = a.str("provider")?;
+    let host = a.opt_str("host");
+    let instance_url = a.opt_str("instance_url");
+    let tokens = resolve_tokens(&ctx, t).await?;
+    let flow = match f {
+        Some(f) => f,
+        None => device_flow(&ctx.state.config)?,
+    };
+    auth(&ctx, &provider, host, instance_url, tokens, flow).await
+}
+
+pub(crate) async fn tool_auth_status(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    t: Option<Arc<OAuthTokenStore>>,
+) -> Result<Value> {
+    let tokens = resolve_tokens(&ctx, t).await?;
+    auth_status(&ctx, a.opt_str("provider").as_deref(), a.opt_str("host").as_deref(), &tokens)
+}
+
+pub(crate) async fn tool_auth_revoke(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    t: Option<Arc<OAuthTokenStore>>,
+) -> Result<Value> {
+    let provider = a.opt_str("provider");
+    let host = a.opt_str("host");
+    let tokens = resolve_tokens(&ctx, t).await?;
+    auth_revoke(&ctx, provider.as_deref(), host.as_deref(), &tokens).await
+}
+
+pub(crate) async fn tool_token_set(
+    ctx: ToolCtx,
+    a: crate::mcp::Args,
+    t: Option<Arc<OAuthTokenStore>>,
+) -> Result<Value> {
+    let host = a.str("host")?;
+    let token = a.str("token")?;
+    let expires_at = match a.raw("expires_at") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err(ToolError::invalid_argument(
+                "argument 'expires_at' must be an RFC 3339 timestamp string",
+            ));
+        }
+    };
+    let tokens = resolve_tokens(&ctx, t).await?;
+    token_set(&ctx, &host, &token, expires_at, &tokens).await
 }
 
 async fn resolve_tokens(
