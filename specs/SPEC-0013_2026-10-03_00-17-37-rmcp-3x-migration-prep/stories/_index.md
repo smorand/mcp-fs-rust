@@ -25,7 +25,11 @@
 | 6 | US-0006 | n/a | Migrate git.auth* (4) + git.pr_* (6) tools | DR-002 | n/a | E2E-GITAUTH-001..003 | 1 | US-0002 | 2 | done |
 | 7 | US-0007 | n/a | Finalize tool surface: golden contract green, 94-tool list | DR-005 | n/a | DT-005, DT-007 | 2-3 | US-0003,US-0004,US-0005,US-0006 | 2 | done |
 | 8 | US-0008 | n/a | Transport swap: rmcp StreamableHttpService + agent client + break tests | DR-008,DR-009,DR-010 | n/a | DT-001..004 + 18 existing-test verdicts | 4 | US-0007 | 2 | done |
-| 9 | US-0009 | n/a | Delete old mcp layer + final suite/clippy/fmt gate | DR-003 | n/a | DT-006, DT-FINAL-001, DT-008 (ack) | 4 | US-0008 | 2 | todo |
+| 9 | US-0009 | n/a | Delete old mcp layer + final suite/clippy/fmt gate | DR-003 | n/a | DT-006, DT-FINAL-001, DT-008 (ack) | 4 | US-0010,US-0011,US-0012,US-0013 | 2 | todo |
+| 10 | US-0010 | n/a | Wean fs.*/admin.*/search.* tool families off ToolRegistry (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | ~10 | US-0009-orig-attempt | 2 | todo |
+| 11 | US-0011 | n/a | Wean git.*/git_auth.*/git_pr.* tool families off ToolRegistry (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | 4 | US-0009-orig-attempt | 2 | todo |
+| 12 | US-0012 | n/a | Replace web.*/context7.*/sqlite.*/db.*/doc.* ToolRegistry registration with a lightweight catalog-only structure (discovered drift) | DR-003 (surplus) | n/a | none new, preserve existing coverage | ~5 | US-0009-orig-attempt | 2 | todo |
+| 13 | US-0013 | n/a | Rewire api/openapi.rs catalog onto McpServer's rmcp router + the new lightweight catalogs; remove AppState.registry/register_all/EnabledFeatures (discovered drift) | DR-003 (surplus) | n/a | none new, preserve openapi.rs output shape | 2 | US-0010,US-0011,US-0012 | 2 | todo |
 
 ## Dependency Graph
 ```
@@ -37,8 +41,18 @@ US-0001 (drift gate)
           └── US-0006 (git.auth*+git.pr_*)
                  └── US-0007 (golden contract closes out all 4 families)
                         └── US-0008 (transport swap, declared breaks)
-                               └── US-0009 (delete old layer, final gate)
+                               └── US-0009 (first attempt: discovered the ~20-file blast radius,
+                                            logged as drift/2026-10-03_04-05-29.md, did not
+                                            delete anything, user authorized expanded scope)
+                                      ├── US-0010 (wean fs.*/admin.*/search.* off ToolRegistry)
+                                      ├── US-0011 (wean git family off ToolRegistry)
+                                      ├── US-0012 (web/context7/sqlite/db/doc -> catalog-only)
+                                      └── US-0013 (rewire openapi.rs onto the new catalogs)
+                                             └── US-0009 (re-run: delete old layer, final gate)
 ```
+
+> Note: US-0010/0011/0012 touch disjoint file sets (no two write the same file) and may run in
+> parallel. US-0013 depends on all three. US-0009 is re-run once US-0013 lands.
 
 ## Coverage Verification (Phase 5 gate)
 - Requirements in spec (`DR-`): 10 | assigned: 10 (DR-001→US-0002, DR-002→US-0003/0004/0005/0006,
