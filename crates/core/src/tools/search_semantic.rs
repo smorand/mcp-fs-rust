@@ -246,6 +246,14 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
     );
 }
 
+/// Plain catalog view of this family, independent of `ToolRegistry`.
+///
+/// `_config` is unused by `register` itself (the four schemas don't vary with
+/// config), so the catalog is built against a default `SearchConfig`.
+pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    crate::tools::catalog::from_register(|reg| register(reg, &SearchConfig::default()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -209,6 +209,11 @@ fn audit_log(ctx: &ToolCtx, a: &Args, mount: &str) -> Value {
     json!({"entries": recent})
 }
 
+/// Plain catalog view of this family, independent of `ToolRegistry`.
+pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    crate::tools::catalog::from_register(register)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -188,6 +188,11 @@ fn edit_specs(a: &crate::mcp::Args) -> Result<Vec<Value>> {
     }
 }
 
+/// Plain catalog view of this family, independent of `ToolRegistry`.
+pub fn catalog() -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    crate::tools::catalog::from_register(register)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

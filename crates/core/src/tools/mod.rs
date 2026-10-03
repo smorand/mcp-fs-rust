@@ -18,6 +18,7 @@
 
 pub mod admin;
 pub mod all;
+pub mod catalog;
 pub mod context7;
 #[cfg(test)]
 pub(crate) mod contract_golden;
