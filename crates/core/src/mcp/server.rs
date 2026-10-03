@@ -64,13 +64,17 @@ pub struct McpServer {
     tool_router: ToolRouter<Self>,
     /// The old hand-rolled `git.*` registry, built once and reused.
     ///
-    /// `git.*` handlers are private free functions inside `crate::tools::git`
-    /// (status/branches/commit/merge/...), unlike `fs.*`/`admin.*` which call a
-    /// shared public engine (`core::fs_ops`). Rather than duplicating that
-    /// private logic here, each `git.*` `#[tool]` method below re-dispatches
-    /// into this registry by name: it runs the exact same handler code (same
-    /// authorize, same `on_git_thread`, same `git::repo`/`git::merge`/`git::odb`
-    /// calls), nothing reimplemented.
+    /// `git.*` handlers are private free functions inside `crate::tools::git`,
+    /// `crate::tools::git_auth` and `crate::tools::git_pr`
+    /// (status/branches/commit/merge/auth/pr_.../...), unlike `fs.*`/`admin.*`
+    /// which call a shared public engine (`core::fs_ops`). Rather than
+    /// duplicating that private logic here, each `git.*` `#[tool]` method below
+    /// re-dispatches into this registry by name: it runs the exact same handler
+    /// code (same authorize, same `on_git_thread`, same
+    /// `git::repo`/`git::merge`/`git::odb`/`git::oauth`/`git::provider` calls),
+    /// nothing reimplemented. This includes the `git.auth*` and `git.pr_*`
+    /// tools added in US-0006, for the same reason recorded in
+    /// `specs/SPEC-0013_2026-10-03_00-17-37-rmcp-3x-migration-prep/drift/2026-10-03_02-05-00.md`.
     git_tools: Arc<crate::mcp::ToolRegistry>,
 }
 
@@ -78,6 +82,8 @@ impl McpServer {
     pub fn new(state: Arc<AppState>, person: String) -> Self {
         let mut git_tools = crate::mcp::ToolRegistry::new();
         crate::tools::git::register(&mut git_tools);
+        crate::tools::git_auth::register(&mut git_tools);
+        crate::tools::git_pr::register(&mut git_tools);
         Self { state, person, tool_router: Self::tool_router(), git_tools: Arc::new(git_tools) }
     }
 
@@ -538,6 +544,145 @@ pub struct CopyArgs {
 pub struct MountOnlyArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
+}
+
+// ── git.auth*/git.pr_* parameter structs ──────────────────────────────
+
+fn def_pr_state() -> String {
+    "open".to_string()
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitAuthArgs {
+    /// OAuth provider, github or gitlab.
+    pub provider: String,
+    /// Host to authenticate against; defaults to the provider's public host.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Base URL of a self-hosted GitLab instance.
+    #[serde(default)]
+    pub instance_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitAuthRevokeArgs {
+    /// OAuth provider, github or gitlab.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Host to revoke the token for.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitAuthStatusArgs {
+    /// OAuth provider, github or gitlab.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Host to check the status for.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitTokenSetArgs {
+    /// Host the token belongs to, as declared in git.hosts.
+    pub host: String,
+    /// Personal access token value. Never echoed back.
+    pub token: String,
+    /// Expiry timestamp for the token, if known.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitPrCreateArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Base branch the pull request merges into.
+    pub base: String,
+    /// Head branch carrying the change.
+    pub head: String,
+    /// Pull request title.
+    pub title: String,
+    /// Pull request body/description.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Open the pull request as a draft.
+    #[serde(default)]
+    pub draft: bool,
+    /// Name of the declared remote the pull request targets.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitPrDiffArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Pull request number.
+    pub pr_number: i64,
+    /// Name of the declared remote the pull request belongs to.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitPrGetArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Pull request number.
+    pub pr_number: i64,
+    /// Name of the declared remote the pull request belongs to.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitPrListArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Filter: open, closed, merged, or all.
+    #[serde(default = "def_pr_state")]
+    pub state: String,
+    /// Name of the declared remote to list pull requests for.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitPrMergeArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Pull request number.
+    pub pr_number: i64,
+    /// Merge strategy: merge, squash, or rebase.
+    pub strategy: String,
+    /// Commit title for the merge, when the provider supports overriding it.
+    #[serde(default)]
+    pub commit_title: Option<String>,
+    /// Commit message for the merge, when the provider supports overriding it.
+    #[serde(default)]
+    pub commit_message: Option<String>,
+    /// Name of the declared remote the pull request belongs to.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitPrReviewArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Pull request number.
+    pub pr_number: i64,
+    /// Review verdict: approve, request_changes, or comment.
+    pub verdict: String,
+    /// Review body; required for request_changes and comment.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Name of the declared remote the pull request belongs to.
+    #[serde(default = "def_origin")]
+    pub remote: String,
 }
 
 // ── git.* parameter structs ──────────────────────────────────────────
@@ -2797,6 +2942,132 @@ impl McpServer {
             self.call_git("git.stash_drop", serde_json::to_value(&a).expect("serialize")).await;
         to_call_result("git.stash_drop", out)
     }
+
+    // ── git.auth* family (4 tools) ────────────────────────────────────
+
+    #[tool(
+        name = "git.auth",
+        description = "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri."
+    )]
+    async fn git_auth(
+        &self,
+        Parameters(a): Parameters<GitAuthArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.auth", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.auth", out)
+    }
+
+    #[tool(name = "git.auth_revoke", description = "Revoke the stored token for a provider.")]
+    async fn git_auth_revoke(
+        &self,
+        Parameters(a): Parameters<GitAuthRevokeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.auth_revoke", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.auth_revoke", out)
+    }
+
+    #[tool(
+        name = "git.auth_status",
+        description = "Check authentication status for a provider (or all providers)."
+    )]
+    async fn git_auth_status(
+        &self,
+        Parameters(a): Parameters<GitAuthStatusArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.auth_status", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.auth_status", out)
+    }
+
+    #[tool(
+        name = "git.token_set",
+        description = "Seed a personal access token you already hold for a host declared in git.hosts, without the interactive device flow. The token is never echoed back."
+    )]
+    async fn git_token_set(
+        &self,
+        Parameters(a): Parameters<GitTokenSetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.token_set", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.token_set", out)
+    }
+
+    // ── git.pr_* family (6 tools) ────────────────────────────────────
+
+    #[tool(
+        name = "git.pr_create",
+        description = "Open a pull request on GitHub, or a merge request on GitLab, for a declared remote. Fails before contacting the provider when the head branch is not on the remote yet."
+    )]
+    async fn git_pr_create(
+        &self,
+        Parameters(a): Parameters<GitPrCreateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.pr_create", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.pr_create", out)
+    }
+
+    #[tool(
+        name = "git.pr_diff",
+        description = "Read the unified diff of one pull request on GitHub, or one merge request on GitLab. The answer is bounded by git.max_pr_diff_mb; a larger diff is returned truncated, with truncated set to true."
+    )]
+    async fn git_pr_diff(
+        &self,
+        Parameters(a): Parameters<GitPrDiffArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.pr_diff", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.pr_diff", out)
+    }
+
+    #[tool(
+        name = "git.pr_get",
+        description = "Read one pull request on GitHub, or one merge request on GitLab, normalized to one shape and enriched with its review state and its check state. Fails rather than reporting an unknown review or check state as none."
+    )]
+    async fn git_pr_get(
+        &self,
+        Parameters(a): Parameters<GitPrGetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.pr_get", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.pr_get", out)
+    }
+
+    #[tool(
+        name = "git.pr_list",
+        description = "List the pull requests of a declared remote on GitHub, or its merge requests on GitLab, filtered by state and normalized to one shape."
+    )]
+    async fn git_pr_list(
+        &self,
+        Parameters(a): Parameters<GitPrListArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.pr_list", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.pr_list", out)
+    }
+
+    #[tool(
+        name = "git.pr_merge",
+        description = "Merge a pull request on GitHub, or a merge request on GitLab, with the chosen strategy. The merge happens on the provider: no local ref and no remote-tracking ref is updated, so git.remote_fetch is required to observe it locally. A refusal by the provider (failing checks, missing reviews, a protected branch, a strategy disabled for that repository, an already merged or closed pull request) is reported as the provider's own status and message, never as a success."
+    )]
+    async fn git_pr_merge(
+        &self,
+        Parameters(a): Parameters<GitPrMergeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self.call_git("git.pr_merge", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.pr_merge", out)
+    }
+
+    #[tool(
+        name = "git.pr_review",
+        description = "Submit a review verdict on a pull request on GitHub, or on a merge request on GitLab: approve it, request changes, or comment. On GitLab, which has no review verdict, approve uses the approve endpoint while the other two leave a note. A refusal by the provider (reviewing one's own pull request, a token the provider no longer accepts) is reported as the provider's own status and message, never as a success."
+    )]
+    async fn git_pr_review(
+        &self,
+        Parameters(a): Parameters<GitPrReviewArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            self.call_git("git.pr_review", serde_json::to_value(&a).expect("serialize")).await;
+        to_call_result("git.pr_review", out)
+    }
 }
 
 #[cfg(test)]
@@ -2843,6 +3114,40 @@ mod tests {
         ("git.log", "List commits. ref_name defaults to HEAD."),
         ("git.show", "Show details and diff of a commit."),
         ("git.tags", "List all tags."),
+        (
+            "git.auth",
+            "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
+        ),
+        ("git.auth_revoke", "Revoke the stored token for a provider."),
+        ("git.auth_status", "Check authentication status for a provider (or all providers)."),
+        (
+            "git.token_set",
+            "Seed a personal access token you already hold for a host declared in git.hosts, without the interactive device flow. The token is never echoed back.",
+        ),
+        (
+            "git.pr_create",
+            "Open a pull request on GitHub, or a merge request on GitLab, for a declared remote. Fails before contacting the provider when the head branch is not on the remote yet.",
+        ),
+        (
+            "git.pr_diff",
+            "Read the unified diff of one pull request on GitHub, or one merge request on GitLab. The answer is bounded by git.max_pr_diff_mb; a larger diff is returned truncated, with truncated set to true.",
+        ),
+        (
+            "git.pr_get",
+            "Read one pull request on GitHub, or one merge request on GitLab, normalized to one shape and enriched with its review state and its check state. Fails rather than reporting an unknown review or check state as none.",
+        ),
+        (
+            "git.pr_list",
+            "List the pull requests of a declared remote on GitHub, or its merge requests on GitLab, filtered by state and normalized to one shape.",
+        ),
+        (
+            "git.pr_merge",
+            "Merge a pull request on GitHub, or a merge request on GitLab, with the chosen strategy. The merge happens on the provider: no local ref and no remote-tracking ref is updated, so git.remote_fetch is required to observe it locally. A refusal by the provider (failing checks, missing reviews, a protected branch, a strategy disabled for that repository, an already merged or closed pull request) is reported as the provider's own status and message, never as a success.",
+        ),
+        (
+            "git.pr_review",
+            "Submit a review verdict on a pull request on GitHub, or on a merge request on GitLab: approve it, request changes, or comment. On GitLab, which has no review verdict, approve uses the approve endpoint while the other two leave a note. A refusal by the provider (reviewing one's own pull request, a token the provider no longer accepts) is reported as the provider's own status and message, never as a success.",
+        ),
     ];
 
     #[test]
@@ -2858,7 +3163,7 @@ mod tests {
     }
 
     #[test]
-    fn total_tool_count_is_eighty_eight() {
+    fn total_tool_count_is_ninety_eight() {
         let router = McpServer::tool_router();
         let names: Vec<String> =
             router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -2869,8 +3174,30 @@ mod tests {
         assert_eq!(fs_count, 35, "got: {names:?}");
         assert_eq!(admin_count, 10, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
-        assert_eq!(git_count, 39, "got: {names:?}");
-        assert_eq!(names.len(), 88, "got: {names:?}");
+        assert_eq!(git_count, 49, "got: {names:?}");
+        assert_eq!(names.len(), 98, "got: {names:?}");
+    }
+
+    #[test]
+    fn every_git_auth_and_pr_tool_is_registered() {
+        const ALL_GIT_AUTH_PR_TOOLS: [&str; 10] = [
+            "git.auth",
+            "git.auth_revoke",
+            "git.auth_status",
+            "git.token_set",
+            "git.pr_create",
+            "git.pr_diff",
+            "git.pr_get",
+            "git.pr_list",
+            "git.pr_merge",
+            "git.pr_review",
+        ];
+        let router = McpServer::tool_router();
+        let names: std::collections::HashSet<String> =
+            router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        for name in ALL_GIT_AUTH_PR_TOOLS {
+            assert!(names.contains(name), "{name} is missing from the router");
+        }
     }
 
     #[test]
@@ -3035,6 +3362,52 @@ mod tests {
         let conflicts = out["conflicts"].as_array().expect("conflicts array");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0]["path"], CFG);
+    }
+
+    /// `tracing_subscriber`'s `MakeWriter` over a shared buffer, same pattern
+    /// as `tools::git_pr::tests::no_token_value_reaches_a_tracing_span_or_a_log_line`.
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// E2E-GITAUTH-002: a fake token value passed to the new `git.token_set`
+    /// `#[tool]` method never reaches a captured tracing span or log line,
+    /// whether the call succeeds or fails.
+    #[tokio::test]
+    async fn git_token_set_tool_never_logs_the_token_value() {
+        const FAKE_TOKEN: &str = "FAKE_SECRET_TOKEN_zzz_never_logged_123";
+
+        let (_f, server) = git_env().await;
+
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || CaptureWriter(writer.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let _ = server
+            .git_token_set(Parameters(GitTokenSetArgs {
+                host: "example-not-declared.test".to_string(),
+                token: FAKE_TOKEN.to_string(),
+                expires_at: None,
+            }))
+            .await;
+
+        drop(guard);
+        let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(!captured.contains(FAKE_TOKEN), "token leaked into logs: {captured}");
     }
 
     #[test]
