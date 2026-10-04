@@ -26,9 +26,10 @@ which is not its target). This project's own tool contract is authoritative:
 `TOOL_CONTRACT.txt` for humans, `tool-contract-golden.json` machine checked on every test
 run. Lineage and design decisions: `.agent_docs/lineage.md`.
 
-Stack: Rust 2024, axum + tokio, rusqlite (bundled), sqlx (optional, PostgreSQL),
-tiberius-ng + bb8 (optional, SQL Server), aws-sdk-s3, jsonwebtoken + rsa, git2 (libgit2),
-tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap, tracing.
+Stack: Rust 2024, axum + tokio, rmcp 3.5.0 (`server` + `transport-streamable-http-server`
+features only, the one production MCP transport, SPEC-0013), rusqlite (bundled), sqlx (optional,
+PostgreSQL), tiberius-ng + bb8 (optional, SQL Server), aws-sdk-s3, jsonwebtoken + rsa, git2
+(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap, tracing.
 
 Cargo features, none in `default`: `postgres`, `sqlserver`, `rag`, `all-backends`. A default build
 is SQLite only and carries neither relational driver. The `rag` feature enables pgvector (PostgreSQL)
@@ -62,11 +63,17 @@ sysroot crate). `crates/mcp-fs` keeps only `src/main.rs` (9 lines) and a path de
 `mcp-fs-core`; its `postgres`/`sqlserver`/`rag`/`all-backends` features forward to the same
 features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unless noted.
 - `cli.rs` : clap verbs (serve/keys/token/version), config path resolution.
-- `app.rs` : axum Router assembly, shared state, the MCP endpoint, `/health`.
-- `mcp/` : the hand-rolled MCP layer. `mod.rs` (JSON-RPC + SSE framing, result/error helpers),
-  `registry.rs` (name -> schema + handler, dot/underscore tolerant resolve), `schema.rs`
-  (declarative builder emitting the frozen JSON Schema exactly), `args.rs` (typed, tolerant
-  argument accessors).
+- `app.rs` : axum Router assembly, shared state, the MCP route (an `rmcp` `StreamableHttpService`
+  wrapping `mcp::server::McpServer`, `LocalSessionManager` + `legacy_session_mode: true` so
+  `initialize` is mandatory; see `.agent_docs/architecture.md` for the exact wire shapes), `/health`.
+- `mcp/` : `server.rs` only — `McpServer`, one `#[tool]` method per entry in `TOOL_CONTRACT.txt`
+  (94 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
+  calls, never reimplementing an operation. The hand-rolled JSON-RPC/SSE framing layer this module
+  used to own (`ToolRegistry`/`ToolSchema`/`Args`/`ToolHandler`) is gone (SPEC-0013); what remains
+  of that machinery lives at `tools::registry_support`, kept only because `Args`/`ToolCtx` are the
+  test-dispatch types for the five optional families' `#[cfg(test)]`-gated `register()` and the
+  shared test harness, and `ToolRegistry`/`ToolSchema` back the five optional families'
+  (`web`/`context7`/`sqlite`/`db`/`doc`) production `catalog()` read by `/api/swagger.json`.
 - `config.rs` : full `ServerConfig` + `${VAR}` expansion + `Dsn` (redacts in Debug and
   Display) + boot validation of every `infra.*` store.
 - `errors.rs` : the 14 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
@@ -85,8 +92,13 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `docs/` : `extract.rs`, `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
   `ocr.rs` (pluggable, null by default), `mime.rs`, `service.rs` (the external
   document to Markdown converter, cli or api, off by default).
-- `tools/` : one module per family, each `register(&mut ToolRegistry)`. `all.rs` has
-  `register_all`.
+- `tools/` : one module per family. Every family exposes typed `pub(crate)` async functions
+  (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the
+  REST plane); `register(&mut ToolRegistry)` survives only as `#[cfg(test)]`-gated glue for the
+  shared test harness, except the five optional families (`web`/`context7`/`sqlite`/`db`/`doc`,
+  off by default, not part of the 94-tool contract), whose `register()`/`catalog()` are genuine
+  production code backing `/api/swagger.json`. `catalog.rs` holds the transport-agnostic
+  `ToolCatalogEntry` shape; `all.rs` has the now-test-only `register_all`.
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
 - `git/` : `db.rs` (SQLite index, plus the `git_operations` row that persists a paused
   combine operation), `merge.rs` (the shared merge engine: one three way merge, one atomic

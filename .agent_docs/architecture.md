@@ -15,7 +15,7 @@ plane can never disagree.
 +------+--------------------------+----------------------------+-----------+
        |                          |                            |
 +------v---------+     +----------v-----------+     +----------v---------+
-| mcp::registry  |     | api::dataplane       |     | git::http          |
+| mcp::server    |     | api::dataplane       |     | git::http          |
 | 94 tools       |     | 38 routes            |     | smart protocol v0  |
 +------+---------+     +----------+-----------+     +----------+---------+
        |                          |                            |
@@ -146,14 +146,32 @@ reached 0.
 | Bearer extraction | `identity.rs`, configured header then `Authorization`, also Basic with the token as password | `ERR_UNAUTHENTICATED` |
 | RS256 verification | signature, `iss`, `exp`/`nbf`, 30s leeway, identity from `username_claim`, lowercased | HTTP 401 JSON `{error, detail}` |
 | Membership gate | `AppState::authorize` -> `AdminBackend::require_member` | `ERR_PROJECT_NOT_FOUND` (404) or `ERR_FORBIDDEN` (403) |
-| Tool dispatch | `mcp::registry`, exact name then a dot/underscore tolerant match | unknown tool: JSON-RPC `-32602` |
-| Argument parsing | `mcp::args`, tolerant accessors (string arrays accept an array, a bare string, or a comma separated string) | `ERR_INVALID_ARGUMENT` (400) |
+| Tool dispatch | `mcp::server::McpServer`'s `rmcp` tool router (`#[tool_router]`/`#[tool]`) | unknown tool: JSON-RPC `-32602` |
+| Argument parsing | `rmcp`'s `schemars`-derived `Parameters<T>` structs, one per tool, deserialized straight from the JSON-RPC params; every `#[tool]` method passes typed fields directly into the engine function it calls (no `Args`/JSON accessor layer in production) | `ERR_INVALID_ARGUMENT` (400) |
 
 The MCP endpoint is the only guarded route on the JSON-RPC side; `/health` and
 the OpenAPI pair are public by design. The REST plane verifies the bearer per
 request in `dataplane::guarded`, and the git routes have their own gate (see
 `.agent_docs/git.md`). A tool failure is a *result* carrying `isError`, not a
 JSON-RPC error: only an unknown tool or an unknown method is a protocol error.
+
+**MCP transport (rmcp 3.5.0, SPEC-0013).** `app::build` mounts `rmcp`'s
+`StreamableHttpService` over `mcp::server::McpServer` at `mcp_path`, configured
+with `LocalSessionManager` + `legacy_session_mode: true`. Two real, observed
+behaviors to know before touching this:
+* `initialize` is genuinely mandatory. A bare `tools/call`/`tools/list` with no
+  prior `initialize` on a fresh connection gets **HTTP 422**, plain-text body
+  `"Unexpected message, expect initialize request"` — not a JSON-RPC envelope.
+  This is rmcp's own behavior under this session-manager pairing, empirically
+  verified against the real crate source (not assumed from docs); see the
+  SPEC-0013 drift directory for the full investigation.
+* Once initialized, a plain tool call's response stays **`text/event-stream`**
+  (SSE), same as before the migration — `rmcp`'s JSON-default framing mode is
+  only reachable in a *stateless* configuration incompatible with mandatory
+  `initialize`, so that particular declared break never materializes in this
+  server's actual shipped behavior.
+* `crates/agent/src/mcp.rs`'s client performs `initialize` + `notifications/
+  initialized` before its first real call, matching this.
 
 ## Safety contract (`safety.rs`)
 

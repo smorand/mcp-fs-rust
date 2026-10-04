@@ -9,9 +9,9 @@
 
 use crate::core::fs_ops;
 use crate::errors::{Result, ToolError};
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::search::indexer;
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 use serde_json::Value;
 
@@ -19,7 +19,8 @@ use serde_json::Value;
 /// `List<EditSpec>` (property order included, and no `required` list).
 const EDIT_ITEMS: &str = r#"{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}}}"#;
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.edit", "Replace a unique string; dry_run returns the diff.")
             .req_str("mount_id", "Project/volume id the operation targets.")
@@ -180,7 +181,7 @@ pub fn register(reg: &mut ToolRegistry) {
 /// Take `edits` as raw JSON: the engine reads `old_string` / `new_string` /
 /// `replace_all` per entry with the same defaults the C# `EditSpec` has, so no
 /// intermediate struct is needed.
-fn edit_specs(a: &crate::mcp::Args) -> Result<Vec<Value>> {
+fn edit_specs(a: &crate::tools::registry_support::Args) -> Result<Vec<Value>> {
     match a.raw("edits") {
         Some(Value::Array(v)) => Ok(v.clone()),
         Some(_) => Err(ToolError::invalid_argument("argument 'edits' must be an array of objects")),

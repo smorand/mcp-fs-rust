@@ -792,18 +792,19 @@ mod scenarios {
             .await
             .expect("the member must be addable");
 
-        let ctx = crate::mcp::registry::ToolCtx {
+        let ctx = crate::tools::registry_support::ToolCtx {
             person: "member@x.y".to_string(),
             state: h.inner.state.clone(),
         };
         let err = h
             .inner
-            .state
             .registry
             .call(
                 "admin.set_index_mode",
                 ctx.clone(),
-                crate::mcp::Args::new(json!({"project_id": MOUNT, "mode": mode})),
+                crate::tools::registry_support::Args::new(
+                    json!({"project_id": MOUNT, "mode": mode}),
+                ),
             )
             .await
             .expect("the tool must be registered")
@@ -814,9 +815,12 @@ mod scenarios {
         // an accident of the project being invisible to them.
         let read = h
             .inner
-            .state
             .registry
-            .call("admin.get_index_mode", ctx, crate::mcp::Args::new(json!({"project_id": MOUNT})))
+            .call(
+                "admin.get_index_mode",
+                ctx,
+                crate::tools::registry_support::Args::new(json!({"project_id": MOUNT})),
+            )
             .await
             .expect("the tool must be registered")
             .expect("a member may read the mode");
@@ -825,15 +829,18 @@ mod scenarios {
 
     /// A stranger cannot even read it.
     pub async fn non_member_cannot_read_index_mode(h: &E2eHarness) {
-        let ctx = crate::mcp::registry::ToolCtx {
+        let ctx = crate::tools::registry_support::ToolCtx {
             person: "stranger@x.y".to_string(),
             state: h.inner.state.clone(),
         };
         let err = h
             .inner
-            .state
             .registry
-            .call("admin.get_index_mode", ctx, crate::mcp::Args::new(json!({"project_id": MOUNT})))
+            .call(
+                "admin.get_index_mode",
+                ctx,
+                crate::tools::registry_support::Args::new(json!({"project_id": MOUNT})),
+            )
             .await
             .expect("the tool must be registered")
             .expect_err("a non member must be forbidden");
@@ -1744,18 +1751,19 @@ mod sqlite_rag {
         let base = spawn_fake_embedding(3).await;
         let h = make_sqlite_rag_harness(&base, 3).await;
 
-        let ctx = crate::mcp::registry::ToolCtx {
+        let ctx = crate::tools::registry_support::ToolCtx {
             person: "stranger@x.y".to_string(),
             state: h.inner.state.clone(),
         };
         let err = h
             .inner
-            .state
             .registry
             .call(
                 "search.index",
                 ctx,
-                crate::mcp::Args::new(json!({"mount_id": MOUNT, "path": "/doc.md"})),
+                crate::tools::registry_support::Args::new(
+                    json!({"mount_id": MOUNT, "path": "/doc.md"}),
+                ),
             )
             .await
             .expect("tool must be registered")
@@ -2423,18 +2431,19 @@ mod pg_rag {
         let schema = unique_schema();
         let h = make_pg_rag_harness(&dsn, &schema, &base, 3).await;
 
-        let ctx = crate::mcp::registry::ToolCtx {
+        let ctx = crate::tools::registry_support::ToolCtx {
             person: "stranger@x.y".to_string(),
             state: h.inner.state.clone(),
         };
         let err = h
             .inner
-            .state
             .registry
             .call(
                 "search.index",
                 ctx,
-                crate::mcp::Args::new(json!({"mount_id": MOUNT, "path": "/doc.md"})),
+                crate::tools::registry_support::Args::new(
+                    json!({"mount_id": MOUNT, "path": "/doc.md"}),
+                ),
             )
             .await
             .expect("tool must be registered")

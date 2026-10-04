@@ -7,13 +7,14 @@
 
 use crate::core::fs_ops;
 use crate::errors::ToolError;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::search::indexer;
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 use base64::Engine as _;
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.write", "Create or overwrite a file (no-clobber by default, atomic).")
             .req_str("mount_id", "Project/volume id the operation targets.")

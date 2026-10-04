@@ -433,7 +433,7 @@ mod tests {
             self.begins.fetch_add(1, Ordering::SeqCst);
             let fail_commit = self
                 .failing_commits
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
                 .is_ok_and(|remaining| remaining > 0);
             Ok(Box::new(CountingTx { fail_commit }))
         }

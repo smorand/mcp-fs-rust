@@ -22,10 +22,10 @@
 use crate::core::fs_ops;
 use crate::docs;
 use crate::errors::{Result, ToolError};
-use crate::mcp::Args;
 use crate::safety::SafetyManager;
 use crate::state::AppState;
 use crate::storage::VolumeClient;
+use crate::tools::registry_support::Args;
 use crate::util::PosixPath;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
@@ -1331,7 +1331,6 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::errors::code;
     use crate::keys;
-    use crate::mcp::registry::ToolRegistry;
     use axum::body::to_bytes;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -1396,7 +1395,6 @@ mod tests {
                     crate::storage::meta::max_path_len(&config.infra.meta.backend),
                 )),
                 identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
-                registry: Arc::new(ToolRegistry::new()),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
                 doc_service,
                 search: None,

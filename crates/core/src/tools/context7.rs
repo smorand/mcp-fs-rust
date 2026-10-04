@@ -4,8 +4,8 @@
 //! required. Registered only when `context7.enabled` is true.
 
 use crate::errors::ToolError;
-use crate::mcp::registry::handler;
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::handler;
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use serde_json::Value;
 
 /// Register the two `context7.*` tools.
@@ -62,6 +62,18 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::Context7Config) 
             }
         }),
     );
+}
+
+/// Catalog-only, `ToolRegistry`-free view of the `context7.*` family.
+pub fn catalog(
+    config: &crate::config::Context7Config,
+) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -166,7 +178,7 @@ fn urlencoding(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Context7Config;
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
 
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();

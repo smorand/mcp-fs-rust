@@ -15,8 +15,8 @@
 use crate::config::SqliteConfig;
 use crate::core::fs_ops;
 use crate::errors::{Result, ToolError};
-use crate::mcp::registry::handler;
-use crate::mcp::{ToolRegistry, ToolSchema};
+use crate::tools::registry_support::handler;
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::tools::{norm, volume};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -178,6 +178,16 @@ pub fn parse_csv(bytes: &[u8], delimiter: char) -> Result<(Vec<String>, Vec<Vec<
         rows.push(row);
     }
     Ok((headers, rows))
+}
+
+/// Catalog-only, `ToolRegistry`-free view of the `sqlite.*` family.
+pub fn catalog(config: &SqliteConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
 }
 
 pub fn register(reg: &mut ToolRegistry, config: &SqliteConfig) {
@@ -573,7 +583,7 @@ fn csv_escape(s: &str, delimiter: char) -> String {
 mod tests {
     use super::*;
     use crate::config::SqliteConfig;
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
 
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();

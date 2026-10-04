@@ -6,11 +6,12 @@
 //! typed `ToolError`, so there is nothing to translate.
 
 use crate::core::fs_ops;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm_or, volume};
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.list_dir", "Flat directory listing with kinds and optional sizes.")
             .req_str("mount_id", "Project/volume id the operation targets.")

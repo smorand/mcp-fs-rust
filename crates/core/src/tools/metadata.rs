@@ -4,11 +4,12 @@
 //! records a read: they are pure probes.
 
 use crate::core::fs_ops;
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 
-pub fn register(reg: &mut ToolRegistry) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
     reg.add(
         ToolSchema::new("fs.stat", "POSIX metadata for a path.")
             .req_str("mount_id", "Project/volume id the operation targets.")

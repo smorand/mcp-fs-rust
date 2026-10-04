@@ -12,13 +12,14 @@
 
 use crate::config::SearchConfig;
 use crate::errors::ToolError;
-use crate::mcp::registry::handler;
-use crate::mcp::{ToolRegistry, ToolSchema};
 use crate::search::fusion::rrf_merge;
+use crate::tools::registry_support::handler;
+use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use serde_json::{Value, json};
 
 /// Register the four `search.*` tools.
-pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
     reg.add(
         ToolSchema::new(
             "search.index",
@@ -250,8 +251,8 @@ pub fn register(reg: &mut ToolRegistry, _config: &SearchConfig) {
 mod tests {
     use super::*;
     use crate::config::SearchConfig;
-    use crate::mcp::ToolRegistry;
     use crate::search::bm25_sqlite::TantivyBm25Backend;
+    use crate::tools::registry_support::ToolRegistry;
     use crate::tools::testkit::MOUNT;
     use std::sync::Arc;
 

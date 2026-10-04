@@ -1017,7 +1017,7 @@ pub(crate) mod tests {
     /// property.
     #[test]
     fn e2e_new_017_no_registered_tool_can_mutate_the_host_map() {
-        let mut reg = crate::mcp::ToolRegistry::new();
+        let mut reg = crate::tools::registry_support::ToolRegistry::new();
         crate::tools::register_fs(&mut reg);
         crate::tools::admin::register(&mut reg);
         crate::tools::git::register(&mut reg);

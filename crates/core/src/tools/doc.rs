@@ -6,10 +6,10 @@
 
 use crate::config::DocConfig;
 use crate::errors::{Result, ToolError};
-use crate::mcp::ToolSchema;
-use crate::mcp::registry::{ToolRegistry, handler};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
+use crate::tools::registry_support::ToolSchema;
+use crate::tools::registry_support::{ToolRegistry, handler};
 use crate::tools::{norm, volume};
 use serde_json::json;
 use std::sync::Arc;
@@ -36,6 +36,17 @@ fn resolve_pandoc(config: &DocConfig) -> Option<String> {
         return Some(config.pandoc_bin.clone());
     }
     which::which("pandoc").ok().map(|p| p.display().to_string())
+}
+
+/// Catalog-only, `ToolRegistry`-free view of the `doc.*` family. Mirrors
+/// `register`'s own conditional: empty when pandoc cannot be resolved.
+pub fn catalog(config: &DocConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry> {
+    let mut reg = ToolRegistry::new();
+    register(&mut reg, config);
+    reg.names()
+        .iter()
+        .map(|n| crate::tools::catalog::ToolCatalogEntry::from(&reg.resolve(n).unwrap().schema))
+        .collect()
 }
 
 /// Register the `doc.*` family. Returns immediately without adding any tool if
@@ -148,8 +159,8 @@ pub fn register(reg: &mut ToolRegistry, config: &DocConfig) {
 
 /// Normalize an optional path parameter (returns `None` when the arg is absent/null).
 fn opt_norm(
-    ctx: &crate::mcp::registry::ToolCtx,
-    a: &crate::mcp::Args,
+    ctx: &crate::tools::registry_support::ToolCtx,
+    a: &crate::tools::registry_support::Args,
     key: &str,
 ) -> Result<Option<String>> {
     match a.opt_str(key) {

@@ -152,11 +152,60 @@ impl Drop for Teardown {
 
 // ── MCP / REST client helpers ────────────────────────────────────────────────
 
-/// One JSON-RPC `tools/call`, decoded from the server's SSE framing
-/// (`event: message\ndata: {json}\n\n`, see `mcp::sse_frame`). Panics with the
-/// tool name and the server's error payload on failure, so a failing scenario
-/// step names itself in the test output instead of surfacing as a generic
-/// "assertion failed".
+/// `initialize` + `notifications/initialized`, the handshake `rmcp`'s
+/// `LocalSessionManager` + `legacy_session_mode: true` now requires before
+/// any `tools/call` (SPEC-0013/US-0008, DR-008/DR-009). Returns the
+/// `Mcp-Session-Id` the server issued.
+async fn establish_session(client: &reqwest::Client, base: &str, token: &str) -> String {
+    let init = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "full-stack-e2e", "version": "0.0"},
+        },
+    });
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(token)
+        .json(&init)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("MCP initialize: request failed: {e}"));
+    assert!(resp.status().is_success(), "MCP initialize: http {}", resp.status());
+    let session_id = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap_or_else(|| panic!("MCP initialize: no Mcp-Session-Id header"))
+        .to_str()
+        .expect("session id header must be ASCII")
+        .to_string();
+
+    let notified = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(token)
+        .header("Mcp-Session-Id", &session_id)
+        .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("MCP notifications/initialized: request failed: {e}"));
+    assert!(
+        notified.status().is_success(),
+        "MCP notifications/initialized: http {}",
+        notified.status()
+    );
+    session_id
+}
+
+/// One JSON-RPC `tools/call`, decoded from the server's SSE framing. Every
+/// response on an established session is `text/event-stream`, and the stream
+/// can carry a priming frame ahead of the real one, so this takes the LAST
+/// `data:` line that parses as JSON rather than assuming the whole body is
+/// one frame (mirrors `crates/agent/src/mcp.rs::parse_body`, empirically
+/// verified shape, SPEC-0013/US-0008). Panics with the tool name and the
+/// server's error payload on failure, so a failing scenario step names
+/// itself in the test output instead of surfacing as a generic "assertion
+/// failed".
 async fn call_tool(
     client: &reqwest::Client,
     base: &str,
@@ -164,6 +213,7 @@ async fn call_tool(
     name: &str,
     arguments: Value,
 ) -> Value {
+    let session_id = establish_session(client, base, token).await;
     let body = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": name, "arguments": arguments},
@@ -171,6 +221,7 @@ async fn call_tool(
     let resp = client
         .post(format!("{base}/mcp"))
         .bearer_auth(token)
+        .header("Mcp-Session-Id", &session_id)
         .json(&body)
         .send()
         .await
@@ -178,9 +229,12 @@ async fn call_tool(
     let status = resp.status();
     let text = resp.text().await.expect("mcp response body must be readable");
     assert!(status.is_success(), "MCP {name}: http {status}: {text}");
-    let frame = text.strip_prefix("event: message\ndata: ").unwrap_or(&text).trim_end();
-    let envelope: Value = serde_json::from_str(frame)
-        .unwrap_or_else(|e| panic!("MCP {name}: response is not JSON: {e}: {text}"));
+    let envelope: Value = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .filter_map(|p| serde_json::from_str::<Value>(p.trim()).ok())
+        .next_back()
+        .unwrap_or_else(|| panic!("MCP {name}: response is not JSON: {text}"));
     if let Some(err) = envelope.get("error") {
         panic!("MCP {name}: tool error: {err}");
     }

@@ -26,3 +26,8 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# DT-002 (SPEC-0013/US-0008): the real migrated server, booted in-process on an
+# ephemeral port, to prove this crate's McpClient actually completes the
+# initialize handshake against it. Test-only: not in [dependencies].
+mcp-fs-core = { path = "../core" }
+axum = { workspace = true }

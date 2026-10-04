@@ -9,45 +9,67 @@
 //!
 //! Contract notes:
 //! * parameter names are snake_case, which is what the generated JSON Schema
-//!   exposes (see [`crate::mcp::schema`]),
+//!   exposes (see [`crate::tools::registry_support::schema`]),
 //! * parameter descriptions are the LLM facing docs and are frozen in
 //!   `TOOL_CONTRACT.txt` / `tool-contract-golden.json`, so editing one is a
 //!   deliberate contract change,
 //! * `authorize` runs before any storage access, and before path normalization,
 //!   so a non member gets `ERR_FORBIDDEN` rather than a path error.
 
-pub mod admin;
+// The fs.* family modules below (and `admin`) are test-only: the live MCP
+// surface dispatches through `mcp::server::McpServer`'s `rmcp` tool router,
+// whose `#[tool]` methods call `core::fs_ops` directly, not these families'
+// `register()`. They survive as the shared harness/contract-golden exercise
+// path (`tools::testkit::Harness`, `contract_golden.rs`, each family's own
+// schema pinning tests).
+#[cfg(test)]
+pub(crate) mod admin;
 pub mod all;
+pub mod catalog;
 pub mod context7;
 #[cfg(test)]
 pub(crate) mod contract_golden;
 pub mod db;
 pub mod doc;
-pub mod document;
-pub mod edit;
+#[cfg(test)]
+pub(crate) mod document;
+#[cfg(test)]
+pub(crate) mod edit;
 pub mod editor;
 pub mod git;
 pub mod git_auth;
 pub mod git_pr;
-pub mod lifecycle;
-pub mod listing;
-pub mod metadata;
-pub mod read;
-pub mod search;
-pub mod search_semantic;
+#[cfg(test)]
+pub(crate) mod lifecycle;
+#[cfg(test)]
+pub(crate) mod listing;
+#[cfg(test)]
+pub(crate) mod metadata;
+#[cfg(test)]
+pub(crate) mod read;
+pub mod registry_support;
+#[cfg(test)]
+pub(crate) mod search;
+#[cfg(test)]
+pub(crate) mod search_semantic;
 pub mod sqlite;
 pub mod web;
-pub mod write;
+#[cfg(test)]
+pub(crate) mod write;
 
 use crate::errors::Result;
-use crate::mcp::Args;
-use crate::mcp::registry::ToolCtx;
 use crate::storage::VolumeClient;
+use crate::tools::registry_support::Args;
+use crate::tools::registry_support::ToolCtx;
 use std::sync::Arc;
 
 /// Register every fs.* tool. Families are added in a stable order so `tools/list`
 /// output is deterministic.
-pub fn register_fs(reg: &mut crate::mcp::ToolRegistry) {
+///
+/// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
+/// `rmcp` tool router now, never through this registry.
+#[cfg(test)]
+pub(crate) fn register_fs(reg: &mut crate::tools::registry_support::ToolRegistry) {
     read::register(reg);
     write::register(reg);
     edit::register(reg);
@@ -72,6 +94,7 @@ pub(crate) async fn volume(ctx: &ToolCtx, a: &Args) -> Result<(String, Arc<Volum
 /// Membership gate for the two tools that never open a volume
 /// (`fs.list_allowed_roots`, `fs.audit_log`): they still take `mount_id` and
 /// still authorize, exactly like the C# `ToolContext.AuthorizeAsync`.
+#[cfg(test)]
 pub(crate) async fn authorize_only(ctx: &ToolCtx, a: &Args) -> Result<String> {
     let mount = a.str("mount_id")?;
     ctx.state.authorize(&mount, &ctx.person).await?;
@@ -84,6 +107,7 @@ pub(crate) fn norm(ctx: &ToolCtx, a: &Args, name: &str) -> Result<String> {
 }
 
 /// Normalize an optional path argument that carries a default (`root`, `path`).
+#[cfg(test)]
 pub(crate) fn norm_or(ctx: &ToolCtx, a: &Args, name: &str, default: &str) -> Result<String> {
     ctx.state.safety.normalize_path(&a.str_or(name, default))
 }
@@ -97,11 +121,11 @@ pub(crate) mod testkit {
 
     use crate::config::ServerConfig;
     use crate::errors::Result;
-    use crate::mcp::registry::ToolCtx;
-    use crate::mcp::{Args, ToolRegistry};
     use crate::state::AppState;
     use crate::storage::VolumeClient;
     use crate::storage::traits::AdminBackend;
+    use crate::tools::registry_support::ToolCtx;
+    use crate::tools::registry_support::{Args, ToolRegistry};
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -111,14 +135,14 @@ pub(crate) mod testkit {
     pub struct Harness {
         _dir: tempfile::TempDir,
         pub state: Arc<AppState>,
+        pub registry: Arc<ToolRegistry>,
     }
 
     impl Harness {
         /// Dispatch through the registry, like `tools/call` does.
         pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
             let ctx = ToolCtx { person: PERSON.to_string(), state: self.state.clone() };
-            self.state
-                .registry
+            self.registry
                 .call(name, ctx, Args::new(args))
                 .await
                 .unwrap_or_else(|| panic!("tool '{name}' is not registered"))
@@ -184,12 +208,11 @@ pub(crate) mod testkit {
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
             )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
-            registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service,
             search: None,
         });
-        Harness { _dir: dir, state }
+        Harness { _dir: dir, state, registry: Arc::new(registry) }
     }
 
     /// Harness with extra registrations applied after the default `register_fs`.
@@ -224,12 +247,11 @@ pub(crate) mod testkit {
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
             )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
-            registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
             search: None,
         });
-        Harness { _dir: dir, state }
+        Harness { _dir: dir, state, registry: Arc::new(registry) }
     }
 
     /// Harness with a search backend injected, for `search.*` tool tests.
@@ -282,12 +304,11 @@ pub(crate) mod testkit {
                 crate::storage::meta::max_path_len(&config.infra.meta.backend),
             )),
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
-            registry: Arc::new(registry),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service,
             search,
         });
-        Harness { _dir: dir, state }
+        Harness { _dir: dir, state, registry: Arc::new(registry) }
     }
 
     /// Assert a family registers exactly the expected tool names, in order.
@@ -318,7 +339,7 @@ pub(crate) mod testkit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::ToolRegistry;
+    use crate::tools::registry_support::ToolRegistry;
     use serde_json::json;
     use testkit::{MOUNT, harness};
 
@@ -397,10 +418,11 @@ mod tests {
     #[tokio::test]
     async fn a_non_member_is_forbidden_before_anything_else() {
         let h = harness().await;
-        let ctx =
-            crate::mcp::registry::ToolCtx { person: "stranger@x.y".into(), state: h.state.clone() };
+        let ctx = crate::tools::registry_support::ToolCtx {
+            person: "stranger@x.y".into(),
+            state: h.state.clone(),
+        };
         let err = h
-            .state
             .registry
             .call("fs.read", ctx, Args::new(json!({"mount_id": MOUNT, "path": "/nope"})))
             .await
@@ -442,5 +464,3 @@ mod tests {
         );
     }
 }
-
-pub use all::register_all;
