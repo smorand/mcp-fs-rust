@@ -181,6 +181,9 @@ than an error (with every combine response serialized through the types in
 `git/merge.rs`, never a hand built `json!`), and `TextKey(n)` bounded keys (SQL Server cannot index `NVARCHAR(MAX)`, so
 keyed text has a length ceiling there).
 
+## Backlog
+The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
+
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
 - `.agent_docs/tools.md` : the 94 tool reference (families, parameters, authorization).
