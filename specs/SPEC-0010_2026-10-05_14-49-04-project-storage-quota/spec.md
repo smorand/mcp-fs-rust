@@ -1425,7 +1425,7 @@ evident (DRIFT-002's citation) or left as an implementation-time correction with
   boundary tests E2E-NEW-032/033 (exact-cap allow/reject) will fail if `old_size_at_path` is wrong,
   which makes this unmissable at implementation time.
 - **Blocks which requirement:** FR-NEW-009.
-- **Status:** open.
+- **Status:** resolved (put_file_reports_old_size_of_overwritten_path, this commit).
 
 #### DRIFT-002: DEC-006 cites the wrong line for the existing HTTP status mapping
 - **Spec says:** DEC-006 cites "`errors.rs:190` (existing `write_quota_exceeded` → 429 mapping)".

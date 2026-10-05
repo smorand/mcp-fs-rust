@@ -891,7 +891,7 @@ mod tests {
             sha256: Option<&str>,
             size: i64,
             mode: i64,
-        ) -> Result<Option<String>> {
+        ) -> Result<crate::storage::traits::PutFileResult> {
             self.inner.put_file(path, sha256, size, mode).await
         }
         async fn delete_file(&self, path: &str) -> Result<Option<String>> {

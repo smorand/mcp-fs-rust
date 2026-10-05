@@ -12,7 +12,7 @@ use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{Assign, ColumnType, Dialect, Upsert};
 use crate::storage::rel::schema::{Column, Index, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
-use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow};
+use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow, PutFileResult};
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -488,7 +488,7 @@ impl MetaBackend for RelationalMetaStore {
         sha256: Option<&str>,
         size: i64,
         mode: i64,
-    ) -> Result<Option<String>> {
+    ) -> Result<PutFileResult> {
         let dialect = self.db.dialect();
         ensure_storable_path(dialect, path)?;
         let put_sql = self.put_node_sql();
@@ -507,7 +507,7 @@ impl MetaBackend for RelationalMetaStore {
                 let existing = tx
                     .query_opt(
                         &Query::new(
-                            "SELECT kind, ctime, sha256 FROM nodes \
+                            "SELECT kind, ctime, sha256, size FROM nodes \
                              WHERE volume_id=?1 AND path=?2",
                         )
                         .bind(&volume)
@@ -517,6 +517,7 @@ impl MetaBackend for RelationalMetaStore {
 
                 let mut ctime = now_unix();
                 let mut old_sha: Option<String> = None;
+                let mut old_size: i64 = 0;
                 if let Some(row) = existing {
                     if row.text(0)? == "dir" {
                         return Err(ToolError::invalid_argument(format!(
@@ -525,6 +526,7 @@ impl MetaBackend for RelationalMetaStore {
                     }
                     ctime = row.f64(1)?;
                     old_sha = row.opt_text(2)?;
+                    old_size = row.i64(3)?;
                 }
 
                 let mut gc = None;
@@ -551,7 +553,7 @@ impl MetaBackend for RelationalMetaStore {
                         .bind(sha.clone()),
                 )
                 .await?;
-                Ok(gc)
+                Ok(PutFileResult { gc, old_size })
             })
         })
         .await
@@ -964,8 +966,9 @@ mod tests {
     #[tokio::test]
     async fn put_file_creates_parents_and_increfs() {
         let s = store().await;
-        let gc = s.put_file("/a/b/c.txt", Some("sha1"), 3, MODE_FILE).await.unwrap();
-        assert_eq!(gc, None);
+        let res = s.put_file("/a/b/c.txt", Some("sha1"), 3, MODE_FILE).await.unwrap();
+        assert_eq!(res.gc, None);
+        assert_eq!(res.old_size, 0, "no prior node at this path");
         assert!(s.get("/a").await.unwrap().unwrap().is_dir());
         assert!(s.get("/a/b").await.unwrap().unwrap().is_dir());
         let f = s.get("/a/b/c.txt").await.unwrap().unwrap();
@@ -995,19 +998,34 @@ mod tests {
         s.put_file("/a.txt", Some("old"), 3, MODE_FILE).await.unwrap();
         let ctime0 = s.get("/a.txt").await.unwrap().unwrap().ctime;
 
-        let gc = s.put_file("/a.txt", Some("new"), 3, MODE_FILE).await.unwrap();
-        assert_eq!(gc.as_deref(), Some("old"), "the replaced blob is GC'd");
+        let res = s.put_file("/a.txt", Some("new"), 3, MODE_FILE).await.unwrap();
+        assert_eq!(res.gc.as_deref(), Some("old"), "the replaced blob is GC'd");
         let f = s.get("/a.txt").await.unwrap().unwrap();
         assert_eq!(f.sha256.as_deref(), Some("new"));
         assert_eq!(f.ctime, ctime0, "ctime is preserved across overwrite");
+    }
+
+    /// DRIFT-001: `put_file`'s existing in-transaction node lookup must expose
+    /// the pre-existing size at `path`, so FR-NEW-009's quota check can read it
+    /// without a second query.
+    #[tokio::test]
+    async fn put_file_reports_old_size_of_overwritten_path() {
+        let s = store().await;
+        s.put_file("/a.txt", Some("old"), 7, MODE_FILE).await.unwrap();
+
+        let res = s.put_file("/a.txt", Some("new"), 3, MODE_FILE).await.unwrap();
+        assert_eq!(res.old_size, 7, "old size read from the same transaction's lookup");
+
+        let res_new = s.put_file("/new.txt", Some("n"), 5, MODE_FILE).await.unwrap();
+        assert_eq!(res_new.old_size, 0, "no prior node means old_size is 0");
     }
 
     #[tokio::test]
     async fn rewriting_same_sha_does_not_gc() {
         let s = store().await;
         s.put_file("/a.txt", Some("x"), 1, MODE_FILE).await.unwrap();
-        let gc = s.put_file("/a.txt", Some("x"), 1, MODE_FILE).await.unwrap();
-        assert_eq!(gc, None);
+        let res = s.put_file("/a.txt", Some("x"), 1, MODE_FILE).await.unwrap();
+        assert_eq!(res.gc, None);
     }
 
     #[tokio::test]

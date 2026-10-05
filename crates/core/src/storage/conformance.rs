@@ -165,7 +165,7 @@ async fn meta_refcount_and_gc(engine: &Engine, tag: &str) -> Result<()> {
     m.put_file("/c.txt", Some("old"), 1, MODE_FILE).await?;
     let ctime = m.get("/c.txt").await?.expect("present").ctime;
     assert_eq!(
-        m.put_file("/c.txt", Some("new"), 1, MODE_FILE).await?.as_deref(),
+        m.put_file("/c.txt", Some("new"), 1, MODE_FILE).await?.gc.as_deref(),
         Some("old"),
         "{who}: the replaced blob is released"
     );
