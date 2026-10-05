@@ -108,6 +108,8 @@ pub struct Project {
     pub created_at: String,
     /// Search index mode, `none` for every project that never set one.
     pub index_mode: IndexMode,
+    /// Maximum storage size in bytes, `None` for unlimited (SPEC-0010).
+    pub quota_bytes: Option<i64>,
 }
 
 /// A project's auto-purge settings (SPEC-0014). Absent for any project that has
@@ -245,6 +247,14 @@ pub trait AdminBackend: Send + Sync {
     /// (SPEC-0014 US-0008): the candidate set the grace-period sweep evaluates
     /// against `project_purge_grace_days`.
     async fn list_soft_deleted_projects(&self) -> Result<Vec<(String, String)>>;
+
+    /// Persist a project's storage quota (SPEC-0010 FR-NEW-002). `None` clears
+    /// it (unlimited). `ERR_PROJECT_NOT_FOUND` when the project does not exist.
+    async fn set_quota(&self, project_id: &str, quota_bytes: Option<i64>) -> Result<()>;
+
+    /// Read a project's storage quota (SPEC-0010), `None` for unlimited.
+    /// `ERR_PROJECT_NOT_FOUND` when the project does not exist.
+    async fn get_quota(&self, project_id: &str) -> Result<Option<i64>>;
 }
 
 #[cfg(test)]

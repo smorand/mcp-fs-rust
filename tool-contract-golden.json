@@ -1,5 +1,5 @@
 {
-  "_note": "Frozen MCP tool contract: the 97 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
+  "_note": "Frozen MCP tool contract: the 98 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
   "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
   "tools": [
     {
@@ -221,6 +221,34 @@
       },
       "annotations": {
         "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "admin.set_project_quota",
+      "description": "Set or clear a project's maximum storage size in megabytes (platform admin only). max_mb absent or null clears the quota (unlimited); max_mb must be > 0 when present. Lowering the quota below current usage is accepted and evicts nothing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Id of the project whose storage quota is set.",
+            "type": "string"
+          },
+          "max_mb": {
+            "description": "Maximum storage size in megabytes. Absent or null clears the quota (unlimited). Must be > 0 when present.",
+            "type": "integer",
+            "minimum": 0,
+            "default": null
+          }
+        },
+        "required": [
+          "project_id"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
         "readOnlyHint": false,
         "idempotentHint": true,
         "openWorldHint": false

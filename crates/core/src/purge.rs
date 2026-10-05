@@ -845,6 +845,12 @@ mod tests {
         async fn list_soft_deleted_projects(&self) -> Result<Vec<(String, String)>> {
             self.inner.list_soft_deleted_projects().await
         }
+        async fn set_quota(&self, project_id: &str, quota_bytes: Option<i64>) -> Result<()> {
+            self.inner.set_quota(project_id, quota_bytes).await
+        }
+        async fn get_quota(&self, project_id: &str) -> Result<Option<i64>> {
+            self.inner.get_quota(project_id).await
+        }
     }
 
     #[tokio::test]

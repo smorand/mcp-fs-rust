@@ -1164,6 +1164,16 @@ pub struct SetPurgeConfigArgs {
     pub project_retention_days: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetProjectQuotaArgs {
+    /// Id of the project whose storage quota is set.
+    pub project_id: String,
+    /// Maximum storage size in megabytes. `None` clears the quota (unlimited).
+    /// `Some(0)` is invalid.
+    #[serde(default)]
+    pub max_mb: Option<u32>,
+}
+
 // ── search.* parameter structs ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2423,6 +2433,34 @@ impl McpServer {
         to_call_result("admin.set_purge_config", out)
     }
 
+    #[tool(
+        name = "admin.set_project_quota",
+        description = "Set or clear a project's maximum storage size in megabytes \
+             (platform admin only). max_mb absent or null clears the quota \
+             (unlimited); max_mb must be > 0 when present. Lowering the quota \
+             below current usage is accepted and evicts nothing."
+    )]
+    async fn admin_set_project_quota(
+        &self,
+        Parameters(a): Parameters<SetProjectQuotaArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            // FR-NEW-014: authorization is checked before project existence.
+            self.state.require_admin(&self.person)?;
+            if a.max_mb == Some(0) {
+                return Err(ToolError::invalid_argument("max_mb must be > 0"));
+            }
+            let quota_bytes = a.max_mb.map(|m| i64::from(m) * 1_048_576);
+            self.state.admin.set_quota(&a.project_id, quota_bytes).await?;
+            Ok(serde_json::json!({
+                "project_id": a.project_id,
+                "max_mb": a.max_mb,
+            }))
+        }
+        .await;
+        to_call_result("admin.set_project_quota", out)
+    }
+
     // ── search.* family ────────────────────────────────────────────
 
     #[tool(
@@ -3370,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    fn total_tool_count_is_one_hundred_and_one() {
+    fn total_tool_count_is_one_hundred_and_two() {
         let router = McpServer::tool_router();
         let names: Vec<String> =
             router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -3379,10 +3417,10 @@ mod tests {
         let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
         assert_eq!(fs_count, 35, "got: {names:?}");
-        assert_eq!(admin_count, 13, "got: {names:?}");
+        assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 101, "got: {names:?}");
+        assert_eq!(names.len(), 102, "got: {names:?}");
     }
 
     #[test]
@@ -3714,14 +3752,14 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 97, "the frozen contract covers exactly 97 non-search tools");
+        assert_eq!(checked, 98, "the frozen contract covers exactly 98 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
-    /// the 97 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
+    /// the 98 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
     /// and undocumented, none documented and missing.
     #[test]
-    fn tool_router_lists_exactly_the_97_contract_names() {
+    fn tool_router_lists_exactly_the_98_contract_names() {
         let router = McpServer::tool_router();
         let names: std::collections::BTreeSet<String> = router
             .list_all()
@@ -3735,8 +3773,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 97, "got: {names:?}");
-        assert_eq!(expected.len(), 97, "the golden contract itself must hold 97 names");
+        assert_eq!(names.len(), 98, "got: {names:?}");
+        assert_eq!(expected.len(), 98, "the golden contract itself must hold 98 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(
@@ -3960,6 +3998,216 @@ mod tests {
             "expected {}, got: {text}",
             code::PROJECT_NOT_FOUND
         );
+    }
+
+    // ── SPEC-0010 T-001: admin.set_project_quota (SC-001) ───────────────────
+    //
+    // These call `McpServer::admin_set_project_quota` directly, the real
+    // dispatched tool handler, proving FR-NEW-001/002/003/004/013/014.
+
+    /// E2E-NEW-001: admin sets a quota.
+    #[tokio::test]
+    async fn e2e_new_001_admin_sets_a_quota() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-quota-e2e", "owner@test.local").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let out = ok_json(
+            server
+                .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                    project_id: "proj-quota-e2e".to_string(),
+                    max_mb: Some(10),
+                }))
+                .await,
+        );
+        assert_eq!(out["project_id"], "proj-quota-e2e");
+        assert_eq!(out["max_mb"], 10);
+
+        let quota = f.state.admin.get_quota("proj-quota-e2e").await.unwrap();
+        assert_eq!(quota, Some(10_485_760));
+    }
+
+    /// E2E-NEW-002: max_mb=0 is rejected, no mutation.
+    #[tokio::test]
+    async fn e2e_new_002_zero_max_mb_is_rejected() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-quota-e2e", "owner@test.local").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                project_id: "proj-quota-e2e".to_string(),
+                max_mb: Some(0),
+            }))
+            .await;
+        let text = error_text(r);
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(text.contains("max_mb must be > 0"), "unexpected message: {text}");
+
+        let quota = f.state.admin.get_quota("proj-quota-e2e").await.unwrap();
+        assert_eq!(quota, None, "unchanged (still unset)");
+    }
+
+    /// E2E-NEW-003: non-admin (even the project owner) cannot set the quota.
+    #[tokio::test]
+    async fn e2e_new_003_non_admin_cannot_set_the_quota() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-quota-e2e", "owner@test.local").await;
+        let server = McpServer::new(f.state.clone(), "owner@test.local".to_string());
+
+        let r = server
+            .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                project_id: "proj-quota-e2e".to_string(),
+                max_mb: Some(5),
+            }))
+            .await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+
+        let quota = f.state.admin.get_quota("proj-quota-e2e").await.unwrap();
+        assert_eq!(quota, None, "no mutation");
+    }
+
+    /// E2E-NEW-004: admin clears a previously set quota.
+    #[tokio::test]
+    async fn e2e_new_004_admin_clears_a_quota() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-quota-e2e", "owner@test.local").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                    project_id: "proj-quota-e2e".to_string(),
+                    max_mb: Some(10),
+                }))
+                .await,
+        );
+        let out = ok_json(
+            server
+                .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                    project_id: "proj-quota-e2e".to_string(),
+                    max_mb: None,
+                }))
+                .await,
+        );
+        assert_eq!(out["project_id"], "proj-quota-e2e");
+        assert_eq!(out["max_mb"], Value::Null);
+
+        let quota = f.state.admin.get_quota("proj-quota-e2e").await.unwrap();
+        assert_eq!(quota, None);
+    }
+
+    /// E2E-NEW-029: lowering the quota below current usage is accepted and
+    /// evicts nothing (FR-NEW-013). Usage is seeded directly through the
+    /// meta backend to avoid any coupling to T-002's not-yet-built
+    /// enforcement path.
+    #[tokio::test]
+    async fn e2e_new_029_lowering_below_usage_does_not_evict() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-quota-e2e", "owner@test.local").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        // Seed two file nodes totalling 5,000,000 bytes directly via the meta
+        // backend, bypassing any write path quota check (none exists yet,
+        // T-002's job; this test only proves set_project_quota itself never
+        // touches nodes).
+        let client = f.state.stores.client("proj-quota-e2e").await.unwrap();
+        let content_a = vec![0u8; 3_000_000];
+        let content_b = vec![0u8; 2_000_000];
+        client.write_bytes_atomic("/a.bin", &content_a).await.unwrap();
+        client.write_bytes_atomic("/b.bin", &content_b).await.unwrap();
+
+        // Set an initial quota of 10 MB (above usage), then lower it to 1 MB
+        // (well below the 5,000,000-byte usage).
+        ok_json(
+            server
+                .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                    project_id: "proj-quota-e2e".to_string(),
+                    max_mb: Some(10),
+                }))
+                .await,
+        );
+        let out = ok_json(
+            server
+                .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                    project_id: "proj-quota-e2e".to_string(),
+                    max_mb: Some(1),
+                }))
+                .await,
+        );
+        assert_eq!(out["max_mb"], 1);
+
+        let quota = f.state.admin.get_quota("proj-quota-e2e").await.unwrap();
+        assert_eq!(quota, Some(1_048_576));
+
+        // Both nodes still exist, untouched.
+        assert!(client.meta.get("/a.bin").await.unwrap().is_some(), "a.bin not evicted");
+        assert!(client.meta.get("/b.bin").await.unwrap().is_some(), "b.bin not evicted");
+    }
+
+    /// E2E-NEW-037: setting a quota on a nonexistent project (admin caller)
+    /// fails with ERR_PROJECT_NOT_FOUND.
+    #[tokio::test]
+    async fn e2e_new_037_set_quota_on_nonexistent_project() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                project_id: "proj-does-not-exist".to_string(),
+                max_mb: Some(10),
+            }))
+            .await;
+        let text = error_text(r);
+        assert!(
+            text.contains(code::PROJECT_NOT_FOUND),
+            "expected {}, got: {text}",
+            code::PROJECT_NOT_FOUND
+        );
+    }
+
+    /// E2E-NEW-049: the minimum valid max_mb (1) is accepted.
+    #[tokio::test]
+    async fn e2e_new_049_minimum_valid_max_mb_is_accepted() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-quota-e2e", "owner@test.local").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let out = ok_json(
+            server
+                .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                    project_id: "proj-quota-e2e".to_string(),
+                    max_mb: Some(1),
+                }))
+                .await,
+        );
+        assert_eq!(out["max_mb"], 1);
+        let quota = f.state.admin.get_quota("proj-quota-e2e").await.unwrap();
+        assert_eq!(quota, Some(1_048_576));
+    }
+
+    /// E2E-NEW-051: a non-admin caller naming a nonexistent project still
+    /// gets ERR_FORBIDDEN, not ERR_PROJECT_NOT_FOUND (FR-NEW-014's check
+    /// ordering: authorization before existence).
+    #[tokio::test]
+    async fn e2e_new_051_non_admin_nonexistent_project_is_forbidden_not_not_found() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), "owner@test.local".to_string());
+
+        let r = server
+            .admin_set_project_quota(Parameters(SetProjectQuotaArgs {
+                project_id: "proj-ghost".to_string(),
+                max_mb: Some(10),
+            }))
+            .await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+        assert!(!text.contains(code::PROJECT_NOT_FOUND), "must not leak project existence: {text}");
     }
 
     // ── SPEC-0014 US-0014: FR-NEW-013 end-to-end through the real fs.read
