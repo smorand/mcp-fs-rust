@@ -10,7 +10,7 @@ use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{Assign, ColumnType, Upsert};
 use crate::storage::rel::schema::{Column, ColumnMigration, ForeignKey, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RowValues};
-use crate::storage::traits::{AdminBackend, IndexMode, Member, Project};
+use crate::storage::traits::{AdminBackend, IndexMode, Member, Project, PurgeConfig};
 use crate::util::{normalize_identity, now_iso};
 use async_trait::async_trait;
 use std::str::FromStr;
@@ -55,6 +55,27 @@ pub fn schema() -> SchemaSet {
                 references_columns: vec!["id"],
                 on_delete_cascade: true,
             }),
+            // One row per project that has ever had its auto purge behavior
+            // configured. No `volume_id`: like `project` itself, this table is
+            // global to the deployment, not scoped per volume (SPEC-0014 DEC-008
+            // and the parent spec's Section 8 correction).
+            Table::new(
+                "project_purge_config",
+                vec![
+                    Column::required("project_id", ColumnType::TextKey(PROJECT_ID_LEN)),
+                    Column::required("autopurge_enabled", ColumnType::BigInt).default("0"),
+                    Column::required("use_internal_purge", ColumnType::BigInt).default("0"),
+                    Column::new("file_retention_days", ColumnType::BigInt),
+                    Column::new("project_retention_days", ColumnType::BigInt),
+                ],
+                vec!["project_id"],
+            )
+            .foreign_key(ForeignKey {
+                columns: vec!["project_id"],
+                references_table: "project",
+                references_columns: vec!["id"],
+                on_delete_cascade: true,
+            }),
         ],
         Vec::new(),
     )
@@ -66,6 +87,15 @@ pub fn schema() -> SchemaSet {
         ty: ColumnType::Text,
         not_null: true,
         default: "'none'",
+    })
+    // Soft-delete marker for SPEC-0014: null for every existing and newly
+    // created project until a later story starts writing it.
+    .column_migration(ColumnMigration {
+        table: "project",
+        column: "deleted_at",
+        ty: ColumnType::Text,
+        not_null: false,
+        default: "NULL",
     })
 }
 
@@ -107,9 +137,17 @@ impl RelationalAdminStore {
         })
     }
 
-    async fn project_exists(&self, id: &str) -> Result<bool> {
-        let row =
-            self.db.query_opt(&Query::new("SELECT 1 FROM project WHERE id=?1").bind(id)).await?;
+    /// Excludes a soft-deleted row (`deleted_at` non-null). Used only by
+    /// `require_member`, the single enforcement point for SPEC-0014's access
+    /// gate; every other existence check in this store must keep seeing
+    /// soft-deleted projects unchanged.
+    async fn live_project_exists(&self, id: &str) -> Result<bool> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT 1 FROM project WHERE id=?1 AND deleted_at IS NULL").bind(id),
+            )
+            .await?;
         Ok(row.is_some())
     }
 }
@@ -291,7 +329,13 @@ impl AdminBackend for RelationalAdminStore {
     }
 
     async fn require_member(&self, project_id: &str, person: &str) -> Result<()> {
-        if !self.project_exists(project_id).await? {
+        // Soft-deleted is indistinguishable from absent here (SPEC-0014 DEC-009):
+        // reuse ERR_PROJECT_NOT_FOUND rather than minting a new code. This is the
+        // single enforcement point for every fs.*/git.* call, MCP and REST alike,
+        // since both surfaces route through `authorize()` -> `require_member`.
+        // `get_project`/`require_owner`/`require_owner_or_admin` must keep seeing
+        // soft-deleted rows unchanged, so the filter lives only in this query.
+        if !self.live_project_exists(project_id).await? {
             return Err(ToolError::project_not_found(project_id));
         }
         if !self.is_member(project_id, person).await? {
@@ -337,6 +381,188 @@ impl AdminBackend for RelationalAdminStore {
             .await?
             .ok_or_else(|| ToolError::project_not_found(project_id))?;
         IndexMode::from_str(&row.text(0)?)
+    }
+
+    async fn get_purge_config(&self, project_id: &str) -> Result<PurgeConfig> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT autopurge_enabled, use_internal_purge, file_retention_days, \
+                     project_retention_days FROM project_purge_config WHERE project_id=?1",
+                )
+                .bind(project_id),
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(PurgeConfig {
+                autopurge_enabled: r.i64(0)? != 0,
+                use_internal_purge: r.i64(1)? != 0,
+                file_retention_days: r.opt_i64(2)?,
+                project_retention_days: r.opt_i64(3)?,
+            }),
+            None => Ok(PurgeConfig::default()),
+        }
+    }
+
+    async fn set_purge_config(&self, project_id: &str, config: PurgeConfig) -> Result<()> {
+        if self.get_project(project_id).await?.is_none() {
+            return Err(ToolError::project_not_found(project_id));
+        }
+        let sql = self.db.dialect().render_upsert(&Upsert::replace(
+            "project_purge_config",
+            vec![
+                "project_id",
+                "autopurge_enabled",
+                "use_internal_purge",
+                "file_retention_days",
+                "project_retention_days",
+            ],
+            vec!["project_id"],
+        ));
+        self.db
+            .execute(
+                &Query::new(sql)
+                    .bind(project_id)
+                    .bind(i64::from(config.autopurge_enabled))
+                    .bind(i64::from(config.use_internal_purge))
+                    .bind(config.file_retention_days)
+                    .bind(config.project_retention_days),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn soft_delete_project(&self, project_id: &str) -> Result<bool> {
+        let now = now_iso();
+        let affected = self
+            .db
+            .execute(
+                &Query::new(
+                    "UPDATE project SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                )
+                .bind(&now)
+                .bind(project_id),
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
+    async fn list_soft_deleted_projects(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .db
+            .query(&Query::new(
+                "SELECT id, deleted_at FROM project WHERE deleted_at IS NOT NULL ORDER BY id",
+            ))
+            .await?;
+        rows.iter().map(|r| Ok((r.text(0)?, r.text(1)?))).collect()
+    }
+
+    async fn undelete_project(&self, project_id: &str) -> Result<()> {
+        let deleted_at = self
+            .db
+            .query_opt(&Query::new("SELECT deleted_at FROM project WHERE id = ?1").bind(project_id))
+            .await?
+            .ok_or_else(|| ToolError::project_not_found(project_id))?
+            .opt_text(0)?;
+        if deleted_at.is_none() {
+            return Err(ToolError::invalid_argument(format!(
+                "project '{project_id}' is not soft-deleted"
+            )));
+        }
+        self.db
+            .execute(
+                &Query::new("UPDATE project SET deleted_at = NULL WHERE id = ?1").bind(project_id),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl RelationalAdminStore {
+    /// Direct seed of `project_purge_config`, bypassing every validation and
+    /// authorization rule `admin.set_purge_config` will enforce (SPEC-0014
+    /// US-0009, not yet implemented). Test-only: this story only needs a
+    /// config row in place to sweep against.
+    pub(crate) async fn seed_purge_config_for_test(
+        &self,
+        project_id: &str,
+        autopurge_enabled: bool,
+        use_internal_purge: bool,
+        file_retention_days: Option<i64>,
+        project_retention_days: Option<i64>,
+    ) -> Result<()> {
+        let sql = self.db.dialect().render_upsert(&Upsert::replace(
+            "project_purge_config",
+            vec![
+                "project_id",
+                "autopurge_enabled",
+                "use_internal_purge",
+                "file_retention_days",
+                "project_retention_days",
+            ],
+            vec!["project_id"],
+        ));
+        self.db
+            .execute(
+                &Query::new(sql)
+                    .bind(project_id)
+                    .bind(i64::from(autopurge_enabled))
+                    .bind(i64::from(use_internal_purge))
+                    .bind(file_retention_days)
+                    .bind(project_retention_days),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Direct overwrite of `project.created_at`, bypassing `create_project`'s
+    /// `now_iso()` stamp. Test-only: lets a test pin a project's age without
+    /// racing the wall clock (SPEC-0014 US-0006).
+    pub(crate) async fn seed_created_at_for_test(
+        &self,
+        project_id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        self.db
+            .execute(
+                &Query::new("UPDATE project SET created_at = ?1 WHERE id = ?2")
+                    .bind(created_at)
+                    .bind(project_id),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Direct overwrite of `project.deleted_at`, bypassing `soft_delete_project`'s
+    /// `now_iso()` stamp. Test-only: lets a grace-sweep test pin a project's age
+    /// since soft-delete without racing the wall clock (SPEC-0014 US-0008).
+    pub(crate) async fn seed_deleted_at_for_test(
+        &self,
+        project_id: &str,
+        deleted_at: &str,
+    ) -> Result<()> {
+        self.db
+            .execute(
+                &Query::new("UPDATE project SET deleted_at = ?1 WHERE id = ?2")
+                    .bind(deleted_at)
+                    .bind(project_id),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reads `project.deleted_at` directly, bypassing `require_member`'s gate.
+    /// Test-only: lets a test assert on the raw value, including equality across
+    /// two sweeps (SPEC-0014 US-0006 idempotency).
+    pub(crate) async fn deleted_at_for_test(&self, project_id: &str) -> Result<Option<String>> {
+        let row = self
+            .db
+            .query_opt(&Query::new("SELECT deleted_at FROM project WHERE id = ?1").bind(project_id))
+            .await?
+            .ok_or_else(|| ToolError::project_not_found(project_id))?;
+        row.opt_text(0)
     }
 }
 
@@ -408,6 +634,62 @@ mod tests {
         assert_eq!(e.code, crate::errors::code::FORBIDDEN);
         assert!(e.message.contains("is not a member of 'proj'"));
 
+        s.require_member("proj", "owner@t.c").await.unwrap();
+    }
+
+    /// SPEC-0014 US-0004 FR-NEW-013: a soft-deleted project (`deleted_at` set)
+    /// is indistinguishable from an absent one to `require_member`, including
+    /// for its owner — no implicit access for anyone, platform admin included
+    /// (enforced one layer up in `state.rs`, this just makes the row invisible).
+    #[tokio::test]
+    async fn require_member_rejects_soft_deleted_project_as_not_found() {
+        let s = store().await;
+        s.create_project("proj", "owner@t.c").await.unwrap();
+        s.add_member("proj", "member@t.c", "owner@t.c").await.unwrap();
+
+        s.db.execute(
+            &Query::new("UPDATE project SET deleted_at = ?1 WHERE id = ?2")
+                .bind("2026-10-04T00:00:00Z")
+                .bind("proj"),
+        )
+        .await
+        .unwrap();
+
+        let e = s.require_member("proj", "member@t.c").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PROJECT_NOT_FOUND);
+
+        // The owner gets no bypass either.
+        let e = s.require_member("proj", "owner@t.c").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PROJECT_NOT_FOUND);
+
+        // get_project/require_owner must keep seeing the row unchanged.
+        assert!(s.get_project("proj").await.unwrap().is_some());
+        s.require_owner("proj", "owner@t.c").await.unwrap();
+    }
+
+    /// Closes the loop: the gate reads live `deleted_at` on every call, never a
+    /// cached value, so clearing it (simulating undelete) immediately restores
+    /// access without reconnecting or recreating the store.
+    #[tokio::test]
+    async fn require_member_re_reads_live_state_after_undelete() {
+        let s = store().await;
+        s.create_project("proj", "owner@t.c").await.unwrap();
+
+        s.db.execute(
+            &Query::new("UPDATE project SET deleted_at = ?1 WHERE id = ?2")
+                .bind("2026-10-04T00:00:00Z")
+                .bind("proj"),
+        )
+        .await
+        .unwrap();
+        let e = s.require_member("proj", "owner@t.c").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PROJECT_NOT_FOUND);
+
+        s.db.execute(
+            &Query::new("UPDATE project SET deleted_at = NULL WHERE id = ?1").bind("proj"),
+        )
+        .await
+        .unwrap();
         s.require_member("proj", "owner@t.c").await.unwrap();
     }
 
@@ -548,7 +830,135 @@ mod tests {
         assert_eq!(s.get_index_mode("legacy").await.unwrap(), IndexMode::Both);
     }
 
-    /// Boundary table from the spec: 3 ok, 32 ok, 33 rejected, bad bounds rejected.
+    /// E2E-coverage for SPEC-0014 US-0002: a fresh database gets the new
+    /// `project_purge_config` table and `project.deleted_at` column, both
+    /// unused by any production code yet, so this exercises the schema layer
+    /// directly with raw SQL rather than through a store method.
+    #[tokio::test]
+    async fn fresh_schema_includes_project_purge_config_and_deleted_at() {
+        let s = store().await;
+        s.create_project("proj", "o@t.c").await.unwrap();
+
+        // `deleted_at` exists, is nullable, and defaults to NULL.
+        let row = s
+            .db
+            .query_opt(&Query::new("SELECT deleted_at FROM project WHERE id = ?1").bind("proj"))
+            .await
+            .unwrap()
+            .expect("the project row exists");
+        assert_eq!(row.opt_text(0).unwrap(), None, "deleted_at starts out null");
+
+        // `project_purge_config` exists, is insertable, and FK-cascades with the project.
+        s.db.execute(
+            &Query::new(
+                "INSERT INTO project_purge_config \
+                     (project_id, autopurge_enabled, use_internal_purge, \
+                      file_retention_days, project_retention_days) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind("proj")
+            .bind(1_i64)
+            .bind(0_i64)
+            .bind(14_i64)
+            .bind(Option::<i64>::None),
+        )
+        .await
+        .unwrap();
+
+        let row =
+            s.db.query_opt(
+                &Query::new(
+                    "SELECT autopurge_enabled, use_internal_purge, file_retention_days, \
+                     project_retention_days FROM project_purge_config WHERE project_id = ?1",
+                )
+                .bind("proj"),
+            )
+            .await
+            .unwrap()
+            .expect("the purge config row exists");
+        assert_eq!(row.i64(0).unwrap(), 1);
+        assert_eq!(row.i64(1).unwrap(), 0);
+        assert_eq!(row.i64(2).unwrap(), 14);
+        assert_eq!(*row.value(3).unwrap(), crate::storage::rel::SqlValue::Null);
+
+        s.delete_project("proj").await.unwrap();
+        let remaining =
+            s.db.query(&Query::new("SELECT project_id FROM project_purge_config")).await.unwrap();
+        assert!(remaining.is_empty(), "deleting the project cascades its purge config");
+    }
+
+    /// Same precedent as `column_migration_adds_index_mode_to_an_old_database`:
+    /// a database created before `deleted_at` shipped must gain it via
+    /// `ALTER TABLE`, not just on a fresh `CREATE TABLE`.
+    #[tokio::test]
+    async fn column_migration_adds_deleted_at_to_an_old_database() {
+        use crate::storage::rel::SqliteRelationalDb;
+
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        db.execute(&Query::new(
+            "CREATE TABLE \"project\" (\"id\" TEXT NOT NULL, \"owner\" TEXT NOT NULL, \
+             \"created_at\" TEXT NOT NULL, PRIMARY KEY (\"id\"))",
+        ))
+        .await
+        .unwrap();
+        db.execute(
+            &Query::new("INSERT INTO project (id, owner, created_at) VALUES (?1, ?2, ?3)")
+                .bind("legacy")
+                .bind("o@t.c")
+                .bind("2020-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let s = RelationalAdminStore::new(db);
+        s.connect().await.unwrap();
+
+        let row = s
+            .db
+            .query_opt(&Query::new("SELECT deleted_at FROM project WHERE id = ?1").bind("legacy"))
+            .await
+            .unwrap()
+            .expect("the legacy row survives");
+        assert_eq!(row.opt_text(0).unwrap(), None, "a migrated row starts out not deleted");
+
+        // Idempotent: connect runs on every open, so a second one must not fail.
+        s.connect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn undelete_project_clears_deleted_at() {
+        let s = store().await;
+        s.create_project("proj", "owner@t.c").await.unwrap();
+        assert!(s.soft_delete_project("proj").await.unwrap());
+
+        s.undelete_project("proj").await.unwrap();
+
+        let row = s
+            .db
+            .query_opt(&Query::new("SELECT deleted_at FROM project WHERE id = ?1").bind("proj"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.opt_text(0).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn undelete_project_rejects_already_live_project() {
+        let s = store().await;
+        s.create_project("proj", "owner@t.c").await.unwrap();
+
+        let e = s.undelete_project("proj").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+    }
+
+    #[tokio::test]
+    async fn undelete_project_rejects_unknown_project() {
+        let s = store().await;
+
+        let e = s.undelete_project("ghost").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PROJECT_NOT_FOUND);
+    }
+
     #[test]
     fn project_id_validation_boundaries() {
         assert!(validate_project_id("abc").is_ok());

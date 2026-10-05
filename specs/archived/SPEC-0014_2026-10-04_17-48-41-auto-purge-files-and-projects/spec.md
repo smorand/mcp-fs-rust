@@ -831,4 +831,5 @@ with the user or verified against the code (see Section 17 and the Drift Registe
   helper is built synchronously or if a bump failure is allowed to propagate.
 - **Blocks which requirement:** none, informational — implementation proceeds with the
   resolution above; FR-NEW-001/002 are otherwise fully specified.
-- **Status:** open
+- **Status:** resolved (E2E-NEW-007 /
+  `detached_write_never_surfaces_as_caller_error`, commit 712df72, SPEC-0014_US-0001)

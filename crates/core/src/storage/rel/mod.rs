@@ -240,6 +240,14 @@ impl RowValues {
         }
     }
 
+    pub fn opt_i64(&self, index: usize) -> Result<Option<i64>> {
+        match self.value(index)? {
+            SqlValue::Int(v) => Ok(Some(*v)),
+            SqlValue::Null => Ok(None),
+            _ => self.mismatch(index, "integer or null"),
+        }
+    }
+
     pub fn blob(&self, index: usize) -> Result<Vec<u8>> {
         match self.value(index)? {
             SqlValue::Blob(v) => Ok(v.clone()),

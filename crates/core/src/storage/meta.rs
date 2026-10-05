@@ -463,6 +463,25 @@ impl MetaBackend for RelationalMetaStore {
         rows.iter().map(Self::read_row).collect()
     }
 
+    async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
+        let rows = self
+            .db
+            .query(
+                &Query::new(format!(
+                    "SELECT {SELECT_COLS} FROM nodes \
+                     WHERE volume_id=?1 AND kind='file' AND atime<?2 \
+                     AND path<>?3 AND path NOT LIKE ?4 ESCAPE '\\' \
+                     ORDER BY path"
+                ))
+                .bind(&self.volume_id)
+                .bind(before)
+                .bind(exclude_root)
+                .bind(self.descendant_pattern(exclude_root)),
+            )
+            .await?;
+        rows.iter().map(Self::read_row).collect()
+    }
+
     async fn put_file(
         &self,
         path: &str,
@@ -739,6 +758,50 @@ impl MetaBackend for RelationalMetaStore {
             })
         })
         .await
+    }
+
+    async fn touch_atime(&self, path: &str) -> Result<()> {
+        self.db
+            .execute(
+                &Query::new("UPDATE nodes SET atime=?1 WHERE volume_id=?2 AND path=?3")
+                    .bind(now_unix())
+                    .bind(&self.volume_id)
+                    .bind(path),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn touch_atime_mtime(&self, path: &str) -> Result<()> {
+        let now = now_unix();
+        self.db
+            .execute(
+                &Query::new("UPDATE nodes SET atime=?1, mtime=?2 WHERE volume_id=?3 AND path=?4")
+                    .bind(now)
+                    .bind(now)
+                    .bind(&self.volume_id)
+                    .bind(path),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl RelationalMetaStore {
+    /// Direct write of an arbitrary `atime`, bypassing `touch_atime`'s
+    /// always-now contract. Test-only: used to seed files whose `atime` is a
+    /// specific number of days in the past (SPEC-0014 US-0005 boundary tests).
+    pub(crate) async fn set_atime_for_test(&self, path: &str, atime: f64) -> Result<()> {
+        self.db
+            .execute(
+                &Query::new("UPDATE nodes SET atime=?1 WHERE volume_id=?2 AND path=?3")
+                    .bind(atime)
+                    .bind(&self.volume_id)
+                    .bind(path),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -1261,5 +1324,50 @@ mod tests {
         assert!(s.get("/a").await.unwrap().is_none());
         let moved = s.get("/z/b/c/d").await.unwrap().unwrap();
         assert_eq!(moved.parent.as_deref(), Some("/z/b/c"));
+    }
+
+    #[tokio::test]
+    async fn touch_atime_bumps_only_atime() {
+        let s = store().await;
+        s.put_file("/a.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        let before = s.get("/a.txt").await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        s.touch_atime("/a.txt").await.unwrap();
+
+        let after = s.get("/a.txt").await.unwrap().unwrap();
+        assert!(after.atime > before.atime, "atime must advance");
+        assert_eq!(after.mtime, before.mtime, "mtime must stay untouched");
+    }
+
+    #[tokio::test]
+    async fn touch_atime_mtime_bumps_both() {
+        let s = store().await;
+        s.put_file("/a.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        let before = s.get("/a.txt").await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        s.touch_atime_mtime("/a.txt").await.unwrap();
+
+        let after = s.get("/a.txt").await.unwrap().unwrap();
+        assert!(after.atime > before.atime, "atime must advance");
+        assert!(after.mtime > before.mtime, "mtime must advance");
+    }
+
+    #[tokio::test]
+    async fn touch_atime_is_scoped_to_its_volume() {
+        let db = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let a = RelationalMetaStore::open(db.clone(), "vol-a").await.unwrap();
+        let b = RelationalMetaStore::open(db, "vol-b").await.unwrap();
+        a.put_file("/f.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        b.put_file("/f.txt", Some("1"), 1, MODE_FILE).await.unwrap();
+        let b_before = b.get("/f.txt").await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        a.touch_atime_mtime("/f.txt").await.unwrap();
+
+        let b_after = b.get("/f.txt").await.unwrap().unwrap();
+        assert_eq!(b_after.atime, b_before.atime, "volume b must be untouched");
+        assert_eq!(b_after.mtime, b_before.mtime, "volume b must be untouched");
     }
 }

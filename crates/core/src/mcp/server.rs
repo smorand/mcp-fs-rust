@@ -56,6 +56,17 @@ fn to_call_result(
     }
 }
 
+const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// Parses `project.deleted_at` (RFC 3339, the format [`crate::util::now_iso`]
+/// writes) into fractional Unix seconds, for `admin.list_deleted_projects`'s
+/// countdown.
+fn parse_deleted_at(iso: &str) -> Result<f64, ToolError> {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|dt| dt.timestamp_micros() as f64 / 1_000_000.0)
+        .map_err(|e| ToolError::internal(format!("invalid deleted_at timestamp '{iso}': {e}")))
+}
+
 /// Per-connection MCP server: the identity (`person`) is fixed for the lifetime
 /// of this instance, exactly like `ToolCtx` is fixed for the lifetime of one
 /// tool call today.
@@ -1137,6 +1148,22 @@ pub struct SetIndexModeArgs {
     pub mode: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetPurgeConfigArgs {
+    /// Id of the project whose auto-purge configuration is set.
+    pub project_id: String,
+    /// Whether auto-purge is enabled for this project.
+    pub autopurge_enabled: bool,
+    /// Whether the internal purge driver is used, as opposed to an external one.
+    pub use_internal_purge: bool,
+    /// Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.
+    #[serde(default)]
+    pub file_retention_days: Option<u32>,
+    /// Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.
+    #[serde(default)]
+    pub project_retention_days: Option<u32>,
+}
+
 // ── search.* parameter structs ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2138,6 +2165,62 @@ impl McpServer {
     }
 
     #[tool(
+        name = "admin.list_deleted_projects",
+        description = "List soft-deleted projects visible to the caller, with a countdown to \
+                        permanent removal (membership-filtered, platform admin sees all)."
+    )]
+    async fn admin_list_deleted_projects(&self) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            let person = normalize_identity(&self.person);
+            let is_admin = self.state.is_admin(&self.person);
+            let grace_days = self.state.config.safety.project_purge_grace_days;
+            let now = crate::util::now_unix();
+            let mut entries = Vec::new();
+            for (project_id, deleted_at) in self.state.admin.list_soft_deleted_projects().await? {
+                if !is_admin && !self.state.admin.is_member(&project_id, &person).await? {
+                    continue;
+                }
+                let owner = self
+                    .state
+                    .admin
+                    .get_project(&project_id)
+                    .await?
+                    .map(|p| p.owner)
+                    .unwrap_or_default();
+                let deleted_unix = parse_deleted_at(&deleted_at)?;
+                let days_elapsed = ((now - deleted_unix) / SECONDS_PER_DAY).floor() as i64;
+                let days_until_permanent_removal = grace_days - days_elapsed;
+                entries.push(serde_json::json!({
+                    "project_id": project_id,
+                    "owner": owner,
+                    "deleted_at": deleted_at,
+                    "days_until_permanent_removal": days_until_permanent_removal,
+                }));
+            }
+            Ok(serde_json::json!({"deleted_projects": entries}))
+        }
+        .await;
+        to_call_result("admin.list_deleted_projects", out)
+    }
+
+    #[tool(
+        name = "admin.undelete_project",
+        description = "Clear a project's soft-delete flag, immediately restoring access (owner or platform admin)."
+    )]
+    async fn admin_undelete_project(
+        &self,
+        Parameters(a): Parameters<ProjectIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
+            self.state.admin.undelete_project(&a.project_id).await?;
+            Ok(serde_json::json!({"project_id": a.project_id, "undeleted": true}))
+        }
+        .await;
+        to_call_result("admin.undelete_project", out)
+    }
+
+    #[tool(
         name = "admin.list_users",
         description = "List every known person and platform admins (platform admin only)."
     )]
@@ -2301,6 +2384,43 @@ impl McpServer {
         }
         .await;
         to_call_result("admin.get_index_mode", out)
+    }
+
+    #[tool(
+        name = "admin.set_purge_config",
+        description = "Configure auto-purge for a project: enable flag, internal-vs-external \
+             driver choice, and the two independent retention thresholds (owner or platform \
+             admin). Either retention value may be absent to disable that axis independently."
+    )]
+    async fn admin_set_purge_config(
+        &self,
+        Parameters(a): Parameters<SetPurgeConfigArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
+            if a.file_retention_days == Some(0) {
+                return Err(ToolError::invalid_argument("file_retention_days must be > 0"));
+            }
+            if a.project_retention_days == Some(0) {
+                return Err(ToolError::invalid_argument("project_retention_days must be > 0"));
+            }
+            let config = crate::storage::traits::PurgeConfig {
+                autopurge_enabled: a.autopurge_enabled,
+                use_internal_purge: a.use_internal_purge,
+                file_retention_days: a.file_retention_days.map(i64::from),
+                project_retention_days: a.project_retention_days.map(i64::from),
+            };
+            self.state.admin.set_purge_config(&a.project_id, config).await?;
+            Ok(serde_json::json!({
+                "project_id": a.project_id,
+                "autopurge_enabled": a.autopurge_enabled,
+                "use_internal_purge": a.use_internal_purge,
+                "file_retention_days": a.file_retention_days,
+                "project_retention_days": a.project_retention_days,
+            }))
+        }
+        .await;
+        to_call_result("admin.set_purge_config", out)
     }
 
     // ── search.* family ────────────────────────────────────────────
@@ -3158,7 +3278,9 @@ impl rmcp::ServerHandler for McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::admin::test_support::Fixture;
+    use crate::errors::code;
+    use crate::storage::traits::AdminBackend;
+    use crate::tools::admin::test_support::{ADMIN, Fixture};
 
     /// Pulls the JSON payload out of a successful `CallToolResult`, panicking
     /// on an error result (callers assert the happy path, or inspect the raw
@@ -3248,7 +3370,7 @@ mod tests {
     }
 
     #[test]
-    fn total_tool_count_is_ninety_eight() {
+    fn total_tool_count_is_one_hundred_and_one() {
         let router = McpServer::tool_router();
         let names: Vec<String> =
             router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -3257,10 +3379,10 @@ mod tests {
         let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
         assert_eq!(fs_count, 35, "got: {names:?}");
-        assert_eq!(admin_count, 10, "got: {names:?}");
+        assert_eq!(admin_count, 13, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 98, "got: {names:?}");
+        assert_eq!(names.len(), 101, "got: {names:?}");
     }
 
     #[test]
@@ -3555,7 +3677,7 @@ mod tests {
         }
     }
 
-    /// US-0007/DT-005: every one of the 94 frozen `#[tool]` schemas structurally
+    /// US-0007/DT-005: every one of the 95 frozen `#[tool]` schemas structurally
     /// matches `tool-contract-golden.json`, modulo representational choices that
     /// carry no client-observable difference: `$ref`/`$defs` indirection vs. an
     /// inlined object (both resolve to the same validated shape), a nullable
@@ -3568,7 +3690,7 @@ mod tests {
     /// order, and the frozen contract's own descriptions are exercised verbatim
     /// by `contract_golden.rs` against the OLD `ToolRegistry` path, not this one.
     #[test]
-    fn ninety_four_tool_schemas_match_the_golden_contract_structurally() {
+    fn ninety_five_tool_schemas_match_the_golden_contract_structurally() {
         let router = McpServer::tool_router();
         let tools = router.list_all();
         let frozen = crate::tools::contract_golden::frozen_tools()
@@ -3577,7 +3699,7 @@ mod tests {
         let mut checked = 0;
         for tool in &tools {
             if tool.name.starts_with("search.") {
-                continue; // config-gated, not part of the frozen 94-tool surface
+                continue; // config-gated, not part of the frozen 95-tool surface
             }
             checked += 1;
             let entry =
@@ -3592,14 +3714,14 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 94, "the frozen contract covers exactly 94 non-search tools");
+        assert_eq!(checked, 97, "the frozen contract covers exactly 97 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
-    /// the 94 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
+    /// the 97 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
     /// and undocumented, none documented and missing.
     #[test]
-    fn tool_router_lists_exactly_the_94_contract_names() {
+    fn tool_router_lists_exactly_the_97_contract_names() {
         let router = McpServer::tool_router();
         let names: std::collections::BTreeSet<String> = router
             .list_all()
@@ -3613,8 +3735,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 94, "got: {names:?}");
-        assert_eq!(expected.len(), 94, "the golden contract itself must hold 94 names");
+        assert_eq!(names.len(), 97, "got: {names:?}");
+        assert_eq!(expected.len(), 97, "the golden contract itself must hold 97 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(
@@ -3635,6 +3757,260 @@ mod tests {
                 found.description.as_deref(),
                 Some(*description),
                 "description mismatch for {name}"
+            );
+        }
+    }
+
+    // ── admin.set_purge_config: production handler (SPEC-0014 US-0013) ─────────
+    //
+    // These call `McpServer::admin_set_purge_config` directly, proving the real
+    // dispatched tool handler (not `tools::admin`'s `#[cfg(test)]`-gated
+    // duplicate) satisfies FR-NEW-004/005/006.
+
+    /// E2E-NEW-provisional-1: the owner sets a valid config through the
+    /// production handler, and it is persisted.
+    #[tokio::test]
+    async fn production_handler_accepts_valid_config_for_the_owner() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let out = ok_json(
+            server
+                .admin_set_purge_config(Parameters(SetPurgeConfigArgs {
+                    project_id: "proj1".to_string(),
+                    autopurge_enabled: true,
+                    use_internal_purge: true,
+                    file_retention_days: Some(7),
+                    project_retention_days: Some(30),
+                }))
+                .await,
+        );
+        assert_eq!(out["project_id"], "proj1");
+        assert_eq!(out["autopurge_enabled"], true);
+        assert_eq!(out["use_internal_purge"], true);
+        assert_eq!(out["file_retention_days"], 7);
+        assert_eq!(out["project_retention_days"], 30);
+
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(persisted.autopurge_enabled);
+        assert!(persisted.use_internal_purge);
+        assert_eq!(persisted.file_retention_days, Some(7));
+        assert_eq!(persisted.project_retention_days, Some(30));
+    }
+
+    /// E2E-NEW-provisional-1 (continued): both retention axes absent is valid,
+    /// through the production handler.
+    #[tokio::test]
+    async fn production_handler_accepts_both_retentions_absent() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let out = ok_json(
+            server
+                .admin_set_purge_config(Parameters(SetPurgeConfigArgs {
+                    project_id: "proj1".to_string(),
+                    autopurge_enabled: false,
+                    use_internal_purge: false,
+                    file_retention_days: None,
+                    project_retention_days: None,
+                }))
+                .await,
+        );
+        assert_eq!(out["file_retention_days"], Value::Null);
+        assert_eq!(out["project_retention_days"], Value::Null);
+
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert_eq!(persisted.file_retention_days, None);
+        assert_eq!(persisted.project_retention_days, None);
+    }
+
+    /// E2E-NEW-provisional-1 (continued): a platform admin who is not the
+    /// owner may also set it, through the production handler.
+    #[tokio::test]
+    async fn production_handler_accepts_valid_config_for_a_platform_admin() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_set_purge_config(Parameters(SetPurgeConfigArgs {
+                    project_id: "proj1".to_string(),
+                    autopurge_enabled: true,
+                    use_internal_purge: true,
+                    file_retention_days: Some(1),
+                    project_retention_days: Some(1),
+                }))
+                .await,
+        );
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert_eq!(persisted.file_retention_days, Some(1));
+        assert_eq!(persisted.project_retention_days, Some(1));
+    }
+
+    /// E2E-NEW-provisional-2: zero retention is rejected as invalid argument
+    /// through the production handler, for either retention axis, and
+    /// nothing is persisted.
+    #[tokio::test]
+    async fn production_handler_rejects_zero_retention() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        for args in [
+            SetPurgeConfigArgs {
+                project_id: "proj1".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(0),
+                project_retention_days: None,
+            },
+            SetPurgeConfigArgs {
+                project_id: "proj1".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: None,
+                project_retention_days: Some(0),
+            },
+        ] {
+            let r = server.admin_set_purge_config(Parameters(args)).await.unwrap();
+            assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+            let text = r
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .expect("a text content block");
+            assert!(
+                text.contains(code::INVALID_ARGUMENT),
+                "expected {}, got: {text}",
+                code::INVALID_ARGUMENT
+            );
+        }
+
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(!persisted.autopurge_enabled);
+    }
+
+    /// E2E-NEW-provisional-3: a non-member, non-admin caller is forbidden
+    /// through the production handler.
+    #[tokio::test]
+    async fn production_handler_forbids_a_non_member_non_admin_caller() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "mallory@test.com".to_string());
+
+        let r = server
+            .admin_set_purge_config(Parameters(SetPurgeConfigArgs {
+                project_id: "proj1".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(7),
+                project_retention_days: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(!persisted.autopurge_enabled);
+    }
+
+    /// E2E-NEW-provisional-3 (continued): an unknown project is not-found
+    /// through the production handler.
+    #[tokio::test]
+    async fn production_handler_reports_not_found_for_an_unknown_project() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let r = server
+            .admin_set_purge_config(Parameters(SetPurgeConfigArgs {
+                project_id: "ghost".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(7),
+                project_retention_days: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::PROJECT_NOT_FOUND),
+            "expected {}, got: {text}",
+            code::PROJECT_NOT_FOUND
+        );
+    }
+
+    // ── SPEC-0014 US-0014: FR-NEW-013 end-to-end through the real fs.read
+    // production handler, converging the gap Phase 4.6 found after US-0004 ──
+
+    /// Error text out of an error `CallToolResult`, same extraction the other
+    /// production-handler tests in this module use.
+    fn error_text(r: Result<CallToolResult, ErrorData>) -> String {
+        let r = r.expect("ErrorData (protocol error), not a tool error");
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        r.content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block")
+    }
+
+    /// E2E-NEW-provisional-4: `fs.read` through the real production handler
+    /// (`McpServer::fs_read`, the exact dispatch path `app.rs` routes) rejects
+    /// a soft-deleted project as not-found for a plain member, for the
+    /// project's own owner, and for a platform admin alike. FR-NEW-013 allows
+    /// no bypass, including for the admin role.
+    #[tokio::test]
+    async fn fs_read_rejects_a_soft_deleted_project_for_member_owner_and_admin_alike() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "owner@test.com").await;
+        f.state.admin.add_member("proj1", "member@test.com", "owner@test.com").await.unwrap();
+        {
+            let client = f.state.stores.client("proj1").await.unwrap();
+            client.write_text_atomic("/a.txt", "hello\n").await.unwrap();
+        }
+        f.admin_store.soft_delete_project("proj1").await.unwrap();
+
+        for caller in ["member@test.com", "owner@test.com", ADMIN] {
+            let server = McpServer::new(f.state.clone(), caller.to_string());
+            let r = server
+                .fs_read(Parameters(ReadArgs {
+                    mount_id: "proj1".to_string(),
+                    path: "/a.txt".to_string(),
+                    offset_lines: 0,
+                    limit_lines: 2000,
+                    line_numbered: true,
+                }))
+                .await;
+            let text = error_text(r);
+            assert!(
+                text.contains(code::PROJECT_NOT_FOUND),
+                "caller {caller}: expected {}, got: {text}",
+                code::PROJECT_NOT_FOUND
             );
         }
     }

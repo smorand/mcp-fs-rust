@@ -1565,6 +1565,22 @@ mod tests {
         assert_eq!(v["error"], code::PROJECT_NOT_FOUND);
     }
 
+    /// SPEC-0014 US-0014, E2E-NEW-provisional-5: a soft-deleted project is
+    /// rejected by the REST plane the same way `an_unknown_project_is_404`
+    /// rejects an absent one, proving the REST `/api/fs/...` route and the
+    /// MCP `fs.read` tool share the one `state.authorize` -> `require_member`
+    /// gate (FR-NEW-013) rather than each carrying its own check.
+    #[tokio::test]
+    async fn a_soft_deleted_project_is_404_on_the_rest_plane_too() {
+        let h = Harness::new().await;
+        h.seed("/a.txt", "hello\n").await;
+        h.state.admin.soft_delete_project(MOUNT).await.unwrap();
+
+        let (status, v) = h.get(&u("read?path=/a.txt")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], code::PROJECT_NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn roots_lists_the_callers_projects() {
         let h = Harness::new().await;
@@ -1676,6 +1692,33 @@ mod tests {
         assert_eq!(v["total_lines"], 1);
         assert_eq!(v["truncated"], false);
         assert!(v["next_offset"].is_null());
+    }
+
+    /// E2E-NEW-002: proves the REST plane shares `core::fs_ops`'s atime bump,
+    /// not a parallel copy of the mechanism.
+    #[tokio::test]
+    async fn rest_read_bumps_atime_like_the_mcp_tool_does() {
+        let h = Harness::new().await;
+        h.seed("/a.txt", "one\ntwo\n").await;
+        let client = h.state.stores.client(MOUNT).await.unwrap();
+        let before = client.meta.get("/a.txt").await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        let (status, _) = h.get(&u("read?path=/a.txt")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = client.meta.get("/a.txt").await.unwrap().unwrap();
+            if after.atime > before.atime {
+                assert_eq!(after.mtime, before.mtime, "a REST read must never bump mtime");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("REST read never bumped atime within 2s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

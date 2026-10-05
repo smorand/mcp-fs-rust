@@ -110,6 +110,17 @@ pub struct Project {
     pub index_mode: IndexMode,
 }
 
+/// A project's auto-purge settings (SPEC-0014). Absent for any project that has
+/// never been configured, in which case every flag defaults to off and both
+/// retention windows default to `None`, exactly like a freshly read default row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PurgeConfig {
+    pub autopurge_enabled: bool,
+    pub use_internal_purge: bool,
+    pub file_retention_days: Option<i64>,
+    pub project_retention_days: Option<i64>,
+}
+
 /// A project membership row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Member {
@@ -147,6 +158,18 @@ pub trait MetaBackend: Send + Sync {
     async fn mkdir(&self, path: &str) -> Result<()>;
     async fn rmdir(&self, path: &str) -> Result<()>;
     async fn rename(&self, src: &str, dst: &str) -> Result<()>;
+
+    /// Bump `atime` to now. Best-effort only: the caller (`VolumeClient::touch_atime`)
+    /// runs this detached and logs rather than surfaces a failure (US-0003, DEC-010).
+    async fn touch_atime(&self, path: &str) -> Result<()>;
+    /// Bump both `atime` and `mtime` to now, same best-effort contract as
+    /// [`MetaBackend::touch_atime`].
+    async fn touch_atime_mtime(&self, path: &str) -> Result<()>;
+
+    /// Every live file (`kind='file'`) whose `atime` is strictly less than
+    /// `before`, excluding `exclude_root` itself and every strict descendant of
+    /// it (SPEC-0014 US-0005: the sweep must never purge trash it just created).
+    async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>>;
 }
 
 /// A content-addressed byte store, keyed by sha256, scoped to one volume.
@@ -185,6 +208,32 @@ pub trait AdminBackend: Send + Sync {
     async fn set_index_mode(&self, project_id: &str, mode: IndexMode) -> Result<()>;
     /// Read a project's search index mode. `ERR_PROJECT_NOT_FOUND` when absent.
     async fn get_index_mode(&self, project_id: &str) -> Result<IndexMode>;
+
+    /// Read a project's auto-purge settings (SPEC-0014 US-0005). Never fails on an
+    /// unconfigured project: returns [`PurgeConfig::default`] (every flag off) so
+    /// a sweep over a project that has never called `admin.set_purge_config` is a
+    /// plain no-op rather than an error.
+    async fn get_purge_config(&self, project_id: &str) -> Result<PurgeConfig>;
+
+    /// Persist a project's auto-purge settings (SPEC-0014 US-0009).
+    /// `ERR_PROJECT_NOT_FOUND` when the project does not exist.
+    async fn set_purge_config(&self, project_id: &str, config: PurgeConfig) -> Result<()>;
+
+    /// Soft-delete a project (SPEC-0014 US-0006): `UPDATE ... WHERE deleted_at IS
+    /// NULL`, so a repeated call is a no-op rather than re-stamping `deleted_at`
+    /// (DEC-013, no locking). Returns whether THIS call set it (`false` when it was
+    /// already set, or the project does not exist).
+    async fn soft_delete_project(&self, project_id: &str) -> Result<bool>;
+
+    /// Clear a soft-deleted project's `deleted_at` (SPEC-0014 US-0011).
+    /// `ERR_PROJECT_NOT_FOUND` when the project does not exist, `ERR_INVALID_ARGUMENT`
+    /// when it is not currently soft-deleted (`deleted_at` already `NULL`).
+    async fn undelete_project(&self, project_id: &str) -> Result<()>;
+
+    /// Every soft-deleted project (`deleted_at` set), paired with that timestamp
+    /// (SPEC-0014 US-0008): the candidate set the grace-period sweep evaluates
+    /// against `project_purge_grace_days`.
+    async fn list_soft_deleted_projects(&self) -> Result<Vec<(String, String)>>;
 }
 
 #[cfg(test)]

@@ -276,7 +276,7 @@ mod tests {
     /// `notifications/initialized` handshake (DR-010) actually lets a bare
     /// `tools/list` succeed against the server this story wires up.
     #[tokio::test]
-    async fn agent_startup_completes_and_lists_all_94_tools() {
+    async fn agent_startup_completes_and_lists_all_97_tools() {
         let dir = tempfile::tempdir().unwrap();
         let (key_path, pub_path) =
             mcp_fs_core::keys::write_keypair(dir.path().join("keys")).unwrap();
@@ -304,12 +304,12 @@ mod tests {
         let tools = client.list_tools().await.expect("list_tools must succeed after the handshake");
         // `McpServer::tool_router` always compiles in the 4 `search.*` tools
         // regardless of runtime config (see
-        // `crates/core/src/mcp/server.rs::tool_router_lists_exactly_the_94_contract_names`,
+        // `crates/core/src/mcp/server.rs::tool_router_lists_exactly_the_95_contract_names`,
         // which excludes them the same way); the frozen, non-search contract
-        // this story's DT-002 means is the 94 count, not the raw catalogue
+        // this story's DT-002 means is the 95 count, not the raw catalogue
         // size.
         let non_search = tools.keys().filter(|n| !n.starts_with("search.")).count();
-        assert_eq!(non_search, 94, "expected the full 94-tool catalogue, got {:?}", tools.keys());
+        assert_eq!(non_search, 97, "expected the full 97-tool catalogue, got {:?}", tools.keys());
         assert!(
             tools.contains_key("fs.read_bytes"),
             "fs.read_bytes must be present: {:?}",

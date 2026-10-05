@@ -1,5 +1,5 @@
 {
-  "_note": "Frozen MCP tool contract: the 94 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
+  "_note": "Frozen MCP tool contract: the 97 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
   "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
   "tools": [
     {
@@ -113,6 +113,19 @@
       }
     },
     {
+      "name": "admin.list_deleted_projects",
+      "description": "List soft-deleted projects visible to the caller, with a countdown to permanent removal (membership-filtered, platform admin sees all).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "admin.list_members",
       "description": "List members of a project (member or platform admin).",
       "inputSchema": {
@@ -210,6 +223,72 @@
         "destructiveHint": true,
         "readOnlyHint": false,
         "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "admin.set_purge_config",
+      "description": "Configure auto-purge for a project: enable flag, internal-vs-external driver choice, and the two independent retention thresholds (owner or platform admin). Either retention value may be absent to disable that axis independently.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Id of the project whose auto-purge configuration is set.",
+            "type": "string"
+          },
+          "autopurge_enabled": {
+            "description": "Whether auto-purge is enabled for this project.",
+            "type": "boolean"
+          },
+          "use_internal_purge": {
+            "description": "Whether the internal purge driver is used, as opposed to an external one.",
+            "type": "boolean"
+          },
+          "file_retention_days": {
+            "description": "Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.",
+            "type": "integer",
+            "minimum": 0,
+            "default": null
+          },
+          "project_retention_days": {
+            "description": "Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.",
+            "type": "integer",
+            "minimum": 0,
+            "default": null
+          }
+        },
+        "required": [
+          "project_id",
+          "autopurge_enabled",
+          "use_internal_purge"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "admin.undelete_project",
+      "description": "Clear a project's soft-delete flag, immediately restoring access (owner or platform admin).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Id of the soft-deleted project to restore.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
         "openWorldHint": false
       }
     },

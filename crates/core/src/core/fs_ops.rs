@@ -60,6 +60,7 @@ pub async fn read_window(
 ) -> Result<Value> {
     let text = client.read_text(path).await?;
     safety.record_read(person, mount_id, path);
+    client.touch_atime(path);
     let lines = split_lines(&text);
     let total = lines.len() as i64;
     let cap = limit_lines.min(safety.config().max_read_lines as i64);
@@ -88,6 +89,7 @@ pub async fn read_bytes_b64(
 ) -> Result<Value> {
     let data = client.read_range(path, offset.max(0) as u64, length.max(0) as u64).await?;
     safety.record_read(person, mount_id, path);
+    client.touch_atime(path);
     Ok(json!({
         "base64": base64::engine::general_purpose::STANDARD.encode(&data),
         "mime_type": mime_guess(path).unwrap_or("application/octet-stream"),
@@ -113,6 +115,7 @@ pub async fn read_lines(
 ) -> Result<Value> {
     let text = client.read_text(path).await?;
     safety.record_read(person, mount_id, path);
+    client.touch_atime(path);
     let lines = split_lines(&text);
     let window = slice(&lines, (start_line - 1).max(0), end_line);
     Ok(json!({
@@ -134,6 +137,7 @@ pub async fn read_section(
 ) -> Result<Value> {
     let text = client.read_text(path).await?;
     safety.record_read(person, mount_id, path);
+    client.touch_atime(path);
     let lines = split_lines(&text);
     let (start, end) = indent_block(&lines, anchor_line - 1, max_lines)?;
     Ok(json!({
@@ -208,6 +212,7 @@ pub async fn head(
 ) -> Result<Value> {
     let text = client.read_text(path).await?;
     safety.record_read(person, mount_id, path);
+    client.touch_atime(path);
     let all = split_lines(&text);
     Ok(json!({ "content": number_lines(slice(&all, 0, lines), 1) }))
 }
@@ -223,6 +228,7 @@ pub async fn tail(
 ) -> Result<Value> {
     let text = client.read_text(path).await?;
     safety.record_read(person, mount_id, path);
+    client.touch_atime(path);
     let all = split_lines(&text);
     let start = (all.len() as i64 - lines).max(0);
     Ok(json!({
@@ -408,6 +414,7 @@ async fn grep_one(
     let Ok(text) = client.read_text(path).await else {
         return Vec::new();
     };
+    client.touch_atime(path);
     let lines = split_lines(&text);
     let mut out = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -565,6 +572,7 @@ async fn commit(
     let data = new_text.as_bytes();
     safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, data).await?;
+    client.touch_atime_mtime(norm);
     safety.record_audit(person, mount_id, op, norm, "");
     Ok(())
 }
@@ -600,6 +608,7 @@ pub async fn write_bytes(
     }
     safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, data).await?;
+    client.touch_atime_mtime(norm);
     safety.record_read(person, mount_id, norm);
     safety.record_audit(person, mount_id, "write", norm, &format!("{} bytes", data.len()));
     Ok(json!({ "path": norm, "bytes_written": data.len(), "overwritten": exists }))
@@ -684,6 +693,7 @@ pub async fn documentize(
     let service = ensure_documentable(doc, norm)?;
     let data = client.read_bytes(norm).await?;
     ensure_input_size(service, norm, data.len())?;
+    client.touch_atime(norm);
 
     let (md_path, bytes_written, overwritten) =
         write_companion(client, safety, service, person, mount_id, norm, &data, overwrite).await?;
@@ -786,6 +796,7 @@ pub async fn write_text(
     let data = content.as_bytes();
     safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, data).await?;
+    client.touch_atime_mtime(norm);
     // A fresh write counts as a read, so a follow-up edit passes the guard.
     safety.record_read(person, mount_id, norm);
     safety.record_audit(person, mount_id, "write", norm, &format!("{} bytes", data.len()));
@@ -816,6 +827,7 @@ pub async fn append_text(
     let mut combined = if exists { client.read_bytes(norm).await? } else { Vec::new() };
     combined.extend_from_slice(data);
     client.write_bytes_atomic(norm, &combined).await?;
+    client.touch_atime_mtime(norm);
     safety.record_audit(person, mount_id, "append", norm, &format!("{} bytes", data.len()));
     Ok(json!({ "path": norm, "bytes_appended": data.len() }))
 }
@@ -836,6 +848,7 @@ pub async fn create_empty(
         return Ok(json!({ "path": norm, "created": false }));
     }
     client.create_empty(norm).await?;
+    client.touch_atime_mtime(norm);
     safety.record_audit(person, mount_id, "create_empty", norm, "");
     Ok(json!({ "path": norm, "created": true }))
 }
@@ -1049,6 +1062,7 @@ pub async fn move_path(
         }
     }
     client.rename(src, dst).await?;
+    client.touch_atime_mtime(dst);
     safety.record_audit(person, mount_id, "move", src, &format!("-> {dst}"));
     Ok(json!({ "source": src, "destination": dst }))
 }
@@ -1078,12 +1092,14 @@ pub async fn copy_path(
             )));
         }
         client.copy_tree(src, dst).await?;
+        client.touch_atime_mtime(dst);
     } else {
         let data = client.read_bytes(src).await?;
         safety.charge_write(person, mount_id, data.len() as i64)?;
         // No explicit makedirs: the metadata store creates missing parents on
         // put_file, exactly like the C# path.
         client.write_bytes_atomic(dst, &data).await?;
+        client.touch_atime_mtime(dst);
     }
     safety.record_audit(person, mount_id, "copy", src, &format!("-> {dst}"));
     Ok(json!({ "source": src, "destination": dst }))
@@ -1440,6 +1456,7 @@ pub async fn extract_document(
         refresh,
     )
     .await?;
+    client.touch_atime(norm);
 
     let cached = payload.get("cached").and_then(Value::as_bool).unwrap_or(false);
     if let Some(md) = payload.get("md_path").and_then(Value::as_str)
@@ -1486,6 +1503,7 @@ pub async fn write_docx(
     }
     safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, &data).await?;
+    client.touch_atime_mtime(norm);
     safety.record_read(person, mount_id, norm);
     safety.record_audit(person, mount_id, "write_docx", norm, &format!("{} bytes", data.len()));
     Ok(json!({"path": norm, "bytes_written": data.len(), "overwritten": exists}))
@@ -1516,6 +1534,7 @@ pub async fn apply_patch(
                 let data = op.add_content.as_bytes();
                 safety.charge_write(person, mount, data.len() as i64)?;
                 client.write_bytes_atomic(&norm, data).await?;
+                client.touch_atime_mtime(&norm);
                 touched.push(json!({"path": norm, "op": "add"}));
             }
             OpKind::Delete => {
@@ -1530,6 +1549,7 @@ pub async fn apply_patch(
                 let data = neu.as_bytes();
                 safety.charge_write(person, mount, data.len() as i64)?;
                 client.write_bytes_atomic(&norm, data).await?;
+                client.touch_atime_mtime(&norm);
                 // Two audit entries per updated file, because the C# writes one
                 // inside its shared Commit helper and one in the loop tail. The
                 // duplicate is observable through fs.audit_log, so it is kept.
@@ -1538,6 +1558,7 @@ pub async fn apply_patch(
                     Some(target) => {
                         let dst = safety.normalize_path(target)?;
                         client.rename(&norm, &dst).await?;
+                        client.touch_atime_mtime(&dst);
                         touched.push(json!({"path": norm, "op": "update", "moved_to": dst}));
                     }
                     None => touched.push(json!({"path": norm, "op": "update"})),
@@ -1716,15 +1737,44 @@ fn join_block(before: &[String], middle: &[String], after: &[String]) -> String 
     all.join("\n")
 }
 
+/// Spawns `fut` detached; any error it returns is logged, never propagated to the
+/// caller. Follows `search::indexer`'s log-on-failure idiom, applied to a DB write
+/// instead of an external embedding call (DRIFT-001). Used by
+/// `VolumeClient::touch_atime`/`touch_atime_mtime` (US-0003).
+pub(crate) fn spawn_best_effort<F>(fut: F)
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            tracing::debug!(error = %e, "best-effort detached write failed");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::SafetyConfig;
     use crate::errors::code;
+    use crate::storage::traits::NodeRow;
     use std::sync::Arc;
 
     const P: &str = "a@b.c";
     const M: &str = "proj";
+
+    #[tokio::test]
+    async fn detached_write_never_surfaces_as_caller_error() {
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let n = notify.clone();
+        spawn_best_effort(async move {
+            n.notify_one();
+            Err::<(), _>(anyhow::anyhow!("simulated DB failure"))
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), notify.notified())
+            .await
+            .expect("spawned task should complete and notify within 2s");
+    }
 
     struct Fix {
         _dir: tempfile::TempDir,
@@ -3351,5 +3401,256 @@ mod tests {
         // This is the actual behavior: the engine does not special-case a file root.
         let e = tree(&f.v, "/solo.txt", 3, &[], false).await.unwrap_err();
         assert_eq!(e.code, code::INVALID_ARGUMENT);
+    }
+
+    // ── US-0003: atime/mtime tracking ──────────────────────────────────────────
+
+    async fn node(f: &Fix, path: &str) -> NodeRow {
+        f.v.meta.get(path).await.unwrap().unwrap()
+    }
+
+    /// The bump is spawned detached (DEC-010), so tests poll rather than assume
+    /// it already landed by the time the call returns.
+    async fn poll_atime_bumped(f: &Fix, path: &str, before: f64) -> NodeRow {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let n = node(f, path).await;
+            if n.atime > before {
+                return n;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("atime for '{path}' never advanced past {before} within 2s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn read_window_bumps_atime_not_mtime() {
+        let f = fixture().await;
+        seed(&f, "/a.txt", "hello\nworld\n").await;
+        let before = node(&f, "/a.txt").await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        read_window(&f.v, &f.s, P, M, "/a.txt", 0, 2000, true).await.unwrap();
+
+        let after = poll_atime_bumped(&f, "/a.txt", before.atime).await;
+        assert_eq!(after.mtime, before.mtime, "a read must never bump mtime");
+    }
+
+    #[tokio::test]
+    async fn every_read_tool_bumps_atime_and_leaves_mtime_alone() {
+        let f = fixture().await;
+        seed(&f, "/a.txt", "one\ntwo\nthree\n").await;
+
+        macro_rules! check {
+            ($call:expr) => {{
+                let before = node(&f, "/a.txt").await;
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                $call;
+                let after = poll_atime_bumped(&f, "/a.txt", before.atime).await;
+                assert_eq!(after.mtime, before.mtime);
+            }};
+        }
+
+        check!(read_bytes_b64(&f.v, &f.s, P, M, "/a.txt", 0, 100).await.unwrap());
+        check!(read_lines(&f.v, &f.s, P, M, "/a.txt", 1, 2).await.unwrap());
+        check!(read_section(&f.v, &f.s, P, M, "/a.txt", 1, 10).await.unwrap());
+        check!(head(&f.v, &f.s, P, M, "/a.txt", 1).await.unwrap());
+        check!(tail(&f.v, &f.s, P, M, "/a.txt", 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn grep_bumps_atime_on_every_file_it_reads() {
+        let f = fixture().await;
+        seed(&f, "/a.txt", "needle here\n").await;
+        let before = node(&f, "/a.txt").await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        grep_files(&f.v, "/", "needle", None, None, false, true, "content", 0, 100).await.unwrap();
+
+        poll_atime_bumped(&f, "/a.txt", before.atime).await;
+    }
+
+    #[tokio::test]
+    async fn read_on_a_missing_path_touches_no_row() {
+        let f = fixture().await;
+        let err = read_window(&f.v, &f.s, P, M, "/missing.txt", 0, 2000, true).await.unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert!(f.v.meta.get("/missing.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_converge_to_one_consistent_atime() {
+        let f = std::sync::Arc::new(fixture().await);
+        seed(&f, "/a.txt", "shared\n").await;
+        let before = node(&f, "/a.txt").await;
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let f = f.clone();
+            set.spawn(async move { read_window(&f.v, &f.s, P, M, "/a.txt", 0, 10, true).await });
+        }
+        while let Some(res) = set.join_next().await {
+            res.unwrap().unwrap();
+        }
+
+        let after = poll_atime_bumped(&f, "/a.txt", before.atime).await;
+        assert!(
+            (after.atime - crate::util::now_unix()).abs() < 2.0,
+            "bumped atime must be close to now"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_ops_never_bump_atime() {
+        let f = fixture().await;
+        seed(&f, "/a.txt", "content\n").await;
+        let before = node(&f, "/a.txt").await;
+
+        stat_info(&f.v, "/a.txt").await.unwrap();
+        glob_files(&f.v, "/", "*.txt", &[]).await.unwrap();
+        list_dir(&f.v, "/", true, "name", false).await.unwrap();
+        tree(&f.v, "/", 3, &[], false).await.unwrap();
+
+        // Polled for 2s to rule out a delayed async bump rather than asserting
+        // the instant after the call, which a detached task could still beat.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after = node(&f, "/a.txt").await;
+        assert_eq!(after.atime, before.atime, "metadata/listing ops must never touch atime");
+        assert_eq!(after.mtime, before.mtime);
+    }
+
+    #[tokio::test]
+    async fn write_text_bumps_both_atime_and_mtime() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/b.txt", "old\n").await.unwrap();
+        f.s.record_read(P, M, "/b.txt");
+        let before = node(&f, "/b.txt").await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        write_text(&f.v, &f.s, P, M, "/b.txt", "new\n", true, true).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = node(&f, "/b.txt").await;
+            if after.atime > before.atime && after.mtime > before.mtime {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("write must bump both atime and mtime");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn write_bytes_bumps_both_atime_and_mtime() {
+        let f = fixture().await;
+        write_bytes(&f.v, &f.s, P, M, "/c.bin", b"abc", false, true).await.unwrap();
+        let before = node(&f, "/c.bin").await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+        write_bytes(&f.v, &f.s, P, M, "/c.bin", b"xyz", true, true).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = node(&f, "/c.bin").await;
+            if after.atime > before.atime && after.mtime > before.mtime {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("write_bytes must bump both atime and mtime");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_copy_move_each_bump_both_timestamps() {
+        let f = fixture().await;
+        seed(&f, "/e.txt", "one\ntwo\n").await;
+        let before = node(&f, "/e.txt").await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        edit_unique(&f.v, &f.s, P, M, "/e.txt", "one", "1", false, false).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = node(&f, "/e.txt").await;
+            if after.atime > before.atime && after.mtime > before.mtime {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("fs.edit must bump both timestamps");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        seed(&f, "/src.txt", "body\n").await;
+        copy_path(&f.v, &f.s, P, M, "/src.txt", "/dst.txt", false, false).await.unwrap();
+        let dst_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let d = f.v.meta.get("/dst.txt").await.unwrap();
+            if let Some(d) = d
+                && d.atime > 0.0
+                && d.mtime > 0.0
+            {
+                break;
+            }
+            if std::time::Instant::now() >= dst_deadline {
+                panic!("fs.copy destination must have atime/mtime set");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        seed(&f, "/mv_src.txt", "body\n").await;
+        move_path(&f.v, &f.s, P, M, "/mv_src.txt", "/mv_dst.txt", false).await.unwrap();
+        let mv_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let d = f.v.meta.get("/mv_dst.txt").await.unwrap();
+            if let Some(d) = d
+                && d.atime > 0.0
+                && d.mtime > 0.0
+            {
+                break;
+            }
+            if std::time::Instant::now() >= mv_deadline {
+                panic!("fs.move destination must have atime/mtime set");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_touches_neither_timestamp() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/exists.txt", "old\n").await.unwrap();
+        let before = node(&f, "/exists.txt").await;
+
+        let err =
+            write_text(&f.v, &f.s, P, M, "/exists.txt", "new\n", false, true).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = node(&f, "/exists.txt").await;
+        assert_eq!(after.atime, before.atime);
+        assert_eq!(after.mtime, before.mtime);
+    }
+
+    #[tokio::test]
+    async fn a_partial_copy_touches_neither_side_wrongly() {
+        let f = fixture().await;
+        seed(&f, "/src.txt", "body\n").await;
+        let before = node(&f, "/src.txt").await;
+
+        // The metadata store creates missing parents on put_file, so this does not
+        // fail the way a real filesystem would; what matters is that a failure
+        // path, if the engine ever grows one, cannot leave the source touched.
+        let _ =
+            copy_path(&f.v, &f.s, P, M, "/src.txt", "/no/such/parent/dst.txt", false, false).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = node(&f, "/src.txt").await;
+        assert_eq!(after.atime, before.atime);
+        assert_eq!(after.mtime, before.mtime);
     }
 }

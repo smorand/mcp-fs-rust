@@ -61,6 +61,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The admin store is connected here (the C# does it on `ApplicationStarted`) so
 /// that a bad database path fails the boot rather than the first request.
 pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
+    let (router, _state) = build_with_state(config).await?;
+    Ok(router)
+}
+
+/// Same as [`build`], but also returns the shared [`AppState`] so [`serve`] can
+/// spawn the purge background loop (SPEC-0014 FR-NEW-009) against the exact
+/// stores/admin/safety the router itself uses, without a second connection pool.
+pub(crate) async fn build_with_state(
+    config: ServerConfig,
+) -> anyhow::Result<(Router, Arc<AppState>)> {
     let config = Arc::new(config);
 
     // One registry for the whole process, so the ACL store, every volume and the
@@ -120,8 +130,11 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         .nest_service(&mcp_path, mcp_service)
         .layer(middleware::from_fn_with_state(state.clone(), mcp_auth));
 
-    let mut router =
-        Router::new().route("/health", get(health)).merge(mcp_router).with_state(state.clone());
+    let mut router = Router::new()
+        .route("/health", get(health))
+        .merge(mcp_router)
+        .with_state(state.clone())
+        .merge(crate::deleted_projects_screen::router(state.clone()));
 
     // The REST data plane and its OpenAPI surface are opt-out via config, matching
     // the C#: with `api.enabled: false` the server is MCP only and both 404.
@@ -147,18 +160,70 @@ pub async fn build(config: ServerConfig) -> anyhow::Result<Router> {
         router = router.merge(crate::token_screen::router(state.clone()));
     }
 
-    Ok(router)
+    Ok((router, state))
 }
 
-/// Bind and serve until Ctrl+C.
+/// Bind and serve until Ctrl+C, running the purge background loop (FR-NEW-009)
+/// alongside it for the whole lifetime of the process.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let app = build(config).await?;
+    let (app, state) = build_with_state(config).await?;
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
+
+    let (purge_stop, purge_stop_rx) = tokio::sync::oneshot::channel();
+    let purge_handle = spawn_purge_loop(state, purge_stop_rx);
+
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+
+    // Same cancellation intent as `shutdown_signal` above: tell the loop to stop,
+    // then wait for it, bounded, so the process never exits with the task still
+    // mid-cycle. A send failure means the loop already exited on its own.
+    let _ = purge_stop.send(());
+    if tokio::time::timeout(std::time::Duration::from_secs(10), purge_handle).await.is_err() {
+        tracing::warn!("purge loop did not stop within the shutdown grace period");
+    }
     Ok(())
+}
+
+/// Detached background task (FR-NEW-009): wakes every `safety.purge_interval_secs`
+/// (floored to 1s, matching `tokio::time::interval`'s own requirement that its
+/// period be non-zero) and runs the FR-NEW-007/FR-NEW-008 sweep across every
+/// project, then the FR-NEW-012 grace sweep (US-0008's hook, see `purge.rs`).
+/// A cycle failure is logged and never stops the loop; the next tick tries again.
+fn spawn_purge_loop(
+    state: Arc<AppState>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let secs = state.config.safety.purge_interval_secs.max(1) as u64;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs));
+        loop {
+            tokio::select! {
+                _ = &mut stop => {
+                    tracing::info!("purge loop: shutdown signal received, exiting");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    match crate::purge::run_cycle(&state.stores, state.admin.as_ref(), &state.safety).await {
+                        Ok(summary) => tracing::info!(
+                            files_purged = summary.files_purged,
+                            projects_soft_deleted = summary.projects_soft_deleted,
+                            "purge loop: cycle complete"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "purge loop: cycle failed"),
+                    }
+                    if let Err(e) =
+                        crate::purge::sweep_grace_period(&state.stores, state.admin.as_ref(), &state.config)
+                            .await
+                    {
+                        tracing::warn!(error = %e, "purge loop: grace sweep failed");
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Resolve on Ctrl+C or SIGTERM so in flight requests finish before the process
@@ -277,6 +342,69 @@ mod tests {
     async fn body_string(r: Response) -> String {
         let b = to_bytes(r.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(b.to_vec()).unwrap()
+    }
+
+    /// Opens the same admin db `state.stores`'s pool cache already points at,
+    /// as the concrete store, rather than minting a second registry (a text-grep
+    /// composition-root guard in `storage::tests` would flag that as a second
+    /// pool). Needed only because `admin.set_purge_config` is US-0009, not
+    /// implemented yet, so seeding a purge config has no path through
+    /// `AdminBackend`.
+    async fn seeded_admin(state: &AppState) -> crate::storage::admin::RelationalAdminStore {
+        let db =
+            crate::storage::open_admin_db(&state.config, state.stores.relational()).await.unwrap();
+        crate::storage::admin::RelationalAdminStore::new(db)
+    }
+
+    #[tokio::test]
+    async fn e2e_new_077_the_loop_performs_real_work_on_its_own_timer() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, _t) = test_setup(d.path());
+        c.safety.purge_interval_secs = 1;
+
+        let (_router, state) = build_with_state(c).await.unwrap();
+        let seed = seeded_admin(&state).await;
+        crate::storage::traits::AdminBackend::create_project(&seed, "stale-proj", "owner@t.c")
+            .await
+            .unwrap();
+        seed.seed_purge_config_for_test("stale-proj", true, true, Some(0), Some(0)).await.unwrap();
+
+        let client = state.stores.client("stale-proj").await.unwrap();
+        client.write_text_atomic("/old.txt", "data").await.unwrap();
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = spawn_purge_loop(state.clone(), stop_rx);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+        assert!(
+            !client.exists("/old.txt").await.unwrap(),
+            "the loop's own timer must have trashed the stale file by now"
+        );
+        assert!(
+            seed.deleted_at_for_test("stale-proj").await.unwrap().is_some(),
+            "the loop's own timer must have soft-deleted the stale project by now"
+        );
+
+        let _ = stop_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn e2e_new_078_graceful_shutdown_joins_within_a_bounded_timeout() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, _t) = test_setup(d.path());
+        c.safety.purge_interval_secs = 1;
+        let (_router, state) = build_with_state(c).await.unwrap();
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let handle = spawn_purge_loop(state, stop_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = stop_tx.send(());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(result.is_ok(), "the loop task must join within the bounded timeout");
+        assert!(result.unwrap().is_ok(), "the loop task must not panic");
     }
 
     /// `rmcp`'s SSE stream can carry a priming event (`data:\nid: ...\nretry:

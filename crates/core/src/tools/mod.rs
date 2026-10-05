@@ -16,13 +16,16 @@
 //! * `authorize` runs before any storage access, and before path normalization,
 //!   so a non member gets `ERR_FORBIDDEN` rather than a path error.
 
-// The fs.* family modules below (and `admin`) are test-only: the live MCP
-// surface dispatches through `mcp::server::McpServer`'s `rmcp` tool router,
-// whose `#[tool]` methods call `core::fs_ops` directly, not these families'
-// `register()`. They survive as the shared harness/contract-golden exercise
-// path (`tools::testkit::Harness`, `contract_golden.rs`, each family's own
-// schema pinning tests).
-#[cfg(test)]
+// The fs.* family modules below are test-only: the live MCP surface dispatches
+// through `mcp::server::McpServer`'s `rmcp` tool router, whose `#[tool]` methods
+// call `core::fs_ops` directly, not these families' `register()`. They survive as
+// the shared harness/contract-golden exercise path (`tools::testkit::Harness`,
+// `contract_golden.rs`, each family's own schema pinning tests).
+//
+// `admin` is the one exception: most of it is the same test-only registry glue,
+// but `list_deleted_projects` and `undelete_project` are real production code,
+// called directly by `crate::deleted_projects_screen` (SPEC-0014 US-0012), never
+// a second implementation.
 pub(crate) mod admin;
 pub mod all;
 pub mod catalog;

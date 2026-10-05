@@ -53,6 +53,28 @@ impl Args {
         }
     }
 
+    pub fn bool(&self, name: &str) -> Result<bool> {
+        match self.get(name) {
+            None => Err(Self::missing(name)),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(Self::wrong(name, "a boolean")),
+        }
+    }
+
+    /// Optional nullable integer: present and non-null returns `Some`, absent or
+    /// null returns `None`. Unlike `opt_num` this never silently truncates a
+    /// non-numeric value; it errors instead.
+    pub fn opt_i64(&self, name: &str) -> Result<Option<i64>> {
+        match self.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .map(Some)
+                .ok_or_else(|| Self::wrong(name, "an integer")),
+        }
+    }
+
     // ── optional with default ────────────────────────────────────────────────
     pub fn str_or(&self, name: &str, default: &str) -> String {
         match self.get(name) {

@@ -29,6 +29,26 @@ impl VolumeClient {
         hex::encode(h.finalize())
     }
 
+    /// Bump `atime` on a content read, asynchronously and best-effort (US-0003,
+    /// DEC-010): never write-amplifies the hot read path, and a failed bump is
+    /// logged, never surfaced to the caller.
+    pub fn touch_atime(&self, path: &str) {
+        let meta = self.meta.clone();
+        let path = path.to_string();
+        crate::core::fs_ops::spawn_best_effort(async move {
+            meta.touch_atime(&path).await.map_err(Into::into)
+        });
+    }
+
+    /// Same as [`Self::touch_atime`], but also bumps `mtime` (write path).
+    pub fn touch_atime_mtime(&self, path: &str) {
+        let meta = self.meta.clone();
+        let path = path.to_string();
+        crate::core::fs_ops::spawn_best_effort(async move {
+            meta.touch_atime_mtime(&path).await.map_err(Into::into)
+        });
+    }
+
     // ── reads ────────────────────────────────────────────────────────────────
 
     pub async fn stat(&self, path: &str) -> Result<NodeRow> {

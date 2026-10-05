@@ -13,24 +13,36 @@
 //! | remove_member            | owner or platform admin                         |
 //! | list_members             | member, or platform admin (project must exist)  |
 //! | list_projects            | none, scoped to the caller's own projects       |
+//! | list_deleted_projects    | none, scoped to the caller's own projects,      |
+//! |                          | platform admin sees all (SPEC-0014 US-0010)     |
+//! | undelete_project         | owner or platform admin (SPEC-0014 US-0011)     |
 //! | set_index_mode           | owner or platform admin                         |
 //! | get_index_mode           | member, or platform admin (project must exist)  |
+//! | set_purge_config         | owner or platform admin                         |
 //!
 //! `create_project` provisions the volume and rolls the ACL row back if that
 //! fails, so a project row never points at a volume that was never created.
 
 use crate::errors::{Result, ToolError};
+#[cfg(test)]
 use crate::git::GitRepoStore;
+#[cfg(test)]
 use crate::storage::admin::validate_project_id;
+#[cfg(test)]
 use crate::storage::traits::IndexMode;
-use crate::tools::registry_support::{ToolCtx, handler};
+use crate::tools::registry_support::ToolCtx;
+#[cfg(test)]
+use crate::tools::registry_support::handler;
+#[cfg(test)]
 use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::util::normalize_identity;
 use serde_json::{Value, json};
+#[cfg(test)]
 use std::str::FromStr;
+#[cfg(test)]
 use std::sync::Arc;
 
-/// Register the ten `admin.*` tools.
+/// Register the twelve `admin.*` tools.
 ///
 /// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
 /// `rmcp` tool router, never through this registry.
@@ -99,6 +111,34 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
             .idempotent(true)
             .open_world(false),
         handler(|ctx: ToolCtx, _a| async move { list_all_projects(&ctx).await }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.list_deleted_projects",
+            "List soft-deleted projects visible to the caller, with a countdown to \
+             permanent removal (membership-filtered, platform admin sees all).",
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx: ToolCtx, _a| async move { list_deleted_projects(&ctx).await }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.undelete_project",
+            "Clear a project's soft-delete flag, immediately restoring access (owner or platform admin).",
+        )
+        .req_str("project_id", "Id of the soft-deleted project to restore.")
+        .read_only(false)
+        .destructive(false)
+        .idempotent(false)
+        .open_world(false),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            undelete_project(&ctx, &project_id).await
+        }),
     );
 
     reg.add(
@@ -201,10 +241,56 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
             get_index_mode(&ctx, &project_id).await
         }),
     );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.set_purge_config",
+            "Configure auto-purge for a project: enable flag, internal-vs-external driver \
+             choice, and the two independent retention thresholds (owner or platform admin). \
+             Either retention value may be absent to disable that axis independently.",
+        )
+        .req_str("project_id", "Id of the project whose auto-purge configuration is set.")
+        .req_bool("autopurge_enabled", "Whether auto-purge is enabled for this project.")
+        .req_bool(
+            "use_internal_purge",
+            "Whether the internal purge driver is used, as opposed to an external one.",
+        )
+        .opt_nullable_uint(
+            "file_retention_days",
+            "Days of inactivity before a file is purged. Must be > 0 when present; absent \
+             disables this axis.",
+        )
+        .opt_nullable_uint(
+            "project_retention_days",
+            "Days after soft-delete before a project is purged. Must be > 0 when present; \
+             absent disables this axis.",
+        )
+        .read_only(false)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            let autopurge_enabled = a.bool("autopurge_enabled")?;
+            let use_internal_purge = a.bool("use_internal_purge")?;
+            let file_retention_days = a.opt_i64("file_retention_days")?;
+            let project_retention_days = a.opt_i64("project_retention_days")?;
+            set_purge_config(
+                &ctx,
+                &project_id,
+                autopurge_enabled,
+                use_internal_purge,
+                file_retention_days,
+                project_retention_days,
+            )
+            .await
+        }),
+    );
 }
 
 // ── implementations ─────────────────────────────────────────────────────────
 
+#[cfg(test)]
 async fn create_project(ctx: &ToolCtx, project_id: &str, owner: &str) -> Result<Value> {
     ctx.state.require_admin(&ctx.person)?;
     validate_project_id(project_id)?;
@@ -225,6 +311,7 @@ async fn create_project(ctx: &ToolCtx, project_id: &str, owner: &str) -> Result<
     }))
 }
 
+#[cfg(test)]
 async fn delete_project(
     ctx: &ToolCtx,
     project_id: &str,
@@ -244,6 +331,7 @@ async fn delete_project(
     Ok(json!({"project_id": project_id, "deleted": true}))
 }
 
+#[cfg(test)]
 async fn list_projects(ctx: &ToolCtx) -> Result<Value> {
     let person = normalize_identity(&ctx.person);
     let projects = ctx.state.admin.list_projects_for(&ctx.person).await?;
@@ -264,6 +352,7 @@ async fn list_projects(ctx: &ToolCtx) -> Result<Value> {
     Ok(json!({"projects": entries}))
 }
 
+#[cfg(test)]
 async fn list_all_projects(ctx: &ToolCtx) -> Result<Value> {
     ctx.state.require_admin(&ctx.person)?;
     let projects = ctx.state.admin.list_all_projects().await?;
@@ -281,6 +370,55 @@ async fn list_all_projects(ctx: &ToolCtx) -> Result<Value> {
     Ok(json!({"projects": entries}))
 }
 
+/// Membership-filtered the same way `list_projects` filters (DEC-012), not
+/// platform-admin-only: a platform admin additionally sees every soft-deleted
+/// project, matching the verified `admin.list_projects` convention rather than
+/// gating the whole tool behind `require_admin`.
+pub(crate) async fn list_deleted_projects(ctx: &ToolCtx) -> Result<Value> {
+    let person = normalize_identity(&ctx.person);
+    let is_admin = ctx.state.is_admin(&ctx.person);
+    let grace_days = ctx.state.config.safety.project_purge_grace_days;
+    let now = crate::util::now_unix();
+    let mut entries = Vec::new();
+    for (project_id, deleted_at) in ctx.state.admin.list_soft_deleted_projects().await? {
+        if !is_admin && !ctx.state.admin.is_member(&project_id, &person).await? {
+            continue;
+        }
+        let owner =
+            ctx.state.admin.get_project(&project_id).await?.map(|p| p.owner).unwrap_or_default();
+        let deleted_unix = parse_deleted_at(&deleted_at)?;
+        let days_elapsed = ((now - deleted_unix) / SECONDS_PER_DAY).floor() as i64;
+        let days_until_permanent_removal = grace_days - days_elapsed;
+        entries.push(json!({
+            "project_id": project_id,
+            "owner": owner,
+            "deleted_at": deleted_at,
+            "days_until_permanent_removal": days_until_permanent_removal,
+        }));
+    }
+    Ok(json!({"deleted_projects": entries}))
+}
+
+/// SPEC-0014 US-0011: clears `deleted_at`, restoring normal access. Authorization
+/// reuses `require_owner_or_admin` verbatim, which per US-0004 is exempted from
+/// the `deleted_at` filter, so it still works on a soft-deleted row.
+pub(crate) async fn undelete_project(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
+    ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
+    ctx.state.admin.undelete_project(project_id).await?;
+    Ok(json!({"project_id": project_id, "undeleted": true}))
+}
+
+const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// Parses `project.deleted_at` (RFC 3339, the format [`crate::util::now_iso`]
+/// writes) into fractional Unix seconds.
+fn parse_deleted_at(iso: &str) -> Result<f64> {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|dt| dt.timestamp_micros() as f64 / 1_000_000.0)
+        .map_err(|e| ToolError::internal(format!("invalid deleted_at timestamp '{iso}': {e}")))
+}
+
+#[cfg(test)]
 async fn list_users(ctx: &ToolCtx) -> Result<Value> {
     ctx.state.require_admin(&ctx.person)?;
     // BTreeSet gives the C# `OrderBy(p, StringComparer.Ordinal)` plus its dedup.
@@ -302,6 +440,7 @@ async fn list_users(ctx: &ToolCtx) -> Result<Value> {
     Ok(json!({"users": users}))
 }
 
+#[cfg(test)]
 async fn add_member(ctx: &ToolCtx, project_id: &str, person: &str) -> Result<Value> {
     ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
     let member = ctx.state.admin.add_member(project_id, person, &ctx.person).await?;
@@ -312,6 +451,7 @@ async fn add_member(ctx: &ToolCtx, project_id: &str, person: &str) -> Result<Val
     }))
 }
 
+#[cfg(test)]
 async fn remove_member(ctx: &ToolCtx, project_id: &str, person: &str) -> Result<Value> {
     ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
     ctx.state.admin.remove_member(project_id, person).await?;
@@ -319,6 +459,7 @@ async fn remove_member(ctx: &ToolCtx, project_id: &str, person: &str) -> Result<
     Ok(json!({"project_id": project_id, "person": person, "removed": true}))
 }
 
+#[cfg(test)]
 async fn list_members(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
     // Not `require_owner_or_admin`: a plain member may list, an owner is not needed.
     // A platform admin skips membership but still needs the project to exist.
@@ -342,6 +483,7 @@ async fn list_members(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
 /// The wipe finishes before the tool answers; the rebuild does not, so
 /// `reindex_started: true` means "a background pass is running", not "the volume
 /// is searchable". Poll `search.status` to watch it fill.
+#[cfg(test)]
 async fn set_index_mode(ctx: &ToolCtx, project_id: &str, mode: &str) -> Result<Value> {
     ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
     let new_mode = IndexMode::from_str(mode)?;
@@ -376,6 +518,7 @@ async fn set_index_mode(ctx: &ToolCtx, project_id: &str, mode: &str) -> Result<V
     }))
 }
 
+#[cfg(test)]
 async fn get_index_mode(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
     // Same gate as list_members: a plain member may read, and a platform admin
     // skips membership but still needs the project to exist.
@@ -388,6 +531,38 @@ async fn get_index_mode(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
     }
     let mode = ctx.state.admin.get_index_mode(project_id).await?;
     Ok(json!({"project_id": project_id, "index_mode": mode}))
+}
+
+#[cfg(test)]
+async fn set_purge_config(
+    ctx: &ToolCtx,
+    project_id: &str,
+    autopurge_enabled: bool,
+    use_internal_purge: bool,
+    file_retention_days: Option<i64>,
+    project_retention_days: Option<i64>,
+) -> Result<Value> {
+    ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
+    if file_retention_days == Some(0) || file_retention_days.is_some_and(|d| d < 0) {
+        return Err(ToolError::invalid_argument("file_retention_days must be > 0"));
+    }
+    if project_retention_days == Some(0) || project_retention_days.is_some_and(|d| d < 0) {
+        return Err(ToolError::invalid_argument("project_retention_days must be > 0"));
+    }
+    let config = crate::storage::traits::PurgeConfig {
+        autopurge_enabled,
+        use_internal_purge,
+        file_retention_days,
+        project_retention_days,
+    };
+    ctx.state.admin.set_purge_config(project_id, config).await?;
+    Ok(json!({
+        "project_id": project_id,
+        "autopurge_enabled": autopurge_enabled,
+        "use_internal_purge": use_internal_purge,
+        "file_retention_days": file_retention_days,
+        "project_retention_days": project_retention_days,
+    }))
 }
 
 // ── shared test fixtures ────────────────────────────────────────────────────
@@ -415,6 +590,10 @@ pub(crate) mod test_support {
         /// Kept alive: dropping it deletes the state dirs.
         pub dir: tempfile::TempDir,
         pub state: Arc<AppState>,
+        /// Concrete handle to the same store `state.admin` wraps, kept around so
+        /// tests can reach backdoor seeding methods (`seed_deleted_at_for_test`)
+        /// that are not part of the `AdminBackend` trait object.
+        pub admin_store: Arc<RelationalAdminStore>,
     }
 
     impl Fixture {
@@ -440,12 +619,12 @@ pub(crate) mod test_support {
             tweak(&mut config);
             let config = Arc::new(config);
 
-            let admin = Arc::new(RelationalAdminStore::in_memory().await.unwrap());
-            admin.connect().await.unwrap();
+            let admin_store = Arc::new(RelationalAdminStore::in_memory().await.unwrap());
+            admin_store.connect().await.unwrap();
 
             let state = Arc::new(AppState {
                 config: config.clone(),
-                admin,
+                admin: admin_store.clone(),
                 stores: Arc::new(StoreManager::new(
                     config.clone(),
                     crate::storage::test_registry(),
@@ -459,7 +638,7 @@ pub(crate) mod test_support {
                 doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
                 search,
             });
-            Self { dir, state }
+            Self { dir, state, admin_store }
         }
 
         pub fn ctx(&self, person: &str) -> ToolCtx {
@@ -470,6 +649,21 @@ pub(crate) mod test_support {
         pub async fn seed_project(&self, project_id: &str, owner: &str) {
             self.state.admin.create_project(project_id, owner).await.unwrap();
             self.state.stores.provision_volume(project_id).await.unwrap();
+        }
+
+        /// Creates `project_id`, soft-deletes it, and backdates `deleted_at` to
+        /// `now - age_seconds` so a countdown test can pin the exact age without
+        /// racing the wall clock (same approach `purge.rs`'s `seed_soft_deleted` uses).
+        pub async fn seed_soft_deleted(&self, project_id: &str, owner: &str, age_seconds: f64) {
+            self.seed_project(project_id, owner).await;
+            let now = crate::util::now_unix();
+            let deleted_at = chrono::DateTime::from_timestamp(
+                (now - age_seconds) as i64,
+                (((now - age_seconds).fract()) * 1_000_000_000.0) as u32,
+            )
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+            self.admin_store.seed_deleted_at_for_test(project_id, &deleted_at).await.unwrap();
         }
 
         pub async fn call(
@@ -498,23 +692,26 @@ mod tests {
         r
     }
 
-    const ALL_ADMIN_TOOLS: [&str; 10] = [
+    const ALL_ADMIN_TOOLS: [&str; 13] = [
         "admin.create_project",
         "admin.delete_project",
         "admin.list_projects",
         "admin.list_all_projects",
+        "admin.list_deleted_projects",
+        "admin.undelete_project",
         "admin.list_users",
         "admin.add_member",
         "admin.remove_member",
         "admin.list_members",
         "admin.set_index_mode",
         "admin.get_index_mode",
+        "admin.set_purge_config",
     ];
 
     #[test]
     fn every_admin_tool_is_registered() {
         let r = registry();
-        assert_eq!(r.len(), 10);
+        assert_eq!(r.len(), 13);
         for name in ALL_ADMIN_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -1163,5 +1360,450 @@ mod tests {
         // mixed case caller, same person
         let out = f.call(&r, "Owner@Test.COM", "admin.list_projects", json!({})).await.unwrap();
         assert_eq!(out["projects"][0]["is_owner"], true);
+    }
+
+    // ── set_purge_config (SPEC-0014 US-0009) ────────────────────────────────────────
+
+    #[test]
+    fn set_purge_config_schema_matches_the_contract() {
+        let r = registry();
+        let s = &r.resolve("admin.set_purge_config").unwrap().schema;
+        assert_eq!(
+            s.input_schema()["required"],
+            json!("project_id autopurge_enabled use_internal_purge".split(' ').collect::<Vec<_>>())
+        );
+    }
+
+    /// E2E-NEW-015: owner sets config.
+    #[tokio::test]
+    async fn owner_sets_purge_config() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        let out = f
+            .call(
+                &r,
+                "alice@test.com",
+                "admin.set_purge_config",
+                json!({
+                    "project_id":"proj1",
+                    "autopurge_enabled":true,
+                    "use_internal_purge":true,
+                    "file_retention_days":7,
+                    "project_retention_days":30,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "project_id":"proj1",
+                "autopurge_enabled":true,
+                "use_internal_purge":true,
+                "file_retention_days":7,
+                "project_retention_days":30,
+            })
+        );
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(persisted.autopurge_enabled);
+        assert!(persisted.use_internal_purge);
+        assert_eq!(persisted.file_retention_days, Some(7));
+        assert_eq!(persisted.project_retention_days, Some(30));
+    }
+
+    /// E2E-NEW-016: platform admin, not the owner, sets config.
+    #[tokio::test]
+    async fn platform_admin_non_owner_sets_purge_config() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        f.call(
+            &r,
+            ADMIN,
+            "admin.set_purge_config",
+            json!({
+                "project_id":"proj1",
+                "autopurge_enabled":true,
+                "use_internal_purge":true,
+                "file_retention_days":7,
+                "project_retention_days":30,
+            }),
+        )
+        .await
+        .unwrap();
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(persisted.autopurge_enabled);
+    }
+
+    /// E2E-NEW-017: a second happy-path variant, exercised a second time via MCP
+    /// since no REST route exists for this tool.
+    #[tokio::test]
+    async fn owner_sets_purge_config_with_internal_purge_disabled() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        let out = f
+            .call(
+                &r,
+                "alice@test.com",
+                "admin.set_purge_config",
+                json!({
+                    "project_id":"proj1",
+                    "autopurge_enabled":true,
+                    "use_internal_purge":false,
+                    "file_retention_days":14,
+                    "project_retention_days":60,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["use_internal_purge"], false);
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(!persisted.use_internal_purge);
+        assert_eq!(persisted.file_retention_days, Some(14));
+    }
+
+    /// E2E-NEW-018: a member who is neither owner nor admin is forbidden, and
+    /// the config is left unchanged.
+    #[tokio::test]
+    async fn non_owner_non_admin_cannot_set_purge_config() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        f.state.admin.add_member("proj1", "mallory@test.com", "alice@test.com").await.unwrap();
+        let r = registry();
+        let e = f
+            .call(
+                &r,
+                "mallory@test.com",
+                "admin.set_purge_config",
+                json!({
+                    "project_id":"proj1",
+                    "autopurge_enabled":true,
+                    "use_internal_purge":true,
+                    "file_retention_days":7,
+                    "project_retention_days":30,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN);
+        assert!(!f.state.admin.get_purge_config("proj1").await.unwrap().autopurge_enabled);
+    }
+
+    /// E2E-NEW-019: unknown project.
+    #[tokio::test]
+    async fn set_purge_config_on_an_unknown_project_is_not_found() {
+        let f = Fixture::new().await;
+        let r = registry();
+        let e = f
+            .call(
+                &r,
+                "alice@test.com",
+                "admin.set_purge_config",
+                json!({
+                    "project_id":"ghost",
+                    "autopurge_enabled":true,
+                    "use_internal_purge":true,
+                    "file_retention_days":7,
+                    "project_retention_days":30,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::PROJECT_NOT_FOUND);
+    }
+
+    /// E2E-NEW-020: zero retention values are rejected, table-driven.
+    #[tokio::test]
+    async fn zero_retention_values_are_rejected() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        for args in [
+            json!({
+                "project_id":"proj1",
+                "autopurge_enabled":true,
+                "use_internal_purge":true,
+                "file_retention_days":0,
+                "project_retention_days":30,
+            }),
+            json!({
+                "project_id":"proj1",
+                "autopurge_enabled":true,
+                "use_internal_purge":true,
+                "file_retention_days":7,
+                "project_retention_days":0,
+            }),
+        ] {
+            let e = f.call(&r, "alice@test.com", "admin.set_purge_config", args).await.unwrap_err();
+            assert_eq!(e.code, code::INVALID_ARGUMENT);
+        }
+        // nothing was persisted
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert!(!persisted.autopurge_enabled);
+    }
+
+    /// E2E-NEW-021: both retentions `None` is a valid, unconditioned config.
+    #[tokio::test]
+    async fn both_retentions_none_is_valid() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        let out = f
+            .call(
+                &r,
+                "alice@test.com",
+                "admin.set_purge_config",
+                json!({
+                    "project_id":"proj1",
+                    "autopurge_enabled":true,
+                    "use_internal_purge":false,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["file_retention_days"], Value::Null);
+        assert_eq!(out["project_retention_days"], Value::Null);
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert_eq!(persisted.file_retention_days, None);
+        assert_eq!(persisted.project_retention_days, None);
+    }
+
+    /// E2E-NEW-022: the minimum valid positive value succeeds.
+    #[tokio::test]
+    async fn minimum_positive_retention_succeeds() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        let out = f
+            .call(
+                &r,
+                "alice@test.com",
+                "admin.set_purge_config",
+                json!({
+                    "project_id":"proj1",
+                    "autopurge_enabled":true,
+                    "use_internal_purge":true,
+                    "file_retention_days":1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["file_retention_days"], 1);
+    }
+
+    /// E2E-NEW-023: re-setting identical values is idempotent, no duplicate row.
+    #[tokio::test]
+    async fn resetting_identical_values_is_idempotent() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "alice@test.com").await;
+        let r = registry();
+        let args = json!({
+            "project_id":"proj1",
+            "autopurge_enabled":true,
+            "use_internal_purge":true,
+            "file_retention_days":7,
+            "project_retention_days":30,
+        });
+        f.call(&r, "alice@test.com", "admin.set_purge_config", args.clone()).await.unwrap();
+        f.call(&r, "alice@test.com", "admin.set_purge_config", args).await.unwrap();
+        let persisted = f.state.admin.get_purge_config("proj1").await.unwrap();
+        assert_eq!(persisted.file_retention_days, Some(7));
+        assert_eq!(persisted.project_retention_days, Some(30));
+    }
+
+    // ── admin.list_deleted_projects (SPEC-0014 US-0010) ────────────────────
+
+    const DAY: f64 = 86_400.0;
+
+    /// E2E-NEW-058: platform admin sees every soft-deleted project, with the
+    /// countdown computed from each project's own `deleted_at`.
+    #[tokio::test]
+    async fn e2e_new_058_platform_admin_sees_all_deleted_projects() {
+        let f = Fixture::with_config(|c| c.safety.project_purge_grace_days = 30).await;
+        f.seed_soft_deleted("proj-5", "alice@test.com", 5.0 * DAY).await;
+        f.seed_soft_deleted("proj-10", "bob@test.com", 10.0 * DAY).await;
+        let r = registry();
+
+        let out = f.call(&r, ADMIN, "admin.list_deleted_projects", json!({})).await.unwrap();
+        let entries = out["deleted_projects"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let by_id: std::collections::HashMap<&str, &Value> =
+            entries.iter().map(|e| (e["project_id"].as_str().unwrap(), e)).collect();
+        assert_eq!(by_id["proj-5"]["owner"], "alice@test.com");
+        assert_eq!(by_id["proj-5"]["days_until_permanent_removal"], 25);
+        assert_eq!(by_id["proj-10"]["owner"], "bob@test.com");
+        assert_eq!(by_id["proj-10"]["days_until_permanent_removal"], 20);
+    }
+
+    /// E2E-NEW-059: single-result shape, MCP-only (no REST equivalent exists).
+    #[tokio::test]
+    async fn e2e_new_059_single_soft_deleted_project() {
+        let f = Fixture::with_config(|c| c.safety.project_purge_grace_days = 30).await;
+        f.seed_soft_deleted("proj-5", "alice@test.com", 5.0 * DAY).await;
+        let r = registry();
+
+        let out = f.call(&r, ADMIN, "admin.list_deleted_projects", json!({})).await.unwrap();
+        let entries = out["deleted_projects"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["project_id"], "proj-5");
+        assert_eq!(entries[0]["days_until_permanent_removal"], 25);
+    }
+
+    /// E2E-NEW-060: a non-admin caller sees only their own soft-deleted project,
+    /// filtered exactly as `admin.list_projects` filters, never `ERR_FORBIDDEN`.
+    #[tokio::test]
+    async fn e2e_new_060_membership_filtered_for_non_admin_caller() {
+        let f = Fixture::with_config(|c| c.safety.project_purge_grace_days = 30).await;
+        f.seed_soft_deleted("proj-mine", "alice@test.com", 5.0 * DAY).await;
+        f.seed_soft_deleted("proj-other", "bob@test.com", 10.0 * DAY).await;
+        let r = registry();
+
+        let out =
+            f.call(&r, "alice@test.com", "admin.list_deleted_projects", json!({})).await.unwrap();
+        let entries = out["deleted_projects"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["project_id"], "proj-mine");
+    }
+
+    /// E2E-NEW-061: zero soft-deleted projects returns an empty array, no error.
+    #[tokio::test]
+    async fn e2e_new_061_empty_state() {
+        let f = Fixture::new().await;
+        let r = registry();
+
+        let out = f.call(&r, ADMIN, "admin.list_deleted_projects", json!({})).await.unwrap();
+        assert_eq!(out["deleted_projects"].as_array().unwrap().len(), 0);
+    }
+
+    /// E2E-NEW-062: grace period already elapsed yields a zero or negative
+    /// countdown, never clamped to zero.
+    #[tokio::test]
+    async fn e2e_new_062_countdown_not_clamped_past_grace_period() {
+        let f = Fixture::with_config(|c| c.safety.project_purge_grace_days = 30).await;
+        f.seed_soft_deleted("proj-overdue", "alice@test.com", 35.0 * DAY).await;
+        let r = registry();
+
+        let out = f.call(&r, ADMIN, "admin.list_deleted_projects", json!({})).await.unwrap();
+        let entries = out["deleted_projects"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["days_until_permanent_removal"], -5);
+    }
+
+    #[test]
+    fn list_deleted_projects_schema_has_no_parameters() {
+        let r = registry();
+        let s = &r.resolve("admin.list_deleted_projects").unwrap().schema;
+        assert_eq!(
+            s.input_schema(),
+            serde_json::from_str::<Value>(r#"{"type":"object","properties":{}}"#).unwrap()
+        );
+    }
+
+    // ── admin.undelete_project (SPEC-0014 US-0011) ──────────────────────────
+
+    #[test]
+    fn undelete_project_schema_matches_the_contract() {
+        let r = registry();
+        let s = &r.resolve("admin.undelete_project").unwrap().schema;
+        assert_eq!(
+            s.description,
+            "Clear a project's soft-delete flag, immediately restoring access (owner or platform admin)."
+        );
+        assert_eq!(
+            s.input_schema()["properties"]["project_id"]["description"],
+            "Id of the soft-deleted project to restore."
+        );
+        assert_eq!(s.input_schema()["required"], json!(["project_id"]));
+    }
+
+    /// E2E-NEW-063: owner undeletes, `deleted_at` cleared to NULL.
+    #[tokio::test]
+    async fn e2e_new_063_owner_undeletes() {
+        let f = Fixture::new().await;
+        f.seed_soft_deleted("proj1", "owner@test.com", 1.0).await;
+        let r = registry();
+
+        let out = f
+            .call(&r, "owner@test.com", "admin.undelete_project", json!({"project_id": "proj1"}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"project_id": "proj1", "undeleted": true}));
+        assert_eq!(f.admin_store.deleted_at_for_test("proj1").await.unwrap(), None);
+    }
+
+    /// E2E-NEW-064: platform admin (non-owner) can also undelete.
+    #[tokio::test]
+    async fn e2e_new_064_platform_admin_undeletes() {
+        let f = Fixture::new().await;
+        f.seed_soft_deleted("proj1", "owner@test.com", 1.0).await;
+        let r = registry();
+
+        f.call(&r, ADMIN, "admin.undelete_project", json!({"project_id": "proj1"})).await.unwrap();
+        assert_eq!(f.admin_store.deleted_at_for_test("proj1").await.unwrap(), None);
+    }
+
+    /// E2E-NEW-065: a project that is not soft-deleted is rejected, no state change.
+    #[tokio::test]
+    async fn e2e_new_065_already_live_project_rejected() {
+        let f = Fixture::new().await;
+        f.seed_project("proj1", "owner@test.com").await;
+        let r = registry();
+
+        let e = f
+            .call(&r, "owner@test.com", "admin.undelete_project", json!({"project_id": "proj1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(f.admin_store.deleted_at_for_test("proj1").await.unwrap(), None);
+    }
+
+    /// E2E-NEW-066: an unknown project fails `ERR_PROJECT_NOT_FOUND`, no row created.
+    #[tokio::test]
+    async fn e2e_new_066_unknown_project() {
+        let f = Fixture::new().await;
+        let r = registry();
+
+        let e = f
+            .call(&r, ADMIN, "admin.undelete_project", json!({"project_id": "ghost"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::PROJECT_NOT_FOUND);
+        assert!(f.state.admin.get_project("ghost").await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-067: a non-owner, non-admin member is forbidden, `deleted_at` unchanged.
+    #[tokio::test]
+    async fn e2e_new_067_non_owner_non_admin_forbidden() {
+        let f = Fixture::new().await;
+        f.seed_soft_deleted("proj1", "owner@test.com", 1.0).await;
+        f.state.admin.add_member("proj1", "member@test.com", "owner@test.com").await.unwrap();
+        let r = registry();
+
+        let e = f
+            .call(&r, "member@test.com", "admin.undelete_project", json!({"project_id": "proj1"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::FORBIDDEN);
+        assert!(f.admin_store.deleted_at_for_test("proj1").await.unwrap().is_some());
+    }
+
+    /// E2E-NEW-068: undelete restores real access through the live gate
+    /// (`require_member`, which `state.authorize` wraps), not a cached state.
+    #[tokio::test]
+    async fn e2e_new_068_undelete_restores_real_access() {
+        let f = Fixture::new().await;
+        f.seed_soft_deleted("proj1", "owner@test.com", 1.0).await;
+        let r = registry();
+
+        let e = f.state.authorize("proj1", "owner@test.com").await.unwrap_err();
+        assert_eq!(e.code, code::PROJECT_NOT_FOUND);
+
+        f.call(&r, "owner@test.com", "admin.undelete_project", json!({"project_id": "proj1"}))
+            .await
+            .unwrap();
+
+        f.state.authorize("proj1", "owner@test.com").await.unwrap();
     }
 }

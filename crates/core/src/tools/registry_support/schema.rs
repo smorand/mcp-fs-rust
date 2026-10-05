@@ -29,6 +29,10 @@ pub enum ParamType {
     StrArray,
     /// Nullable number: renders `"type": ["number","null"]`.
     NullableNum,
+    /// Nullable non-negative integer (an `Option<u32>` in the rmcp surface):
+    /// renders `"type": "integer", "minimum": 0`, matching what `schemars`
+    /// derives for `Option<u32>` (`admin.set_purge_config`'s retention days).
+    NullableUInt,
     /// Tolerant string array: renders with NO `type` at all (matches the C#
     /// `FlexibleStringArrayConverter`, which accepts array | string | csv | null).
     FlexibleStrArray,
@@ -116,6 +120,9 @@ impl ToolSchema {
     pub fn req_obj_array(self, n: &'static str, d: &'static str, items: &'static str) -> Self {
         self.push(n, d, ParamType::ObjArray(items), true, None)
     }
+    pub fn req_bool(self, n: &'static str, d: &'static str) -> Self {
+        self.push(n, d, ParamType::Bool, true, None)
+    }
 
     // ── optional params with a default rendered in the schema ────────────────
     pub fn opt_str(self, n: &'static str, def: &'static str, d: &'static str) -> Self {
@@ -134,6 +141,10 @@ impl ToolSchema {
     /// Nullable number (`since`): `"type": ["number","null"], "default": null`.
     pub fn opt_nullable_num(self, n: &'static str, d: &'static str) -> Self {
         self.push(n, d, ParamType::NullableNum, false, Some(Value::Null))
+    }
+    /// Nullable non-negative integer, matching `schemars`' `Option<u32>` output.
+    pub fn opt_nullable_uint(self, n: &'static str, d: &'static str) -> Self {
+        self.push(n, d, ParamType::NullableUInt, false, Some(Value::Null))
     }
     /// Optional object array (`resolutions` on a continue tool): same shape as
     /// [`Self::req_obj_array`], `"default": null`, because a call that resolves
@@ -173,6 +184,10 @@ impl ToolSchema {
                 }
                 ParamType::NullableNum => {
                     o.insert("type".into(), json!(["number", "null"]));
+                }
+                ParamType::NullableUInt => {
+                    o.insert("type".into(), json!("integer"));
+                    o.insert("minimum".into(), json!(0));
                 }
                 ParamType::FlexibleStrArray => { /* no type, by design */ }
                 ParamType::ObjArray(items) => {

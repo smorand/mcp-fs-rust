@@ -1,4 +1,4 @@
-# Tool reference (94 tools)
+# Tool reference (97 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -139,7 +139,7 @@ written) and handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR through a
 configured multimodal provider, disabled by default) and text. Audio and video
 are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 
-## admin (10)
+## admin (13)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -147,12 +147,15 @@ are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 | `admin.delete_project` | delete a project and tear down its volume | `project_id` | `project_id`, `deleted` | D,!RO,I,!OW | owner/admin |
 | `admin.list_projects` | projects the caller can access | (none) | `projects[{project_id, owner, created_at, index_mode, is_owner}]` | RO,I,!OW | auth |
 | `admin.list_all_projects` | every project | (none) | `projects[{project_id, owner, created_at, index_mode}]` | RO,I,!OW | admin |
+| `admin.list_deleted_projects` | soft-deleted projects visible to the caller, with a countdown to permanent removal | (none) | `deleted_projects[{project_id, owner, deleted_at, days_until_permanent_removal}]` | RO,I,!OW | auth, admin sees all |
 | `admin.list_users` | every known person plus platform admins | (none) | `users[{person, is_admin}]` | RO,I,!OW | admin |
 | `admin.add_member` | add a member | `project_id`, `person` | `project_id`, `person`, `role` | !D,!RO,I,!OW | owner/admin |
 | `admin.remove_member` | remove a member | `project_id`, `person` | `project_id`, `person`, `removed` | D,!RO,I,!OW | owner/admin |
 | `admin.list_members` | members of a project | `project_id` | `project_id`, `members[{person, role, added_by}]` | RO,I,!OW | member or admin |
 | `admin.set_index_mode` | set the search index mode and wipe or rebuild the index | `project_id`, `mode` | `project_id`, `index_mode`, `previous_mode`, `reindex_started` | D,!RO,I,!OW | owner/admin |
 | `admin.get_index_mode` | read the search index mode | `project_id` | `project_id`, `index_mode` | RO,I,!OW | member or admin |
+| `admin.set_purge_config` | configure auto-purge: enable flag, internal/external driver, file and project retention | `project_id`, `autopurge_enabled`, `use_internal_purge`, `file_retention_days`?, `project_retention_days`? | `project_id`, `autopurge_enabled`, `use_internal_purge`, `file_retention_days`, `project_retention_days` | !D,!RO,I,!OW | owner/admin |
+| `admin.undelete_project` | clear a project's soft-delete flag, immediately restoring access | `project_id` | `project_id`, `undeleted` | !D,!RO,!I,!OW | owner/admin |
 
 `project_id` must be 3 to 32 characters of lowercase letters, digits and hyphens,
 with alphanumeric first and last characters. Creation provisions the volume and
@@ -276,7 +279,7 @@ rules: [`git.md`](git.md#the-pull-request-surface-gitpr_-us-025).
 | Verified identity | `IdentityResolver::verify`, RS256, `iss`, `exp`/`nbf`, 30s leeway | every tool call, checked before dispatch |
 | Membership | `AdminBackend::require_member` | every `fs.*` and `git.*` tool |
 | Platform admin | caseless match against `auth.admins` | `admin.create_project`, `admin.list_all_projects`, `admin.list_users` |
-| Owner or platform admin | `AppState::require_owner_or_admin` | `admin.delete_project`, `admin.add_member`, `admin.remove_member`, `admin.set_index_mode` |
+| Owner or platform admin | `AppState::require_owner_or_admin` | `admin.delete_project`, `admin.add_member`, `admin.remove_member`, `admin.set_index_mode`, `admin.set_purge_config` |
 | Member or platform admin | inline in `tools/admin.rs` | `admin.list_members`, `admin.get_index_mode` |
 
 **Separation of duties.** A platform admin manages projects and membership and

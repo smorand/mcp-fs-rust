@@ -23,6 +23,11 @@ admin.list_all_projects
   params: (none)
   required: []
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+admin.list_deleted_projects
+  desc: List soft-deleted projects visible to the caller, with a countdown to permanent removal (membership-filtered, platform admin sees all).
+  params: (none)
+  required: []
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.list_members
   desc: List members of a project (member or platform admin).
   params: project_id:string
@@ -48,6 +53,16 @@ admin.set_index_mode
   params: project_id:string, mode:string
   required: ['project_id', 'mode']
   annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
+admin.set_purge_config
+  desc: Configure auto-purge for a project: enable flag, internal-vs-external driver choice, and the two independent retention thresholds (owner or platform admin). Either retention value may be absent to disable that axis independently.
+  params: project_id:string, autopurge_enabled:boolean, use_internal_purge:boolean, file_retention_days:number|null, project_retention_days:number|null
+  required: ['project_id', 'autopurge_enabled', 'use_internal_purge']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
+admin.undelete_project
+  desc: Clear a project's soft-delete flag, immediately restoring access (owner or platform admin).
+  params: project_id:string
+  required: ['project_id']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.append
   desc: Append content to a file (optionally create it).
   params: mount_id:string, path:string, content:string, create:boolean=false
@@ -583,6 +598,7 @@ fs.list_allowed_roots: {"person": "admin@example.com", "roots": [{"mount_id": "p
 fs.audit_log: {"entries": [{"timestamp": "<volatile>", "op": "edit", "path": "/a.txt", "detail": ""}, {"timestamp": "<volatile>", "op": "write", "path": "/dup.txt", "detail": "11 bytes"}, {"timestamp": "<volatile>", "op": "edit", "path": "/dup.txt", "detail": ""}, {"timestamp": "<volatile>", "op": "append", "path
 admin.list_projects: {"projects": [{"project_id": "parity-probe", "owner": "admin@example.com", "created_at": "<volatile>", "index_mode": "none", "is_owner": true}]}
 admin.list_all_projects: {"projects": [{"project_id": "docling-scripts", "owner": "seb.morand@gmail.com", "created_at": "<volatile>", "index_mode": "none"}, {"project_id": "mcp-fs", "owner": "user", "created_at": "<volatile>", "index_mode": "none"}, {"project_id": "parity-probe", "owner": "admin@example.com", "created_at": "<volatile>", "index_mode": "none"}]}
+admin.list_deleted_projects: {"deleted_projects": [{"project_id": "parity-probe", "owner": "admin@example.com", "deleted_at": "<volatile>", "days_until_permanent_removal": 30}]}
 admin.list_users: {"users": [{"person": "admin@example.com", "is_admin": true}, {"person": "seb.morand@gmail.com", "is_admin": false}, {"person": "user", "is_admin": false}]}
 admin.list_members: {"project_id": "parity-probe", "members": [{"person": "admin@example.com", "role": "owner", "added_by": "admin@example.com"}]}
 admin.set_index_mode: {"project_id": "parity-probe", "index_mode": "bm25", "previous_mode": "none", "reindex_started": true}

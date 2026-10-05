@@ -356,6 +356,12 @@ fn d_trash_dir() -> String {
 fn d_max_read_lines() -> usize {
     2000
 }
+fn d_purge_interval_secs() -> i64 {
+    3600
+}
+fn d_project_purge_grace_days() -> i64 {
+    30
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -365,6 +371,12 @@ pub struct SafetyConfig {
     pub read_guard: bool,
     pub allow_hard_delete: bool,
     pub max_read_lines: usize,
+    /// How often the auto purge loop wakes up, in seconds (SPEC-0014).
+    pub purge_interval_secs: i64,
+    /// Days after `project.deleted_at` before a soft-deleted project is
+    /// eligible for a hard purge. One global value, not per-project
+    /// (SPEC-0014 DEC-008).
+    pub project_purge_grace_days: i64,
 }
 impl Default for SafetyConfig {
     fn default() -> Self {
@@ -374,6 +386,8 @@ impl Default for SafetyConfig {
             read_guard: true,
             allow_hard_delete: false,
             max_read_lines: d_max_read_lines(),
+            purge_interval_secs: d_purge_interval_secs(),
+            project_purge_grace_days: d_project_purge_grace_days(),
         }
     }
 }
@@ -1155,6 +1169,41 @@ mod tests {
         assert_eq!(c.git.remote_timeout_secs, 120);
         assert_eq!(c.git.max_stash_entries, 100);
         assert_eq!(c.git.max_rebase_todo, 200);
+        assert_eq!(c.safety.purge_interval_secs, 3600);
+        assert_eq!(c.safety.project_purge_grace_days, 30);
+    }
+
+    /// E2E-NEW-074: with no YAML override, `SafetyConfig::default()` carries the
+    /// documented purge defaults.
+    #[test]
+    fn e2e_new_074_safety_purge_config_defaults() {
+        let c = SafetyConfig::default();
+        assert_eq!(c.purge_interval_secs, 3600);
+        assert_eq!(c.project_purge_grace_days, 30);
+    }
+
+    /// E2E-NEW-075: both keys, when set in YAML, load exactly as configured.
+    #[test]
+    fn e2e_new_075_safety_purge_config_override() {
+        let parsed: ServerConfig = serde_yaml::from_str(
+            "safety:\n  purge_interval_secs: 60\n  project_purge_grace_days: 7\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.safety.purge_interval_secs, 60);
+        assert_eq!(parsed.safety.project_purge_grace_days, 7);
+    }
+
+    /// E2E-NEW-076: `purge_interval_secs: 0` is an explicit, documented boundary.
+    /// This story only lands schema and config (no loop wiring yet, see the
+    /// story's Scope Boundary), so the chosen behavior is: config loading
+    /// performs no validation on this field, and a value of zero loads as-is.
+    /// The loop that would degrade into a tight cycle on zero is wired by a
+    /// later story, which is where boot-time rejection (if any) belongs.
+    #[test]
+    fn e2e_new_076_safety_purge_interval_zero_loads_unvalidated() {
+        let parsed: ServerConfig =
+            serde_yaml::from_str("safety:\n  purge_interval_secs: 0\n").unwrap();
+        assert_eq!(parsed.safety.purge_interval_secs, 0);
     }
 
     /// E2E-NEW-881: with nothing configured the requested scopes are exactly

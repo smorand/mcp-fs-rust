@@ -109,6 +109,19 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         to: PathBuf,
     },
+    /// Run one purge sweep (SPEC-0014): a project's file/project sweep, or
+    /// (with no `--project`) the global grace-period sweep.
+    Purge {
+        /// Config file path. Overrides MCP_FS_CONFIG and the dir/name pair.
+        #[arg(short = 'c', long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Sweep only this project instead of running the global grace sweep.
+        #[arg(long, value_name = "ID")]
+        project: Option<String>,
+        /// Run the sweep even though the project is not configured for autopurge.
+        #[arg(long)]
+        on_demand: bool,
+    },
     /// Print the version and exit.
     Version,
 }
@@ -147,6 +160,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             cmd_serve(config.as_deref(), git, web, context7, sqlite, db, doc).await
         }
         Command::Migrate { from, to } => cmd_migrate(&from, &to).await,
+        Command::Purge { config, project, on_demand } => {
+            cmd_purge(config.as_deref(), project, on_demand).await
+        }
     }
 }
 
@@ -160,6 +176,76 @@ async fn cmd_migrate(from: &std::path::Path, to: &std::path::Path) -> anyhow::Re
     let report = crate::migrate::run(&source, &dest).await?;
     // stdout carries the machine readable total, so the verb is usable in a script.
     println!("{}", report.total_rows());
+    Ok(())
+}
+
+/// Dispatch for `mcp-fs purge` (FR-NEW-010/FR-NEW-011).
+///
+/// Builds its own admin store, volume store manager and safety manager rather
+/// than reusing `app::build`'s: a one-shot CLI sweep needs none of `app::build`'s
+/// HTTP surface (identity, MCP route, REST plane, git), only the three pieces
+/// `purge.rs`'s sweep functions take.
+async fn cmd_purge(
+    explicit: Option<&std::path::Path>,
+    project: Option<String>,
+    on_demand: bool,
+) -> anyhow::Result<()> {
+    crate::logging::init();
+    let (config, _resolved) = load_config(explicit)?;
+    let config = std::sync::Arc::new(config);
+    let relational = std::sync::Arc::new(crate::storage::RelationalRegistry::new());
+    let admin = crate::storage::build_admin_store(&config, &relational).await?;
+    admin.connect().await?;
+    let stores = crate::storage::StoreManager::new(config.clone(), relational.clone());
+    let safety = crate::safety::SafetyManager::new(
+        config.safety.clone(),
+        crate::storage::meta::max_path_len(&config.infra.meta.backend),
+    );
+
+    match project {
+        Some(project_id) => {
+            cmd_purge_project(&*admin, &stores, &safety, &project_id, on_demand).await
+        }
+        None => {
+            // FR-NEW-011: the global form ignores `autopurge_enabled` entirely,
+            // since a soft-deleted project is already past that decision point
+            // (FR-NEW-012's grace-period comparison, unconditional on
+            // `use_internal_purge` too).
+            let removed = crate::purge::sweep_grace_period(&stores, &*admin, &config).await?;
+            println!("purge summary: global grace sweep, projects_permanently_removed={removed}");
+            Ok(())
+        }
+    }
+}
+
+/// The `--project <id>` branch of `cmd_purge`: gate per DEC-003, then run the
+/// same unmodified file/project sweep functions the background loop uses.
+async fn cmd_purge_project(
+    admin: &dyn crate::storage::traits::AdminBackend,
+    stores: &crate::storage::StoreManager,
+    safety: &crate::safety::SafetyManager,
+    project_id: &str,
+    on_demand: bool,
+) -> anyhow::Result<()> {
+    if admin.get_project(project_id).await?.is_none() {
+        anyhow::bail!("ERR_PROJECT_NOT_FOUND: project '{project_id}' does not exist");
+    }
+    let purge_config = admin.get_purge_config(project_id).await?;
+    if !purge_config.autopurge_enabled && !on_demand {
+        anyhow::bail!(
+            "project '{project_id}' is not configured for autopurge \
+             (autopurge_enabled=false); pass --on-demand to purge it anyway"
+        );
+    }
+    let client = stores.client(project_id).await?;
+    let files_purged =
+        crate::purge::sweep_project_files(&client, admin, safety, project_id).await?;
+    let project_soft_deleted =
+        crate::purge::sweep_project(&client, admin, safety, project_id).await?;
+    println!(
+        "purge summary: project={project_id} files_purged={files_purged} \
+         project_soft_deleted={project_soft_deleted}"
+    );
     Ok(())
 }
 
@@ -329,6 +415,7 @@ fn load_config(explicit: Option<&std::path::Path>) -> Result<(ServerConfig, Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::traits::AdminBackend;
     use clap::CommandFactory;
 
     fn no_env(_: &str) -> Option<String> {
@@ -591,6 +678,28 @@ mod tests {
         assert!(Cli::try_parse_from(["mcp-fs", "frobnicate"]).is_err());
     }
 
+    #[test]
+    fn purge_accepts_project_and_on_demand() {
+        match Cli::parse_from(["mcp-fs", "purge", "--project", "proj1", "--on-demand"]).command {
+            Some(Command::Purge { project, on_demand, .. }) => {
+                assert_eq!(project, Some("proj1".to_string()));
+                assert!(on_demand);
+            }
+            other => panic!("expected purge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn purge_with_no_flags_means_the_global_sweep() {
+        match Cli::parse_from(["mcp-fs", "purge"]).command {
+            Some(Command::Purge { project, on_demand, .. }) => {
+                assert_eq!(project, None);
+                assert!(!on_demand);
+            }
+            other => panic!("expected purge, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn keys_then_token_works_end_to_end() {
         let d = tempfile::tempdir().unwrap();
@@ -636,5 +745,172 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// Writes a `ServerConfig` pointed at throwaway state under `root` to
+    /// `root/config.yaml`, returning that path. Shared by every `purge` e2e test
+    /// below, which seed the admin db directly (bypassing the CLI, which has no
+    /// `admin.create_project` verb) then run `dispatch` against the same file.
+    fn write_purge_test_config(root: &std::path::Path) -> (PathBuf, ServerConfig) {
+        let mut c = ServerConfig::default();
+        c.infra.meta.dir = root.join("volumes").display().to_string();
+        c.infra.blob.dir = root.join("blobs").display().to_string();
+        c.infra.admin.path = root.join("admin.db").display().to_string();
+        // Hand-written rather than `serde_yaml::to_string(&c)`: `ServerConfig`'s
+        // default `git.hosts` round-trips through YAML as a sequence, which its
+        // own `Deserialize` then rejects (expects a mapping); every other field
+        // is left to its `#[serde(default)]`, exactly like the minimal YAML
+        // fixtures in `config.rs`'s own tests.
+        let yaml = format!(
+            "infra:\n  meta:\n    dir: {:?}\n  blob:\n    dir: {:?}\n  admin:\n    path: {:?}\n",
+            c.infra.meta.dir, c.infra.blob.dir, c.infra.admin.path
+        );
+        let path = root.join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        (path, c)
+    }
+
+    /// Opens the same admin db `write_purge_test_config` pointed `config.yaml`
+    /// at, as the concrete store (not the `AdminBackend` trait object `cmd_purge`
+    /// builds), so a test can reach the `pub(crate)`, test-only seeding methods
+    /// (`admin.set_purge_config` is US-0009, not yet implemented).
+    async fn seeded_admin(config: &ServerConfig) -> crate::storage::admin::RelationalAdminStore {
+        let relational = std::sync::Arc::new(crate::storage::RelationalRegistry::new());
+        let db = crate::storage::open_admin_db(config, &relational).await.unwrap();
+        let admin = crate::storage::admin::RelationalAdminStore::new(db);
+        AdminBackend::connect(&admin).await.unwrap();
+        admin
+    }
+
+    /// E2E-NEW-046: happy path, `--project` on an autopurge-enabled project with
+    /// a stale file and a stale-project condition both purged.
+    #[tokio::test]
+    async fn e2e_new_046_cli_happy_path() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, config) = write_purge_test_config(d.path());
+        let admin = seeded_admin(&config).await;
+        AdminBackend::create_project(&admin, "proj1", "owner@t.c").await.unwrap();
+        admin.seed_purge_config_for_test("proj1", true, true, Some(0), Some(30)).await.unwrap();
+
+        let relational = std::sync::Arc::new(crate::storage::RelationalRegistry::new());
+        let stores =
+            crate::storage::StoreManager::new(std::sync::Arc::new(config.clone()), relational);
+        let client = stores.client("proj1").await.unwrap();
+        client.write_text_atomic("/old.txt", "data").await.unwrap();
+        drop(client);
+
+        dispatch(Cli::parse_from([
+            "mcp-fs",
+            "purge",
+            "--config",
+            path.to_str().unwrap(),
+            "--project",
+            "proj1",
+        ]))
+        .await
+        .unwrap();
+    }
+
+    /// E2E-NEW-047: an unconfigured project (`autopurge_enabled=false`) refuses
+    /// without `--on-demand`, exits non-zero, leaves the project's config untouched.
+    #[tokio::test]
+    async fn e2e_new_047_cli_refuses_unconfigured_project_without_on_demand() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, config) = write_purge_test_config(d.path());
+        let admin = seeded_admin(&config).await;
+        AdminBackend::create_project(&admin, "proj1", "owner@t.c").await.unwrap();
+        admin.seed_purge_config_for_test("proj1", false, true, Some(7), Some(30)).await.unwrap();
+
+        let err = dispatch(Cli::parse_from([
+            "mcp-fs",
+            "purge",
+            "--config",
+            path.to_str().unwrap(),
+            "--project",
+            "proj1",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("proj1"), "{err}");
+        assert!(!admin.get_purge_config("proj1").await.unwrap().autopurge_enabled);
+    }
+
+    /// E2E-NEW-048: `--on-demand` overrides the CLI's own gate, so the sweep
+    /// dispatches even though `autopurge_enabled` is false.
+    #[tokio::test]
+    async fn e2e_new_048_cli_on_demand_overrides_the_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, config) = write_purge_test_config(d.path());
+        let admin = seeded_admin(&config).await;
+        AdminBackend::create_project(&admin, "proj1", "owner@t.c").await.unwrap();
+        admin.seed_purge_config_for_test("proj1", false, true, Some(7), Some(30)).await.unwrap();
+
+        dispatch(Cli::parse_from([
+            "mcp-fs",
+            "purge",
+            "--config",
+            path.to_str().unwrap(),
+            "--project",
+            "proj1",
+            "--on-demand",
+        ]))
+        .await
+        .unwrap();
+    }
+
+    /// E2E-NEW-050: a nonexistent project is `ERR_PROJECT_NOT_FOUND`-equivalent
+    /// and non-zero, even with `--on-demand`.
+    #[tokio::test]
+    async fn e2e_new_050_cli_on_nonexistent_project() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, config) = write_purge_test_config(d.path());
+        let admin = seeded_admin(&config).await;
+        drop(admin);
+
+        let err = dispatch(Cli::parse_from([
+            "mcp-fs",
+            "purge",
+            "--config",
+            path.to_str().unwrap(),
+            "--project",
+            "ghost",
+            "--on-demand",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("ERR_PROJECT_NOT_FOUND"), "{err}");
+    }
+
+    /// E2E-NEW-051: the global (no `--project`) form on zero soft-deleted
+    /// projects anywhere exits 0 with a zero-count summary, no error.
+    #[tokio::test]
+    async fn e2e_new_051_cli_global_sweep_empty_state() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, config) = write_purge_test_config(d.path());
+        let admin = seeded_admin(&config).await;
+        drop(admin);
+
+        dispatch(Cli::parse_from(["mcp-fs", "purge", "--config", path.to_str().unwrap()]))
+            .await
+            .unwrap();
+    }
+
+    /// E2E-NEW-052: the global form dispatches to the grace-sweep hook
+    /// unconditionally, regardless of any project's `autopurge_enabled`; this
+    /// only asserts the CLI wiring reaches `purge::sweep_grace_period`
+    /// (the permanent-removal assertion itself is US-0008's).
+    #[tokio::test]
+    async fn e2e_new_052_cli_global_sweep_ignores_autopurge_enabled_dispatch_only() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, config) = write_purge_test_config(d.path());
+        let admin = seeded_admin(&config).await;
+        AdminBackend::create_project(&admin, "proj1", "owner@t.c").await.unwrap();
+        admin.seed_purge_config_for_test("proj1", false, false, None, None).await.unwrap();
+
+        // Must not fail or require `--project`/`--on-demand`: the no-`--project`
+        // branch never reads `autopurge_enabled` at all.
+        dispatch(Cli::parse_from(["mcp-fs", "purge", "--config", path.to_str().unwrap()]))
+            .await
+            .unwrap();
     }
 }
