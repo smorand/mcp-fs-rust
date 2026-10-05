@@ -97,6 +97,15 @@ pub fn schema() -> SchemaSet {
         not_null: false,
         default: "NULL",
     })
+    // Storage quota in bytes for SPEC-0010: null (unlimited) for every existing
+    // and newly created project until an admin sets one.
+    .column_migration(ColumnMigration {
+        table: "project",
+        column: "quota_bytes",
+        ty: ColumnType::BigInt,
+        not_null: false,
+        default: "NULL",
+    })
 }
 
 pub struct RelationalAdminStore {
@@ -124,6 +133,7 @@ impl RelationalAdminStore {
             owner: r.text(1)?,
             created_at: r.text(2)?,
             index_mode: IndexMode::from_str(&r.text(3)?)?,
+            quota_bytes: r.opt_i64(4)?,
         })
     }
 
@@ -192,7 +202,7 @@ impl AdminBackend for RelationalAdminStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(Project { id, owner, created_at: now, index_mode: IndexMode::None })
+        Ok(Project { id, owner, created_at: now, index_mode: IndexMode::None, quota_bytes: None })
     }
 
     async fn delete_project(&self, project_id: &str) -> Result<()> {
@@ -261,8 +271,10 @@ impl AdminBackend for RelationalAdminStore {
         let row = self
             .db
             .query_opt(
-                &Query::new("SELECT id, owner, created_at, index_mode FROM project WHERE id=?1")
-                    .bind(project_id),
+                &Query::new(
+                    "SELECT id, owner, created_at, index_mode, quota_bytes FROM project WHERE id=?1",
+                )
+                .bind(project_id),
             )
             .await?;
         match row {
@@ -276,7 +288,7 @@ impl AdminBackend for RelationalAdminStore {
             .db
             .query(
                 &Query::new(
-                    "SELECT p.id, p.owner, p.created_at, p.index_mode FROM project p \
+                    "SELECT p.id, p.owner, p.created_at, p.index_mode, p.quota_bytes FROM project p \
                      JOIN project_member m ON m.project_id = p.id \
                      WHERE m.person = ?1 ORDER BY p.id",
                 )
@@ -289,7 +301,9 @@ impl AdminBackend for RelationalAdminStore {
     async fn list_all_projects(&self) -> Result<Vec<Project>> {
         let rows = self
             .db
-            .query(&Query::new("SELECT id, owner, created_at, index_mode FROM project ORDER BY id"))
+            .query(&Query::new(
+                "SELECT id, owner, created_at, index_mode, quota_bytes FROM project ORDER BY id",
+            ))
             .await?;
         rows.iter().map(Self::read_project).collect()
     }
@@ -431,6 +445,30 @@ impl AdminBackend for RelationalAdminStore {
             )
             .await?;
         Ok(())
+    }
+
+    async fn set_quota(&self, project_id: &str, quota_bytes: Option<i64>) -> Result<()> {
+        let affected = self
+            .db
+            .execute(
+                &Query::new("UPDATE project SET quota_bytes=?1 WHERE id=?2")
+                    .bind(quota_bytes)
+                    .bind(project_id),
+            )
+            .await?;
+        if affected == 0 {
+            return Err(ToolError::project_not_found(project_id));
+        }
+        Ok(())
+    }
+
+    async fn get_quota(&self, project_id: &str) -> Result<Option<i64>> {
+        let row = self
+            .db
+            .query_opt(&Query::new("SELECT quota_bytes FROM project WHERE id=?1").bind(project_id))
+            .await?
+            .ok_or_else(|| ToolError::project_not_found(project_id))?;
+        row.opt_i64(0)
     }
 
     async fn soft_delete_project(&self, project_id: &str) -> Result<bool> {

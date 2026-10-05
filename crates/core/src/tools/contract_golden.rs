@@ -1,6 +1,6 @@
 //! Test only access to the frozen MCP tool contract at the repo root.
 //!
-//! The 97 tool names, descriptions and `inputSchema` values are a client and an
+//! The 98 tool names, descriptions and `inputSchema` values are a client and an
 //! LLM facing contract. An accidental edit to a description silently changes what
 //! an agent is told a tool does, and a reordered schema key changes the bytes a
 //! client receives, so both are frozen in `tool-contract-golden.json` and a drift
@@ -8,7 +8,7 @@
 //!
 //! This is a snapshot of THIS server, not of anything external: the file is
 //! regenerated from the live registry, so the review is the diff. A one line
-//! description change shows up as one line; 97 changed tools means something went
+//! description change shows up as one line; 98 changed tools means something went
 //! wrong. Regenerate deliberately with:
 //!
 //! ```text
@@ -25,7 +25,7 @@ const REWRITE_ENV: &str = "MCPFS_REWRITE_TOOL_CONTRACT";
 pub(crate) const PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../tool-contract-golden.json");
 
-const NOTE: &str = "Frozen MCP tool contract: the 97 tool names, descriptions and inputSchema \
+const NOTE: &str = "Frozen MCP tool contract: the 98 tool names, descriptions and inputSchema \
 values this server must keep serving. Changing a name, a description or a schema here is a client \
 visible contract change, so this file is never hand edited: regenerate it deliberately with the \
 command below and review the diff.";
@@ -138,7 +138,7 @@ fn render(reg: &ToolRegistry) -> String {
 #[test]
 fn tool_contract_golden_is_current() {
     let reg = contract_registry();
-    assert_eq!(reg.len(), 97, "the frozen contract covers 35 fs, 13 admin and 49 git tools");
+    assert_eq!(reg.len(), 98, "the frozen contract covers 35 fs, 14 admin and 49 git tools");
     let rendered = render(&reg);
 
     if std::env::var_os(REWRITE_ENV).is_some() {
@@ -245,7 +245,7 @@ fn e2e_new_960_the_thirty_one_enumerated_names_are_exactly_the_new_tool_set() {
     git_enumeration_verdict(reg.names()).expect("the git family must match the enumeration");
 
     assert_eq!(PRE_SPEC_GIT_TOOLS.len() + NEW_GIT_TOOLS.len(), 49);
-    assert_eq!(reg.len(), 97);
+    assert_eq!(reg.len(), 98);
 
     // Every new tool is frozen, and carries the family's required mount_id.
     let Some(frozen) = frozen_tools() else {
@@ -301,7 +301,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
     let admin_family = reg.names().iter().filter(|n| n.starts_with("admin.")).count();
 
     // contract_golden.rs's own total, and the subtotals all.rs asserts.
-    assert_eq!(reg.len(), 97);
+    assert_eq!(reg.len(), 98);
     assert_eq!(git_family, 49);
     assert_eq!(fs_family + admin_family + git_family, reg.len());
 
@@ -315,7 +315,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
         eprintln!("skipped: {PATH} is absent");
         return;
     };
-    assert_eq!(frozen.len(), 97, "the golden file holds one entry per registered tool");
+    assert_eq!(frozen.len(), 98, "the golden file holds one entry per registered tool");
 
     // The contract text documents the same names, set for set.
     let text =

@@ -1,4 +1,4 @@
-# Tool reference (97 tools)
+# Tool reference (98 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -139,7 +139,7 @@ written) and handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR through a
 configured multimodal provider, disabled by default) and text. Audio and video
 are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 
-## admin (13)
+## admin (14)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -156,6 +156,7 @@ are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 | `admin.get_index_mode` | read the search index mode | `project_id` | `project_id`, `index_mode` | RO,I,!OW | member or admin |
 | `admin.set_purge_config` | configure auto-purge: enable flag, internal/external driver, file and project retention | `project_id`, `autopurge_enabled`, `use_internal_purge`, `file_retention_days`?, `project_retention_days`? | `project_id`, `autopurge_enabled`, `use_internal_purge`, `file_retention_days`, `project_retention_days` | !D,!RO,I,!OW | owner/admin |
 | `admin.undelete_project` | clear a project's soft-delete flag, immediately restoring access | `project_id` | `project_id`, `undeleted` | !D,!RO,!I,!OW | owner/admin |
+| `admin.set_project_quota` | set or clear a project's maximum storage size (SPEC-0010) | `project_id`, `max_mb`? | `project_id`, `max_mb` | !D,!RO,I,!OW | admin |
 
 `project_id` must be 3 to 32 characters of lowercase letters, digits and hyphens,
 with alphanumeric first and last characters. Creation provisions the volume and

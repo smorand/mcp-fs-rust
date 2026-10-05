@@ -53,6 +53,11 @@ admin.set_index_mode
   params: project_id:string, mode:string
   required: ['project_id', 'mode']
   annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
+admin.set_project_quota
+  desc: Set or clear a project's maximum storage size in megabytes (platform admin only). max_mb absent or null clears the quota (unlimited); max_mb must be > 0 when present. Lowering the quota below current usage is accepted and evicts nothing.
+  params: project_id:string, max_mb:number|null
+  required: ['project_id']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 admin.set_purge_config
   desc: Configure auto-purge for a project: enable flag, internal-vs-external driver choice, and the two independent retention thresholds (owner or platform admin). Either retention value may be absent to disable that axis independently.
   params: project_id:string, autopurge_enabled:boolean, use_internal_purge:boolean, file_retention_days:number|null, project_retention_days:number|null

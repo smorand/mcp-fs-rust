@@ -144,8 +144,8 @@ impl VolumeClient {
             self.blob.put(&sha, data).await?;
             (Some(sha), data.len() as i64)
         };
-        let gc = self.meta.put_file(path, sha.as_deref(), size, MODE_FILE).await?;
-        if let Some(dead) = gc {
+        let res = self.meta.put_file(path, sha.as_deref(), size, MODE_FILE).await?;
+        if let Some(dead) = res.gc {
             self.blob.delete(&dead).await?;
         }
         Ok(())
@@ -193,8 +193,8 @@ impl VolumeClient {
         if n.is_dir() {
             return Err(ToolError::invalid_argument(format!("'{src}' is a directory")));
         }
-        let gc = self.meta.put_file(dst, n.sha256.as_deref(), n.size, n.mode).await?;
-        if let Some(dead) = gc {
+        let res = self.meta.put_file(dst, n.sha256.as_deref(), n.size, n.mode).await?;
+        if let Some(dead) = res.gc {
             self.blob.delete(&dead).await?;
         }
         Ok(())
@@ -215,7 +215,7 @@ impl VolumeClient {
                     self.meta.mkdirs(&parent, true).await?;
                 }
                 if let Some(dead) =
-                    self.meta.put_file(&target, n.sha256.as_deref(), n.size, n.mode).await?
+                    self.meta.put_file(&target, n.sha256.as_deref(), n.size, n.mode).await?.gc
                 {
                     self.blob.delete(&dead).await?;
                 }

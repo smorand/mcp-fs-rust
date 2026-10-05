@@ -108,6 +108,8 @@ pub struct Project {
     pub created_at: String,
     /// Search index mode, `none` for every project that never set one.
     pub index_mode: IndexMode,
+    /// Maximum storage size in bytes, `None` for unlimited (SPEC-0010).
+    pub quota_bytes: Option<i64>,
 }
 
 /// A project's auto-purge settings (SPEC-0014). Absent for any project that has
@@ -132,6 +134,15 @@ pub struct Member {
     pub added_at: String,
 }
 
+/// Result of [`MetaBackend::put_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutFileResult {
+    /// A sha whose refcount hit 0 (caller GCs it).
+    pub gc: Option<String>,
+    /// The size of the node previously at `path`, or 0 if it did not exist.
+    pub old_size: i64,
+}
+
 /// A volume's metadata tree plus content-addressed blob reference counts.
 #[async_trait]
 pub trait MetaBackend: Send + Sync {
@@ -139,14 +150,16 @@ pub trait MetaBackend: Send + Sync {
     async fn list_children(&self, parent: &str) -> Result<Vec<NodeRow>>;
     async fn subtree(&self, root: &str) -> Result<Vec<NodeRow>>;
 
-    /// Upsert a file node. Returns a sha whose refcount hit 0 (caller GCs it).
+    /// Upsert a file node. Returns the sha whose refcount hit 0 (caller GCs
+    /// it), plus the pre-existing size at `path` (0 when no node existed),
+    /// read in the same transaction as the lookup.
     async fn put_file(
         &self,
         path: &str,
         sha256: Option<&str>,
         size: i64,
         mode: i64,
-    ) -> Result<Option<String>>;
+    ) -> Result<PutFileResult>;
 
     /// Remove a file node. Returns a sha whose refcount hit 0.
     async fn delete_file(&self, path: &str) -> Result<Option<String>>;
@@ -234,6 +247,14 @@ pub trait AdminBackend: Send + Sync {
     /// (SPEC-0014 US-0008): the candidate set the grace-period sweep evaluates
     /// against `project_purge_grace_days`.
     async fn list_soft_deleted_projects(&self) -> Result<Vec<(String, String)>>;
+
+    /// Persist a project's storage quota (SPEC-0010 FR-NEW-002). `None` clears
+    /// it (unlimited). `ERR_PROJECT_NOT_FOUND` when the project does not exist.
+    async fn set_quota(&self, project_id: &str, quota_bytes: Option<i64>) -> Result<()>;
+
+    /// Read a project's storage quota (SPEC-0010), `None` for unlimited.
+    /// `ERR_PROJECT_NOT_FOUND` when the project does not exist.
+    async fn get_quota(&self, project_id: &str) -> Result<Option<i64>>;
 }
 
 #[cfg(test)]

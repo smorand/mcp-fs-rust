@@ -19,6 +19,7 @@
 //! | set_index_mode           | owner or platform admin                         |
 //! | get_index_mode           | member, or platform admin (project must exist)  |
 //! | set_purge_config         | owner or platform admin                         |
+//! | set_project_quota        | platform admin only (SPEC-0010)                 |
 //!
 //! `create_project` provisions the volume and rolls the ACL row back if that
 //! fails, so a project row never points at a volume that was never created.
@@ -42,7 +43,7 @@ use std::str::FromStr;
 #[cfg(test)]
 use std::sync::Arc;
 
-/// Register the twelve `admin.*` tools.
+/// Register the thirteen `admin.*` tools.
 ///
 /// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
 /// `rmcp` tool router, never through this registry.
@@ -284,6 +285,31 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
                 project_retention_days,
             )
             .await
+        }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.set_project_quota",
+            "Set or clear a project's maximum storage size in megabytes (platform admin \
+             only). max_mb absent or null clears the quota (unlimited); max_mb must be > 0 \
+             when present. Lowering the quota below current usage is accepted and evicts \
+             nothing.",
+        )
+        .req_str("project_id", "Id of the project whose storage quota is set.")
+        .opt_nullable_uint(
+            "max_mb",
+            "Maximum storage size in megabytes. Absent or null clears the quota \
+             (unlimited). Must be > 0 when present.",
+        )
+        .read_only(false)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            let max_mb = a.opt_i64("max_mb")?.map(|m| m as u32);
+            set_project_quota(&ctx, &project_id, max_mb).await
         }),
     );
 }
@@ -565,6 +591,22 @@ async fn set_purge_config(
     }))
 }
 
+/// SPEC-0010 FR-NEW-002/003/004/013/014: platform-admin only, checked before
+/// project existence (FR-NEW-014).
+#[cfg(test)]
+async fn set_project_quota(ctx: &ToolCtx, project_id: &str, max_mb: Option<u32>) -> Result<Value> {
+    ctx.state.require_admin(&ctx.person)?;
+    if max_mb == Some(0) {
+        return Err(ToolError::invalid_argument("max_mb must be > 0"));
+    }
+    let quota_bytes = max_mb.map(|m| i64::from(m) * 1_048_576);
+    ctx.state.admin.set_quota(project_id, quota_bytes).await?;
+    Ok(json!({
+        "project_id": project_id,
+        "max_mb": max_mb,
+    }))
+}
+
 // ── shared test fixtures ────────────────────────────────────────────────────
 
 /// Fixtures shared by the `admin.*`, `git.*` and `git.auth*` test modules: a real
@@ -692,7 +734,7 @@ mod tests {
         r
     }
 
-    const ALL_ADMIN_TOOLS: [&str; 13] = [
+    const ALL_ADMIN_TOOLS: [&str; 14] = [
         "admin.create_project",
         "admin.delete_project",
         "admin.list_projects",
@@ -706,12 +748,13 @@ mod tests {
         "admin.set_index_mode",
         "admin.get_index_mode",
         "admin.set_purge_config",
+        "admin.set_project_quota",
     ];
 
     #[test]
     fn every_admin_tool_is_registered() {
         let r = registry();
-        assert_eq!(r.len(), 13);
+        assert_eq!(r.len(), 14);
         for name in ALL_ADMIN_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
