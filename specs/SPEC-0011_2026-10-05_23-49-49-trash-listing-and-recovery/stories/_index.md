@@ -20,8 +20,8 @@
 | 1 | US-0001 | n/a | `trash_entries` persistence layer | FR-NEW-001 | (infra) | 0 (own unit verification) | 5 | none | 2 | done |
 | 2 | US-0002 | n/a | `fs.delete` writes the trash entry, collision-safe | FR-NEW-002, 004, 005, 006, 013 | SC-004 | 15 | 1 | US-0001 | 2 | done |
 | 3 | US-0003 | n/a | Sweep writes the trash entry | FR-NEW-003 | SC-003 | 5 | 1 | US-0001, US-0002 | 2 | done |
-| 4 | US-0004 | n/a | `fs.trash_list` tool | FR-NEW-007, 008, 011, 016 | SC-001 | 16 | 2 | US-0001, US-0002, US-0003 | 2 | in-progress |
-| 5 | US-0005 | n/a | `fs.trash_restore` tool | FR-NEW-009, 010 | SC-002 | 14 | 2 | US-0004 | 2 | todo |
+| 4 | US-0004 | n/a | `fs.trash_list` tool | FR-NEW-007, 008, 011, 016 | SC-001 | 16 | 2 | US-0001, US-0002, US-0003 | 2 | done |
+| 5 | US-0005 | n/a | `fs.trash_restore` tool | FR-NEW-009, 010 | SC-002 | 14 | 2 | US-0004 | 2 | in-progress |
 | 6 | US-0006 | n/a | `/app/trash` GUI screen | FR-NEW-012, 018 | SC-006 | 7 | 2 | US-0004, US-0005 | 2 | todo |
 | 7 | US-0007 | n/a | `admin.create_project` retention parameters | FR-NEW-014, 015 | SC-005 | 6 | 3 | none (parallel-safe) | 2 | todo |
 | 8 | US-0008 | n/a | Contract regeneration & docs | FR-NEW-017 | (process) | 0 (structural verification) | 4 | US-0001..0007 | 2 | todo |
