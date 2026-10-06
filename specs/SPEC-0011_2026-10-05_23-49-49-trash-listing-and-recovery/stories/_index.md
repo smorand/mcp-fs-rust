@@ -17,7 +17,7 @@
 ## Implementation Order
 | Order | ID | Epic | Title | FRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
 |-------|----|----|-------|-----|-----------|-------|-------|------------|----------|--------|
-| 1 | US-0001 | n/a | `trash_entries` persistence layer | FR-NEW-001 | (infra) | 0 (own unit verification) | 5 | none | 2 | todo |
+| 1 | US-0001 | n/a | `trash_entries` persistence layer | FR-NEW-001 | (infra) | 0 (own unit verification) | 5 | none | 2 | in-progress |
 | 2 | US-0002 | n/a | `fs.delete` writes the trash entry, collision-safe | FR-NEW-002, 004, 005, 006, 013 | SC-004 | 15 | 1 | US-0001 | 2 | todo |
 | 3 | US-0003 | n/a | Sweep writes the trash entry | FR-NEW-003 | SC-003 | 5 | 1 | US-0001, US-0002 | 2 | todo |
 | 4 | US-0004 | n/a | `fs.trash_list` tool | FR-NEW-007, 008, 011, 016 | SC-001 | 16 | 2 | US-0001, US-0002, US-0003 | 2 | todo |
