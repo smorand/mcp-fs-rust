@@ -134,7 +134,8 @@ pub(crate) async fn build_with_state(
         .route("/health", get(health))
         .merge(mcp_router)
         .with_state(state.clone())
-        .merge(crate::deleted_projects_screen::router(state.clone()));
+        .merge(crate::deleted_projects_screen::router(state.clone()))
+        .merge(crate::trash_screen::router(state.clone()));
 
     // The REST data plane and its OpenAPI surface are opt-out via config, matching
     // the C#: with `api.enabled: false` the server is MCP only and both 404.
