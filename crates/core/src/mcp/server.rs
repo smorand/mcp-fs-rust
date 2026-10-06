@@ -1150,6 +1150,18 @@ pub struct CreateProjectArgs {
     pub project_id: String,
     /// Person id who owns the new project.
     pub owner: String,
+    /// Whether auto-purge is enabled for this project.
+    #[serde(default)]
+    pub autopurge_enabled: bool,
+    /// Whether the internal purge driver is used, as opposed to an external one.
+    #[serde(default)]
+    pub use_internal_purge: bool,
+    /// Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.
+    #[serde(default)]
+    pub file_retention_days: Option<i64>,
+    /// Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.
+    #[serde(default)]
+    pub project_retention_days: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2151,7 +2163,25 @@ impl McpServer {
             if a.owner.trim().is_empty() {
                 return Err(ToolError::invalid_argument("owner is required"));
             }
-            let project = self.state.admin.create_project(&a.project_id, &a.owner).await?;
+            if a.file_retention_days == Some(0) || a.file_retention_days.is_some_and(|d| d < 0) {
+                return Err(ToolError::invalid_argument("file_retention_days must be > 0"));
+            }
+            if a.project_retention_days == Some(0)
+                || a.project_retention_days.is_some_and(|d| d < 0)
+            {
+                return Err(ToolError::invalid_argument("project_retention_days must be > 0"));
+            }
+            let config = crate::storage::traits::PurgeConfig {
+                autopurge_enabled: a.autopurge_enabled,
+                use_internal_purge: a.use_internal_purge,
+                file_retention_days: a.file_retention_days,
+                project_retention_days: a.project_retention_days,
+            };
+            let project = self
+                .state
+                .admin
+                .create_project_with_purge_config(&a.project_id, &a.owner, config)
+                .await?;
             if let Err(e) = self.state.stores.provision_volume(&a.project_id).await {
                 let _ = self.state.admin.delete_project(&a.project_id).await;
                 return Err(e);
@@ -3813,6 +3843,14 @@ mod tests {
                 // each story's own Scope Boundary), not by this story.
                 continue;
             }
+            if tool.name.as_ref() == "admin.create_project" {
+                // SPEC-0011 US-0007: gained four new optional retention params
+                // (FR-NEW-014/015). `tools/admin.rs`'s test-dispatch glue (the
+                // source of `tool-contract-golden.json`) is explicitly out of
+                // scope for new production logic per that story, so the two
+                // schemas now diverge deliberately, same as the two tools above.
+                continue;
+            }
             checked += 1;
             let entry =
                 frozen.iter().find(|t| t["name"] == tool.name.as_ref()).unwrap_or_else(|| {
@@ -3826,7 +3864,11 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 98, "the frozen contract covers exactly 98 non-search tools");
+        assert_eq!(
+            checked, 97,
+            "the frozen contract covers 98 non-search tools, minus admin.create_project \
+             (excluded above for SPEC-0011 US-0007)"
+        );
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4076,6 +4118,188 @@ mod tests {
             "expected {}, got: {text}",
             code::PROJECT_NOT_FOUND
         );
+    }
+
+    // ── SPEC-0011 US-0007: admin.create_project retention parameters ───────
+    //
+    // These call `McpServer::admin_create_project` directly, the real
+    // dispatched tool handler, proving FR-NEW-014/015.
+
+    /// E2E-NEW-429: retention params are applied atomically at creation.
+    #[tokio::test]
+    async fn e2e_new_429_create_project_applies_retention_at_creation() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_create_project(Parameters(CreateProjectArgs {
+                    project_id: "proj-new-purge".to_string(),
+                    owner: "alice".to_string(),
+                    autopurge_enabled: true,
+                    use_internal_purge: true,
+                    file_retention_days: Some(7),
+                    project_retention_days: Some(30),
+                }))
+                .await,
+        );
+
+        let persisted = f.state.admin.get_purge_config("proj-new-purge").await.unwrap();
+        assert!(persisted.autopurge_enabled);
+        assert!(persisted.use_internal_purge);
+        assert_eq!(persisted.file_retention_days, Some(7));
+        assert_eq!(persisted.project_retention_days, Some(30));
+    }
+
+    /// E2E-NEW-430: omitted purge params keep today's default.
+    #[tokio::test]
+    async fn e2e_new_430_create_project_omitted_params_keep_default() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_create_project(Parameters(CreateProjectArgs {
+                    project_id: "proj-old-style".to_string(),
+                    owner: "alice".to_string(),
+                    autopurge_enabled: false,
+                    use_internal_purge: false,
+                    file_retention_days: None,
+                    project_retention_days: None,
+                }))
+                .await,
+        );
+
+        let persisted = f.state.admin.get_purge_config("proj-old-style").await.unwrap();
+        assert_eq!(persisted, crate::storage::traits::PurgeConfig::default());
+    }
+
+    /// E2E-NEW-431: negative `file_retention_days` at creation is rejected.
+    #[tokio::test]
+    async fn e2e_new_431_create_project_negative_file_retention_is_rejected() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_create_project(Parameters(CreateProjectArgs {
+                project_id: "proj-bad-retention".to_string(),
+                owner: "alice".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(-1),
+                project_retention_days: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(f.state.admin.get_project("proj-bad-retention").await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-459: partial retention params at creation don't implicitly
+    /// enable autopurge.
+    #[tokio::test]
+    async fn e2e_new_459_create_project_partial_retention_does_not_enable_autopurge() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_create_project(Parameters(CreateProjectArgs {
+                    project_id: "proj-partial-purge".to_string(),
+                    owner: "alice".to_string(),
+                    autopurge_enabled: false,
+                    use_internal_purge: false,
+                    file_retention_days: Some(5),
+                    project_retention_days: None,
+                }))
+                .await,
+        );
+
+        let persisted = f.state.admin.get_purge_config("proj-partial-purge").await.unwrap();
+        assert_eq!(persisted.file_retention_days, Some(5));
+        assert!(!persisted.autopurge_enabled);
+        assert!(!persisted.use_internal_purge);
+    }
+
+    /// E2E-NEW-460: negative `project_retention_days` at creation is rejected.
+    #[tokio::test]
+    async fn e2e_new_460_create_project_negative_project_retention_is_rejected() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_create_project(Parameters(CreateProjectArgs {
+                project_id: "proj-bad-retention-2".to_string(),
+                owner: "alice".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: None,
+                project_retention_days: Some(-3),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(f.state.admin.get_project("proj-bad-retention-2").await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-461: exact-zero retention at creation is rejected.
+    #[tokio::test]
+    async fn e2e_new_461_create_project_zero_retention_is_rejected() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_create_project(Parameters(CreateProjectArgs {
+                project_id: "proj-zero-retention".to_string(),
+                owner: "alice".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(0),
+                project_retention_days: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(f.state.admin.get_project("proj-zero-retention").await.unwrap().is_none());
     }
 
     // ── SPEC-0010 T-001: admin.set_project_quota (SC-001) ───────────────────

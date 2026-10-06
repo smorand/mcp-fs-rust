@@ -221,6 +221,28 @@ pub trait BlobBackend: Send + Sync {
 pub trait AdminBackend: Send + Sync {
     async fn connect(&self) -> Result<()>;
     async fn create_project(&self, project_id: &str, owner: &str) -> Result<Project>;
+
+    /// Same as [`AdminBackend::create_project`], plus applying `config` as the
+    /// new project's purge settings (SPEC-0011 US-0007), identical to calling
+    /// [`AdminBackend::set_purge_config`] with the same value right after.
+    /// `config == PurgeConfig::default()` is a no-op on the purge config, so a
+    /// caller passing the default behaves byte-identically to `create_project`.
+    /// The provided default is not transactional; implementors that create the
+    /// project inside one transaction should override it to insert the purge
+    /// config row in that same transaction.
+    async fn create_project_with_purge_config(
+        &self,
+        project_id: &str,
+        owner: &str,
+        config: PurgeConfig,
+    ) -> Result<Project> {
+        let project = self.create_project(project_id, owner).await?;
+        if config != PurgeConfig::default() {
+            self.set_purge_config(project_id, config).await?;
+        }
+        Ok(project)
+    }
+
     async fn delete_project(&self, project_id: &str) -> Result<()>;
     async fn add_member(&self, project_id: &str, person: &str, added_by: &str) -> Result<Member>;
     async fn remove_member(&self, project_id: &str, person: &str) -> Result<()>;
