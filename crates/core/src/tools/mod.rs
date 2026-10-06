@@ -56,6 +56,7 @@ pub(crate) mod search;
 #[cfg(test)]
 pub(crate) mod search_semantic;
 pub mod sqlite;
+pub(crate) mod trash;
 pub mod web;
 #[cfg(test)]
 pub(crate) mod write;

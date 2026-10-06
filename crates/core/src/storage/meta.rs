@@ -265,6 +265,56 @@ impl RelationalMetaStore {
         ))
     }
 
+    /// Page through `trash_entries` for this volume, newest delete first,
+    /// optionally restricted to `path_prefix` and its descendants, alongside the
+    /// unpaged total count matching the same filter (SPEC-0011 US-0004,
+    /// FR-NEW-007). Two queries in one transaction: `list_trash_entries` alone
+    /// cannot report `total` when `limit` cuts the result short.
+    pub(crate) async fn list_trash_entries_page(
+        &self,
+        path_prefix: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<TrashEntryRow>, i64)> {
+        let mut tx = self.db.begin().await?;
+        let rows =
+            list_trash_entries(&mut *tx, &self.volume_id, path_prefix, limit, offset).await?;
+        let total = count_trash_entries(&mut *tx, &self.volume_id, path_prefix).await?;
+        tx.commit().await?;
+        Ok((rows, total))
+    }
+
+    /// Insert a `trash_entries` row for `trash_path` unless one already exists
+    /// (SPEC-0011 US-0004, FR-NEW-011): the lazy backfill of a legacy trashed
+    /// node that predates `trash_entries`. Idempotent by construction, the
+    /// get-then-insert runs inside one transaction so two concurrent backfills
+    /// of the same node cannot both insert.
+    pub(crate) async fn backfill_trash_entry(
+        &self,
+        trash_path: &str,
+        original_path: &str,
+        size: i64,
+        kind: &str,
+        deleted_at: &str,
+    ) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        if get_trash_entry(&mut *tx, &self.volume_id, trash_path).await?.is_none() {
+            insert_trash_entry(
+                &mut *tx,
+                &self.volume_id,
+                trash_path,
+                original_path,
+                size,
+                kind,
+                deleted_at,
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Record a `trash_entries` row for a trash-destination rename that already
     /// committed (SPEC-0011 US-0002, FR-NEW-002).
     ///
@@ -595,10 +645,41 @@ pub(crate) async fn get_trash_entry(
     row.as_ref().map(read_trash_row).transpose()
 }
 
+/// Count of `trash_entries` rows matching the same `path_prefix` filter as
+/// [`list_trash_entries`], unpaged (US-0004's `total`).
+async fn count_trash_entries(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    path_prefix: &str,
+) -> Result<i64> {
+    let dialect = tx.dialect();
+    let row = if path_prefix.is_empty() {
+        tx.query_opt(
+            &Query::new("SELECT COUNT(*) FROM trash_entries WHERE volume_id=?1").bind(volume_id),
+        )
+        .await?
+    } else {
+        let pattern = trash_path_prefix_pattern(dialect, path_prefix);
+        tx.query_opt(
+            &Query::new(
+                "SELECT COUNT(*) FROM trash_entries WHERE volume_id=?1 \
+                 AND (original_path=?2 OR original_path LIKE ?3 ESCAPE '\\')",
+            )
+            .bind(volume_id)
+            .bind(path_prefix)
+            .bind(pattern),
+        )
+        .await?
+    };
+    match row {
+        Some(r) => r.i64(0),
+        None => Ok(0),
+    }
+}
+
 /// Every row for `volume_id`, newest delete first, optionally restricted to
 /// `path_prefix` and its descendants (US-0004's `fs.trash_list` filter; an
 /// empty prefix matches every row). `limit`/`offset` page the result.
-#[allow(dead_code)]
 pub(crate) async fn list_trash_entries(
     tx: &mut dyn RelationalTx,
     volume_id: &str,

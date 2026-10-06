@@ -216,6 +216,9 @@ pub struct HeadTailArgs {
 fn def_lines_20() -> i64 {
     20
 }
+fn def_trash_list_limit() -> i64 {
+    200
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PathOnlyArgs {
@@ -1061,6 +1064,21 @@ pub struct AuditLogArgs {
     /// Maximum number of recent entries to return.
     #[serde(default = "def_lines_20")]
     pub limit: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TrashListArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Only return trashed entries whose original path starts with this prefix.
+    #[serde(default)]
+    pub path_prefix: String,
+    /// Maximum number of entries to return.
+    #[serde(default = "def_trash_list_limit")]
+    pub limit: i64,
+    /// Number of entries to skip before collecting `limit` results.
+    #[serde(default)]
+    pub offset: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1981,6 +1999,29 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.audit_log", out)
+    }
+
+    #[tool(
+        name = "fs.trash_list",
+        description = "List trashed files, paginated and filterable by original path prefix."
+    )]
+    async fn fs_trash_list(
+        &self,
+        Parameters(a): Parameters<TrashListArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            crate::tools::trash::trash_list(
+                &self.state,
+                &a.mount_id,
+                &a.path_prefix,
+                a.limit,
+                a.offset,
+            )
+            .await
+        }
+        .await;
+        to_call_result("fs.trash_list", out)
     }
 
     // ── document family ──────────────────────────────────────────────────────
@@ -3396,7 +3437,7 @@ mod tests {
     ];
 
     #[test]
-    fn fs_tool_count_is_thirty_five() {
+    fn fs_tool_count_is_thirty_six() {
         let router = McpServer::tool_router();
         let names: Vec<String> = router
             .list_all()
@@ -3404,11 +3445,11 @@ mod tests {
             .map(|t| t.name.to_string())
             .filter(|n| n.starts_with("fs."))
             .collect();
-        assert_eq!(names.len(), 35, "got: {names:?}");
+        assert_eq!(names.len(), 36, "got: {names:?}");
     }
 
     #[test]
-    fn total_tool_count_is_one_hundred_and_two() {
+    fn total_tool_count_is_one_hundred_and_three() {
         let router = McpServer::tool_router();
         let names: Vec<String> =
             router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -3416,11 +3457,11 @@ mod tests {
         let admin_count = names.iter().filter(|n| n.starts_with("admin.")).count();
         let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
-        assert_eq!(fs_count, 35, "got: {names:?}");
+        assert_eq!(fs_count, 36, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 102, "got: {names:?}");
+        assert_eq!(names.len(), 103, "got: {names:?}");
     }
 
     #[test]
@@ -3739,6 +3780,12 @@ mod tests {
             if tool.name.starts_with("search.") {
                 continue; // config-gated, not part of the frozen 95-tool surface
             }
+            if tool.name.as_ref() == "fs.trash_list" {
+                // SPEC-0011 US-0004: not yet in TOOL_CONTRACT.txt / the golden
+                // contract, added there deliberately by US-0008 (see the story's
+                // own Scope Boundary), not by this story.
+                continue;
+            }
             checked += 1;
             let entry =
                 frozen.iter().find(|t| t["name"] == tool.name.as_ref()).unwrap_or_else(|| {
@@ -3766,6 +3813,9 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .filter(|n| !n.starts_with("search."))
+            // SPEC-0011 US-0004: fs.trash_list is deliberately absent from the
+            // frozen contract until US-0008 adds it (story's own Scope Boundary).
+            .filter(|n| n != "fs.trash_list")
             .collect();
 
         let frozen = crate::tools::contract_golden::frozen_tools()
