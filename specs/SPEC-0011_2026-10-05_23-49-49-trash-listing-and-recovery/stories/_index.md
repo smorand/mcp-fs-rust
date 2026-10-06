@@ -24,7 +24,7 @@
 | 5 | US-0005 | n/a | `fs.trash_restore` tool | FR-NEW-009, 010 | SC-002 | 14 | 2 | US-0004 | 2 | done |
 | 6 | US-0006 | n/a | `/app/trash` GUI screen | FR-NEW-012, 018 | SC-006 | 7 | 2 | US-0004, US-0005 | 2 | done |
 | 7 | US-0007 | n/a | `admin.create_project` retention parameters | FR-NEW-014, 015 | SC-005 | 6 | 3 | none (parallel-safe) | 2 | done |
-| 8 | US-0008 | n/a | Contract regeneration & docs | FR-NEW-017 | (process) | 0 (structural verification) | 4 | US-0001..0007 | 2 | in-progress |
+| 8 | US-0008 | n/a | Contract regeneration & docs | FR-NEW-017 | (process) | 0 (structural verification) | 4 | US-0001..0007 | 2 | done |
 
 **Cost caveat:** n/a at tier 2 (the caveat applies only to tiers 3/4).
 
