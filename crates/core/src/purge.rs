@@ -7,6 +7,7 @@
 //! story — `cli.rs` and `app.rs` are not touched here).
 
 use crate::config::ServerConfig;
+use crate::core::fs_ops::rename_with_collision_retry;
 use crate::errors::{Result, ToolError};
 use crate::git::GitRepoStore;
 use crate::safety::SafetyManager;
@@ -63,14 +64,36 @@ async fn sweep_project_files_at(
         let dst = safety.trash_path(&node.path);
         let Some(slash) = dst.rfind('/') else { continue };
         let parent = &dst[..slash];
-        // One commit per file: any failure here (mkdir or rename) is swallowed
-        // so it never blocks or rolls back the files before or after it.
+        // One commit per file: any failure here (mkdir, rename, or the
+        // trash-entry insert) is swallowed so it never blocks or rolls back
+        // the files before or after it (DEC-013). A failed insert additionally
+        // renames the file back to its original path, so the rename and the
+        // insert still appear atomic to an external observer even though they
+        // are not one database transaction (SPEC-0011 US-0002's logged drift).
         if client.makedirs(parent, true).await.is_err() {
             continue;
         }
-        if client.rename(&node.path, &dst).await.is_ok() {
-            purged += 1;
+        let final_dst = match rename_with_collision_retry(client, &node.path, &dst).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Some(store) = &client.trash {
+            let recorded = store
+                .record_trash_entry(
+                    &final_dst,
+                    &node.path,
+                    node.size,
+                    &node.kind,
+                    &crate::util::now_iso(),
+                    None,
+                )
+                .await;
+            if recorded.is_err() {
+                let _ = client.rename(&final_dst, &node.path).await;
+                continue;
+            }
         }
+        purged += 1;
     }
     Ok(purged)
 }
@@ -251,6 +274,7 @@ mod tests {
     use crate::storage::admin::RelationalAdminStore;
     use crate::storage::blob::local::LocalBlobStore;
     use crate::storage::meta::RelationalMetaStore;
+    use crate::storage::rel::{Dialect, Query, RelationalDb, RelationalTx, RowValues};
     use crate::storage::traits::{MetaBackend, NodeRow};
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -269,7 +293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let meta = Arc::new(RelationalMetaStore::in_memory("proj").await.unwrap());
         let blob = Arc::new(LocalBlobStore::new(dir.path(), "mcpfs-test"));
-        let client = VolumeClient::new("proj", meta.clone(), blob);
+        let client = VolumeClient::new("proj", meta.clone(), blob).with_trash_store(meta.clone());
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         admin.create_project("proj", "owner@t.c").await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
@@ -418,6 +442,254 @@ mod tests {
         let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
         assert_eq!(purged, 0);
         assert!(f.client.exists("/stale.txt").await.unwrap());
+    }
+
+    // ── SPEC-0011 US-0003: sweep writes the trash entry ─────────────────────
+
+    /// Locates the one `trash_entries` row under `trash_root` whose
+    /// `original_path` matches `original`, by scanning the trash subtree on
+    /// disk (the sweep's destination stamp is wall-clock, so a test cannot
+    /// predict it ahead of time).
+    async fn find_trash_row_for(
+        f: &Fix,
+        trash_root: &str,
+        original: &str,
+    ) -> crate::storage::traits::TrashEntryRow {
+        let store = f.client.trash.as_ref().unwrap();
+        let in_trash = f.client.meta.subtree(trash_root).await.unwrap();
+        for node in in_trash {
+            if let Some(row) = store.get_trash_entry_for_test(&node.path).await.unwrap()
+                && row.original_path == original
+            {
+                return row;
+            }
+        }
+        panic!("no trash_entries row found for original_path '{original}'");
+    }
+
+    #[tokio::test]
+    async fn e2e_new_403_sweep_writes_a_system_initiated_trash_entry() {
+        let f = fixture().await;
+        seed_stale_file(&f, "/old.txt", 3.0 * DAY).await;
+        f.admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
+
+        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        assert_eq!(purged, 1);
+
+        let trash_root = format!("/{}", f.safety.config().trash_dir);
+        let row = find_trash_row_for(&f, &trash_root, "/old.txt").await;
+        assert_eq!(row.original_path, "/old.txt");
+        assert!(row.deleted_by.is_none(), "system-initiated delete, not a null string");
+    }
+
+    #[tokio::test]
+    async fn e2e_new_440_sweep_created_entries_match_a_user_initiated_shape() {
+        let f = fixture().await;
+        seed_stale_file(&f, "/stale.txt", 5.0 * DAY).await;
+        f.admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
+
+        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        assert_eq!(purged, 1);
+
+        // TODO(US-0004/US-0005): once fs.trash_list/fs.trash_restore exist, extend
+        // this into a full round trip instead of a direct DB query (E2E-NEW-440).
+        let trash_root = format!("/{}", f.safety.config().trash_dir);
+        let row = find_trash_row_for(&f, &trash_root, "/stale.txt").await;
+        assert!(row.trash_path.ends_with("__stale.txt"), "got {}", row.trash_path);
+        assert_eq!(row.size, 4, "matches the seeded \"data\" payload");
+        assert_eq!(row.kind, "file");
+        assert!(row.deleted_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2e_new_457_sweep_with_no_stale_files_writes_no_trash_entries() {
+        let f = fixture().await;
+        f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
+        let store = f.client.trash.as_ref().unwrap();
+        let before = store.count_trash_entries_for_test().await.unwrap();
+
+        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        assert_eq!(purged, 0);
+        let after = store.count_trash_entries_for_test().await.unwrap();
+        assert_eq!(before, after, "a no-op sweep writes nothing");
+        assert_eq!(after, 0);
+    }
+
+    /// Delegates every [`MetaBackend`] method to `inner`, except `rename`,
+    /// which always fails with `ERR_NO_CLOBBER`, counting its calls. Used in
+    /// place of pre-occupying 51 wall-clock-stamped destinations (the sweep's
+    /// destination, unlike `fs_ops::delete_path_at`'s deterministic seam, is
+    /// stamped off `safety.trash_path`'s own `now_unix()` call, which a test
+    /// cannot predict ahead of time): this reaches the same collision-
+    /// exhaustion path deterministically, at the `MetaBackend::rename` level
+    /// `rename_with_collision_retry` itself calls (E2E-NEW-447).
+    struct AlwaysCollideMeta {
+        inner: Arc<dyn MetaBackend>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MetaBackend for AlwaysCollideMeta {
+        async fn get(&self, path: &str) -> Result<Option<NodeRow>> {
+            self.inner.get(path).await
+        }
+        async fn list_children(&self, parent: &str) -> Result<Vec<NodeRow>> {
+            self.inner.list_children(parent).await
+        }
+        async fn subtree(&self, root: &str) -> Result<Vec<NodeRow>> {
+            self.inner.subtree(root).await
+        }
+        async fn put_file(
+            &self,
+            path: &str,
+            sha256: Option<&str>,
+            size: i64,
+            mode: i64,
+        ) -> Result<crate::storage::traits::PutFileResult> {
+            self.inner.put_file(path, sha256, size, mode).await
+        }
+        async fn delete_file(&self, path: &str) -> Result<Option<String>> {
+            self.inner.delete_file(path).await
+        }
+        async fn remove_subtree(&self, path: &str) -> Result<Vec<String>> {
+            self.inner.remove_subtree(path).await
+        }
+        async fn mkdirs(&self, path: &str, exist_ok: bool) -> Result<()> {
+            self.inner.mkdirs(path, exist_ok).await
+        }
+        async fn mkdir(&self, path: &str) -> Result<()> {
+            self.inner.mkdir(path).await
+        }
+        async fn rmdir(&self, path: &str) -> Result<()> {
+            self.inner.rmdir(path).await
+        }
+        async fn rename(&self, _src: &str, _dst: &str) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::errors::ToolError::no_clobber("simulated collision"))
+        }
+        async fn touch_atime(&self, path: &str) -> Result<()> {
+            self.inner.touch_atime(path).await
+        }
+        async fn touch_atime_mtime(&self, path: &str) -> Result<()> {
+            self.inner.touch_atime_mtime(path).await
+        }
+        async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
+            self.inner.stale_files(before, exclude_root).await
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_new_447_collision_exhaustion_inside_the_sweep_surfaces_the_same_error() {
+        let f = fixture().await;
+        seed_stale_file(&f, "/x", 8.0 * DAY).await;
+        f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = AlwaysCollideMeta { inner: f.client.meta.clone(), calls: calls.clone() };
+        let colliding_client = VolumeClient::new("proj", Arc::new(mock), f.client.blob.clone())
+            .with_trash_store(f.meta.clone());
+
+        let purged =
+            sweep_project_files(&colliding_client, &f.admin, &f.safety, "proj").await.unwrap();
+        assert_eq!(purged, 0, "the colliding file's failure is isolated, not propagated");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            51,
+            "one bare attempt plus 50 suffixed retries, same exhaustion as E2E-NEW-405"
+        );
+        assert!(f.client.exists("/x").await.unwrap(), "stale file remains live after exhaustion");
+    }
+
+    /// Wraps a real [`RelationalDb`] so one `INSERT INTO trash_entries`
+    /// transaction fails exactly once, for E2E-NEW-445: proving a failed
+    /// `trash_entries` insert leaves the swept file live rather than
+    /// orphaned in the trash directory with no tracking row.
+    struct FailTrashInsertOnceDb {
+        inner: Arc<dyn RelationalDb>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl RelationalDb for FailTrashInsertOnceDb {
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+        async fn execute(&self, query: &Query) -> Result<u64> {
+            self.inner.execute(query).await
+        }
+        async fn query(&self, query: &Query) -> Result<Vec<RowValues>> {
+            self.inner.query(query).await
+        }
+        async fn begin(&self) -> Result<Box<dyn RelationalTx>> {
+            let tx = self.inner.begin().await?;
+            Ok(Box::new(FailTrashInsertOnceTx { inner: tx, armed: self.armed.clone() }))
+        }
+        async fn migrate(&self, schema: &crate::storage::rel::SchemaSet) -> Result<()> {
+            self.inner.migrate(schema).await
+        }
+    }
+
+    struct FailTrashInsertOnceTx {
+        inner: Box<dyn RelationalTx>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl RelationalTx for FailTrashInsertOnceTx {
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+        async fn execute(&mut self, query: &Query) -> Result<u64> {
+            if query.sql.contains("INSERT INTO trash_entries")
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ToolError::internal("simulated trash_entries insert failure"));
+            }
+            self.inner.execute(query).await
+        }
+        async fn query(&mut self, query: &Query) -> Result<Vec<RowValues>> {
+            self.inner.query(query).await
+        }
+        async fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit().await
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_new_445_a_failed_trash_entries_insert_leaves_the_file_live() {
+        use crate::storage::meta::RelationalMetaStore;
+        use crate::storage::rel::SqliteRelationalDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_db: Arc<dyn RelationalDb> =
+            Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let meta = Arc::new(RelationalMetaStore::open(real_db.clone(), "proj").await.unwrap());
+        let blob = Arc::new(LocalBlobStore::new(dir.path(), "mcpfs-test"));
+        let client = VolumeClient::new("proj", meta.clone(), blob);
+
+        let failing_db: Arc<dyn RelationalDb> = Arc::new(FailTrashInsertOnceDb {
+            inner: real_db,
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        let failing_trash = Arc::new(RelationalMetaStore::open(failing_db, "proj").await.unwrap());
+        let client = client.with_trash_store(failing_trash.clone());
+
+        let admin = RelationalAdminStore::in_memory().await.unwrap();
+        admin.create_project("proj", "owner@t.c").await.unwrap();
+        let safety = SafetyManager::new(SafetyConfig::default(), None);
+
+        client.write_text_atomic("/stale2.txt", "data").await.unwrap();
+        meta.set_atime_for_test("/stale2.txt", now_unix() - 8.0 * DAY).await.unwrap();
+        admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
+
+        let purged = sweep_project_files(&client, &admin, &safety, "proj").await.unwrap();
+        assert_eq!(purged, 0, "the per-file failure is isolated, matching purge.rs:26");
+        assert!(client.exists("/stale2.txt").await.unwrap(), "the file remains live, not trashed");
+        assert_eq!(
+            failing_trash.count_trash_entries_for_test().await.unwrap(),
+            0,
+            "no orphaned trash_entries row either"
+        );
     }
 
     /// Backdates `proj`'s `created_at` to `now - age_seconds`, so a project-sweep
