@@ -7,9 +7,66 @@
 use crate::errors::{Result, ToolError};
 use crate::state::AppState;
 use crate::storage::VolumeClient;
+#[cfg(test)]
+use crate::tools::authorize_only;
+#[cfg(test)]
+use crate::tools::registry_support::{ToolRegistry, ToolSchema, handler};
 use serde_json::{Value, json};
 
 const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// Test-dispatch glue for `fs.trash_list`/`fs.trash_restore`, mirroring the real
+/// production handlers (`McpServer::fs_trash_list`/`fs_trash_restore`) so the
+/// golden-contract regeneration sees the same schema the live MCP surface serves.
+#[cfg(test)]
+pub(crate) fn register(reg: &mut ToolRegistry) {
+    reg.add(
+        ToolSchema::new(
+            "fs.trash_list",
+            "List trashed files, paginated and filterable by original path prefix.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_str(
+            "path_prefix",
+            "",
+            "Only return trashed entries whose original path starts with this prefix.",
+        )
+        .opt_int("limit", 200, "Maximum number of entries to return.")
+        .opt_int("offset", 0, "Number of entries to skip before collecting `limit` results.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx, a| async move {
+            let mount = authorize_only(&ctx, &a).await?;
+            trash_list(
+                &ctx.state,
+                &mount,
+                &a.str_or("path_prefix", ""),
+                a.int_or("limit", 200),
+                a.int_or("offset", 0),
+            )
+            .await
+        }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "fs.trash_restore",
+            "Restore a trashed file or directory subtree back to its original path, renaming to `_restoredN` on collision.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("trash_path", "The trashed entry's current path (as returned by `fs.trash_list`).")
+        .read_only(false)
+        .destructive(false)
+        .idempotent(false)
+        .open_world(false),
+        handler(|ctx, a| async move {
+            let mount = authorize_only(&ctx, &a).await?;
+            let trash_path = a.str("trash_path")?;
+            trash_restore(&ctx.state, &mount, &trash_path).await
+        }),
+    );
+}
 
 /// `fs.trash_list(mount_id, path_prefix, limit, offset)` (FR-NEW-007/008/011).
 ///

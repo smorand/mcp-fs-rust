@@ -1,4 +1,4 @@
-# Tool reference (98 tools)
+# Tool reference (100 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -104,7 +104,7 @@ directory, matching the reference.
 `uid`/`gid` are the synthetic constants 1000/1000: a volume has no real POSIX
 owner.
 
-## fs lifecycle (6)
+## fs lifecycle (8)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -114,10 +114,18 @@ owner.
 | `fs.copy` | copy a file or tree | `source`, `destination`, `overwrite:bool=false`, `recursive:bool=false` | `source`, `destination` | D,!RO,!I,!OW | member |
 | `fs.list_allowed_roots` | volumes the caller can reach | (`mount_id` only) | `person`, `roots[{mount_id, root, owner}]` | RO,I,!OW | member |
 | `fs.audit_log` | mutations recorded this session | `since:number=null`, `limit:int=20` | `entries[{timestamp, op, path, detail}]` | RO,I,!OW | member |
+| `fs.trash_list` | list trashed files, paginated | `path_prefix:string=""`, `limit:int=200`, `offset:int=0` | `entries[{trash_path, original_path, size, kind, deleted_at, deleted_by, purge_in_days}]`, `total` | RO,I,!OW | member |
+| `fs.trash_restore` | restore a trashed entry to its original path | `trash_path` | `restored_path`, `trash_path` | !D,!RO,!I,!OW | member |
 
 `trash=false` needs `safety.allow_hard_delete` on the server, otherwise
 `ERR_NOT_SUPPORTED`. `fs.list_allowed_roots` and `fs.audit_log` still take and
 check `mount_id` even though they never open the volume.
+
+`fs.trash_list` backfills any trash-directory node not yet tracked in
+`trash_entries` before paging, so it also covers files trashed outside the MCP
+surface. `purge_in_days` is `null` when the project has no file retention
+configured. `fs.trash_restore` renames to `_restoredN` on a collision at the
+original path rather than failing (SPEC-0011).
 
 ## fs document (3)
 
@@ -143,7 +151,7 @@ are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
-| `admin.create_project` | create a project and provision its volume | `project_id`, `owner` | `project_id`, `owner`, `created_at` | !D,!RO,!I,!OW | admin |
+| `admin.create_project` | create a project and provision its volume | `project_id`, `owner`, `autopurge_enabled:bool=false`, `use_internal_purge:bool=false`, `file_retention_days:int=null`, `project_retention_days:int=null` | `project_id`, `owner`, `created_at` | !D,!RO,!I,!OW | admin |
 | `admin.delete_project` | delete a project and tear down its volume | `project_id` | `project_id`, `deleted` | D,!RO,I,!OW | owner/admin |
 | `admin.list_projects` | projects the caller can access | (none) | `projects[{project_id, owner, created_at, index_mode, is_owner}]` | RO,I,!OW | auth |
 | `admin.list_all_projects` | every project | (none) | `projects[{project_id, owner, created_at, index_mode}]` | RO,I,!OW | admin |

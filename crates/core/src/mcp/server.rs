@@ -3835,21 +3835,7 @@ mod tests {
         let mut checked = 0;
         for tool in &tools {
             if tool.name.starts_with("search.") {
-                continue; // config-gated, not part of the frozen 95-tool surface
-            }
-            if tool.name.as_ref() == "fs.trash_list" || tool.name.as_ref() == "fs.trash_restore" {
-                // SPEC-0011 US-0004/US-0005: not yet in TOOL_CONTRACT.txt / the
-                // golden contract, added there deliberately by US-0008 (see
-                // each story's own Scope Boundary), not by this story.
-                continue;
-            }
-            if tool.name.as_ref() == "admin.create_project" {
-                // SPEC-0011 US-0007: gained four new optional retention params
-                // (FR-NEW-014/015). `tools/admin.rs`'s test-dispatch glue (the
-                // source of `tool-contract-golden.json`) is explicitly out of
-                // scope for new production logic per that story, so the two
-                // schemas now diverge deliberately, same as the two tools above.
-                continue;
+                continue; // config-gated, not part of the frozen 100-tool surface
             }
             checked += 1;
             let entry =
@@ -3864,28 +3850,20 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(
-            checked, 97,
-            "the frozen contract covers 98 non-search tools, minus admin.create_project \
-             (excluded above for SPEC-0011 US-0007)"
-        );
+        assert_eq!(checked, 100, "the frozen contract covers 100 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
-    /// the 98 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
+    /// the 100 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
     /// and undocumented, none documented and missing.
     #[test]
-    fn tool_router_lists_exactly_the_98_contract_names() {
+    fn tool_router_lists_exactly_the_100_contract_names() {
         let router = McpServer::tool_router();
         let names: std::collections::BTreeSet<String> = router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .filter(|n| !n.starts_with("search."))
-            // SPEC-0011 US-0004/US-0005: fs.trash_list and fs.trash_restore are
-            // deliberately absent from the frozen contract until US-0008 adds
-            // them (each story's own Scope Boundary).
-            .filter(|n| n != "fs.trash_list" && n != "fs.trash_restore")
             .collect();
 
         let frozen = crate::tools::contract_golden::frozen_tools()
@@ -3893,8 +3871,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 98, "got: {names:?}");
-        assert_eq!(expected.len(), 98, "the golden contract itself must hold 98 names");
+        assert_eq!(names.len(), 100, "got: {names:?}");
+        assert_eq!(expected.len(), 100, "the golden contract itself must hold 100 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(
