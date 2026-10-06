@@ -360,6 +360,9 @@ mod tests {
             project_id: "proj".to_string(),
             meta: failing_meta,
             blob: f.client.blob.clone(),
+            // SPEC-0011 US-0002 added this field; this mock has no real relational
+            // store behind it, and the trash write is a no-op without one.
+            trash: None,
         };
 
         let purged = sweep_project_files(&flaky_client, &f.admin, &f.safety, "proj").await.unwrap();

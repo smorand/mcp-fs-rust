@@ -284,6 +284,18 @@ pub async fn build_meta_store(
     registry: &RelationalRegistry,
     project_id: &str,
 ) -> Result<Arc<dyn MetaBackend>> {
+    Ok(build_meta_store_concrete(config, registry, project_id).await?)
+}
+
+/// Same as [`build_meta_store`], but keeps the concrete type rather than erasing
+/// it, so [`StoreManager::client`] can also hand [`VolumeClient`] the relational
+/// store it needs for `trash_entries` writes (SPEC-0011 US-0002). Every other
+/// caller keeps using [`build_meta_store`] unchanged.
+async fn build_meta_store_concrete(
+    config: &ServerConfig,
+    registry: &RelationalRegistry,
+    project_id: &str,
+) -> Result<Arc<meta::RelationalMetaStore>> {
     let m = &config.infra.meta;
     let db = build_relational_db(
         registry,
@@ -428,10 +440,13 @@ impl StoreManager {
         if let Some(c) = guard.get(project_id) {
             return Ok(c.clone());
         }
-        let meta = build_meta_store(&self.config, &self.relational, project_id).await?;
+        let relational_meta =
+            build_meta_store_concrete(&self.config, &self.relational, project_id).await?;
+        let meta: Arc<dyn MetaBackend> = relational_meta.clone();
         let blob = build_blob_store(&self.config, project_id)?;
         blob.ensure_bucket().await?;
-        let client = Arc::new(VolumeClient::new(project_id, meta, blob));
+        let client =
+            Arc::new(VolumeClient::new(project_id, meta, blob).with_trash_store(relational_meta));
         guard.insert(project_id.to_string(), client.clone());
         Ok(client)
     }

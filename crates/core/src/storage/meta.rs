@@ -264,6 +264,58 @@ impl RelationalMetaStore {
             vec!["volume_id", "path"],
         ))
     }
+
+    /// Record a `trash_entries` row for a trash-destination rename that already
+    /// committed (SPEC-0011 US-0002, FR-NEW-002).
+    ///
+    /// Runs in its own transaction rather than the rename's: `rename_with_
+    /// collision_retry`'s signature is shared, trash-agnostic, and fixed
+    /// (`crates/core/src/core/fs_ops.rs`, reused by the purge sweep), so it only
+    /// knows how to retry [`MetaBackend::rename`] itself, which already commits on
+    /// its own. This is therefore a best-effort companion write immediately after a
+    /// successful rename, not a joint commit with it.
+    pub(crate) async fn record_trash_entry(
+        &self,
+        trash_path: &str,
+        original_path: &str,
+        size: i64,
+        kind: &str,
+        deleted_at: &str,
+        deleted_by: Option<&str>,
+    ) -> Result<()> {
+        let volume = self.volume_id.clone();
+        let (trash_path, original_path, kind, deleted_at, deleted_by) = (
+            trash_path.to_string(),
+            original_path.to_string(),
+            kind.to_string(),
+            deleted_at.to_string(),
+            deleted_by.map(str::to_string),
+        );
+        run_retrying(&*self.db, move |tx| {
+            let (volume, trash_path, original_path, kind, deleted_at, deleted_by) = (
+                volume.clone(),
+                trash_path.clone(),
+                original_path.clone(),
+                kind.clone(),
+                deleted_at.clone(),
+                deleted_by.clone(),
+            );
+            Box::pin(async move {
+                insert_trash_entry(
+                    tx,
+                    &volume,
+                    &trash_path,
+                    &original_path,
+                    size,
+                    &kind,
+                    &deleted_at,
+                    deleted_by.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
+    }
 }
 
 // ── transaction helpers ─────────────────────────────────────────────────────────
@@ -974,6 +1026,37 @@ impl RelationalMetaStore {
                     .bind(path),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Read one `trash_entries` row directly, for a `fs_ops.rs` test asserting
+    /// what SPEC-0011 US-0002's `delete_path` wrote.
+    pub(crate) async fn get_trash_entry_for_test(
+        &self,
+        trash_path: &str,
+    ) -> Result<Option<TrashEntryRow>> {
+        let mut tx = self.db.begin().await?;
+        let row = get_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Count every `trash_entries` row for this volume, for a `fs_ops.rs` test
+    /// asserting how many rows a delete wrote (SPEC-0011 US-0002).
+    pub(crate) async fn count_trash_entries_for_test(&self) -> Result<usize> {
+        let mut tx = self.db.begin().await?;
+        let rows = list_trash_entries(&mut *tx, &self.volume_id, "", i64::MAX, 0).await?;
+        tx.commit().await?;
+        Ok(rows.len())
+    }
+
+    /// Remove one `trash_entries` row directly, for a `fs_ops.rs` test
+    /// simulating a closed soft-delete/restore cycle ahead of US-0005
+    /// (SPEC-0011 US-0002, E2E-NEW-456).
+    pub(crate) async fn delete_trash_entry_for_test(&self, trash_path: &str) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        delete_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
