@@ -5,7 +5,7 @@ admin.add_member
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 admin.create_project
   desc: Create a project for a designated owner and provision its volume (platform admin only).
-  params: project_id:string, owner:string, autopurge_enabled:boolean=false, use_internal_purge:boolean=false, file_retention_days:number|null=null, project_retention_days:number|null=null
+  params: project_id:string, owner:string
   required: ['project_id', 'owner']
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 admin.delete_project
