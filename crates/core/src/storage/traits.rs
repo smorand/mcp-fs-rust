@@ -38,6 +38,25 @@ impl NodeRow {
 pub const MODE_DIR: i64 = 0o040_755;
 pub const MODE_FILE: i64 = 0o100_644;
 
+/// One soft-deleted top-level path, per volume (SPEC-0011 US-0001, DEC-001).
+///
+/// Recorded explicitly rather than reconstructed from the trash path string:
+/// the flatten encoding is lossy (`/a/b.txt` and `/a__b.txt` collide), so this
+/// row is the only unambiguous source of `original_path` once a delete lands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrashEntryRow {
+    pub volume_id: String,
+    pub trash_path: String,
+    pub original_path: String,
+    pub size: i64,
+    /// "dir" | "file"
+    pub kind: String,
+    /// RFC3339.
+    pub deleted_at: String,
+    /// `None` for a sweep-initiated delete.
+    pub deleted_by: Option<String>,
+}
+
 /// How much of a project's content is kept in the search index.
 ///
 /// Stored on the project row, so it survives a restart and applies to every write
@@ -202,6 +221,28 @@ pub trait BlobBackend: Send + Sync {
 pub trait AdminBackend: Send + Sync {
     async fn connect(&self) -> Result<()>;
     async fn create_project(&self, project_id: &str, owner: &str) -> Result<Project>;
+
+    /// Same as [`AdminBackend::create_project`], plus applying `config` as the
+    /// new project's purge settings (SPEC-0011 US-0007), identical to calling
+    /// [`AdminBackend::set_purge_config`] with the same value right after.
+    /// `config == PurgeConfig::default()` is a no-op on the purge config, so a
+    /// caller passing the default behaves byte-identically to `create_project`.
+    /// The provided default is not transactional; implementors that create the
+    /// project inside one transaction should override it to insert the purge
+    /// config row in that same transaction.
+    async fn create_project_with_purge_config(
+        &self,
+        project_id: &str,
+        owner: &str,
+        config: PurgeConfig,
+    ) -> Result<Project> {
+        let project = self.create_project(project_id, owner).await?;
+        if config != PurgeConfig::default() {
+            self.set_purge_config(project_id, config).await?;
+        }
+        Ok(project)
+    }
+
     async fn delete_project(&self, project_id: &str) -> Result<()>;
     async fn add_member(&self, project_id: &str, person: &str, added_by: &str) -> Result<Member>;
     async fn remove_member(&self, project_id: &str, person: &str) -> Result<()>;

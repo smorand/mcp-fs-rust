@@ -216,6 +216,9 @@ pub struct HeadTailArgs {
 fn def_lines_20() -> i64 {
     20
 }
+fn def_trash_list_limit() -> i64 {
+    200
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PathOnlyArgs {
@@ -1064,6 +1067,29 @@ pub struct AuditLogArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct TrashListArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Only return trashed entries whose original path starts with this prefix.
+    #[serde(default)]
+    pub path_prefix: String,
+    /// Maximum number of entries to return.
+    #[serde(default = "def_trash_list_limit")]
+    pub limit: i64,
+    /// Number of entries to skip before collecting `limit` results.
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TrashRestoreArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// The trashed entry's current path (as returned by `fs.trash_list`).
+    pub trash_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExtractTextArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -1124,6 +1150,18 @@ pub struct CreateProjectArgs {
     pub project_id: String,
     /// Person id who owns the new project.
     pub owner: String,
+    /// Whether auto-purge is enabled for this project.
+    #[serde(default)]
+    pub autopurge_enabled: bool,
+    /// Whether the internal purge driver is used, as opposed to an external one.
+    #[serde(default)]
+    pub use_internal_purge: bool,
+    /// Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.
+    #[serde(default)]
+    pub file_retention_days: Option<i64>,
+    /// Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.
+    #[serde(default)]
+    pub project_retention_days: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1983,6 +2021,45 @@ impl McpServer {
         to_call_result("fs.audit_log", out)
     }
 
+    #[tool(
+        name = "fs.trash_list",
+        description = "List trashed files, paginated and filterable by original path prefix."
+    )]
+    async fn fs_trash_list(
+        &self,
+        Parameters(a): Parameters<TrashListArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            crate::tools::trash::trash_list(
+                &self.state,
+                &a.mount_id,
+                &a.path_prefix,
+                a.limit,
+                a.offset,
+            )
+            .await
+        }
+        .await;
+        to_call_result("fs.trash_list", out)
+    }
+
+    #[tool(
+        name = "fs.trash_restore",
+        description = "Restore a trashed file or directory subtree back to its original path, renaming to `_restoredN` on collision."
+    )]
+    async fn fs_trash_restore(
+        &self,
+        Parameters(a): Parameters<TrashRestoreArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            crate::tools::trash::trash_restore(&self.state, &a.mount_id, &a.trash_path).await
+        }
+        .await;
+        to_call_result("fs.trash_restore", out)
+    }
+
     // ── document family ──────────────────────────────────────────────────────
 
     #[tool(name = "fs.extract_text", description = EXTRACT_DESC)]
@@ -2086,7 +2163,25 @@ impl McpServer {
             if a.owner.trim().is_empty() {
                 return Err(ToolError::invalid_argument("owner is required"));
             }
-            let project = self.state.admin.create_project(&a.project_id, &a.owner).await?;
+            if a.file_retention_days == Some(0) || a.file_retention_days.is_some_and(|d| d < 0) {
+                return Err(ToolError::invalid_argument("file_retention_days must be > 0"));
+            }
+            if a.project_retention_days == Some(0)
+                || a.project_retention_days.is_some_and(|d| d < 0)
+            {
+                return Err(ToolError::invalid_argument("project_retention_days must be > 0"));
+            }
+            let config = crate::storage::traits::PurgeConfig {
+                autopurge_enabled: a.autopurge_enabled,
+                use_internal_purge: a.use_internal_purge,
+                file_retention_days: a.file_retention_days,
+                project_retention_days: a.project_retention_days,
+            };
+            let project = self
+                .state
+                .admin
+                .create_project_with_purge_config(&a.project_id, &a.owner, config)
+                .await?;
             if let Err(e) = self.state.stores.provision_volume(&a.project_id).await {
                 let _ = self.state.admin.delete_project(&a.project_id).await;
                 return Err(e);
@@ -3396,7 +3491,7 @@ mod tests {
     ];
 
     #[test]
-    fn fs_tool_count_is_thirty_five() {
+    fn fs_tool_count_is_thirty_six() {
         let router = McpServer::tool_router();
         let names: Vec<String> = router
             .list_all()
@@ -3404,11 +3499,12 @@ mod tests {
             .map(|t| t.name.to_string())
             .filter(|n| n.starts_with("fs."))
             .collect();
-        assert_eq!(names.len(), 35, "got: {names:?}");
+        // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37.
+        assert_eq!(names.len(), 37, "got: {names:?}");
     }
 
     #[test]
-    fn total_tool_count_is_one_hundred_and_two() {
+    fn total_tool_count_is_one_hundred_and_three() {
         let router = McpServer::tool_router();
         let names: Vec<String> =
             router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -3416,11 +3512,13 @@ mod tests {
         let admin_count = names.iter().filter(|n| n.starts_with("admin.")).count();
         let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
-        assert_eq!(fs_count, 35, "got: {names:?}");
+        // SPEC-0011 US-0005 adds fs.trash_restore, bumping fs_count 36->37 and
+        // the total 103->104.
+        assert_eq!(fs_count, 37, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 102, "got: {names:?}");
+        assert_eq!(names.len(), 104, "got: {names:?}");
     }
 
     #[test]
@@ -3737,7 +3835,7 @@ mod tests {
         let mut checked = 0;
         for tool in &tools {
             if tool.name.starts_with("search.") {
-                continue; // config-gated, not part of the frozen 95-tool surface
+                continue; // config-gated, not part of the frozen 100-tool surface
             }
             checked += 1;
             let entry =
@@ -3752,14 +3850,14 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 98, "the frozen contract covers exactly 98 non-search tools");
+        assert_eq!(checked, 100, "the frozen contract covers 100 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
-    /// the 98 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
+    /// the 100 names `TOOL_CONTRACT.txt` documents, as a set: no tool registered
     /// and undocumented, none documented and missing.
     #[test]
-    fn tool_router_lists_exactly_the_98_contract_names() {
+    fn tool_router_lists_exactly_the_100_contract_names() {
         let router = McpServer::tool_router();
         let names: std::collections::BTreeSet<String> = router
             .list_all()
@@ -3773,8 +3871,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 98, "got: {names:?}");
-        assert_eq!(expected.len(), 98, "the golden contract itself must hold 98 names");
+        assert_eq!(names.len(), 100, "got: {names:?}");
+        assert_eq!(expected.len(), 100, "the golden contract itself must hold 100 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(
@@ -3998,6 +4096,188 @@ mod tests {
             "expected {}, got: {text}",
             code::PROJECT_NOT_FOUND
         );
+    }
+
+    // ── SPEC-0011 US-0007: admin.create_project retention parameters ───────
+    //
+    // These call `McpServer::admin_create_project` directly, the real
+    // dispatched tool handler, proving FR-NEW-014/015.
+
+    /// E2E-NEW-429: retention params are applied atomically at creation.
+    #[tokio::test]
+    async fn e2e_new_429_create_project_applies_retention_at_creation() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_create_project(Parameters(CreateProjectArgs {
+                    project_id: "proj-new-purge".to_string(),
+                    owner: "alice".to_string(),
+                    autopurge_enabled: true,
+                    use_internal_purge: true,
+                    file_retention_days: Some(7),
+                    project_retention_days: Some(30),
+                }))
+                .await,
+        );
+
+        let persisted = f.state.admin.get_purge_config("proj-new-purge").await.unwrap();
+        assert!(persisted.autopurge_enabled);
+        assert!(persisted.use_internal_purge);
+        assert_eq!(persisted.file_retention_days, Some(7));
+        assert_eq!(persisted.project_retention_days, Some(30));
+    }
+
+    /// E2E-NEW-430: omitted purge params keep today's default.
+    #[tokio::test]
+    async fn e2e_new_430_create_project_omitted_params_keep_default() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_create_project(Parameters(CreateProjectArgs {
+                    project_id: "proj-old-style".to_string(),
+                    owner: "alice".to_string(),
+                    autopurge_enabled: false,
+                    use_internal_purge: false,
+                    file_retention_days: None,
+                    project_retention_days: None,
+                }))
+                .await,
+        );
+
+        let persisted = f.state.admin.get_purge_config("proj-old-style").await.unwrap();
+        assert_eq!(persisted, crate::storage::traits::PurgeConfig::default());
+    }
+
+    /// E2E-NEW-431: negative `file_retention_days` at creation is rejected.
+    #[tokio::test]
+    async fn e2e_new_431_create_project_negative_file_retention_is_rejected() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_create_project(Parameters(CreateProjectArgs {
+                project_id: "proj-bad-retention".to_string(),
+                owner: "alice".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(-1),
+                project_retention_days: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(f.state.admin.get_project("proj-bad-retention").await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-459: partial retention params at creation don't implicitly
+    /// enable autopurge.
+    #[tokio::test]
+    async fn e2e_new_459_create_project_partial_retention_does_not_enable_autopurge() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        ok_json(
+            server
+                .admin_create_project(Parameters(CreateProjectArgs {
+                    project_id: "proj-partial-purge".to_string(),
+                    owner: "alice".to_string(),
+                    autopurge_enabled: false,
+                    use_internal_purge: false,
+                    file_retention_days: Some(5),
+                    project_retention_days: None,
+                }))
+                .await,
+        );
+
+        let persisted = f.state.admin.get_purge_config("proj-partial-purge").await.unwrap();
+        assert_eq!(persisted.file_retention_days, Some(5));
+        assert!(!persisted.autopurge_enabled);
+        assert!(!persisted.use_internal_purge);
+    }
+
+    /// E2E-NEW-460: negative `project_retention_days` at creation is rejected.
+    #[tokio::test]
+    async fn e2e_new_460_create_project_negative_project_retention_is_rejected() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_create_project(Parameters(CreateProjectArgs {
+                project_id: "proj-bad-retention-2".to_string(),
+                owner: "alice".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: None,
+                project_retention_days: Some(-3),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(f.state.admin.get_project("proj-bad-retention-2").await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-461: exact-zero retention at creation is rejected.
+    #[tokio::test]
+    async fn e2e_new_461_create_project_zero_retention_is_rejected() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server
+            .admin_create_project(Parameters(CreateProjectArgs {
+                project_id: "proj-zero-retention".to_string(),
+                owner: "alice".to_string(),
+                autopurge_enabled: true,
+                use_internal_purge: true,
+                file_retention_days: Some(0),
+                project_retention_days: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "expected an error result: {r:?}");
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        assert!(
+            text.contains(code::INVALID_ARGUMENT),
+            "expected {}, got: {text}",
+            code::INVALID_ARGUMENT
+        );
+        assert!(f.state.admin.get_project("proj-zero-retention").await.unwrap().is_none());
     }
 
     // ── SPEC-0010 T-001: admin.set_project_quota (SC-001) ───────────────────
@@ -4261,5 +4541,201 @@ mod tests {
                 code::PROJECT_NOT_FOUND
             );
         }
+    }
+
+    // ── SPEC-0011 US-0004: ACL/not-found coverage for fs.trash_list, through
+    // the real production handler (McpServer::fs_trash_list) rather than the
+    // bare `tools::trash::trash_list` function, since that function does not
+    // authorize itself ──
+
+    fn trash_list_args(mount_id: &str) -> TrashListArgs {
+        TrashListArgs {
+            mount_id: mount_id.to_string(),
+            path_prefix: String::new(),
+            limit: 200,
+            offset: 0,
+        }
+    }
+
+    /// E2E-NEW-407: `fs.trash_list` on an unknown project fails with
+    /// `ERR_PROJECT_NOT_FOUND`.
+    #[tokio::test]
+    async fn e2e_new_407_trash_list_on_unknown_project_is_not_found() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let r = server.fs_trash_list(Parameters(trash_list_args("nonexistent-proj"))).await;
+        let text = error_text(r);
+        assert!(
+            text.contains(code::PROJECT_NOT_FOUND),
+            "expected {}, got: {text}",
+            code::PROJECT_NOT_FOUND
+        );
+    }
+
+    /// E2E-NEW-408: `fs.trash_list` is forbidden for a non-member.
+    #[tokio::test]
+    async fn e2e_new_408_trash_list_forbidden_for_non_member() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-list-1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "eve@test.com".to_string());
+
+        let r = server.fs_trash_list(Parameters(trash_list_args("proj-list-1"))).await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// E2E-NEW-428: a platform admin who is not a member of the project is
+    /// forbidden from calling `fs.trash_list` on it.
+    #[tokio::test]
+    async fn e2e_new_428_trash_list_platform_admin_without_membership_is_forbidden() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-acl", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server.fs_trash_list(Parameters(trash_list_args("proj-acl"))).await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// E2E-NEW-442: a member removed from the project loses trash access;
+    /// "any current project member" does not mean "whoever was ever a member".
+    #[tokio::test]
+    async fn e2e_new_442_removed_member_loses_trash_list_access() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-acl-2", "alice@test.com").await;
+        f.state.admin.add_member("proj-acl-2", "dave@test.com", "alice@test.com").await.unwrap();
+        {
+            let client = f.state.stores.client("proj-acl-2").await.unwrap();
+            client.write_text_atomic("/x.txt", "x").await.unwrap();
+            crate::core::fs_ops::delete_path(
+                &client,
+                &f.state.safety,
+                "dave@test.com",
+                "proj-acl-2",
+                "/x.txt",
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        f.state.admin.remove_member("proj-acl-2", "dave@test.com").await.unwrap();
+
+        let server = McpServer::new(f.state.clone(), "dave@test.com".to_string());
+        let r = server.fs_trash_list(Parameters(trash_list_args("proj-acl-2"))).await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    // ── SPEC-0011 US-0005: fs.trash_restore, through the real production handler
+    // (McpServer::fs_trash_restore) rather than the bare `tools::trash::
+    // trash_restore` function, since that function does not authorize itself ──
+
+    fn trash_restore_args(mount_id: &str, trash_path: &str) -> TrashRestoreArgs {
+        TrashRestoreArgs { mount_id: mount_id.to_string(), trash_path: trash_path.to_string() }
+    }
+
+    async fn trashed_path(f: &Fixture, mount_id: &str, path: &str, owner: &str) -> String {
+        let client = f.state.stores.client(mount_id).await.unwrap();
+        client.write_text_atomic(path, "x").await.unwrap();
+        let r = crate::core::fs_ops::delete_path(
+            &client,
+            &f.state.safety,
+            owner,
+            mount_id,
+            path,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        r["trash_path"].as_str().unwrap().to_string()
+    }
+
+    /// E2E-NEW-419: restore forbidden for a non-member.
+    #[tokio::test]
+    async fn e2e_new_419_restore_forbidden_for_non_member() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", "alice@test.com").await;
+        let trash_path = trashed_path(&f, "proj-restore-1", "/doc.txt", "alice@test.com").await;
+
+        let server = McpServer::new(f.state.clone(), "eve@test.com".to_string());
+        let r = server
+            .fs_trash_restore(Parameters(trash_restore_args("proj-restore-1", &trash_path)))
+            .await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// E2E-NEW-427: any member can list/restore, not just the deleter.
+    #[tokio::test]
+    async fn e2e_new_427_any_member_can_list_and_restore_not_just_the_deleter() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-acl", "alice@test.com").await;
+        f.state.admin.add_member("proj-acl", "bob@test.com", "alice@test.com").await.unwrap();
+        let trash_path = trashed_path(&f, "proj-acl", "/shared.txt", "alice@test.com").await;
+
+        let server = McpServer::new(f.state.clone(), "bob@test.com".to_string());
+        let listed = ok_json(server.fs_trash_list(Parameters(trash_list_args("proj-acl"))).await);
+        assert_eq!(listed["entries"][0]["deleted_by"], "alice@test.com");
+
+        let restored = ok_json(
+            server.fs_trash_restore(Parameters(trash_restore_args("proj-acl", &trash_path))).await,
+        );
+        assert_eq!(restored["restored_path"], "/shared.txt");
+    }
+
+    /// E2E-NEW-436: full lifecycle, live → trashed → listed → restored → live.
+    #[tokio::test]
+    async fn e2e_new_436_full_lifecycle_live_trashed_listed_restored_live() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-lifecycle", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let client = f.state.stores.client("proj-lifecycle").await.unwrap();
+        client.write_text_atomic("/cycle.txt", "v1").await.unwrap();
+
+        ok_json(
+            server
+                .fs_delete(Parameters(DeleteArgs {
+                    mount_id: "proj-lifecycle".to_string(),
+                    path: "/cycle.txt".to_string(),
+                    recursive: false,
+                    trash: true,
+                }))
+                .await,
+        );
+        assert!(!client.exists("/cycle.txt").await.unwrap());
+
+        let listed =
+            ok_json(server.fs_trash_list(Parameters(trash_list_args("proj-lifecycle"))).await);
+        let entries = listed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let trash_path = entries[0]["trash_path"].as_str().unwrap().to_string();
+
+        let restored = ok_json(
+            server
+                .fs_trash_restore(Parameters(trash_restore_args("proj-lifecycle", &trash_path)))
+                .await,
+        );
+        assert_eq!(restored["restored_path"], "/cycle.txt");
+
+        let after_restore =
+            ok_json(server.fs_trash_list(Parameters(trash_list_args("proj-lifecycle"))).await);
+        assert_eq!(after_restore["total"], 0);
+
+        let read = ok_json(
+            server
+                .fs_read(Parameters(ReadArgs {
+                    mount_id: "proj-lifecycle".to_string(),
+                    path: "/cycle.txt".to_string(),
+                    offset_lines: 0,
+                    limit_lines: 2000,
+                    line_numbered: false,
+                }))
+                .await,
+        );
+        assert_eq!(read["content"], "v1");
     }
 }

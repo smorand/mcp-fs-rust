@@ -1,5 +1,5 @@
 {
-  "_note": "Frozen MCP tool contract: the 98 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
+  "_note": "Frozen MCP tool contract: the 100 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
   "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
   "tools": [
     {
@@ -42,6 +42,26 @@
           "owner": {
             "description": "Person id who owns the new project.",
             "type": "string"
+          },
+          "autopurge_enabled": {
+            "description": "Whether auto-purge is enabled for this project.",
+            "type": "boolean",
+            "default": false
+          },
+          "use_internal_purge": {
+            "description": "Whether the internal purge driver is used, as opposed to an external one.",
+            "type": "boolean",
+            "default": false
+          },
+          "file_retention_days": {
+            "description": "Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.",
+            "type": "integer",
+            "default": null
+          },
+          "project_retention_days": {
+            "description": "Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.",
+            "type": "integer",
+            "default": null
           }
         },
         "required": [
@@ -1440,6 +1460,69 @@
       "annotations": {
         "readOnlyHint": true,
         "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fs.trash_list",
+      "description": "List trashed files, paginated and filterable by original path prefix.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path_prefix": {
+            "description": "Only return trashed entries whose original path starts with this prefix.",
+            "type": "string",
+            "default": ""
+          },
+          "limit": {
+            "description": "Maximum number of entries to return.",
+            "type": "integer",
+            "default": 200
+          },
+          "offset": {
+            "description": "Number of entries to skip before collecting `limit` results.",
+            "type": "integer",
+            "default": 0
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fs.trash_restore",
+      "description": "Restore a trashed file or directory subtree back to its original path, renaming to `_restoredN` on collision.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "trash_path": {
+            "description": "The trashed entry's current path (as returned by `fs.trash_list`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "trash_path"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
         "openWorldHint": false
       }
     },

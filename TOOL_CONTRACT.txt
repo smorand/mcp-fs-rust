@@ -5,7 +5,7 @@ admin.add_member
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 admin.create_project
   desc: Create a project for a designated owner and provision its volume (platform admin only).
-  params: project_id:string, owner:string
+  params: project_id:string, owner:string, autopurge_enabled:boolean=false, use_internal_purge:boolean=false, file_retention_days:integer=null, project_retention_days:integer=null
   required: ['project_id', 'owner']
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 admin.delete_project
@@ -223,6 +223,16 @@ fs.tail
   params: mount_id:string, path:string, lines:integer=20
   required: ['mount_id', 'path']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.trash_list
+  desc: List trashed files, paginated and filterable by original path prefix.
+  params: mount_id:string, path_prefix:string="", limit:integer=200, offset:integer=0
+  required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.trash_restore
+  desc: Restore a trashed file or directory subtree back to its original path, renaming to `_restoredN` on collision.
+  params: mount_id:string, trash_path:string
+  required: ['mount_id', 'trash_path']
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.tree
   desc: Recursive JSON tree to a maximum depth.
   params: mount_id:string, path:string="/", max_depth:integer=3, exclude_patterns:<untyped>=null, with_sizes:boolean=false

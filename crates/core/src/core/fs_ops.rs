@@ -982,10 +982,83 @@ pub async fn mkdir(
     Ok(json!({ "path": norm, "created": true }))
 }
 
+/// Trash destination for a soft delete: `/{trash_dir}/{epoch_ms}__{flattened
+/// path}`. Mirrors [`SafetyManager::trash_path`] exactly, but takes `now`
+/// explicitly so [`delete_path_at`] can be pinned in a test (SPEC-0011
+/// US-0002); [`delete_path`]'s production path always passes a fresh
+/// `now_unix()`, so the observable format is unchanged.
+fn trash_destination(trash_dir: &str, path: &str, now: f64) -> String {
+    let flat = path.trim_matches('/').replace('/', "__");
+    let stamp = (now * 1000.0) as i64;
+    format!("/{trash_dir}/{stamp}__{flat}")
+}
+
+/// Rename `src` into `dst`, retrying at `dst~1`, `dst~2`, ... up to `dst~50`
+/// when the destination is already occupied (SPEC-0011 US-0002, FR-NEW-004).
+/// Any error other than `ERR_NO_CLOBBER` propagates immediately, with no retry
+/// (FR-NEW-006). `ERR_INTERNAL_ERROR` once every suffix up to `~50` is also
+/// occupied (FR-NEW-005), leaving `src` untouched. Returns the destination that
+/// actually received `src`.
+///
+/// Time complexity: O(k) `rename` calls, k <= 51 in the worst case (one bare
+/// attempt plus 50 suffixed retries), each itself O(subtree size) for a
+/// directory. Space: O(1) beyond the formatted candidate path.
+pub(crate) async fn rename_with_collision_retry(
+    client: &VolumeClient,
+    src: &str,
+    dst: &str,
+) -> Result<String> {
+    const MAX_RETRIES: u32 = 50;
+    match client.rename(src, dst).await {
+        Ok(()) => return Ok(dst.to_string()),
+        Err(e) if e.code == crate::errors::code::NO_CLOBBER => {}
+        Err(e) => return Err(e),
+    }
+    for n in 1..=MAX_RETRIES {
+        let candidate = format!("{dst}~{n}");
+        match client.rename(src, &candidate).await {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.code == crate::errors::code::NO_CLOBBER => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(ToolError::internal(format!(
+        "no free trash destination for '{src}' after {MAX_RETRIES} collisions at '{dst}'"
+    )))
+}
+
 /// Delete a path. Soft-deletes into the trash unless `trash=false` AND the
 /// server was started with `allow_hard_delete`.
 /// Keys: `path`, `trashed`, `trash_path`.
 pub async fn delete_path(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    recursive: bool,
+    trash: bool,
+) -> Result<Value> {
+    delete_path_at(
+        crate::util::now_unix(),
+        client,
+        safety,
+        person,
+        mount_id,
+        norm,
+        recursive,
+        trash,
+    )
+    .await
+}
+
+/// Same as [`delete_path`], but with an explicit `now` rather than reading the
+/// wall clock, so a test can pin two deletes to the exact same instant and
+/// deterministically force a trash-destination collision (SPEC-0011 US-0002,
+/// FR-NEW-004/005), the same seam `purge::sweep_project_files_at` uses for its
+/// own boundary tests.
+async fn delete_path_at(
+    now: f64,
     client: &VolumeClient,
     safety: &SafetyManager,
     person: &str,
@@ -1017,10 +1090,26 @@ pub async fn delete_path(
         }
         None
     } else {
-        let dst = safety.trash_path(norm);
+        // Captured before the move: once `rename_with_collision_retry` succeeds,
+        // the node lives at the trash destination, not here.
+        let node = client.stat(norm).await?;
+        let dst = trash_destination(&safety.config().trash_dir, norm, now);
         let parent = &dst[..dst.rfind('/').unwrap_or(0)];
         client.makedirs(parent, true).await?;
-        client.rename(norm, &dst).await?;
+        let dst = rename_with_collision_retry(client, norm, &dst).await?;
+        if let Some(store) = &client.trash {
+            tracing::debug!(trash_path = %dst, original_path = norm, "trash_entries insert");
+            store
+                .record_trash_entry(
+                    &dst,
+                    norm,
+                    node.size,
+                    &node.kind,
+                    &crate::util::now_iso(),
+                    Some(person),
+                )
+                .await?;
+        }
         Some(dst)
     };
     let detail = match &destination {
@@ -1757,8 +1846,12 @@ mod tests {
     use super::*;
     use crate::config::SafetyConfig;
     use crate::errors::code;
-    use crate::storage::traits::NodeRow;
+    use crate::storage::traits::{MetaBackend, NodeRow, PutFileResult};
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const P: &str = "a@b.c";
     const M: &str = "proj";
@@ -1791,7 +1884,8 @@ mod tests {
             Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
         let d = tempfile::tempdir().unwrap();
         let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
-        Fix { _dir: d, v: VolumeClient::new("p", meta, blob), s: SafetyManager::new(cfg, None) }
+        let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta);
+        Fix { _dir: d, v, s: SafetyManager::new(cfg, None) }
     }
 
     /// Seed a file and mark it read, the usual precondition for the edit family.
@@ -2820,6 +2914,326 @@ mod tests {
         assert!(dst.ends_with("__d"), "got {dst}");
         assert!(!f.v.exists("/d").await.unwrap());
         assert_eq!(f.v.read_text(&format!("{dst}/sub/a.txt")).await.unwrap(), "x");
+    }
+
+    // ── SPEC-0011 US-0002: fs.delete writes the trash entry ────────────────────
+
+    /// Delegates every [`MetaBackend`] method to `inner`, except `rename`,
+    /// which consults a queued script of outcomes: `None` delegates to
+    /// `inner`, `Some(code)` returns a scripted error without touching
+    /// `inner`'s state. Used to assert `rename_with_collision_retry`'s call
+    /// count and its strict ERR_NO_CLOBBER-only retry trigger (E2E-NEW-441,
+    /// 449, 450).
+    struct ScriptedRenameMeta {
+        inner: Arc<dyn MetaBackend>,
+        script: StdMutex<VecDeque<Option<&'static str>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MetaBackend for ScriptedRenameMeta {
+        async fn get(&self, path: &str) -> Result<Option<NodeRow>> {
+            self.inner.get(path).await
+        }
+        async fn list_children(&self, parent: &str) -> Result<Vec<NodeRow>> {
+            self.inner.list_children(parent).await
+        }
+        async fn subtree(&self, root: &str) -> Result<Vec<NodeRow>> {
+            self.inner.subtree(root).await
+        }
+        async fn put_file(
+            &self,
+            path: &str,
+            sha256: Option<&str>,
+            size: i64,
+            mode: i64,
+        ) -> Result<PutFileResult> {
+            self.inner.put_file(path, sha256, size, mode).await
+        }
+        async fn delete_file(&self, path: &str) -> Result<Option<String>> {
+            self.inner.delete_file(path).await
+        }
+        async fn remove_subtree(&self, path: &str) -> Result<Vec<String>> {
+            self.inner.remove_subtree(path).await
+        }
+        async fn mkdirs(&self, path: &str, exist_ok: bool) -> Result<()> {
+            self.inner.mkdirs(path, exist_ok).await
+        }
+        async fn mkdir(&self, path: &str) -> Result<()> {
+            self.inner.mkdir(path).await
+        }
+        async fn rmdir(&self, path: &str) -> Result<()> {
+            self.inner.rmdir(path).await
+        }
+        async fn rename(&self, src: &str, dst: &str) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
+                Some(Some(code)) => Err(ToolError::new(code, "scripted failure")),
+                _ => self.inner.rename(src, dst).await,
+            }
+        }
+        async fn touch_atime(&self, path: &str) -> Result<()> {
+            self.inner.touch_atime(path).await
+        }
+        async fn touch_atime_mtime(&self, path: &str) -> Result<()> {
+            self.inner.touch_atime_mtime(path).await
+        }
+        async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
+            self.inner.stale_files(before, exclude_root).await
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_new_401_delete_creates_a_trash_entry() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        let r = delete_path(&f.v, &f.s, P, M, "/a.txt", false, true).await.unwrap();
+        assert_eq!(r["trashed"], true);
+        let dst = s(&r, "trash_path");
+        let row = f.v.trash.as_ref().unwrap().get_trash_entry_for_test(&dst).await.unwrap();
+        let row = row.expect("trash_entries row must exist");
+        assert_eq!(row.original_path, "/a.txt");
+        assert_eq!(row.size, 1);
+        assert_eq!(row.kind, "file");
+        assert_eq!(row.deleted_by, Some(P.to_string()));
+    }
+
+    #[tokio::test]
+    async fn e2e_new_402_deleted_by_reflects_the_actual_caller() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        let r = delete_path(&f.v, &f.s, "bob", M, "/a.txt", false, true).await.unwrap();
+        let dst = s(&r, "trash_path");
+        let row =
+            f.v.trash.as_ref().unwrap().get_trash_entry_for_test(&dst).await.unwrap().unwrap();
+        assert_eq!(row.deleted_by, Some("bob".to_string()));
+    }
+
+    #[tokio::test]
+    async fn e2e_new_404_flatten_timestamp_collision_retries_at_tilde_1() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/d/a.txt", "x").await.unwrap();
+        f.v.write_text_atomic("/d__a.txt", "y").await.unwrap();
+        const NOW: f64 = 1_700_000_000.0;
+        let r1 = delete_path_at(NOW, &f.v, &f.s, P, M, "/d/a.txt", false, true).await.unwrap();
+        let r2 = delete_path_at(NOW, &f.v, &f.s, P, M, "/d__a.txt", false, true).await.unwrap();
+        let dst1 = s(&r1, "trash_path");
+        let dst2 = s(&r2, "trash_path");
+        assert_eq!(dst2, format!("{dst1}~1"), "second delete collides and retries at ~1");
+        let store = f.v.trash.as_ref().unwrap();
+        assert_eq!(
+            store.get_trash_entry_for_test(&dst1).await.unwrap().unwrap().original_path,
+            "/d/a.txt"
+        );
+        assert_eq!(
+            store.get_trash_entry_for_test(&dst2).await.unwrap().unwrap().original_path,
+            "/d__a.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_new_405_collision_retries_exhausted() {
+        let f = fixture().await;
+        const NOW: f64 = 1_700_000_001.0;
+        let stamp = (NOW * 1000.0) as i64;
+        for n in 0..=50u32 {
+            let slot = if n == 0 {
+                format!("/.mcp_trash/{stamp}__x")
+            } else {
+                format!("/.mcp_trash/{stamp}__x~{n}")
+            };
+            f.v.write_text_atomic(&slot, "occupied").await.unwrap();
+        }
+        f.v.write_text_atomic("/x", "real").await.unwrap();
+        let start = std::time::Instant::now();
+        let e = delete_path_at(NOW, &f.v, &f.s, P, M, "/x", false, true).await.unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(f.v.exists("/x").await.unwrap(), "the original file is left live and untouched");
+    }
+
+    #[tokio::test]
+    async fn e2e_new_441_retry_fires_only_on_no_clobber() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ScriptedRenameMeta {
+            inner: f.v.meta.clone(),
+            script: StdMutex::new(VecDeque::from([Some(code::INTERNAL_ERROR)])),
+            calls: calls.clone(),
+        };
+        let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
+        let e = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/x").await.unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry on a non-collision error");
+    }
+
+    #[tokio::test]
+    async fn e2e_new_443_retry_counter_advances_past_tilde_1_with_two_slots_occupied() {
+        let f = fixture().await;
+        const NOW: f64 = 1_700_000_002.0;
+        let stamp = (NOW * 1000.0) as i64;
+        f.v.write_text_atomic(&format!("/.mcp_trash/{stamp}__f.txt"), "occupied").await.unwrap();
+        f.v.write_text_atomic(&format!("/.mcp_trash/{stamp}__f.txt~1"), "occupied").await.unwrap();
+        f.v.write_text_atomic("/f.txt", "real").await.unwrap();
+        let r = delete_path_at(NOW, &f.v, &f.s, P, M, "/f.txt", false, true).await.unwrap();
+        let dst = s(&r, "trash_path");
+        assert_eq!(dst, format!("/.mcp_trash/{stamp}__f.txt~2"));
+        let store = f.v.trash.as_ref().unwrap();
+        assert!(store.get_trash_entry_for_test(&dst).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn e2e_new_444_collision_retry_succeeds_on_the_49th_attempt() {
+        let f = fixture().await;
+        const NOW: f64 = 1_700_000_003.0;
+        let stamp = (NOW * 1000.0) as i64;
+        f.v.write_text_atomic(&format!("/.mcp_trash/{stamp}__y"), "occupied").await.unwrap();
+        for n in 1..=48u32 {
+            f.v.write_text_atomic(&format!("/.mcp_trash/{stamp}__y~{n}"), "occupied")
+                .await
+                .unwrap();
+        }
+        f.v.write_text_atomic("/y", "real").await.unwrap();
+        let r = delete_path_at(NOW, &f.v, &f.s, P, M, "/y", false, true).await.unwrap();
+        assert_eq!(s(&r, "trash_path"), format!("/.mcp_trash/{stamp}__y~49"));
+    }
+
+    #[tokio::test]
+    async fn e2e_new_446_trashing_a_directory_writes_exactly_one_row() {
+        let f = fixture().await;
+        for i in 0..10 {
+            f.v.write_text_atomic(&format!("/big/f{i}.txt"), "x").await.unwrap();
+        }
+        let store = f.v.trash.as_ref().unwrap();
+        let before = store.count_trash_entries_for_test().await.unwrap();
+        let r = delete_path(&f.v, &f.s, P, M, "/big", true, true).await.unwrap();
+        let after = store.count_trash_entries_for_test().await.unwrap();
+        assert_eq!(after - before, 1, "one row for the directory, not one per descendant");
+        let dst = s(&r, "trash_path");
+        assert!(store.get_trash_entry_for_test(&dst).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn e2e_new_448_no_permanent_poison_after_exhaustion() {
+        let f = fixture().await;
+        const NOW: f64 = 1_700_000_004.0;
+        let stamp = (NOW * 1000.0) as i64;
+        for n in 0..=50u32 {
+            let slot = if n == 0 {
+                format!("/.mcp_trash/{stamp}__z")
+            } else {
+                format!("/.mcp_trash/{stamp}__z~{n}")
+            };
+            f.v.write_text_atomic(&slot, "occupied").await.unwrap();
+        }
+        f.v.write_text_atomic("/z", "real").await.unwrap();
+        delete_path_at(NOW, &f.v, &f.s, P, M, "/z", false, true).await.unwrap_err();
+        assert!(f.v.exists("/z").await.unwrap());
+
+        // Free the bare destination, then retry: exhaustion is not permanent.
+        f.v.delete_file(&format!("/.mcp_trash/{stamp}__z")).await.unwrap();
+        let r = delete_path_at(NOW, &f.v, &f.s, P, M, "/z", false, true).await.unwrap();
+        assert_eq!(s(&r, "trash_path"), format!("/.mcp_trash/{stamp}__z"));
+    }
+
+    #[tokio::test]
+    async fn e2e_new_449_unrelated_error_on_a_later_retry_aborts_without_further_retry() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        f.v.write_text_atomic("/.mcp_trash/dst", "occupied").await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ScriptedRenameMeta {
+            inner: f.v.meta.clone(),
+            script: StdMutex::new(VecDeque::from([None, Some(code::INTERNAL_ERROR)])),
+            calls: calls.clone(),
+        };
+        let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
+        let e =
+            rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst").await.unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "aborts after exactly one retry attempt");
+    }
+
+    #[tokio::test]
+    async fn e2e_new_450_non_colliding_delete_never_invokes_retry_path() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ScriptedRenameMeta {
+            inner: f.v.meta.clone(),
+            script: StdMutex::new(VecDeque::new()),
+            calls: calls.clone(),
+        };
+        let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
+        let dst = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst2").await.unwrap();
+        assert_eq!(dst, "/.mcp_trash/dst2");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry path stays dormant");
+    }
+
+    #[tokio::test]
+    async fn e2e_new_453_hard_deleting_a_file_writes_no_trash_entry() {
+        let f = fixture_with(SafetyConfig { allow_hard_delete: true, ..Default::default() }).await;
+        f.v.write_text_atomic("/h.txt", "x").await.unwrap();
+        delete_path(&f.v, &f.s, P, M, "/h.txt", false, false).await.unwrap();
+        assert!(!f.v.exists("/h.txt").await.unwrap());
+        let count = f.v.trash.as_ref().unwrap().count_trash_entries_for_test().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_new_454_hard_deleting_a_directory_writes_no_trash_entries() {
+        let f = fixture_with(SafetyConfig { allow_hard_delete: true, ..Default::default() }).await;
+        for i in 0..3 {
+            f.v.write_text_atomic(&format!("/hd/f{i}.txt"), "x").await.unwrap();
+        }
+        let store = f.v.trash.as_ref().unwrap();
+        let before = store.count_trash_entries_for_test().await.unwrap();
+        delete_path(&f.v, &f.s, P, M, "/hd", true, false).await.unwrap();
+        assert!(!f.v.exists("/hd").await.unwrap());
+        let after = store.count_trash_entries_for_test().await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after, 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_new_456_hard_delete_does_not_disturb_an_unrelated_prior_trash_entry() {
+        let f = fixture_with(SafetyConfig { allow_hard_delete: true, ..Default::default() }).await;
+        let store = f.v.trash.as_ref().unwrap();
+        // Simulate a closed soft-delete/restore cycle for `/k.txt`: US-0005 (the
+        // restore tool) does not exist yet, so the "leaves zero rows" end state
+        // is reproduced directly via US-0001's own insert/delete methods.
+        store
+            .record_trash_entry(
+                "/.mcp_trash/999__k.txt",
+                "/k.txt",
+                1,
+                "file",
+                &crate::util::now_iso(),
+                Some(P),
+            )
+            .await
+            .unwrap();
+        store.delete_trash_entry_for_test("/.mcp_trash/999__k.txt").await.unwrap();
+        assert_eq!(store.count_trash_entries_for_test().await.unwrap(), 0);
+
+        f.v.write_text_atomic("/m.txt", "x").await.unwrap();
+        delete_path(&f.v, &f.s, P, M, "/m.txt", false, false).await.unwrap();
+        assert_eq!(store.count_trash_entries_for_test().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_new_458_soft_deleting_a_directory_records_kind_and_size() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/dirx/a.txt", "hello").await.unwrap();
+        let expected = f.v.stat("/dirx").await.unwrap();
+        let r = delete_path(&f.v, &f.s, P, M, "/dirx", true, true).await.unwrap();
+        let dst = s(&r, "trash_path");
+        let row =
+            f.v.trash.as_ref().unwrap().get_trash_entry_for_test(&dst).await.unwrap().unwrap();
+        assert_eq!(row.kind, "dir");
+        assert_eq!(row.size, expected.size);
     }
 
     #[tokio::test]

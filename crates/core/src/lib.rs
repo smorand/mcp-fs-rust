@@ -29,6 +29,7 @@ pub mod state;
 pub mod storage;
 pub mod token_screen;
 pub mod tools;
+pub mod trash_screen;
 pub mod util;
 
 pub use errors::{Result, ToolError};

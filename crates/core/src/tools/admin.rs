@@ -67,6 +67,20 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
             "New project id: 3 to 32 chars, lowercase letters, digits, hyphens, alphanumeric bounds.",
         )
         .req_str("owner", "Person id who owns the new project.")
+        .opt_bool("autopurge_enabled", false, "Whether auto-purge is enabled for this project.")
+        .opt_bool(
+            "use_internal_purge",
+            false,
+            "Whether the internal purge driver is used, as opposed to an external one.",
+        )
+        .opt_nullable_int(
+            "file_retention_days",
+            "Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.",
+        )
+        .opt_nullable_int(
+            "project_retention_days",
+            "Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.",
+        )
         .read_only(false)
         .destructive(false)
         .idempotent(false)
@@ -772,7 +786,11 @@ mod tests {
         let expected: Value = serde_json::from_str(
             r#"{"type":"object","properties":{
                  "project_id":{"description":"New project id: 3 to 32 chars, lowercase letters, digits, hyphens, alphanumeric bounds.","type":"string"},
-                 "owner":{"description":"Person id who owns the new project.","type":"string"}},
+                 "owner":{"description":"Person id who owns the new project.","type":"string"},
+                 "autopurge_enabled":{"description":"Whether auto-purge is enabled for this project.","type":"boolean","default":false},
+                 "use_internal_purge":{"description":"Whether the internal purge driver is used, as opposed to an external one.","type":"boolean","default":false},
+                 "file_retention_days":{"description":"Days of inactivity before a file is purged. Must be > 0 when present; absent disables this axis.","type":"integer","default":null},
+                 "project_retention_days":{"description":"Days after soft-delete before a project is purged. Must be > 0 when present; absent disables this axis.","type":"integer","default":null}},
                "required":["project_id","owner"]}"#,
         )
         .unwrap();

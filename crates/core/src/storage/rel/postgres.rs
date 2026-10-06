@@ -231,6 +231,10 @@ struct PgTx {
 
 #[async_trait]
 impl RelationalTx for PgTx {
+    fn dialect(&self) -> Dialect {
+        Dialect::Postgres
+    }
+
     async fn execute(&mut self, query: &Query) -> Result<u64> {
         let sql = rendered(query)?;
         let done = sqlx::query_with(AssertSqlSafe(sql), bind_all(query)?)

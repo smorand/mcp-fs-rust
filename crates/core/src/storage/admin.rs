@@ -147,31 +147,17 @@ impl RelationalAdminStore {
         })
     }
 
-    /// Excludes a soft-deleted row (`deleted_at` non-null). Used only by
-    /// `require_member`, the single enforcement point for SPEC-0014's access
-    /// gate; every other existence check in this store must keep seeing
-    /// soft-deleted projects unchanged.
-    async fn live_project_exists(&self, id: &str) -> Result<bool> {
-        let row = self
-            .db
-            .query_opt(
-                &Query::new("SELECT 1 FROM project WHERE id=?1 AND deleted_at IS NULL").bind(id),
-            )
-            .await?;
-        Ok(row.is_some())
-    }
-}
-
-#[async_trait]
-impl AdminBackend for RelationalAdminStore {
-    async fn connect(&self) -> Result<()> {
-        self.db.migrate(&schema()).await
-    }
-
-    async fn create_project(&self, project_id: &str, owner: &str) -> Result<Project> {
+    /// Inserts the `project` and owner `project_member` rows on an open
+    /// transaction, without committing. Shared by `create_project` and
+    /// `create_project_with_purge_config` so both insert the project row
+    /// exactly once.
+    async fn insert_project_tx(
+        tx: &mut Box<dyn crate::storage::rel::RelationalTx>,
+        project_id: &str,
+        owner: &str,
+    ) -> Result<Project> {
         let id = project_id.to_string();
         let owner = normalize_identity(owner);
-        let mut tx = self.db.begin().await?;
         // Safe to retry in principle: a failed attempt rolls back, so the duplicate
         // check would re-read the original state. Left on an owned handle because
         // creating a project is a cold path where a serialization conflict is
@@ -201,8 +187,62 @@ impl AdminBackend for RelationalAdminStore {
             .bind(&now),
         )
         .await?;
-        tx.commit().await?;
         Ok(Project { id, owner, created_at: now, index_mode: IndexMode::None, quota_bytes: None })
+    }
+
+    /// Excludes a soft-deleted row (`deleted_at` non-null). Used only by
+    /// `require_member`, the single enforcement point for SPEC-0014's access
+    /// gate; every other existence check in this store must keep seeing
+    /// soft-deleted projects unchanged.
+    async fn live_project_exists(&self, id: &str) -> Result<bool> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT 1 FROM project WHERE id=?1 AND deleted_at IS NULL").bind(id),
+            )
+            .await?;
+        Ok(row.is_some())
+    }
+}
+
+#[async_trait]
+impl AdminBackend for RelationalAdminStore {
+    async fn connect(&self) -> Result<()> {
+        self.db.migrate(&schema()).await
+    }
+
+    async fn create_project(&self, project_id: &str, owner: &str) -> Result<Project> {
+        let mut tx = self.db.begin().await?;
+        let project = Self::insert_project_tx(&mut tx, project_id, owner).await?;
+        tx.commit().await?;
+        Ok(project)
+    }
+
+    async fn create_project_with_purge_config(
+        &self,
+        project_id: &str,
+        owner: &str,
+        config: PurgeConfig,
+    ) -> Result<Project> {
+        let mut tx = self.db.begin().await?;
+        let project = Self::insert_project_tx(&mut tx, project_id, owner).await?;
+        if config != PurgeConfig::default() {
+            tx.execute(
+                &Query::new(
+                    "INSERT INTO project_purge_config (project_id, autopurge_enabled, \
+                     use_internal_purge, file_retention_days, project_retention_days) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .bind(project_id)
+                .bind(i64::from(config.autopurge_enabled))
+                .bind(i64::from(config.use_internal_purge))
+                .bind(config.file_retention_days)
+                .bind(config.project_retention_days),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(project)
     }
 
     async fn delete_project(&self, project_id: &str) -> Result<()> {

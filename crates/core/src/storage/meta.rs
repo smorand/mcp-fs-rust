@@ -12,7 +12,7 @@ use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{Assign, ColumnType, Dialect, Upsert};
 use crate::storage::rel::schema::{Column, Index, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
-use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow, PutFileResult};
+use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow, PutFileResult, TrashEntryRow};
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -145,13 +145,36 @@ pub fn schema() -> SchemaSet {
                 ],
                 vec!["volume_id", "sha256"],
             ),
+            Table::new(
+                "trash_entries",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    // Indexed as part of the primary key, so it is keyed rather
+                    // than unbounded text, same budget as `nodes.path`.
+                    Column::required("trash_path", ColumnType::TextKey(PATH_LEN)),
+                    Column::required("original_path", ColumnType::Text),
+                    Column::required("size", ColumnType::BigInt).default("0"),
+                    Column::required("kind", ColumnType::Text),
+                    Column::required("deleted_at", ColumnType::Text),
+                    Column::new("deleted_by", ColumnType::Text),
+                ],
+                vec!["volume_id", "trash_path"],
+            ),
         ],
-        vec![Index {
-            name: "idx_nodes_parent",
-            table: "nodes",
-            // Volume first: every lookup filters on it before the parent.
-            columns: vec!["volume_id", "parent"],
-        }],
+        vec![
+            Index {
+                name: "idx_nodes_parent",
+                table: "nodes",
+                // Volume first: every lookup filters on it before the parent.
+                columns: vec!["volume_id", "parent"],
+            },
+            Index {
+                name: "idx_trash_entries_deleted_at",
+                table: "trash_entries",
+                // Supports `fs.trash_list`'s ordering (US-0004), scoped by volume.
+                columns: vec!["volume_id", "deleted_at"],
+            },
+        ],
     )
 }
 
@@ -240,6 +263,128 @@ impl RelationalMetaStore {
             NODE_COLS.to_vec(),
             vec!["volume_id", "path"],
         ))
+    }
+
+    /// Page through `trash_entries` for this volume, newest delete first,
+    /// optionally restricted to `path_prefix` and its descendants, alongside the
+    /// unpaged total count matching the same filter (SPEC-0011 US-0004,
+    /// FR-NEW-007). Two queries in one transaction: `list_trash_entries` alone
+    /// cannot report `total` when `limit` cuts the result short.
+    pub(crate) async fn list_trash_entries_page(
+        &self,
+        path_prefix: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<TrashEntryRow>, i64)> {
+        let mut tx = self.db.begin().await?;
+        let rows =
+            list_trash_entries(&mut *tx, &self.volume_id, path_prefix, limit, offset).await?;
+        let total = count_trash_entries(&mut *tx, &self.volume_id, path_prefix).await?;
+        tx.commit().await?;
+        Ok((rows, total))
+    }
+
+    /// Insert a `trash_entries` row for `trash_path` unless one already exists
+    /// (SPEC-0011 US-0004, FR-NEW-011): the lazy backfill of a legacy trashed
+    /// node that predates `trash_entries`. Idempotent by construction, the
+    /// get-then-insert runs inside one transaction so two concurrent backfills
+    /// of the same node cannot both insert.
+    pub(crate) async fn backfill_trash_entry(
+        &self,
+        trash_path: &str,
+        original_path: &str,
+        size: i64,
+        kind: &str,
+        deleted_at: &str,
+    ) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        if get_trash_entry(&mut *tx, &self.volume_id, trash_path).await?.is_none() {
+            insert_trash_entry(
+                &mut *tx,
+                &self.volume_id,
+                trash_path,
+                original_path,
+                size,
+                kind,
+                deleted_at,
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a `trash_entries` row for a trash-destination rename that already
+    /// committed (SPEC-0011 US-0002, FR-NEW-002).
+    ///
+    /// Runs in its own transaction rather than the rename's: `rename_with_
+    /// collision_retry`'s signature is shared, trash-agnostic, and fixed
+    /// (`crates/core/src/core/fs_ops.rs`, reused by the purge sweep), so it only
+    /// knows how to retry [`MetaBackend::rename`] itself, which already commits on
+    /// its own. This is therefore a best-effort companion write immediately after a
+    /// successful rename, not a joint commit with it.
+    pub(crate) async fn record_trash_entry(
+        &self,
+        trash_path: &str,
+        original_path: &str,
+        size: i64,
+        kind: &str,
+        deleted_at: &str,
+        deleted_by: Option<&str>,
+    ) -> Result<()> {
+        let volume = self.volume_id.clone();
+        let (trash_path, original_path, kind, deleted_at, deleted_by) = (
+            trash_path.to_string(),
+            original_path.to_string(),
+            kind.to_string(),
+            deleted_at.to_string(),
+            deleted_by.map(str::to_string),
+        );
+        run_retrying(&*self.db, move |tx| {
+            let (volume, trash_path, original_path, kind, deleted_at, deleted_by) = (
+                volume.clone(),
+                trash_path.clone(),
+                original_path.clone(),
+                kind.clone(),
+                deleted_at.clone(),
+                deleted_by.clone(),
+            );
+            Box::pin(async move {
+                insert_trash_entry(
+                    tx,
+                    &volume,
+                    &trash_path,
+                    &original_path,
+                    size,
+                    &kind,
+                    &deleted_at,
+                    deleted_by.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    /// Look up a single `trash_entries` row for `fs.trash_restore` (SPEC-0011
+    /// US-0005, FR-NEW-009): production counterpart to
+    /// [`Self::get_trash_entry_for_test`].
+    pub(crate) async fn get_trash_entry(&self, trash_path: &str) -> Result<Option<TrashEntryRow>> {
+        let mut tx = self.db.begin().await?;
+        let row = get_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Delete a single `trash_entries` row once `fs.trash_restore` has renamed
+    /// the node back (SPEC-0011 US-0005, FR-NEW-009): production counterpart to
+    /// [`Self::delete_trash_entry_for_test`].
+    pub(crate) async fn delete_trash_entry(&self, trash_path: &str) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        delete_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -410,6 +555,185 @@ async fn tx_ensure_parents(
         tx_mkdirs_chain(tx, dialect, volume, &parent).await?;
     }
     Ok(())
+}
+
+/// Every column of `trash_entries`, in the order the insert binds them.
+const TRASH_COLS: [&str; 7] =
+    ["volume_id", "trash_path", "original_path", "size", "kind", "deleted_at", "deleted_by"];
+
+// The functions below are pure infrastructure (SPEC-0011 US-0001): no caller
+// exists yet, US-0002/US-0003 are the first ones. `allow(dead_code)` is
+// deliberate rather than a leftover, since the lint cannot see a future
+// story's call site.
+#[allow(dead_code)]
+fn read_trash_row(r: &RowValues) -> Result<TrashEntryRow> {
+    Ok(TrashEntryRow {
+        volume_id: r.text(0)?,
+        trash_path: r.text(1)?,
+        original_path: r.text(2)?,
+        size: r.i64(3)?,
+        kind: r.text(4)?,
+        deleted_at: r.text(5)?,
+        deleted_by: r.opt_text(6)?,
+    })
+}
+
+/// A `LIKE` pattern matching `prefix` itself and every strict descendant of it,
+/// for [`list_trash_entries`]'s `path_prefix` filter. A free function rather
+/// than a method on [`RelationalMetaStore`] (the trash CRUD functions take
+/// only the caller's open transaction, not the store), but it goes through
+/// the same [`Dialect::escape_like_literal`] as every other `LIKE` in this
+/// codebase, never a hand built prefix.
+#[allow(dead_code)]
+fn trash_path_prefix_pattern(dialect: Dialect, prefix: &str) -> String {
+    let base = dialect.escape_like_literal(prefix.trim_end_matches('/'));
+    format!("{base}/%")
+}
+
+/// Insert or overwrite one soft-delete record (SPEC-0011 US-0001, DEC-001).
+///
+/// Takes the caller's open transaction instead of opening one, so US-0002's
+/// delete can commit this row atomically with the `rename` that moved the file
+/// into the trash (NFR 7.4): a failed rename never leaves an orphaned row, and
+/// a failed insert never leaves an untracked rename, because both roll back
+/// together.
+// One argument per column plus the transaction: a struct wrapper would just
+// rename the same seven fields the story's call site spells out directly.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn insert_trash_entry(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    trash_path: &str,
+    original_path: &str,
+    size: i64,
+    kind: &str,
+    deleted_at: &str,
+    deleted_by: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        &Query::new(format!(
+            "INSERT INTO trash_entries ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            TRASH_COLS.join(", ")
+        ))
+        .bind(volume_id)
+        .bind(trash_path)
+        .bind(original_path)
+        .bind(size)
+        .bind(kind)
+        .bind(deleted_at)
+        .bind(deleted_by),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Remove exactly one row. A second call for the same key is a no-op: the
+/// `DELETE` simply matches nothing, so a caller never has to check existence
+/// first to make the delete idempotent.
+#[allow(dead_code)]
+pub(crate) async fn delete_trash_entry(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    trash_path: &str,
+) -> Result<()> {
+    tx.execute(
+        &Query::new("DELETE FROM trash_entries WHERE volume_id=?1 AND trash_path=?2")
+            .bind(volume_id)
+            .bind(trash_path),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The row for `(volume_id, trash_path)`, or `None` when there is none.
+#[allow(dead_code)]
+pub(crate) async fn get_trash_entry(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    trash_path: &str,
+) -> Result<Option<TrashEntryRow>> {
+    let row = tx
+        .query_opt(
+            &Query::new(format!(
+                "SELECT {} FROM trash_entries WHERE volume_id=?1 AND trash_path=?2",
+                TRASH_COLS.join(", ")
+            ))
+            .bind(volume_id)
+            .bind(trash_path),
+        )
+        .await?;
+    row.as_ref().map(read_trash_row).transpose()
+}
+
+/// Count of `trash_entries` rows matching the same `path_prefix` filter as
+/// [`list_trash_entries`], unpaged (US-0004's `total`).
+async fn count_trash_entries(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    path_prefix: &str,
+) -> Result<i64> {
+    let dialect = tx.dialect();
+    let row = if path_prefix.is_empty() {
+        tx.query_opt(
+            &Query::new("SELECT COUNT(*) FROM trash_entries WHERE volume_id=?1").bind(volume_id),
+        )
+        .await?
+    } else {
+        let pattern = trash_path_prefix_pattern(dialect, path_prefix);
+        tx.query_opt(
+            &Query::new(
+                "SELECT COUNT(*) FROM trash_entries WHERE volume_id=?1 \
+                 AND (original_path=?2 OR original_path LIKE ?3 ESCAPE '\\')",
+            )
+            .bind(volume_id)
+            .bind(path_prefix)
+            .bind(pattern),
+        )
+        .await?
+    };
+    match row {
+        Some(r) => r.i64(0),
+        None => Ok(0),
+    }
+}
+
+/// Every row for `volume_id`, newest delete first, optionally restricted to
+/// `path_prefix` and its descendants (US-0004's `fs.trash_list` filter; an
+/// empty prefix matches every row). `limit`/`offset` page the result.
+pub(crate) async fn list_trash_entries(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    path_prefix: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<TrashEntryRow>> {
+    let dialect = tx.dialect();
+    let page = dialect.render_limit_offset(limit, offset);
+    let cols = TRASH_COLS.join(", ");
+    let rows = if path_prefix.is_empty() {
+        tx.query(
+            &Query::new(format!(
+                "SELECT {cols} FROM trash_entries WHERE volume_id=?1 \
+                 ORDER BY deleted_at DESC {page}"
+            ))
+            .bind(volume_id),
+        )
+        .await?
+    } else {
+        let pattern = trash_path_prefix_pattern(dialect, path_prefix);
+        tx.query(
+            &Query::new(format!(
+                "SELECT {cols} FROM trash_entries WHERE volume_id=?1 \
+                 AND (original_path=?2 OR original_path LIKE ?3 ESCAPE '\\') \
+                 ORDER BY deleted_at DESC {page}"
+            ))
+            .bind(volume_id)
+            .bind(path_prefix)
+            .bind(pattern),
+        )
+        .await?
+    };
+    rows.iter().map(read_trash_row).collect()
 }
 
 #[async_trait]
@@ -803,6 +1127,37 @@ impl RelationalMetaStore {
                     .bind(path),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Read one `trash_entries` row directly, for a `fs_ops.rs` test asserting
+    /// what SPEC-0011 US-0002's `delete_path` wrote.
+    pub(crate) async fn get_trash_entry_for_test(
+        &self,
+        trash_path: &str,
+    ) -> Result<Option<TrashEntryRow>> {
+        let mut tx = self.db.begin().await?;
+        let row = get_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Count every `trash_entries` row for this volume, for a `fs_ops.rs` test
+    /// asserting how many rows a delete wrote (SPEC-0011 US-0002).
+    pub(crate) async fn count_trash_entries_for_test(&self) -> Result<usize> {
+        let mut tx = self.db.begin().await?;
+        let rows = list_trash_entries(&mut *tx, &self.volume_id, "", i64::MAX, 0).await?;
+        tx.commit().await?;
+        Ok(rows.len())
+    }
+
+    /// Remove one `trash_entries` row directly, for a `fs_ops.rs` test
+    /// simulating a closed soft-delete/restore cycle ahead of US-0005
+    /// (SPEC-0011 US-0002, E2E-NEW-456).
+    pub(crate) async fn delete_trash_entry_for_test(&self, trash_path: &str) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        delete_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -1387,5 +1742,122 @@ mod tests {
         let b_after = b.get("/f.txt").await.unwrap().unwrap();
         assert_eq!(b_after.atime, b_before.atime, "volume b must be untouched");
         assert_eq!(b_after.mtime, b_before.mtime, "volume b must be untouched");
+    }
+
+    // ── trash_entries CRUD (SPEC-0011 US-0001) ──────────────────────────────────
+
+    /// This story's one acceptance test: every `trash_entries` trait method,
+    /// called from inside a transaction the test holds open, exactly as
+    /// US-0002/US-0003 will call them from inside their own `run_retrying` body.
+    #[tokio::test]
+    async fn trash_entries_round_trip_insert_get_delete_list_and_isolate_volumes() {
+        let db: Arc<dyn RelationalDb> = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        db.migrate(&schema()).await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+
+        insert_trash_entry(
+            &mut *tx,
+            "v1",
+            "/.mcp_trash/123__a.txt",
+            "/a.txt",
+            5,
+            "file",
+            "2026-01-01T00:00:00Z",
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+        let got = get_trash_entry(&mut *tx, "v1", "/.mcp_trash/123__a.txt")
+            .await
+            .unwrap()
+            .expect("row was just inserted");
+        assert_eq!(got.volume_id, "v1");
+        assert_eq!(got.trash_path, "/.mcp_trash/123__a.txt");
+        assert_eq!(got.original_path, "/a.txt");
+        assert_eq!(got.size, 5);
+        assert_eq!(got.kind, "file");
+        assert_eq!(got.deleted_at, "2026-01-01T00:00:00Z");
+        assert_eq!(got.deleted_by, Some("alice".to_string()));
+
+        // A second row with `deleted_by: None` must round-trip a real SQL NULL.
+        insert_trash_entry(
+            &mut *tx,
+            "v1",
+            "/.mcp_trash/456__b.txt",
+            "/b.txt",
+            9,
+            "file",
+            "2026-01-02T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+        let raw = tx
+            .query_opt(
+                &Query::new(
+                    "SELECT deleted_by FROM trash_entries WHERE volume_id=?1 AND trash_path=?2",
+                )
+                .bind("v1")
+                .bind("/.mcp_trash/456__b.txt"),
+            )
+            .await
+            .unwrap()
+            .expect("row was just inserted");
+        assert_eq!(
+            raw.value(0).unwrap(),
+            &crate::storage::rel::SqlValue::Null,
+            "a real SQL NULL, not an empty string"
+        );
+        let got_none = get_trash_entry(&mut *tx, "v1", "/.mcp_trash/456__b.txt")
+            .await
+            .unwrap()
+            .expect("row was just inserted");
+        assert_eq!(got_none.deleted_by, None);
+
+        // A third row, deleted before the second, so descending order is
+        // actually exercised once the first row is gone.
+        insert_trash_entry(
+            &mut *tx,
+            "v1",
+            "/.mcp_trash/789__d.txt",
+            "/d.txt",
+            1,
+            "dir",
+            "2025-12-31T00:00:00Z",
+            Some("bob"),
+        )
+        .await
+        .unwrap();
+
+        // Idempotent delete: removes exactly that row, a second call is a no-op.
+        delete_trash_entry(&mut *tx, "v1", "/.mcp_trash/123__a.txt").await.unwrap();
+        assert!(get_trash_entry(&mut *tx, "v1", "/.mcp_trash/123__a.txt").await.unwrap().is_none());
+        delete_trash_entry(&mut *tx, "v1", "/.mcp_trash/123__a.txt")
+            .await
+            .expect("deleting an already absent key is a no-op, not an error");
+
+        // A second volume's row must be invisible to a query scoped to "v1".
+        insert_trash_entry(
+            &mut *tx,
+            "v2",
+            "/.mcp_trash/999__c.txt",
+            "/c.txt",
+            1,
+            "file",
+            "2026-01-03T00:00:00Z",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let listed = list_trash_entries(&mut *tx, "v1", "", 10, 0).await.unwrap();
+        let paths: Vec<&str> = listed.iter().map(|r| r.trash_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/.mcp_trash/456__b.txt", "/.mcp_trash/789__d.txt"],
+            "newest delete first, and volume v2's row is excluded"
+        );
+
+        tx.commit().await.unwrap();
     }
 }

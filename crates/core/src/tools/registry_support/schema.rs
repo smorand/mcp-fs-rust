@@ -33,6 +33,10 @@ pub enum ParamType {
     /// renders `"type": "integer", "minimum": 0`, matching what `schemars`
     /// derives for `Option<u32>` (`admin.set_purge_config`'s retention days).
     NullableUInt,
+    /// Nullable signed integer (an `Option<i64>` in the rmcp surface): renders
+    /// `"type": "integer"` with no `minimum`, matching what `schemars` derives
+    /// for `Option<i64>` (`admin.create_project`'s retention-day params).
+    NullableInt,
     /// Tolerant string array: renders with NO `type` at all (matches the C#
     /// `FlexibleStringArrayConverter`, which accepts array | string | csv | null).
     FlexibleStrArray,
@@ -146,6 +150,10 @@ impl ToolSchema {
     pub fn opt_nullable_uint(self, n: &'static str, d: &'static str) -> Self {
         self.push(n, d, ParamType::NullableUInt, false, Some(Value::Null))
     }
+    /// Nullable signed integer, matching `schemars`' `Option<i64>` output.
+    pub fn opt_nullable_int(self, n: &'static str, d: &'static str) -> Self {
+        self.push(n, d, ParamType::NullableInt, false, Some(Value::Null))
+    }
     /// Optional object array (`resolutions` on a continue tool): same shape as
     /// [`Self::req_obj_array`], `"default": null`, because a call that resolves
     /// nothing is a legitimate call that the handler refuses on its own terms.
@@ -188,6 +196,9 @@ impl ToolSchema {
                 ParamType::NullableUInt => {
                     o.insert("type".into(), json!("integer"));
                     o.insert("minimum".into(), json!(0));
+                }
+                ParamType::NullableInt => {
+                    o.insert("type".into(), json!("integer"));
                 }
                 ParamType::FlexibleStrArray => { /* no type, by design */ }
                 ParamType::ObjArray(items) => {

@@ -276,7 +276,7 @@ mod tests {
     /// `notifications/initialized` handshake (DR-010) actually lets a bare
     /// `tools/list` succeed against the server this story wires up.
     #[tokio::test]
-    async fn agent_startup_completes_and_lists_all_98_tools() {
+    async fn agent_startup_completes_and_lists_all_100_tools() {
         let dir = tempfile::tempdir().unwrap();
         let (key_path, pub_path) =
             mcp_fs_core::keys::write_keypair(dir.path().join("keys")).unwrap();
@@ -307,9 +307,9 @@ mod tests {
         // `crates/core/src/mcp/server.rs::tool_router_lists_exactly_the_95_contract_names`,
         // which excludes them the same way); the frozen, non-search contract
         // this story's DT-002 means is the 95 count, not the raw catalogue
-        // size.
+        // size. SPEC-0011 US-0005 adds `fs.trash_restore`, bumping 99 to 100.
         let non_search = tools.keys().filter(|n| !n.starts_with("search.")).count();
-        assert_eq!(non_search, 98, "expected the full 98-tool catalogue, got {:?}", tools.keys());
+        assert_eq!(non_search, 100, "expected the full 100-tool catalogue, got {:?}", tools.keys());
         assert!(
             tools.contains_key("fs.read_bytes"),
             "fs.read_bytes must be present: {:?}",

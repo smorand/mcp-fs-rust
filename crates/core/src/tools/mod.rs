@@ -56,6 +56,7 @@ pub(crate) mod search;
 #[cfg(test)]
 pub(crate) mod search_semantic;
 pub mod sqlite;
+pub(crate) mod trash;
 pub mod web;
 #[cfg(test)]
 pub(crate) mod write;
@@ -81,6 +82,7 @@ pub(crate) fn register_fs(reg: &mut crate::tools::registry_support::ToolRegistry
     metadata::register(reg);
     lifecycle::register(reg);
     document::register(reg);
+    trash::register(reg);
 }
 
 /// Read `mount_id`, enforce project membership, open the volume.
@@ -346,7 +348,7 @@ mod tests {
     use serde_json::json;
     use testkit::{MOUNT, harness};
 
-    /// The 35 fs.* tools of this layer, in registration order.
+    /// The 37 fs.* tools of this layer, in registration order.
     const FS_TOOLS: &[&str] = &[
         "fs.read",
         "fs.read_bytes",
@@ -383,13 +385,15 @@ mod tests {
         "fs.extract_text",
         "fs.write_docx",
         "fs.documentize",
+        "fs.trash_list",
+        "fs.trash_restore",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        assert_eq!(reg.len(), 35);
+        assert_eq!(reg.len(), 37);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -462,7 +466,7 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            35,
+            37,
             "fs.* tools",
         );
     }

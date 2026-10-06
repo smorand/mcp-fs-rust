@@ -283,6 +283,11 @@ pub trait RelationalDb: Send + Sync {
 /// An open transaction. Every statement runs inside it until [`Self::commit`].
 #[async_trait]
 pub trait RelationalTx: Send {
+    /// Which engine this transaction belongs to, so a free function taking only
+    /// a transaction handle (no separate `Dialect`) can still render a dialect
+    /// specific fragment, e.g. a `LIKE` pattern or a page clause.
+    fn dialect(&self) -> Dialect;
+
     async fn execute(&mut self, query: &Query) -> Result<u64>;
     async fn query(&mut self, query: &Query) -> Result<Vec<RowValues>>;
 
@@ -410,6 +415,9 @@ mod tests {
 
     #[async_trait]
     impl RelationalTx for CountingTx {
+        fn dialect(&self) -> Dialect {
+            Dialect::Postgres
+        }
         async fn execute(&mut self, _query: &Query) -> Result<u64> {
             Ok(0)
         }

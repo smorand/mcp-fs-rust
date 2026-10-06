@@ -3,6 +3,7 @@
 //! operation works against.
 
 use crate::errors::{Result, ToolError};
+use crate::storage::meta::RelationalMetaStore;
 use crate::storage::traits::{BlobBackend, MODE_FILE, MetaBackend, NodeRow};
 use crate::util::PosixPath;
 use sha2::{Digest, Sha256};
@@ -12,6 +13,13 @@ pub struct VolumeClient {
     pub project_id: String,
     pub meta: Arc<dyn MetaBackend>,
     pub blob: Arc<dyn BlobBackend>,
+    /// The concrete relational metadata store behind `meta`, when there is one
+    /// (every production backend), so `core::fs_ops::delete_path` can record a
+    /// `trash_entries` row (SPEC-0011 US-0002). `None` for a test double that
+    /// implements `MetaBackend` without a real store behind it (e.g. a fault
+    /// injection mock): such a client is already exercising a different code
+    /// path and the trash write is skipped rather than panicking.
+    pub trash: Option<Arc<RelationalMetaStore>>,
 }
 
 impl VolumeClient {
@@ -20,7 +28,17 @@ impl VolumeClient {
         meta: Arc<dyn MetaBackend>,
         blob: Arc<dyn BlobBackend>,
     ) -> Self {
-        Self { project_id: project_id.into(), meta, blob }
+        Self { project_id: project_id.into(), meta, blob, trash: None }
+    }
+
+    /// Attach the concrete relational metadata store, so trash-entry recording
+    /// is available (SPEC-0011 US-0002). Separate from [`Self::new`] so every
+    /// existing call site (including test doubles with no real store) keeps
+    /// compiling unchanged.
+    #[must_use]
+    pub fn with_trash_store(mut self, store: Arc<RelationalMetaStore>) -> Self {
+        self.trash = Some(store);
+        self
     }
 
     pub fn sha256_hex(data: &[u8]) -> String {
