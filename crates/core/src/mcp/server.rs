@@ -4312,4 +4312,89 @@ mod tests {
             );
         }
     }
+
+    // ── SPEC-0011 US-0004: ACL/not-found coverage for fs.trash_list, through
+    // the real production handler (McpServer::fs_trash_list) rather than the
+    // bare `tools::trash::trash_list` function, since that function does not
+    // authorize itself ──
+
+    fn trash_list_args(mount_id: &str) -> TrashListArgs {
+        TrashListArgs {
+            mount_id: mount_id.to_string(),
+            path_prefix: String::new(),
+            limit: 200,
+            offset: 0,
+        }
+    }
+
+    /// E2E-NEW-407: `fs.trash_list` on an unknown project fails with
+    /// `ERR_PROJECT_NOT_FOUND`.
+    #[tokio::test]
+    async fn e2e_new_407_trash_list_on_unknown_project_is_not_found() {
+        let f = Fixture::new().await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let r = server.fs_trash_list(Parameters(trash_list_args("nonexistent-proj"))).await;
+        let text = error_text(r);
+        assert!(
+            text.contains(code::PROJECT_NOT_FOUND),
+            "expected {}, got: {text}",
+            code::PROJECT_NOT_FOUND
+        );
+    }
+
+    /// E2E-NEW-408: `fs.trash_list` is forbidden for a non-member.
+    #[tokio::test]
+    async fn e2e_new_408_trash_list_forbidden_for_non_member() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-list-1", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "eve@test.com".to_string());
+
+        let r = server.fs_trash_list(Parameters(trash_list_args("proj-list-1"))).await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// E2E-NEW-428: a platform admin who is not a member of the project is
+    /// forbidden from calling `fs.trash_list` on it.
+    #[tokio::test]
+    async fn e2e_new_428_trash_list_platform_admin_without_membership_is_forbidden() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-acl", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), ADMIN.to_string());
+
+        let r = server.fs_trash_list(Parameters(trash_list_args("proj-acl"))).await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// E2E-NEW-442: a member removed from the project loses trash access;
+    /// "any current project member" does not mean "whoever was ever a member".
+    #[tokio::test]
+    async fn e2e_new_442_removed_member_loses_trash_list_access() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-acl-2", "alice@test.com").await;
+        f.state.admin.add_member("proj-acl-2", "dave@test.com", "alice@test.com").await.unwrap();
+        {
+            let client = f.state.stores.client("proj-acl-2").await.unwrap();
+            client.write_text_atomic("/x.txt", "x").await.unwrap();
+            crate::core::fs_ops::delete_path(
+                &client,
+                &f.state.safety,
+                "dave@test.com",
+                "proj-acl-2",
+                "/x.txt",
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        f.state.admin.remove_member("proj-acl-2", "dave@test.com").await.unwrap();
+
+        let server = McpServer::new(f.state.clone(), "dave@test.com".to_string());
+        let r = server.fs_trash_list(Parameters(trash_list_args("proj-acl-2"))).await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
 }
