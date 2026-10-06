@@ -403,6 +403,10 @@ impl Drop for MssqlTx {
 
 #[async_trait]
 impl RelationalTx for MssqlTx {
+    fn dialect(&self) -> Dialect {
+        Dialect::SqlServer
+    }
+
     async fn execute(&mut self, query: &Query) -> Result<u64> {
         execute_on(&mut self.conn, query).await
     }

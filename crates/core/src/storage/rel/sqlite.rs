@@ -123,6 +123,10 @@ impl SqliteTx {
 
 #[async_trait]
 impl RelationalTx for SqliteTx {
+    fn dialect(&self) -> Dialect {
+        Dialect::Sqlite
+    }
+
     async fn execute(&mut self, query: &Query) -> Result<u64> {
         let (reply, answer) = oneshot::channel();
         self.send(TxCommand::Execute { query: query.clone(), reply }).await?;

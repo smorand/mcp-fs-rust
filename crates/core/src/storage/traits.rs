@@ -38,6 +38,25 @@ impl NodeRow {
 pub const MODE_DIR: i64 = 0o040_755;
 pub const MODE_FILE: i64 = 0o100_644;
 
+/// One soft-deleted top-level path, per volume (SPEC-0011 US-0001, DEC-001).
+///
+/// Recorded explicitly rather than reconstructed from the trash path string:
+/// the flatten encoding is lossy (`/a/b.txt` and `/a__b.txt` collide), so this
+/// row is the only unambiguous source of `original_path` once a delete lands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrashEntryRow {
+    pub volume_id: String,
+    pub trash_path: String,
+    pub original_path: String,
+    pub size: i64,
+    /// "dir" | "file"
+    pub kind: String,
+    /// RFC3339.
+    pub deleted_at: String,
+    /// `None` for a sweep-initiated delete.
+    pub deleted_by: Option<String>,
+}
+
 /// How much of a project's content is kept in the search index.
 ///
 /// Stored on the project row, so it survives a restart and applies to every write

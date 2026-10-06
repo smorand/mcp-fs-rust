@@ -259,6 +259,18 @@ impl Dialect {
         }
     }
 
+    /// Render a page clause for a query that already has `ORDER BY`.
+    ///
+    /// SQL Server has no `LIMIT`/`OFFSET`: `OFFSET ... ROWS FETCH NEXT ... ROWS
+    /// ONLY` requires the preceding `ORDER BY`, which every caller already has
+    /// (paging without a stable order is meaningless on any engine).
+    pub fn render_limit_offset(self, limit: i64, offset: i64) -> String {
+        match self {
+            Self::Sqlite | Self::Postgres => format!("LIMIT {limit} OFFSET {offset}"),
+            Self::SqlServer => format!("OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"),
+        }
+    }
+
     /// A query returning one text column: the name of every table.
     pub fn table_names_query(self) -> &'static str {
         match self {
@@ -645,6 +657,16 @@ mod tests {
         assert_eq!(Dialect::Sqlite.escape_like_literal("a[b]"), "a[b]");
         assert_eq!(Dialect::Postgres.escape_like_literal("a[b]"), "a[b]");
         assert_eq!(Dialect::SqlServer.escape_like_literal("a[b]"), "a\\[b]");
+    }
+
+    #[test]
+    fn limit_offset_is_portable_across_engines() {
+        assert_eq!(Dialect::Sqlite.render_limit_offset(10, 0), "LIMIT 10 OFFSET 0");
+        assert_eq!(Dialect::Postgres.render_limit_offset(10, 5), "LIMIT 10 OFFSET 5");
+        assert_eq!(
+            Dialect::SqlServer.render_limit_offset(10, 5),
+            "OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
     }
 
     #[test]
