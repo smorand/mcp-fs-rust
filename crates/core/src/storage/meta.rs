@@ -366,6 +366,26 @@ impl RelationalMetaStore {
         })
         .await
     }
+
+    /// Look up a single `trash_entries` row for `fs.trash_restore` (SPEC-0011
+    /// US-0005, FR-NEW-009): production counterpart to
+    /// [`Self::get_trash_entry_for_test`].
+    pub(crate) async fn get_trash_entry(&self, trash_path: &str) -> Result<Option<TrashEntryRow>> {
+        let mut tx = self.db.begin().await?;
+        let row = get_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Delete a single `trash_entries` row once `fs.trash_restore` has renamed
+    /// the node back (SPEC-0011 US-0005, FR-NEW-009): production counterpart to
+    /// [`Self::delete_trash_entry_for_test`].
+    pub(crate) async fn delete_trash_entry(&self, trash_path: &str) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        delete_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 // ── transaction helpers ─────────────────────────────────────────────────────────

@@ -1082,6 +1082,14 @@ pub struct TrashListArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct TrashRestoreArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// The trashed entry's current path (as returned by `fs.trash_list`).
+    pub trash_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExtractTextArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2022,6 +2030,22 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.trash_list", out)
+    }
+
+    #[tool(
+        name = "fs.trash_restore",
+        description = "Restore a trashed file or directory subtree back to its original path, renaming to `_restoredN` on collision."
+    )]
+    async fn fs_trash_restore(
+        &self,
+        Parameters(a): Parameters<TrashRestoreArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            crate::tools::trash::trash_restore(&self.state, &a.mount_id, &a.trash_path).await
+        }
+        .await;
+        to_call_result("fs.trash_restore", out)
     }
 
     // ── document family ──────────────────────────────────────────────────────
@@ -3445,7 +3469,8 @@ mod tests {
             .map(|t| t.name.to_string())
             .filter(|n| n.starts_with("fs."))
             .collect();
-        assert_eq!(names.len(), 36, "got: {names:?}");
+        // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37.
+        assert_eq!(names.len(), 37, "got: {names:?}");
     }
 
     #[test]
@@ -3457,11 +3482,13 @@ mod tests {
         let admin_count = names.iter().filter(|n| n.starts_with("admin.")).count();
         let search_count = names.iter().filter(|n| n.starts_with("search.")).count();
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
-        assert_eq!(fs_count, 36, "got: {names:?}");
+        // SPEC-0011 US-0005 adds fs.trash_restore, bumping fs_count 36->37 and
+        // the total 103->104.
+        assert_eq!(fs_count, 37, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 103, "got: {names:?}");
+        assert_eq!(names.len(), 104, "got: {names:?}");
     }
 
     #[test]
@@ -3780,10 +3807,10 @@ mod tests {
             if tool.name.starts_with("search.") {
                 continue; // config-gated, not part of the frozen 95-tool surface
             }
-            if tool.name.as_ref() == "fs.trash_list" {
-                // SPEC-0011 US-0004: not yet in TOOL_CONTRACT.txt / the golden
-                // contract, added there deliberately by US-0008 (see the story's
-                // own Scope Boundary), not by this story.
+            if tool.name.as_ref() == "fs.trash_list" || tool.name.as_ref() == "fs.trash_restore" {
+                // SPEC-0011 US-0004/US-0005: not yet in TOOL_CONTRACT.txt / the
+                // golden contract, added there deliberately by US-0008 (see
+                // each story's own Scope Boundary), not by this story.
                 continue;
             }
             checked += 1;
@@ -3813,9 +3840,10 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .filter(|n| !n.starts_with("search."))
-            // SPEC-0011 US-0004: fs.trash_list is deliberately absent from the
-            // frozen contract until US-0008 adds it (story's own Scope Boundary).
-            .filter(|n| n != "fs.trash_list")
+            // SPEC-0011 US-0004/US-0005: fs.trash_list and fs.trash_restore are
+            // deliberately absent from the frozen contract until US-0008 adds
+            // them (each story's own Scope Boundary).
+            .filter(|n| n != "fs.trash_list" && n != "fs.trash_restore")
             .collect();
 
         let frozen = crate::tools::contract_golden::frozen_tools()
@@ -4396,5 +4424,116 @@ mod tests {
         let r = server.fs_trash_list(Parameters(trash_list_args("proj-acl-2"))).await;
         let text = error_text(r);
         assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    // ── SPEC-0011 US-0005: fs.trash_restore, through the real production handler
+    // (McpServer::fs_trash_restore) rather than the bare `tools::trash::
+    // trash_restore` function, since that function does not authorize itself ──
+
+    fn trash_restore_args(mount_id: &str, trash_path: &str) -> TrashRestoreArgs {
+        TrashRestoreArgs { mount_id: mount_id.to_string(), trash_path: trash_path.to_string() }
+    }
+
+    async fn trashed_path(f: &Fixture, mount_id: &str, path: &str, owner: &str) -> String {
+        let client = f.state.stores.client(mount_id).await.unwrap();
+        client.write_text_atomic(path, "x").await.unwrap();
+        let r = crate::core::fs_ops::delete_path(
+            &client,
+            &f.state.safety,
+            owner,
+            mount_id,
+            path,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        r["trash_path"].as_str().unwrap().to_string()
+    }
+
+    /// E2E-NEW-419: restore forbidden for a non-member.
+    #[tokio::test]
+    async fn e2e_new_419_restore_forbidden_for_non_member() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", "alice@test.com").await;
+        let trash_path = trashed_path(&f, "proj-restore-1", "/doc.txt", "alice@test.com").await;
+
+        let server = McpServer::new(f.state.clone(), "eve@test.com".to_string());
+        let r = server
+            .fs_trash_restore(Parameters(trash_restore_args("proj-restore-1", &trash_path)))
+            .await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// E2E-NEW-427: any member can list/restore, not just the deleter.
+    #[tokio::test]
+    async fn e2e_new_427_any_member_can_list_and_restore_not_just_the_deleter() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-acl", "alice@test.com").await;
+        f.state.admin.add_member("proj-acl", "bob@test.com", "alice@test.com").await.unwrap();
+        let trash_path = trashed_path(&f, "proj-acl", "/shared.txt", "alice@test.com").await;
+
+        let server = McpServer::new(f.state.clone(), "bob@test.com".to_string());
+        let listed = ok_json(server.fs_trash_list(Parameters(trash_list_args("proj-acl"))).await);
+        assert_eq!(listed["entries"][0]["deleted_by"], "alice@test.com");
+
+        let restored = ok_json(
+            server.fs_trash_restore(Parameters(trash_restore_args("proj-acl", &trash_path))).await,
+        );
+        assert_eq!(restored["restored_path"], "/shared.txt");
+    }
+
+    /// E2E-NEW-436: full lifecycle, live → trashed → listed → restored → live.
+    #[tokio::test]
+    async fn e2e_new_436_full_lifecycle_live_trashed_listed_restored_live() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-lifecycle", "alice@test.com").await;
+        let server = McpServer::new(f.state.clone(), "alice@test.com".to_string());
+
+        let client = f.state.stores.client("proj-lifecycle").await.unwrap();
+        client.write_text_atomic("/cycle.txt", "v1").await.unwrap();
+
+        ok_json(
+            server
+                .fs_delete(Parameters(DeleteArgs {
+                    mount_id: "proj-lifecycle".to_string(),
+                    path: "/cycle.txt".to_string(),
+                    recursive: false,
+                    trash: true,
+                }))
+                .await,
+        );
+        assert!(!client.exists("/cycle.txt").await.unwrap());
+
+        let listed =
+            ok_json(server.fs_trash_list(Parameters(trash_list_args("proj-lifecycle"))).await);
+        let entries = listed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let trash_path = entries[0]["trash_path"].as_str().unwrap().to_string();
+
+        let restored = ok_json(
+            server
+                .fs_trash_restore(Parameters(trash_restore_args("proj-lifecycle", &trash_path)))
+                .await,
+        );
+        assert_eq!(restored["restored_path"], "/cycle.txt");
+
+        let after_restore =
+            ok_json(server.fs_trash_list(Parameters(trash_list_args("proj-lifecycle"))).await);
+        assert_eq!(after_restore["total"], 0);
+
+        let read = ok_json(
+            server
+                .fs_read(Parameters(ReadArgs {
+                    mount_id: "proj-lifecycle".to_string(),
+                    path: "/cycle.txt".to_string(),
+                    offset_lines: 0,
+                    limit_lines: 2000,
+                    line_numbered: false,
+                }))
+                .await,
+        );
+        assert_eq!(read["content"], "v1");
     }
 }

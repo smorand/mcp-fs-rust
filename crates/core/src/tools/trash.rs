@@ -110,6 +110,80 @@ fn reconstruct_legacy_entry(name: &str) -> (String, String) {
     (original_path, deleted_at)
 }
 
+/// `fs.trash_restore(mount_id, trash_path)` (FR-NEW-009/010).
+///
+/// Time complexity: O(1) lookups/writes for the row plus O(k) collision
+/// retries (k <= 51, same bound as [`crate::core::fs_ops::rename_with_
+/// collision_retry`]) and O(subtree size) for the actual rename when
+/// `trash_path` names a directory. Space: O(1) beyond the formatted
+/// candidate path.
+pub(crate) async fn trash_restore(
+    state: &AppState,
+    mount_id: &str,
+    trash_path: &str,
+) -> Result<Value> {
+    if trash_path.trim().is_empty() {
+        return Err(ToolError::invalid_argument("trash_path must not be empty"));
+    }
+    let client = state.stores.client(mount_id).await?;
+    let store = client
+        .trash
+        .as_ref()
+        .ok_or_else(|| ToolError::internal("volume has no trash store attached"))?;
+
+    let mut entry = store.get_trash_entry(trash_path).await?;
+    if entry.is_none() && client.exists(trash_path).await? {
+        backfill_trash_entries(&client, &state.safety.config().trash_dir).await?;
+        entry = store.get_trash_entry(trash_path).await?;
+    }
+    let entry = entry
+        .ok_or_else(|| ToolError::not_found(format!("'{trash_path}' is not a trashed entry")))?;
+
+    // The legacy backfill (FR-NEW-011) reconstructs `original_path` without a
+    // leading slash; every other `original_path` already has one.
+    let destination = if entry.original_path.starts_with('/') {
+        entry.original_path.clone()
+    } else {
+        format!("/{}", entry.original_path)
+    };
+    let parent = &destination[..destination.rfind('/').unwrap_or(0)];
+    if !parent.is_empty() {
+        client.makedirs(parent, true).await?;
+    }
+    let restored_path = restore_with_collision_retry(&client, trash_path, &destination).await?;
+    store.delete_trash_entry(trash_path).await?;
+
+    tracing::info!(trash_path, restored_path = %restored_path, "fs.trash_restore");
+    Ok(json!({"restored_path": restored_path, "trash_path": trash_path}))
+}
+
+/// Rename `src` back to `dst`, retrying at `dst_restored`, `dst_restored2`,
+/// ... until a free destination is found (SPEC-0011 US-0005, FR-NEW-010,
+/// DEC-002). Unlike [`crate::core::fs_ops::rename_with_collision_retry`]'s
+/// `~N` suffix, this one appends after the full file name including its
+/// extension, and never gives up: restore must never fail on a collision.
+async fn restore_with_collision_retry(
+    client: &VolumeClient,
+    src: &str,
+    dst: &str,
+) -> Result<String> {
+    match client.rename(src, dst).await {
+        Ok(()) => return Ok(dst.to_string()),
+        Err(e) if e.code == crate::errors::code::NO_CLOBBER => {}
+        Err(e) => return Err(e),
+    }
+    let mut n: u64 = 1;
+    loop {
+        let candidate =
+            if n == 1 { format!("{dst}_restored") } else { format!("{dst}_restored{n}") };
+        match client.rename(src, &candidate).await {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.code == crate::errors::code::NO_CLOBBER => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +387,217 @@ mod tests {
         let r = trash_list(&f.state, "proj-list-1", "", 0, 0).await.unwrap();
         assert_eq!(r["entries"].as_array().unwrap().len(), 0);
         assert_eq!(r["total"], 1);
+    }
+
+    // ── SPEC-0011 US-0005: fs.trash_restore engine tests ───────────────────
+
+    /// E2E-NEW-417: restore to the original path.
+    #[tokio::test]
+    async fn e2e_new_417_restore_to_the_original_path() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        trash_delete(&f, "proj-restore-1", "/doc.txt").await;
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        let r = trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        assert_eq!(r["restored_path"], "/doc.txt");
+        assert_eq!(r["trash_path"], trash_path.as_str());
+
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        assert!(client.exists("/doc.txt").await.unwrap());
+        let store = client.trash.as_ref().unwrap();
+        assert!(store.get_trash_entry_for_test(&trash_path).await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-418: restore of an unknown trash path fails `ERR_NOT_FOUND`.
+    #[tokio::test]
+    async fn e2e_new_418_restore_of_an_unknown_trash_path_is_not_found() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        let e = trash_restore(&f.state, "proj-restore-1", "/.mcp_trash/999__nope.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+    }
+
+    /// E2E-NEW-420: restore collision renames to `_restored`.
+    #[tokio::test]
+    async fn e2e_new_420_restore_collision_renames_to_restored() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        trash_delete(&f, "proj-restore-1", "/a.txt").await;
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        client.write_text_atomic("/a.txt", "new").await.unwrap();
+
+        let r = trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        assert_eq!(r["restored_path"], "/a.txt_restored");
+        assert!(client.exists("/a.txt").await.unwrap());
+        assert!(client.exists("/a.txt_restored").await.unwrap());
+        let store = client.trash.as_ref().unwrap();
+        assert!(store.get_trash_entry_for_test(&trash_path).await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-421: double collision renames to `_restored2`.
+    #[tokio::test]
+    async fn e2e_new_421_double_collision_renames_to_restored2() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        trash_delete(&f, "proj-restore-1", "/a.txt").await;
+        let listed1 = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path1 = listed1["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        client.write_text_atomic("/a.txt", "new").await.unwrap();
+        trash_restore(&f.state, "proj-restore-1", &trash_path1).await.unwrap();
+        // Now /a.txt and /a.txt_restored both occupied; trash a second copy.
+        trash_delete(&f, "proj-restore-1", "/a.txt").await;
+        let listed2 = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path2 = listed2["entries"][0]["trash_path"].as_str().unwrap().to_string();
+        client.write_text_atomic("/a.txt", "newer").await.unwrap();
+
+        let r = trash_restore(&f.state, "proj-restore-1", &trash_path2).await.unwrap();
+        assert_eq!(r["restored_path"], "/a.txt_restored2");
+    }
+
+    /// E2E-NEW-422: collision suffix appended after the extension.
+    #[tokio::test]
+    async fn e2e_new_422_collision_suffix_appended_after_the_extension() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        trash_delete(&f, "proj-restore-1", "/report.pdf").await;
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        client.write_text_atomic("/report.pdf", "new").await.unwrap();
+
+        let r = trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        assert_eq!(r["restored_path"], "/report.pdf_restored");
+    }
+
+    /// E2E-NEW-423: restoring a directory restores the whole subtree.
+    #[tokio::test]
+    async fn e2e_new_423_restoring_a_directory_restores_the_whole_subtree() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        client.write_text_atomic("/proj/x.txt", "x").await.unwrap();
+        client.write_text_atomic("/proj/sub/y.txt", "y").await.unwrap();
+        crate::core::fs_ops::delete_path(
+            &client,
+            &f.state.safety,
+            OWNER,
+            "proj-restore-1",
+            "/proj",
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        assert_eq!(listed["total"], 1);
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        let store = client.trash.as_ref().unwrap();
+        let before = store.count_trash_entries_for_test().await.unwrap();
+        trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        let after = store.count_trash_entries_for_test().await.unwrap();
+        assert_eq!(before - after, 1);
+
+        assert!(client.is_dir("/proj").await.unwrap());
+        assert!(client.exists("/proj/x.txt").await.unwrap());
+        assert!(client.exists("/proj/sub/y.txt").await.unwrap());
+    }
+
+    /// E2E-NEW-424: restore backfills an untracked node inline.
+    #[tokio::test]
+    async fn e2e_new_424_restore_backfills_an_untracked_node_inline() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-backfill-2", OWNER).await;
+        let client = f.state.stores.client("proj-backfill-2").await.unwrap();
+        client.write_text_atomic("/.mcp_trash/1700000000000__orphan.txt", "x").await.unwrap();
+
+        let r = trash_restore(&f.state, "proj-backfill-2", "/.mcp_trash/1700000000000__orphan.txt")
+            .await
+            .unwrap();
+        assert_eq!(r["restored_path"], "/orphan.txt");
+        assert!(client.exists("/orphan.txt").await.unwrap());
+        let store = client.trash.as_ref().unwrap();
+        assert_eq!(store.count_trash_entries_for_test().await.unwrap(), 0);
+    }
+
+    /// E2E-NEW-425: restoring twice fails the second time.
+    #[tokio::test]
+    async fn e2e_new_425_restoring_twice_fails_the_second_time() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        trash_delete(&f, "proj-restore-1", "/doc.txt").await;
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        let e = trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+    }
+
+    /// E2E-NEW-426: restore deletes the row, verified independently.
+    #[tokio::test]
+    async fn e2e_new_426_restore_deletes_the_row_verified_independently() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        trash_delete(&f, "proj-restore-1", "/z.txt").await;
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        let store = client.trash.as_ref().unwrap();
+        assert!(store.get_trash_entry_for_test(&trash_path).await.unwrap().is_some());
+
+        trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        assert!(store.get_trash_entry_for_test(&trash_path).await.unwrap().is_none());
+    }
+
+    /// E2E-NEW-437: restore with an empty `trash_path` fails `ERR_INVALID_ARGUMENT`.
+    #[tokio::test]
+    async fn e2e_new_437_restore_with_an_empty_trash_path_is_invalid_argument() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        let e = trash_restore(&f.state, "proj-restore-1", "").await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+    }
+
+    /// E2E-NEW-439: restore recreates a missing ancestor directory.
+    #[tokio::test]
+    async fn e2e_new_439_restore_recreates_a_missing_ancestor_directory() {
+        let f = Fixture::with_config(|c| c.safety.allow_hard_delete = true).await;
+        f.seed_project("proj-restore-1", OWNER).await;
+        let client = f.state.stores.client("proj-restore-1").await.unwrap();
+        client.write_text_atomic("/parent/child/f.txt", "x").await.unwrap();
+        crate::core::fs_ops::delete_path(
+            &client,
+            &f.state.safety,
+            OWNER,
+            "proj-restore-1",
+            "/parent/child",
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        // Hard-delete the now-empty `/parent` ancestor out from under the trash entry.
+        client.delete_tree("/parent").await.unwrap();
+        assert!(!client.exists("/parent").await.unwrap());
+
+        let listed = trash_list(&f.state, "proj-restore-1", "", 200, 0).await.unwrap();
+        let trash_path = listed["entries"][0]["trash_path"].as_str().unwrap().to_string();
+
+        trash_restore(&f.state, "proj-restore-1", &trash_path).await.unwrap();
+        assert!(client.is_dir("/parent").await.unwrap());
+        assert!(client.is_dir("/parent/child").await.unwrap());
     }
 }
