@@ -39,6 +39,7 @@ pub(crate) mod document;
 #[cfg(test)]
 pub(crate) mod edit;
 pub mod editor;
+pub(crate) mod export;
 pub mod git;
 pub mod git_auth;
 pub mod git_pr;
@@ -83,6 +84,7 @@ pub(crate) fn register_fs(reg: &mut crate::tools::registry_support::ToolRegistry
     lifecycle::register(reg);
     document::register(reg);
     trash::register(reg);
+    export::register(reg);
 }
 
 /// Read `mount_id`, enforce project membership, open the volume.
@@ -387,13 +389,14 @@ mod tests {
         "fs.documentize",
         "fs.trash_list",
         "fs.trash_restore",
+        "fs.export_zip",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        assert_eq!(reg.len(), 37);
+        assert_eq!(reg.len(), 38);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -466,7 +469,7 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            37,
+            38,
             "fs.* tools",
         );
     }

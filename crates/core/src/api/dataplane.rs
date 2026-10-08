@@ -84,6 +84,7 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "write-docx"),
     ("POST", "write-bytes"),
     ("POST", "documentize"),
+    ("POST", "export-zip"),
 ];
 
 /// Request body ceiling for the JSON endpoints. Axum defaults to 2 MiB, which is
@@ -145,6 +146,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/write-docx", post(write_docx))
         .route("/api/fs/{mount_id}/write-bytes", post(write_bytes))
         .route("/api/fs/{mount_id}/documentize", post(documentize))
+        .route("/api/fs/{mount_id}/export-zip", post(export_zip))
         // Applied outside the routes so the upload keeps its own larger ceiling.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
@@ -626,13 +628,34 @@ async fn download_zip(
     .await
 }
 
+/// A selection of files and directories as a single use download link. Same
+/// function as `fs.export_zip`, so the two doors cannot drift apart.
+async fn export_zip(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guarded_json(state, headers, mount, |r| async move {
+        let a = body_args(&body)?;
+        // `str_array` would read a non array `paths` as empty and let the
+        // empty selection rule answer; an explicit type check names the cause.
+        if !a.raw("paths").is_some_and(Value::is_array) {
+            return Err(ToolError::invalid_argument("'paths' must be an array of strings"));
+        }
+        let paths = a.req_str_array("paths")?;
+        crate::tools::export::export_zip(&r.state, &r.mount, &paths).await
+    })
+    .await
+}
+
 fn zip_error(e: zip::result::ZipError) -> ToolError {
     ToolError::internal(format!("zip: {e}"))
 }
 
 /// An attachment response. The filename is sent twice (a sanitized ASCII form
 /// plus RFC 5987 `filename*`) so unicode names survive without breaking headers.
-fn attachment(data: Vec<u8>, mime: &str, name: &str) -> Response {
+pub(crate) fn attachment(data: Vec<u8>, mime: &str, name: &str) -> Response {
     let ascii: String = name
         .chars()
         .map(|c| if c.is_ascii() && !c.is_control() && c != '"' && c != '\\' { c } else { '_' })
@@ -2366,7 +2389,8 @@ mod tests {
     async fn the_route_inventory_covers_every_registered_path() {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
-        assert_eq!(REST_ROUTES.len(), 38);
+        assert_eq!(REST_ROUTES.len(), 39);
+        assert!(REST_ROUTES.contains(&("POST", "export-zip")));
         assert!(REST_ROUTES.contains(&("GET", "download-zip")));
         assert!(REST_ROUTES.contains(&("POST", "write-docx")));
         assert!(REST_ROUTES.contains(&("POST", "write-bytes")));
@@ -2659,5 +2683,102 @@ mod tests {
         assert_eq!(exists["exists"], true, "the source survives");
         let (_, md) = h.get(&u("exists?path=/deck.md")).await;
         assert_eq!(md["exists"], false);
+    }
+
+    // ── export-zip (SPEC-0012 US-0002) ───────────────────────────────────────
+
+    /// A POST to `export-zip` with an explicit bearer.
+    async fn post_export(h: &Harness, token: &str, body: &str) -> (StatusCode, Value) {
+        let (s, b) = h
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri(u("export-zip"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+    }
+
+    /// Every `export:*` blob anywhere under the harness blob root.
+    fn export_blob_count(h: &Harness) -> usize {
+        let mut n = 0;
+        let mut stack = vec![std::path::PathBuf::from(&h.state.config.infra.blob.dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.path().is_dir() {
+                    stack.push(e.path());
+                } else if e.file_name().to_string_lossy().starts_with("export:") {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    async fn seed_export_fixture(h: &Harness) {
+        h.seed("/src/main.rs", "fn main() {}").await;
+        h.seed("/docs/readme.md", "# Hello").await;
+        h.seed("/docs/notes/todo.txt", "buy milk").await;
+    }
+
+    /// E2E-NEW-002: the REST door answers `{"url"}` like the tool, and the
+    /// archive it parked holds the same three entries.
+    #[tokio::test]
+    async fn e2e_new_002_export_zip_happy_path() {
+        let h = Harness::new().await;
+        seed_export_fixture(&h).await;
+        let (s, v) = h.post(&u("export-zip"), json!({"paths": ["/src/main.rs", "/docs"]})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let url = v["url"].as_str().unwrap();
+        let token = url.strip_prefix("/exports/").expect("relative export url");
+        assert_eq!(token.len(), 36);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+
+        let client = h.state.stores.client(MOUNT).await.unwrap();
+        let bytes = client.blob.get(&format!("export:{token}"), 0, None).await.unwrap();
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut names: Vec<&str> = archive.file_names().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["docs/notes/todo.txt", "docs/readme.md", "src/main.rs"]);
+    }
+
+    /// E2E-NEW-042: a non array `paths` is a 400 and stores nothing.
+    #[tokio::test]
+    async fn e2e_new_042_export_zip_malformed_body_is_400() {
+        let h = Harness::new().await;
+        seed_export_fixture(&h).await;
+        let (s, v) = post_export(&h, &h.owner_token, r#"{"paths": "not-an-array"}"#).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let (s, _) = post_export(&h, &h.owner_token, "{not json").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(export_blob_count(&h), 0);
+    }
+
+    /// E2E-NEW-044: a non member is 403 on the REST door too.
+    #[tokio::test]
+    async fn e2e_new_044_export_zip_stranger_is_403() {
+        let h = Harness::new().await;
+        seed_export_fixture(&h).await;
+        let (s, v) = post_export(&h, &h.stranger_token, r#"{"paths": ["/src/main.rs"]}"#).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["error"], code::FORBIDDEN);
+        assert_eq!(export_blob_count(&h), 0);
+    }
+
+    /// E2E-NEW-045: one escaping path is a 400 `ERR_PATH_OUT_OF_BOUNDS`.
+    #[tokio::test]
+    async fn e2e_new_045_export_zip_escaping_path_is_400() {
+        let h = Harness::new().await;
+        seed_export_fixture(&h).await;
+        let (s, v) = h
+            .post(&u("export-zip"), json!({"paths": ["/src/main.rs", "/../../../etc/passwd"]}))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::PATH_OUT_OF_BOUNDS);
+        assert_eq!(export_blob_count(&h), 0);
     }
 }

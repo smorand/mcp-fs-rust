@@ -12,6 +12,7 @@ defaults, and unknown keys are ignored (there is no strict mode).
 | `host` | string | `0.0.0.0` | bind address |
 | `port` | int | `5002` | bind port |
 | `mcp_path` | string | `/mcp` | path of the MCP endpoint; must start with `/`, otherwise the boot fails |
+| `public_base_url` | string | `""` | origin prefixed to `fs.export_zip` URLs (`{public_base_url}/exports/{token}`); empty keeps them relative; `${VAR}` expandable |
 
 ## `auth.jwt`
 

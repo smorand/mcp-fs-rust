@@ -681,6 +681,36 @@
       }
     },
     {
+      "name": "fs.export_zip",
+      "description": "Zip a selection of files and directories and return a single-use download URL valid for 5 minutes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "paths": {
+            "description": "Absolute POSIX paths of files or directories to include; directories are walked recursively.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "mount_id",
+          "paths"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "fs.extract_text",
       "description": "Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it if already up to date. Returns md_path + a preview; read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR via a configured multimodal provider) and text; audio/video unsupported.",
       "inputSchema": {

@@ -57,6 +57,23 @@ pub struct TrashEntryRow {
     pub deleted_by: Option<String>,
 }
 
+/// One pending zip export link (SPEC-0012 US-0001, FR-NEW-015).
+///
+/// A server-side record, not a stateless signed token (DEC-008): the blob
+/// bytes it names live under `export:{token}` in the owning volume's blob
+/// backend, and this row is what makes the single-use consume and the expiry
+/// sweep possible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportLinkRow {
+    /// UUIDv4 string, the primary key.
+    pub token: String,
+    pub volume_id: String,
+    /// RFC3339.
+    pub created_at: String,
+    /// RFC3339, `created_at` + 300s (DEC-013: also the sweep's grace period).
+    pub expires_at: String,
+}
+
 /// How much of a project's content is kept in the search index.
 ///
 /// Stored on the project row, so it survives a restart and applies to every write

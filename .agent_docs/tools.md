@@ -1,4 +1,4 @@
-# Tool reference (100 tools)
+# Tool reference (101 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -126,6 +126,23 @@ check `mount_id` even though they never open the volume.
 surface. `purge_in_days` is `null` when the project has no file retention
 configured. `fs.trash_restore` renames to `_restoredN` on a collision at the
 original path rather than failing (SPEC-0011).
+
+## fs export (1)
+
+| Tool | Purpose | Params | Returns | Annotations | Who |
+|---|---|---|---|---|---|
+| `fs.export_zip` | zip a selection, return a single use download URL | `paths:string[]` | `url` | !D,!RO,!I,!OW | member |
+
+All or nothing (2026-10-08, SPEC-0012 US-0002): an empty `paths` or an empty
+entry is `ERR_INVALID_ARGUMENT`, any `..` climbing above the root is
+`ERR_PATH_OUT_OF_BOUNDS` (checked on the raw path, since `normalize_path`
+clamps `/../x` to `/x`), a missing entry is `ERR_NOT_FOUND` naming it; nothing
+is stored on any error. Directories are walked recursively, each zip entry is
+the full project relative path, overlapping entries are deduplicated. The zip
+is buffered in memory (no size limit, like `download-zip`), stored at blob key
+`export:{token}` with an `export_links` row expiring 300 s later. `url` is
+`{server.public_base_url}/exports/{token}`, relative when that key is empty.
+The full token is never logged, only its first 8 characters.
 
 ## fs document (3)
 

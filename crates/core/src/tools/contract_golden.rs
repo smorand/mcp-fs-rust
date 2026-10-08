@@ -138,7 +138,7 @@ fn render(reg: &ToolRegistry) -> String {
 #[test]
 fn tool_contract_golden_is_current() {
     let reg = contract_registry();
-    assert_eq!(reg.len(), 100, "the frozen contract covers 37 fs, 14 admin and 49 git tools");
+    assert_eq!(reg.len(), 101, "the frozen contract covers 38 fs, 14 admin and 49 git tools");
     let rendered = render(&reg);
 
     if std::env::var_os(REWRITE_ENV).is_some() {
@@ -245,7 +245,7 @@ fn e2e_new_960_the_thirty_one_enumerated_names_are_exactly_the_new_tool_set() {
     git_enumeration_verdict(reg.names()).expect("the git family must match the enumeration");
 
     assert_eq!(PRE_SPEC_GIT_TOOLS.len() + NEW_GIT_TOOLS.len(), 49);
-    assert_eq!(reg.len(), 100);
+    assert_eq!(reg.len(), 101);
 
     // Every new tool is frozen, and carries the family's required mount_id.
     let Some(frozen) = frozen_tools() else {
@@ -301,7 +301,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
     let admin_family = reg.names().iter().filter(|n| n.starts_with("admin.")).count();
 
     // contract_golden.rs's own total, and the subtotals all.rs asserts.
-    assert_eq!(reg.len(), 100);
+    assert_eq!(reg.len(), 101);
     assert_eq!(git_family, 49);
     assert_eq!(fs_family + admin_family + git_family, reg.len());
 
@@ -315,7 +315,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
         eprintln!("skipped: {PATH} is absent");
         return;
     };
-    assert_eq!(frozen.len(), 100, "the golden file holds one entry per registered tool");
+    assert_eq!(frozen.len(), 101, "the golden file holds one entry per registered tool");
 
     // The contract text documents the same names, set for set.
     let text =

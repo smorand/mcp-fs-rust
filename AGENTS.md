@@ -2,7 +2,7 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (100 tools: 37 `fs.*`, 14 `admin.*`, 39 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
+multi-project filesystem** (101 tools: 38 `fs.*`, 14 `admin.*`, 39 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
 + 4 `search.*` when search enabled),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/` with push,
@@ -76,7 +76,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   wrapping `mcp::server::McpServer`, `LocalSessionManager` + `legacy_session_mode: true` so
   `initialize` is mandatory; see `.agent_docs/architecture.md` for the exact wire shapes), `/health`.
 - `mcp/` : `server.rs` only — `McpServer`, one `#[tool]` method per entry in `TOOL_CONTRACT.txt`
-  (100 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
+  (101 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
   calls, never reimplementing an operation. The hand-rolled JSON-RPC/SSE framing layer this module
   used to own (`ToolRegistry`/`ToolSchema`/`Args`/`ToolHandler`) is gone (SPEC-0013); what remains
   of that machinery lives at `tools::registry_support`, kept only because `Args`/`ToolCtx` are the
@@ -105,12 +105,17 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the
   REST plane); `register(&mut ToolRegistry)` survives only as `#[cfg(test)]`-gated glue for the
   shared test harness, except the five optional families (`web`/`context7`/`sqlite`/`db`/`doc`,
-  off by default, not part of the 100-tool contract), whose `register()`/`catalog()` are genuine
+  off by default, not part of the 101-tool contract), whose `register()`/`catalog()` are genuine
   production code backing `/api/swagger.json`. `catalog.rs` holds the transport-agnostic
   `ToolCatalogEntry` shape; `all.rs` has the now-test-only `register_all`. `trash.rs` holds
   `fs.trash_list`/`fs.trash_restore` (SPEC-0011): the backfill of untracked trash nodes into
-  `trash_entries`, paginated listing, and restore-with-rename-on-collision.
+  `trash_entries`, paginated listing, and restore-with-rename-on-collision. `export.rs` holds
+  `fs.export_zip` (SPEC-0012), also served by `POST /api/fs/{mount_id}/export-zip`: zip a
+  selection into blob key `export:{token}` plus an `export_links` row, return the URL.
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
+- `exports.rs` : `GET /exports/{token}` (SPEC-0012), mounted unconditionally (outside `api.enabled`),
+  no auth: the token is the credential. Atomic single use via `meta::delete_export_link_if_live`
+  probed per project (SQLite meta is one file per volume), expiry checked once; no `DELETE` route.
 - `token_screen.rs` : the `/app/tokens` browser screen (git enabled only), session-cookie +
   CSRF, delegating to `tools::git_auth`.
 - `deleted_projects_screen.rs` : the `/app/deleted-projects` browser screen (always mounted),
@@ -132,7 +137,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 100 tool schemas and return shapes, human readable. **This is
+- `TOOL_CONTRACT.txt` : the 101 tool schemas and return shapes, human readable. **This is
   the authoritative contract.**
 - `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
   every name, description and `inputSchema` against it, serialized, so a reordered schema
@@ -204,7 +209,7 @@ The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
 
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
-- `.agent_docs/tools.md` : the 100 tool reference (families, parameters, authorization).
+- `.agent_docs/tools.md` : the 101 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, the
   `git.hosts` host map, OAuth/PAT tokens (per person+host), the remote pipeline

@@ -434,6 +434,13 @@ impl StoreManager {
         &self.relational
     }
 
+    /// The config this manager was built with, so a caller that needs to open
+    /// a project's raw meta db directly (e.g. `open_meta_db`) doesn't need its
+    /// own copy threaded through.
+    pub fn config(&self) -> &Arc<ServerConfig> {
+        &self.config
+    }
+
     /// Get (or open) the client for a project.
     pub async fn client(&self, project_id: &str) -> Result<Arc<VolumeClient>> {
         let mut guard = self.clients.lock().await;

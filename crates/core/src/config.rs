@@ -142,10 +142,19 @@ pub struct HttpConfig {
     pub host: String,
     pub port: u16,
     pub mcp_path: String,
+    /// Origin prefixed to an export download URL (`fs.export_zip`). Empty means
+    /// the URL stays relative (`/exports/{token}`), which is right whenever the
+    /// caller already knows the server it is talking to.
+    pub public_base_url: String,
 }
 impl Default for HttpConfig {
     fn default() -> Self {
-        Self { host: d_host(), port: d_port(), mcp_path: d_mcp_path() }
+        Self {
+            host: d_host(),
+            port: d_port(),
+            mcp_path: d_mcp_path(),
+            public_base_url: String::new(),
+        }
     }
 }
 
@@ -1695,5 +1704,23 @@ infra:
         assert!(c.is_admin("admin@example.com"));
         assert!(c.is_admin("ADMIN@EXAMPLE.COM"));
         assert!(!c.is_admin("someone@else.com"));
+    }
+
+    /// E2E-NEW-056: no `server.public_base_url` key at all resolves to `""`.
+    #[test]
+    fn e2e_new_056_public_base_url_defaults_to_empty() {
+        let c = ServerConfig::from_yaml("server:\n  port: 6000\n").unwrap();
+        assert_eq!(c.server.public_base_url, "");
+        assert_eq!(c.server.port, 6000);
+        assert_eq!(ServerConfig::default().server.public_base_url, "");
+    }
+
+    /// E2E-NEW-051: `server.public_base_url` goes through `${VAR}` expansion.
+    #[test]
+    fn e2e_new_051_public_base_url_expands_env() {
+        unsafe { std::env::set_var("MCPFS_PUBLIC_URL", "https://files.example.com") };
+        let c = ServerConfig::from_yaml("server:\n  public_base_url: \"${MCPFS_PUBLIC_URL}\"\n")
+            .unwrap();
+        assert_eq!(c.server.public_base_url, "https://files.example.com");
     }
 }

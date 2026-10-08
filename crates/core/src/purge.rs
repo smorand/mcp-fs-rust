@@ -164,6 +164,7 @@ async fn sweep_project_at(
 pub struct CycleSummary {
     pub files_purged: usize,
     pub projects_soft_deleted: usize,
+    pub exports_swept: usize,
 }
 
 /// Runs the FR-NEW-007 file sweep then the FR-NEW-008 project sweep for every
@@ -202,8 +203,83 @@ pub async fn run_cycle(
                 tracing::warn!(project = %project.id, error = %e, "purge cycle: project sweep failed");
             }
         }
+        match sweep_project_exports(stores, &client, &project.id).await {
+            Ok(n) => summary.exports_swept += n,
+            Err(e) => {
+                tracing::warn!(project = %project.id, error = %e, "purge cycle: export sweep failed");
+            }
+        }
     }
     Ok(summary)
+}
+
+/// Deletes every `export_links` row (and its blob) in `project_id` whose
+/// `expires_at` has already passed, per FR-NEW-014 / DEC-013: the grace
+/// period for a never-downloaded export is simply its own expiry. Returns the
+/// number of rows swept.
+///
+/// Each row commits independently, mirroring `sweep_project_files`'s per-item
+/// isolation (DEC-013): a failure deleting one row's blob is logged and the
+/// row is still deleted (the cheaper orphan to clean up next cycle is a
+/// missing blob, never an orphaned row), and a failure deleting the row
+/// itself is logged and skipped without touching any other row.
+async fn sweep_project_exports(
+    stores: &StoreManager,
+    client: &VolumeClient,
+    project_id: &str,
+) -> Result<usize> {
+    let now = crate::tools::export::iso(chrono::Utc::now());
+    let db = crate::storage::open_meta_db(stores.config(), stores.relational(), project_id).await?;
+    let rows = {
+        let mut tx = db.begin().await?;
+        let rows =
+            crate::storage::meta::select_expired_export_links(&mut *tx, project_id, &now).await?;
+        tx.commit().await?;
+        rows
+    };
+
+    let mut swept = 0usize;
+    for row in rows {
+        if let Err(e) = client.blob.delete(&format!("export:{}", row.token)).await {
+            tracing::warn!(
+                project = %project_id,
+                token_prefix = &row.token[..row.token.len().min(8)],
+                error = %e,
+                "purge cycle: export blob delete failed"
+            );
+        }
+        if delete_export_row(&db, &row.token).await {
+            swept += 1;
+        }
+    }
+    Ok(swept)
+}
+
+/// Deletes one `export_links` row unconditionally (an empty `now` matches any
+/// `expires_at` against `delete_export_link_if_live`'s `expires_at>?`
+/// predicate, the same trick `exports::reap_expired` already relies on to
+/// avoid a second delete query in `storage::meta`). Logs and returns `false`
+/// on failure rather than propagating, so this row never aborts the sweep.
+async fn delete_export_row(
+    db: &std::sync::Arc<dyn crate::storage::rel::RelationalDb>,
+    token: &str,
+) -> bool {
+    let mut tx = match db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(error = %e, "purge cycle: export row delete failed to begin transaction");
+            return false;
+        }
+    };
+    if let Err(e) = crate::storage::meta::delete_export_link_if_live(&mut *tx, token, "").await {
+        tracing::warn!(error = %e, "purge cycle: export row delete failed");
+        return false;
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(error = %e, "purge cycle: export row delete failed to commit");
+        return false;
+    }
+    true
 }
 
 /// Permanently removes every soft-deleted project whose grace period has
@@ -1207,5 +1283,155 @@ mod tests {
         async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
             self.inner.stale_files(before, exclude_root).await
         }
+    }
+
+    // ── export sweep (SPEC-0012 US-0004, FR-NEW-014) ───────────────────────────
+
+    struct ExportFix {
+        _dir: tempfile::TempDir,
+        stores: StoreManager,
+        admin: RelationalAdminStore,
+        safety: SafetyManager,
+    }
+
+    async fn export_fixture() -> ExportFix {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw_config = crate::config::ServerConfig::default();
+        raw_config.infra.meta.dir = dir.path().join("volumes").display().to_string();
+        raw_config.infra.blob.dir = dir.path().join("blobs").display().to_string();
+        let relational = Arc::new(crate::storage::RelationalRegistry::new());
+        let config = Arc::new(raw_config);
+        let stores = StoreManager::new(config, relational);
+        let admin = RelationalAdminStore::in_memory().await.unwrap();
+        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        admin.create_project("proj", "owner@t.c").await.unwrap();
+        ExportFix { _dir: dir, stores, admin, safety }
+    }
+
+    /// Inserts a live `export_links` row for `token`, with `expires_at` set to
+    /// `now + offset_secs` (negative = already expired), and its blob at
+    /// `export:{token}` carrying `bytes`.
+    async fn seed_export(f: &ExportFix, token: &str, offset_secs: f64, bytes: &[u8]) {
+        // Ensures the volume's schema (including `export_links`) exists before
+        // the raw connection below writes to it.
+        f.stores.client("proj").await.unwrap();
+        let db = crate::storage::open_meta_db(f.stores.config(), f.stores.relational(), "proj")
+            .await
+            .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::milliseconds((offset_secs * 1000.0) as i64);
+        crate::storage::meta::insert_export_link(
+            &mut *tx,
+            token,
+            "proj",
+            &crate::tools::export::iso(now),
+            &crate::tools::export::iso(expires),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let client = f.stores.client("proj").await.unwrap();
+        client.blob.put(&format!("export:{token}"), bytes).await.unwrap();
+    }
+
+    /// `0` or `1`: whether `token`'s `export_links` row still exists.
+    async fn export_row_count(f: &ExportFix, token: &str) -> usize {
+        let db = crate::storage::open_meta_db(f.stores.config(), f.stores.relational(), "proj")
+            .await
+            .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        // Far-future cutoff: every row, expired or not, has `expires_at` in
+        // the past relative to it, so this is an unconditional row count.
+        let rows = crate::storage::meta::select_expired_export_links(
+            &mut *tx,
+            "proj",
+            "9999-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        rows.iter().filter(|r| r.token == token).count()
+    }
+
+    async fn export_blob_present(f: &ExportFix, token: &str) -> bool {
+        let client = f.stores.client("proj").await.unwrap();
+        client.blob.exists(&format!("export:{token}")).await.unwrap()
+    }
+
+    /// E2E-NEW-031: happy path, the cycle returns success.
+    #[tokio::test]
+    async fn e2e_new_031_sweep_deletes_expired_never_downloaded_export() {
+        let f = export_fixture().await;
+        seed_export(&f, "T", -3600.0, b"zip bytes").await;
+        let result = run_cycle(&f.stores, &f.admin, &f.safety).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// E2E-NEW-032: the `export_links` row is gone after the sweep.
+    #[tokio::test]
+    async fn e2e_new_032_sweep_removes_the_export_link_row() {
+        let f = export_fixture().await;
+        seed_export(&f, "T", -3600.0, b"zip bytes").await;
+        assert_eq!(export_row_count(&f, "T").await, 1, "row present before the sweep");
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        assert_eq!(export_row_count(&f, "T").await, 0);
+        assert_eq!(summary.exports_swept, 1);
+    }
+
+    /// E2E-NEW-033: the export blob is gone after the sweep.
+    #[tokio::test]
+    async fn e2e_new_033_sweep_removes_the_export_blob() {
+        let f = export_fixture().await;
+        seed_export(&f, "T", -3600.0, b"zip bytes").await;
+        assert!(export_blob_present(&f, "T").await, "blob present before the sweep");
+        run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        assert!(!export_blob_present(&f, "T").await);
+    }
+
+    /// E2E-NEW-034: one row's blob already gone out-of-band must not stop the
+    /// other row's row+blob from being swept, nor abort the cycle.
+    #[tokio::test]
+    async fn e2e_new_034_a_missing_blob_on_one_row_does_not_abort_the_sweep() {
+        let f = export_fixture().await;
+        seed_export(&f, "T1", -3600.0, b"t1 bytes").await;
+        seed_export(&f, "T2", -3600.0, b"t2 bytes").await;
+        let client = f.stores.client("proj").await.unwrap();
+        client.blob.delete("export:T1").await.unwrap();
+
+        let result = run_cycle(&f.stores, &f.admin, &f.safety).await;
+        assert!(result.is_ok(), "{result:?}");
+        let summary = result.unwrap();
+        assert_eq!(summary.exports_swept, 2, "both rows removed regardless of T1's blob outcome");
+        assert_eq!(export_row_count(&f, "T1").await, 0);
+        assert_eq!(export_row_count(&f, "T2").await, 0);
+        assert!(!export_blob_present(&f, "T2").await, "T2's blob was deleted by the sweep");
+    }
+
+    /// E2E-NEW-035: an unexpired row (and its blob) is left untouched.
+    #[tokio::test]
+    async fn e2e_new_035_unexpired_rows_are_left_untouched() {
+        let f = export_fixture().await;
+        seed_export(&f, "T_expired", -3600.0, b"expired bytes").await;
+        seed_export(&f, "T_live", 4.0 * 60.0, b"live bytes").await;
+
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        assert_eq!(summary.exports_swept, 1);
+        assert_eq!(export_row_count(&f, "T_expired").await, 0);
+        assert!(!export_blob_present(&f, "T_expired").await);
+        assert_eq!(export_row_count(&f, "T_live").await, 1, "the live row must survive");
+        assert!(export_blob_present(&f, "T_live").await, "the live blob must survive");
+        let client = f.stores.client("proj").await.unwrap();
+        let bytes = client.blob.get("export:T_live", 0, None).await.unwrap();
+        assert_eq!(bytes, b"live bytes");
+    }
+
+    /// E2E-NEW-036: zero `export_links` rows is a no-op, no panic.
+    #[tokio::test]
+    async fn e2e_new_036_zero_export_links_rows_is_a_no_op() {
+        let f = export_fixture().await;
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        assert_eq!(summary.exports_swept, 0);
     }
 }

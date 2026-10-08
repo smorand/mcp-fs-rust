@@ -33,6 +33,7 @@ token as the password. A 401 body is `{"error": "ERR_UNAUTHENTICATED", "detail":
 | POST | `/api/fs/{mount_id}/upload` | multipart: file parts, field `directory` (destination, default `/`), repeated field `paths` (per file relative path), field `trigger_documentation_service` (`"true"`/`"1"`) | `{written[], count, documentation[]}` |
 | GET | `/api/fs/{mount_id}/download` | query `path` (required) | raw bytes as an attachment, MIME guessed |
 | GET | `/api/fs/{mount_id}/download-zip` | query `path` (default `/`) | subtree as a zip, entry names relative to that root |
+| POST | `/api/fs/{mount_id}/export-zip` | body `{"paths": [...]}` | `{"url"}` single use link, same function as `fs.export_zip` |
 
 `trigger_documentation_service` on the upload applies to **every** file of the
 form, and only `"true"` or `"1"` turn it on, because a form field is free text and

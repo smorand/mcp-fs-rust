@@ -307,9 +307,10 @@ mod tests {
         // `crates/core/src/mcp/server.rs::tool_router_lists_exactly_the_95_contract_names`,
         // which excludes them the same way); the frozen, non-search contract
         // this story's DT-002 means is the 95 count, not the raw catalogue
-        // size. SPEC-0011 US-0005 adds `fs.trash_restore`, bumping 99 to 100.
+        // size. SPEC-0011 US-0005 adds `fs.trash_restore` (99 to 100), SPEC-0012 US-0002
+        // adds `fs.export_zip` (100 to 101).
         let non_search = tools.keys().filter(|n| !n.starts_with("search.")).count();
-        assert_eq!(non_search, 100, "expected the full 100-tool catalogue, got {:?}", tools.keys());
+        assert_eq!(non_search, 101, "expected the full 101-tool catalogue, got {:?}", tools.keys());
         assert!(
             tools.contains_key("fs.read_bytes"),
             "fs.read_bytes must be present: {:?}",

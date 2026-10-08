@@ -135,7 +135,10 @@ pub(crate) async fn build_with_state(
         .merge(mcp_router)
         .with_state(state.clone())
         .merge(crate::deleted_projects_screen::router(state.clone()))
-        .merge(crate::trash_screen::router(state.clone()));
+        .merge(crate::trash_screen::router(state.clone()))
+        // Outside the api.enabled gate: a link minted over MCP must stay
+        // downloadable on an MCP only deployment (SPEC-0012 FR-NEW-009b).
+        .merge(crate::exports::router(state.clone()));
 
     // The REST data plane and its OpenAPI surface are opt-out via config, matching
     // the C#: with `api.enabled: false` the server is MCP only and both 404.

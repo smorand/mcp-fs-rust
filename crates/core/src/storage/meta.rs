@@ -12,7 +12,9 @@ use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{Assign, ColumnType, Dialect, Upsert};
 use crate::storage::rel::schema::{Column, Index, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
-use crate::storage::traits::{MODE_DIR, MetaBackend, NodeRow, PutFileResult, TrashEntryRow};
+use crate::storage::traits::{
+    ExportLinkRow, MODE_DIR, MetaBackend, NodeRow, PutFileResult, TrashEntryRow,
+};
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -52,6 +54,8 @@ pub const MAX_PATH_CHARS: usize = SQLSERVER_KEY_CHARS - MAX_VOLUME_ID_CHARS;
 const _: () = assert!(SQLSERVER_KEY_CHARS * 2 <= 900);
 /// A hex sha256 is 64 characters. Doubled, so a longer digest stays storable.
 const SHA_LEN: u32 = 128;
+/// A UUIDv4 string is exactly 36 characters (SPEC-0012 US-0001, FR-NEW-015).
+const EXPORT_TOKEN_LEN: u32 = 36;
 
 const SELECT_COLS: &str = "path, parent, name, kind, size, mode, mtime, ctime, atime, sha256";
 
@@ -159,6 +163,16 @@ pub fn schema() -> SchemaSet {
                     Column::new("deleted_by", ColumnType::Text),
                 ],
                 vec!["volume_id", "trash_path"],
+            ),
+            Table::new(
+                "export_links",
+                vec![
+                    Column::required("token", ColumnType::TextKey(EXPORT_TOKEN_LEN)),
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("created_at", ColumnType::Text),
+                    Column::required("expires_at", ColumnType::Text),
+                ],
+                vec!["token"],
             ),
         ],
         vec![
@@ -734,6 +748,89 @@ pub(crate) async fn list_trash_entries(
         .await?
     };
     rows.iter().map(read_trash_row).collect()
+}
+
+// ── export_links CRUD (SPEC-0012 US-0001, FR-NEW-015) ───────────────────────────
+//
+// Called by tools/export.rs (insert), exports.rs (atomic delete-and-fetch) and
+// purge.rs (sweep of expired rows).
+
+/// Every column of `export_links`, in the order the insert binds them.
+const EXPORT_LINK_COLS: [&str; 4] = ["token", "volume_id", "created_at", "expires_at"];
+
+fn read_export_link_row(r: &RowValues) -> Result<ExportLinkRow> {
+    Ok(ExportLinkRow {
+        token: r.text(0)?,
+        volume_id: r.text(1)?,
+        created_at: r.text(2)?,
+        expires_at: r.text(3)?,
+    })
+}
+
+/// Insert one pending export record (FR-NEW-007's write side).
+pub(crate) async fn insert_export_link(
+    tx: &mut dyn RelationalTx,
+    token: &str,
+    volume_id: &str,
+    created_at: &str,
+    expires_at: &str,
+) -> Result<()> {
+    tx.execute(
+        &Query::new(format!(
+            "INSERT INTO export_links ({}) VALUES (?1, ?2, ?3, ?4)",
+            EXPORT_LINK_COLS.join(", ")
+        ))
+        .bind(token)
+        .bind(volume_id)
+        .bind(created_at)
+        .bind(expires_at),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Atomically delete and report whether `token` was a live, unexpired row
+/// (FR-NEW-009/FR-NEW-010/FR-NEW-011/FR-NEW-013's shared storage primitive).
+///
+/// A single `DELETE ... WHERE token=? AND expires_at>?` followed by its
+/// affected-row count IS the whole mechanism: a replay of an already
+/// consumed token, an unknown token, and an expired-but-still-present token
+/// all return `false` with no row left behind, and two concurrent callers
+/// racing on the same token can only ever have one of them see `true`.
+pub(crate) async fn delete_export_link_if_live(
+    tx: &mut dyn RelationalTx,
+    token: &str,
+    now: &str,
+) -> Result<bool> {
+    let affected = tx
+        .execute(
+            &Query::new("DELETE FROM export_links WHERE token=?1 AND expires_at>?2")
+                .bind(token)
+                .bind(now),
+        )
+        .await?;
+    Ok(affected == 1)
+}
+
+/// Every row for `volume_id` whose `expires_at` has passed, for the sweep to
+/// iterate and delete (FR-NEW-014, later story; DEC-013's one-timestamp
+/// criterion).
+pub(crate) async fn select_expired_export_links(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    now: &str,
+) -> Result<Vec<ExportLinkRow>> {
+    let cols = EXPORT_LINK_COLS.join(", ");
+    let rows = tx
+        .query(
+            &Query::new(format!(
+                "SELECT {cols} FROM export_links WHERE volume_id=?1 AND expires_at<=?2"
+            ))
+            .bind(volume_id)
+            .bind(now),
+        )
+        .await?;
+    rows.iter().map(read_export_link_row).collect()
 }
 
 #[async_trait]
@@ -1856,6 +1953,158 @@ mod tests {
             paths,
             vec!["/.mcp_trash/456__b.txt", "/.mcp_trash/789__d.txt"],
             "newest delete first, and volume v2's row is excluded"
+        );
+
+        tx.commit().await.unwrap();
+    }
+
+    // ── export_links CRUD (SPEC-0012 US-0001, FR-NEW-015) ───────────────────────────
+
+    /// E2E-NEW-040/E2E-NEW-050's storage-layer floor: insert one row, read it
+    /// back directly, assert every column matches.
+    #[tokio::test]
+    async fn export_link_insert_round_trips_every_column() {
+        let db: Arc<dyn RelationalDb> = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        db.migrate(&schema()).await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+
+        insert_export_link(
+            &mut *tx,
+            "11111111-1111-4111-8111-111111111111",
+            "proj",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        let rows =
+            select_expired_export_links(&mut *tx, "proj", "2099-01-01T00:00:00Z").await.unwrap();
+        assert_eq!(rows.len(), 1, "the row must exist and belong to this volume");
+        let got = &rows[0];
+        assert_eq!(got.token, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(got.volume_id, "proj");
+        assert_eq!(got.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(got.expires_at, "2026-01-01T00:05:00Z");
+
+        tx.commit().await.unwrap();
+    }
+
+    /// The atomic consume primitive: success once, "not found" on replay of
+    /// the same token (FR-NEW-009/FR-NEW-010's storage-layer mechanism).
+    #[tokio::test]
+    async fn export_link_delete_if_live_succeeds_once_then_reports_not_found_on_replay() {
+        let db: Arc<dyn RelationalDb> = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        db.migrate(&schema()).await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+
+        insert_export_link(
+            &mut *tx,
+            "22222222-2222-4222-8222-222222222222",
+            "proj",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        let consumed = delete_export_link_if_live(
+            &mut *tx,
+            "22222222-2222-4222-8222-222222222222",
+            "2026-01-01T00:01:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(consumed, "a live, unexpired token must be reported as consumed");
+
+        let replay = delete_export_link_if_live(
+            &mut *tx,
+            "22222222-2222-4222-8222-222222222222",
+            "2026-01-01T00:01:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(!replay, "a second consume of the same token must report not found");
+
+        let unknown =
+            delete_export_link_if_live(&mut *tx, "not-a-real-token", "2026-01-01T00:01:00Z")
+                .await
+                .unwrap();
+        assert!(!unknown, "an unknown token must report not found, not error");
+
+        tx.commit().await.unwrap();
+    }
+
+    /// FR-NEW-011's storage-layer mechanism: a row whose `expires_at` is
+    /// already in the past must report "not found" even though it still
+    /// physically exists in the table.
+    #[tokio::test]
+    async fn export_link_delete_if_live_reports_not_found_once_expired() {
+        let db: Arc<dyn RelationalDb> = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        db.migrate(&schema()).await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+
+        insert_export_link(
+            &mut *tx,
+            "33333333-3333-4333-8333-333333333333",
+            "proj",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        let expired = delete_export_link_if_live(
+            &mut *tx,
+            "33333333-3333-4333-8333-333333333333",
+            "2026-01-01T00:10:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(!expired, "a token whose expires_at has already passed must report not found");
+
+        // The row is untouched by the failed delete: still selectable as expired.
+        let still_there =
+            select_expired_export_links(&mut *tx, "proj", "2026-01-01T00:10:00Z").await.unwrap();
+        assert_eq!(still_there.len(), 1, "the row must still physically exist");
+
+        tx.commit().await.unwrap();
+    }
+
+    /// The sweep accessor: only the row whose `expires_at` has passed comes
+    /// back, the still-live row does not (FR-NEW-014's storage-layer floor).
+    #[tokio::test]
+    async fn select_expired_export_links_returns_only_the_expired_row() {
+        let db: Arc<dyn RelationalDb> = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        db.migrate(&schema()).await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+
+        insert_export_link(
+            &mut *tx,
+            "44444444-4444-4444-8444-444444444444",
+            "proj",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:05:00Z",
+        )
+        .await
+        .unwrap();
+        insert_export_link(
+            &mut *tx,
+            "55555555-5555-4555-8555-555555555555",
+            "proj",
+            "2026-01-01T01:00:00Z",
+            "2026-01-01T01:05:00Z",
+        )
+        .await
+        .unwrap();
+
+        let expired =
+            select_expired_export_links(&mut *tx, "proj", "2026-01-01T00:30:00Z").await.unwrap();
+        let tokens: Vec<&str> = expired.iter().map(|r| r.token.as_str()).collect();
+        assert_eq!(
+            tokens,
+            vec!["44444444-4444-4444-8444-444444444444"],
+            "only the row whose expires_at has passed is returned"
         );
 
         tx.commit().await.unwrap();

@@ -6,7 +6,7 @@
 > Depth: L
 > Generated on: 2026-10-07
 > Target tier: 2 (standard frontier), resolved from default (no `--tier` flag, no `.spec.json`)
-> Total: 4 stories in 0 epics (tier 2, epics are tier 3/4 only)
+> Total: 4 stories in 0 epics (tier 2, epics are tier 3/4 only), plus 1 converge story (US-0005) appended by Phase 4.6
 
 ## Slicing Verdict
 | Verdict | SLICEABLE-WITH-EXCEPTIONS |
@@ -23,10 +23,11 @@ with the user at the Phase 3 slicing gate before generation.
 
 | Order | ID | Epic | Title | FRs | Scenarios | Tests | Files | Depends On | min_tier | Status |
 |-------|----|----|-------|-----|-----------|-------|-------|------------|----------|--------|
-| 1 | US-0001 | n/a | Foundation: `export_links` schema + storage primitives | 1 (FR-NEW-015) | — (structural) | 2 | 1 | none | 2 | todo |
-| 2 | US-0002 | n/a | Export creation: `fs.export_zip` tool + REST route + URL config | 9 (FR-NEW-001,002,003,004,005,006,007,008,016) | SC-001 | 21 | 3 | US-0001 | 1 | todo |
-| 3 | US-0003 | n/a | Signed URL download: route, atomic consume, concurrency, unconditional mount | 8 (FR-NEW-009,009b,010,011,012,013,017,018) | SC-002, SC-003, SC-004 | 30 | 3 | US-0001, US-0002 | 1 | todo |
-| 4 | US-0004 | n/a | Background purge sweep for expired exports | 1 (FR-NEW-014) | SC-005 | 6 | 1 | US-0001 | 2 | todo |
+| 1 | US-0001 | n/a | Foundation: `export_links` schema + storage primitives | 1 (FR-NEW-015) | — (structural) | 2 | 1 | none | 2 | done |
+| 2 | US-0002 | n/a | Export creation: `fs.export_zip` tool + REST route + URL config | 9 (FR-NEW-001,002,003,004,005,006,007,008,016) | SC-001 | 21 | 3 | US-0001 | 1 | done |
+| 3 | US-0003 | n/a | Signed URL download: route, atomic consume, concurrency, unconditional mount | 8 (FR-NEW-009,009b,010,011,012,013,017,018) | SC-002, SC-003, SC-004 | 30 | 3 | US-0001, US-0002 | 1 | done |
+| 4 | US-0004 | n/a | Background purge sweep for expired exports | 1 (FR-NEW-014) | SC-005 | 6 | 1 | US-0001 | 2 | done |
+| 5 | US-0005 | n/a | Converge gap: export_links multi-dialect conformance case | 1 (FR-NEW-015) | SC-001 | 1 | 1 | US-0001 | 2 | done |
 
 ## Dependency Graph
 

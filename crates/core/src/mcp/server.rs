@@ -1090,6 +1090,14 @@ pub struct TrashRestoreArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportZipArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX paths of files or directories to include; directories are walked recursively.
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExtractTextArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2058,6 +2066,22 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.trash_restore", out)
+    }
+
+    #[tool(
+        name = "fs.export_zip",
+        description = "Zip a selection of files and directories and return a single-use download URL valid for 5 minutes."
+    )]
+    async fn fs_export_zip(
+        &self,
+        Parameters(a): Parameters<ExportZipArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            crate::tools::export::export_zip(&self.state, &a.mount_id, &a.paths).await
+        }
+        .await;
+        to_call_result("fs.export_zip", out)
     }
 
     // ── document family ──────────────────────────────────────────────────────
@@ -3500,7 +3524,7 @@ mod tests {
             .filter(|n| n.starts_with("fs."))
             .collect();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37.
-        assert_eq!(names.len(), 37, "got: {names:?}");
+        assert_eq!(names.len(), 38, "got: {names:?}");
     }
 
     #[test]
@@ -3514,11 +3538,11 @@ mod tests {
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping fs_count 36->37 and
         // the total 103->104.
-        assert_eq!(fs_count, 37, "got: {names:?}");
+        assert_eq!(fs_count, 38, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 104, "got: {names:?}");
+        assert_eq!(names.len(), 105, "got: {names:?}");
     }
 
     #[test]
@@ -3850,7 +3874,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 100, "the frozen contract covers 100 non-search tools");
+        assert_eq!(checked, 101, "the frozen contract covers 101 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -3871,8 +3895,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 100, "got: {names:?}");
-        assert_eq!(expected.len(), 100, "the golden contract itself must hold 100 names");
+        assert_eq!(names.len(), 101, "got: {names:?}");
+        assert_eq!(expected.len(), 101, "the golden contract itself must hold 101 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(
@@ -4583,6 +4607,55 @@ mod tests {
         let r = server.fs_trash_list(Parameters(trash_list_args("proj-list-1"))).await;
         let text = error_text(r);
         assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+    }
+
+    /// Every file name under `dir`, recursively.
+    fn walkdir_names(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else { return out };
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                out.extend(walkdir_names(&e.path()));
+            } else {
+                out.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+        out
+    }
+
+    /// E2E-NEW-004: `fs.export_zip` by a non-member is `ERR_FORBIDDEN`, through
+    /// the production handler, and creates no blob (the stranger never reaches
+    /// path resolution).
+    #[tokio::test]
+    async fn e2e_new_004_export_zip_forbidden_for_non_member() {
+        let f = Fixture::new().await;
+        f.seed_project("proj", "owner@test.com").await;
+        let client = f.state.stores.client("proj").await.unwrap();
+        client.write_bytes_atomic("/src/main.rs", b"fn main() {}").await.unwrap();
+        let server = McpServer::new(f.state.clone(), "stranger@test.com".to_string());
+
+        let r = server
+            .fs_export_zip(Parameters(ExportZipArgs {
+                mount_id: "proj".into(),
+                paths: vec!["/src/main.rs".into()],
+            }))
+            .await;
+        let text = error_text(r);
+        assert!(text.contains(code::FORBIDDEN), "expected {}, got: {text}", code::FORBIDDEN);
+        let export_dir = std::path::Path::new(&f.state.config.infra.blob.dir);
+        let has_export = walkdir_names(export_dir).iter().any(|n| n.starts_with("export:"));
+        assert!(!has_export, "a forbidden call must not store an export blob");
+
+        let owner = McpServer::new(f.state.clone(), "owner@test.com".to_string());
+        let ok = ok_json(
+            owner
+                .fs_export_zip(Parameters(ExportZipArgs {
+                    mount_id: "proj".into(),
+                    paths: vec!["/src/main.rs".into()],
+                }))
+                .await,
+        );
+        assert!(ok["url"].as_str().unwrap().starts_with("/exports/"), "{ok}");
     }
 
     /// E2E-NEW-428: a platform admin who is not a member of the project is

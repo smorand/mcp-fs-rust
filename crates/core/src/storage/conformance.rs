@@ -26,7 +26,10 @@ use crate::git::oauth::cipher;
 use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use crate::git::oauth::store::OAuthSession;
 use crate::storage::admin::{ROLE_OWNER, RelationalAdminStore};
-use crate::storage::meta::RelationalMetaStore;
+use crate::storage::meta::{
+    RelationalMetaStore, delete_export_link_if_live, insert_export_link,
+    select_expired_export_links,
+};
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
 use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend};
 use chrono::{DateTime, Utc};
@@ -675,6 +678,79 @@ async fn oauth_legacy_table_is_rebuilt_identically(engine: &Engine, tag: &str) -
     Ok(())
 }
 
+// ── export_links case (SPEC-0012 US-0005, FR-NEW-015) ───────────────────────────
+
+/// E2E-NEW-050: the same `export_links` insert/consume/sweep behavior proven
+/// SQLite-only in `storage::meta`'s unit tests, now run against every engine.
+async fn export_links_round_trip(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let volume_id = format!("{tag}-exp");
+    let live_token = format!("{tag}-live");
+    let expired_token = format!("{tag}-expired");
+    let future_token = format!("{tag}-future");
+
+    // export_links lives in the same schema `RelationalMetaStore::open` migrates,
+    // so opening one against this volume is what gets the table into existence.
+    RelationalMetaStore::open(db.clone(), volume_id.clone()).await?;
+
+    let mut tx = db.begin().await?;
+
+    insert_export_link(
+        &mut *tx,
+        &live_token,
+        &volume_id,
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:05:00Z",
+    )
+    .await?;
+
+    // Columns round trip exactly, read back through the sweep accessor with a
+    // far-future cutoff so the still-live row is included.
+    let rows = select_expired_export_links(&mut *tx, &volume_id, "2099-01-01T00:00:00Z").await?;
+    assert_eq!(rows.len(), 1, "{who}: the inserted row is visible");
+    let got = &rows[0];
+    assert_eq!(got.token, live_token, "{who}: token round trips");
+    assert_eq!(got.volume_id, volume_id, "{who}: volume_id round trips");
+    assert_eq!(got.created_at, "2026-01-01T00:00:00Z", "{who}: created_at round trips");
+    assert_eq!(got.expires_at, "2026-01-01T00:05:00Z", "{who}: expires_at round trips");
+
+    let consumed =
+        delete_export_link_if_live(&mut *tx, &live_token, "2026-01-01T00:01:00Z").await?;
+    assert!(consumed, "{who}: a live token is consumed exactly once");
+
+    let replay = delete_export_link_if_live(&mut *tx, &live_token, "2026-01-01T00:01:00Z").await?;
+    assert!(!replay, "{who}: replaying the same token reports not found");
+
+    insert_export_link(
+        &mut *tx,
+        &expired_token,
+        &volume_id,
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:05:00Z",
+    )
+    .await?;
+    insert_export_link(
+        &mut *tx,
+        &future_token,
+        &volume_id,
+        "2026-01-01T01:00:00Z",
+        "2026-01-01T01:05:00Z",
+    )
+    .await?;
+
+    let expired = select_expired_export_links(&mut *tx, &volume_id, "2026-01-01T00:30:00Z").await?;
+    let tokens: Vec<&str> = expired.iter().map(|r| r.token.as_str()).collect();
+    assert_eq!(
+        tokens,
+        vec![expired_token.as_str()],
+        "{who}: only the row whose expires_at has passed is returned"
+    );
+
+    tx.commit().await?;
+    Ok(())
+}
+
 // ── the suite ───────────────────────────────────────────────────────────────────
 
 async fn run_suite(engine: &Engine) -> Result<()> {
@@ -692,6 +768,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     git_purge_is_scoped_to_one_volume(engine, &tag).await?;
     oauth_round_trip(engine, &tag).await?;
     oauth_legacy_table_is_rebuilt_identically(engine, &tag).await?;
+    export_links_round_trip(engine, &tag).await?;
     Ok(())
 }
 

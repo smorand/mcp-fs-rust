@@ -16,6 +16,7 @@ pub mod core;
 pub mod deleted_projects_screen;
 pub mod docs;
 pub mod errors;
+pub mod exports;
 pub mod git;
 pub mod identity;
 pub mod keys;

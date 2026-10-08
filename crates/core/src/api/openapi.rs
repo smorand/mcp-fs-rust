@@ -1012,6 +1012,14 @@ const OPERATIONS: &[Op] = &[
         body: "DocumentizeBody",
     },
     Op {
+        method: "POST",
+        sub: "export-zip",
+        path: "/api/fs/{mount_id}/export-zip",
+        tool: "fs.export_zip",
+        params: NO_PARAMS,
+        body: "ExportZipBody",
+    },
+    Op {
         method: "GET",
         sub: "find-definition",
         path: "/api/fs/{mount_id}/find-definition",
@@ -1246,6 +1254,19 @@ const SCHEMAS: &[Schema] = &[
         tool: "fs.apply_patch",
         required: &["patch_text"],
         props: &[plain("patch_text", "string")],
+    },
+    Schema {
+        name: "ExportZipBody",
+        tool: "fs.export_zip",
+        required: &["paths"],
+        props: &[Prop {
+            name: "paths",
+            ty: "array",
+            format: "",
+            default: Def::Absent,
+            items: "string",
+            nullable: false,
+        }],
     },
     Schema {
         name: "ReadManyBody",
