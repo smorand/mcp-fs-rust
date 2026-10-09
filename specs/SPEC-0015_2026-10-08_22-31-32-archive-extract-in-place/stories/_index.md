@@ -32,9 +32,9 @@ Total story count: 12 (0 epics)
 | 10 | US-0010 | n/a | Audit entry; tracing; password-never-logged | FR-NEW-025,026,027 | none | E2E-NEW-028,029,044 | `tools/archive.rs` | US-0009 | 2 | done |
 | 11 | US-0011 | n/a | REST route + OpenAPI schema | FR-NEW-029 | none | E2E-NEW-031,032,047 | `api/dataplane.rs`, `api/openapi.rs` | US-0009 | 2 | done |
 | 12 | US-0012 | n/a | `TOOL_CONTRACT.txt` + golden regeneration | FR-NEW-030 | none | E2E-NEW-033,048,061 | `TOOL_CONTRACT.txt`, `tool-contract-golden.json` (generated) | US-0011 | 2 | done |
-| 13 | US-0013 | n/a | [converge] 7z missing and wrong password tested | FR-NEW-010,011 | SC-004,SC-005 | new 7z password tests | `tools/archive.rs` | US-0012 | 2 | todo |
-| 14 | US-0014 | n/a | [converge] 7z non-regular entry rejection (FR-NEW-013 7z clause, within DEC-008) | FR-NEW-013 | SC-009 | new 7z special entry tests | `tools/archive.rs` | US-0012 | 2 | todo |
-| 15 | US-0015 | n/a | [converge] dirs_created excludes pre-existing directories | FR-NEW-023 | SC-007 | new dirs_created test | `tools/archive.rs` | US-0012 | 2 | todo |
+| 13 | US-0013 | n/a | [converge] 7z missing and wrong password tested; unwritten E2E-NEW-004,005,007,009,058 | FR-NEW-010,011 | SC-003,SC-004,SC-005 | E2E-NEW-004,005,007,009,058 + 7z password tests | `tools/archive.rs` | US-0012 | 2 | done |
+| 14 | US-0014 | n/a | [converge] 7z non-regular entry rejection (FR-NEW-013 7z clause, within DEC-008); 7z zip-slip error code | FR-NEW-013,014 | SC-008,SC-009 | new 7z special entry tests | `tools/archive.rs` | US-0012 | 2 | done |
+| 15 | US-0015 | n/a | [converge] dirs_created excludes pre-existing directories | FR-NEW-023 | SC-007 | new dirs_created test | `tools/archive.rs` | US-0012 | 2 | done |
 
 ## Dependency Graph
 
