@@ -81,7 +81,21 @@ url = "2.5"
 regex = "1"
 globset = "0.4"
 similar = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
+# Pure-Rust tar reader (SPEC-0015 US-0006): `.tar`/`.tar.gz`/`.tar.bz2`/`.tar.xz` entries.
+tar = "0.4"
+# `.tar.gz`/`.tgz` decompression. Default features pull the pure-Rust `miniz_oxide`
+# backend, so no system zlib dependency.
+flate2 = "1"
+# `.tar.bz2`/`.tb2` decompression. Default features (0.6+) use `libbz2-rs-sys`,
+# a pure-Rust port, so no system libbz2 dependency.
+bzip2 = "0.6"
+# `.tar.xz`/`.txz` decompression, pure Rust.
+lzma-rs = "0.3"
+# `.7z` decompression. `sevenz-rust2`, not `sevenz-rust` (DEC-007: the latter has
+# an unmaintained advisory and its repository was deleted). Pinned under 0.21 to
+# stay within this workspace's 1.88 MSRV (0.21+ requires a newer rustc).
+sevenz-rust2 = { version = "0.20", features = ["util", "aes256"] }
 tantivy = "0.26"
 # sqlite-vec is pre-v1: pinned exactly so an upstream breaking change cannot sneak in.
 sqlite-vec = "=0.1.9"

@@ -66,6 +66,11 @@ regex = { workspace = true }
 globset = { workspace = true }
 similar = { workspace = true }
 zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+bzip2 = { workspace = true }
+lzma-rs = { workspace = true }
+sevenz-rust2 = { workspace = true }
 
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
@@ -113,3 +118,9 @@ zerocopy = { workspace = true, optional = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = "0.30.0"
+# Test-only: fixtures in `tools::archive` build their own `.7z` files with
+# `ArchiveWriter`, which needs the `compress` feature the production path
+# never uses. Cargo unifies features for a crate across dev and normal
+# dependency edges, so this only ever grows what `cargo test` compiles, not
+# a release build without tests.
+sevenz-rust2 = { workspace = true, features = ["compress"] }
