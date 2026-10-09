@@ -147,8 +147,46 @@ pub(crate) async fn extract_archive(
         entries.iter().filter(|e| !e.is_dir).map(|e| e.declared_size as i64).sum();
     state.safety.charge_write(person, mount_id, total_declared)?;
 
-    // The write pass itself lands in US-0009.
-    Ok(json!({}))
+    // FR-NEW-021: directories first (destination root, then every directory
+    // entry, both in archive order), then files, each via `VolumeClient`
+    // primitives directly, never `core::fs_ops::write_bytes` (DEC-006).
+    //
+    // `dirs_created` (FR-NEW-023) needs to know, for each directory this
+    // pass creates, whether it already existed immediately before this
+    // call; that one `exists` probe per directory happens before the
+    // (idempotent) `makedirs` call that follows it, never twice.
+    let mut dirs_created = 0u64;
+    if !client.exists(&dest).await? {
+        dirs_created += 1;
+    }
+    client.makedirs(&dest, true).await?;
+
+    for entry in entries.iter().filter(|e| e.is_dir) {
+        let entry_dest = join_entry_destination(&dest, &entry.rel_path);
+        if !client.exists(&entry_dest).await? {
+            dirs_created += 1;
+        }
+        client.makedirs(&entry_dest, true).await?;
+    }
+
+    let mut files_written = 0u64;
+    let mut bytes_written = 0u64;
+    for entry in entries.iter().filter(|e| !e.is_dir) {
+        let entry_dest = join_entry_destination(&dest, &entry.rel_path);
+        crate::core::fs_ops::ensure_parents(&client, &entry_dest).await?;
+        client.write_bytes_atomic(&entry_dest, &entry.bytes).await?;
+        client.touch_atime_mtime(&entry_dest);
+        files_written += 1;
+        bytes_written += entry.bytes.len() as u64;
+    }
+
+    // FR-NEW-024: the response key is `destination`, never an alias.
+    Ok(json!({
+        "destination": dest,
+        "files_written": files_written,
+        "dirs_created": dirs_created,
+        "bytes_written": bytes_written,
+    }))
 }
 
 /// `dest` joined with an entry's archive-relative path, normalized. The
@@ -164,8 +202,8 @@ fn join_entry_destination(dest: &str, rel_path: &str) -> String {
 /// Open `bytes` as `format`, detect corruption, and for `zip`/`sevenz`
 /// enforce the password rules (FR-NEW-007, FR-NEW-009..012). Fully decodes
 /// every regular-file entry into memory during this one pass (FR-NEW-012),
-/// so a later story's write pass never decodes twice; the decoded bytes
-/// themselves are not needed by this story and are dropped.
+/// and keeps the decoded bytes on [`DecodedEntry`] so the write pass
+/// (US-0009) never decodes twice.
 ///
 /// DRIFT-001 (resolved): the pinned `zip` 2.4.2 crate exposes entry name,
 /// size and the `encrypted` flag without a password via
@@ -185,17 +223,20 @@ fn decode_archive(
     }
 }
 
-/// One archive entry, as needed past decode (US-0008): its archive-relative
-/// path (used to compute every entry's destination for the no-clobber scan,
-/// FR-NEW-017), whether it is a directory, and its declared uncompressed
-/// size (FR-NEW-009), summed over every regular file for the one quota
-/// charge (FR-NEW-019). Listed in archive entry order, which is what makes
-/// "first colliding path in archive order" (FR-NEW-017) well defined.
+/// One archive entry, as needed past decode (US-0008/US-0009): its
+/// archive-relative path (used to compute every entry's destination for the
+/// no-clobber scan, FR-NEW-017, and for the write pass), whether it is a
+/// directory, its declared uncompressed size (FR-NEW-009, summed over every
+/// regular file for the one quota charge, FR-NEW-019), and, for a regular
+/// file, its fully decoded bytes (empty `Vec` for a directory, never read).
+/// Listed in archive entry order, which is what makes "first colliding path
+/// in archive order" (FR-NEW-017) well defined.
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedEntry {
     pub(crate) rel_path: String,
     pub(crate) is_dir: bool,
     pub(crate) declared_size: u64,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// FR-NEW-020: an entry's decoded byte length must never exceed its
@@ -289,6 +330,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
             rel_path: raw_path,
             is_dir: file.is_dir(),
             declared_size: file.size(),
+            bytes: Vec::new(),
         });
     }
 
@@ -313,6 +355,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
             let mut buf = Vec::new();
             file.read_to_end(&mut buf).map_err(|e| corrupt("zip", e))?;
             ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
+            entries[i].bytes = buf;
             continue;
         }
         // An explicitly supplied empty string is a supplied-but-wrong
@@ -326,6 +369,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf).map_err(|e| corrupt("zip", e))?;
                 ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
+                entries[i].bytes = buf;
             }
             Err(zip::result::ZipError::InvalidPassword) => {
                 return Err(ToolError::password_required("incorrect password for this archive"));
@@ -387,17 +431,27 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
         let declared = entry.size();
         let rel_path = entry.name().to_string();
         if entry.is_directory() {
-            entries.push(DecodedEntry { rel_path, is_dir: true, declared_size: declared });
+            entries.push(DecodedEntry {
+                rel_path,
+                is_dir: true,
+                declared_size: declared,
+                bytes: Vec::new(),
+            });
             return Ok(true);
         }
         let mut buf = Vec::new();
         read.read_to_end(&mut buf)?;
         if let Err(e) = ensure_decoded_size_matches(&rel_path, declared, buf.len()) {
             size_mismatch = Some(e);
-            entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared });
+            entries.push(DecodedEntry {
+                rel_path,
+                is_dir: false,
+                declared_size: declared,
+                bytes: Vec::new(),
+            });
             return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
         }
-        entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared });
+        entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared, bytes: buf });
         Ok(true)
     });
     if let Some(e) = size_mismatch {
@@ -481,13 +535,19 @@ fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<Vec<DecodedEn
                 rel_path: raw_path,
                 is_dir: true,
                 declared_size: declared,
+                bytes: Vec::new(),
             });
             continue;
         }
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).map_err(|e| corrupt(format_name, e))?;
         ensure_decoded_size_matches(&raw_path, declared, buf.len())?;
-        entries.push(DecodedEntry { rel_path: raw_path, is_dir: false, declared_size: declared });
+        entries.push(DecodedEntry {
+            rel_path: raw_path,
+            is_dir: false,
+            declared_size: declared,
+            bytes: buf,
+        });
     }
     Ok(entries)
 }
@@ -1361,5 +1421,224 @@ mod tests {
         assert_eq!(e.code, code::INVALID_ARGUMENT);
         assert!(e.message.contains("folder/bad.bin"), "{}", e.message);
         assert!(e.message.contains("declared 5"), "{}", e.message);
+    }
+
+    // ── US-0009: write pass; result counts; response shape ───────────────
+
+    /// E2E-NEW-001: extract a `.tar.gz` with the default destination; both
+    /// files land on disk and the counts/response shape are exact.
+    #[tokio::test]
+    async fn e2e_new_001_extract_tar_gz_default_destination() {
+        let f = fixture().await;
+        let bytes = build_tar_gz(&[("a.txt", b"hello"), ("sub/b.txt", b"world")]);
+        seed_bytes(&f, "/uploads/report.tar.gz", &bytes).await;
+
+        let result = extract(&f, "/uploads/report.tar.gz").await.unwrap();
+        assert_eq!(result["destination"], "/uploads/report");
+        assert_eq!(result["files_written"], 2);
+        assert_eq!(result["dirs_created"], 1);
+        assert_eq!(result["bytes_written"], 10);
+
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/report/a.txt").await.unwrap(), b"hello");
+        assert_eq!(c.read_bytes("/uploads/report/sub/b.txt").await.unwrap(), b"world");
+    }
+
+    /// E2E-NEW-002: each of the six supported formats extracts its single
+    /// entry to disk with the default destination.
+    #[tokio::test]
+    async fn e2e_new_002_six_formats_extract_default_destination() {
+        async fn check(f: &Fixture, path: &str, bytes: Vec<u8>, expected_dir: &str) {
+            seed_bytes(f, path, &bytes).await;
+            extract(f, path).await.unwrap();
+            let c = f.state.stores.client(MOUNT).await.unwrap();
+            assert_eq!(
+                c.read_bytes(&format!("{expected_dir}/only.txt")).await.unwrap(),
+                b"x",
+                "{path}"
+            );
+        }
+
+        let f = fixture().await;
+        check(&f, "/u/f.zip", build_zip(&[("only.txt", b"x")], None), "/u/f").await;
+        check(&f, "/u2/f.7z", build_sevenz(&[("only.txt", b"x")]), "/u2/f").await;
+        check(&f, "/u3/f.tar", build_tar(&[("only.txt", b"x")]), "/u3/f").await;
+        check(&f, "/u4/f.tgz", build_tar_gz(&[("only.txt", b"x")]), "/u4/f").await;
+
+        // `.tb2` / `.txz`: reuse the tar builder, recompressed with the matching codec.
+        let plain_tar = build_tar(&[("only.txt", b"x")]);
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(&plain_tar).unwrap();
+        let bz2_bytes = encoder.finish().unwrap();
+        check(&f, "/u5/f.tb2", bz2_bytes, "/u5/f").await;
+
+        let mut xz_bytes = Vec::new();
+        lzma_rs::xz_compress(&mut Cursor::new(&plain_tar), &mut xz_bytes).unwrap();
+        check(&f, "/u6/f.txz", xz_bytes, "/u6/f").await;
+    }
+
+    /// E2E-NEW-003: an explicit `destination` overrides the stripped stem;
+    /// the would-be default never gets created.
+    #[tokio::test]
+    async fn e2e_new_003_explicit_destination_override() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("x.txt", b"y")], None);
+        seed_bytes(&f, "/uploads/report.zip", &bytes).await;
+
+        let result =
+            extract_full(&f, "/uploads/report.zip", Some("/extracted"), false).await.unwrap();
+        assert_eq!(result["destination"], "/extracted");
+
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/extracted/x.txt").await.unwrap(), b"y");
+        assert!(!c.exists("/uploads/report").await.unwrap());
+    }
+
+    /// E2E-NEW-012: a destination collision with `overwrite=true` replaces
+    /// the colliding files' content.
+    #[tokio::test]
+    async fn e2e_new_012_overwrite_true_replaces_colliding_files() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"new"), ("sub/b.txt", b"new2")], None);
+        seed_bytes(&f, "/uploads/report.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/report/a.txt", b"old").await.unwrap();
+
+        extract_full(&f, "/uploads/report.zip", None, true).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/report/a.txt").await.unwrap(), b"new");
+        assert_eq!(c.read_bytes("/uploads/report/sub/b.txt").await.unwrap(), b"new2");
+    }
+
+    /// E2E-NEW-013: `overwrite=true` against a pre-existing directory entry
+    /// reuses it rather than recreating/emptying it.
+    #[tokio::test]
+    async fn e2e_new_013_overwrite_true_reuses_pre_existing_directory() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("sub/", b""), ("sub/c.txt", b"c")], None);
+        seed_bytes(&f, "/uploads/report5.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/report5/sub", true).await.unwrap();
+        c.write_bytes_atomic("/uploads/report5/sub/other.txt", b"keep me").await.unwrap();
+
+        extract_full(&f, "/uploads/report5.zip", None, true).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/report5/sub/other.txt").await.unwrap(), b"keep me");
+        assert_eq!(c.read_bytes("/uploads/report5/sub/c.txt").await.unwrap(), b"c");
+    }
+
+    /// E2E-NEW-050: `overwrite=true` with zero actual collisions is a no-op
+    /// success, proving the flag changes nothing on a genuinely clean run.
+    #[tokio::test]
+    async fn e2e_new_050_overwrite_true_with_no_collisions_is_plain_success() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"a"), ("b.txt", b"b")], None);
+        seed_bytes(&f, "/uploads/report6.zip", &bytes).await;
+
+        extract_full(&f, "/uploads/report6.zip", None, true).await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/report6/a.txt").await.unwrap(), b"a");
+        assert_eq!(c.read_bytes("/uploads/report6/b.txt").await.unwrap(), b"b");
+    }
+
+    /// E2E-NEW-051: a destination override two levels deep, with no
+    /// intermediate directory existing beforehand; `dirs_created` counts
+    /// only the destination root, not the transitively-created parents.
+    #[tokio::test]
+    async fn e2e_new_051_nested_destination_counts_only_the_root_dir() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("x.txt", b"y")], None);
+        seed_bytes(&f, "/uploads/nested.zip", &bytes).await;
+
+        let result = extract_full(&f, "/uploads/nested.zip", Some("/a/b/c"), false).await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/a/b/c/x.txt").await.unwrap(), b"y");
+        assert!(result["dirs_created"].as_i64().unwrap() >= 1);
+    }
+
+    /// E2E-NEW-052: an AES zip with a zero-byte entry; `bytes_written == 0`,
+    /// `files_written == 1`.
+    #[tokio::test]
+    async fn e2e_new_052_aes_zip_zero_byte_entry() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("empty.txt", b"")], Some("p"));
+        seed_bytes(&f, "/uploads/zerobyte.zip", &bytes).await;
+
+        let result = extract_with_password(&f, "/uploads/zerobyte.zip", Some("p")).await.unwrap();
+        assert_eq!(result["bytes_written"], 0);
+        assert_eq!(result["files_written"], 1);
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/zerobyte/empty.txt").await.unwrap(), b"");
+    }
+
+    /// E2E-NEW-053: no pre-existing collision at all; the conflict machinery
+    /// does not misfire on the happy path.
+    #[tokio::test]
+    async fn e2e_new_053_no_collision_succeeds_with_default_overwrite() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"new"), ("sub/b.txt", b"new2")], None);
+        seed_bytes(&f, "/uploads/report7.zip", &bytes).await;
+
+        extract_full(&f, "/uploads/report7.zip", None, false).await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/report7/a.txt").await.unwrap(), b"new");
+        assert_eq!(c.read_bytes("/uploads/report7/sub/b.txt").await.unwrap(), b"new2");
+    }
+
+    /// E2E-NEW-054: a benign `.tar` with no escaping entries writes normally.
+    #[tokio::test]
+    async fn e2e_new_054_benign_tar_writes_normally() {
+        let f = fixture().await;
+        let bytes = build_tar(&[("good.txt", b"benign")]);
+        seed_bytes(&f, "/uploads/benign.tar", &bytes).await;
+
+        extract(&f, "/uploads/benign.tar").await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/benign/good.txt").await.unwrap(), b"benign");
+    }
+
+    /// E2E-NEW-055: a benign `.tar` with no symlink entries writes normally.
+    #[tokio::test]
+    async fn e2e_new_055_tar_with_only_regular_files_writes_normally() {
+        let f = fixture().await;
+        let bytes = build_tar(&[("good.txt", b"benign")]);
+        seed_bytes(&f, "/uploads/benign2.tar", &bytes).await;
+
+        extract(&f, "/uploads/benign2.tar").await.unwrap();
+    }
+
+    /// E2E-NEW-056: an uppercase `.ZIP` extension is matched case
+    /// insensitively end to end, including the write pass.
+    #[tokio::test]
+    async fn e2e_new_056_uppercase_zip_extension_writes_normally() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("x.txt", b"y")], None);
+        seed_bytes(&f, "/uploads/REPORT.ZIP", &bytes).await;
+
+        extract(&f, "/uploads/REPORT.ZIP").await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/REPORT/x.txt").await.unwrap(), b"y");
+    }
+
+    /// E2E-NEW-027 (structural): `tools::archive` reuses
+    /// `core::fs_ops::ensure_parents` rather than re-implementing a
+    /// parent-directory walk loop.
+    #[test]
+    fn e2e_new_027_archive_reuses_ensure_parents_no_duplicate_loop() {
+        let source = std::fs::read_to_string("src/tools/archive.rs").unwrap();
+        assert!(
+            source.contains("fs_ops::ensure_parents"),
+            "must call core::fs_ops::ensure_parents, not reimplement it"
+        );
+        let needle = concat!("rfind", "('/')");
+        for line in source.lines() {
+            // Excludes this very assertion's own source line, which
+            // necessarily names both substrings to describe what it forbids.
+            if line.contains("must not re-implement") {
+                continue;
+            }
+            assert!(
+                !(line.contains(needle) && line.contains("makedirs")),
+                "must not re-implement a parent-directory-walk loop: {line}"
+            );
+        }
     }
 }
