@@ -31,7 +31,7 @@ Total story count: 12 (0 epics)
 | 9 | US-0009 | n/a | Write pass; result counts; response shape | FR-NEW-021,022,023,024 | SC-001,SC-002,SC-003,SC-004,SC-005,SC-006,SC-007,SC-008,SC-009,SC-011 | E2E-NEW-001,002,003,004,005,007,009,012,013,027,050,051,052,053,054,055,056 | `tools/archive.rs`, `core/fs_ops.rs` | US-0008 | 2 | done |
 | 10 | US-0010 | n/a | Audit entry; tracing; password-never-logged | FR-NEW-025,026,027 | none | E2E-NEW-028,029,044 | `tools/archive.rs` | US-0009 | 2 | done |
 | 11 | US-0011 | n/a | REST route + OpenAPI schema | FR-NEW-029 | none | E2E-NEW-031,032,047 | `api/dataplane.rs`, `api/openapi.rs` | US-0009 | 2 | done |
-| 12 | US-0012 | n/a | `TOOL_CONTRACT.txt` + golden regeneration | FR-NEW-030 | none | E2E-NEW-033,048,061 | `TOOL_CONTRACT.txt`, `tool-contract-golden.json` (generated) | US-0011 | 2 | todo |
+| 12 | US-0012 | n/a | `TOOL_CONTRACT.txt` + golden regeneration | FR-NEW-030 | none | E2E-NEW-033,048,061 | `TOOL_CONTRACT.txt`, `tool-contract-golden.json` (generated) | US-0011 | 2 | done |
 
 ## Dependency Graph
 
