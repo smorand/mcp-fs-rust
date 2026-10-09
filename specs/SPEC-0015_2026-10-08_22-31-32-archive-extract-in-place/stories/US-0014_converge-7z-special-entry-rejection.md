@@ -15,3 +15,8 @@ entry carries the unix extension flag (attributes & 0x8000) and its POSIX mode
 with `ERR_NOT_SUPPORTED` naming the entry and its type, nothing written. Test with a fixture whose
 entry is marked symlink (0xA000) next to a benign entry; a 7z entry without the unix flag is still
 extracted as a regular file.
+
+Orchestrator finding on the same code path: decode_sevenz maps an `ensure_entry_path_safe` error
+into `sevenz_rust2::Error::Other`, which then falls to `corrupt("7z", ..)`, so a 7z zip-slip entry
+is reported ERR_INVALID_ARGUMENT instead of ERR_PATH_OUT_OF_BOUNDS (FR-NEW-014). Carry entry level
+ToolErrors through a side channel and test a 7z `../../etc/passwd` entry.

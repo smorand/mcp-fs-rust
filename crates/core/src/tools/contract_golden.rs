@@ -12,7 +12,7 @@
 //! wrong. Regenerate deliberately with:
 //!
 //! ```text
-//! MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
+//! MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
 //! ```
 
 use crate::tools::registry_support::ToolRegistry;
@@ -31,7 +31,7 @@ visible contract change, so this file is never hand edited: regenerate it delibe
 command below and review the diff.";
 
 const REGENERATE: &str =
-    "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current";
+    "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current";
 
 /// The frozen tools, or `None` when the file is absent.
 pub(crate) fn frozen_tools() -> Option<Vec<Value>> {

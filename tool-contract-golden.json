@@ -1,6 +1,6 @@
 {
   "_note": "Frozen MCP tool contract: the 100 tool names, descriptions and inputSchema values this server must keep serving. Changing a name, a description or a schema here is a client visible contract change, so this file is never hand edited: regenerate it deliberately with the command below and review the diff.",
-  "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current",
+  "_regenerate": "MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current",
   "tools": [
     {
       "name": "admin.add_member",

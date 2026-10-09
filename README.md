@@ -234,6 +234,27 @@ the response carries `documentation.error`, and `fs.documentize` retries. Conver
 synchronous and slow (tens of seconds for a small PDF, minutes for a video), so set your
 client's read timeout accordingly.
 
+## Extracting archives in place
+
+`fs.extract_archive` (and `POST /api/fs/{mount_id}/extract-archive`) unpacks an archive that
+is already stored in the project, with no download and re upload through the client:
+
+```bash
+# MCP: extract /uploads/report.tar.gz into /uploads/report
+{"name": "fs.extract_archive", "arguments": {"mount_id": "proj", "path": "/uploads/report.tar.gz"}}
+# -> {"destination": "/uploads/report", "files_written": 2, "dirs_created": 1, "bytes_written": 10}
+```
+
+Formats, by extension: `.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`,
+`.tar.xz`/`.txz`, all decoded in pure Rust. `destination` defaults to the archive path minus
+its suffix; `overwrite` defaults to `false`. **Passwords are a plain retry**: an encrypted zip
+or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQUIRED` (HTTP
+428) and the caller sends the same call again with `password`; nothing is stored between
+calls and the password is never logged. **All or nothing**: the whole archive is decoded and
+checked before the first write, so a symlink or device entry, an entry escaping the
+destination (zip slip), a collision without `overwrite`, or a declared total above the write
+quota rejects the call with nothing written.
+
 ## Security model
 
 - **Authentication**: RS256 JWT, signature, issuer and expiry verified (30s clock skew,
@@ -335,7 +356,7 @@ run, serialized form included, which means even a reordered schema key fails the
 Changing the contract is deliberate, never a hand edit:
 
 ```bash
-MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
 ```
 
 Then review the diff: a description edit is one line, and 57 changed tools means something
@@ -346,9 +367,9 @@ went wrong.
 Stated on their own terms; the full record is in
 [`.agent_docs/lineage.md`](.agent_docs/lineage.md), and each is documented at its call site.
 
-**Errors are usable.** Every failure carries one of the 14 `ERR_*` codes, and the REST
+**Errors are usable.** Every failure carries one of the 15 `ERR_*` codes, and the REST
 status suggests a remedy rather than a generic 400: a missing file is 404, a spent quota
-429, a missing read before write 428, a duplicate project 409, an unsupported extraction
+429, a missing read before write or a missing archive password 428, a duplicate project 409, an unsupported extraction
 format 501, and an edit that matched nothing or matched ambiguously 422.
 
 **A real `git clone` and `git push` work.** Smart HTTP is unforgiving: `upload-pack`
@@ -381,7 +402,8 @@ identical stored bytes.
 
 Audio and video extraction (needs a speech model) and legacy binary Office formats
 (`.doc`, `.xls`, `.ppt`). `object_format: sha256` is accepted and ignored: the bundled
-libgit2 is sha1 only.
+libgit2 is sha1 only. RAR archives are not extracted (no pure Rust decoder; out of scope
+by decision), nor multi volume archives (`.7z.001`, `.zip.001`).
 
 On the relational side: there is no online migration (`mcp-fs migrate` is offline, run with
 the server stopped) and no automated downgrade, since a database written by the current

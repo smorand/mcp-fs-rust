@@ -51,7 +51,7 @@ mcp-fs migrate --from a.yaml --to b.yaml  offline copy of relational state betwe
 mcp-fs purge [--project <id> [--on-demand]]  run the auto-purge sweep once; no --project runs
                                       every configured project plus the grace-period removal
 docker compose -f docker-compose.test.yml up -d  postgres + mssql for the opt-in suites
-MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs --lib tool_contract_golden_is_current
+MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
 ./agent.sh --user <name>              interactive CLI agent; starts/stops the server if needed
@@ -85,7 +85,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (`web`/`context7`/`sqlite`/`db`/`doc`) production `catalog()` read by `/api/swagger.json`.
 - `config.rs` : full `ServerConfig` + `${VAR}` expansion + `Dsn` (redacts in Debug and
   Display) + boot validation of every `infra.*` store.
-- `errors.rs` : the 14 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
+- `errors.rs` : the 15 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
   flag for transient database failures (no new code).
 - `migrate.rs` : the `migrate` verb, offline row for row copy between backends.
 - `identity.rs` : RS256 verification, 30s clock skew, forwarded header then `Authorization`.
@@ -112,6 +112,10 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `trash_entries`, paginated listing, and restore-with-rename-on-collision. `export.rs` holds
   `fs.export_zip` (SPEC-0012), also served by `POST /api/fs/{mount_id}/export-zip`: zip a
   selection into blob key `export:{token}` plus an `export_links` row, return the URL.
+  `archive.rs` holds `fs.extract_archive` (SPEC-0015), also served by `POST
+  /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
+  type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
+  password retry via `ERR_PASSWORD_REQUIRED`.
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
 - `exports.rs` : `GET /exports/{token}` (SPEC-0012), mounted unconditionally (outside `api.enabled`),
   no auth: the token is the credential. Atomic single use via `meta::delete_export_link_if_live`

@@ -13,3 +13,10 @@ AES-encrypted 7z fixture (built with sevenz-rust2 in the test): no password give
 `ERR_PASSWORD_REQUIRED` "password required to extract this archive"; a wrong password gives
 `ERR_PASSWORD_REQUIRED` "incorrect password for this archive"; nothing is written in either case.
 Fix the code if either test is red.
+
+Orchestrator check (mechanical grep of all 61 spec test ids) also found these spec tests never
+written, all in the password flow, so they belong here: E2E-NEW-004 (AES 7z, correct password,
+extracts), E2E-NEW-005 (AES and legacy ZipCrypto zip, correct password, extract), E2E-NEW-007
+(retry after a missing password, now supplied, succeeds), E2E-NEW-009 (retry after a wrong
+password, now correct, succeeds), E2E-NEW-058 (`password: ""` against an encrypted zip is
+"incorrect password", not "password required").
