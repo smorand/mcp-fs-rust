@@ -3565,8 +3565,9 @@ mod tests {
             .map(|t| t.name.to_string())
             .filter(|n| n.starts_with("fs."))
             .collect();
-        // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37.
-        assert_eq!(names.len(), 38, "got: {names:?}");
+        // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37; SPEC-0015 adds
+        // fs.extract_archive, 38 to 39.
+        assert_eq!(names.len(), 39, "got: {names:?}");
     }
 
     #[test]
@@ -3580,11 +3581,12 @@ mod tests {
         let git_count = names.iter().filter(|n| n.starts_with("git.")).count();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping fs_count 36->37 and
         // the total 103->104.
-        assert_eq!(fs_count, 38, "got: {names:?}");
+        // SPEC-0015 adds fs.extract_archive: fs 39, total 106.
+        assert_eq!(fs_count, 39, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 105, "got: {names:?}");
+        assert_eq!(names.len(), 106, "got: {names:?}");
     }
 
     #[test]
@@ -3916,7 +3918,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 101, "the frozen contract covers 101 non-search tools");
+        assert_eq!(checked, 102, "the frozen contract covers 102 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -3937,8 +3939,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 101, "got: {names:?}");
-        assert_eq!(expected.len(), 101, "the golden contract itself must hold 101 names");
+        assert_eq!(names.len(), 102, "got: {names:?}");
+        assert_eq!(expected.len(), 102, "the golden contract itself must hold 102 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

@@ -65,6 +65,46 @@ pub(crate) fn detect_format(path: &str) -> Result<(ArchiveFormat, usize)> {
         })
 }
 
+/// Test-dispatch glue for `fs.extract_archive`, mirroring the production
+/// handler (`McpServer::fs_extract_archive`) so the golden contract sees the
+/// same schema. Hints follow `fs.write_bytes`, the closest analogue: it writes
+/// files and can replace them when `overwrite` is set.
+#[cfg(test)]
+pub(crate) fn register(reg: &mut crate::tools::registry_support::ToolRegistry) {
+    use crate::tools::registry_support::{ToolSchema, handler};
+    reg.add(
+        ToolSchema::new(
+            "fs.extract_archive",
+            "Extract an archive file in place inside the volume.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("path", "Absolute POSIX path of the archive file to extract.")
+        .opt_str_null("destination", "Destination directory for the extracted entries.")
+        .opt_bool("overwrite", false, "Overwrite existing files at the destination.")
+        .opt_str_null("password", "Password for an encrypted archive.")
+        .read_only(false)
+        .destructive(true)
+        .idempotent(false)
+        .open_world(false),
+        handler(|ctx, a| async move {
+            let mount = crate::tools::authorize_only(&ctx, &a).await?;
+            let path = a.str("path")?;
+            let destination = a.opt_str("destination");
+            let password = a.opt_str("password");
+            extract_archive(
+                &ctx.state,
+                &mount,
+                &ctx.person,
+                &path,
+                destination.as_deref(),
+                a.bool_or("overwrite", false),
+                password.as_deref(),
+            )
+            .await
+        }),
+    );
+}
+
 /// `fs.extract_archive(mount_id, path, destination?, overwrite?, password?)`
 /// (FR-NEW-001..004, FR-NEW-016..020). The caller has already authorized
 /// `mount_id` (FR-NEW-002 runs strictly before this, exactly as
@@ -1810,5 +1850,42 @@ mod tests {
                 "must not re-implement a parent-directory-walk loop: {line}"
             );
         }
+    }
+
+    /// E2E-NEW-033: the human contract lists the tool with its exact schema
+    /// line, hints and return shape.
+    #[test]
+    fn e2e_new_033_tool_contract_txt_lists_extract_archive() {
+        let txt = include_str!("../../../../TOOL_CONTRACT.txt");
+        assert!(txt.contains(
+            "fs.extract_archive\n  desc: Extract an archive file in place inside the volume.\n  \
+             params: mount_id:string, path:string, destination:string=null, overwrite:boolean=false, \
+             password:string=null\n  required: ['mount_id', 'path']\n  annotations: \
+             destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false\n"
+        ));
+        assert!(txt.contains("fs.extract_archive: {\"destination\": \"/uploads/report\""));
+    }
+
+    /// E2E-NEW-048: the machine checked twin carries the same tool, required
+    /// fields `mount_id` and `path` only.
+    #[test]
+    fn e2e_new_048_golden_json_includes_extract_archive() {
+        let tools = crate::tools::contract_golden::frozen_tools().expect("golden present");
+        let t = tools.iter().find(|t| t["name"] == "fs.extract_archive").expect("listed");
+        assert_eq!(t["inputSchema"]["required"], json!(["mount_id", "path"]));
+        assert_eq!(t["annotations"]["destructiveHint"], true);
+    }
+
+    /// E2E-NEW-061: the live router serves the tool, and the frozen fs
+    /// family count moved by exactly one (38 to 39).
+    #[test]
+    fn e2e_new_061_router_serves_extract_archive_and_fs_count_is_39() {
+        let names: Vec<String> = crate::mcp::server::McpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "fs.extract_archive"));
+        assert_eq!(names.iter().filter(|n| n.starts_with("fs.")).count(), 39);
     }
 }

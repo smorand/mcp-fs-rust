@@ -1,4 +1,4 @@
-# Tool reference (101 tools)
+# Tool reference (102 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -143,6 +143,27 @@ is buffered in memory (no size limit, like `download-zip`), stored at blob key
 `export:{token}` with an `export_links` row expiring 300 s later. `url` is
 `{server.public_base_url}/exports/{token}`, relative when that key is empty.
 The full token is never logged, only its first 8 characters.
+
+## fs archive (1)
+
+| Tool | Purpose | Params | Returns | Annotations | Who |
+|---|---|---|---|---|---|
+| `fs.extract_archive` | extract a stored archive in place | `path`, `destination?`, `overwrite=false`, `password?` | `destination,files_written,dirs_created,bytes_written` | D,!RO,!I,!OW | member |
+
+(2026-10-09, SPEC-0015.) Formats by extension, case insensitive: `.zip`, `.7z`,
+`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`; anything else
+(including `.rar`) is `ERR_NOT_SUPPORTED`. Default destination: the archive
+path minus its suffix. Stateless password retry: an encrypted zip or 7z with no
+or a wrong `password` is `ERR_PASSWORD_REQUIRED` (HTTP 428), the caller just
+retries with it; a password on a tar family archive is `ERR_INVALID_ARGUMENT`.
+All or nothing: one pre scan decodes everything in memory and rejects the whole
+call, before any write, on a symlink/hardlink/device entry (`ERR_NOT_SUPPORTED`),
+an entry escaping the destination (`ERR_PATH_OUT_OF_BOUNDS`), a collision with
+`overwrite=false` (`ERR_NO_CLOBBER`, first collision in archive order), a
+decoded size above the declared one (`ERR_INVALID_ARGUMENT`), or the declared
+total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
+untouched on failure). The password is never logged. REST twin: `POST
+/api/fs/{mount_id}/extract-archive`.
 
 ## fs document (3)
 

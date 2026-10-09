@@ -711,6 +711,48 @@
       }
     },
     {
+      "name": "fs.extract_archive",
+      "description": "Extract an archive file in place inside the volume.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path of the archive file to extract.",
+            "type": "string"
+          },
+          "destination": {
+            "description": "Destination directory for the extracted entries.",
+            "type": "string",
+            "default": null
+          },
+          "overwrite": {
+            "description": "Overwrite existing files at the destination.",
+            "type": "boolean",
+            "default": false
+          },
+          "password": {
+            "description": "Password for an encrypted archive.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id",
+          "path"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "fs.extract_text",
       "description": "Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it if already up to date. Returns md_path + a preview; read the .md with fs.read for the full content. Handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR via a configured multimodal provider) and text; audio/video unsupported.",
       "inputSchema": {
