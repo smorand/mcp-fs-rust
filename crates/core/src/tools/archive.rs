@@ -2232,4 +2232,21 @@ mod tests {
         assert_eq!(r["dirs_created"], 1, "{r}");
         assert_eq!(r["files_written"], 2, "{r}");
     }
+
+    /// E2E-NEW-057: repeating the failing call is stable. The retry is
+    /// stateless, so the second failure equals the first and neither writes.
+    #[tokio::test]
+    async fn e2e_new_057_repeated_password_failure_is_identical() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("s.txt", b"x")], Some("pwz"));
+        seed_bytes(&f, "/uploads/twice.zip", &bytes).await;
+        for password in [None, Some("bad")] {
+            let first =
+                extract_with_password(&f, "/uploads/twice.zip", password).await.unwrap_err();
+            let second =
+                extract_with_password(&f, "/uploads/twice.zip", password).await.unwrap_err();
+            assert_eq!((first.code, first.message), (second.code, second.message));
+            assert!(!exists(&f, "/uploads/twice").await);
+        }
+    }
 }
