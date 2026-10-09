@@ -2114,6 +2114,7 @@ impl McpServer {
             crate::tools::archive::extract_archive(
                 &self.state,
                 &a.mount_id,
+                &self.person,
                 &a.path,
                 a.destination.as_deref(),
                 a.overwrite,

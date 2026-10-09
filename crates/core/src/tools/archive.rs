@@ -13,6 +13,7 @@
 
 use crate::errors::{Result, ToolError};
 use crate::state::AppState;
+use crate::util::PosixPath;
 use serde_json::{Value, json};
 use std::io::{Cursor, Read as _};
 
@@ -65,17 +66,22 @@ pub(crate) fn detect_format(path: &str) -> Result<(ArchiveFormat, usize)> {
 }
 
 /// `fs.extract_archive(mount_id, path, destination?, overwrite?, password?)`
-/// (FR-NEW-001..004). The caller has already authorized `mount_id`
-/// (FR-NEW-002 runs strictly before this, exactly as `export_zip` assumes).
+/// (FR-NEW-001..004, FR-NEW-016..020). The caller has already authorized
+/// `mount_id` (FR-NEW-002 runs strictly before this, exactly as
+/// `export_zip` assumes); `person` is the identity `charge_write` keys the
+/// per-session quota counter on.
 ///
-/// Time: O(1) node lookups in this story (format detection and the actual
-/// extraction walk are deferred to later stories). Space: O(1).
+/// Time: O(n) over the archive's entry list for the conflict scan (one
+/// `exists` probe per entry) plus the O(1) quota charge; decode is the
+/// dominant cost and is already paid in the prior story. Space: O(n) for the
+/// decoded entry list, no entry bytes retained past decode.
 pub(crate) async fn extract_archive(
     state: &AppState,
     mount_id: &str,
+    person: &str,
     path: &str,
-    _destination: Option<&str>,
-    _overwrite: bool,
+    destination: Option<&str>,
+    overwrite: bool,
     password: Option<&str>,
 ) -> Result<Value> {
     let normalized = state.safety.normalize_path(path)?;
@@ -95,7 +101,7 @@ pub(crate) async fn extract_archive(
     // Decided on the name alone: a tar stream carries no encryption, so a
     // password there is a caller mistake, refused before any byte is read
     // (FR-NEW-008).
-    let (format, _suffix_len) = detect_format(&normalized)?;
+    let (format, suffix_len) = detect_format(&normalized)?;
     if matches!(format, ArchiveFormat::Tar(_)) && password.is_some() {
         return Err(ToolError::invalid_argument(
             "password is not applicable to this archive format",
@@ -107,13 +113,52 @@ pub(crate) async fn extract_archive(
     // guidance on `spawn_blocking`).
     let bytes = client.read_bytes(&normalized).await?;
     let owned_password = password.map(ToOwned::to_owned);
-    tokio::task::spawn_blocking(move || decode_archive(format, &bytes, owned_password.as_deref()))
-        .await
-        .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??;
+    let entries = tokio::task::spawn_blocking(move || {
+        decode_archive(format, &bytes, owned_password.as_deref())
+    })
+    .await
+    .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??;
 
-    // Entry safety, destination computation and the write pass land in
-    // US-0007..US-0009.
+    // FR-NEW-016: caller-supplied destination normalized exactly like any
+    // other `fs.*` destination parameter; otherwise the archive's own path
+    // with its matched extension stripped, preserving the stem's case.
+    let dest = match destination {
+        Some(d) => state.safety.normalize_path(d)?,
+        None => normalized[..normalized.len() - suffix_len].to_string(),
+    };
+
+    // FR-NEW-017/018: no-clobber scan in archive entry order, before any
+    // write; `overwrite=true` bypasses this entirely (DEC-004).
+    if !overwrite {
+        for entry in &entries {
+            let entry_dest = join_entry_destination(&dest, &entry.rel_path);
+            if client.exists(&entry_dest).await? {
+                return Err(ToolError::no_clobber(format!(
+                    "'{entry_dest}' already exists; pass overwrite=true to replace it"
+                )));
+            }
+        }
+    }
+
+    // FR-NEW-019: one charge for the archive's total declared uncompressed
+    // size, after the conflict check, before any write (DEC-005). A failed
+    // charge is `charge_write`'s own fail-closed behavior: nothing mutated.
+    let total_declared: i64 =
+        entries.iter().filter(|e| !e.is_dir).map(|e| e.declared_size as i64).sum();
+    state.safety.charge_write(person, mount_id, total_declared)?;
+
+    // The write pass itself lands in US-0009.
     Ok(json!({}))
+}
+
+/// `dest` joined with an entry's archive-relative path, normalized. The
+/// entry path has already passed `ensure_entry_path_safe` during decode, so
+/// this join can never climb above `dest`; it still runs through
+/// `PosixPath::normpath` to collapse `.`/`..` the same way every other
+/// in-volume path is collapsed.
+fn join_entry_destination(dest: &str, rel_path: &str) -> String {
+    let joined = format!("{}/{}", dest.trim_end_matches('/'), rel_path.trim_start_matches('/'));
+    PosixPath::normpath(&joined)
 }
 
 /// Open `bytes` as `format`, detect corruption, and for `zip`/`sevenz`
@@ -128,12 +173,43 @@ pub(crate) async fn extract_archive(
 /// `ZipFileData::encrypted` (`zip-2.4.2/src/types.rs:440`); only decoding an
 /// encrypted entry's bytes needs the password. `FR-NEW-009` holds as
 /// written; no new requirement was needed.
-fn decode_archive(format: ArchiveFormat, bytes: &[u8], password: Option<&str>) -> Result<()> {
+fn decode_archive(
+    format: ArchiveFormat,
+    bytes: &[u8],
+    password: Option<&str>,
+) -> Result<Vec<DecodedEntry>> {
     match format {
         ArchiveFormat::Zip => decode_zip(bytes, password),
         ArchiveFormat::SevenZ => decode_sevenz(bytes, password),
         ArchiveFormat::Tar(compression) => decode_tar(compression, bytes),
     }
+}
+
+/// One archive entry, as needed past decode (US-0008): its archive-relative
+/// path (used to compute every entry's destination for the no-clobber scan,
+/// FR-NEW-017), whether it is a directory, and its declared uncompressed
+/// size (FR-NEW-009), summed over every regular file for the one quota
+/// charge (FR-NEW-019). Listed in archive entry order, which is what makes
+/// "first colliding path in archive order" (FR-NEW-017) well defined.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedEntry {
+    pub(crate) rel_path: String,
+    pub(crate) is_dir: bool,
+    pub(crate) declared_size: u64,
+}
+
+/// FR-NEW-020: an entry's decoded byte length must never exceed its
+/// declared uncompressed size, independently of the quota charge (DEC-010):
+/// a declared-size lie is a distinct amplification vector from a merely
+/// large, honestly declared archive.
+fn ensure_decoded_size_matches(rel_path: &str, declared: u64, actual: usize) -> Result<()> {
+    let actual = actual as u64;
+    if actual > declared {
+        return Err(ToolError::invalid_argument(format!(
+            "archive entry '{rel_path}' decompressed to {actual} bytes but declared {declared}"
+        )));
+    }
+    Ok(())
 }
 
 fn corrupt(format_name: &str, detail: impl std::fmt::Display) -> ToolError {
@@ -187,13 +263,16 @@ fn ensure_entry_path_safe(raw: &str) -> Result<()> {
 /// `external_attributes >> 16` for `System::Unix`). The native method is
 /// used directly per US-0002's resolution note, rather than re-deriving the
 /// `S_IFLNK` bit-mask by hand.
-fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
+fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| corrupt("zip", e))?;
 
     // FR-NEW-013/014/015: every entry is checked for type and path safety
     // before any entry is decoded, so a disqualifying entry anywhere in the
-    // archive voids the whole call before a single byte is read.
+    // archive voids the whole call before a single byte is read. Also
+    // collects the entry list (US-0008): declared size and directory-ness
+    // are both already known from the raw metadata, with no password.
     let mut any_encrypted = false;
+    let mut entries = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let file = archive.by_index_raw(i).map_err(|e| corrupt("zip", e))?;
         let raw_path = file.name().to_string();
@@ -206,14 +285,23 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
         if file.encrypted() {
             any_encrypted = true;
         }
+        entries.push(DecodedEntry {
+            rel_path: raw_path,
+            is_dir: file.is_dir(),
+            declared_size: file.size(),
+        });
     }
 
     if any_encrypted && password.is_none() {
         return Err(ToolError::password_required("password required to extract this archive"));
     }
 
+    // Indexed, not iterator-driven: `by_index`/`by_index_decrypt` need the
+    // numeric index itself, not just `entries[i]`.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..archive.len() {
         let encrypted = archive.by_index_raw(i).map_err(|e| corrupt("zip", e))?.encrypted();
+        let declared = entries[i].declared_size;
         if !encrypted {
             // Still fully decoded, per FR-NEW-012: a non-encrypted entry can
             // still be corrupt (bad deflate stream) independently of any
@@ -224,6 +312,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
             }
             let mut buf = Vec::new();
             file.read_to_end(&mut buf).map_err(|e| corrupt("zip", e))?;
+            ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
             continue;
         }
         // An explicitly supplied empty string is a supplied-but-wrong
@@ -236,6 +325,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
                 }
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf).map_err(|e| corrupt("zip", e))?;
+                ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
             }
             Err(zip::result::ZipError::InvalidPassword) => {
                 return Err(ToolError::password_required("incorrect password for this archive"));
@@ -243,7 +333,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
             Err(e) => return Err(corrupt("zip", e)),
         }
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// `sevenz`: `sevenz_rust2::Archive::read` fails outright
@@ -253,7 +343,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
 /// treated as a listing step (per US-0001's resolution). Otherwise entries
 /// are listed from the parsed header with no password, and any AES256
 /// content coder gates the same password rules before a full decode.
-fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<()> {
+fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>> {
     use sevenz_rust2::{ArchiveReader, Password};
 
     let probe_password = password.map(Password::from).unwrap_or_else(Password::empty);
@@ -281,19 +371,40 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<()> {
     // implemented symlink representation, so any entry this branch cannot
     // positively identify as a symlink is written as an ordinary regular
     // file (a safe default, since the path check still applies to it).
+    //
+    // `size_mismatch` is a side channel for FR-NEW-020 (US-0008): the
+    // closure's error type is `sevenz_rust2::Error`, which cannot carry a
+    // `ToolError` through `for_each_entries`'s `?`, so a size mismatch is
+    // recorded here and checked first after the call returns, ahead of the
+    // generic password-required/corrupt fallback below (which would
+    // otherwise misreport it).
+    let mut entries = Vec::new();
+    let mut size_mismatch: Option<ToolError> = None;
     let mut reader = ArchiveReader::from_archive(archive, Cursor::new(bytes), probe_password);
     let decode_result = reader.for_each_entries(|entry, read| {
         ensure_entry_path_safe(entry.name())
             .map_err(|e| sevenz_rust2::Error::Other(e.to_string().into()))?;
+        let declared = entry.size();
+        let rel_path = entry.name().to_string();
         if entry.is_directory() {
+            entries.push(DecodedEntry { rel_path, is_dir: true, declared_size: declared });
             return Ok(true);
         }
         let mut buf = Vec::new();
         read.read_to_end(&mut buf)?;
+        if let Err(e) = ensure_decoded_size_matches(&rel_path, declared, buf.len()) {
+            size_mismatch = Some(e);
+            entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared });
+            return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
+        }
+        entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared });
         Ok(true)
     });
+    if let Some(e) = size_mismatch {
+        return Err(e);
+    }
     match decode_result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(entries),
         Err(_) if header_encrypted => Err(password_required_message(password)),
         Err(e) => Err(corrupt("7z", e)),
     }
@@ -315,7 +426,7 @@ fn password_required_message(password: Option<&str>) -> ToolError {
 /// themselves (the password gate above already refused any `password` for
 /// these), so this step is pure corruption detection plus the full decode
 /// `FR-NEW-012` mandates.
-fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<()> {
+fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<Vec<DecodedEntry>> {
     let format_name = match compression {
         TarCompression::None => "tar",
         TarCompression::Gzip => "tar.gz",
@@ -347,8 +458,9 @@ fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<()> {
     };
 
     let mut tar = tar::Archive::new(Cursor::new(decompressed));
-    let entries = tar.entries().map_err(|e| corrupt(format_name, e))?;
-    for entry in entries {
+    let tar_entries = tar.entries().map_err(|e| corrupt(format_name, e))?;
+    let mut entries = Vec::new();
+    for entry in tar_entries {
         let mut entry = entry.map_err(|e| corrupt(format_name, e))?;
         let entry_type = entry.header().entry_type();
         let raw_path =
@@ -363,13 +475,21 @@ fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<()> {
             )));
         }
         ensure_entry_path_safe(&raw_path)?;
+        let declared = entry.header().size().map_err(|e| corrupt(format_name, e))?;
         if entry_type.is_dir() {
+            entries.push(DecodedEntry {
+                rel_path: raw_path,
+                is_dir: true,
+                declared_size: declared,
+            });
             continue;
         }
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).map_err(|e| corrupt(format_name, e))?;
+        ensure_decoded_size_matches(&raw_path, declared, buf.len())?;
+        entries.push(DecodedEntry { rel_path: raw_path, is_dir: false, declared_size: declared });
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// Names `t` for the `ERR_NOT_SUPPORTED` message when it is neither a
@@ -407,7 +527,7 @@ mod tests {
     }
 
     async fn extract(f: &Fixture, path: &str) -> Result<Value> {
-        extract_archive(&f.state, MOUNT, path, None, false, None).await
+        extract_archive(&f.state, MOUNT, OWNER, path, None, false, None).await
     }
 
     /// `path` points at a file that does not exist: `ERR_NOT_FOUND`.
@@ -452,7 +572,16 @@ mod tests {
         path: &str,
         password: Option<&str>,
     ) -> Result<Value> {
-        extract_archive(&f.state, MOUNT, path, None, false, password).await
+        extract_archive(&f.state, MOUNT, OWNER, path, None, false, password).await
+    }
+
+    async fn extract_full(
+        f: &Fixture,
+        path: &str,
+        destination: Option<&str>,
+        overwrite: bool,
+    ) -> Result<Value> {
+        extract_archive(&f.state, MOUNT, OWNER, path, destination, overwrite, None).await
     }
 
     async fn seed_file(f: &Fixture, path: &str) {
@@ -1007,5 +1136,230 @@ mod tests {
         for bad in ["/etc/passwd", "../../etc/passwd", "..\\..\\windows\\system32\\evil.dll"] {
             ensure_entry_path_safe(bad).unwrap_err();
         }
+    }
+
+    // ── US-0008: destination; no-clobber/overwrite; quota charge; decoded
+    // size vs. declared size ───────────────────────────────────────────────
+
+    /// E2E-NEW-010: destination collision, `overwrite` omitted (defaults
+    /// false): the whole call fails, naming the colliding path, and nothing
+    /// changes on disk.
+    #[tokio::test]
+    async fn e2e_new_010_destination_collision_overwrite_defaults_false() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"new"), ("sub/b.txt", b"new2")], None);
+        seed_bytes(&f, "/uploads/report.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/report/a.txt", b"old").await.unwrap();
+
+        let e = extract(&f, "/uploads/report.zip").await.unwrap_err();
+        assert_eq!(e.code, code::NO_CLOBBER);
+        assert!(e.message.contains("/uploads/report/a.txt"), "{}", e.message);
+        assert_eq!(c.read_bytes("/uploads/report/a.txt").await.unwrap(), b"old");
+        assert!(!c.exists("/uploads/report/sub/b.txt").await.unwrap());
+    }
+
+    /// E2E-NEW-011: the message names the FIRST colliding path in archive
+    /// entry order, not lexicographic order: `sub/b.txt` is listed first in
+    /// the archive and collides, `a.txt` is listed second and also
+    /// collides, but only `sub/b.txt` is named.
+    #[tokio::test]
+    async fn e2e_new_011_collision_names_first_colliding_path_in_archive_order() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("sub/b.txt", b"new2"), ("a.txt", b"new")], None);
+        seed_bytes(&f, "/uploads/report2.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/report2/sub", true).await.unwrap();
+        c.write_bytes_atomic("/uploads/report2/sub/b.txt", b"old2").await.unwrap();
+        c.write_bytes_atomic("/uploads/report2/a.txt", b"old").await.unwrap();
+
+        let e = extract(&f, "/uploads/report2.zip").await.unwrap_err();
+        assert_eq!(e.code, code::NO_CLOBBER);
+        assert!(e.message.contains("/uploads/report2/sub/b.txt"), "{}", e.message);
+        assert!(!e.message.contains("/uploads/report2/a.txt"), "{}", e.message);
+    }
+
+    /// E2E-NEW-049: the conflict check also fires against a pre-existing
+    /// FILE at a path the archive wants to use as a directory, not just a
+    /// file-vs-file collision.
+    #[tokio::test]
+    async fn e2e_new_049_no_clobber_conflict_against_pre_existing_directory_entry() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("d/", b""), ("d/x.txt", b"x")], None);
+        seed_bytes(&f, "/uploads/report3.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/report3/d", b"preexisting file").await.unwrap();
+
+        let e = extract(&f, "/uploads/report3.zip").await.unwrap_err();
+        assert_eq!(e.code, code::NO_CLOBBER);
+        assert!(e.message.contains("/uploads/report3/d"), "{}", e.message);
+    }
+
+    /// FR-NEW-018: `overwrite=true` bypasses the conflict scan entirely, so
+    /// the same archive that fails above succeeds once `overwrite` is set.
+    /// (The write pass itself is out of scope for this story, US-0009; this
+    /// only proves the conflict check is skipped, i.e. the call reaches the
+    /// quota charge and returns `Ok`.)
+    #[tokio::test]
+    async fn overwrite_true_bypasses_the_conflict_scan() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"new")], None);
+        seed_bytes(&f, "/uploads/report4.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/report4/a.txt", b"old").await.unwrap();
+
+        extract_full(&f, "/uploads/report4.zip", None, true).await.unwrap();
+    }
+
+    /// FR-NEW-016: an explicit `destination` is normalized like any other
+    /// `fs.*` destination parameter and used verbatim (modulo normalization)
+    /// instead of the archive's own stripped-extension stem.
+    #[tokio::test]
+    async fn explicit_destination_is_used_instead_of_the_stripped_stem() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"new")], None);
+        seed_bytes(&f, "/uploads/named.zip", &bytes).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/named/a.txt", b"irrelevant, different destination")
+            .await
+            .unwrap();
+
+        // The default destination (`/uploads/named`) collides; an explicit,
+        // disjoint destination does not, proving the explicit value, not
+        // the stripped stem, is what the conflict scan actually used.
+        extract_full(&f, "/uploads/named.zip", Some("/uploads/elsewhere"), false).await.unwrap();
+    }
+
+    /// E2E-NEW-020: the archive's total declared size exceeds the remaining
+    /// quota, failing the whole call and leaving nothing written.
+    #[tokio::test]
+    async fn e2e_new_020_archive_total_declared_size_exceeds_remaining_quota() {
+        let f = Fixture::with_config(|c| {
+            c.safety.write_quota_bytes = 100;
+        })
+        .await;
+        f.seed_project(MOUNT, OWNER).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads", true).await.unwrap();
+        let content = vec![b'x'; 10_000];
+        let bytes = build_zip(&[("big.bin", &content)], None);
+        c.write_bytes_atomic("/uploads/big.zip", &bytes).await.unwrap();
+
+        let e = extract(&f, "/uploads/big.zip").await.unwrap_err();
+        assert_eq!(e.code, code::WRITE_QUOTA_EXCEEDED);
+        assert!(!c.exists("/uploads/big/big.bin").await.unwrap());
+    }
+
+    /// E2E-NEW-021: continuation of E2E-NEW-020, same session: a small,
+    /// unrelated write within the ORIGINAL headroom still succeeds,
+    /// observationally proving the failed extraction charged nothing (not
+    /// by reading `SafetyManager`'s internals, by exercising the quota
+    /// through a second real write).
+    #[tokio::test]
+    async fn e2e_new_021_after_quota_rejection_an_unrelated_small_write_still_succeeds() {
+        let f = Fixture::with_config(|c| {
+            c.safety.write_quota_bytes = 100;
+        })
+        .await;
+        f.seed_project(MOUNT, OWNER).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads", true).await.unwrap();
+        let content = vec![b'x'; 10_000];
+        let bytes = build_zip(&[("big.bin", &content)], None);
+        c.write_bytes_atomic("/uploads/big.zip", &bytes).await.unwrap();
+        extract(&f, "/uploads/big.zip").await.unwrap_err();
+
+        // 50 <= 100 headroom only holds if the failed extraction charged
+        // nothing against the session counter.
+        crate::core::fs_ops::write_bytes(
+            &c,
+            &f.state.safety,
+            OWNER,
+            MOUNT,
+            "/uploads/small.bin",
+            &[b'y'; 50],
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Builds a `.zip` with one entry, stored (uncompressed) so patching the
+    /// declared uncompressed-size field never has to touch the data itself.
+    fn build_zip_stored(name: &str, content: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack.windows(needle.len()).position(|w| w == needle).expect("signature not found")
+    }
+
+    /// Patches both the local file header's and the central directory
+    /// record's declared uncompressed-size field to `declared`, leaving the
+    /// data (and `Stored` method's `compressed_size`, which bounds the
+    /// actual read per `zip-2.4.2/src/read.rs:347`) untouched: the archive
+    /// still decodes its full content, which is now larger than what it
+    /// declares (FR-NEW-020, E2E-NEW-026).
+    fn patch_zip_declared_size(bytes: &mut [u8], declared: u32) {
+        let local = find_bytes(bytes, &[0x50, 0x4b, 0x03, 0x04]);
+        bytes[local + 22..local + 26].copy_from_slice(&declared.to_le_bytes());
+        let central = find_bytes(bytes, &[0x50, 0x4b, 0x01, 0x02]);
+        bytes[central + 24..central + 28].copy_from_slice(&declared.to_le_bytes());
+    }
+
+    /// E2E-NEW-026: a crafted zip entry whose central directory and local
+    /// header both declare `uncompressed_size = 1` while the entry actually
+    /// decodes to 10 bytes.
+    #[tokio::test]
+    async fn e2e_new_026_zip_entry_decoded_size_exceeds_declared_is_invalid_argument() {
+        let f = fixture().await;
+        let mut bytes = build_zip_stored("mismatch.txt", b"0123456789");
+        patch_zip_declared_size(&mut bytes, 1);
+        seed_bytes(&f, "/uploads/mismatch.zip", &bytes).await;
+
+        let e = extract(&f, "/uploads/mismatch.zip").await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(e.message.contains("mismatch.txt"), "{}", e.message);
+        assert!(e.message.contains("declared 1"), "{}", e.message);
+    }
+
+    /// E2E-NEW-042/E2E-NEW-043 (tar/7z size mismatch): neither crate's
+    /// public writer/reader API allows forging this at the archive level.
+    /// tar enforces `header.size()` as a strict read boundary
+    /// (`tar-0.4.46/src/archive.rs:360`, `.take(size)`), and its one escape
+    /// hatch, GNU sparse extents, cross-checks the expanded length against
+    /// `real_size` and errors on any discrepancy
+    /// (`tar-0.4.46/src/archive.rs:530-549`), so there is no way to make the
+    /// reader itself yield more bytes than the header declares. A genuine
+    /// 7z-level forgery needs hand-patching the folder header's packed
+    /// varint size tables, out of proportion to this P2 fixture. Both are
+    /// therefore exercised directly against the one guard every decoder
+    /// calls, `ensure_decoded_size_matches`, the same fallback E2E-NEW-026's
+    /// own acceptance text explicitly allows ("a unit-level test that calls
+    /// the internal decode-and-verify step with a mocked declared size").
+    #[test]
+    fn e2e_new_042_tar_decoded_size_exceeds_declared_is_invalid_argument() {
+        let e = ensure_decoded_size_matches("bad.txt", 1, 10).unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(e.message.contains("bad.txt"), "{}", e.message);
+        assert!(e.message.contains("declared 1"), "{}", e.message);
+    }
+
+    #[test]
+    fn e2e_new_043_sevenz_decoded_size_exceeds_declared_is_invalid_argument() {
+        let e = ensure_decoded_size_matches("folder/bad.bin", 5, 20).unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(e.message.contains("folder/bad.bin"), "{}", e.message);
+        assert!(e.message.contains("declared 5"), "{}", e.message);
     }
 }
