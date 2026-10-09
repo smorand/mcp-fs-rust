@@ -1196,7 +1196,7 @@ pub async fn copy_path(
 
 // ──────────────────────────────────────────────────────────────── helpers ─────
 
-async fn ensure_parents(client: &VolumeClient, norm: &str) -> Result<()> {
+pub(crate) async fn ensure_parents(client: &VolumeClient, norm: &str) -> Result<()> {
     let parent = match norm.rfind('/') {
         Some(0) | None => "/".to_string(),
         Some(i) => norm[..i].to_string(),

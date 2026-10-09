@@ -28,6 +28,7 @@
 // a second implementation.
 pub(crate) mod admin;
 pub mod all;
+pub(crate) mod archive;
 pub mod catalog;
 pub mod context7;
 #[cfg(test)]
@@ -85,6 +86,7 @@ pub(crate) fn register_fs(reg: &mut crate::tools::registry_support::ToolRegistry
     document::register(reg);
     trash::register(reg);
     export::register(reg);
+    archive::register(reg);
 }
 
 /// Read `mount_id`, enforce project membership, open the volume.
@@ -390,13 +392,14 @@ mod tests {
         "fs.trash_list",
         "fs.trash_restore",
         "fs.export_zip",
+        "fs.extract_archive",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        assert_eq!(reg.len(), 38);
+        assert_eq!(reg.len(), 39);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -469,7 +472,8 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            38,
+            // 39 since SPEC-0015 added fs.extract_archive.
+            39,
             "fs.* tools",
         );
     }

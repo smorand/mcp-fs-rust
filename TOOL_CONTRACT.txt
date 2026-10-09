@@ -123,6 +123,11 @@ fs.export_zip
   params: mount_id:string, paths:array
   required: ['mount_id', 'paths']
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
+fs.extract_archive
+  desc: Extract an archive file in place inside the volume.
+  params: mount_id:string, path:string, destination:string=null, overwrite:boolean=false, password:string=null
+  required: ['mount_id', 'path']
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 fs.extract_text
   desc: Extract a document to Markdown and store it as a companion .md next to the source (report.pdf -> report.md), reusing it 
   params: mount_id:string, path:string, max_chars:integer=200000, preview_chars:integer=4000, ocr:boolean=true, refresh:boolean=false
@@ -595,6 +600,7 @@ fs.count_lines: {"total_lines": 2}
 fs.hash: {"path": "/a.txt", "algo": "sha256", "hash": "4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92", "size": 12}
 fs.exists: {"exists": true, "kind": "file"}
 fs.export_zip: {"url": "/exports/0b7e2f4c-1a3d-4e5f-8a9b-0c1d2e3f4a5b"}
+fs.extract_archive: {"destination": "/uploads/report", "files_written": 2, "dirs_created": 1, "bytes_written": 10}
 fs.stat: {"path": "/empty.txt", "size": 0, "mode": "0o644", "kind": "file", "mtime": "<volatile>", "ctime": "<volatile>", "atime": "<volatile>", "uid": 1000, "gid": 1000}
 fs.create_empty: {"path": "/empty.txt", "created": true}
 fs.edit: {"path": "/a.txt", "applied": true, "diff": "--- /a.txt\n+++ /a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n"}

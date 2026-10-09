@@ -85,6 +85,8 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "write-bytes"),
     ("POST", "documentize"),
     ("POST", "export-zip"),
+    // SPEC-0015 FR-NEW-029: extract-archive mirrors export-zip exactly.
+    ("POST", "extract-archive"),
 ];
 
 /// Request body ceiling for the JSON endpoints. Axum defaults to 2 MiB, which is
@@ -147,6 +149,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/write-bytes", post(write_bytes))
         .route("/api/fs/{mount_id}/documentize", post(documentize))
         .route("/api/fs/{mount_id}/export-zip", post(export_zip))
+        .route("/api/fs/{mount_id}/extract-archive", post(extract_archive))
         // Applied outside the routes so the upload keeps its own larger ceiling.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
@@ -645,6 +648,34 @@ async fn export_zip(
         }
         let paths = a.req_str_array("paths")?;
         crate::tools::export::export_zip(&r.state, &r.mount, &paths).await
+    })
+    .await
+}
+
+/// Extract an archive file in place. Same function as `fs.extract_archive`,
+/// so the two doors cannot drift apart (SPEC-0015 FR-NEW-029).
+async fn extract_archive(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    guarded_json(state, headers, mount, |r| async move {
+        let a = body_args(&body)?;
+        let path = a.str("path")?;
+        let destination = a.opt_str("destination");
+        let overwrite = a.bool_or("overwrite", false);
+        let password = a.opt_str("password");
+        crate::tools::archive::extract_archive(
+            &r.state,
+            &r.mount,
+            &r.person,
+            &path,
+            destination.as_deref(),
+            overwrite,
+            password.as_deref(),
+        )
+        .await
     })
     .await
 }
@@ -2389,8 +2420,10 @@ mod tests {
     async fn the_route_inventory_covers_every_registered_path() {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
-        assert_eq!(REST_ROUTES.len(), 39);
+        // 40 since SPEC-0015 FR-NEW-029 added extract-archive.
+        assert_eq!(REST_ROUTES.len(), 40);
         assert!(REST_ROUTES.contains(&("POST", "export-zip")));
+        assert!(REST_ROUTES.contains(&("POST", "extract-archive")));
         assert!(REST_ROUTES.contains(&("GET", "download-zip")));
         assert!(REST_ROUTES.contains(&("POST", "write-docx")));
         assert!(REST_ROUTES.contains(&("POST", "write-bytes")));
@@ -2780,5 +2813,95 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
         assert_eq!(v["error"], code::PATH_OUT_OF_BOUNDS);
         assert_eq!(export_blob_count(&h), 0);
+    }
+
+    // ── extract-archive (SPEC-0015 US-0011) ──────────────────────────────────
+
+    /// The E2E-NEW-001 fixture: two entries, 10 bytes, one subdirectory.
+    fn report_tar_gz() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (name, content) in [("a.txt", &b"hello"[..]), ("sub/b.txt", &b"world"[..])] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(name).unwrap();
+                header.set_size(content.len() as u64);
+                header.set_cksum();
+                builder.append(&header, content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    async fn seed_report(h: &Harness) {
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/report.tar.gz", &report_tar_gz()).await.unwrap();
+    }
+
+    async fn post_extract(h: &Harness, token: Option<&str>, body: &str) -> (StatusCode, Value) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(u("extract-archive"))
+            .header("Content-Type", "application/json");
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let (s, b) = h.send(req.body(axum::body::Body::from(body.to_string())).unwrap()).await;
+        (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+    }
+
+    /// E2E-NEW-031: the REST door answers exactly what the tool answers and
+    /// writes the entries.
+    #[tokio::test]
+    async fn e2e_new_031_extract_archive_happy_path() {
+        let h = Harness::new().await;
+        seed_report(&h).await;
+        let (s, v) = h.post(&u("extract-archive"), json!({"path": "/uploads/report.tar.gz"})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"destination": "/uploads/report", "files_written": 2,
+                   "dirs_created": 1, "bytes_written": 10})
+        );
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/uploads/report/sub/b.txt").await.unwrap(), b"world");
+    }
+
+    /// E2E-NEW-032: missing `path` is 400; no bearer gets what `read` gets,
+    /// cross checked through the router; a non member is 403. None writes.
+    #[tokio::test]
+    async fn e2e_new_032_extract_archive_failures_match_other_routes() {
+        let h = Harness::new().await;
+        seed_report(&h).await;
+
+        let (s, v) = post_extract(&h, Some(&h.owner_token), r#"{"overwrite": true}"#).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
+        let (s_x, v_x) = post_extract(&h, None, r#"{"path": "/uploads/report.tar.gz"}"#).await;
+        let (s_r, b_r) = h
+            .send(
+                Request::builder()
+                    .uri(u("read?path=/uploads/report.tar.gz"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let v_r: Value = serde_json::from_slice(&b_r).unwrap_or(Value::Null);
+        assert_eq!(s_x, s_r);
+        assert_eq!(v_x["error"], v_r["error"]);
+        assert_eq!(v_x["error"], code::UNAUTHENTICATED);
+
+        let (s, v) =
+            post_extract(&h, Some(&h.stranger_token), r#"{"path": "/uploads/report.tar.gz"}"#)
+                .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["error"], code::FORBIDDEN);
+
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        assert!(!c.exists("/uploads/report").await.unwrap(), "nothing may be extracted");
     }
 }

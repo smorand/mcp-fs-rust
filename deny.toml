@@ -21,7 +21,10 @@ ignore = [
 ]
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CDLA-Permissive-2.0", "Unlicense", "0BSD", "CC0-1.0", "BSL-1.0", "OpenSSL"]
+# "bzip2-1.0.6" (SPDX id, zlib/libpng-style permissive text) added for
+# `libbz2-rs-sys`, a transitive dependency of the `bzip2` crate pinned in
+# SPEC-0015 US-0006 for `.tar.bz2` decode.
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CDLA-Permissive-2.0", "Unlicense", "0BSD", "CC0-1.0", "BSL-1.0", "OpenSSL", "bzip2-1.0.6"]
 
 [bans]
 multiple-versions = "warn"

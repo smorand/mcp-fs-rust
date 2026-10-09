@@ -1019,6 +1019,15 @@ const OPERATIONS: &[Op] = &[
         params: NO_PARAMS,
         body: "ExportZipBody",
     },
+    // SPEC-0015 FR-NEW-029: extract-archive mirrors export-zip exactly.
+    Op {
+        method: "POST",
+        sub: "extract-archive",
+        path: "/api/fs/{mount_id}/extract-archive",
+        tool: "fs.extract_archive",
+        params: NO_PARAMS,
+        body: "ExtractArchiveBody",
+    },
     Op {
         method: "GET",
         sub: "find-definition",
@@ -1267,6 +1276,32 @@ const SCHEMAS: &[Schema] = &[
             items: "string",
             nullable: false,
         }],
+    },
+    // SPEC-0015 FR-NEW-029: extract-archive mirrors export-zip exactly.
+    Schema {
+        name: "ExtractArchiveBody",
+        tool: "fs.extract_archive",
+        required: &["path"],
+        props: &[
+            plain("path", "string"),
+            Prop {
+                name: "destination",
+                ty: "string",
+                format: "",
+                default: Def::Null,
+                items: "",
+                nullable: true,
+            },
+            flag("overwrite", false),
+            Prop {
+                name: "password",
+                ty: "string",
+                format: "",
+                default: Def::Null,
+                items: "",
+                nullable: true,
+            },
+        ],
     },
     Schema {
         name: "ReadManyBody",
@@ -1813,5 +1848,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// E2E-NEW-047: the served document carries the extract-archive operation
+    /// and its body schema, `path` required, the other three optional.
+    #[tokio::test]
+    async fn e2e_new_047_document_has_extract_archive() {
+        let v = doc(false).await;
+        assert!(v["paths"]["/api/fs/{mount_id}/extract-archive"]["post"].is_object(), "{v}");
+        let schema = &v["components"]["schemas"]["ExtractArchiveBody"];
+        assert_eq!(schema["required"], json!(["path"]), "{schema}");
+        for prop in ["path", "destination", "overwrite", "password"] {
+            assert!(schema["properties"][prop].is_object(), "missing {prop}: {schema}");
+        }
     }
 }

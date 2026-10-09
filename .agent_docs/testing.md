@@ -36,14 +36,22 @@ means something went wrong.
 
 ```bash
 ./test.sh                                    # cargo test --workspace
-cargo test -p mcp-fs                         # the server crate only
-cargo test -p mcp-fs --lib storage::         # one area
+cargo test -p mcp-fs-core --lib              # the library, where every test lives
+cargo test -p mcp-fs-core --lib storage::     # one area
 cargo test --workspace --all-features        # includes the postgres and sqlserver drivers
 cargo clippy --all-targets --all-features -- -D warnings   # second half of the quality gate
 ```
 
 Both must be clean before any commit. Use `--all-features` on the clippy gate, otherwise
 the two optional drivers are never compiled and their warnings never surface.
+
+Gotchas (2026-10-09, SPEC-0015 run):
+- `mcp-fs` has no lib target any more (all code is in `mcp-fs-core`), so `-p mcp-fs --lib`
+  fails with "no library targets"; use `-p mcp-fs-core --lib`.
+- `cargo test --workspace` stops at the first failing test binary and skips the rest; to get
+  the real total use `--no-fail-fast` and sum every `test result:` line.
+- `ld: library 'git2' not found` after a Homebrew libgit2 bottle bump (Cellar path changes,
+  e.g. `1.9.7` to `1.9.7_2`) is a stale `libgit2-sys` build cache: `cargo clean -p libgit2-sys`.
 
 ## Current counts
 
