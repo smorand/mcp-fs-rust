@@ -1367,7 +1367,7 @@ unlabeled.
   - Detected by: `cargo build` (API mismatch) or `E2E-NEW-002`/`E2E-NEW-005` (wrong runtime
     behavior).
   - Blocks which requirement: FR-NEW-009, FR-NEW-010, FR-NEW-011.
-  - Status: resolved (drift_001_zip_entry_metadata_readable_without_password, SPEC-0015_US-0006).
+  - Status: not-reproducible (drift_001_zip_entry_metadata_readable_without_password green on first run: zip 2.4.2 exposes name, size and encrypted flag without a password via ZipArchive::by_index_raw, read.rs:1097; pending user confirmation).
 - **DRIFT-002**
   - Spec says: `FR-NEW-013` — a zip entry's symlink-ness is readable via Unix mode bits in
     `external_attributes`, high 16 bits, `S_IFLNK`.
