@@ -458,6 +458,13 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
         Err(sevenz_rust2::Error::PasswordRequired) => {
             return Err(password_required_message(password));
         }
+        // An encrypted header decrypted with the wrong key decodes to garbage,
+        // which the library can only report as a possible bad password: with a
+        // password supplied that is FR-NEW-011's incorrect password, not a
+        // corrupt archive.
+        Err(sevenz_rust2::Error::MaybeBadPassword(_)) if password.is_some() => {
+            return Err(password_required_message(password));
+        }
         Err(e) => return Err(corrupt("7z", e)),
     };
 
@@ -472,24 +479,33 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
         return Err(ToolError::password_required("password required to extract this archive"));
     }
 
-    // FR-NEW-014: path safety applies format-agnostically. Entry-type
-    // rejection does not: per DEC-008, the 7z format has no universally
-    // implemented symlink representation, so any entry this branch cannot
-    // positively identify as a symlink is written as an ordinary regular
-    // file (a safe default, since the path check still applies to it).
+    // FR-NEW-014 path safety applies to every entry. Entry type rejection
+    // (FR-NEW-013) is best effort per DEC-008: 7z has no universal symlink
+    // representation, so only an entry whose unix extension attributes
+    // positively name a non regular type is refused; anything else is an
+    // ordinary file, still covered by the path check.
     //
-    // `size_mismatch` is a side channel for FR-NEW-020 (US-0008): the
-    // closure's error type is `sevenz_rust2::Error`, which cannot carry a
-    // `ToolError` through `for_each_entries`'s `?`, so a size mismatch is
-    // recorded here and checked first after the call returns, ahead of the
-    // generic password-required/corrupt fallback below (which would
-    // otherwise misreport it).
+    // `entry_error` is a side channel: the closure's error type is
+    // `sevenz_rust2::Error`, which cannot carry a `ToolError` through
+    // `for_each_entries`'s `?`. Without it a zip-slip, special entry or size
+    // mismatch (FR-NEW-020) would fall to the generic corrupt/password
+    // fallback below and surface with the wrong code.
     let mut entries = Vec::new();
-    let mut size_mismatch: Option<ToolError> = None;
+    let mut entry_error: Option<ToolError> = None;
     let mut reader = ArchiveReader::from_archive(archive, Cursor::new(bytes), probe_password);
     let decode_result = reader.for_each_entries(|entry, read| {
-        ensure_entry_path_safe(entry.name())
-            .map_err(|e| sevenz_rust2::Error::Other(e.to_string().into()))?;
+        let refusal = ensure_entry_path_safe(entry.name()).err().or_else(|| {
+            sevenz_special_type(entry).map(|label| {
+                ToolError::not_supported(format!(
+                    "archive entry '{}' is a {label}, which is not supported",
+                    entry.name()
+                ))
+            })
+        });
+        if let Some(e) = refusal {
+            entry_error = Some(e);
+            return Err(sevenz_rust2::Error::Other("entry refused".into()));
+        }
         let declared = entry.size();
         let rel_path = entry.name().to_string();
         if entry.is_directory() {
@@ -504,19 +520,13 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
         let mut buf = Vec::new();
         read.read_to_end(&mut buf)?;
         if let Err(e) = ensure_decoded_size_matches(&rel_path, declared, buf.len()) {
-            size_mismatch = Some(e);
-            entries.push(DecodedEntry {
-                rel_path,
-                is_dir: false,
-                declared_size: declared,
-                bytes: Vec::new(),
-            });
+            entry_error = Some(e);
             return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
         }
         entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared, bytes: buf });
         Ok(true)
     });
-    if let Some(e) = size_mismatch {
+    if let Some(e) = entry_error {
         return Err(e);
     }
     match decode_result {
@@ -530,6 +540,26 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
 /// password supplied is the missing-password message, any supplied
 /// password (including an explicit empty string) that fails to decode is
 /// the incorrect-password message.
+/// 7-Zip sets this attribute bit when the high 16 bits carry a POSIX mode.
+const SEVENZ_UNIX_EXTENSION: u32 = 0x8000;
+
+/// The non regular type a 7z entry's unix extension attributes positively
+/// name, or `None` when they are absent or name a regular file or directory
+/// (DEC-008: what cannot be identified is treated as a regular file).
+fn sevenz_special_type(entry: &sevenz_rust2::ArchiveEntry) -> Option<&'static str> {
+    let attrs = entry.windows_attributes;
+    if !entry.has_windows_attributes || attrs & SEVENZ_UNIX_EXTENSION == 0 {
+        return None;
+    }
+    match (attrs >> 16) & 0o170_000 {
+        0o120_000 => Some("symlink"),
+        0o010_000 => Some("FIFO"),
+        0o020_000 | 0o060_000 => Some("device"),
+        0o140_000 => Some("socket"),
+        _ => None,
+    }
+}
+
 fn password_required_message(password: Option<&str>) -> ToolError {
     if password.is_none() {
         ToolError::password_required("password required to extract this archive")
@@ -1277,7 +1307,7 @@ mod tests {
     /// the operation, carrying the destination/files_written/bytes_written
     /// in its detail, mirroring `core::fs_ops::write_bytes` (`fs_ops.rs:613`).
     #[tokio::test]
-    async fn e2e_new_025_fr_success_records_one_audit_entry() {
+    async fn fr_new_025_success_records_one_audit_entry() {
         let f = fixture().await;
         let bytes = build_zip(&[("a.txt", b"hello")], None);
         seed_bytes(&f, "/uploads/audited.zip", &bytes).await;
@@ -1887,5 +1917,319 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "fs.extract_archive"));
         assert_eq!(names.iter().filter(|n| n.starts_with("fs.")).count(), 39);
+    }
+
+    // ── converge round 1 (US-0013..US-0015) ─────────────────────────────────
+
+    /// A 7z built with `sevenz-rust2`. `attrs` sets an entry's raw attributes;
+    /// `password` encrypts the content (and the header unless `plain_header`).
+    fn build_sevenz_ext(
+        entries: &[(&str, &[u8], Option<u32>)],
+        password: Option<&str>,
+        plain_header: bool,
+    ) -> Vec<u8> {
+        use sevenz_rust2::encoder_options::AesEncoderOptions;
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod};
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArchiveWriter::new(Cursor::new(&mut buf)).unwrap();
+            if let Some(pw) = password {
+                writer.set_content_methods(vec![
+                    AesEncoderOptions::new(pw.into()).into(),
+                    EncoderMethod::LZMA2.into(),
+                ]);
+                writer.set_encrypt_header(!plain_header);
+            }
+            for (name, content, attrs) in entries {
+                let mut entry = ArchiveEntry::new_file(name);
+                if let Some(a) = attrs {
+                    entry.has_windows_attributes = true;
+                    entry.windows_attributes = *a;
+                }
+                writer.push_archive_entry(entry, Some(Cursor::new(*content))).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    /// The standard CRC-32 (IEEE), bitwise: test fixtures only.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    /// One stored entry under legacy ZipCrypto (PKWARE traditional encryption),
+    /// assembled by hand: the zip crate only exposes that writer crate
+    /// internally, and E2E-NEW-005 needs a real legacy encrypted entry.
+    fn build_zipcrypto(name: &str, content: &[u8], password: &str) -> Vec<u8> {
+        fn crc_byte(crc: u32, b: u8) -> u32 {
+            let mut c = crc ^ u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 == 1 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            }
+            c
+        }
+        let mut k = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
+        let update = |k: &mut [u32; 3], p: u8| {
+            k[0] = crc_byte(k[0], p);
+            k[1] = (k[1].wrapping_add(k[0] & 0xff)).wrapping_mul(134_775_813).wrapping_add(1);
+            k[2] = crc_byte(k[2], (k[1] >> 24) as u8);
+        };
+        for b in password.bytes() {
+            update(&mut k, b);
+        }
+        let crc = crc32(content);
+        let mut plain = vec![0x5Au8; 11];
+        plain.push((crc >> 24) as u8);
+        plain.extend_from_slice(content);
+        let cipher: Vec<u8> = plain
+            .iter()
+            .map(|&p| {
+                let t = (k[2] | 2) & 0xffff;
+                let c = p ^ ((t.wrapping_mul(t ^ 1) >> 8) & 0xff) as u8;
+                update(&mut k, p);
+                c
+            })
+            .collect();
+
+        let (n, csize, usize_) = (name.len() as u16, cipher.len() as u32, content.len() as u32);
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        for v in [20u16, 1, 0, 0, 0x21] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [crc, csize, usize_] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&cipher);
+
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        for v in [20u16, 20, 1, 0, 0, 0x21] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [crc, csize, usize_] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [n, 0, 0, 0, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        let cd_size = out.len() as u32 - cd_offset;
+
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        for v in [0u16, 0, 1, 1] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    async fn read(f: &Fixture, path: &str) -> Vec<u8> {
+        f.state.stores.client(MOUNT).await.unwrap().read_bytes(path).await.unwrap()
+    }
+
+    async fn exists(f: &Fixture, path: &str) -> bool {
+        f.state.stores.client(MOUNT).await.unwrap().exists(path).await.unwrap()
+    }
+
+    /// E2E-NEW-004: an AES-encrypted 7z with the correct password extracts.
+    #[tokio::test]
+    async fn e2e_new_004_aes_sevenz_correct_password_extracts() {
+        let f = fixture().await;
+        let bytes = build_sevenz_ext(&[("secret.txt", b"top secret", None)], Some("pw7"), false);
+        seed_bytes(&f, "/uploads/vault.7z", &bytes).await;
+        let r = extract_with_password(&f, "/uploads/vault.7z", Some("pw7")).await.unwrap();
+        assert_eq!(r["files_written"], 1);
+        assert_eq!(read(&f, "/uploads/vault/secret.txt").await, b"top secret");
+    }
+
+    /// FR-NEW-010 on 7z, header encrypted and header plain: no password is
+    /// "password required", nothing written.
+    #[tokio::test]
+    async fn sevenz_missing_password_is_password_required() {
+        let f = fixture().await;
+        for (i, plain_header) in [false, true].into_iter().enumerate() {
+            let path = format!("/uploads/vault{i}.7z");
+            let bytes = build_sevenz_ext(&[("s.txt", b"x", None)], Some("pw7"), plain_header);
+            seed_bytes(&f, &path, &bytes).await;
+            let e = extract(&f, &path).await.unwrap_err();
+            assert_eq!(e.code, code::PASSWORD_REQUIRED, "plain_header={plain_header}");
+            assert_eq!(e.message, "password required to extract this archive");
+            assert!(!exists(&f, &format!("/uploads/vault{i}")).await);
+        }
+    }
+
+    /// FR-NEW-011 on 7z, header encrypted and header plain: a wrong password is
+    /// "incorrect password", nothing written.
+    #[tokio::test]
+    async fn sevenz_wrong_password_is_incorrect_password() {
+        let f = fixture().await;
+        for (i, plain_header) in [false, true].into_iter().enumerate() {
+            let path = format!("/uploads/vault{i}.7z");
+            let bytes = build_sevenz_ext(&[("s.txt", b"x", None)], Some("pw7"), plain_header);
+            seed_bytes(&f, &path, &bytes).await;
+            let e = extract_with_password(&f, &path, Some("wrong")).await.unwrap_err();
+            assert_eq!(e.code, code::PASSWORD_REQUIRED, "plain_header={plain_header}");
+            assert_eq!(e.message, "incorrect password for this archive");
+            assert!(!exists(&f, &format!("/uploads/vault{i}")).await);
+        }
+    }
+
+    /// E2E-NEW-005: AES-256 and legacy ZipCrypto zips with the right password.
+    #[tokio::test]
+    async fn e2e_new_005_aes_and_zipcrypto_zip_correct_password_extract() {
+        let f = fixture().await;
+        let aes = build_zip(&[("a.txt", b"aes body")], Some("pwz"));
+        seed_bytes(&f, "/uploads/aes.zip", &aes).await;
+        extract_with_password(&f, "/uploads/aes.zip", Some("pwz")).await.unwrap();
+        assert_eq!(read(&f, "/uploads/aes/a.txt").await, b"aes body");
+
+        let legacy = build_zipcrypto("l.txt", b"legacy body", "pwz");
+        seed_bytes(&f, "/uploads/legacy.zip", &legacy).await;
+        assert_eq!(
+            extract(&f, "/uploads/legacy.zip").await.unwrap_err().code,
+            code::PASSWORD_REQUIRED
+        );
+        extract_with_password(&f, "/uploads/legacy.zip", Some("pwz")).await.unwrap();
+        assert_eq!(read(&f, "/uploads/legacy/l.txt").await, b"legacy body");
+    }
+
+    /// E2E-NEW-007: the stateless retry, missing then supplied, succeeds and
+    /// the failed attempt left nothing behind to collide with.
+    #[tokio::test]
+    async fn e2e_new_007_retry_after_missing_password_succeeds() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("s.txt", b"retry")], Some("pwz"));
+        seed_bytes(&f, "/uploads/r.zip", &bytes).await;
+        assert_eq!(extract(&f, "/uploads/r.zip").await.unwrap_err().code, code::PASSWORD_REQUIRED);
+        let r = extract_with_password(&f, "/uploads/r.zip", Some("pwz")).await.unwrap();
+        assert_eq!(r["files_written"], 1);
+        assert_eq!(read(&f, "/uploads/r/s.txt").await, b"retry");
+    }
+
+    /// E2E-NEW-009: wrong then correct, succeeds.
+    #[tokio::test]
+    async fn e2e_new_009_retry_after_wrong_password_succeeds() {
+        let f = fixture().await;
+        let bytes = build_sevenz_ext(&[("s.txt", b"retry7", None)], Some("pw7"), false);
+        seed_bytes(&f, "/uploads/r.7z", &bytes).await;
+        let e = extract_with_password(&f, "/uploads/r.7z", Some("nope")).await.unwrap_err();
+        assert_eq!(e.message, "incorrect password for this archive");
+        extract_with_password(&f, "/uploads/r.7z", Some("pw7")).await.unwrap();
+        assert_eq!(read(&f, "/uploads/r/s.txt").await, b"retry7");
+    }
+
+    /// E2E-NEW-058: an empty string is a (wrong) password, not an absent one.
+    #[tokio::test]
+    async fn e2e_new_058_empty_password_is_incorrect_not_required() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("s.txt", b"x")], Some("pwz"));
+        seed_bytes(&f, "/uploads/e.zip", &bytes).await;
+        let e = extract_with_password(&f, "/uploads/e.zip", Some("")).await.unwrap_err();
+        assert_eq!(e.code, code::PASSWORD_REQUIRED);
+        assert_eq!(e.message, "incorrect password for this archive");
+    }
+
+    /// FR-NEW-013 7z clause (DEC-008): an entry whose unix extension
+    /// attributes name a symlink voids the call; the benign entry before it is
+    /// not written.
+    #[tokio::test]
+    async fn sevenz_symlink_entry_is_not_supported_and_nothing_written() {
+        let f = fixture().await;
+        let link = SEVENZ_UNIX_EXTENSION | (0o120_777 << 16);
+        let bytes = build_sevenz_ext(
+            &[("good.txt", b"benign", None), ("link", b"/etc/passwd", Some(link))],
+            None,
+            false,
+        );
+        seed_bytes(&f, "/uploads/l.7z", &bytes).await;
+        let e = extract(&f, "/uploads/l.7z").await.unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert_eq!(e.message, "archive entry 'link' is a symlink, which is not supported");
+        assert!(!exists(&f, "/uploads/l/good.txt").await);
+    }
+
+    /// DEC-008: without the unix extension flag nothing identifies the entry,
+    /// so it is an ordinary file; a unix regular mode is too.
+    #[tokio::test]
+    async fn sevenz_entries_not_positively_special_are_regular_files() {
+        let f = fixture().await;
+        let regular = SEVENZ_UNIX_EXTENSION | (0o100_644 << 16);
+        let bytes = build_sevenz_ext(
+            &[("plain.txt", b"p", Some(0x20)), ("unix.txt", b"u", Some(regular))],
+            None,
+            false,
+        );
+        seed_bytes(&f, "/uploads/ok.7z", &bytes).await;
+        extract(&f, "/uploads/ok.7z").await.unwrap();
+        assert_eq!(read(&f, "/uploads/ok/plain.txt").await, b"p");
+        assert_eq!(read(&f, "/uploads/ok/unix.txt").await, b"u");
+    }
+
+    /// FR-NEW-014 on 7z: an escaping entry is ERR_PATH_OUT_OF_BOUNDS (it was
+    /// misreported as a corrupt archive), the benign entry is not written,
+    /// and nothing lands at the target.
+    #[tokio::test]
+    async fn sevenz_zip_slip_entry_is_path_out_of_bounds() {
+        let f = fixture().await;
+        let bytes = build_sevenz_ext(
+            &[("good.txt", b"benign", None), ("../../etc/passwd", b"pwned", None)],
+            None,
+            false,
+        );
+        seed_bytes(&f, "/uploads/evil.7z", &bytes).await;
+        let e = extract(&f, "/uploads/evil.7z").await.unwrap_err();
+        assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS, "{}", e.message);
+        assert!(e.message.contains("../../etc/passwd"), "{}", e.message);
+        assert!(!exists(&f, "/uploads/evil/good.txt").await);
+        assert!(!exists(&f, "/etc/passwd").await);
+    }
+
+    /// FR-NEW-023: a directory entry that already exists is not counted, nor
+    /// is the pre-existing destination root; only `new` is.
+    #[tokio::test]
+    async fn dirs_created_excludes_pre_existing_directory_entries() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/tree/sub", true).await.unwrap();
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            for dir in ["sub/", "new/"] {
+                let mut h = tar::Header::new_gnu();
+                h.set_path(dir).unwrap();
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_size(0);
+                h.set_cksum();
+                b.append(&h, std::io::empty()).unwrap();
+            }
+            for (name, body) in [("sub/a.txt", &b"a"[..]), ("new/b.txt", &b"b"[..])] {
+                let mut h = tar::Header::new_gnu();
+                h.set_path(name).unwrap();
+                h.set_size(body.len() as u64);
+                h.set_cksum();
+                b.append(&h, body).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        seed_bytes(&f, "/uploads/tree.tar", &tar_bytes).await;
+        let r = extract_full(&f, "/uploads/tree.tar", None, true).await.unwrap();
+        assert_eq!(r["dirs_created"], 1, "{r}");
+        assert_eq!(r["files_written"], 2, "{r}");
     }
 }
