@@ -142,15 +142,71 @@ fn corrupt(format_name: &str, detail: impl std::fmt::Display) -> ToolError {
     ))
 }
 
+/// Rejects an entry path that is absolute or that climbs above the
+/// destination root (FR-NEW-014), using the same walking technique
+/// `tools::export::ensure_no_escape` uses (`export.rs:122-130`): split on
+/// `/`, walk component by component, `..` is a one-level decrease, any
+/// other non-empty, non-`.` component is a one-level increase, reject if
+/// the running total goes below zero at any point.
+///
+/// Splitting also on `\` (not just `/`) covers Windows-style backslash
+/// traversal (`..\\..\\windows\\system32\\evil.dll`) the same way, since a
+/// POSIX destination never treats a backslash as a legitimate path
+/// character worth preserving literally when it is used to spell `..`.
+fn ensure_entry_path_safe(raw: &str) -> Result<()> {
+    if raw.starts_with('/') {
+        return Err(ToolError::path_out_of_bounds(format!(
+            "archive entry path escapes the destination: '{raw}'"
+        )));
+    }
+    let mut depth: usize = 0;
+    for part in raw.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    ToolError::path_out_of_bounds(format!(
+                        "archive entry path escapes the destination: '{raw}'"
+                    ))
+                })?;
+            }
+            _ => depth += 1,
+        }
+    }
+    Ok(())
+}
+
 /// `zip`: list every entry without a password (DRIFT-001), fail fast on a
 /// missing password if any entry is encrypted (FR-NEW-010), then fully
 /// decode every regular-file entry, surfacing a wrong password distinctly
 /// from a general corruption error (FR-NEW-011).
+///
+/// DRIFT-002 (resolved): the pinned `zip` 2.4.2 crate exposes a native
+/// `ZipFile::is_symlink()` (`zip-2.4.2/src/read.rs:1746-1749`), itself built
+/// on `unix_mode()` (`zip-2.4.2/src/types.rs:555-562`, which reads
+/// `external_attributes >> 16` for `System::Unix`). The native method is
+/// used directly per US-0002's resolution note, rather than re-deriving the
+/// `S_IFLNK` bit-mask by hand.
 fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| corrupt("zip", e))?;
 
-    let any_encrypted =
-        (0..archive.len()).any(|i| archive.by_index_raw(i).map(|f| f.encrypted()).unwrap_or(false));
+    // FR-NEW-013/014/015: every entry is checked for type and path safety
+    // before any entry is decoded, so a disqualifying entry anywhere in the
+    // archive voids the whole call before a single byte is read.
+    let mut any_encrypted = false;
+    for i in 0..archive.len() {
+        let file = archive.by_index_raw(i).map_err(|e| corrupt("zip", e))?;
+        let raw_path = file.name().to_string();
+        if file.is_symlink() {
+            return Err(ToolError::not_supported(format!(
+                "archive entry '{raw_path}' is a symlink, which is not supported"
+            )));
+        }
+        ensure_entry_path_safe(&raw_path)?;
+        if file.encrypted() {
+            any_encrypted = true;
+        }
+    }
 
     if any_encrypted && password.is_none() {
         return Err(ToolError::password_required("password required to extract this archive"));
@@ -220,8 +276,15 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<()> {
         return Err(ToolError::password_required("password required to extract this archive"));
     }
 
+    // FR-NEW-014: path safety applies format-agnostically. Entry-type
+    // rejection does not: per DEC-008, the 7z format has no universally
+    // implemented symlink representation, so any entry this branch cannot
+    // positively identify as a symlink is written as an ordinary regular
+    // file (a safe default, since the path check still applies to it).
     let mut reader = ArchiveReader::from_archive(archive, Cursor::new(bytes), probe_password);
     let decode_result = reader.for_each_entries(|entry, read| {
+        ensure_entry_path_safe(entry.name())
+            .map_err(|e| sevenz_rust2::Error::Other(e.to_string().into()))?;
         if entry.is_directory() {
             return Ok(true);
         }
@@ -287,13 +350,41 @@ fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<()> {
     let entries = tar.entries().map_err(|e| corrupt(format_name, e))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| corrupt(format_name, e))?;
-        if entry.header().entry_type().is_dir() {
+        let entry_type = entry.header().entry_type();
+        let raw_path =
+            entry.path().map_err(|e| corrupt(format_name, e))?.to_string_lossy().into_owned();
+        // FR-NEW-013: reject anything other than a regular file or a
+        // directory, before touching the path check or reading content, so
+        // a symlink entry is named with the right word even when its own
+        // path happens to be benign.
+        if let Some(label) = tar_entry_type_label(entry_type) {
+            return Err(ToolError::not_supported(format!(
+                "archive entry '{raw_path}' is a {label}, which is not supported"
+            )));
+        }
+        ensure_entry_path_safe(&raw_path)?;
+        if entry_type.is_dir() {
             continue;
         }
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).map_err(|e| corrupt(format_name, e))?;
     }
     Ok(())
+}
+
+/// Names `t` for the `ERR_NOT_SUPPORTED` message when it is neither a
+/// regular file nor a directory (FR-NEW-013); `None` for the two accepted
+/// types.
+fn tar_entry_type_label(t: tar::EntryType) -> Option<&'static str> {
+    use tar::EntryType;
+    match t {
+        EntryType::Regular | EntryType::Directory => None,
+        EntryType::Symlink => Some("symlink"),
+        EntryType::Link => Some("hardlink"),
+        EntryType::Fifo => Some("FIFO"),
+        EntryType::Char | EntryType::Block => Some("device"),
+        _ => Some("special file"),
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +749,263 @@ mod tests {
         let bytes = build_tar_gz(&[("a.txt", b"hello")]);
         seed_bytes(&f, "/uploads/plain2.tar.gz", &bytes).await;
         extract(&f, "/uploads/plain2.tar.gz").await.unwrap();
+    }
+
+    // ── US-0007: symlink/hardlink/zip-slip rejection ──────────────────────
+
+    /// Writes `name` into `header`'s raw GNU name field, bypassing
+    /// `Header::set_path`'s validation (which rejects a `..` component):
+    /// the fixtures below need to actually store a traversal path on disk,
+    /// which is exactly the attack `ensure_entry_path_safe` must catch, so
+    /// the test build step cannot itself refuse to write it.
+    fn set_raw_tar_name(header: &mut tar::Header, name: &str) {
+        let gnu = header.as_gnu_mut().expect("gnu header");
+        gnu.name = [0u8; 100];
+        gnu.name[..name.len()].copy_from_slice(name.as_bytes());
+    }
+
+    /// Plain (uncompressed) tar with regular-file entries only. Names may
+    /// contain `..` (raw name field, bypassing `set_path`'s validation).
+    fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (name, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                set_raw_tar_name(&mut header, name);
+                header.set_size(content.len() as u64);
+                header.set_cksum();
+                builder.append(&header, *content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        tar_bytes
+    }
+
+    /// A plain tar with one benign entry plus one entry of `entry_type`
+    /// named `special_name`, optionally carrying a link target.
+    fn build_tar_with_special_entry(
+        good_name: &str,
+        good_content: &[u8],
+        special_name: &str,
+        entry_type: tar::EntryType,
+        link_target: Option<&str>,
+    ) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut good = tar::Header::new_gnu();
+            set_raw_tar_name(&mut good, good_name);
+            good.set_size(good_content.len() as u64);
+            good.set_cksum();
+            builder.append(&good, good_content).unwrap();
+
+            let mut special = tar::Header::new_gnu();
+            set_raw_tar_name(&mut special, special_name);
+            special.set_entry_type(entry_type);
+            special.set_size(0);
+            if let Some(target) = link_target {
+                special.set_link_name(target).unwrap();
+            }
+            special.set_cksum();
+            builder.append(&special, std::io::empty()).unwrap();
+
+            builder.finish().unwrap();
+        }
+        tar_bytes
+    }
+
+    /// A zip with a benign entry plus one entry named exactly `special_name`
+    /// (no sanitization: the raw name is stored as given). `special_as_symlink`
+    /// selects `ZipWriter::add_symlink` (native symlink entry, DRIFT-002) over
+    /// a plain file entry: `unix_permissions` alone cannot do this, since it
+    /// masks its argument with `& 0o777` and discards the `S_IFLNK` type bit
+    /// (`zip-2.4.2/src/write.rs:472-476`).
+    fn build_zip_with_special_entry(
+        good_name: &str,
+        good_content: &[u8],
+        special_name: &str,
+        special_content: &[u8],
+        special_as_symlink: bool,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let plain = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(good_name, plain).unwrap();
+            writer.write_all(good_content).unwrap();
+
+            let special_options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            if special_as_symlink {
+                let target = String::from_utf8_lossy(special_content).into_owned();
+                writer.add_symlink(special_name, target, special_options).unwrap();
+            } else {
+                writer.start_file(special_name, special_options).unwrap();
+                writer.write_all(special_content).unwrap();
+            }
+
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    /// E2E-NEW-014: a `.tar` with one zip-slip entry and one benign entry.
+    #[tokio::test]
+    async fn e2e_new_014_tar_zip_slip_entry_is_path_out_of_bounds() {
+        let f = fixture().await;
+        let bytes = build_tar(&[("good.txt", b"benign"), ("../../etc/passwd", b"pwned")]);
+        seed_bytes(&f, "/uploads/evil.tar", &bytes).await;
+        let e = extract(&f, "/uploads/evil.tar").await.unwrap_err();
+        assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS);
+        assert!(e.message.contains("../../etc/passwd"), "{}", e.message);
+    }
+
+    /// E2E-NEW-015: same archive, the benign entry's content never appears
+    /// anywhere on disk after the failure (verified through a different
+    /// channel than the tool's own response: `client.exists`).
+    #[tokio::test]
+    async fn e2e_new_015_tar_zip_slip_leaves_nothing_written() {
+        let f = fixture().await;
+        let bytes = build_tar(&[("good.txt", b"benign"), ("../../etc/passwd", b"pwned")]);
+        seed_bytes(&f, "/uploads/evil.tar", &bytes).await;
+        extract(&f, "/uploads/evil.tar").await.unwrap_err();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert!(!c.exists("/uploads/evil/good.txt").await.unwrap());
+        assert!(!c.exists("/etc/passwd").await.unwrap());
+    }
+
+    /// E2E-NEW-040: a `.zip` entry whose stored name is absolute.
+    #[tokio::test]
+    async fn e2e_new_040_zip_absolute_entry_is_path_out_of_bounds() {
+        let f = fixture().await;
+        let bytes =
+            build_zip_with_special_entry("good.txt", b"benign", "/etc/passwd", b"pwned", false);
+        seed_bytes(&f, "/uploads/evil.zip", &bytes).await;
+        let e = extract(&f, "/uploads/evil.zip").await.unwrap_err();
+        assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS);
+        assert!(e.message.contains("/etc/passwd"), "{}", e.message);
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert!(!c.exists("/uploads/evil/good.txt").await.unwrap());
+    }
+
+    /// E2E-NEW-041: a `.zip` entry with a Windows-style backslash traversal
+    /// name, mirroring `tools::export::ensure_no_escape`'s own windows-style
+    /// test case.
+    #[tokio::test]
+    async fn e2e_new_041_zip_backslash_traversal_entry_is_path_out_of_bounds() {
+        let f = fixture().await;
+        let bytes = build_zip_with_special_entry(
+            "good.txt",
+            b"benign",
+            "..\\..\\windows\\system32\\evil.dll",
+            b"pwned",
+            false,
+        );
+        seed_bytes(&f, "/uploads/evil2.zip", &bytes).await;
+        let e = extract(&f, "/uploads/evil2.zip").await.unwrap_err();
+        assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS);
+    }
+
+    /// E2E-NEW-016: a `.tar` with a symlink entry and one benign entry.
+    #[tokio::test]
+    async fn e2e_new_016_tar_symlink_entry_is_not_supported() {
+        let f = fixture().await;
+        let bytes = build_tar_with_special_entry(
+            "good.txt",
+            b"benign",
+            "link",
+            tar::EntryType::Symlink,
+            Some("/etc/passwd"),
+        );
+        seed_bytes(&f, "/uploads/evil3.tar", &bytes).await;
+        let e = extract(&f, "/uploads/evil3.tar").await.unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert!(e.message.contains("link"), "{}", e.message);
+        assert!(e.message.contains("symlink"), "{}", e.message);
+    }
+
+    /// E2E-NEW-017: a `.tar` hardlink entry; the message names a hardlink,
+    /// not the word "symlink".
+    #[tokio::test]
+    async fn e2e_new_017_tar_hardlink_entry_is_not_supported() {
+        let f = fixture().await;
+        let bytes = build_tar_with_special_entry(
+            "good.txt",
+            b"benign",
+            "link",
+            tar::EntryType::Link,
+            Some("good.txt"),
+        );
+        seed_bytes(&f, "/uploads/evil4.tar", &bytes).await;
+        let e = extract(&f, "/uploads/evil4.tar").await.unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert!(e.message.contains("link"), "{}", e.message);
+        assert!(!e.message.contains("symlink"), "{}", e.message);
+    }
+
+    /// E2E-NEW-018: a zip entry with Unix mode `S_IFLNK` (DRIFT-002). Red
+    /// before the fix: `zip` crate's native `is_symlink()` is read directly,
+    /// no check existed before this story.
+    #[tokio::test]
+    async fn e2e_new_018_zip_symlink_entry_is_not_supported() {
+        let f = fixture().await;
+        let bytes =
+            build_zip_with_special_entry("good.txt", b"benign", "link", b"/etc/passwd", true);
+        seed_bytes(&f, "/uploads/evil5.zip", &bytes).await;
+        let e = extract(&f, "/uploads/evil5.zip").await.unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert!(e.message.contains("link"), "{}", e.message);
+    }
+
+    /// E2E-NEW-019: symlink-carrying tar archive leaves the benign entry's
+    /// content unwritten anywhere, same verification channel as
+    /// E2E-NEW-015.
+    #[tokio::test]
+    async fn e2e_new_019_tar_symlink_leaves_nothing_written() {
+        let f = fixture().await;
+        let bytes = build_tar_with_special_entry(
+            "good.txt",
+            b"benign",
+            "link",
+            tar::EntryType::Symlink,
+            Some("/etc/passwd"),
+        );
+        seed_bytes(&f, "/uploads/evil6.tar", &bytes).await;
+        extract(&f, "/uploads/evil6.tar").await.unwrap_err();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert!(!c.exists("/uploads/evil6/good.txt").await.unwrap());
+    }
+
+    /// DRIFT-002 (resolved): the pinned `zip` 2.4.2 crate exposes a native
+    /// `is_symlink()` on `ZipFile`, readable through `by_index_raw` with no
+    /// password, confirmed against the real crate (not a mock).
+    #[test]
+    fn drift_002_zip_entry_is_symlink_readable_via_native_method() {
+        let bytes =
+            build_zip_with_special_entry("good.txt", b"benign", "link", b"/etc/passwd", true);
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let link_index = (0..archive.len())
+            .find(|&i| archive.by_index_raw(i).unwrap().name() == "link")
+            .unwrap();
+        assert!(archive.by_index_raw(link_index).unwrap().is_symlink());
+        let good_index = (0..archive.len())
+            .find(|&i| archive.by_index_raw(i).unwrap().name() == "good.txt")
+            .unwrap();
+        assert!(!archive.by_index_raw(good_index).unwrap().is_symlink());
+    }
+
+    /// FR-NEW-014's own walking technique, exercised directly: ordinary
+    /// relative paths and in-bounds `..` are accepted, an absolute path or a
+    /// net-negative walk (slash or backslash separated) is rejected.
+    #[test]
+    fn ensure_entry_path_safe_accepts_in_bounds_rejects_escapes() {
+        for ok in ["good.txt", "a/b/../c.txt", "./a.txt", "a/.."] {
+            ensure_entry_path_safe(ok).unwrap();
+        }
+        for bad in ["/etc/passwd", "../../etc/passwd", "..\\..\\windows\\system32\\evil.dll"] {
+            ensure_entry_path_safe(bad).unwrap_err();
+        }
     }
 }

@@ -1379,4 +1379,6 @@ unlabeled.
     present, falling back to the bit-mask approach only if not).
   - Detected by: `E2E-NEW-018` (wrong runtime behavior) or `cargo build` (API mismatch).
   - Blocks which requirement: FR-NEW-013.
-  - Status: open.
+  - Status: resolved (E2E-NEW-018 red before, green after; `ZipFile::is_symlink()` at
+    zip-2.4.2/src/read.rs:1746-1749, built on `unix_mode()` at zip-2.4.2/src/types.rs:555-562;
+    SPEC-0015_US-0007).
