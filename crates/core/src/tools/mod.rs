@@ -28,6 +28,7 @@
 // a second implementation.
 pub(crate) mod admin;
 pub mod all;
+pub(crate) mod archive;
 pub mod catalog;
 pub mod context7;
 #[cfg(test)]

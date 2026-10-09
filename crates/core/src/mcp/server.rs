@@ -1098,6 +1098,23 @@ pub struct ExportZipArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExtractArchiveArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path of the archive file to extract.
+    pub path: String,
+    /// Destination directory for the extracted entries.
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// Overwrite existing files at the destination.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Password for an encrypted archive.
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExtractTextArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2082,6 +2099,30 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.export_zip", out)
+    }
+
+    #[tool(
+        name = "fs.extract_archive",
+        description = "Extract an archive file in place inside the volume."
+    )]
+    async fn fs_extract_archive(
+        &self,
+        Parameters(a): Parameters<ExtractArchiveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            crate::tools::archive::extract_archive(
+                &self.state,
+                &a.mount_id,
+                &a.path,
+                a.destination.as_deref(),
+                a.overwrite,
+                a.password.as_deref(),
+            )
+            .await
+        }
+        .await;
+        to_call_result("fs.extract_archive", out)
     }
 
     // ── document family ──────────────────────────────────────────────────────
