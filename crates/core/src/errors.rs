@@ -20,6 +20,7 @@ pub mod code {
     pub const INVALID_ARGUMENT: &str = "ERR_INVALID_ARGUMENT";
     pub const NOT_SUPPORTED: &str = "ERR_NOT_SUPPORTED";
     pub const INTERNAL_ERROR: &str = "ERR_INTERNAL_ERROR";
+    pub const PASSWORD_REQUIRED: &str = "ERR_PASSWORD_REQUIRED";
 }
 
 /// An expected, user-facing error (4xx-style). Rendered to the client as
@@ -93,6 +94,9 @@ impl ToolError {
     pub fn internal(m: impl Into<String>) -> Self {
         Self::new(code::INTERNAL_ERROR, m)
     }
+    pub fn password_required(m: impl Into<String>) -> Self {
+        Self::new(code::PASSWORD_REQUIRED, m)
+    }
 
     /// HTTP status for the REST data plane.
     ///
@@ -121,6 +125,9 @@ impl ToolError {
             // subsystem), which is what 501 means.
             code::NOT_SUPPORTED => 501,
             code::INTERNAL_ERROR => 500,
+            // An archive member is encrypted and no (or the wrong) password was
+            // supplied: a precondition the caller can satisfy and retry.
+            code::PASSWORD_REQUIRED => 428,
             // A new code must be mapped explicitly, so this stays exhaustive in
             // spirit: an unmapped code is a bug, not a silent 500.
             _ => 500,
@@ -211,6 +218,7 @@ mod tests {
             ToolError::write_quota_exceeded("x"),
             ToolError::edit_without_prior_read("x"),
             ToolError::no_match("x"),
+            ToolError::password_required("x"),
         ] {
             assert!(e.is_client_error(), "{} must be a 4xx, got {}", e.code, e.http_status());
         }
@@ -235,11 +243,27 @@ mod tests {
             code::NO_MATCH,
             code::WRITE_QUOTA_EXCEEDED,
             code::INVALID_ARGUMENT,
+            code::PASSWORD_REQUIRED,
         ];
         for c in client_caused {
             let status = ToolError::new(c, "x").http_status();
             assert!((400..500).contains(&status), "{c} mapped to {status}, expected a 4xx");
         }
+    }
+
+    #[test]
+    fn password_required_maps_to_http_428() {
+        assert_eq!(ToolError::password_required("x").code, "ERR_PASSWORD_REQUIRED");
+        assert_eq!(ToolError::password_required("x").http_status(), 428);
+        assert!(ToolError::password_required("x").is_client_error());
+    }
+
+    #[test]
+    fn password_required_display_is_code_colon_message() {
+        assert_eq!(
+            ToolError::password_required("bad guess").to_string(),
+            "ERR_PASSWORD_REQUIRED: bad guess"
+        );
     }
 
     #[test]

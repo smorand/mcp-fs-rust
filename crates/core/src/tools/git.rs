@@ -12571,15 +12571,15 @@ mod tests {
         assert!(err.message.starts_with("remote timeout"), "got {}", err.message);
     }
 
-    /// E2E-NEW-184: enumerating the error code set after implementation still
-    /// finds exactly the 14 constants of `errors.rs:9-22`; the timeout and the
-    /// frozen-prefix failures of FR-NEW-049 all reuse existing codes, adding
-    /// none.
+    /// E2E-NEW-184: the timeout and the frozen-prefix failures of FR-NEW-049
+    /// reuse existing codes, adding none. The frozen count moved from 14 to 15
+    /// only because SPEC-0015 FR-NEW-028 deliberately added
+    /// `ERR_PASSWORD_REQUIRED`; any other new constant still fails here.
     #[test]
     fn e2e_new_184_no_new_error_constant_is_introduced() {
         let src = include_str!("../errors.rs");
         let count = src.matches("pub const ").count();
-        assert_eq!(count, 14, "the ERR_* set must stay exactly 14 constants");
+        assert_eq!(count, 15, "the ERR_* set must stay exactly 15 constants");
     }
 
     // ── US-018: audit, tracing and total token redaction ────────────────────
