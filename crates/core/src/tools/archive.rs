@@ -180,6 +180,28 @@ pub(crate) async fn extract_archive(
         bytes_written += entry.bytes.len() as u64;
     }
 
+    // FR-NEW-025: one audit entry per call, success only, mirroring
+    // `core::fs_ops::write_bytes` (`fs_ops.rs:613`). The detail string names
+    // the destination and the two counters a caller would want in the
+    // audit trail; it never carries `password` (FR-NEW-027).
+    state.safety.record_audit(
+        person,
+        mount_id,
+        "extract_archive",
+        &normalized,
+        &format!("destination={dest} files_written={files_written} bytes_written={bytes_written}"),
+    );
+
+    // FR-NEW-026: exactly these five fields, never `password` (FR-NEW-027).
+    tracing::info!(
+        mount_id = %mount_id,
+        path = %normalized,
+        destination = %dest,
+        files_written = files_written,
+        bytes_written = bytes_written,
+        "archive extracted"
+    );
+
     // FR-NEW-024: the response key is `destination`, never an alias.
     Ok(json!({
         "destination": dest,
@@ -1196,6 +1218,154 @@ mod tests {
         for bad in ["/etc/passwd", "../../etc/passwd", "..\\..\\windows\\system32\\evil.dll"] {
             ensure_entry_path_safe(bad).unwrap_err();
         }
+    }
+
+    // ── US-0010: audit entry, tracing event, password never logged ───────
+
+    /// Runs `f` on a dedicated single-threaded runtime while holding the
+    /// capture lock, mirroring `tools::git`'s own `with_git_hosts_lock`: the
+    /// capturing subscriber (`crate::logging::capture`) only records spans
+    /// and events on the one OS thread that called `lock_for_test`, so the
+    /// whole async body (and anything it `spawn_blocking`s back onto that
+    /// same awaiting task) must run on that thread.
+    fn with_capture_lock<F: std::future::Future>(f: F) -> F::Output {
+        let _guard = crate::logging::capture::lock_for_test();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    /// FR-NEW-025: a successful call records exactly one audit entry naming
+    /// the operation, carrying the destination/files_written/bytes_written
+    /// in its detail, mirroring `core::fs_ops::write_bytes` (`fs_ops.rs:613`).
+    #[tokio::test]
+    async fn e2e_new_025_fr_success_records_one_audit_entry() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"hello")], None);
+        seed_bytes(&f, "/uploads/audited.zip", &bytes).await;
+        let out = extract(&f, "/uploads/audited.zip").await.unwrap();
+
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        let entries: Vec<_> = log.iter().filter(|e| e.op == "extract_archive").collect();
+        assert_eq!(entries.len(), 1, "exactly one audit entry");
+        let detail = &entries[0].detail;
+        assert!(detail.contains(out["destination"].as_str().unwrap()), "{detail}");
+        assert!(detail.contains(&out["files_written"].to_string()), "{detail}");
+        assert!(detail.contains(&out["bytes_written"].to_string()), "{detail}");
+    }
+
+    /// E2E-NEW-028: a failing call (wrong password) logs no line containing
+    /// the literal attempted password.
+    #[test]
+    fn e2e_new_028_failing_call_logs_no_literal_password() {
+        with_capture_lock(async {
+            let f = fixture().await;
+            let bytes =
+                build_zip(&[("secret.txt", b"top secret")], Some("S3cr3t-Pa55-Unique-7731"));
+            seed_bytes(&f, "/uploads/wrongpw.zip", &bytes).await;
+
+            crate::logging::capture::clear();
+            let _ = extract_with_password(&f, "/uploads/wrongpw.zip", Some("wrong")).await;
+
+            for ev in crate::logging::capture::events() {
+                for v in ev.fields.values() {
+                    assert!(!v.contains("wrong"), "event field leaked attempted password: {v}");
+                }
+            }
+            for sp in crate::logging::capture::spans() {
+                for v in sp.fields.values() {
+                    assert!(!v.contains("wrong"), "span field leaked attempted password: {v}");
+                }
+            }
+        });
+    }
+
+    /// E2E-NEW-029: a succeeding call's log line also contains no literal
+    /// substring of the correct password.
+    #[test]
+    fn e2e_new_029_succeeding_call_logs_no_literal_password() {
+        with_capture_lock(async {
+            let f = fixture().await;
+            let bytes =
+                build_zip(&[("secret.txt", b"top secret")], Some("S3cr3t-Pa55-Unique-7731"));
+            seed_bytes(&f, "/uploads/rightpw.zip", &bytes).await;
+
+            crate::logging::capture::clear();
+            extract_with_password(&f, "/uploads/rightpw.zip", Some("S3cr3t-Pa55-Unique-7731"))
+                .await
+                .unwrap();
+
+            for ev in crate::logging::capture::events() {
+                for v in ev.fields.values() {
+                    assert!(
+                        !v.contains("S3cr3t-Pa55-Unique-7731"),
+                        "event field leaked the password: {v}"
+                    );
+                }
+            }
+            for sp in crate::logging::capture::spans() {
+                for v in sp.fields.values() {
+                    assert!(
+                        !v.contains("S3cr3t-Pa55-Unique-7731"),
+                        "span field leaked the password: {v}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// E2E-NEW-044: the success tracing event carries exactly the five named
+    /// fields (`mount_id`, `path`, `destination`, `files_written`,
+    /// `bytes_written`), no `password` key present at all; a failure (wrong
+    /// password) emits no event carrying a `password` key either.
+    #[test]
+    fn e2e_new_044_success_event_has_exactly_five_fields_no_password_key() {
+        with_capture_lock(async {
+            let f = fixture().await;
+            let bytes = build_zip(&[("a.txt", b"hello")], None);
+            seed_bytes(&f, "/uploads/fields.zip", &bytes).await;
+
+            crate::logging::capture::clear();
+            extract(&f, "/uploads/fields.zip").await.unwrap();
+
+            let events = crate::logging::capture::events();
+            let with_all_fields = events.iter().find(|e| {
+                ["mount_id", "path", "destination", "files_written", "bytes_written"]
+                    .iter()
+                    .all(|k| e.fields.contains_key(*k))
+            });
+            let event = with_all_fields.expect("no event carried the five named fields");
+            let keys: std::collections::BTreeSet<_> = event.fields.keys().cloned().collect();
+            let expected: std::collections::BTreeSet<_> = [
+                "mount_id".to_string(),
+                "path".to_string(),
+                "destination".to_string(),
+                "files_written".to_string(),
+                "bytes_written".to_string(),
+                "message".to_string(),
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(keys, expected, "event must carry exactly the five named fields");
+            assert!(!event.fields.contains_key("password"));
+
+            for ev in &events {
+                assert!(!ev.fields.contains_key("password"), "no event may carry a password key");
+            }
+            for sp in crate::logging::capture::spans() {
+                assert!(!sp.fields.contains_key("password"), "no span may carry a password key");
+            }
+
+            crate::logging::capture::clear();
+            let bytes2 =
+                build_zip(&[("secret.txt", b"top secret")], Some("S3cr3t-Pa55-Unique-7731"));
+            seed_bytes(&f, "/uploads/fields2.zip", &bytes2).await;
+            let _ = extract_with_password(&f, "/uploads/fields2.zip", Some("wrong")).await;
+            for ev in crate::logging::capture::events() {
+                assert!(!ev.fields.contains_key("password"), "no event may carry a password key");
+            }
+            for sp in crate::logging::capture::spans() {
+                assert!(!sp.fields.contains_key("password"), "no span may carry a password key");
+            }
+        });
     }
 
     // ── US-0008: destination; no-clobber/overwrite; quota charge; decoded
