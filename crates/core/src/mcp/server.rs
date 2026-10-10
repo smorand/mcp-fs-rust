@@ -1082,6 +1082,17 @@ pub struct TrashListArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListTablesArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path of the source document.
+    pub path: String,
+    /// Continuation marker returned by the previous page; omit for the first page.
+    #[serde(default)]
+    pub marker: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TrashRestoreArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2129,7 +2140,7 @@ impl McpServer {
     // ── document family ──────────────────────────────────────────────────────
 
     #[tool(name = "fs.extract_text", description = EXTRACT_DESC)]
-    async fn fs_extract_text(
+    pub(crate) async fn fs_extract_text(
         &self,
         Parameters(a): Parameters<ExtractTextArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2154,6 +2165,30 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.extract_text", out)
+    }
+
+    #[tool(
+        name = "fs.list_tables",
+        description = "List the tables kept from a document's last conversion, in reading order, 100 per page."
+    )]
+    #[tracing::instrument(skip(self, a), fields(mcp.tool = "fs.list_tables"))]
+    pub(crate) async fn fs_list_tables(
+        &self,
+        Parameters(a): Parameters<ListTablesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            let path = self.norm(&a.path)?;
+            crate::tools::artifacts::list_tables(
+                &self.state,
+                &a.mount_id,
+                &path,
+                a.marker.as_deref(),
+            )
+            .await
+        }
+        .await;
+        to_call_result("fs.list_tables", out)
     }
 
     #[tool(
@@ -3566,8 +3601,8 @@ mod tests {
             .filter(|n| n.starts_with("fs."))
             .collect();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37; SPEC-0015 adds
-        // fs.extract_archive, 38 to 39.
-        assert_eq!(names.len(), 39, "got: {names:?}");
+        // fs.extract_archive, 38 to 39; SPEC-0019 adds fs.list_tables, 39 to 40.
+        assert_eq!(names.len(), 40, "got: {names:?}");
     }
 
     #[test]
@@ -3582,11 +3617,12 @@ mod tests {
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping fs_count 36->37 and
         // the total 103->104.
         // SPEC-0015 adds fs.extract_archive: fs 39, total 106.
-        assert_eq!(fs_count, 39, "got: {names:?}");
+        // SPEC-0019 adds fs.list_tables: fs 40, total 107.
+        assert_eq!(fs_count, 40, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 106, "got: {names:?}");
+        assert_eq!(names.len(), 107, "got: {names:?}");
     }
 
     #[test]
@@ -3918,7 +3954,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 102, "the frozen contract covers 102 non-search tools");
+        assert_eq!(checked, 103, "the frozen contract covers 103 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -3939,8 +3975,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 102, "got: {names:?}");
-        assert_eq!(expected.len(), 102, "the golden contract itself must hold 102 names");
+        assert_eq!(names.len(), 103, "got: {names:?}");
+        assert_eq!(expected.len(), 103, "the golden contract itself must hold 103 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

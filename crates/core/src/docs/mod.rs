@@ -11,6 +11,7 @@
 //! CSV, images (OCR) and plain text are supported. Audio and video are out of
 //! scope and answer `ERR_NOT_SUPPORTED`, like the C#.
 
+pub(crate) mod artifacts;
 pub mod docx;
 pub mod extract;
 pub mod mime;

@@ -1,6 +1,6 @@
 | Story | Spec | Title | Depends on | Tier | Status | Branch | Base |
 |---|---|---|---|---|---|---|---|
-| US-0001 | SPEC-0019 | table artifacts from text extraction | main | 1 | todo | | |
+| US-0001 | SPEC-0019 | table artifacts from text extraction | main | 1 | done | story/US-0001-table-artifacts-from-text-extraction | main |
 | US-0002 | SPEC-0019 | converter bundle and conversion capture | US-0001 | 1 | todo | | |
 | US-0003 | SPEC-0019 | get a table as markdown or csv | US-0002 | 1 | todo | | |
 | US-0004 | SPEC-0019 | table refusals and table routes | US-0003 | 1 | todo | | |

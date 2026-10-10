@@ -1129,6 +1129,37 @@
       }
     },
     {
+      "name": "fs.list_tables",
+      "description": "List the tables kept from a document's last conversion, in reading order, 100 per page.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path of the source document.",
+            "type": "string"
+          },
+          "marker": {
+            "description": "Continuation marker returned by the previous page; omit for the first page.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id",
+          "path"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "fs.mkdir",
       "description": "Create a directory (parents by default).",
       "inputSchema": {

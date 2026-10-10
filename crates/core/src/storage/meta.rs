@@ -10,7 +10,7 @@
 
 use crate::errors::{Result, ToolError};
 use crate::storage::rel::dialect::{Assign, ColumnType, Dialect, Upsert};
-use crate::storage::rel::schema::{Column, Index, SchemaSet, Table};
+use crate::storage::rel::schema::{Column, ColumnMigration, Index, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
 use crate::storage::traits::{
     ExportLinkRow, MODE_DIR, MetaBackend, NodeRow, PutFileResult, TrashEntryRow,
@@ -57,10 +57,19 @@ const SHA_LEN: u32 = 128;
 /// A UUIDv4 string is exactly 36 characters (SPEC-0012 US-0001, FR-NEW-015).
 const EXPORT_TOKEN_LEN: u32 = 36;
 
+/// A node revision and an artifact set id are UUIDv4 strings (SPEC-0019 DEC-003).
+const UUID_LEN: u32 = 36;
+/// `exact` or `approximate` (SPEC-0019 FR-NEW-002).
+const QUALITY_LEN: u32 = 16;
+/// Refusal when the document changed between reading it and committing its
+/// artifacts (SPEC-0019 FR-NEW-035).
+const CHANGED_DURING_CONVERSION: &str = "Document changed during conversion";
+
 const SELECT_COLS: &str = "path, parent, name, kind, size, mode, mtime, ctime, atime, sha256";
 
-/// Every column of `nodes`, in the order the upserts bind them.
-const NODE_COLS: [&str; 11] = [
+/// Every column of `nodes`, in the order the upserts bind them. `rev` is last:
+/// every insert, path change and byte write binds a fresh one (DEC-003).
+const NODE_COLS: [&str; 12] = [
     "volume_id",
     "path",
     "parent",
@@ -72,7 +81,27 @@ const NODE_COLS: [&str; 11] = [
     "ctime",
     "atime",
     "sha256",
+    "rev",
 ];
+
+/// Every column of `doc_tables`, in the order the insert binds them.
+const DOC_TABLE_COLS: [&str; 10] = [
+    "volume_id",
+    "set_id",
+    "seq",
+    "caption",
+    "row_count",
+    "col_count",
+    "quality",
+    "cells",
+    "line_start",
+    "line_count",
+];
+
+/// A fresh node revision: a node insert, path change or byte write calls this.
+fn new_rev() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 /// The longest path the metadata backend can store, when it has a limit at all.
 ///
@@ -174,6 +203,69 @@ pub fn schema() -> SchemaSet {
                 ],
                 vec!["token"],
             ),
+            // SPEC-0019 data model: the pointer a reader follows to the set
+            // built from the node revision it names.
+            Table::new(
+                "doc_artifact_current",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("path", ColumnType::TextKey(PATH_LEN)),
+                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("node_rev", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("updated_at", ColumnType::BigInt),
+                ],
+                vec!["volume_id", "path"],
+            ),
+            Table::new(
+                "doc_artifact_sets",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("path", ColumnType::TextKey(PATH_LEN)),
+                    Column::required("node_rev", ColumnType::TextKey(UUID_LEN)),
+                    Column::new("text_sha", ColumnType::TextKey(SHA_LEN)),
+                    Column::required("text_len", ColumnType::BigInt).default("0"),
+                    Column::required("report", ColumnType::Text),
+                    Column::new("superseded_at", ColumnType::BigInt),
+                    Column::required("created_at", ColumnType::BigInt),
+                ],
+                vec!["volume_id", "set_id"],
+            ),
+            Table::new(
+                "doc_images",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("seq", ColumnType::BigInt),
+                    Column::required("caption", ColumnType::Text),
+                    Column::new("page", ColumnType::BigInt),
+                    Column::required("format", ColumnType::TextKey(8)),
+                    Column::required("sha256", ColumnType::TextKey(SHA_LEN)),
+                    Column::required("size", ColumnType::BigInt),
+                    Column::required("line_start", ColumnType::BigInt),
+                    Column::required("line_count", ColumnType::BigInt),
+                    Column::new("caption_line", ColumnType::BigInt),
+                ],
+                vec!["volume_id", "set_id", "seq"],
+            ),
+            // `row_count`/`col_count` rather than the design's `rows`/`cols`:
+            // `ROWS` is reserved in SQL Server's `OFFSET ... ROWS` grammar.
+            Table::new(
+                "doc_tables",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("seq", ColumnType::BigInt),
+                    Column::required("caption", ColumnType::Text),
+                    Column::required("row_count", ColumnType::BigInt),
+                    Column::required("col_count", ColumnType::BigInt),
+                    Column::required("quality", ColumnType::TextKey(QUALITY_LEN)),
+                    Column::required("cells", ColumnType::Text),
+                    Column::required("line_start", ColumnType::BigInt),
+                    Column::required("line_count", ColumnType::BigInt),
+                ],
+                vec!["volume_id", "set_id", "seq"],
+            ),
         ],
         vec![
             Index {
@@ -188,8 +280,57 @@ pub fn schema() -> SchemaSet {
                 // Supports `fs.trash_list`'s ordering (US-0004), scoped by volume.
                 columns: vec!["volume_id", "deleted_at"],
             },
+            Index {
+                name: "idx_doc_artifact_sets_path",
+                table: "doc_artifact_sets",
+                columns: vec!["volume_id", "path"],
+            },
         ],
     )
+    // SPEC-0019 DEC-003: the validity token of a node. Existing rows keep NULL
+    // until a conversion stamps them.
+    .column_migration(ColumnMigration {
+        table: "nodes",
+        column: "rev",
+        ty: ColumnType::TextKey(UUID_LEN),
+        not_null: false,
+        default: "NULL",
+    })
+}
+
+/// One table of an artifact set about to be committed (SPEC-0019 data model).
+pub(crate) struct NewDocTable {
+    /// The n of `table-n`.
+    pub seq: i64,
+    pub caption: String,
+    pub rows: i64,
+    pub cols: i64,
+    pub quality: String,
+    /// JSON array of arrays of strings.
+    pub cells: String,
+    /// 0 based first line of the table in the conversion text.
+    pub line_start: i64,
+    pub line_count: i64,
+}
+
+/// A conversion's whole artifact set, committed at once.
+pub(crate) struct NewArtifactSet {
+    pub set_id: String,
+    pub path: String,
+    pub node_rev: String,
+    pub text_sha: Option<String>,
+    pub text_len: i64,
+    pub report: String,
+    pub tables: Vec<NewDocTable>,
+}
+
+/// A listed table: what `fs.list_tables` reports.
+pub(crate) struct DocTableRow {
+    pub seq: i64,
+    pub caption: String,
+    pub rows: i64,
+    pub cols: i64,
+    pub quality: String,
 }
 
 /// The metadata tree of one volume.
@@ -239,7 +380,8 @@ impl RelationalMetaStore {
                     .bind(now)
                     .bind(now)
                     .bind(now)
-                    .bind(None::<String>),
+                    .bind(None::<String>)
+                    .bind(new_rev()),
             )
             .await?;
         Ok(())
@@ -391,6 +533,164 @@ impl RelationalMetaStore {
         Ok(row)
     }
 
+    /// The revision of the node at `path`, stamping a fresh one first when the
+    /// row predates the `rev` column (SPEC-0019 DEC-003). `None` when no node
+    /// is there. Idempotent: the stamp only fills a NULL, so a retry or a
+    /// concurrent caller reads back the one value that won.
+    pub(crate) async fn ensure_node_rev(&self, path: &str) -> Result<Option<String>> {
+        let volume = self.volume_id.clone();
+        let path = path.to_string();
+        run_retrying(&*self.db, move |tx| {
+            let (volume, path) = (volume.clone(), path.clone());
+            Box::pin(async move {
+                tx.execute(
+                    &Query::new(
+                        "UPDATE nodes SET rev=?1 WHERE volume_id=?2 AND path=?3 AND rev IS NULL",
+                    )
+                    .bind(new_rev())
+                    .bind(&volume)
+                    .bind(&path),
+                )
+                .await?;
+                tx_node_rev(tx, &volume, &path).await
+            })
+        })
+        .await
+    }
+
+    /// Commit a conversion's artifact set and point `path` at it, in one
+    /// transaction that first checks the node still carries `set.node_rev`
+    /// (SPEC-0019 DEC-008). The set it replaces is marked superseded, never
+    /// deleted here, so a reader that already resolved it keeps reading whole
+    /// rows. The conversion text blob gains its reference here (DEC-004).
+    pub(crate) async fn commit_artifact_set(&self, set: &NewArtifactSet) -> Result<()> {
+        let dialect = self.db.dialect();
+        let volume = self.volume_id.as_str();
+        let now = now_unix() as i64;
+        let mut tx = self.db.begin().await?;
+        if tx_node_rev(&mut *tx, volume, &set.path).await?.as_deref() != Some(set.node_rev.as_str())
+        {
+            return Err(ToolError::invalid_argument(format!(
+                "{CHANGED_DURING_CONVERSION}: {}",
+                set.path
+            )));
+        }
+        tx.execute(
+            &Query::new(
+                "UPDATE doc_artifact_sets SET superseded_at=?1 \
+                 WHERE volume_id=?2 AND path=?3 AND superseded_at IS NULL",
+            )
+            .bind(now)
+            .bind(volume)
+            .bind(&set.path),
+        )
+        .await?;
+        tx.execute(
+            &Query::new(
+                "INSERT INTO doc_artifact_sets (volume_id, set_id, path, node_rev, text_sha, \
+                 text_len, report, superseded_at, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(volume)
+            .bind(&set.set_id)
+            .bind(&set.path)
+            .bind(&set.node_rev)
+            .bind(set.text_sha.clone())
+            .bind(set.text_len)
+            .bind(&set.report)
+            .bind(None::<i64>)
+            .bind(now),
+        )
+        .await?;
+        let insert_table = format!(
+            "INSERT INTO doc_tables ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            DOC_TABLE_COLS.join(", ")
+        );
+        for t in &set.tables {
+            tx.execute(
+                &Query::new(insert_table.clone())
+                    .bind(volume)
+                    .bind(&set.set_id)
+                    .bind(t.seq)
+                    .bind(&t.caption)
+                    .bind(t.rows)
+                    .bind(t.cols)
+                    .bind(&t.quality)
+                    .bind(&t.cells)
+                    .bind(t.line_start)
+                    .bind(t.line_count),
+            )
+            .await?;
+        }
+        tx_incref(&mut *tx, dialect, volume, set.text_sha.as_deref(), set.text_len).await?;
+        let pointer = dialect.render_upsert(&Upsert::replace(
+            "doc_artifact_current",
+            vec!["volume_id", "path", "set_id", "node_rev", "updated_at"],
+            vec!["volume_id", "path"],
+        ));
+        tx.execute(
+            &Query::new(pointer)
+                .bind(volume)
+                .bind(&set.path)
+                .bind(&set.set_id)
+                .bind(&set.node_rev)
+                .bind(now),
+        )
+        .await?;
+        tx.commit().await
+    }
+
+    /// The id of the set `path` currently points at, only while the node still
+    /// carries the revision that set was built from (FR-NEW-023): one query, so
+    /// the rev check and the pointer read cannot disagree.
+    pub(crate) async fn current_artifact_set(&self, path: &str) -> Result<Option<String>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT c.set_id FROM doc_artifact_current c \
+                     JOIN nodes n ON n.volume_id=c.volume_id AND n.path=c.path \
+                     WHERE c.volume_id=?1 AND c.path=?2 AND n.rev=c.node_rev",
+                )
+                .bind(&self.volume_id)
+                .bind(path),
+            )
+            .await?;
+        row.map(|r| r.text(0)).transpose()
+    }
+
+    /// One page of a set's tables, in reading order.
+    pub(crate) async fn list_artifact_tables(
+        &self,
+        set_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DocTableRow>> {
+        let page = self.db.dialect().render_limit_offset(limit, offset);
+        let rows = self
+            .db
+            .query(
+                &Query::new(format!(
+                    "SELECT seq, caption, row_count, col_count, quality FROM doc_tables \
+                     WHERE volume_id=?1 AND set_id=?2 ORDER BY seq {page}"
+                ))
+                .bind(&self.volume_id)
+                .bind(set_id),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(DocTableRow {
+                    seq: r.i64(0)?,
+                    caption: r.text(1)?,
+                    rows: r.i64(2)?,
+                    cols: r.i64(3)?,
+                    quality: r.text(4)?,
+                })
+            })
+            .collect()
+    }
+
     /// Delete a single `trash_entries` row once `fs.trash_restore` has renamed
     /// the node back (SPEC-0011 US-0005, FR-NEW-009): production counterpart to
     /// [`Self::delete_trash_entry_for_test`].
@@ -428,6 +728,25 @@ async fn tx_kind(tx: &mut dyn RelationalTx, volume: &str, path: &str) -> Result<
         .await?;
     match row {
         Some(r) => Ok(Some(r.text(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// The `rev` of a node, `None` when there is no node or it was never stamped.
+async fn tx_node_rev(
+    tx: &mut dyn RelationalTx,
+    volume: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let row = tx
+        .query_opt(
+            &Query::new("SELECT rev FROM nodes WHERE volume_id=?1 AND path=?2")
+                .bind(volume)
+                .bind(path),
+        )
+        .await?;
+    match row {
+        Some(r) => r.opt_text(0),
         None => Ok(None),
     }
 }
@@ -516,7 +835,8 @@ async fn tx_insert_dir(
                 .bind(now)
                 .bind(now)
                 .bind(now)
-                .bind(None::<String>),
+                .bind(None::<String>)
+                .bind(new_rev()),
         )
         .await?;
     Ok(affected > 0)
@@ -971,7 +1291,8 @@ impl MetaBackend for RelationalMetaStore {
                         .bind(now)
                         .bind(ctime)
                         .bind(now)
-                        .bind(sha.clone()),
+                        .bind(sha.clone())
+                        .bind(new_rev()),
                 )
                 .await?;
                 Ok(PutFileResult { gc, old_size })
@@ -1166,12 +1487,13 @@ impl MetaBackend for RelationalMetaStore {
                     ensure_storable_path(dialect, &new)?;
                     tx.execute(
                         &Query::new(
-                            "UPDATE nodes SET path=?1, parent=?2, name=?3 \
-                             WHERE volume_id=?4 AND path=?5",
+                            "UPDATE nodes SET path=?1, parent=?2, name=?3, rev=?4 \
+                             WHERE volume_id=?5 AND path=?6",
                         )
                         .bind(&new)
                         .bind(PosixPath::parent_of(&new))
                         .bind(PosixPath::name_of(&new))
+                        .bind(new_rev())
                         .bind(&volume)
                         .bind(&old),
                     )

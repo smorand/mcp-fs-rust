@@ -1519,8 +1519,16 @@ pub async fn find_references(client: &VolumeClient, root: &str, name: &str) -> R
 /// Extract a document to a companion `.md` and account for the write.
 ///
 /// A cache hit wrote nothing, so it is not charged, not audited, and does not
-/// record a read. A miss charges the companion's size, records the read (so a
-/// follow-up edit on the companion passes the guard) and audits it.
+/// record a read, and it leaves the artifact set unchanged (SPEC-0019
+/// FR-NEW-026). A miss charges ONCE, before writing anything, the companion,
+/// the kept tables and the conversion text (DEC-005, FR-MOD-001), so a refusal
+/// leaves no companion and no set; then it writes the companion, records the
+/// read (so a follow-up edit on the companion passes the guard), audits it,
+/// and commits the built-in set (FR-NEW-017) when the format gets a companion.
+///
+/// The source revision is read before the bytes, so a write landing during
+/// the extraction makes the commit refuse rather than keep a set built from
+/// older bytes (DEC-008).
 #[allow(clippy::too_many_arguments)]
 pub async fn extract_document(
     client: &VolumeClient,
@@ -1535,7 +1543,13 @@ pub async fn extract_document(
     refresh: bool,
 ) -> Result<Value> {
     let provider = crate::docs::provider_from_config(ocr_config);
-    let payload = crate::docs::extract_text(
+    // A client without the relational store (a test double) keeps no artifacts.
+    let store = client.trash.as_deref();
+    let rev = match store {
+        Some(s) => s.ensure_node_rev(norm).await?,
+        None => None,
+    };
+    let prepared = crate::docs::extract::prepare_extraction(
         client,
         provider.as_ref(),
         norm,
@@ -1547,16 +1561,38 @@ pub async fn extract_document(
     .await?;
     client.touch_atime(norm);
 
-    let cached = payload.get("cached").and_then(Value::as_bool).unwrap_or(false);
-    if let Some(md) = payload.get("md_path").and_then(Value::as_str)
-        && !cached
-    {
-        let bytes = client.stat(md).await?.size;
-        safety.charge_write(person, mount_id, bytes)?;
-        safety.record_read(person, mount_id, md);
-        safety.record_audit(person, mount_id, "extract_text", md, &format!("{bytes} bytes"));
+    let fresh = match prepared {
+        crate::docs::extract::Prepared::Cached(payload) => return Ok(payload),
+        crate::docs::extract::Prepared::Fresh(fresh) => fresh,
+    };
+    // Only an extraction that writes (or would write) a companion converts
+    // the document, an empty one included (FR-NEW-001).
+    let capture = match (store, rev.as_deref(), fresh.companion.is_some()) {
+        (Some(store), Some(rev), true) => Some((
+            store,
+            rev,
+            crate::docs::artifacts::BuiltinSet::new(
+                &fresh.result.text,
+                &fresh.result.tables,
+                fresh.truncated_at(),
+            ),
+        )),
+        _ => None,
+    };
+    let sibling = fresh.sibling_bytes();
+    let total = sibling + capture.as_ref().map_or(0, |(_, _, set)| set.bytes());
+    if total > 0 {
+        safety.charge_write(person, mount_id, total)?;
     }
-    Ok(payload)
+    fresh.write_sibling(client).await?;
+    if let Some(md) = fresh.md_path() {
+        safety.record_read(person, mount_id, md);
+        safety.record_audit(person, mount_id, "extract_text", md, &format!("{sibling} bytes"));
+    }
+    if let Some((store, rev, set)) = &capture {
+        set.commit(client, store, norm, rev).await?;
+    }
+    Ok(fresh.into_payload())
 }
 
 /// Render Markdown to a `.docx` and store it. Keys: `path`, `bytes_written`,
