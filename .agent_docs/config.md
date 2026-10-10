@@ -164,7 +164,7 @@ built-in extractor. **Off by default**, so no existing deployment changes.
 | `mode` | string | `cli` | `cli` or `api`. Anything else is `ERR_INVALID_ARGUMENT` naming the accepted values |
 | `extensions` | list | `[]` | overrides the built-in eligible set when non empty, so a deployment can narrow it to what its converter really handles |
 | `max_input_bytes` | int | `536870912` (512 MiB) | refuse to convert beyond this; checked **before** any byte is written |
-| `cli.command` | list | `[doc-convert, --stdout, --quiet, {document}]` | argv, never a shell string. Exactly one `{document}` placeholder across the whole list |
+| `cli.command` | list | `[doc-convert, --quiet, -o, {outdir}, {document}]` | argv, never a shell string. Exactly one `{document}` and at most one `{outdir}` placeholder across the whole list; with `{outdir}` the bundle is read from that directory (`document.md`, files, `artifacts.json`), without it stdout is the Markdown (SPEC-0019 DEC-006, 2026-10-10) |
 | `cli.timeout_secs` | int | `900` | wall clock ceiling for one conversion; on expiry the child is killed and reaped |
 | `api.url` | string | `""` | `POST` target; must start with `http://` or `https://` |
 | `api.auth_header` | string | `Authorization` | header **NAME**, not necessarily a bearer scheme |

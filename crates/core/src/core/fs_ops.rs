@@ -656,9 +656,10 @@ pub async fn write_bytes_documented(
         Some(service) => {
             match write_companion(client, safety, service, person, mount_id, norm, data, true).await
             {
-                Ok((md_path, bytes_written, _)) => json!({
-                    "md_path": md_path,
-                    "bytes_written": bytes_written,
+                Ok(done) => json!({
+                    "md_path": done.md_path,
+                    "bytes_written": done.bytes_written,
+                    "artifacts_report": done.report,
                 }),
                 Err(e) => json!({ "error": { "code": e.code, "message": e.message } }),
             }
@@ -671,7 +672,8 @@ pub async fn write_bytes_documented(
 }
 
 /// Run the document service on a file already stored in the volume and write its
-/// companion. Keys: `path`, `md_path`, `bytes_written`, `overwritten`.
+/// companion. Keys: `path`, `md_path`, `bytes_written`, `overwritten`,
+/// `artifacts_report` (SPEC-0019 FR-MOD-002).
 ///
 /// Unlike the upload path this one honours the caller's `overwrite` on the
 /// companion, and a conversion failure IS the result: there is no source write to
@@ -695,14 +697,15 @@ pub async fn documentize(
     ensure_input_size(service, norm, data.len())?;
     client.touch_atime(norm);
 
-    let (md_path, bytes_written, overwritten) =
+    let done =
         write_companion(client, safety, service, person, mount_id, norm, &data, overwrite).await?;
     safety.record_read(person, mount_id, norm);
     Ok(json!({
         "path": norm,
-        "md_path": md_path,
-        "bytes_written": bytes_written,
-        "overwritten": overwritten,
+        "md_path": done.md_path,
+        "bytes_written": done.bytes_written,
+        "overwritten": done.overwritten,
+        "artifacts_report": done.report,
     }))
 }
 
@@ -739,13 +742,28 @@ fn ensure_input_size(service: &dyn DocService, norm: &str, len: usize) -> Result
     Ok(())
 }
 
-/// Convert `data` and store the Markdown beside its source. Returns the companion
-/// path, its size and whether it replaced an existing file.
+/// What [`write_companion`] did.
+struct Companion {
+    md_path: String,
+    bytes_written: usize,
+    overwritten: bool,
+    /// The conversion report (SPEC-0019 FR-NEW-030).
+    report: String,
+}
+
+/// Convert `data` and store the Markdown beside its source, keeping the
+/// conversion's artifact set (SPEC-0019 FR-NEW-001).
 ///
 /// The companion goes to [`crate::docs::companion_md_path`], the very path
 /// `fs.extract_text` looks at, so a doc service companion is served as a cache hit
-/// by the built-in extractor at no extra cost. It is charged and audited like any
-/// write, under its own op so the audit log distinguishes it from a plain write.
+/// by the built-in extractor at no extra cost. It is audited like any write,
+/// under its own op so the audit log distinguishes it from a plain write.
+///
+/// One charge covers the set, the companion and the conversion text, taken
+/// before anything is written (DEC-005), so a refusal leaves no companion and
+/// no set. The source revision is read before converting: `data` is what the
+/// caller just read or wrote, so a write landing since makes the commit refuse
+/// rather than keep a set built from other bytes (DEC-008).
 #[allow(clippy::too_many_arguments)]
 async fn write_companion(
     client: &VolumeClient,
@@ -756,18 +774,34 @@ async fn write_companion(
     norm: &str,
     data: &[u8],
     overwrite: bool,
-) -> Result<(String, usize, bool)> {
+) -> Result<Companion> {
     let md = crate::docs::companion_md_path(norm);
     let overwritten = client.exists(&md).await?;
     if overwritten && !overwrite {
         return Err(ToolError::no_clobber(format!("'{md}' exists (pass overwrite=true)")));
     }
+    // A client without the relational store (a test double) keeps no artifacts.
+    let store = client.trash.as_deref();
+    let rev = match store {
+        Some(s) => s.ensure_node_rev(norm).await?,
+        None => None,
+    };
     let file_name = norm.rsplit('/').next().unwrap_or(norm);
-    let markdown = service.to_markdown(data, file_name).await?;
-    commit(client, safety, person, mount_id, &md, &markdown, "doc_service").await?;
+    let conversion = service.convert(data, file_name).await?;
+    let markdown = conversion.markdown.as_str();
+    let set = crate::docs::artifacts::capture::PendingSet::converter(markdown);
+    let kept = store.zip(rev.as_deref());
+    let set_bytes = if kept.is_some() { set.bytes() } else { 0 };
+    safety.charge_write(person, mount_id, markdown.len() as i64 + set_bytes)?;
+    client.write_bytes_atomic(&md, markdown.as_bytes()).await?;
+    client.touch_atime_mtime(&md);
+    safety.record_audit(person, mount_id, "doc_service", &md, "");
     // A fresh companion counts as read, so a follow-up edit passes the guard.
     safety.record_read(person, mount_id, &md);
-    Ok((md, markdown.len(), overwritten))
+    if let Some((store, rev)) = kept {
+        set.commit(client, store, norm, rev).await?;
+    }
+    Ok(Companion { md_path: md, bytes_written: markdown.len(), overwritten, report: set.report() })
 }
 
 pub async fn write_text(
@@ -1571,7 +1605,7 @@ pub async fn extract_document(
         (Some(store), Some(rev), true) => Some((
             store,
             rev,
-            crate::docs::artifacts::BuiltinSet::new(
+            crate::docs::artifacts::capture::PendingSet::builtin(
                 &fresh.result.text,
                 &fresh.result.tables,
                 fresh.truncated_at(),
@@ -1589,10 +1623,19 @@ pub async fn extract_document(
         safety.record_read(person, mount_id, md);
         safety.record_audit(person, mount_id, "extract_text", md, &format!("{sibling} bytes"));
     }
-    if let Some((store, rev, set)) = &capture {
-        set.commit(client, store, norm, rev).await?;
+    let report = match &capture {
+        Some((store, rev, set)) => {
+            set.commit(client, store, norm, rev).await?;
+            Some(set.report())
+        }
+        None => None,
+    };
+    let mut payload = fresh.into_payload();
+    // Only a conversion reports (FR-NEW-030); the extracted text is untouched.
+    if let (Some(report), Value::Object(map)) = (report, &mut payload) {
+        map.insert("artifacts_report".into(), Value::String(report));
     }
-    Ok(fresh.into_payload())
+    Ok(payload)
 }
 
 /// Render Markdown to a `.docx` and store it. Keys: `path`, `bytes_written`,
@@ -3563,7 +3606,9 @@ mod tests {
         assert_eq!(f.v.read_bytes("/deck.pptx").await.unwrap(), payload);
         assert_eq!(f.v.read_text("/deck.md").await.unwrap(), MD);
 
-        assert_eq!(f.s.bytes_written(P, M), 64 + MD.len() as i64, "both writes charged");
+        // SPEC-0019 FR-NEW-013: the conversion text is charged beside the
+        // companion; `MD` holds no table, so the set adds nothing else.
+        assert_eq!(f.s.bytes_written(P, M), 64 + 2 * MD.len() as i64, "both writes charged");
         let log = f.s.audit(P, M);
         assert_eq!(log.len(), 2, "one entry per write: {log:?}");
         assert_eq!(log[0].op, "write");

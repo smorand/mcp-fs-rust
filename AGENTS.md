@@ -16,8 +16,9 @@ Server state (metadata tree, ACL, git index, OAuth tokens) lives in a relational
 stay in `infra.blob` (local or S3).
 
 An optional `doc_service` section plugs an external document to Markdown converter in,
-either a CLI (`doc-convert --stdout {document}`, sandboxed in a per call tempdir) or an
-HTTP endpoint. It is off by default and drives `fs.write_bytes`'s
+either a CLI (`doc-convert --quiet -o {outdir} {document}`, sandboxed in a per call tempdir,
+`{outdir}` optional: without it the Markdown is stdout) or an HTTP endpoint (a JSON answer
+is a `{markdown, files, manifest}` bundle). It is off by default and drives `fs.write_bytes`'s
 `trigger_documentation_service` flag, the same flag on the REST `/upload`, and
 `fs.documentize`. The companion is written at the path `fs.extract_text` already uses.
 

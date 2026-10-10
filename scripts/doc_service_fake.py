@@ -7,9 +7,11 @@ It implements the contract `ApiDocService` speaks, and nothing else:
     Content-Type: multipart/form-data with one part named by --file-field (default "file")
     optional auth header, checked by name and exact value
     -> 200 text/markdown, the body IS the Markdown
+    -> with --bundle: 200 application/json, the SPEC-0019 bundle
+       {"markdown": "...", "files": {"<relative path>": "<base64>"}, "manifest": {...}}
 
-The conversion itself is delegated to `doc-convert --stdout --quiet` run inside a
-throwaway directory, so this server is also the reference for what a real
+The conversion itself is delegated to `doc-convert --stdout --quiet` (or, with
+--bundle, `doc-convert --quiet -o <outdir>`) run inside a throwaway directory, so this server is also the reference for what a real
 implementation has to do: stage the upload under its original name, convert,
 answer with the Markdown.
 
@@ -20,13 +22,16 @@ threaded, keeps nothing, and is NOT a production component.
 Usage:
     scripts/doc_service_fake.py --port 8099
     scripts/doc_service_fake.py --port 8099 --auth-header X-Convert-Key --auth-token s3cret
+    scripts/doc_service_fake.py --port 8099 --bundle
 
 Stdlib only: no dependency to install, so a functional test can just run it.
 """
 
 import argparse
+import base64
 import email.parser
 import email.policy
+import json
 import os
 import shutil
 import subprocess
@@ -69,6 +74,50 @@ def convert(file_name, payload):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def convert_bundle(file_name, payload):
+    """Run the converter in bundle mode and return the JSON bundle as bytes.
+
+    `document.md` is the Markdown, every other regular file under the output
+    directory travels base64 encoded by its relative path, and `artifacts.json`,
+    when the converter wrote one, is the manifest. Symlinks are not followed.
+    """
+    workdir = tempfile.mkdtemp(prefix="doc-service-fake-")
+    try:
+        safe = os.path.basename(file_name) or "document"
+        with open(os.path.join(workdir, safe), "wb") as handle:
+            handle.write(payload)
+        outdir = os.path.join(workdir, ".bundle")
+        os.mkdir(outdir)
+        result = subprocess.run(
+            ["doc-convert", "--quiet", "-o", outdir, "./" + safe],
+            cwd=workdir,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            tail = result.stderr[-2048:].decode("utf-8", "replace").strip()
+            raise RuntimeError("doc-convert exited with %d: %s" % (result.returncode, tail))
+        files = {}
+        for root, _dirs, names in os.walk(outdir):
+            for name in names:
+                path = os.path.join(root, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                with open(path, "rb") as handle:
+                    key = os.path.relpath(path, outdir).replace(os.sep, "/")
+                    files[key] = handle.read()
+        if "document.md" not in files:
+            raise RuntimeError("doc-convert wrote no document.md")
+        bundle = {
+            "markdown": files.pop("document.md").decode("utf-8", "replace"),
+            "files": {k: base64.b64encode(v).decode("ascii") for k, v in files.items()},
+        }
+        if "artifacts.json" in files:
+            bundle["manifest"] = json.loads(files["artifacts.json"])
+        return json.dumps(bundle).encode("utf-8")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def parse_file_part(content_type, body):
     """Return `(filename, bytes)` of the part named `file`, or `None`."""
     # The stdlib email parser understands multipart/form-data as long as it is
@@ -91,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
 
     auth_header = ""
     auth_token = ""
+    bundle = False
 
     def log_message(self, fmt, *args):
         sys.stderr.write("doc-service-fake: " + (fmt % args) + "\n")
@@ -130,6 +180,9 @@ class Handler(BaseHTTPRequestHandler):
 
         name, payload = part
         try:
+            if self.bundle:
+                self.reply(200, convert_bundle(name, payload), "application/json")
+                return
             markdown = convert(name, payload)
         except FileNotFoundError:
             self.reply(500, "doc-convert is not on PATH\n")
@@ -161,11 +214,17 @@ def main():
         default="",
         help="expected header value, verbatim. Empty means no authentication.",
     )
+    parser.add_argument(
+        "--bundle",
+        action="store_true",
+        help="answer the SPEC-0019 JSON bundle (markdown, files, manifest) instead of Markdown",
+    )
     args = parser.parse_args()
 
     FILE_PART = args.file_field
     Handler.auth_header = args.auth_header
     Handler.auth_token = args.auth_token
+    Handler.bundle = args.bundle
     # Loopback only: this server runs arbitrary conversions and has no business
     # being reachable from anywhere else.
     server = HTTPServer(("127.0.0.1", args.port), Handler)

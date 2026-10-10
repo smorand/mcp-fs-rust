@@ -763,6 +763,9 @@ pub mod doc_service_mode {
 /// The single placeholder the CLI argv may carry, replaced by the document the
 /// converter must read. There is no `{output}`: the contract is stdout.
 pub const DOC_PLACEHOLDER: &str = "{document}";
+/// The optional output directory placeholder of `doc_service.cli.command`
+/// (SPEC-0019 DEC-006): with it the converter writes a bundle, not stdout.
+pub const OUTDIR_PLACEHOLDER: &str = "{outdir}";
 
 fn d_doc_service_mode() -> String {
     doc_service_mode::CLI.into()
@@ -774,7 +777,13 @@ fn d_doc_service_timeout() -> u64 {
     900
 }
 fn d_doc_service_command() -> Vec<String> {
-    vec!["doc-convert".into(), "--stdout".into(), "--quiet".into(), DOC_PLACEHOLDER.into()]
+    vec![
+        "doc-convert".into(),
+        "--quiet".into(),
+        "-o".into(),
+        OUTDIR_PLACEHOLDER.into(),
+        DOC_PLACEHOLDER.into(),
+    ]
 }
 fn d_doc_service_auth_header() -> String {
     "Authorization".into()
@@ -787,8 +796,10 @@ fn d_doc_service_file_field() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DocServiceCliConfig {
-    /// argv, with exactly one `{document}` placeholder. argv[0] is the binary, so
-    /// a deployment that wants OS level containment wraps it there.
+    /// argv, with exactly one `{document}` placeholder and at most one `{outdir}`
+    /// (with it the converter writes a bundle there, without it the Markdown is
+    /// its stdout). argv[0] is the binary, so a deployment that wants OS level
+    /// containment wraps it there.
     pub command: Vec<String>,
     pub timeout_secs: u64,
 }
@@ -1065,6 +1076,15 @@ fn validate_doc_service(cfg: &DocServiceConfig) -> Result<()> {
                 return Err(ToolError::invalid_argument(format!(
                     "doc_service.cli.command must contain exactly one '{DOC_PLACEHOLDER}' \
                      placeholder across its arguments, found {placeholders}"
+                )));
+            }
+            // One bundle directory: a second would split the converter's output.
+            let outdirs: usize =
+                cfg.cli.command.iter().map(|a| a.matches(OUTDIR_PLACEHOLDER).count()).sum();
+            if outdirs > 1 {
+                return Err(ToolError::invalid_argument(format!(
+                    "doc_service.cli.command may contain at most one '{OUTDIR_PLACEHOLDER}' \
+                     placeholder across its arguments, found {outdirs}"
                 )));
             }
             Ok(())
@@ -1581,9 +1601,10 @@ infra:
         assert_eq!(c.doc_service.mode, doc_service_mode::CLI);
         assert!(c.doc_service.extensions.is_empty(), "empty means the built-in set");
         assert_eq!(c.doc_service.max_input_bytes, 536_870_912);
+        // SPEC-0019 design 5.5: the default writes a bundle into `{outdir}`.
         assert_eq!(
             c.doc_service.cli.command,
-            vec!["doc-convert", "--stdout", "--quiet", "{document}"]
+            vec!["doc-convert", "--quiet", "-o", "{outdir}", "{document}"]
         );
         assert_eq!(c.doc_service.cli.timeout_secs, 900);
         assert_eq!(c.doc_service.api.auth_header, "Authorization");
@@ -1643,6 +1664,22 @@ infra:
         )
         .expect_err("two documents is not the contract");
         assert!(e.message.contains("exactly one"), "{}", e.message);
+    }
+
+    /// SPEC-0019 DEC-006: `{outdir}` is optional, but one bundle directory only.
+    #[test]
+    fn doc_service_cli_accepts_zero_or_one_outdir_placeholder() {
+        for command in ["[c, \"{document}\"]", "[c, -o, \"{outdir}\", \"{document}\"]"] {
+            let yaml = format!("doc_service:\n  enabled: true\n  cli:\n    command: {command}\n");
+            ServerConfig::from_yaml(&yaml).unwrap_or_else(|e| panic!("{command}: {}", e.message));
+        }
+        let e = ServerConfig::from_yaml(
+            "doc_service:\n  enabled: true\n  cli:\n    command: [c, \"{outdir}\", \"{outdir}\", \"{document}\"]\n",
+        )
+        .expect_err("two output directories is not the contract");
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(e.message.contains(OUTDIR_PLACEHOLDER), "{}", e.message);
+        assert!(e.message.contains("at most one"), "{}", e.message);
     }
 
     #[test]
