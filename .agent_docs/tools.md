@@ -1,4 +1,4 @@
-# Tool reference (103 tools)
+# Tool reference (104 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -165,13 +165,14 @@ total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
 untouched on failure). The password is never logged. REST twin: `POST
 /api/fs/{mount_id}/extract-archive`.
 
-## fs artifacts (1)
+## fs artifacts (2)
 
 | Tool | Purpose | Params | Returns | Annotations | Who |
 |---|---|---|---|---|---|
 | `fs.list_tables` | tables kept by a document's last conversion | `path`, `marker?` | `tables[{id,caption,rows,columns,csv_quality}],marker` | RO,I,!OW | member |
+| `fs.get_table` | one kept table, `markdown` (default) or `csv`, FR-NEW-002 bytes | `path`, `id`, `format?` | `id,format,content` | RO,I,!OW | member |
 
-(2026-10-10, SPEC-0019 US-0001; full docs land with US-0014.)
+(2026-10-10, SPEC-0019 US-0001, US-0003; full docs land with US-0014.)
 
 ## fs document (3)
 

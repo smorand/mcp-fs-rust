@@ -1916,8 +1916,8 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         assert!(names.iter().any(|n| n == "fs.extract_archive"));
-        // SPEC-0019 adds fs.list_tables, 39 to 40.
-        assert_eq!(names.iter().filter(|n| n.starts_with("fs.")).count(), 40);
+        // SPEC-0019 adds fs.list_tables, 39 to 40, then fs.get_table, 41.
+        assert_eq!(names.iter().filter(|n| n.starts_with("fs.")).count(), 41);
     }
 
     // ── converge round 1 (US-0013..US-0015) ─────────────────────────────────

@@ -867,6 +867,42 @@
       }
     },
     {
+      "name": "fs.get_table",
+      "description": "Get one table kept from a document's last conversion, as Markdown or CSV.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path of the source document.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Table id from fs.list_tables, e.g. table-1.",
+            "type": "string"
+          },
+          "format": {
+            "description": "markdown (default) or csv.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id",
+          "path",
+          "id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "fs.glob",
       "description": "Find files by glob pattern, newest first (cap 100).",
       "inputSchema": {

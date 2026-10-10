@@ -691,6 +691,27 @@ impl RelationalMetaStore {
             .collect()
     }
 
+    /// The JSON cells of table `seq` in a set, `None` when the set has no such
+    /// table (a gap or past the end).
+    pub(crate) async fn artifact_table_cells(
+        &self,
+        set_id: &str,
+        seq: i64,
+    ) -> Result<Option<String>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT cells FROM doc_tables WHERE volume_id=?1 AND set_id=?2 AND seq=?3",
+                )
+                .bind(&self.volume_id)
+                .bind(set_id)
+                .bind(seq),
+            )
+            .await?;
+        row.map(|r| r.text(0)).transpose()
+    }
+
     /// Delete a single `trash_entries` row once `fs.trash_restore` has renamed
     /// the node back (SPEC-0011 US-0005, FR-NEW-009): production counterpart to
     /// [`Self::delete_trash_entry_for_test`].
