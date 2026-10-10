@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: L
 > Depth evidence: FEAT / depth L: 4 areas touched (document conversion, file changes, quota, access), a new persisted concept (document artifacts), 39 requirements. Rescoped after gate round 5 (non convergence): artifacts following their source moved to BL-0038.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-09
 > Project: existing
 > From backlog: BL-0009
