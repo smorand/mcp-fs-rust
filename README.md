@@ -222,7 +222,10 @@ below it (symlinks not followed, total capped by `max_input_bytes`), and
 before. In `api` mode an `application/json` answer (with `response_field` empty) is
 `{"markdown": "...", "files": {"figures/f1.png": "<base64>"}, "manifest": {...}}`. Pipe
 tables of the Markdown are kept as table artifacts (`fs.list_tables`, `CSV quality:
-approximate`), and every conversion result carries an `artifacts_report`.
+approximate`); each line holding one `![alt](target)` whose target is a bundle file in
+`png`, `jpeg`, `gif`, `webp`, `tiff` or `bmp` is kept as an image artifact, captioned and
+paged by the manifest (`fs.list_images`, `fs.get_image`); every conversion result carries
+an `artifacts_report`.
 
 Two tools and two routes:
 

@@ -789,7 +789,7 @@ async fn write_companion(
     let file_name = norm.rsplit('/').next().unwrap_or(norm);
     let conversion = service.convert(data, file_name).await?;
     let markdown = conversion.markdown.as_str();
-    let set = crate::docs::artifacts::capture::PendingSet::converter(markdown);
+    let set = crate::docs::artifacts::capture::PendingSet::converter(&conversion, norm);
     let kept = store.zip(rev.as_deref());
     let set_bytes = if kept.is_some() { set.bytes() } else { 0 };
     safety.charge_write(person, mount_id, markdown.len() as i64 + set_bytes)?;

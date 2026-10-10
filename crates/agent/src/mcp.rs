@@ -309,9 +309,10 @@ mod tests {
         // this story's DT-002 means is the 95 count, not the raw catalogue
         // size. SPEC-0011 US-0005 adds `fs.trash_restore` (99 to 100), SPEC-0012 US-0002
         // adds `fs.export_zip` (100 to 101), SPEC-0015 adds `fs.extract_archive` (101 to 102),
-        // SPEC-0019 adds `fs.list_tables` (102 to 103), then `fs.get_table` (104).
+        // SPEC-0019 adds `fs.list_tables` (102 to 103), then `fs.get_table` (104), then
+        // `fs.list_images` and `fs.get_image` (106).
         let non_search = tools.keys().filter(|n| !n.starts_with("search.")).count();
-        assert_eq!(non_search, 104, "expected the full 104-tool catalogue, got {:?}", tools.keys());
+        assert_eq!(non_search, 106, "expected the full 106-tool catalogue, got {:?}", tools.keys());
         assert!(
             tools.contains_key("fs.read_bytes"),
             "fs.read_bytes must be present: {:?}",

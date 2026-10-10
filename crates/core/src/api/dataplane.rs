@@ -70,6 +70,8 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("GET", "find-references"),
     ("GET", "audit-log"),
     // SPEC-0019 DEC-001: document artifacts, the same functions as the tools.
+    ("GET", "images"),
+    ("GET", "image"),
     ("GET", "tables"),
     ("GET", "table"),
     // tool parity, write and compute side
@@ -136,6 +138,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/find-definition", get(find_definition))
         .route("/api/fs/{mount_id}/find-references", get(find_references))
         .route("/api/fs/{mount_id}/audit-log", get(audit_log))
+        .route("/api/fs/{mount_id}/images", get(list_images))
+        .route("/api/fs/{mount_id}/image", get(get_image))
         .route("/api/fs/{mount_id}/tables", get(list_tables))
         .route("/api/fs/{mount_id}/table", get(get_table))
         // tool parity, write and compute side
@@ -653,6 +657,38 @@ async fn export_zip(
         }
         let paths = a.req_str_array("paths")?;
         crate::tools::export::export_zip(&r.state, &r.mount, &paths).await
+    })
+    .await
+}
+
+/// The images kept from a document's last conversion. Same function as
+/// `fs.list_images`, so the refusal order and categories cannot drift apart.
+async fn list_images(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let q = Q(q);
+    guarded_json(state, headers, mount, |r| async move {
+        let norm = r.norm(q.req_str("path")?)?;
+        crate::tools::artifacts::list_images(&r.state, &r.mount, &norm, q.opt("marker")).await
+    })
+    .await
+}
+
+/// One kept image, its picture base64 encoded. Same function as `fs.get_image`.
+async fn get_image(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let q = Q(q);
+    guarded_json(state, headers, mount, |r| async move {
+        let norm = r.norm(q.req_str("path")?)?;
+        let id = q.req_str("id")?;
+        crate::tools::artifacts::get_image(&r.state, &r.mount, &norm, id).await
     })
     .await
 }
@@ -2457,8 +2493,11 @@ mod tests {
     async fn the_route_inventory_covers_every_registered_path() {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
-        // 42 since SPEC-0019 US-0004 added tables and table.
-        assert_eq!(REST_ROUTES.len(), 42);
+        // 42 since SPEC-0019 US-0004 added tables and table, 44 since US-0005
+        // added images and image.
+        assert_eq!(REST_ROUTES.len(), 44);
+        assert!(REST_ROUTES.contains(&("GET", "images")));
+        assert!(REST_ROUTES.contains(&("GET", "image")));
         assert!(REST_ROUTES.contains(&("GET", "tables")));
         assert!(REST_ROUTES.contains(&("GET", "table")));
         assert!(REST_ROUTES.contains(&("POST", "export-zip")));
@@ -2934,6 +2973,104 @@ mod tests {
     async fn table_routes_refuse_a_stranger_with_403() {
         let h = converted_report().await;
         for uri in [u("tables?path=/report.pdf"), u("table?path=/report.pdf&id=table-1")] {
+            let (s, b) = h
+                .send(
+                    Request::builder()
+                        .uri(&uri)
+                        .header("Authorization", format!("Bearer {}", h.stranger_token))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{uri}");
+            let v: Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!(v["error"], code::FORBIDDEN);
+        }
+    }
+
+    // ── images (SPEC-0019 US-0005) ──────────────────────────────────────────────
+
+    const LOGO: &[u8] = b"\x89PNG logo";
+
+    /// A harness whose converter turns `/report.pdf` into one captioned PNG on
+    /// page 2, already converted through the REST door.
+    async fn converted_pictures() -> Harness {
+        use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
+        let meta = PictureMeta { caption: "Logo".into(), caption_failed: false, page: Some(2) };
+        let conversion = Conversion {
+            markdown: "# R\n\n![l](fig/logo.png)\n".into(),
+            files: [("fig/logo.png".to_string(), LOGO.to_vec())].into(),
+            manifest: Some(Manifest { pictures: [("fig/logo.png".to_string(), meta)].into() }),
+        };
+        let h = Harness::with_doc_service(Some(Arc::new(StubDocService::bundle(conversion)))).await;
+        h.seed("/report.pdf", "%PDF-1.4 source").await;
+        h.seed("/notes.pdf", "%PDF-1.4 never converted").await;
+        let (s, v) = h.post(&u("documentize"), json!({"path": "/report.pdf"})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["artifacts_report"], "1 images, 0 tables");
+        h
+    }
+
+    /// `GET images` answers what `fs.list_images` answers.
+    #[tokio::test]
+    async fn images_route_lists_the_kept_images() {
+        let h = converted_pictures().await;
+        let (s, v) = h.get(&u("images?path=/report.pdf")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"images": [{"id": "image-1", "caption": "Logo", "page": 2}], "marker": null})
+        );
+    }
+
+    /// `GET image` answers what `fs.get_image` answers, the picture byte exact.
+    #[tokio::test]
+    async fn image_route_returns_the_picture() {
+        use base64::Engine as _;
+        let h = converted_pictures().await;
+        let (s, v) = h.get(&u("image?path=/report.pdf&id=image-1")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["id"], "image-1");
+        assert_eq!(v["format"], "png");
+        assert_eq!(v["caption"], "Logo");
+        assert_eq!(v["page"], 2);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(v["base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, LOGO);
+    }
+
+    /// SPEC-0019/E2E-120 (HTTP door): a never converted document answers the
+    /// not found category with `No artifacts: document not extracted`; the
+    /// MCP door is pinned in `tools::artifacts`.
+    #[tokio::test]
+    async fn spec_0019_e2e_120_no_artifacts_is_not_found_for_the_http_consumer() {
+        let h = converted_pictures().await;
+        let (s, v) = h.get(&u("images?path=/notes.pdf")).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+        assert_eq!(v["error"], code::NOT_FOUND);
+        assert!(v["detail"].as_str().unwrap().contains("No artifacts: document not extracted"));
+    }
+
+    /// Refusals keep their categories on both image routes.
+    #[tokio::test]
+    async fn image_routes_map_refusals_to_their_status() {
+        let h = converted_pictures().await;
+        let cases = [
+            (u("image?path=/report.pdf&id=image-9"), StatusCode::NOT_FOUND, "Not found: image-9"),
+            (u("images?path=/ghost.pdf"), StatusCode::NOT_FOUND, "not a file: /ghost.pdf"),
+            (
+                u("images?path=/report.pdf&marker=zzz"),
+                StatusCode::BAD_REQUEST,
+                "Invalid continuation marker: zzz",
+            ),
+        ];
+        for (uri, status, want) in cases {
+            let (s, v) = h.get(&uri).await;
+            assert_eq!(s, status, "{uri}: {v}");
+            assert!(v["detail"].as_str().unwrap().contains(want), "{uri}: {v}");
+        }
+        for uri in [u("images?path=/report.pdf"), u("image?path=/report.pdf&id=image-1")] {
             let (s, b) = h
                 .send(
                     Request::builder()

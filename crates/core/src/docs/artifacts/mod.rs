@@ -49,12 +49,14 @@ impl CsvQuality {
 /// Which list a continuation marker belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ListKind {
+    Images,
     Tables,
 }
 
 impl ListKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Images => "images",
             Self::Tables => "tables",
         }
     }

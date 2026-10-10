@@ -1019,7 +1019,35 @@ const OPERATIONS: &[Op] = &[
         params: NO_PARAMS,
         body: "ExportZipBody",
     },
-    // SPEC-0019 DEC-001: the table routes call the same functions as the tools.
+    // SPEC-0019 DEC-001: the artifact routes call the same functions as the tools.
+    Op {
+        method: "GET",
+        sub: "images",
+        path: "/api/fs/{mount_id}/images",
+        tool: "fs.list_images",
+        params: &[
+            Param { name: "path", required: true, ty: "string", format: "", default: Def::Absent },
+            Param {
+                name: "marker",
+                required: false,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+        ],
+        body: "",
+    },
+    Op {
+        method: "GET",
+        sub: "image",
+        path: "/api/fs/{mount_id}/image",
+        tool: "fs.get_image",
+        params: &[
+            Param { name: "path", required: true, ty: "string", format: "", default: Def::Absent },
+            Param { name: "id", required: true, ty: "string", format: "", default: Def::Absent },
+        ],
+        body: "",
+    },
     Op {
         method: "GET",
         sub: "tables",

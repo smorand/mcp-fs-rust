@@ -27,7 +27,7 @@ use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use crate::git::oauth::store::OAuthSession;
 use crate::storage::admin::{ROLE_OWNER, RelationalAdminStore};
 use crate::storage::meta::{
-    NewArtifactSet, NewDocTable, RelationalMetaStore, delete_export_link_if_live,
+    NewArtifactSet, NewDocImage, NewDocTable, RelationalMetaStore, delete_export_link_if_live,
     insert_export_link, select_expired_export_links,
 };
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
@@ -766,6 +766,19 @@ fn doc_table(seq: i64, caption: &str) -> NewDocTable {
     }
 }
 
+fn doc_image(seq: i64, page: Option<i64>) -> NewDocImage {
+    NewDocImage {
+        seq,
+        caption: format!("cap {seq} é 😀"),
+        page,
+        format: "png".to_string(),
+        sha256: "sha-img".to_string(),
+        size: 7,
+        line_start: seq,
+        line_count: 1,
+    }
+}
+
 /// The artifact tables, the `nodes.rev` validity token and the current set
 /// pointer behave the same on every engine (DEC-002, DEC-003, DEC-008).
 async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
@@ -787,7 +800,8 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
         node_rev: rev.clone(),
         text_sha: Some("sha-text".into()),
         text_len: 42,
-        report: "0 images, 2 tables".into(),
+        report: "2 images, 2 tables".into(),
+        images: vec![doc_image(3, Some(1)), doc_image(1, None)],
         tables: vec![doc_table(2, "Q2"), doc_table(1, "Q1 é | \"x\"")],
     };
     m.commit_artifact_set(&set).await?;
@@ -809,12 +823,30 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     assert_eq!(m.artifact_table_cells(&set.set_id, 3).await?, None, "{who}: no such table");
     assert_eq!(other.artifact_table_cells(&set.set_id, 1).await?, None, "{who}: cells scoped");
 
+    let images = m.list_artifact_images(&set.set_id, 10, 0).await?;
+    let listed: Vec<_> = images.iter().map(|i| (i.seq, i.caption.as_str(), i.page)).collect();
+    assert_eq!(listed, vec![(1, "cap 1 é 😀", None), (3, "cap 3 é 😀", Some(1))], "{who}: images");
+    let page = m.list_artifact_images(&set.set_id, 1, 1).await?;
+    assert_eq!(page.iter().map(|i| i.seq).collect::<Vec<_>>(), vec![3], "{who}: image paging");
+    assert!(other.list_artifact_images(&set.set_id, 10, 0).await?.is_empty(), "{who}: scoped");
+    let one = m.artifact_image(&set.set_id, 3).await?.expect("image 3");
+    assert_eq!((one.format.as_str(), one.sha256.as_str(), one.page), ("png", "sha-img", Some(1)));
+    assert!(m.artifact_image(&set.set_id, 2).await?.is_none(), "{who}: a gap is no image");
+    assert!(other.artifact_image(&set.set_id, 3).await?.is_none(), "{who}: image scoped");
+    // Each placement holds one reference to the shared picture blob (DEC-004).
+    assert_eq!(m.blob_refcount_for_test("sha-img").await?, Some(2), "{who}: one ref per image");
+
     // A same bytes rewrite changes rev, so the set is no longer served.
     m.put_file("/b.xlsx", Some("sha-b"), 3, MODE_FILE).await?;
     assert_eq!(m.current_artifact_set("/b.xlsx").await?, None, "{who}: rewrite invalidates");
 
     // A commit built from the old rev is refused and changes nothing.
-    let stale = NewArtifactSet { set_id: format!("{tag}-set2"), tables: Vec::new(), ..set };
+    let stale = NewArtifactSet {
+        set_id: format!("{tag}-set2"),
+        images: Vec::new(),
+        tables: Vec::new(),
+        ..set
+    };
     let err = m.commit_artifact_set(&stale).await.expect_err("stale rev must be refused");
     assert_eq!(err.message, "Document changed during conversion: /b.xlsx", "{who}");
 
