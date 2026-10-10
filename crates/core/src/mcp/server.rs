@@ -1656,7 +1656,7 @@ impl McpServer {
     // ── edit family ──────────────────────────────────────────────────────────
 
     #[tool(name = "fs.edit", description = "Replace a unique string; dry_run returns the diff.")]
-    async fn fs_edit(
+    pub(crate) async fn fs_edit(
         &self,
         Parameters(a): Parameters<EditArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1876,7 +1876,7 @@ impl McpServer {
         name = "fs.list_dir",
         description = "Flat directory listing with kinds and optional sizes."
     )]
-    async fn fs_list_dir(
+    pub(crate) async fn fs_list_dir(
         &self,
         Parameters(a): Parameters<ListDirArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1973,7 +1973,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.delete", description = "Delete a path (moves to trash by default).")]
-    async fn fs_delete(
+    pub(crate) async fn fs_delete(
         &self,
         Parameters(a): Parameters<DeleteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2028,7 +2028,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.copy", description = "Copy a file or tree (no-clobber by default).")]
-    async fn fs_copy(
+    pub(crate) async fn fs_copy(
         &self,
         Parameters(a): Parameters<CopyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2132,7 +2132,7 @@ impl McpServer {
         name = "fs.trash_restore",
         description = "Restore a trashed file or directory subtree back to its original path, renaming to `_restoredN` on collision."
     )]
-    async fn fs_trash_restore(
+    pub(crate) async fn fs_trash_restore(
         &self,
         Parameters(a): Parameters<TrashRestoreArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2164,7 +2164,7 @@ impl McpServer {
         name = "fs.extract_archive",
         description = "Extract an archive file in place inside the volume."
     )]
-    async fn fs_extract_archive(
+    pub(crate) async fn fs_extract_archive(
         &self,
         Parameters(a): Parameters<ExtractArchiveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2553,7 +2553,7 @@ impl McpServer {
         name = "admin.undelete_project",
         description = "Clear a project's soft-delete flag, immediately restoring access (owner or platform admin)."
     )]
-    async fn admin_undelete_project(
+    pub(crate) async fn admin_undelete_project(
         &self,
         Parameters(a): Parameters<ProjectIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {

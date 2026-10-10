@@ -6416,6 +6416,58 @@ async fn pull_branch(
     .await
 }
 
+/// The `file://` clone and pull mechanics for other modules' e2e tests: the
+/// registered tools reject that scheme (FR-NEW-041), so a no network remote
+/// is only reachable one layer down. The caller hands its own store in, as
+/// this module's tests do, because the process wide one is fixed to the first
+/// caller's configuration.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Clone `url` into `ctx`'s `mount_id`, through [`clone_and_import`].
+    pub(crate) async fn clone_from(
+        ctx: &ToolCtx,
+        store: Arc<GitRepoStore>,
+        mount_id: &str,
+        url: &str,
+    ) -> Result<Value> {
+        clone_and_import(ctx, store, mount_id, url, None, 0, None, "anonymous".into()).await
+    }
+
+    /// Pull `branch` from `url` into `mount_id`, through [`pull_branch`].
+    pub(crate) async fn pull_from(
+        ctx: &ToolCtx,
+        store: &GitRepoStore,
+        mount_id: &str,
+        url: &str,
+        branch: &str,
+    ) -> Result<Value> {
+        let entry = store.get_or_open_repo(mount_id).await?;
+        let local = entry
+            .db
+            .get_ref(&format!("refs/heads/{branch}"))
+            .await?
+            .ok_or_else(|| ToolError::not_found(format!("no branch {branch}")))?
+            .target;
+        let client = ctx.state.stores.client(mount_id).await?;
+        pull_branch(
+            entry,
+            "origin",
+            branch,
+            &local,
+            url,
+            None,
+            "anonymous".into(),
+            client,
+            &ctx.person,
+            ctx.state.safety.clone(),
+            ctx.state.config.git.remote_timeout_secs,
+        )
+        .await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pull_branch_inner(
     entry: Arc<GitRepoEntry>,

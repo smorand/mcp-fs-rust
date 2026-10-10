@@ -11,6 +11,6 @@
 | US-0009 | SPEC-0019 | view line rules and sibling independence | US-0008 | 2 | landed | story/US-0009-view-line-rules-and-sibling-independence | story/US-0008-full-document-view |
 | US-0010 | SPEC-0019 | re-conversion replaces the set | US-0009 | 1 | landed | story/US-0010-re-conversion-replaces-the-set | story/US-0009-view-line-rules-and-sibling-independence |
 | US-0011 | SPEC-0019 | refused and overtaken re-conversions | US-0010 | 1 | landed | story/US-0011-refused-and-overtaken-re-conversions | story/US-0010-re-conversion-replaces-the-set |
-| US-0012 | SPEC-0019 | changed documents lose their artifacts | US-0011 | 1 | todo | | |
+| US-0012 | SPEC-0019 | changed documents lose their artifacts | US-0011 | 1 | landed | story/US-0012-changed-documents-lose-their-artifacts | story/US-0011-refused-and-overtaken-re-conversions |
 | US-0013 | SPEC-0019 | artifacts are not files, stale sets swept | US-0012 | 2 | todo | | |
 | US-0014 | SPEC-0019 | consumer parity, marker scope and docs | US-0013 | 1 | todo | | |

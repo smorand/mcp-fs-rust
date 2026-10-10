@@ -368,8 +368,10 @@ mod e2e {
     use crate::docs::DocService;
     use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
     use crate::mcp::server::{
-        DocumentViewArgs, DocumentizeArgs, ExtractTextArgs, GetImageArgs, GetTableArgs,
-        ListImagesArgs, ListTablesArgs, McpServer, MoveArgs, ReadBytesArgs, WriteBytesArgs,
+        CopyArgs, DeleteArgs, DocumentViewArgs, DocumentizeArgs, EditArgs, ExtractArchiveArgs,
+        ExtractTextArgs, GetImageArgs, GetTableArgs, GitBranchCreateArgs, GitBranchSwitchArgs,
+        GitCheckoutFileArgs, GitCommitArgs, ListDirArgs, ListImagesArgs, ListTablesArgs, McpServer,
+        MountOnlyArgs, MoveArgs, ProjectIdArgs, ReadBytesArgs, TrashRestoreArgs, WriteBytesArgs,
     };
     use crate::state::AppState;
     use crate::tools::admin::test_support::Fixture;
@@ -3634,5 +3636,398 @@ mod e2e {
         assert_eq!(sibling(&f).await, reference);
         assert_eq!(f.state.safety.bytes_written(ALICE, PROJECT), used, "nothing charged");
         no_artifacts(&server, "/report.pdf").await;
+    }
+
+    // ── changed documents lose their artifacts (US-0012) ───────────────────
+
+    fn report_ids(list: &Value) {
+        assert_eq!(image_ids(list), numbered("image", 2));
+    }
+
+    async fn read(server: &McpServer, path: &str) {
+        let args = ReadBytesArgs {
+            mount_id: PROJECT.into(),
+            path: path.into(),
+            offset_bytes: 0,
+            length_bytes: 1_000_000,
+        };
+        ok_json(server.fs_read_bytes(Parameters(args)).await);
+    }
+
+    async fn move_to(server: &McpServer, source: &str, destination: &str) {
+        let args = MoveArgs {
+            mount_id: PROJECT.into(),
+            source: source.into(),
+            destination: destination.into(),
+            overwrite: false,
+        };
+        ok_json(server.fs_move(Parameters(args)).await);
+    }
+
+    async fn copy_to(server: &McpServer, source: &str, destination: &str, overwrite: bool) {
+        let args = CopyArgs {
+            mount_id: PROJECT.into(),
+            source: source.into(),
+            destination: destination.into(),
+            overwrite,
+            recursive: false,
+        };
+        ok_json(server.fs_copy(Parameters(args)).await);
+    }
+
+    /// SPEC-0019/E2E-086: reading the document, listing its folder and
+    /// reading its sibling keep the artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_086_reads_keep_the_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        read(&server, "/report.pdf").await;
+        let list = ListDirArgs {
+            mount_id: PROJECT.into(),
+            path: "/".into(),
+            include_hidden: false,
+            sort_by: "name".into(),
+            with_sizes: true,
+        };
+        ok_json(server.fs_list_dir(Parameters(list)).await);
+        read(&server, "/report.md").await;
+        report_ids(&images(&server, "/report.pdf", None).await);
+    }
+
+    /// SPEC-0019/E2E-087: a moved document has no artifacts until it is
+    /// converted again at its new path (FR-NEW-011, FR-NEW-001).
+    #[tokio::test]
+    async fn spec_0019_e2e_087_a_moved_document_converts_again() {
+        let (_f, server, _) = report_with_images().await;
+        move_to(&server, "/report.pdf", "/archive/r.pdf").await;
+        no_artifacts(&server, "/archive/r.pdf").await;
+        convert(&server, "/archive/r.pdf").await;
+        report_ids(&images(&server, "/archive/r.pdf", None).await);
+    }
+
+    /// SPEC-0019/E2E-088: after a move the new path has no artifacts and the
+    /// old one is not a file (FR-NEW-011, FR-NEW-028).
+    #[tokio::test]
+    async fn spec_0019_e2e_088_a_move_leaves_no_artifacts_on_either_path() {
+        let (_f, server, _) = report_with_images().await;
+        move_to(&server, "/report.pdf", "/b.pdf").await;
+        no_artifacts(&server, "/b.pdf").await;
+        let err = err_text(
+            server.fs_list_images(Parameters(list_images_args("/report.pdf", None))).await,
+        );
+        assert!(err.contains("not a file: /report.pdf"), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-089: a copy starts with no artifacts, the source keeps
+    /// its own (FR-NEW-012).
+    #[tokio::test]
+    async fn spec_0019_e2e_089_a_copy_has_no_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        copy_to(&server, "/report.pdf", "/copy.pdf", false).await;
+        no_artifacts(&server, "/copy.pdf").await;
+        report_ids(&images(&server, "/report.pdf", None).await);
+    }
+
+    /// FR-NEW-012: the copy is charged the file bytes only, never the
+    /// source's artifacts.
+    #[tokio::test]
+    async fn a_copy_is_charged_the_file_bytes_only() {
+        let (f, server, _) = report_with_images().await;
+        let before = f.state.safety.bytes_written(ALICE, PROJECT);
+        copy_to(&server, "/report.pdf", "/copy.pdf", false).await;
+        let size = b"%PDF-1.4 source".len() as i64;
+        assert_eq!(f.state.safety.bytes_written(ALICE, PROJECT) - before, size);
+    }
+
+    /// SPEC-0019/E2E-090: a document deleted to the trash and restored has
+    /// no artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_090_trash_and_restore_discards_the_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        let args = DeleteArgs {
+            mount_id: PROJECT.into(),
+            path: "/report.pdf".into(),
+            recursive: false,
+            trash: true,
+        };
+        let out = ok_json(server.fs_delete(Parameters(args)).await);
+        let trash_path = out["trash_path"].as_str().expect("a trash path").to_string();
+        let restore = TrashRestoreArgs { mount_id: PROJECT.into(), trash_path };
+        ok_json(server.fs_trash_restore(Parameters(restore)).await);
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-091: writing the same bytes again discards the
+    /// artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_091_the_same_bytes_again_discard_the_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        overwrite_as(&server, "/report.pdf", b"%PDF-1.4 source").await;
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-093: another document copied over the converted one
+    /// leaves no artifacts (FR-NEW-011, FR-NEW-012).
+    #[tokio::test]
+    async fn spec_0019_e2e_093_a_copy_over_the_document_discards_the_artifacts() {
+        let (f, server, _) = report_with_images().await;
+        put(&f, "/notes.pdf", b"%PDF-1.4 notes").await;
+        copy_to(&server, "/notes.pdf", "/report.pdf", true).await;
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-094: an archive extracted over the document discards
+    /// its artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_094_an_extracted_archive_discards_the_artifacts() {
+        let (f, server, _) = report_with_images().await;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("report.pdf", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut zip, b"%PDF-1.4 archived").unwrap();
+        put(&f, "/pack.zip", &zip.finish().unwrap().into_inner()).await;
+        let args = ExtractArchiveArgs {
+            mount_id: PROJECT.into(),
+            path: "/pack.zip".into(),
+            destination: Some("/".into()),
+            overwrite: true,
+            password: None,
+        };
+        ok_json(server.fs_extract_archive(Parameters(args)).await);
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-095: moving the folder holding the document discards
+    /// its artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_095_a_moved_folder_discards_the_artifacts() {
+        let (f, server) = converting_bundle("/q1/report.pdf", report_bundle()).await;
+        convert(&server, "/q1/report.pdf").await;
+        report_ids(&images(&server, "/q1/report.pdf", None).await);
+        move_to(&server, "/q1", "/archive").await;
+        no_artifacts(&server, "/archive/report.pdf").await;
+        drop(f);
+    }
+
+    /// SPEC-0019/E2E-096: rewriting the sibling leaves the document and its
+    /// artifacts alone (FR-NEW-011, FR-NEW-022).
+    #[tokio::test]
+    async fn spec_0019_e2e_096_rewriting_the_sibling_keeps_the_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        overwrite_as(&server, "/report.md", b"edited\n").await;
+        report_ids(&images(&server, "/report.pdf", None).await);
+    }
+
+    /// SPEC-0019/E2E-097: a move away and back discards the artifacts
+    /// (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_097_away_and_back_discards_the_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        move_to(&server, "/report.pdf", "/b.pdf").await;
+        move_to(&server, "/b.pdf", "/report.pdf").await;
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-108: an in place edit discards the artifacts
+    /// (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_108_an_edit_discards_the_artifacts() {
+        let (_f, server, _) = report_with_images().await;
+        read(&server, "/report.pdf").await;
+        let args = EditArgs {
+            mount_id: PROJECT.into(),
+            path: "/report.pdf".into(),
+            old_string: "source".into(),
+            new_string: "edited".into(),
+            replace_all: false,
+            dry_run: false,
+        };
+        ok_json(server.fs_edit(Parameters(args)).await);
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-137: a project soft deleted then restored keeps the
+    /// artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_137_a_restored_project_keeps_the_artifacts() {
+        let (f, server, _) = report_with_images().await;
+        assert!(f.state.admin.soft_delete_project(PROJECT).await.unwrap());
+        let args = ProjectIdArgs { project_id: PROJECT.into() };
+        ok_json(server.admin_undelete_project(Parameters(args)).await);
+        report_ids(&images(&server, "/report.pdf", None).await);
+    }
+
+    // The `git.*` tool methods reach the process wide repository store, fixed
+    // to the first caller's configuration, whose temporary directory another
+    // test may already have dropped. The git operations below therefore run
+    // the same `tool_*` functions with a store of the test's own, the way the
+    // git module's tests do; conversion and listing stay on `McpServer`.
+
+    struct Git {
+        f: Fixture,
+        server: McpServer,
+        store: Arc<crate::git::GitRepoStore>,
+        mount: &'static str,
+    }
+
+    impl Git {
+        async fn new(mount: &'static str) -> Git {
+            let f = Fixture::with_config(|c| c.git.enabled = true).await;
+            f.seed_project(mount, ALICE).await;
+            let server = bundling(&f, report_bundle());
+            let store = Arc::new(crate::git::GitRepoStore::new(
+                f.state.config.clone(),
+                f.state.stores.relational().clone(),
+            ));
+            Git { f, server, store, mount }
+        }
+
+        fn ctx(&self) -> crate::tools::registry_support::ToolCtx {
+            self.f.ctx(ALICE)
+        }
+
+        fn g(&self) -> Option<Arc<crate::git::GitRepoStore>> {
+            Some(self.store.clone())
+        }
+
+        async fn init(&self) {
+            let args = MountOnlyArgs { mount_id: self.mount.into() };
+            crate::tools::git::tool_init(self.ctx(), args, self.g()).await.unwrap();
+        }
+
+        async fn put(&self, path: &str, bytes: &[u8]) {
+            let client = self.f.state.stores.client(self.mount).await.unwrap();
+            client.write_bytes_atomic(path, bytes).await.unwrap();
+        }
+
+        async fn bytes(&self, path: &str) -> Vec<u8> {
+            self.f.state.stores.client(self.mount).await.unwrap().read_bytes(path).await.unwrap()
+        }
+
+        async fn convert(&self, path: &str) {
+            let args =
+                DocumentizeArgs { mount_id: self.mount.into(), path: path.into(), overwrite: true };
+            ok_json(self.server.fs_documentize(Parameters(args)).await);
+        }
+
+        async fn images(&self, path: &str) -> Result<CallToolResult, rmcp::ErrorData> {
+            let args =
+                ListImagesArgs { mount_id: self.mount.into(), path: path.into(), marker: None };
+            self.server.fs_list_images(Parameters(args)).await
+        }
+
+        async fn commit(&self, message: &str) -> String {
+            let args = GitCommitArgs {
+                mount_id: self.mount.into(),
+                message: message.into(),
+                author_name: None,
+                author_email: None,
+            };
+            let out = crate::tools::git::tool_commit(self.ctx(), args, self.g()).await.unwrap();
+            out["commit_sha"].as_str().expect("a commit sha").to_string()
+        }
+
+        async fn switch(&self, name: &str) {
+            let args = GitBranchSwitchArgs { mount_id: self.mount.into(), name: name.into() };
+            crate::tools::git::tool_branch_switch(self.ctx(), args, self.g()).await.unwrap();
+        }
+    }
+
+    fn assert_no_artifacts(r: Result<CallToolResult, rmcp::ErrorData>) {
+        let err = err_text(r);
+        assert!(err.contains("No artifacts: document not extracted"), "got: {err}");
+    }
+
+    /// A bare repository whose `main` holds `files`, as a `file://` url.
+    fn bare_remote(dir: &std::path::Path, files: &[(&str, &[u8])]) -> String {
+        let repo = git2::Repository::init_bare(dir).unwrap();
+        commit_bare(&repo, files, &[]);
+        repo.set_head("refs/heads/main").unwrap();
+        format!("file://{}", dir.display())
+    }
+
+    /// One commit on `main` of `repo` whose tree is `files` plus the parent's.
+    fn commit_bare(
+        repo: &git2::Repository,
+        files: &[(&str, &[u8])],
+        parents: &[&git2::Commit<'_>],
+    ) {
+        let base = parents.first().map(|p| p.tree().unwrap());
+        let mut builder = repo.treebuilder(base.as_ref()).unwrap();
+        for (name, bytes) in files {
+            builder.insert(*name, repo.blob(bytes).unwrap(), 0o100_644).unwrap();
+        }
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        repo.commit(Some("refs/heads/main"), &sig, &sig, "remote\n", &tree, parents).unwrap();
+    }
+
+    /// SPEC-0019/E2E-092: a pull bringing a changed document discards its
+    /// artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_092_a_pull_changing_the_document_discards_the_artifacts() {
+        let git = Git::new("artifacts-pull").await;
+        let dir = git.f.dir.path().join("remote-092");
+        let url = bare_remote(&dir, &[("report.pdf", b"%PDF-1.4 source")]);
+        crate::tools::git::test_support::clone_from(&git.ctx(), git.store.clone(), git.mount, &url)
+            .await
+            .unwrap();
+        git.convert("/report.pdf").await;
+        git.commit("sibling").await;
+        report_ids(&ok_json(git.images("/report.pdf").await));
+        let remote = git2::Repository::open_bare(&dir).unwrap();
+        let tip = remote.find_reference("refs/heads/main").unwrap().peel_to_commit().unwrap();
+        commit_bare(&remote, &[("report.pdf", b"%PDF-1.4 changed")], &[&tip]);
+        crate::tools::git::test_support::pull_from(&git.ctx(), &git.store, git.mount, &url, "main")
+            .await
+            .unwrap();
+        assert_eq!(git.bytes("/report.pdf").await, b"%PDF-1.4 changed");
+        assert_no_artifacts(git.images("/report.pdf").await);
+    }
+
+    /// SPEC-0019/E2E-109: restoring the committed version over a converted,
+    /// different current version discards the artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_109_a_file_restore_discards_the_artifacts() {
+        let git = Git::new("artifacts-restore").await;
+        git.init().await;
+        git.put("/report.pdf", b"%PDF-1.4 committed").await;
+        let committed = git.commit("c0").await;
+        git.put("/report.pdf", b"%PDF-1.4 current").await;
+        git.convert("/report.pdf").await;
+        report_ids(&ok_json(git.images("/report.pdf").await));
+        let args = GitCheckoutFileArgs {
+            mount_id: git.mount.into(),
+            commit_sha: committed,
+            path: "/report.pdf".into(),
+        };
+        crate::tools::git::tool_checkout_file(git.ctx(), args, git.g()).await.unwrap();
+        assert_eq!(git.bytes("/report.pdf").await, b"%PDF-1.4 committed");
+        assert_no_artifacts(git.images("/report.pdf").await);
+    }
+
+    /// SPEC-0019/E2E-141: a checkout leaves a document identical on both
+    /// branches untouched, so it keeps its artifacts (FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_141_an_identical_document_survives_a_checkout() {
+        let git = Git::new("artifacts-checkout").await;
+        git.init().await;
+        git.put("/report.pdf", b"%PDF-1.4 source").await;
+        git.put("/other.txt", b"main\n").await;
+        git.convert("/report.pdf").await;
+        let c0 = git.commit("c0").await;
+        let create = GitBranchCreateArgs {
+            mount_id: git.mount.into(),
+            name: "dev".into(),
+            start_point: c0,
+            checkout: true,
+        };
+        crate::tools::git::tool_branch_create(git.ctx(), create, git.g()).await.unwrap();
+        git.put("/other.txt", b"dev\n").await;
+        git.commit("c1").await;
+        git.switch("main").await;
+        assert_eq!(git.bytes("/other.txt").await, b"main\n");
+        git.switch("dev").await;
+        assert_eq!(git.bytes("/other.txt").await, b"dev\n");
+        report_ids(&ok_json(git.images("/report.pdf").await));
     }
 }
