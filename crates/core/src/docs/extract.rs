@@ -48,6 +48,22 @@ const MD_COMPANION_EXTS: &[&str] = &[
 /// Row cap for generated Markdown tables, matching the C# `TableRowCap`.
 const TABLE_ROW_CAP: usize = 400;
 
+/// A table the built-in conversion found (SPEC-0019 DEC-009): its whole grid,
+/// uncapped, and where its rendered Markdown sits in the extracted text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinTable {
+    /// The sheet name for Excel, empty for Word and CSV (FR-NEW-017).
+    pub caption: String,
+    /// Every row found, header first, each cell trimmed (FR-NEW-002).
+    pub cells: Vec<Vec<String>>,
+    /// 0 based line of the table's first Markdown line in the full text.
+    pub line_start: usize,
+    pub line_count: usize,
+    /// Character offset just past the table's Markdown in the full text, so a
+    /// cut at a character limit can tell whether the table survived whole.
+    pub char_end: usize,
+}
+
 /// Outcome of a document extraction. Mirrors the C# `ExtractResult`.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractResult {
@@ -56,6 +72,8 @@ pub struct ExtractResult {
     pub truncated: bool,
     pub meta: Map<String, Value>,
     pub note: String,
+    /// Word, Excel and CSV tables, positioned in the text before any cut.
+    pub tables: Vec<BuiltinTable>,
 }
 
 impl ExtractResult {
@@ -71,6 +89,50 @@ impl ExtractResult {
     fn with_note(mut self, note: impl Into<String>) -> Self {
         self.note = note.into();
         self
+    }
+
+    /// Join Markdown blocks with a blank line and trim, like every format does,
+    /// recording where each `(block index, caption, grid)` table landed.
+    fn of_blocks(
+        fmt: &str,
+        blocks: &[String],
+        grids: Vec<(usize, String, Vec<Vec<String>>)>,
+    ) -> Self {
+        let joined = blocks.join("\n\n");
+        let lead = joined.len() - joined.trim_start().len();
+        let text = joined.trim().to_string();
+        // Grids arrive in block order, so one cursor walks the text once: the
+        // byte, line and character counts before each table are carried
+        // forward instead of rescanning the prefix per table.
+        // `joined_at` is where block `block` starts in `joined`.
+        let (mut block, mut joined_at) = (0usize, 0usize);
+        let mut cursor = TextCursor::new(&text);
+        let tables = grids
+            .into_iter()
+            .map(|(index, caption, rows)| {
+                while block < index {
+                    joined_at += blocks[block].len() + 2;
+                    block += 1;
+                }
+                // A table block starts and ends with `|`, so the trim never
+                // reaches into it and both offsets stay inside `text`.
+                let start = joined_at.saturating_sub(lead);
+                cursor.advance(start);
+                let line_start = cursor.lines;
+                cursor.advance(start + blocks[index].len());
+                BuiltinTable {
+                    caption,
+                    cells: rows
+                        .into_iter()
+                        .map(|r| r.into_iter().map(|c| c.trim().to_string()).collect())
+                        .collect(),
+                    line_start,
+                    line_count: cursor.lines - line_start + 1,
+                    char_end: cursor.chars,
+                }
+            })
+            .collect();
+        Self { fmt: fmt.to_string(), text, tables, ..Default::default() }
     }
 }
 
@@ -169,7 +231,8 @@ pub fn companion_md_path(path: &str) -> String {
 /// The companion is reused when its mtime is at least the source mtime, unless
 /// `refresh` is set. The caller (the tool layer) owns the safety accounting:
 /// charge the write, record the read on `md_path` and audit, exactly like the C#
-/// `FsOps.ExtractDocument` does around this engine.
+/// `FsOps.ExtractDocument` does around this engine. `core::fs_ops` uses
+/// [`prepare_extraction`] instead, so it can charge before the write.
 pub async fn extract_text(
     client: &VolumeClient,
     ocr: &dyn OcrProvider,
@@ -179,23 +242,112 @@ pub async fn extract_text(
     ocr_enabled: bool,
     refresh: bool,
 ) -> Result<Value> {
+    match prepare_extraction(client, ocr, path, max_chars, preview_chars, ocr_enabled, refresh)
+        .await?
+    {
+        Prepared::Cached(payload) => Ok(payload),
+        Prepared::Fresh(fresh) => {
+            fresh.write_sibling(client).await?;
+            Ok(fresh.into_payload())
+        }
+    }
+}
+
+/// What [`prepare_extraction`] found: the up to date companion, or a fresh
+/// extraction whose companion is not written yet.
+pub enum Prepared {
+    Cached(Value),
+    Fresh(FreshExtraction),
+}
+
+/// A fresh extraction held in memory, so the quota is charged before the
+/// companion is written (SPEC-0019 FR-MOD-001).
+pub struct FreshExtraction {
+    pub source: String,
+    /// The companion path when the format gets one, whatever the text.
+    pub companion: Option<String>,
+    pub result: ExtractResult,
+    pub max_chars: usize,
+    preview_chars: usize,
+}
+
+impl FreshExtraction {
+    /// The companion that gets written: none for an empty extraction, which
+    /// must not create an empty companion (there would be nothing to read and
+    /// the stale file would then satisfy the mtime check forever).
+    pub fn md_path(&self) -> Option<&str> {
+        self.companion.as_deref().filter(|_| !self.result.text.trim().is_empty())
+    }
+
+    /// UTF-8 bytes of the companion that gets written.
+    pub fn sibling_bytes(&self) -> i64 {
+        self.md_path().map_or(0, |_| self.result.text.len() as i64)
+    }
+
+    /// The character offset the text was cut at, when it was cut.
+    pub fn truncated_at(&self) -> Option<usize> {
+        self.result.truncated.then_some(self.max_chars)
+    }
+
+    pub async fn write_sibling(&self, client: &VolumeClient) -> Result<()> {
+        match self.md_path() {
+            Some(md) => client.write_bytes_atomic(md, self.result.text.as_bytes()).await,
+            None => Ok(()),
+        }
+    }
+
+    pub fn into_payload(self) -> Value {
+        let mut payload = doc_payload(
+            &self.source,
+            self.md_path(),
+            &self.result.fmt,
+            &self.result.text,
+            self.preview_chars,
+            false,
+        );
+        if let Value::Object(map) = &mut payload {
+            map.insert("truncated".into(), Value::Bool(self.result.truncated));
+            map.insert("meta".into(), Value::Object(self.result.meta));
+            map.insert("note".into(), Value::String(self.result.note));
+        }
+        payload
+    }
+}
+
+/// Answer from the up to date companion, or extract afresh without writing.
+pub async fn prepare_extraction(
+    client: &VolumeClient,
+    ocr: &dyn OcrProvider,
+    path: &str,
+    max_chars: usize,
+    preview_chars: usize,
+    ocr_enabled: bool,
+    refresh: bool,
+) -> Result<Prepared> {
     if !client.is_file(path).await? {
         return Err(ToolError::not_found(format!("not a file: {path}")));
     }
     let ext = extension_of(path);
-    let mut md_path: Option<String> = if MD_COMPANION_EXTS.contains(&ext.as_str()) {
+    let companion: Option<String> = if MD_COMPANION_EXTS.contains(&ext.as_str()) {
         Some(companion_md_path(path))
     } else {
         None
     };
 
-    if let Some(md) = md_path.as_deref()
+    if let Some(md) = companion.as_deref()
         && !refresh
         && client.exists(md).await?
         && client.stat(md).await?.mtime >= client.stat(path).await?.mtime
     {
         let cached = client.read_text(md).await?;
-        return Ok(doc_payload(path, Some(md), "md", &cached, preview_chars, true));
+        return Ok(Prepared::Cached(doc_payload(
+            path,
+            Some(md),
+            "md",
+            &cached,
+            preview_chars,
+            true,
+        )));
     }
 
     let data = client.read_bytes(path).await?;
@@ -211,25 +363,13 @@ pub async fn extract_text(
         }
     };
 
-    // An empty extraction (a scanned PDF with no OCR, for instance) must not
-    // create an empty companion: there would be nothing to read and the stale
-    // file would then satisfy the mtime check forever.
-    if let Some(md) = md_path.as_deref() {
-        if result.text.trim().is_empty() {
-            md_path = None;
-        } else {
-            client.write_bytes_atomic(md, result.text.as_bytes()).await?;
-        }
-    }
-
-    let mut payload =
-        doc_payload(path, md_path.as_deref(), &result.fmt, &result.text, preview_chars, false);
-    if let Value::Object(map) = &mut payload {
-        map.insert("truncated".into(), Value::Bool(result.truncated));
-        map.insert("meta".into(), Value::Object(result.meta));
-        map.insert("note".into(), Value::String(result.note));
-    }
-    Ok(payload)
+    Ok(Prepared::Fresh(FreshExtraction {
+        source: path.to_string(),
+        companion,
+        result,
+        max_chars,
+        preview_chars,
+    }))
 }
 
 fn doc_payload(
@@ -281,6 +421,35 @@ fn truncate_chars(text: &str, max: usize) -> (String, bool) {
 
 fn take_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
+}
+
+/// Line and character counts of a text prefix, extended forward only, so
+/// locating every table costs one pass over the text.
+struct TextCursor<'a> {
+    text: &'a str,
+    byte: usize,
+    lines: usize,
+    chars: usize,
+}
+
+impl<'a> TextCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { text, byte: 0, lines: 0, chars: 0 }
+    }
+
+    /// Move to byte offset `to`, which is never behind the cursor because
+    /// tables come in text order and never overlap.
+    fn advance(&mut self, to: usize) {
+        let span = &self.text[self.byte..to];
+        self.lines += span.matches('\n').count();
+        self.chars += span.chars().count();
+        self.byte = to;
+    }
+}
+
+/// The rows the Markdown rendering shows: the first [`TABLE_ROW_CAP`].
+fn capped(rows: &[Vec<String>]) -> &[Vec<String>] {
+    &rows[..rows.len().min(TABLE_ROW_CAP)]
 }
 
 /// Render rows as a GitHub Markdown table. Port of the C# `MdTable`: newlines
@@ -529,6 +698,7 @@ fn docx(data: &[u8]) -> Result<ExtractResult> {
 
     let mut reader = quick_xml::Reader::from_str(&xml);
     let mut lines: Vec<String> = Vec::new();
+    let mut grids = Vec::new();
     let mut para_count = 0usize;
     let mut mode = DocxMode::Idle;
     let mut in_text = false;
@@ -611,9 +781,10 @@ fn docx(data: &[u8]) -> Result<ExtractResult> {
                         }
                     }
                     "tr" => {
+                        // Uncapped: the kept table has every row; only the
+                        // rendered sibling is capped (SPEC-0019 FR-NEW-002).
                         if let DocxMode::Table { depth, rows, row, .. } = &mut mode
                             && *depth == 1
-                            && rows.len() < TABLE_ROW_CAP
                         {
                             rows.push(std::mem::take(row));
                         }
@@ -625,7 +796,8 @@ fn docx(data: &[u8]) -> Result<ExtractResult> {
                                 let rows = std::mem::take(rows);
                                 if !rows.is_empty() {
                                     lines.push(String::new());
-                                    lines.push(md_table(&rows));
+                                    lines.push(md_table(capped(&rows)));
+                                    grids.push((lines.len() - 1, String::new(), rows));
                                 }
                                 mode = DocxMode::Idle;
                             }
@@ -639,8 +811,7 @@ fn docx(data: &[u8]) -> Result<ExtractResult> {
         }
     }
 
-    Ok(ExtractResult::of("docx", lines.join("\n\n").trim().to_string())
-        .with_meta("paragraphs", json!(para_count)))
+    Ok(ExtractResult::of_blocks("docx", &lines, grids).with_meta("paragraphs", json!(para_count)))
 }
 
 /// Route a text chunk to the paragraph or the table cell being built.
@@ -796,6 +967,7 @@ fn xlsx(data: &[u8]) -> Result<ExtractResult> {
     let shared = xlsx_shared_strings(&mut zip);
     let sheets = xlsx_sheets(&mut zip);
     let mut lines: Vec<String> = Vec::new();
+    let mut grids = Vec::new();
     for (name, part) in &sheets {
         let Some(xml) = entry_text(&mut zip, part) else { continue };
         let rows = xlsx_rows(&xml, &shared);
@@ -803,10 +975,10 @@ fn xlsx(data: &[u8]) -> Result<ExtractResult> {
             continue;
         }
         lines.push(format!("## Sheet: {name}"));
-        lines.push(md_table(&rows));
+        lines.push(md_table(capped(&rows)));
+        grids.push((lines.len() - 1, name.clone(), rows));
     }
-    Ok(ExtractResult::of("xlsx", lines.join("\n\n").trim().to_string())
-        .with_meta("sheets", json!(sheets.len())))
+    Ok(ExtractResult::of_blocks("xlsx", &lines, grids).with_meta("sheets", json!(sheets.len())))
 }
 
 /// The shared string table, one entry per `si` (concatenating its rich text runs).
@@ -875,7 +1047,7 @@ fn xlsx_sheets(zip: &mut Zip) -> Vec<(String, String)> {
     out
 }
 
-/// Non empty rows of a worksheet, capped like the C#.
+/// Non empty rows of a worksheet, uncapped: the caller caps the rendering.
 fn xlsx_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -905,13 +1077,8 @@ fn xlsx_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
                     in_cell = false;
                     row.push(xlsx_cell_text(&cell_type, &value, shared));
                 }
-                "row" => {
-                    if row.iter().any(|c| !c.trim().is_empty()) {
-                        rows.push(std::mem::take(&mut row));
-                    }
-                    if rows.len() >= TABLE_ROW_CAP {
-                        return rows;
-                    }
+                "row" if row.iter().any(|c| !c.trim().is_empty()) => {
+                    rows.push(std::mem::take(&mut row));
                 }
                 _ => {}
             },
@@ -1036,10 +1203,15 @@ fn unescape_html(text: &str) -> String {
 // ── CSV and text ─────────────────────────────────────────────────────────────
 
 fn csv(data: &[u8]) -> ExtractResult {
-    let mut rows = parse_csv(&decode(data));
-    rows.truncate(TABLE_ROW_CAP);
-    let count = rows.len();
-    ExtractResult::of("csv", md_table(&rows)).with_meta("rows", json!(count))
+    let rows = parse_csv(&decode(data));
+    let shown = capped(&rows);
+    let count = shown.len();
+    let md = md_table(shown);
+    if md.is_empty() {
+        return ExtractResult::of("csv", md).with_meta("rows", json!(count));
+    }
+    ExtractResult::of_blocks("csv", &[md], vec![(0, String::new(), rows)])
+        .with_meta("rows", json!(count))
 }
 
 /// Minimal RFC 4180 parser (quotes, escaped quotes, embedded newlines). Direct
@@ -1486,6 +1658,78 @@ mod tests {
         .unwrap();
         assert!(r.text.contains("## Sheet: S & T"), "{}", r.text);
         assert!(r.text.contains("| R&D | 1 < 2 |"), "{}", r.text);
+    }
+
+    /// SPEC-0019 DEC-009: Word tables have an empty caption and their spans
+    /// land on the rendered tables, around paragraphs and blank blocks.
+    #[test]
+    fn docx_tables_are_positioned_between_paragraphs() {
+        let tbl = |a: &str, b: &str| {
+            format!(
+                "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>{a}</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>{b}</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+            )
+        };
+        let doc = format!(
+            r#"<w:document xmlns:w="x"><w:body>{}<w:p><w:r><w:t>between</w:t></w:r></w:p>{}<w:p><w:r><w:t>after</w:t></w:r></w:p></w:body></w:document>"#,
+            tbl("h1", "v1"),
+            tbl("h2", "v2")
+        );
+        let r = docx(&make_zip(&[("word/document.xml", &doc)])).unwrap();
+        let lines: Vec<&str> = r.text.lines().collect();
+        assert_eq!(r.tables.len(), 2);
+        for (t, (header, last)) in r.tables.iter().zip([("| h1 |", "| v1 |"), ("| h2 |", "| v2 |")])
+        {
+            assert_eq!(t.caption, "");
+            assert_eq!(t.cells.len(), 2);
+            assert_eq!(t.line_count, 3);
+            assert_eq!(lines[t.line_start], header);
+            assert_eq!(lines[t.line_start + 2], last);
+            let upto: String = r.text.chars().take(t.char_end).collect();
+            assert!(upto.ends_with(last), "{upto:?}");
+        }
+    }
+
+    /// SPEC-0019 DEC-009: each sheet's grid comes back uncapped, captioned
+    /// with the sheet name, positioned on the rendered (capped) Markdown.
+    #[test]
+    fn xlsx_tables_are_uncapped_captioned_and_positioned() {
+        let workbook = r#"<workbook xmlns:r="r"><sheets><sheet name="A" r:id="rId1"/><sheet name="B" r:id="rId2"/></sheets></workbook>"#;
+        let rels = r#"<Relationships xmlns="x"><Relationship Id="rId1" Type="w" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="w" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let row = |v: &str| format!(r#"<row><c t="inlineStr"><is><t> {v} </t></is></c></row>"#);
+        let big: String = (0..450).map(|i| row(&format!("r{i}"))).collect();
+        let sheet1 = format!(
+            "<worksheet><sheetData>{}<row><c><v> </v></c></row>{}</sheetData></worksheet>",
+            row("h"),
+            row("x")
+        );
+        let sheet2 = format!("<worksheet><sheetData>{big}</sheetData></worksheet>");
+        let bytes = make_zip(&[
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/worksheets/sheet1.xml", &sheet1),
+            ("xl/worksheets/sheet2.xml", &sheet2),
+        ]);
+        let r = xlsx(&bytes).unwrap();
+        assert_eq!(r.tables.len(), 2);
+        let (a, b) = (&r.tables[0], &r.tables[1]);
+        assert_eq!(a.caption, "A");
+        assert_eq!(
+            a.cells,
+            vec![vec!["h".to_string()], vec!["x".to_string()]],
+            "blank row dropped, cells trimmed"
+        );
+        assert_eq!((a.line_start, a.line_count), (2, 3));
+        let lines: Vec<&str> = r.text.lines().collect();
+        assert_eq!(lines[a.line_start], "| h |");
+        assert_eq!(
+            r.text.chars().take(a.char_end).collect::<String>().lines().last(),
+            Some("| x |")
+        );
+        assert_eq!(b.caption, "B");
+        assert_eq!(b.cells.len(), 450, "the kept grid is uncapped");
+        assert_eq!(b.line_count, TABLE_ROW_CAP + 1, "the rendering stays capped");
+        assert_eq!(lines[b.line_start], "| r0 |");
+        assert_eq!(b.char_end, r.text.chars().count());
     }
 
     #[test]

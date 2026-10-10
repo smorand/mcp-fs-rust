@@ -178,6 +178,11 @@ fs.list_dir
   params: mount_id:string, path:string="/", include_hidden:boolean=false, sort_by:string="name", with_sizes:boolean=false
   required: ['mount_id']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.list_tables
+  desc: List the tables kept from a document's last conversion, in reading order, 100 per page.
+  params: mount_id:string, path:string, marker:string=null
+  required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.mkdir
   desc: Create a directory (parents by default).
   params: mount_id:string, path:string, parents:boolean=true, exist_ok:boolean=true
@@ -601,6 +606,7 @@ fs.hash: {"path": "/a.txt", "algo": "sha256", "hash": "4a1e67f2fe1d1cc7b31d0ca2e
 fs.exists: {"exists": true, "kind": "file"}
 fs.export_zip: {"url": "/exports/0b7e2f4c-1a3d-4e5f-8a9b-0c1d2e3f4a5b"}
 fs.extract_archive: {"destination": "/uploads/report", "files_written": 2, "dirs_created": 1, "bytes_written": 10}
+fs.list_tables: {"tables": [{"id": "table-1", "caption": "Q1", "rows": 2, "columns": 2, "csv_quality": "CSV quality: exact"}], "marker": null}
 fs.stat: {"path": "/empty.txt", "size": 0, "mode": "0o644", "kind": "file", "mtime": "<volatile>", "ctime": "<volatile>", "atime": "<volatile>", "uid": 1000, "gid": 1000}
 fs.create_empty: {"path": "/empty.txt", "created": true}
 fs.edit: {"path": "/a.txt", "applied": true, "diff": "--- /a.txt\n+++ /a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n"}

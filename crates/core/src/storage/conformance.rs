@@ -27,8 +27,8 @@ use crate::git::oauth::persistence::RelationalOAuthPersistence;
 use crate::git::oauth::store::OAuthSession;
 use crate::storage::admin::{ROLE_OWNER, RelationalAdminStore};
 use crate::storage::meta::{
-    RelationalMetaStore, delete_export_link_if_live, insert_export_link,
-    select_expired_export_links,
+    NewArtifactSet, NewDocTable, RelationalMetaStore, delete_export_link_if_live,
+    insert_export_link, select_expired_export_links,
 };
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
 use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend};
@@ -751,6 +751,81 @@ async fn export_links_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     Ok(())
 }
 
+// ── document artifacts case (SPEC-0019 US-0001) ─────────────────────────────────
+
+fn doc_table(seq: i64, caption: &str) -> NewDocTable {
+    NewDocTable {
+        seq,
+        caption: caption.to_string(),
+        rows: seq + 1,
+        cols: 2,
+        quality: "exact".to_string(),
+        cells: r#"[["h1","h2"],["a","b"]]"#.to_string(),
+        line_start: seq * 10,
+        line_count: 3,
+    }
+}
+
+/// The artifact tables, the `nodes.rev` validity token and the current set
+/// pointer behave the same on every engine (DEC-002, DEC-003, DEC-008).
+async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let m = RelationalMetaStore::open(db.clone(), format!("{tag}-art")).await?;
+    let other = RelationalMetaStore::open(db, format!("{tag}-art-other")).await?;
+
+    m.put_file("/b.xlsx", Some("sha-b"), 3, MODE_FILE).await?;
+    let rev = m.ensure_node_rev("/b.xlsx").await?.expect("a file has a rev");
+    assert_eq!(rev.len(), 36, "{who}: rev is a uuid");
+    assert_eq!(m.ensure_node_rev("/b.xlsx").await?, Some(rev.clone()), "{who}: stable rev");
+    assert_eq!(m.ensure_node_rev("/none").await?, None, "{who}: no node, no rev");
+    assert_eq!(m.current_artifact_set("/b.xlsx").await?, None, "{who}: never converted");
+
+    let set = NewArtifactSet {
+        set_id: format!("{tag}-set1"),
+        path: "/b.xlsx".into(),
+        node_rev: rev.clone(),
+        text_sha: Some("sha-text".into()),
+        text_len: 42,
+        report: "0 images, 2 tables".into(),
+        tables: vec![doc_table(2, "Q2"), doc_table(1, "Q1 é | \"x\"")],
+    };
+    m.commit_artifact_set(&set).await?;
+    let current = m.current_artifact_set("/b.xlsx").await?;
+    assert_eq!(current.as_deref(), Some(set.set_id.as_str()), "{who}: pointer follows commit");
+    assert_eq!(other.current_artifact_set("/b.xlsx").await?, None, "{who}: scoped by volume");
+
+    let tables = m.list_artifact_tables(&set.set_id, 10, 0).await?;
+    let seqs: Vec<i64> = tables.iter().map(|t| t.seq).collect();
+    assert_eq!(seqs, vec![1, 2], "{who}: reading order is seq order");
+    assert_eq!(tables[0].caption, "Q1 é | \"x\"", "{who}: caption round trips");
+    assert_eq!((tables[0].rows, tables[0].cols), (2, 2), "{who}: counts round trip");
+    assert_eq!(tables[0].quality, "exact", "{who}: quality round trips");
+    let page = m.list_artifact_tables(&set.set_id, 1, 1).await?;
+    assert_eq!(page.iter().map(|t| t.seq).collect::<Vec<_>>(), vec![2], "{who}: paging");
+    assert!(other.list_artifact_tables(&set.set_id, 10, 0).await?.is_empty(), "{who}: scoped");
+
+    // A same bytes rewrite changes rev, so the set is no longer served.
+    m.put_file("/b.xlsx", Some("sha-b"), 3, MODE_FILE).await?;
+    assert_eq!(m.current_artifact_set("/b.xlsx").await?, None, "{who}: rewrite invalidates");
+
+    // A commit built from the old rev is refused and changes nothing.
+    let stale = NewArtifactSet { set_id: format!("{tag}-set2"), tables: Vec::new(), ..set };
+    let err = m.commit_artifact_set(&stale).await.expect_err("stale rev must be refused");
+    assert_eq!(err.message, "Document changed during conversion: /b.xlsx", "{who}");
+
+    // An atime touch keeps rev; a rename stamps a new one.
+    let rev2 = m.ensure_node_rev("/b.xlsx").await?.expect("rev");
+    assert_ne!(rev2, rev, "{who}: rewrite stamped a fresh rev");
+    m.touch_atime("/b.xlsx").await?;
+    m.touch_atime_mtime("/b.xlsx").await?;
+    assert_eq!(m.ensure_node_rev("/b.xlsx").await?, Some(rev2.clone()), "{who}: touch keeps rev");
+    m.rename("/b.xlsx", "/c.xlsx").await?;
+    let rev3 = m.ensure_node_rev("/c.xlsx").await?.expect("rev");
+    assert_ne!(rev3, rev2, "{who}: a path change stamps a fresh rev");
+    Ok(())
+}
+
 // ── the suite ───────────────────────────────────────────────────────────────────
 
 async fn run_suite(engine: &Engine) -> Result<()> {
@@ -769,6 +844,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     oauth_round_trip(engine, &tag).await?;
     oauth_legacy_table_is_rebuilt_identically(engine, &tag).await?;
     export_links_round_trip(engine, &tag).await?;
+    doc_artifacts_round_trip(engine, &tag).await?;
     Ok(())
 }
 

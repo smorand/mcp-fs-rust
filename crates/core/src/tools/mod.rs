@@ -29,6 +29,7 @@
 pub(crate) mod admin;
 pub mod all;
 pub(crate) mod archive;
+pub(crate) mod artifacts;
 pub mod catalog;
 pub mod context7;
 #[cfg(test)]
@@ -87,6 +88,7 @@ pub(crate) fn register_fs(reg: &mut crate::tools::registry_support::ToolRegistry
     trash::register(reg);
     export::register(reg);
     archive::register(reg);
+    artifacts::register(reg);
 }
 
 /// Read `mount_id`, enforce project membership, open the volume.
@@ -393,13 +395,14 @@ mod tests {
         "fs.trash_restore",
         "fs.export_zip",
         "fs.extract_archive",
+        "fs.list_tables",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        assert_eq!(reg.len(), 39);
+        assert_eq!(reg.len(), 40);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -472,8 +475,8 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            // 39 since SPEC-0015 added fs.extract_archive.
-            39,
+            // 40 since SPEC-0019 added fs.list_tables.
+            40,
             "fs.* tools",
         );
     }
