@@ -581,6 +581,11 @@ mod e2e {
     /// A server whose converter is `doc`, sharing the fixture's stores and
     /// session accounting, so `put` and the quota see the same state.
     fn with_doc(f: &Fixture, doc: Option<Arc<dyn DocService>>) -> McpServer {
+        with_doc_as(f, doc, ALICE)
+    }
+
+    /// [`with_doc`] acting as `person`.
+    fn with_doc_as(f: &Fixture, doc: Option<Arc<dyn DocService>>, person: &str) -> McpServer {
         let s = &f.state;
         let state = AppState {
             config: s.config.clone(),
@@ -592,7 +597,7 @@ mod e2e {
             doc_service: doc,
             search: None,
         };
-        McpServer::new(Arc::new(state), ALICE.to_string())
+        McpServer::new(Arc::new(state), person.to_string())
     }
 
     /// A project, a document at `path`, and a server whose fake converter
@@ -2094,5 +2099,254 @@ mod e2e {
         let (_f, server) = converting_bundle("/abs.pdf", conversion).await;
         let out = convert(&server, "/abs.pdf").await;
         assert_eq!(out["artifacts_report"], "0 images, 0 tables\nimage-1: picture unavailable");
+    }
+
+    // ── images through every conversion path (US-0007) ──────────────────────
+
+    /// A few PNG signature bytes: an image the built-in conversion reads no
+    /// text from, the OCR provider being null by default.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    async fn no_artifacts(server: &McpServer, path: &str) {
+        let err = err_text(server.fs_list_images(Parameters(list_images_args(path, None))).await);
+        assert!(err.contains("No artifacts: document not extracted"), "got: {err}");
+    }
+
+    fn empty_images() -> Value {
+        json!({"images": [], "marker": null})
+    }
+
+    fn qualities(list: &Value) -> Vec<String> {
+        list["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["csv_quality"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn pdf_only(markdown: &str) -> Arc<dyn DocService> {
+        Arc::new(StubDocService::ok(markdown).with_extensions(&[".pdf"]))
+    }
+
+    /// SPEC-0019/E2E-002: no converter, the built-in conversion keeps both
+    /// Excel tables, exact, and no image (FR-NEW-017).
+    #[tokio::test]
+    async fn spec_0019_e2e_002_builtin_excel_keeps_exact_tables_and_no_image() {
+        let (f, _) = setup(None).await;
+        let server = with_doc(&f, None);
+        put(&f, "/budget.xlsx", &two_xlsx()).await;
+        let out = ok_json(
+            server.fs_extract_text(Parameters(extract_args("/budget.xlsx", 200_000))).await,
+        );
+        assert_eq!(out["artifacts_report"], "0 images, 2 tables");
+        let list = tables(&server, "/budget.xlsx").await;
+        assert_eq!(qualities(&list), vec!["CSV quality: exact", "CSV quality: exact"]);
+        assert_eq!(images(&server, "/budget.xlsx", None).await, empty_images());
+    }
+
+    /// SPEC-0019/E2E-003: a converter configured for PDF only does not change
+    /// what text extraction keeps: the built-in tables, exact, no image.
+    #[tokio::test]
+    async fn spec_0019_e2e_003_extraction_ignores_the_converter() {
+        let (f, _) = setup(None).await;
+        // Were the converter used, it would yield one approximate table.
+        let server = with_doc(&f, Some(pdf_only("| z |\n| --- |\n| 9 |\n")));
+        put(&f, "/budget.xlsx", &two_xlsx()).await;
+        ok_json(server.fs_extract_text(Parameters(extract_args("/budget.xlsx", 200_000))).await);
+        let list = tables(&server, "/budget.xlsx").await;
+        assert_eq!(ids(&list), vec!["table-1", "table-2"]);
+        assert_eq!(qualities(&list), vec!["CSV quality: exact", "CSV quality: exact"]);
+        assert_eq!(images(&server, "/budget.xlsx", None).await, empty_images());
+    }
+
+    /// SPEC-0019/E2E-004: a conversion over the session quota is refused and
+    /// keeps no set and no sibling (FR-NEW-013).
+    #[tokio::test]
+    async fn spec_0019_e2e_004_a_conversion_over_the_quota_keeps_nothing() {
+        // Sibling 25 000 and conversion text 25 000: 50 000 together.
+        let (f, server) = converting("/report.pdf", &"z".repeat(25_000), Some(QUOTA)).await;
+        f.state.safety.charge_write(ALICE, PROJECT, 250_000).unwrap();
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/report.pdf", false))).await,
+        );
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+        no_artifacts(&server, "/report.pdf").await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert!(!client.exists("/report.md").await.unwrap(), "no sibling");
+    }
+
+    /// SPEC-0019/E2E-009: no converter, a PDF goes through the built-in
+    /// conversion, which keeps no image and no PDF table (FR-NEW-017).
+    #[tokio::test]
+    async fn spec_0019_e2e_009_builtin_pdf_keeps_no_image_and_no_table() {
+        let (f, _) = setup(None).await;
+        let server = with_doc(&f, None);
+        put(&f, "/scan.pdf", &crate::docs::extract::tests::tiny_pdf()).await;
+        let out =
+            ok_json(server.fs_extract_text(Parameters(extract_args("/scan.pdf", 200_000))).await);
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables");
+        assert_eq!(images(&server, "/scan.pdf", None).await, empty_images());
+        assert_eq!(tables(&server, "/scan.pdf").await, json!({"tables": [], "marker": null}));
+    }
+
+    /// SPEC-0019/E2E-012 then E2E-017: a documented upload over the quota
+    /// keeps the source, charged alone, reports the quota message as its
+    /// documentation outcome, and keeps no sibling and no set (FR-NEW-014).
+    #[tokio::test]
+    async fn spec_0019_e2e_012_017_a_documented_upload_over_the_quota_charges_the_source_only() {
+        let (f, _) = setup(Some(QUOTA)).await;
+        // Sibling 50 000 and conversion text 50 000: 100 000 together.
+        let server = with_doc(&f, Some(Arc::new(StubDocService::ok("z".repeat(50_000)))));
+        let source = vec![b'p'; 200_000];
+
+        // E2E-012.
+        let out = ok_json(
+            server.fs_write_bytes(Parameters(write_args("/report.pdf", &source, true))).await,
+        );
+        assert_eq!(out["path"], "/report.pdf");
+        assert_eq!(out["bytes_written"], 200_000);
+        assert_eq!(
+            out["documentation"]["error"]["message"],
+            "session write quota of 262144 bytes exceeded",
+            "got: {out}"
+        );
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert_eq!(client.read_bytes("/report.pdf").await.unwrap(), source);
+        assert!(!client.exists("/report.md").await.unwrap(), "no sibling");
+        no_artifacts(&server, "/report.pdf").await;
+
+        // E2E-017: only the 200 000 source bytes were charged.
+        ok_json(
+            server
+                .fs_write_bytes(Parameters(write_args("/notes.txt", &[b'n'; 62_144], false)))
+                .await,
+        );
+        let err =
+            err_text(server.fs_write_bytes(Parameters(write_args("/one.txt", b"x", false))).await);
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-013: a non member converting gets the usual refusal and
+    /// leaves no set behind (FR-NEW-016).
+    #[tokio::test]
+    async fn spec_0019_e2e_013_a_non_member_cannot_convert() {
+        let (f, server) = converting_bundle("/report.pdf", report_bundle()).await;
+        let doc: Arc<dyn DocService> = Arc::new(StubDocService::bundle(report_bundle()));
+        let olga = with_doc_as(&f, Some(doc), "olga@test.com");
+        let usual =
+            err_text(olga.fs_extract_text(Parameters(extract_args("/report.pdf", 200_000))).await);
+        assert!(usual.contains("ERR_FORBIDDEN"), "got: {usual}");
+        let refusal = |e: &str| e.split_once("': ").map(|(_, r)| r.to_string()).unwrap();
+        let got =
+            err_text(olga.fs_documentize(Parameters(documentize_args("/report.pdf", true))).await);
+        assert_eq!(refusal(&got), refusal(&usual));
+        no_artifacts(&server, "/report.pdf").await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert!(!client.exists("/report.md").await.unwrap(), "no sibling");
+    }
+
+    /// SPEC-0019/E2E-015: a text only document reports and lists nothing.
+    #[tokio::test]
+    async fn spec_0019_e2e_015_a_text_only_document_keeps_nothing() {
+        let (_f, server) = converting("/plain.pdf", "# Plain\n\nJust prose.\n", None).await;
+        assert_eq!(convert(&server, "/plain.pdf").await["artifacts_report"], "0 images, 0 tables");
+        assert_eq!(images(&server, "/plain.pdf", None).await, empty_images());
+        assert_eq!(tables(&server, "/plain.pdf").await, json!({"tables": [], "marker": null}));
+    }
+
+    /// SPEC-0019/E2E-016: an image extracted while the converter takes PDF
+    /// only goes through the built-in conversion: no image kept.
+    #[tokio::test]
+    async fn spec_0019_e2e_016_an_extracted_image_keeps_no_image() {
+        let (f, _) = setup(None).await;
+        let server = with_doc(&f, Some(pdf_only("x")));
+        put(&f, "/photo.png", PNG).await;
+        let out =
+            ok_json(server.fs_extract_text(Parameters(extract_args("/photo.png", 200_000))).await);
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables");
+        assert_eq!(images(&server, "/photo.png", None).await, empty_images());
+    }
+
+    /// SPEC-0019/E2E-018: a never converted document with no sibling converts
+    /// without overwrite and keeps its image (FR-NEW-027).
+    #[tokio::test]
+    async fn spec_0019_e2e_018_a_first_conversion_needs_no_overwrite() {
+        let conversion = bundle(
+            "![](f/1.png)\n",
+            &[Pic { target: "f/1.png", bytes: b"fresh", caption: "", page: Some(1) }],
+        );
+        let (_f, server) = converting_bundle("/fresh.pdf", conversion).await;
+        let out = convert(&server, "/fresh.pdf").await;
+        assert_eq!(out["artifacts_report"], "1 images, 0 tables");
+        assert_eq!(out["overwritten"], false);
+        assert_eq!(image_ids(&images(&server, "/fresh.pdf", None).await), vec!["image-1"]);
+    }
+
+    /// SPEC-0019/E2E-100: an image yielding no text writes no sibling, yet
+    /// counts as converted: an empty report and an empty list.
+    #[tokio::test]
+    async fn spec_0019_e2e_100_a_textless_image_is_converted_empty() {
+        let (f, _) = setup(None).await;
+        let server = with_doc(&f, None);
+        put(&f, "/blank.png", PNG).await;
+        let out =
+            ok_json(server.fs_extract_text(Parameters(extract_args("/blank.png", 200_000))).await);
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables");
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert!(!client.exists("/blank.md").await.unwrap(), "no empty sibling");
+        assert_eq!(images(&server, "/blank.png", None).await, empty_images());
+    }
+
+    /// SPEC-0019/E2E-111: the convert action on a format the converter
+    /// refuses answers today's refusal verbatim and keeps no set (FR-NEW-018).
+    #[tokio::test]
+    async fn spec_0019_e2e_111_a_refused_format_is_refused_verbatim() {
+        let (f, _) = setup(None).await;
+        put(&f, "/photo.png", PNG).await;
+        let server = with_doc(&f, Some(pdf_only("x")));
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/photo.png", false))).await,
+        );
+        assert!(
+            err.contains("'/photo.png' cannot be documented, the document service accepts: .pdf"),
+            "got: {err}"
+        );
+        no_artifacts(&server, "/photo.png").await;
+    }
+
+    /// SPEC-0019/E2E-124: the convert action keeps every key of today and
+    /// adds the report (FR-NEW-030, FR-MOD-002).
+    #[tokio::test]
+    async fn spec_0019_e2e_124_convert_keeps_its_keys_and_reports() {
+        let (_f, _server, out) = report_with_images().await;
+        let mut keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["artifacts_report", "bytes_written", "md_path", "overwritten", "path"],
+            "got: {out}"
+        );
+        assert_eq!(out["path"], "/report.pdf");
+        assert_eq!(out["md_path"], "/report.md");
+        assert_eq!(out["artifacts_report"], "2 images, 2 tables");
+    }
+
+    /// SPEC-0019/E2E-125: a documented upload carries the sibling path as
+    /// today and the report (FR-NEW-030, FR-MOD-002).
+    #[tokio::test]
+    async fn spec_0019_e2e_125_a_documented_upload_reports() {
+        let (f, _) = setup(None).await;
+        let server = bundling(&f, report_bundle());
+        let out = ok_json(
+            server.fs_write_bytes(Parameters(write_args("/report.pdf", b"%PDF-1.4", true))).await,
+        );
+        let doc = &out["documentation"];
+        assert_eq!(doc["md_path"], "/report.md");
+        assert_eq!(doc["artifacts_report"], "2 images, 2 tables");
+        assert_eq!(
+            image_ids(&images(&server, "/report.pdf", None).await),
+            vec!["image-1", "image-2"]
+        );
     }
 }

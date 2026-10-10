@@ -1279,7 +1279,7 @@ fn fenced(data: &[u8], ext: &str) -> ExtractResult {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::docs::ocr::{NullOcrProvider, OcrProvider};
     use crate::storage::blob::local::LocalBlobStore;
@@ -1743,7 +1743,7 @@ mod tests {
 
     /// Smallest PDF with a real text object, built by hand so the test has no
     /// binary fixture to check in.
-    fn tiny_pdf() -> Vec<u8> {
+    pub(crate) fn tiny_pdf() -> Vec<u8> {
         let content = b"BT /F1 24 Tf 72 700 Td (Hello PDF) Tj ET";
         let mut pdf = Vec::new();
         let mut offsets = Vec::new();
