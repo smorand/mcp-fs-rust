@@ -399,14 +399,15 @@ mod tests {
         "fs.get_image",
         "fs.list_tables",
         "fs.get_table",
+        "fs.get_document_view",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        // 43 since SPEC-0019 US-0005 added fs.list_images and fs.get_image.
-        assert_eq!(reg.len(), 43);
+        // 44 since SPEC-0019 US-0008 added fs.get_document_view.
+        assert_eq!(reg.len(), 44);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -479,9 +480,9 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            // 43 since SPEC-0019 added fs.list_tables, fs.get_table, fs.list_images
-            // and fs.get_image.
-            43,
+            // 44 since SPEC-0019 added fs.list_tables, fs.get_table, fs.list_images,
+            // fs.get_image and fs.get_document_view.
+            44,
             "fs.* tools",
         );
     }

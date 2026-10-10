@@ -359,6 +359,24 @@ pub(crate) struct DocImage {
     pub sha256: String,
 }
 
+/// An image as a full document view places it.
+pub(crate) struct ViewImageRow {
+    pub seq: i64,
+    pub caption: String,
+    /// 0 based line of the picture reference in the conversion text.
+    pub line: i64,
+}
+
+/// A table as a full document view renders it.
+pub(crate) struct ViewTableRow {
+    pub seq: i64,
+    pub caption: String,
+    /// JSON array of arrays of strings.
+    pub cells: String,
+    pub line_start: i64,
+    pub line_count: i64,
+}
+
 /// A conversion's whole artifact set, committed at once.
 pub(crate) struct NewArtifactSet {
     pub set_id: String,
@@ -831,6 +849,68 @@ impl RelationalMetaStore {
             )
             .await?;
         row.map(|r| r.text(0)).transpose()
+    }
+
+    /// The sha256 of a set's conversion text blob, `None` when the text was
+    /// empty (no blob is stored for it).
+    pub(crate) async fn artifact_text_sha(&self, set_id: &str) -> Result<Option<String>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT text_sha FROM doc_artifact_sets WHERE volume_id=?1 AND set_id=?2",
+                )
+                .bind(&self.volume_id)
+                .bind(set_id),
+            )
+            .await?;
+        Ok(row.map(|r| r.opt_text(0)).transpose()?.flatten())
+    }
+
+    /// Every image of a set with its position in the conversion text, in
+    /// reading order: what a full document view places (FR-NEW-007).
+    pub(crate) async fn artifact_view_images(&self, set_id: &str) -> Result<Vec<ViewImageRow>> {
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT seq, caption, line_start FROM doc_images \
+                     WHERE volume_id=?1 AND set_id=?2 ORDER BY seq",
+                )
+                .bind(&self.volume_id)
+                .bind(set_id),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| Ok(ViewImageRow { seq: r.i64(0)?, caption: r.text(1)?, line: r.i64(2)? }))
+            .collect()
+    }
+
+    /// Every table of a set with its cells and position in the conversion
+    /// text, in reading order (FR-NEW-007).
+    pub(crate) async fn artifact_view_tables(&self, set_id: &str) -> Result<Vec<ViewTableRow>> {
+        let rows = self
+            .db
+            .query(
+                &Query::new(
+                    "SELECT seq, caption, cells, line_start, line_count FROM doc_tables \
+                     WHERE volume_id=?1 AND set_id=?2 ORDER BY seq",
+                )
+                .bind(&self.volume_id)
+                .bind(set_id),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ViewTableRow {
+                    seq: r.i64(0)?,
+                    caption: r.text(1)?,
+                    cells: r.text(2)?,
+                    line_start: r.i64(3)?,
+                    line_count: r.i64(4)?,
+                })
+            })
+            .collect()
     }
 
     /// Delete a single `trash_entries` row once `fs.trash_restore` has renamed

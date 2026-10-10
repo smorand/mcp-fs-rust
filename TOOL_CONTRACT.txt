@@ -143,6 +143,11 @@ fs.find_references
   params: mount_id:string, name:string, root:string="/"
   required: ['mount_id', 'name']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.get_document_view
+  desc: Get a converted document's whole text with an image line at each image and each table in the chosen table mode.
+  params: mount_id:string, path:string, captions:boolean=true, table_mode:string=null
+  required: ['mount_id', 'path']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.get_image
   desc: Get one image kept from a document's last conversion: its picture as base64, its format and its caption.
   params: mount_id:string, path:string, id:string
@@ -625,6 +630,7 @@ fs.list_images: {"images": [{"id": "image-1", "caption": "Figure 1: Revenue 2024
 fs.get_image: {"id": "image-2", "format": "png", "caption": "Schéma réseau 🌐", "page": 3, "base64": "iVBORw0KGgo..."}
 fs.list_tables: {"tables": [{"id": "table-1", "caption": "Q1", "rows": 2, "columns": 2, "csv_quality": "CSV quality: exact"}], "marker": null}
 fs.get_table: {"id": "table-2", "format": "csv", "content": "Item,EUR\nRent,900\nPower,120"}
+fs.get_document_view: {"path": "/report.pdf", "text": "# Report\n\nTable 2: Costs\n\n[Table table-2: Costs (CSV)]\n"}
 fs.stat: {"path": "/empty.txt", "size": 0, "mode": "0o644", "kind": "file", "mtime": "<volatile>", "ctime": "<volatile>", "atime": "<volatile>", "uid": 1000, "gid": 1000}
 fs.create_empty: {"path": "/empty.txt", "created": true}
 fs.edit: {"path": "/a.txt", "applied": true, "diff": "--- /a.txt\n+++ /a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n"}
