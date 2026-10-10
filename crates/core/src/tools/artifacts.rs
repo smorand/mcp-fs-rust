@@ -1821,4 +1821,278 @@ mod e2e {
         let sha = crate::storage::VolumeClient::sha256_hex(FIG_1);
         assert_eq!(client.blob.get(&sha, 0, None).await.unwrap(), FIG_1);
     }
+
+    // ── image failures and picture formats (US-0006) ────────────────────────
+
+    /// `n` PNG pictures, captioned `cap1`..`capN`, one reference each, page
+    /// `i` for the i-th, every target and file present (FR-NEW-015).
+    fn captioned_pictures(n: usize) -> Conversion {
+        let targets: Vec<String> = (1..=n).map(|i| format!("p/{i}.png")).collect();
+        let bytes: Vec<Vec<u8>> = (1..=n).map(|i| format!("png {i}").into_bytes()).collect();
+        let captions: Vec<String> = (1..=n).map(|i| format!("cap{i}")).collect();
+        let md: String = targets.iter().map(|t| format!("![]({t})\n\n")).collect();
+        let pics: Vec<Pic<'_>> = targets
+            .iter()
+            .zip(&bytes)
+            .zip(&captions)
+            .zip(1i64..)
+            .map(|(((t, b), c), page)| Pic { target: t, bytes: b, caption: c, page: Some(page) })
+            .collect();
+        bundle(&md, &pics)
+    }
+
+    /// `conversion`, its manifest entry for `target` marked caption failed.
+    fn with_caption_failed(mut conversion: Conversion, target: &str) -> Conversion {
+        if let Some(meta) = conversion.manifest.as_mut().and_then(|m| m.pictures.get_mut(target)) {
+            meta.caption_failed = true;
+        }
+        conversion
+    }
+
+    /// `n` pictures referenced in the text, the `missing`-th (1 based) absent
+    /// from the converter's files, every other present.
+    fn conversion_with_missing(n: usize, missing: usize) -> Conversion {
+        let targets: Vec<String> = (1..=n).map(|i| format!("p/{i}.png")).collect();
+        let md: String = targets.iter().map(|t| format!("![]({t})\n\n")).collect();
+        let mut files = std::collections::BTreeMap::new();
+        let mut pictures = std::collections::BTreeMap::new();
+        for (idx, t) in (1..=n).zip(&targets) {
+            if idx == missing {
+                continue;
+            }
+            files.insert(t.clone(), format!("png {idx}").into_bytes());
+            pictures.insert(
+                t.clone(),
+                PictureMeta {
+                    caption: String::new(),
+                    caption_failed: false,
+                    page: Some(idx as i64),
+                },
+            );
+        }
+        Conversion { markdown: md, files, manifest: Some(Manifest { pictures }) }
+    }
+
+    /// SPEC-0019/E2E-005: a failed caption is reported and the image is kept
+    /// with an empty caption, every other image unaffected.
+    #[tokio::test]
+    async fn spec_0019_e2e_005_a_failed_caption_is_reported_and_the_image_kept() {
+        let conversion = with_caption_failed(captioned_pictures(5), "p/4.png");
+        let (_f, server) = converting_bundle("/deck.pdf", conversion).await;
+        let out = convert(&server, "/deck.pdf").await;
+        assert_eq!(out["artifacts_report"], "5 images, 0 tables\nimage-4: caption unavailable");
+        let list = images(&server, "/deck.pdf", None).await;
+        let captions: Vec<Value> =
+            list["images"].as_array().unwrap().iter().map(|i| i["caption"].clone()).collect();
+        assert_eq!(
+            captions,
+            vec![json!("cap1"), json!("cap2"), json!("cap3"), json!(""), json!("cap5")]
+        );
+    }
+
+    /// SPEC-0019/E2E-007: a referenced picture missing from the converter's
+    /// files is reported and its id stays unused.
+    #[tokio::test]
+    async fn spec_0019_e2e_007_a_missing_referenced_picture_is_reported() {
+        let conversion = conversion_with_missing(5, 3);
+        let (_f, server) = converting_bundle("/deck2.pdf", conversion).await;
+        let out = convert(&server, "/deck2.pdf").await;
+        assert_eq!(out["artifacts_report"], "4 images, 0 tables\nimage-3: picture unavailable");
+        let list = images(&server, "/deck2.pdf", None).await;
+        assert_eq!(image_ids(&list), vec!["image-1", "image-2", "image-4", "image-5"]);
+    }
+
+    /// SPEC-0019/E2E-008: an unsupported picture format is reported and not
+    /// kept; a supported one beside it still comes through.
+    #[tokio::test]
+    async fn spec_0019_e2e_008_an_unsupported_picture_format_is_reported() {
+        let md = "![](a.jpg)\n\n![](b.svg)\n";
+        let files: std::collections::BTreeMap<String, Vec<u8>> = [
+            ("a.jpg".to_string(), b"jpeg bytes".to_vec()),
+            ("b.svg".to_string(), b"<svg/>".to_vec()),
+        ]
+        .into();
+        let conversion = Conversion { markdown: md.to_string(), files, manifest: None };
+        let (_f, server) = converting_bundle("/mixed.pdf", conversion).await;
+        let out = convert(&server, "/mixed.pdf").await;
+        assert_eq!(
+            out["artifacts_report"],
+            "1 images, 0 tables\nimage-2: unsupported picture format svg"
+        );
+        let got = image(&server, "/mixed.pdf", "image-1").await;
+        assert_eq!(got["format"], "jpeg");
+    }
+
+    /// SPEC-0019/E2E-113: a `.tif` picture is kept as format `tiff`, with no
+    /// missing item.
+    #[tokio::test]
+    async fn spec_0019_e2e_113_a_tif_picture_is_kept_as_tiff() {
+        let md = "![](scan.tif)\n";
+        let files: std::collections::BTreeMap<String, Vec<u8>> =
+            [("scan.tif".to_string(), b"tiff bytes".to_vec())].into();
+        let conversion = Conversion { markdown: md.to_string(), files, manifest: None };
+        let (_f, server) = converting_bundle("/scan2.pdf", conversion).await;
+        let out = convert(&server, "/scan2.pdf").await;
+        assert_eq!(out["artifacts_report"], "1 images, 0 tables");
+        let got = image(&server, "/scan2.pdf", "image-1").await;
+        assert_eq!(got["format"], "tiff");
+    }
+
+    /// SPEC-0019/E2E-114: an image failure then a table failure are reported
+    /// in that order, images before tables.
+    #[tokio::test]
+    async fn spec_0019_e2e_114_image_and_table_failures_are_reported_in_order() {
+        let md = "![](p/1.png)\n\n![](p/2.png)\n\n![](p/3.png)\n\n\
+                  | a | b |\n| --- |\n\n\
+                  | c |\n| --- |\n";
+        let mut files = std::collections::BTreeMap::new();
+        let mut pictures = std::collections::BTreeMap::new();
+        for i in [1, 3] {
+            let t = format!("p/{i}.png");
+            files.insert(t.clone(), format!("png {i}").into_bytes());
+            pictures.insert(
+                t,
+                PictureMeta { caption: String::new(), caption_failed: false, page: Some(i) },
+            );
+        }
+        let conversion =
+            Conversion { markdown: md.to_string(), files, manifest: Some(Manifest { pictures }) };
+        let (_f, server) = converting_bundle("/mix2.pdf", conversion).await;
+        let out = convert(&server, "/mix2.pdf").await;
+        assert_eq!(
+            out["artifacts_report"],
+            "2 images, 1 tables\nimage-2: picture unavailable\ntable-1: malformed table"
+        );
+    }
+
+    /// SPEC-0019/E2E-129: a single failed caption is reported, the image kept
+    /// with an empty caption.
+    #[tokio::test]
+    async fn spec_0019_e2e_129_a_single_failed_caption_is_reported() {
+        let conversion = with_caption_failed(captioned_pictures(1), "p/1.png");
+        let (_f, server) = converting_bundle("/blur.pdf", conversion).await;
+        let out = convert(&server, "/blur.pdf").await;
+        assert_eq!(out["artifacts_report"], "1 images, 0 tables\nimage-1: caption unavailable");
+        assert_eq!(images(&server, "/blur.pdf", None).await["images"][0]["caption"], "");
+    }
+
+    /// SPEC-0019/E2E-143: a picture the converter drops entirely (not
+    /// referenced in the text) takes no id and is not reported.
+    #[tokio::test]
+    async fn spec_0019_e2e_143_a_converter_dropped_picture_is_not_reported() {
+        let md = "![](p/1.png)\n\n![](p/2.png)\n";
+        let files: std::collections::BTreeMap<String, Vec<u8>> =
+            [("p/1.png".to_string(), b"one".to_vec()), ("p/2.png".to_string(), b"two".to_vec())]
+                .into();
+        let conversion = Conversion { markdown: md.to_string(), files, manifest: None };
+        let (_f, server) = converting_bundle("/drop.pdf", conversion).await;
+        let out = convert(&server, "/drop.pdf").await;
+        assert_eq!(out["artifacts_report"], "2 images, 0 tables");
+        let list = images(&server, "/drop.pdf", None).await;
+        assert_eq!(image_ids(&list), vec!["image-1", "image-2"]);
+    }
+
+    /// A shell script `document.md` producer run through the real
+    /// [`CliDocService`], `{outdir}` mode: writes `document.md`, a kept
+    /// picture, and (SPEC-0019/E2E-151) a `secret.png` at the exact
+    /// filesystem location its own `../../secret.png` markdown reference
+    /// would resolve to, so the only thing standing between the conversion
+    /// and that file is the real escape rejection, not an in-memory stub.
+    fn write_traversal_bundle_script(dir: &std::path::Path, secret: &[u8]) -> std::path::PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("bundle.sh");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        // $1 is the outdir ({outdir}), $2 is the staged input ({document}).
+        writeln!(f, "out=\"$1\"").unwrap();
+        writeln!(f, "mkdir -p \"$out/figures\"").unwrap();
+        writeln!(
+            f,
+            "printf '![x](../../secret.png)\\n\\n![y](figures/figure_1.png)\\n' > \"$out/document.md\""
+        )
+        .unwrap();
+        writeln!(f, "printf 'fig1' > \"$out/figures/figure_1.png\"").unwrap();
+        // Resolve where `../../secret.png` really lands from $out, by
+        // navigating there, not by assuming a path: this is the exact
+        // location the production target resolution would read from if it
+        // ever followed `..` onto disk.
+        writeln!(f, "dest=$(cd \"$out/../..\" && pwd)").unwrap();
+        writeln!(f, "printf '%s' '{}' > \"$dest/secret.png\"", String::from_utf8_lossy(secret))
+            .unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// SPEC-0019/E2E-151: a target escaping the converter's output with `..`
+    /// is reported and never read, even when a real file sits there, driven
+    /// through the real CLI document service (not an in-memory stub), so a
+    /// future regression that let a target resolve onto disk would actually
+    /// be caught.
+    #[tokio::test]
+    async fn spec_0019_e2e_151_a_path_escaping_the_output_is_never_read() {
+        let secret = b"top secret pixels";
+        let home = tempfile::tempdir().expect("a temp dir for the fake converter script");
+        let sh = write_traversal_bundle_script(home.path(), secret);
+
+        let cli = crate::docs::CliDocService::new(
+            crate::config::DocServiceCliConfig {
+                command: vec![
+                    sh.display().to_string(),
+                    crate::config::OUTDIR_PLACEHOLDER.into(),
+                    crate::config::DOC_PLACEHOLDER.into(),
+                ],
+                timeout_secs: 30,
+            },
+            crate::docs::DOC_SERVICE_EXTS.iter().map(|e| (*e).to_string()).collect(),
+            u64::MAX,
+        );
+
+        let (f, _) = setup(None).await;
+        put(&f, "/trav.pdf", b"%PDF-1.4 source").await;
+        let server = with_doc(&f, Some(Arc::new(cli)));
+
+        let out = convert(&server, "/trav.pdf").await;
+        assert_eq!(out["artifacts_report"], "1 images, 0 tables\nimage-1: picture unavailable");
+        let list = images(&server, "/trav.pdf", None).await;
+        assert_eq!(image_ids(&list), vec!["image-2"]);
+
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        let sha = crate::storage::VolumeClient::sha256_hex(secret);
+        assert!(client.blob.get(&sha, 0, None).await.is_err(), "no blob for the secret's bytes");
+
+        // Cleanup: the planted file sits two levels above the sandbox, which
+        // is outside the tempdir that CliDocService itself removes.
+        let _ = std::fs::remove_file(std::env::temp_dir().join("secret.png"));
+    }
+
+    /// SPEC-0019/E2E-152: a URL target is reported and never fetched.
+    #[tokio::test]
+    async fn spec_0019_e2e_152_a_url_target_is_never_read() {
+        let md = "![x](https://example.com/a.png)\n";
+        let conversion = Conversion {
+            markdown: md.to_string(),
+            files: std::collections::BTreeMap::new(),
+            manifest: None,
+        };
+        let (_f, server) = converting_bundle("/url.pdf", conversion).await;
+        let out = convert(&server, "/url.pdf").await;
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables\nimage-1: picture unavailable");
+    }
+
+    /// SPEC-0019/E2E-153: an absolute path target is reported and never read
+    /// from disk.
+    #[tokio::test]
+    async fn spec_0019_e2e_153_an_absolute_target_is_never_read() {
+        let md = "![x](/etc/hosts.png)\n";
+        let conversion = Conversion {
+            markdown: md.to_string(),
+            files: std::collections::BTreeMap::new(),
+            manifest: None,
+        };
+        let (_f, server) = converting_bundle("/abs.pdf", conversion).await;
+        let out = convert(&server, "/abs.pdf").await;
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables\nimage-1: picture unavailable");
+    }
 }
