@@ -369,7 +369,7 @@ mod e2e {
     use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
     use crate::mcp::server::{
         DocumentViewArgs, DocumentizeArgs, ExtractTextArgs, GetImageArgs, GetTableArgs,
-        ListImagesArgs, ListTablesArgs, McpServer, WriteBytesArgs,
+        ListImagesArgs, ListTablesArgs, McpServer, MoveArgs, ReadBytesArgs, WriteBytesArgs,
     };
     use crate::state::AppState;
     use crate::tools::admin::test_support::Fixture;
@@ -3339,5 +3339,300 @@ mod e2e {
         assert_eq!(image_ids(&list), numbered("image", 4));
         assert_eq!(captions(&list), vec!["B1", "B2", "B3", "B4"]);
         assert_eq!(sibling(&f).await, bob_markdown);
+    }
+
+    // ── refused and overtaken re-conversions (US-0011) ──────────────────────
+
+    /// `report.pdf` (a parseable PDF, so the built-in extraction works too)
+    /// converted through the fake converter under a session quota of `quota`.
+    async fn report_with_quota(quota: i64) -> (Fixture, McpServer) {
+        let (f, _) = setup(Some(quota)).await;
+        put(&f, "/report.pdf", &crate::docs::extract::tests::tiny_pdf()).await;
+        let server = bundling(&f, report_bundle());
+        convert(&server, "/report.pdf").await;
+        (f, server)
+    }
+
+    /// Charge Alice so exactly `left` bytes of her `quota` remain.
+    fn leave(f: &Fixture, quota: i64, left: i64) {
+        let used = f.state.safety.bytes_written(ALICE, PROJECT);
+        f.state.safety.charge_write(ALICE, PROJECT, quota - left - used).unwrap();
+    }
+
+    /// A conversion with no picture whose sibling and conversion text weigh
+    /// 25 000 bytes each: 50 000 together.
+    fn heavy() -> Conversion {
+        bundle(&"z".repeat(25_000), &[])
+    }
+
+    fn refresh_args(path: &str) -> ExtractTextArgs {
+        let mut args = extract_args(path, 200_000);
+        args.refresh = true;
+        args
+    }
+
+    /// `person` reads `path` then overwrites it with `bytes`, the read
+    /// before write guard being part of any real edit.
+    async fn overwrite_as(server: &McpServer, path: &str, bytes: &[u8]) {
+        let read = ReadBytesArgs {
+            mount_id: PROJECT.into(),
+            path: path.into(),
+            offset_bytes: 0,
+            length_bytes: 1_000_000,
+        };
+        ok_json(server.fs_read_bytes(Parameters(read)).await);
+        let mut args = write_args(path, bytes, false);
+        args.overwrite = true;
+        ok_json(server.fs_write_bytes(Parameters(args)).await);
+    }
+
+    /// SPEC-0019/E2E-071: a re-conversion over the quota is refused and keeps
+    /// the set and the sibling byte for byte (FR-NEW-013, FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_071_a_reconversion_over_the_quota_keeps_the_set() {
+        let (f, _) = report_with_quota(QUOTA).await;
+        let before = sibling(&f).await;
+        leave(&f, QUOTA, 10_000);
+        let server = bundling(&f, heavy());
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/report.pdf", true))).await,
+        );
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+        report_unchanged(&f, &server, &before).await;
+        assert_eq!(
+            picture(&image(&server, "/report.pdf", "image-1").await),
+            FIG_1,
+            "the kept picture bytes"
+        );
+    }
+
+    /// SPEC-0019/E2E-075: an extraction with refresh over the quota keeps the
+    /// images (FR-MOD-001, FR-NEW-013, FR-NEW-026).
+    #[tokio::test]
+    async fn spec_0019_e2e_075_a_refused_refresh_keeps_the_images() {
+        let (f, server) = report_with_quota(QUOTA).await;
+        leave(&f, QUOTA, 10);
+        let err = err_text(server.fs_extract_text(Parameters(refresh_args("/report.pdf"))).await);
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+        assert_eq!(image_ids(&images(&server, "/report.pdf", None).await), numbered("image", 2));
+    }
+
+    /// SPEC-0019/E2E-076: an extraction with refresh over the quota leaves
+    /// the sibling byte identical (FR-MOD-001).
+    #[tokio::test]
+    async fn spec_0019_e2e_076_a_refused_refresh_keeps_the_sibling() {
+        let (f, server) = report_with_quota(QUOTA).await;
+        let reference = sibling(&f).await;
+        leave(&f, QUOTA, 10);
+        let err = err_text(server.fs_extract_text(Parameters(refresh_args("/report.pdf"))).await);
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+        assert_eq!(sibling(&f).await, reference);
+    }
+
+    /// SPEC-0019/E2E-077: a re-conversion over the quota leaves the sibling
+    /// byte identical and the images unchanged (FR-NEW-013, FR-NEW-022).
+    #[tokio::test]
+    async fn spec_0019_e2e_077_a_refused_reconversion_keeps_sibling_and_images() {
+        let (f, server) = report_with_quota(QUOTA).await;
+        let reference = sibling(&f).await;
+        leave(&f, QUOTA, 10);
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/report.pdf", true))).await,
+        );
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+        report_unchanged(&f, &server, &reference).await;
+    }
+
+    /// SPEC-0019/E2E-078: a documented upload whose conversion overflows the
+    /// quota keeps the new source, reports the quota message, and leaves the
+    /// sibling as it was (FR-NEW-014, FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_078_a_documented_upload_over_the_quota_keeps_the_sibling() {
+        const BIG: i64 = 600_000;
+        let (f, _) = report_with_quota(BIG).await;
+        let reference = sibling(&f).await;
+        leave(&f, BIG, 300_000);
+        let server = bundling(&f, heavy());
+        let source = vec![b'p'; 290_000];
+        let mut args = write_args("/report.pdf", &source, true);
+        args.overwrite = true;
+        let out = ok_json(server.fs_write_bytes(Parameters(args)).await);
+        assert_eq!(
+            out["documentation"]["error"]["message"],
+            "session write quota of 600000 bytes exceeded",
+            "got: {out}"
+        );
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert_eq!(client.read_bytes("/report.pdf").await.unwrap(), source);
+        assert_eq!(sibling(&f).await, reference);
+        no_artifacts(&server, "/report.pdf").await;
+    }
+
+    /// SPEC-0019/E2E-085: a re-conversion keeps its full charge, the former
+    /// set's bytes are not given back (FR-NEW-013).
+    #[tokio::test]
+    async fn spec_0019_e2e_085_a_reconversion_gives_no_quota_back() {
+        let (f, _) = report_with_quota(QUOTA).await;
+        leave(&f, QUOTA, 60_000);
+        let server = bundling(&f, heavy());
+        let out = reconvert(&server, "/report.pdf").await;
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables");
+        let err = err_text(
+            server.fs_write_bytes(Parameters(write_args("/w.txt", &[b'w'; 20_000], false))).await,
+        );
+        assert!(err.contains("session write quota of 262144 bytes exceeded"), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-107: with the converter removed the convert action is
+    /// refused and the set is kept (FR-NEW-029, FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_107_no_converter_keeps_the_set() {
+        let (f, _, _) = report_with_images().await;
+        let server = with_doc(&f, None);
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/report.pdf", true))).await,
+        );
+        assert!(err.contains("document service is not configured"), "got: {err}");
+        assert_eq!(image_ids(&images(&server, "/report.pdf", None).await), numbered("image", 2));
+    }
+
+    fn assert_changed(err: &str, path: &str) {
+        assert!(err.contains(&format!("Document changed during conversion: {path}")), "got: {err}");
+        assert!(err.contains("ERR_INVALID_ARGUMENT"), "invalid argument category, got: {err}");
+    }
+
+    /// SPEC-0019/E2E-133: a document rewritten during its re-conversion
+    /// refuses it, and the document is then not extracted (FR-NEW-035).
+    #[tokio::test]
+    async fn spec_0019_e2e_133_a_write_during_reconversion_refuses_it() {
+        let (f, _) = report_with_bob().await;
+        let reference = sibling(&f).await;
+        let (doc, gate) = gated(report_pictures(&["A", "B", "C"]));
+        let alice = with_doc(&f, Some(doc));
+        let bob = with_doc_as(&f, None, BOB);
+        let drive = async {
+            gate.started.await.unwrap();
+            overwrite_as(&bob, "/report.pdf", b"%PDF-1.4 bob").await;
+            gate.release.send(()).unwrap();
+        };
+        let (got, ()) = tokio::join!(
+            alice.fs_documentize(Parameters(documentize_args("/report.pdf", true))),
+            drive
+        );
+        assert_changed(&err_text(got), "/report.pdf");
+        no_artifacts(&alice, "/report.pdf").await;
+        assert_eq!(sibling(&f).await, reference);
+    }
+
+    /// SPEC-0019/E2E-134: a document moved during its first conversion
+    /// refuses it, and neither path keeps artifacts or a sibling (FR-NEW-035).
+    #[tokio::test]
+    async fn spec_0019_e2e_134_a_move_during_conversion_refuses_it() {
+        let (f, _) = setup(None).await;
+        f.state.admin.add_member(PROJECT, BOB, ALICE).await.unwrap();
+        put(&f, "/fresh.pdf", b"%PDF-1.4 fresh").await;
+        let (doc, gate) = gated(report_bundle());
+        let alice = with_doc(&f, Some(doc));
+        let bob = with_doc_as(&f, None, BOB);
+        let drive = async {
+            gate.started.await.unwrap();
+            let args = MoveArgs {
+                mount_id: PROJECT.into(),
+                source: "/fresh.pdf".into(),
+                destination: "/moved.pdf".into(),
+                overwrite: false,
+            };
+            ok_json(bob.fs_move(Parameters(args)).await);
+            gate.release.send(()).unwrap();
+        };
+        let (got, ()) = tokio::join!(
+            alice.fs_documentize(Parameters(documentize_args("/fresh.pdf", false))),
+            drive
+        );
+        assert_changed(&err_text(got), "/fresh.pdf");
+        no_artifacts(&alice, "/moved.pdf").await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert!(!client.exists("/fresh.md").await.unwrap(), "no sibling kept");
+    }
+
+    /// SPEC-0019/E2E-135: a read during a re-conversion changes nothing, the
+    /// re-conversion succeeds (FR-NEW-035).
+    #[tokio::test]
+    async fn spec_0019_e2e_135_a_read_during_reconversion_lets_it_succeed() {
+        let (f, _) = report_with_bob().await;
+        let (doc, gate) = gated(report_pictures(&["A", "B", "C"]));
+        let alice = with_doc(&f, Some(doc));
+        let bob = with_doc_as(&f, None, BOB);
+        let drive = async {
+            gate.started.await.unwrap();
+            let read = ReadBytesArgs {
+                mount_id: PROJECT.into(),
+                path: "/report.pdf".into(),
+                offset_bytes: 0,
+                length_bytes: 1_000,
+            };
+            ok_json(bob.fs_read_bytes(Parameters(read)).await);
+            gate.release.send(()).unwrap();
+        };
+        let (out, ()) = tokio::join!(reconvert(&alice, "/report.pdf"), drive);
+        assert_eq!(out["artifacts_report"], "3 images, 2 tables");
+        assert_eq!(captions(&images(&alice, "/report.pdf", None).await), vec!["A", "B", "C"]);
+    }
+
+    /// SPEC-0019/E2E-138: an overtaken re-conversion charges nothing and
+    /// leaves the sibling byte identical (FR-NEW-035, FR-NEW-013).
+    #[tokio::test]
+    async fn spec_0019_e2e_138_an_overtaken_reconversion_charges_nothing() {
+        let (f, _) = report_with_quota(QUOTA).await;
+        f.state.admin.add_member(PROJECT, BOB, ALICE).await.unwrap();
+        let reference = sibling(&f).await;
+        let used = f.state.safety.bytes_written(ALICE, PROJECT);
+        f.state.safety.refund_write(ALICE, PROJECT, used);
+        let (doc, gate) = gated(report_pictures(&["A", "B", "C"]));
+        let alice = with_doc(&f, Some(doc));
+        let bob = with_doc_as(&f, None, BOB);
+        let drive = async {
+            gate.started.await.unwrap();
+            overwrite_as(&bob, "/report.pdf", b"%PDF-1.4 bob").await;
+            gate.release.send(()).unwrap();
+        };
+        let (got, ()) = tokio::join!(
+            alice.fs_documentize(Parameters(documentize_args("/report.pdf", true))),
+            drive
+        );
+        assert_changed(&err_text(got), "/report.pdf");
+        assert_eq!(sibling(&f).await, reference);
+        ok_json(
+            alice.fs_write_bytes(Parameters(write_args("/n.txt", &[b'n'; 262_144], false))).await,
+        );
+    }
+
+    /// FR-NEW-035 on the extraction path: a write landing while an extraction
+    /// with refresh waits for the document's artifact lock refuses it,
+    /// charges nothing and leaves the sibling and the set as they were.
+    #[tokio::test]
+    async fn an_extraction_overtaken_by_a_write_charges_nothing() {
+        let (f, server) = report_with_quota(QUOTA).await;
+        f.state.admin.add_member(PROJECT, BOB, ALICE).await.unwrap();
+        let reference = sibling(&f).await;
+        let used = f.state.safety.bytes_written(ALICE, PROJECT);
+        let bob = with_doc_as(&f, None, BOB);
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        let store = client.trash.clone().expect("a relational store");
+        let held = store.lock_artifacts("/report.pdf").await;
+        let drive = async {
+            // The extraction converted and now waits on the held lock.
+            while store.artifact_lock_contenders("/report.pdf") < 2 {
+                tokio::task::yield_now().await;
+            }
+            overwrite_as(&bob, "/report.pdf", &crate::docs::extract::tests::tiny_pdf()).await;
+            drop(held);
+        };
+        let (got, ()) =
+            tokio::join!(server.fs_extract_text(Parameters(refresh_args("/report.pdf"))), drive);
+        assert_changed(&err_text(got), "/report.pdf");
+        assert_eq!(sibling(&f).await, reference);
+        assert_eq!(f.state.safety.bytes_written(ALICE, PROJECT), used, "nothing charged");
+        no_artifacts(&server, "/report.pdf").await;
     }
 }

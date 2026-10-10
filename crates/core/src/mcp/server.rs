@@ -1397,7 +1397,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.read_bytes", description = "Read raw bytes (base64) with MIME type.")]
-    async fn fs_read_bytes(
+    pub(crate) async fn fs_read_bytes(
         &self,
         Parameters(a): Parameters<ReadBytesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1999,7 +1999,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.move", description = "Rename or relocate a path (no-clobber by default).")]
-    async fn fs_move(
+    pub(crate) async fn fs_move(
         &self,
         Parameters(a): Parameters<MoveArgs>,
     ) -> Result<CallToolResult, ErrorData> {

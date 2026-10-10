@@ -11,10 +11,12 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::core::diff;
+use crate::docs::artifacts::capture::PendingSet;
 use crate::docs::service::{DocService, eligible_in};
 use crate::errors::{Result, ToolError};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
+use crate::storage::meta::RelationalMetaStore;
 use crate::util::text::split_lines;
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
@@ -794,22 +796,86 @@ async fn write_companion(
     let set = crate::docs::artifacts::capture::PendingSet::converter(&conversion, norm);
     let kept = store.zip(rev.as_deref());
     let set_bytes = if kept.is_some() { set.bytes() } else { 0 };
-    safety.charge_write(person, mount_id, markdown.len() as i64 + set_bytes)?;
-    // Held until the commit: an overlapping conversion of this document waits
-    // here, so the last one to commit also wrote the sibling (DEC-008).
-    let _commit_order = match kept {
-        Some((store, _)) => Some(store.lock_artifacts(norm).await),
-        None => None,
+    let write = async {
+        client.write_bytes_atomic(&md, markdown.as_bytes()).await?;
+        client.touch_atime_mtime(&md);
+        Ok(())
     };
-    client.write_bytes_atomic(&md, markdown.as_bytes()).await?;
-    client.touch_atime_mtime(&md);
+    let landing = kept.map(|(store, rev)| (store, rev, &set));
+    let charge = markdown.len() as i64 + set_bytes;
+    land_conversion(client, safety, person, mount_id, norm, landing, Some(&md), charge, write)
+        .await?;
     safety.record_audit(person, mount_id, "doc_service", &md, "");
     // A fresh companion counts as read, so a follow-up edit passes the guard.
     safety.record_read(person, mount_id, &md);
-    if let Some((store, rev)) = kept {
-        set.commit(client, store, norm, rev).await?;
-    }
     Ok(Companion { md_path: md, bytes_written: markdown.len(), overwritten, report: set.report() })
+}
+
+/// The tail every conversion shares: charge, write the sibling, commit the
+/// set (DEC-005, DEC-008, FR-NEW-035).
+///
+/// With a set to keep, everything runs under the document's artifact lock, so
+/// of overlapping conversions the one committing last also wrote the sibling
+/// (FR-NEW-010). The revision is checked BEFORE the charge and the sibling
+/// write, so a conversion overtaken by a change to its document charges
+/// nothing and leaves the sibling as it was. Writers take no artifact lock, so
+/// a change can still land between that check and the commit: the commit then
+/// refuses, the former sibling bytes are put back and the charge is refunded.
+/// The lock only orders conversions: an ordinary write to the sibling takes no
+/// lock, so one landing during this window is overwritten by the restore. That
+/// is an accepted risk: the sibling is a generated companion, and the window
+/// is the few awaits between the snapshot and the commit.
+#[allow(clippy::too_many_arguments)]
+async fn land_conversion(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    norm: &str,
+    landing: Option<(&RelationalMetaStore, &str, &PendingSet<'_>)>,
+    md: Option<&str>,
+    charge: i64,
+    write_sibling: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let Some((store, rev, set)) = landing else {
+        safety.charge_write(person, mount_id, charge)?;
+        return write_sibling.await;
+    };
+    let _commit_order = store.lock_artifacts(norm).await;
+    store.ensure_rev_unchanged(norm, rev).await?;
+    // Snapshot before charging, so a failed read leaks no charge.
+    let before = match md {
+        Some(md) if client.exists(md).await? => Some(client.read_bytes(md).await?),
+        _ => None,
+    };
+    safety.charge_write(person, mount_id, charge)?;
+    let landed = async {
+        write_sibling.await?;
+        set.commit(client, store, norm, rev).await
+    }
+    .await;
+    if let Err(e) = landed {
+        if let Some(md) = md {
+            restore_sibling(client, md, before).await;
+        }
+        safety.refund_write(person, mount_id, charge);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Put a sibling back as it was before a refused conversion: its former
+/// bytes, or no sibling at all. Best effort: the refusal is what the caller
+/// reports, a failed restore is logged.
+async fn restore_sibling(client: &VolumeClient, md: &str, before: Option<Vec<u8>>) {
+    let restored = match before {
+        Some(bytes) => client.write_bytes_atomic(md, &bytes).await,
+        None if client.exists(md).await.unwrap_or(false) => client.delete_file(md).await,
+        None => Ok(()),
+    };
+    if let Err(e) = restored {
+        tracing::error!(path = md, error = %e.message, "sibling restore after a refused conversion failed");
+    }
 }
 
 pub async fn write_text(
@@ -1623,26 +1689,24 @@ pub async fn extract_document(
     };
     let sibling = fresh.sibling_bytes();
     let total = sibling + capture.as_ref().map_or(0, |(_, _, set)| set.bytes());
-    if total > 0 {
-        safety.charge_write(person, mount_id, total)?;
-    }
-    // Held until the commit, as in `write_companion` (DEC-008).
-    let _commit_order = match &capture {
-        Some((store, _, _)) => Some(store.lock_artifacts(norm).await),
-        None => None,
-    };
-    fresh.write_sibling(client).await?;
+    let landing = capture.as_ref().map(|(store, rev, set)| (*store, *rev, set));
+    land_conversion(
+        client,
+        safety,
+        person,
+        mount_id,
+        norm,
+        landing,
+        fresh.md_path(),
+        total,
+        fresh.write_sibling(client),
+    )
+    .await?;
     if let Some(md) = fresh.md_path() {
         safety.record_read(person, mount_id, md);
         safety.record_audit(person, mount_id, "extract_text", md, &format!("{sibling} bytes"));
     }
-    let report = match &capture {
-        Some((store, rev, set)) => {
-            set.commit(client, store, norm, rev).await?;
-            Some(set.report())
-        }
-        None => None,
-    };
+    let report = capture.as_ref().map(|(_, _, set)| set.report());
     let mut payload = fresh.into_payload();
     // Only a conversion reports (FR-NEW-030); the extracted text is untouched.
     if let (Some(report), Value::Object(map)) = (report, &mut payload) {
@@ -3849,6 +3913,67 @@ mod tests {
         let text = meta.artifact_text_sha(&set).await.unwrap();
         assert_eq!(text, Some(VolumeClient::sha256_hex(&sibling)), "set and sibling disagree");
         assert_eq!(sibling, BOB_MD.as_bytes(), "Bob committed last");
+    }
+
+    /// Drive a conversion paused on its commit's text put (after the sibling
+    /// write, before the commit's revision check) while the source changes, so
+    /// the commit refuses late. Returns the conversion error, the sibling bytes
+    /// left (or `None`) and the bytes still charged.
+    async fn late_refusal(former_sibling: Option<&[u8]>) -> (ToolError, Option<Vec<u8>>, i64) {
+        const NEW_MD: &str = "# late\n";
+        let meta =
+            Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
+        let d = tempfile::tempdir().unwrap();
+        let (paused_tx, paused) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let blob = Arc::new(PausingBlob {
+            inner: crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"),
+            pause: VolumeClient::sha256_hex(NEW_MD.as_bytes()),
+            puts: AtomicUsize::new(0),
+            paused: StdMutex::new(Some(paused_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        });
+        let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta.clone());
+        let s = SafetyManager::new(SafetyConfig::default(), None);
+        v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
+        if let Some(bytes) = former_sibling {
+            v.write_bytes_atomic("/report.md", bytes).await.unwrap();
+        }
+        let stub = StubDocService::ok(NEW_MD);
+        let call = documentize(&v, &s, Some(&stub), P, M, "/report.pdf", true);
+        let drive = async {
+            paused.await.unwrap();
+            assert_eq!(v.read_bytes("/report.md").await.unwrap(), NEW_MD.as_bytes());
+            v.write_bytes_atomic("/report.pdf", b"%PDF changed").await.unwrap();
+            release.send(()).unwrap();
+        };
+        let (r, ()) = tokio::join!(call, drive);
+        let e = r.unwrap_err();
+        let left = if v.exists("/report.md").await.unwrap() {
+            Some(v.read_bytes("/report.md").await.unwrap())
+        } else {
+            None
+        };
+        (e, left, s.bytes_written(P, M))
+    }
+
+    /// FR-NEW-035 late refusal: the former sibling bytes are put back and the
+    /// charge is refunded.
+    #[tokio::test]
+    async fn a_late_refusal_restores_the_former_sibling_and_refunds() {
+        let (e, left, charged) = late_refusal(Some(b"# former\n")).await;
+        assert!(e.message.contains("Document changed during conversion"), "{}", e.message);
+        assert_eq!(left.as_deref(), Some(&b"# former\n"[..]), "former sibling restored");
+        assert_eq!(charged, 0, "charge refunded");
+    }
+
+    /// FR-NEW-035 late refusal with no former sibling: the sibling is removed.
+    #[tokio::test]
+    async fn a_late_refusal_deletes_a_sibling_that_did_not_exist() {
+        let (e, left, charged) = late_refusal(None).await;
+        assert!(e.message.contains("Document changed during conversion"), "{}", e.message);
+        assert_eq!(left, None, "no sibling left behind");
+        assert_eq!(charged, 0, "charge refunded");
     }
 
     /// The companion path is deliberately the one `fs.extract_text` looks at, so a

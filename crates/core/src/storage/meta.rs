@@ -670,10 +670,7 @@ impl RelationalMetaStore {
         let mut tx = self.db.begin().await?;
         if tx_node_rev(&mut *tx, volume, &set.path).await?.as_deref() != Some(set.node_rev.as_str())
         {
-            return Err(ToolError::invalid_argument(format!(
-                "{CHANGED_DURING_CONVERSION}: {}",
-                set.path
-            )));
+            return Err(changed_during_conversion(&set.path));
         }
         tx.execute(
             &Query::new(
@@ -760,6 +757,22 @@ impl RelationalMetaStore {
         )
         .await?;
         tx.commit().await
+    }
+
+    /// Refuse when `path` no longer carries `rev`, a missing node included
+    /// (FR-NEW-035). Run under the artifact lock before a conversion charges
+    /// or writes anything, so an overtaken conversion leaves nothing behind.
+    pub(crate) async fn ensure_rev_unchanged(&self, path: &str, rev: &str) -> Result<()> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT rev FROM nodes WHERE volume_id=?1 AND path=?2")
+                    .bind(&self.volume_id)
+                    .bind(path),
+            )
+            .await?;
+        let current = row.map(|r| r.opt_text(0)).transpose()?.flatten();
+        if current.as_deref() == Some(rev) { Ok(()) } else { Err(changed_during_conversion(path)) }
     }
 
     /// Hold `path`'s artifact lock across a sibling write and the set commit
@@ -998,6 +1011,11 @@ async fn tx_kind(tx: &mut dyn RelationalTx, volume: &str, path: &str) -> Result<
         Some(r) => Ok(Some(r.text(0)?)),
         None => Ok(None),
     }
+}
+
+/// The FR-NEW-035 refusal, in the invalid argument category.
+fn changed_during_conversion(path: &str) -> ToolError {
+    ToolError::invalid_argument(format!("{CHANGED_DURING_CONVERSION}: {path}"))
 }
 
 /// The `rev` of a node, `None` when there is no node or it was never stamped.
