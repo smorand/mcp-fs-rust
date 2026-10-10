@@ -368,10 +368,11 @@ mod e2e {
     use crate::docs::DocService;
     use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
     use crate::mcp::server::{
-        CopyArgs, DeleteArgs, DocumentViewArgs, DocumentizeArgs, EditArgs, ExtractArchiveArgs,
-        ExtractTextArgs, GetImageArgs, GetTableArgs, GitBranchCreateArgs, GitBranchSwitchArgs,
-        GitCheckoutFileArgs, GitCommitArgs, ListDirArgs, ListImagesArgs, ListTablesArgs, McpServer,
-        MountOnlyArgs, MoveArgs, ProjectIdArgs, ReadBytesArgs, TrashRestoreArgs, WriteBytesArgs,
+        CopyArgs, DeleteArgs, DocumentViewArgs, DocumentizeArgs, EditArgs, ExcludePatterns,
+        ExportZipArgs, ExtractArchiveArgs, ExtractTextArgs, GetImageArgs, GetTableArgs,
+        GitBranchCreateArgs, GitBranchSwitchArgs, GitCheckoutFileArgs, GitCommitArgs, GlobArgs,
+        GrepArgs, ListDirArgs, ListImagesArgs, ListTablesArgs, McpServer, MountOnlyArgs, MoveArgs,
+        ProjectIdArgs, ReadBytesArgs, TrashRestoreArgs, WriteBytesArgs,
     };
     use crate::state::AppState;
     use crate::tools::admin::test_support::Fixture;
@@ -4029,5 +4030,188 @@ mod e2e {
         git.switch("dev").await;
         assert_eq!(git.bytes("/other.txt").await, b"dev\n");
         report_ids(&ok_json(git.images("/report.pdf").await));
+    }
+
+    /// Every entry name a commit's tree holds, walked recursively.
+    async fn committed_tree_entries(git: &Git, sha: &str) -> Vec<String> {
+        let entry = git.store.get_or_open_repo(git.mount).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let commit = repo.find_commit(git2::Oid::from_str(sha).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        let mut names = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+            names.push(entry.name().unwrap_or("").to_string());
+            git2::TreeWalkResult::Ok
+        })
+        .unwrap();
+        names
+    }
+
+    /// SPEC-0019/E2E-019: a folder listing and a pushed commit's tree both
+    /// show `report.pdf` and `report.md` only, no image or table of it
+    /// (FR-NEW-021). "Pushed" is exercised as "committed": the pushed history
+    /// is exactly the committed tree a push transfers, built from `nodes`
+    /// alone (DEC-002), so a commit already proves what a push would carry.
+    #[tokio::test]
+    async fn spec_0019_e2e_019_artifacts_are_absent_from_listings_and_pushed_history() {
+        let git = Git::new("artifacts-019").await;
+        git.init().await;
+        git.put("/report.pdf", b"%PDF-1.4 source").await;
+        git.convert("/report.pdf").await;
+        report_ids(&ok_json(git.images("/report.pdf").await));
+        let sha = git.commit("convert report").await;
+
+        let list = ListDirArgs {
+            mount_id: git.mount.into(),
+            path: "/".into(),
+            include_hidden: false,
+            sort_by: "name".into(),
+            with_sizes: true,
+        };
+        let out = ok_json(git.server.fs_list_dir(Parameters(list)).await);
+        let names: Vec<String> = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["report.md", "report.pdf"], "folder listing: {names:?}");
+
+        let mut tree_names = committed_tree_entries(&git, &sha).await;
+        tree_names.sort();
+        assert_eq!(tree_names, vec!["report.md", "report.pdf"], "pushed history: {tree_names:?}");
+    }
+
+    /// SPEC-0019/E2E-022: a file name search and a content search both skip
+    /// every image and table, surfacing only real files (FR-NEW-021).
+    #[tokio::test]
+    async fn spec_0019_e2e_022_artifacts_are_absent_from_searches() {
+        let (_f, server, _) = report_with_images().await;
+
+        let out = ok_json(
+            server
+                .fs_glob(Parameters(GlobArgs {
+                    mount_id: PROJECT.into(),
+                    pattern: "**/*".into(),
+                    root: "/".into(),
+                    exclude_patterns: ExcludePatterns(Vec::new()),
+                }))
+                .await,
+        );
+        let mut matches: Vec<String> = out["matches"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default();
+        matches.sort();
+        assert_eq!(matches, vec!["/report.md", "/report.pdf"], "glob: {matches:?}");
+
+        let out = ok_json(
+            server
+                .fs_grep(Parameters(GrepArgs {
+                    mount_id: PROJECT.into(),
+                    pattern: "Q1 sales".into(),
+                    root: "/".into(),
+                    include_glob: None,
+                    exclude_glob: None,
+                    regex: false,
+                    case_sensitive: true,
+                    output_mode: "files".into(),
+                    context_lines: 0,
+                    max_matches: 100,
+                }))
+                .await,
+        );
+        let files: Vec<String> = out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(files, vec!["/report.md"], "content search: {files:?}");
+    }
+
+    /// SPEC-0019/E2E-023: a project export zip holds `report.pdf` and
+    /// `report.md` only (FR-NEW-021).
+    #[tokio::test]
+    async fn spec_0019_e2e_023_artifacts_are_absent_from_exports() {
+        let (f, server, _) = report_with_images().await;
+        let out = ok_json(
+            server
+                .fs_export_zip(Parameters(ExportZipArgs {
+                    mount_id: PROJECT.into(),
+                    paths: vec!["/".to_string()],
+                }))
+                .await,
+        );
+        let url = out["url"].as_str().unwrap();
+        let token = url.rsplit('/').next().unwrap();
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        let bytes = client.blob.get(&format!("export:{token}"), 0, None).await.unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut names: Vec<String> =
+            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["report.md", "report.pdf"], "export zip: {names:?}");
+    }
+
+    /// SPEC-0019/E2E-098: the trash listing after deleting the document shows
+    /// `report.pdf` only, no image or table entry (FR-NEW-021, FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_098_artifacts_are_absent_from_trash_listing() {
+        let (f, server, _) = report_with_images().await;
+        let delete = DeleteArgs {
+            mount_id: PROJECT.into(),
+            path: "/report.pdf".into(),
+            recursive: false,
+            trash: true,
+        };
+        ok_json(server.fs_delete(Parameters(delete)).await);
+
+        let out = crate::tools::trash::trash_list(&f.state, PROJECT, "", 200, 0).await.unwrap();
+        let entries = out["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "got: {entries:?}");
+        assert_eq!(entries[0]["original_path"], json!("/report.pdf"));
+    }
+
+    /// SPEC-0019/E2E-099: copying a converted document charges only its file
+    /// bytes, never its artifact bytes (FR-NEW-012, FR-NEW-013).
+    #[tokio::test]
+    async fn spec_0019_e2e_099_a_copy_charges_only_the_file_bytes() {
+        let (f, _) = setup(Some(1_000_000)).await;
+        let pixels = vec![7u8; 200_000];
+        let conversion = bundle(
+            "# Small\n![Figure](figures/f1.png)\n",
+            &[Pic { target: "figures/f1.png", bytes: &pixels, caption: "Figure", page: None }],
+        );
+        let server = bundling(&f, conversion);
+        let small = vec![9u8; 5_000];
+        put(&f, "/small.pdf", &small).await;
+        convert(&server, "/small.pdf").await;
+
+        // Pin the remaining session quota to exactly 10 000 bytes, whatever
+        // the setup write and the conversion itself already charged.
+        f.state.safety.refund_write(ALICE, PROJECT, 10_000_000);
+        f.state.safety.charge_write(ALICE, PROJECT, 990_000).unwrap();
+
+        copy_to(&server, "/small.pdf", "/c.pdf", false).await;
+        let write = write_args("/new.bin", &vec![1u8; 4_000], false);
+        ok_json(server.fs_write_bytes(Parameters(write)).await);
+
+        // The copy charged only `small.pdf`'s 5 000 file bytes (never the
+        // artifact bytes), so 10 000 - 5 000 - 4 000 leaves exactly 1 000
+        // bytes of session quota remaining: a 1 000 byte write succeeds, and
+        // one more byte is refused.
+        let fits = write_args("/fits.bin", &vec![2u8; 1_000], false);
+        ok_json(server.fs_write_bytes(Parameters(fits)).await);
+
+        let overflow = write_args("/overflow.bin", &[3u8; 1], false);
+        let result = server.fs_write_bytes(Parameters(overflow)).await.unwrap();
+        assert!(result.is_error.unwrap_or(false), "the next byte must be refused: {result:?}");
+        assert!(
+            text_of(&result).contains("write quota"),
+            "the next byte must be refused for a quota reason: {result:?}"
+        );
     }
 }

@@ -1800,7 +1800,7 @@ impl McpServer {
     // ── search family ────────────────────────────────────────────────────────
 
     #[tool(name = "fs.glob", description = "Find files by glob pattern, newest first (cap 100).")]
-    async fn fs_glob(
+    pub(crate) async fn fs_glob(
         &self,
         Parameters(a): Parameters<GlobArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1814,7 +1814,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.grep", description = "Search file contents (files|content|count modes).")]
-    async fn fs_grep(
+    pub(crate) async fn fs_grep(
         &self,
         Parameters(a): Parameters<GrepArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2148,7 +2148,7 @@ impl McpServer {
         name = "fs.export_zip",
         description = "Zip a selection of files and directories and return a single-use download URL valid for 5 minutes."
     )]
-    async fn fs_export_zip(
+    pub(crate) async fn fs_export_zip(
         &self,
         Parameters(a): Parameters<ExportZipArgs>,
     ) -> Result<CallToolResult, ErrorData> {

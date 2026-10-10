@@ -19,6 +19,12 @@ use std::sync::Arc;
 
 const SECONDS_PER_DAY: f64 = 86_400.0;
 
+/// How long a superseded artifact set survives before the sweep reclaims it
+/// (SPEC-0019 DEC-011): long enough that a reader mid-way through a prior
+/// `fs.get_image`/`fs.get_table` call against the old set is not racing the
+/// delete.
+const ARTIFACT_SWEEP_GRACE_SECONDS: i64 = 600;
+
 /// Soft-delete into `client`'s trash every live file older than its project's
 /// configured `file_retention_days`. Returns the number of files purged.
 ///
@@ -165,6 +171,7 @@ pub struct CycleSummary {
     pub files_purged: usize,
     pub projects_soft_deleted: usize,
     pub exports_swept: usize,
+    pub artifact_sets_swept: usize,
 }
 
 /// Runs the FR-NEW-007 file sweep then the FR-NEW-008 project sweep for every
@@ -209,8 +216,36 @@ pub async fn run_cycle(
                 tracing::warn!(project = %project.id, error = %e, "purge cycle: export sweep failed");
             }
         }
+        match sweep_project_artifacts(&client).await {
+            Ok(n) => summary.artifact_sets_swept += n,
+            Err(e) => {
+                tracing::warn!(project = %project.id, error = %e, "purge cycle: artifact sweep failed");
+            }
+        }
     }
     Ok(summary)
+}
+
+/// Deletes every stale artifact set of `client`'s volume (SPEC-0019 DEC-011)
+/// and GCs the blobs that reached zero. A no-op for a client with no
+/// relational store behind it (a test double, see `VolumeClient::trash`'s
+/// doc). Returns the number of blobs GC'd.
+async fn sweep_project_artifacts(client: &VolumeClient) -> Result<usize> {
+    sweep_project_artifacts_at(now_unix() as i64, client).await
+}
+
+/// Same as [`sweep_project_artifacts`], but with an explicit `now`, for the
+/// same boundary-test reason as [`sweep_project_files_at`].
+async fn sweep_project_artifacts_at(now: i64, client: &VolumeClient) -> Result<usize> {
+    let Some(store) = client.trash.as_deref() else { return Ok(0) };
+    let (sets_swept, gc) =
+        store.sweep_stale_artifact_sets(now, ARTIFACT_SWEEP_GRACE_SECONDS).await?;
+    for sha in gc {
+        if let Err(e) = client.blob.delete(&sha).await {
+            tracing::warn!(error = %e, "purge cycle: artifact blob delete failed");
+        }
+    }
+    Ok(sets_swept)
 }
 
 /// Deletes every `export_links` row (and its blob) in `project_id` whose
@@ -1433,5 +1468,135 @@ mod tests {
         let f = export_fixture().await;
         let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
         assert_eq!(summary.exports_swept, 0);
+    }
+
+    // ── artifact sweep (SPEC-0019 US-0013, DEC-011) ─────────────────────────────
+
+    use crate::storage::meta::{NewArtifactSet, NewDocImage};
+
+    fn one_image(sha: &str) -> NewDocImage {
+        NewDocImage {
+            seq: 1,
+            caption: "cap".into(),
+            page: None,
+            format: "png".into(),
+            sha256: sha.into(),
+            size: 3,
+            line_start: 0,
+            line_count: 1,
+        }
+    }
+
+    /// Converts `path` in `proj` (writes the bytes, commits a one image set
+    /// built from `node_rev`) and returns the image's sha, so a test can later
+    /// assert its blob is gone.
+    async fn convert(f: &ExportFix, path: &str, bytes: &[u8]) -> String {
+        let client = f.stores.client("proj").await.unwrap();
+        client.write_bytes_atomic(path, bytes).await.unwrap();
+        let store = client.trash.clone().expect("a real relational store");
+        let node_rev = store.ensure_node_rev(path).await.unwrap().expect("a rev");
+        let tag = path.trim_start_matches('/').replace(['/', '.'], "-");
+        let image_sha = format!("sha-img-{tag}");
+        client.blob.put(&image_sha, b"pixels").await.unwrap();
+        let set = NewArtifactSet {
+            set_id: format!("set-{tag}"),
+            path: path.to_string(),
+            node_rev,
+            text_sha: Some(format!("sha-text-{tag}")),
+            text_len: 4,
+            report: "1 images, 0 tables".into(),
+            images: vec![one_image(&image_sha)],
+            tables: Vec::new(),
+        };
+        client.blob.put(set.text_sha.as_deref().unwrap(), b"text").await.unwrap();
+        store.commit_artifact_set(&set).await.unwrap();
+        image_sha
+    }
+
+    /// Independent Test (US-0013): convert `/report.pdf`, move it, run
+    /// `run_cycle`, and observe the stale set's blob references gone.
+    #[tokio::test]
+    async fn e2e_new_independent_run_cycle_sweeps_a_set_orphaned_by_a_move() {
+        let f = export_fixture().await;
+        let image_sha = convert(&f, "/report.pdf", b"%PDF-1.4").await;
+        let client = f.stores.client("proj").await.unwrap();
+        client.rename("/report.pdf", "/moved.pdf").await.unwrap();
+
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+
+        assert!(summary.artifact_sets_swept >= 1, "{summary:?}");
+        assert!(!client.blob.exists(&image_sha).await.unwrap(), "the orphaned image is GC'd");
+        assert!(
+            !client.blob.exists("sha-text-report-pdf").await.unwrap(),
+            "the orphaned conversion text is GC'd"
+        );
+
+        let store = client.trash.clone().expect("a real relational store");
+        assert_eq!(
+            store.count_artifact_set_rows_for_test("set-report-pdf").await.unwrap(),
+            0,
+            "the swept set's doc_artifact_sets row is gone"
+        );
+        assert_eq!(
+            store.count_doc_image_rows_for_test("set-report-pdf").await.unwrap(),
+            0,
+            "the swept set's doc_images rows are gone"
+        );
+        assert_eq!(
+            store.blob_refcount_for_test(&image_sha).await.unwrap(),
+            None,
+            "the swept image's blob_refs row is gone"
+        );
+        assert_eq!(
+            store.blob_refcount_for_test("sha-text-report-pdf").await.unwrap(),
+            None,
+            "the swept text's blob_refs row is gone"
+        );
+    }
+
+    /// A superseded set inside its grace window is left alone; a document that
+    /// never changed keeps its current set forever.
+    #[tokio::test]
+    async fn e2e_new_artifact_sweep_respects_the_grace_period_and_the_current_set() {
+        let f = export_fixture().await;
+        let old_sha = convert(&f, "/report.pdf", b"%PDF-1.4 v1").await;
+        let client = f.stores.client("proj").await.unwrap();
+        let store = client.trash.clone().unwrap();
+
+        // Re-converting overwrites the sibling and node bytes, superseding the
+        // first set rather than deleting it outright (DEC-002).
+        client.write_bytes_atomic("/report.pdf", b"%PDF-1.4 v2").await.unwrap();
+        let node_rev = store.ensure_node_rev("/report.pdf").await.unwrap().unwrap();
+        let new_sha = "sha-img-v2";
+        client.blob.put(new_sha, b"pixels2").await.unwrap();
+        let current = NewArtifactSet {
+            set_id: "set-v2".into(),
+            path: "/report.pdf".into(),
+            node_rev,
+            text_sha: Some("sha-text-v2".into()),
+            text_len: 4,
+            report: "1 images, 0 tables".into(),
+            images: vec![one_image(new_sha)],
+            tables: Vec::new(),
+        };
+        client.blob.put("sha-text-v2", b"text2").await.unwrap();
+        store.commit_artifact_set(&current).await.unwrap();
+
+        // Too soon: the just superseded first set must survive this cycle.
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        assert_eq!(summary.artifact_sets_swept, 0, "inside the 10 minute grace period");
+        assert!(client.blob.exists(&old_sha).await.unwrap(), "not yet GC'd");
+        assert!(client.blob.exists(new_sha).await.unwrap(), "the current image is untouched");
+
+        // Force the stale branch via the explicit clock, as every other sweep
+        // in this module does for its boundary tests.
+        let far_future = now_unix() + 700.0;
+        let swept = sweep_project_artifacts_at(far_future as i64, &client).await.unwrap();
+        assert!(swept >= 1, "the superseded set is reclaimed once past its grace period");
+        assert!(!client.blob.exists(&old_sha).await.unwrap(), "the superseded image is GC'd");
+        assert!(
+            client.blob.exists(new_sha).await.unwrap(),
+            "the current set of an unchanged document is never swept"
+        );
     }
 }

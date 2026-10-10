@@ -775,6 +775,109 @@ impl RelationalMetaStore {
         if current.as_deref() == Some(rev) { Ok(()) } else { Err(changed_during_conversion(path)) }
     }
 
+    /// Deletes every stale artifact set in this volume (SPEC-0019 DEC-011): one
+    /// superseded for more than `grace_seconds` relative to `now`, or one whose
+    /// `node_rev` no longer matches the node at its path (moved, overwritten
+    /// outside a conversion, or the node is gone). The current set of an
+    /// unchanged document never matches either arm, so it is never touched.
+    ///
+    /// Deletes the set's `doc_images`/`doc_tables` rows and, when the stale set
+    /// is still the current pointer, the `doc_artifact_current` row too (a
+    /// no-op `DELETE` otherwise, since a superseded set is never the pointer).
+    /// Decrefs every image blob and the text blob, returning the shas that
+    /// reached zero so the caller GCs them, the same `PutFileResult.gc` style
+    /// every other mutation here already uses. One transaction, so a crash
+    /// mid-sweep leaves either the old state or the fully swept state, never a
+    /// half deleted set; `run_retrying` re-selects the stale rows afresh on
+    /// retry, so re-running this is idempotent.
+    pub(crate) async fn sweep_stale_artifact_sets(
+        &self,
+        now: i64,
+        grace_seconds: i64,
+    ) -> Result<(usize, Vec<String>)> {
+        let volume = self.volume_id.clone();
+        run_retrying(&*self.db, move |tx| {
+            let volume = volume.clone();
+            Box::pin(async move {
+                let stale = tx
+                    .query(
+                        &Query::new(
+                            "SELECT s.set_id, s.path, s.text_sha FROM doc_artifact_sets s \
+                             LEFT JOIN nodes n ON n.volume_id = s.volume_id \
+                             AND n.path = s.path AND n.rev = s.node_rev \
+                             WHERE s.volume_id = ?1 AND ( \
+                             (s.superseded_at IS NOT NULL AND ?2 - s.superseded_at > ?3) \
+                             OR (s.superseded_at IS NULL AND n.path IS NULL))",
+                        )
+                        .bind(&volume)
+                        .bind(now)
+                        .bind(grace_seconds),
+                    )
+                    .await?;
+                let mut gc = Vec::new();
+                let mut sets_swept = 0usize;
+                for row in stale {
+                    let set_id = row.text(0)?;
+                    let path = row.text(1)?;
+                    let text_sha = row.opt_text(2)?;
+                    sets_swept += 1;
+                    let images = tx
+                        .query(
+                            &Query::new(
+                                "SELECT sha256 FROM doc_images WHERE volume_id=?1 AND set_id=?2",
+                            )
+                            .bind(&volume)
+                            .bind(&set_id),
+                        )
+                        .await?;
+                    for img in images {
+                        let sha = img.text(0)?;
+                        if tx_decref(tx, &volume, Some(&sha)).await? {
+                            gc.push(sha);
+                        }
+                    }
+                    if let Some(sha) = text_sha
+                        && tx_decref(tx, &volume, Some(&sha)).await?
+                    {
+                        gc.push(sha);
+                    }
+                    tx.execute(
+                        &Query::new("DELETE FROM doc_images WHERE volume_id=?1 AND set_id=?2")
+                            .bind(&volume)
+                            .bind(&set_id),
+                    )
+                    .await?;
+                    tx.execute(
+                        &Query::new("DELETE FROM doc_tables WHERE volume_id=?1 AND set_id=?2")
+                            .bind(&volume)
+                            .bind(&set_id),
+                    )
+                    .await?;
+                    tx.execute(
+                        &Query::new(
+                            "DELETE FROM doc_artifact_sets WHERE volume_id=?1 AND set_id=?2",
+                        )
+                        .bind(&volume)
+                        .bind(&set_id),
+                    )
+                    .await?;
+                    tx.execute(
+                        &Query::new(
+                            "DELETE FROM doc_artifact_current WHERE volume_id=?1 \
+                             AND path=?2 AND set_id=?3",
+                        )
+                        .bind(&volume)
+                        .bind(&path)
+                        .bind(&set_id),
+                    )
+                    .await?;
+                }
+                Ok((sets_swept, gc))
+            })
+        })
+        .await
+    }
+
     /// Hold `path`'s artifact lock across a sibling write and the set commit
     /// that goes with it, so overlapping conversions of one document commit in
     /// the order they wrote their siblings (DEC-008).
@@ -1868,6 +1971,36 @@ impl RelationalMetaStore {
             )
             .await?;
         row.map(|r| r.i64(0)).transpose()
+    }
+
+    /// Count of `doc_artifact_sets` rows for `set_id` in this volume, for a
+    /// `purge.rs` test asserting a swept set's row is really gone (US-0013).
+    pub(crate) async fn count_artifact_set_rows_for_test(&self, set_id: &str) -> Result<i64> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT COUNT(*) FROM doc_artifact_sets WHERE volume_id=?1 AND set_id=?2",
+                )
+                .bind(&self.volume_id)
+                .bind(set_id),
+            )
+            .await?;
+        row.map_or(Ok(0), |r| r.i64(0))
+    }
+
+    /// Count of `doc_images` rows for `set_id` in this volume, for the same
+    /// US-0013 test.
+    pub(crate) async fn count_doc_image_rows_for_test(&self, set_id: &str) -> Result<i64> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT COUNT(*) FROM doc_images WHERE volume_id=?1 AND set_id=?2")
+                    .bind(&self.volume_id)
+                    .bind(set_id),
+            )
+            .await?;
+        row.map_or(Ok(0), |r| r.i64(0))
     }
 
     /// Remove one `trash_entries` row directly, for a `fs_ops.rs` test

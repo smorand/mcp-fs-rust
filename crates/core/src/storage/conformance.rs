@@ -32,6 +32,7 @@ use crate::storage::meta::{
 };
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
 use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend};
+use crate::util::now_unix;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
@@ -767,12 +768,16 @@ fn doc_table(seq: i64, caption: &str) -> NewDocTable {
 }
 
 fn doc_image(seq: i64, page: Option<i64>) -> NewDocImage {
+    doc_image_with_sha(seq, page, "sha-img")
+}
+
+fn doc_image_with_sha(seq: i64, page: Option<i64>, sha256: &str) -> NewDocImage {
     NewDocImage {
         seq,
         caption: format!("cap {seq} é 😀"),
         page,
         format: "png".to_string(),
-        sha256: "sha-img".to_string(),
+        sha256: sha256.to_string(),
         size: 7,
         line_start: seq,
         line_count: 1,
@@ -859,6 +864,87 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     m.rename("/b.xlsx", "/c.xlsx").await?;
     let rev3 = m.ensure_node_rev("/c.xlsx").await?.expect("rev");
     assert_ne!(rev3, rev2, "{who}: a path change stamps a fresh rev");
+
+    // SPEC-0019 DEC-011: `sweep_stale_artifact_sets` on every engine.
+    //
+    // The old `/b.xlsx` set (`set.set_id`) is now orphaned: the node at its
+    // path (`/c.xlsx` these days) no longer carries `set.node_rev`. It is
+    // stale on the very first sweep, grace period or not, and it was never
+    // the current pointer for `other`'s volume, so `other` stays untouched.
+    let (other_sets, other_gc) = other.sweep_stale_artifact_sets(now_unix() as i64, 600).await?;
+    assert_eq!(other_sets, 0, "{who}: a sweep is scoped by volume");
+    assert!(other_gc.is_empty(), "{who}: a sweep is scoped by volume");
+
+    let fresh = NewArtifactSet {
+        set_id: format!("{tag}-set3"),
+        path: "/d.xlsx".into(),
+        node_rev: String::new(),
+        text_sha: Some("sha-text-d1".into()),
+        text_len: 5,
+        report: "1 images, 0 tables".into(),
+        images: vec![doc_image_with_sha(1, None, "sha-img-d1")],
+        tables: Vec::new(),
+    };
+    m.put_file("/d.xlsx", Some("sha-d"), 3, MODE_FILE).await?;
+    let d_rev1 = m.ensure_node_rev("/d.xlsx").await?.expect("rev");
+    m.commit_artifact_set(&NewArtifactSet { node_rev: d_rev1, ..fresh }).await?;
+    let superseded_set_id = format!("{tag}-set3");
+
+    // A second conversion of the same document supersedes the first set
+    // rather than deleting it outright (DEC-002's "never deleted here").
+    m.put_file("/d.xlsx", Some("sha-d2"), 4, MODE_FILE).await?;
+    let d_rev2 = m.ensure_node_rev("/d.xlsx").await?.expect("rev");
+    let current_set = NewArtifactSet {
+        set_id: format!("{tag}-set4"),
+        path: "/d.xlsx".into(),
+        node_rev: d_rev2,
+        text_sha: Some("sha-text-d2".into()),
+        text_len: 5,
+        report: "1 images, 0 tables".into(),
+        images: vec![doc_image_with_sha(1, None, "sha-img-d2")],
+        tables: Vec::new(),
+    };
+    m.commit_artifact_set(&current_set).await?;
+
+    let sweep_now = now_unix() as i64;
+    let (too_soon_sets, too_soon) = m.sweep_stale_artifact_sets(sweep_now, 600).await?;
+    assert_eq!(too_soon_sets, 1, "{who}: only the orphaned /c.xlsx set is stale right now");
+    assert!(
+        too_soon.iter().all(|s| s != "sha-img-d1"),
+        "{who}: a just superseded set is inside its grace period"
+    );
+    assert!(
+        too_soon.contains(&"sha-img".to_string()),
+        "{who}: the orphaned /c.xlsx set is stale right away, grace period or not: {too_soon:?}"
+    );
+    assert_eq!(
+        m.current_artifact_set("/d.xlsx").await?.as_deref(),
+        Some(current_set.set_id.as_str()),
+        "{who}: the current set of an unchanged document is never swept"
+    );
+
+    let past_grace = sweep_now + 700;
+    let (gc_sets, gc) = m.sweep_stale_artifact_sets(past_grace, 600).await?;
+    assert_eq!(gc_sets, 1, "{who}: exactly the superseded /d.xlsx set is stale now");
+    assert!(gc.contains(&"sha-img-d1".to_string()), "{who}: the superseded image is GC'd: {gc:?}");
+    assert!(
+        gc.iter().any(|s| s == "sha-text-d1"),
+        "{who}: the superseded conversion text is GC'd: {gc:?}"
+    );
+    assert_eq!(
+        m.list_artifact_images(&superseded_set_id, 10, 0).await?.len(),
+        0,
+        "{who}: the superseded set's images are gone"
+    );
+    assert_eq!(
+        m.current_artifact_set("/d.xlsx").await?.as_deref(),
+        Some(current_set.set_id.as_str()),
+        "{who}: sweeping the old set leaves the current one alone"
+    );
+    let (replay_sets, replay) = m.sweep_stale_artifact_sets(past_grace, 600).await?;
+    assert_eq!(replay_sets, 0, "{who}: a replay finds nothing left to sweep");
+    assert!(replay.is_empty(), "{who}: a replay finds nothing left to sweep");
+
     Ok(())
 }
 
