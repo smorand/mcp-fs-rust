@@ -4214,4 +4214,216 @@ mod e2e {
             "the next byte must be refused for a quota reason: {result:?}"
         );
     }
+
+    // ── consumer parity and marker scope (US-0014) ──────────────────────────
+
+    /// The HTTP API door over the very state `server`'s AI assistant door uses,
+    /// with a signed token for `ALICE`: a second `AppState` sharing every store,
+    /// only its identity resolver pointed at a throwaway public key.
+    struct RestDoor {
+        _keys: tempfile::TempDir,
+        app: axum::Router,
+        token: String,
+    }
+
+    impl RestDoor {
+        fn over(f: &Fixture, doc: Option<Arc<dyn DocService>>) -> Self {
+            let keys = tempfile::tempdir().unwrap();
+            let (key, public) = crate::keys::write_keypair(keys.path()).unwrap();
+            let mut config = (*f.state.config).clone();
+            config.auth.jwt.public_key_path = public.display().to_string();
+            let s = &f.state;
+            let state = AppState {
+                config: Arc::new(config.clone()),
+                admin: s.admin.clone(),
+                stores: s.stores.clone(),
+                safety: s.safety.clone(),
+                identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+                editors: s.editors.clone(),
+                doc_service: doc,
+                search: None,
+            };
+            let token = crate::keys::mint_token_from_file(
+                &key,
+                ALICE,
+                crate::keys::DEFAULT_ISSUER,
+                crate::keys::DEFAULT_CLAIM,
+                3600,
+            )
+            .unwrap();
+            Self { _keys: keys, app: crate::api::dataplane::router(Arc::new(state)), token }
+        }
+
+        /// The raw response body of `GET /api/fs/{PROJECT}/{sub}`, asserted 200.
+        async fn body(&self, sub: &str) -> String {
+            use tower::ServiceExt as _;
+            let req = axum::http::Request::builder()
+                .uri(format!("/api/fs/{PROJECT}/{sub}"))
+                .header("Authorization", format!("Bearer {}", self.token))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = self.app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_eq!(status, axum::http::StatusCode::OK, "{sub}: {text}");
+            text
+        }
+    }
+
+    /// The raw text the AI assistant door answers, asserted a success.
+    fn mcp_body(r: Result<CallToolResult, rmcp::ErrorData>) -> String {
+        let r = r.expect("a tool result, not a protocol error");
+        assert_ne!(r.is_error, Some(true), "expected success, got: {}", text_of(&r));
+        text_of(&r)
+    }
+
+    /// `report.pdf` converted with its pictures, and both doors over it.
+    async fn report_both_doors() -> (Fixture, McpServer, RestDoor) {
+        let (f, server) = converting_bundle("/report.pdf", report_bundle()).await;
+        convert(&server, "/report.pdf").await;
+        let rest = RestDoor::over(&f, None);
+        (f, server, rest)
+    }
+
+    /// SPEC-0019/E2E-033: listing images and getting `image-1` answers the
+    /// same bytes to an AI assistant and to an HTTP API consumer (FR-NEW-020).
+    #[tokio::test]
+    async fn spec_0019_e2e_033_images_are_byte_identical_on_both_doors() {
+        let (_f, server, rest) = report_both_doors().await;
+        let mcp = mcp_body(
+            server.fs_list_images(Parameters(list_images_args("/report.pdf", None))).await,
+        );
+        assert_eq!(mcp, rest.body("images?path=/report.pdf").await);
+        let list: Value = serde_json::from_str(&mcp).unwrap();
+        assert_eq!(image_ids(&list), ["image-1", "image-2"]);
+
+        let mcp = mcp_body(
+            server.fs_get_image(Parameters(get_image_args("/report.pdf", "image-1"))).await,
+        );
+        assert_eq!(mcp, rest.body("image?path=/report.pdf&id=image-1").await);
+        let got: Value = serde_json::from_str(&mcp).unwrap();
+        assert_eq!(picture(&got), FIG_1);
+        assert_eq!(got["format"], "png");
+        assert_eq!(got["caption"], "Figure 1: Revenue 2024");
+        assert_eq!(got["page"], 1);
+    }
+
+    /// SPEC-0019/E2E-049: `table-1` as Markdown and as CSV is byte identical
+    /// on both doors (FR-NEW-020).
+    #[tokio::test]
+    async fn spec_0019_e2e_049_tables_are_byte_identical_on_both_doors() {
+        let (_f, server, rest) = report_both_doors().await;
+        for format in ["markdown", "csv"] {
+            let args = get_args("/report.pdf", "table-1", Some(format));
+            let mcp = mcp_body(server.fs_get_table(Parameters(args)).await);
+            let http =
+                rest.body(&format!("table?path=/report.pdf&id=table-1&format={format}")).await;
+            assert_eq!(mcp, http, "{format}");
+            let got: Value = serde_json::from_str(&mcp).unwrap();
+            assert_eq!(got["format"], format);
+            assert!(!got["content"].as_str().unwrap().is_empty());
+        }
+    }
+
+    /// SPEC-0019/E2E-067: the full document in `both` mode is byte identical
+    /// on both doors (FR-NEW-020).
+    #[tokio::test]
+    async fn spec_0019_e2e_067_the_document_view_is_byte_identical_on_both_doors() {
+        let (_f, server, rest) = report_both_doors().await;
+        let args = DocumentViewArgs {
+            mount_id: PROJECT.into(),
+            path: "/report.pdf".into(),
+            captions: true,
+            table_mode: Some("both".into()),
+        };
+        let mcp = mcp_body(server.fs_get_document_view(Parameters(args)).await);
+        assert_eq!(mcp, rest.body("document-view?path=/report.pdf&table_mode=both").await);
+        let got: Value = serde_json::from_str(&mcp).unwrap();
+        assert!(got["text"].as_str().unwrap().contains("[Table table-1:"), "{got}");
+    }
+
+    const BOREALIS: &str = "borealis";
+
+    /// `atlas2.pdf` (101 images) converted in `PROJECT` (Atlas) and in
+    /// `BOREALIS`, `big.pdf` (101 tables) in `BOREALIS`, Alice a member of
+    /// both, Bob of Atlas; returns Alice's page 1 images marker from Atlas.
+    async fn two_atlases() -> (Fixture, McpServer, String) {
+        let (f, _) = setup(None).await;
+        f.seed_project(BOREALIS, ALICE).await;
+        f.state.admin.add_member(PROJECT, BOB, ALICE).await.unwrap();
+        for project in [PROJECT, BOREALIS] {
+            let client = f.state.stores.client(project).await.unwrap();
+            client.write_bytes_atomic("/atlas2.pdf", b"%PDF atlas").await.unwrap();
+        }
+        let atlas = bundling(&f, many_pictures(101));
+        for project in [PROJECT, BOREALIS] {
+            let a = DocumentizeArgs {
+                mount_id: project.into(),
+                ..documentize_args("/atlas2.pdf", false)
+            };
+            ok_json(atlas.fs_documentize(Parameters(a)).await);
+        }
+        let client = f.state.stores.client(BOREALIS).await.unwrap();
+        client.write_bytes_atomic("/big.pdf", b"%PDF big").await.unwrap();
+        let md: String = (1..=101).map(|i| format!("| k{i} |\n| --- |\n| v |\n\n")).collect();
+        let big = with_doc(&f, Some(Arc::new(StubDocService::ok(md))));
+        let a =
+            DocumentizeArgs { mount_id: BOREALIS.into(), ..documentize_args("/big.pdf", false) };
+        ok_json(big.fs_documentize(Parameters(a)).await);
+
+        let marker =
+            images(&atlas, "/atlas2.pdf", None).await["marker"].as_str().unwrap().to_string();
+        (f, atlas, marker)
+    }
+
+    fn page_two() -> Value {
+        json!({"images": [{"id": "image-101", "caption": "", "page": 101}], "marker": null})
+    }
+
+    /// SPEC-0019/E2E-155: a marker is not bound to the person; Bob, a member
+    /// of the same project, continues Alice's listing (FR-NEW-003, DEC-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_155_another_member_continues_with_the_marker() {
+        let (f, _, marker) = two_atlases().await;
+        let bob = with_doc_as(&f, None, BOB);
+        assert_eq!(images(&bob, "/atlas2.pdf", Some(&marker)).await, page_two());
+    }
+
+    /// SPEC-0019/E2E-165: the same path in another project refuses the marker,
+    /// spelled as issued (FR-NEW-003, DEC-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_165_another_project_refuses_the_marker() {
+        let (_f, alice, marker) = two_atlases().await;
+        let args = ListImagesArgs {
+            mount_id: BOREALIS.into(),
+            path: "/atlas2.pdf".into(),
+            marker: Some(marker.clone()),
+        };
+        let err = err_text(alice.fs_list_images(Parameters(args)).await);
+        assert!(err.contains("ERR_INVALID_ARGUMENT"), "got: {err}");
+        assert!(err.ends_with(&format!("Invalid continuation marker: {marker}")), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-166: the same marker still works where it was issued.
+    #[tokio::test]
+    async fn spec_0019_e2e_166_the_marker_works_where_it_was_issued() {
+        let (_f, alice, marker) = two_atlases().await;
+        assert_eq!(images(&alice, "/atlas2.pdf", Some(&marker)).await, page_two());
+    }
+
+    /// SPEC-0019/E2E-167: another document of another project refuses the
+    /// marker, spelled as issued (FR-NEW-003, DEC-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_167_another_document_of_another_project_refuses_the_marker() {
+        let (_f, alice, marker) = two_atlases().await;
+        let args = ListImagesArgs {
+            mount_id: BOREALIS.into(),
+            path: "/big.pdf".into(),
+            marker: Some(marker.clone()),
+        };
+        let err = err_text(alice.fs_list_images(Parameters(args)).await);
+        assert!(err.contains("ERR_INVALID_ARGUMENT"), "got: {err}");
+        assert!(err.ends_with(&format!("Invalid continuation marker: {marker}")), "got: {err}");
+    }
 }

@@ -74,6 +74,33 @@ Rules that the on disk contract depends on (`storage/meta.rs`,
   canonical `{type} {len}\0{payload}` bytes. A sha256 is plain hex, so the prefix
   makes a collision impossible. See `.agent_docs/git.md`.
 
+## Document artifacts (SPEC-0019, 2026-10-10)
+
+The images and tables a conversion keeps live in four meta tables, every row keyed by
+`volume_id`, never in `nodes`, so no file enumerator sees them (`storage/meta.rs`,
+`docs/artifacts/`):
+
+| Table | Role |
+|---|---|
+| `doc_artifact_current` | `(volume_id, path)` to the current `set_id` plus the `node_rev` it was built from |
+| `doc_artifact_sets` | one row per set: `path`, `node_rev`, conversion text blob `text_sha`, `report`, `superseded_at` |
+| `doc_images` | `seq`, caption, page, format, picture `sha256` (a counted blob ref), line position |
+| `doc_tables` | `seq`, caption, row/col counts, CSV quality, cells as JSON, line position |
+
+* **Validity token.** `nodes.rev` is a uuid restamped on every content write and move. A
+  reader joins the pointer to `nodes` on `rev = node_rev`; a mismatch is `No artifacts`, so a
+  changed document loses its set at once, with no write path touching artifact tables.
+* **Commit.** `capture::PendingSet` is weighed and charged with the sibling before any write
+  (one quota charge). The commit is one transaction: refuse when the node rev moved
+  (`Document changed during conversion`), mark the previous set superseded, insert the new
+  set and its rows, replace the pointer. A reader that resolved the old set keeps reading it.
+* **Per path lock.** `lock_artifacts(path)` orders overlapping conversions of one document,
+  so the one committing last also wrote the sibling. Ordinary writers take no lock.
+* **Sweep.** `purge::run_cycle` calls `sweep_stale_artifact_sets`: a set superseded for more
+  than 600 s, or whose `node_rev` no longer matches its node, loses its rows and blob refs in
+  one transaction; the blobs reaching refcount 0 are deleted after.
+* Converter limitation: the real `doc-convert` writes no `artifacts.json`, so its images carry no page and no caption failure marker; it emits PNG only and deduplicates identical figures, so one picture referenced twice is one image.
+
 ## The relational layer
 
 Every store speaks `storage::rel::RelationalDb` rather than a driver, so the metadata

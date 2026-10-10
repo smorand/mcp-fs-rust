@@ -101,7 +101,8 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `core/` : `fs_ops.rs` (every filesystem operation, the engine the tools call), `diff.rs`.
 - `docs/` : `extract.rs`, `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
   `ocr.rs` (pluggable, null by default), `mime.rs`, `service.rs` (the external
-  document to Markdown converter, cli or api, off by default).
+  document to Markdown converter, cli or api, off by default), `artifacts/` (parse,
+  capture and render of the images and tables a conversion keeps; meta rows, never `nodes`).
 - `tools/` : one module per family. Every family exposes typed `pub(crate)` async functions
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the
   REST plane); `register(&mut ToolRegistry)` survives only as `#[cfg(test)]`-gated glue for the
@@ -116,7 +117,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `archive.rs` holds `fs.extract_archive` (SPEC-0015), also served by `POST
   /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
   type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
-  password retry via `ERR_PASSWORD_REQUIRED`.
+  password retry via `ERR_PASSWORD_REQUIRED`. `artifacts.rs` holds the five SPEC-0019 tools
+  (`fs.list_images`/`get_image`/`list_tables`/`get_table`/`get_document_view`), also served by
+  five `GET /api/fs/{mount_id}/...` routes with byte identical payloads.
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
 - `exports.rs` : `GET /exports/{token}` (SPEC-0012), mounted unconditionally (outside `api.enabled`),
   no auth: the token is the credential. Atomic single use via `meta::delete_export_link_if_live`
@@ -213,7 +216,8 @@ keyed text has a length ceiling there).
 The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
 
 ## Documentation index
-- `.agent_docs/architecture.md` : storage model, request lifecycle, safety, error logging.
+- `.agent_docs/architecture.md` : storage model, document artifact store, request lifecycle,
+  safety, error logging.
 - `.agent_docs/tools.md` : the 107 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, the

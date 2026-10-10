@@ -78,6 +78,16 @@ segment; `path` is required unless stated.
 | `find-definition` | `name` (required), `root=/`, `kind` | `fs.find_definition` |
 | `find-references` | `name` (required), `root=/` | `fs.find_references` |
 | `audit-log` | `since` (number), `limit=20` | `fs.audit_log` |
+| `images` | `path`, `marker` | `fs.list_images` |
+| `image` | `path`, `id` (required) | `fs.get_image` |
+| `tables` | `path`, `marker` | `fs.list_tables` |
+| `table` | `path`, `id` (required), `format=markdown` | `fs.get_table` |
+| `document-view` | `path`, `captions=true`, `table_mode=markdown` | `fs.get_document_view` |
+
+The five artifact routes (2026-10-10, SPEC-0019 DEC-001) call `tools::artifacts`, the
+functions the tools call, so the body is byte for byte the tool's text (pinned by
+E2E-033/049/067 in `tools/artifacts.rs`). A refusal maps through the usual table:
+`ERR_NOT_FOUND` 404, `ERR_INVALID_ARGUMENT` 400, a non member 403.
 
 A missing required value or an unparsable one is `ERR_INVALID_ARGUMENT` (400),
 never a silent default. Booleans accept `true/false/1/0`. A repeatable parameter

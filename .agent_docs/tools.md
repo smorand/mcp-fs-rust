@@ -165,7 +165,7 @@ total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
 untouched on failure). The password is never logged. REST twin: `POST
 /api/fs/{mount_id}/extract-archive`.
 
-## fs artifacts (2)
+## fs artifacts (5)
 
 | Tool | Purpose | Params | Returns | Annotations | Who |
 |---|---|---|---|---|---|
@@ -175,7 +175,25 @@ untouched on failure). The password is never logged. REST twin: `POST
 | `fs.get_table` | one kept table, `markdown` (default) or `csv`, FR-NEW-002 bytes | `path`, `id`, `format?` | `id,format,content` | RO,I,!OW | member |
 | `fs.get_document_view` | the stored conversion text with `[Image image-n: caption]` lines and tables as `markdown` (default), `csv-reference` or `both`; never reads the sibling | `path`, `captions?`=true, `table_mode?` | `path,text` | RO,I,!OW | member |
 
-(2026-10-10, SPEC-0019 US-0001, US-0003; full docs land with US-0014.)
+Rules (2026-10-10, SPEC-0019):
+
+* A set is kept by every conversion: `fs.extract_text` (built in tables, `CSV quality: exact`,
+  only when it rewrites the sibling), `fs.documentize`, a documented `fs.write_bytes` or
+  upload (converter tables `approximate`, images). Ids `image-n`/`table-n` follow reading order.
+* Lists page by 100. `marker` is base64url of `v1\n<project>\n<kind>\n<path>\n<offset>`:
+  valid for that project, list kind and document only, not bound to the person (another
+  member may continue it); anything else is `Invalid continuation marker: <value>`
+  (`ERR_INVALID_ARGUMENT`), spelled as issued. An offset past the end is an empty page.
+* Check order: authorize, path is a file (`not a file: <path>`, `ERR_NOT_FOUND`), argument
+  validation (format, table mode, marker), current set with a matching node `rev` (`No
+  artifacts: document not extracted`, `ERR_NOT_FOUND`), id lookup (`Not found: <id>`).
+* A changed, moved or overwritten document loses its artifacts at once (rev mismatch).
+  Artifacts are not files: no listing, glob, grep, tree or export shows them.
+* The set, sibling and conversion text are charged once to the session write quota before
+  any write; a refusal keeps the previous set.
+* REST twins (same functions, byte identical payloads, FR-NEW-020): `GET /api/fs/{mount_id}/`
+  `images`, `image`, `tables`, `table`, `document-view`.
+* Known limitation (2026-10-10): the real `doc-convert` writes no `artifacts.json`, so its images carry no page and no caption failure marker; it emits PNG only and deduplicates identical figures, so one picture referenced twice is one image.
 
 ## fs document (3)
 

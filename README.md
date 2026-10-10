@@ -1,7 +1,7 @@
 # mcp-fs (Rust)
 
 A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem**:
-66 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
+107 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
@@ -227,7 +227,11 @@ approximate`); each line holding one `![alt](target)` whose target is a bundle f
 paged by the manifest (`fs.list_images`, `fs.get_image`); every conversion result carries
 an `artifacts_report`.
 
-Two tools and two routes:
+The manifest `{outdir}/artifacts.json` (or the bundle's `manifest`) is optional:
+`{"pictures": {"figures/f1.png": {"caption": "...", "caption_failed": false, "page": 3}}}`;
+a missing field means an empty caption, no failure marker, no page.
+
+The doc service surfaces, two tools and two routes:
 
 | Surface | Purpose |
 |---|---|
@@ -235,6 +239,25 @@ Two tools and two routes:
 | `fs.documentize` | convert a file already stored in the volume, the retry surface |
 | `POST /api/fs/{mount_id}/write-bytes` | the JSON mirror of `fs.write_bytes` |
 | `POST /api/fs/{mount_id}/documentize` | the JSON mirror of `fs.documentize` |
+
+**Document artifacts.** Each conversion keeps the document's images and tables beside its
+Markdown sibling, readable by five read only tools and their REST twins, one implementation,
+byte identical payloads:
+
+| Tool | Route | Returns |
+|---|---|---|
+| `fs.list_images` | `GET /api/fs/{mount_id}/images?path=&marker=` | `images[{id,caption,page}]`, `marker` |
+| `fs.get_image` | `GET .../image?path=&id=` | `id`, `format`, `caption`, `page`, `base64` |
+| `fs.list_tables` | `GET .../tables?path=&marker=` | `tables[{id,caption,rows,columns,csv_quality}]`, `marker` |
+| `fs.get_table` | `GET .../table?path=&id=&format=` | `id`, `format` (`markdown` or `csv`), `content` |
+| `fs.get_document_view` | `GET .../document-view?path=&captions=&table_mode=` | `path`, `text` with image lines and tables (`markdown`, `csv-reference`, `both`) |
+
+Lists page by 100; the continuation marker is valid for its project, list and document,
+for any member. A document changed since its conversion has no artifacts until it is
+converted again. The set is charged to the session write quota together with the sibling,
+before anything is written; artifacts are not files and never show in listings or exports.
+The real `doc-convert` writes no `artifacts.json` yet (no pages, no caption failure marker),
+emits PNG only and deduplicates identical figures.
 
 The existing multipart `POST /api/fs/{mount_id}/upload` takes the same flag as a form field
 (`"true"` or `"1"`), applied to every file of the form, and answers with a `documentation`
@@ -325,7 +348,7 @@ store behaves identically on all three. See
 
 ## Interactive CLI agent
 
-`crates/agent` builds an `agent` binary that drives the 94 tools through an LLM. It is a
+`crates/agent` builds an `agent` binary that drives the 107 tools through an LLM. It is a
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash
