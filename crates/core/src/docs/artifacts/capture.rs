@@ -28,6 +28,9 @@ struct SetImage<'a> {
     format: &'static str,
     bytes: &'a [u8],
     line: usize,
+    /// Whether the converter marked its description as failed (FR-NEW-015):
+    /// the image is kept with an empty caption but still reported.
+    caption_failed: bool,
 }
 
 /// One table about to be kept.
@@ -80,13 +83,24 @@ impl<'a> PendingSet<'a> {
     /// pictures, resolved only among the converter's own files (DEC-007), and
     /// its pipe tables, approximate, a malformed one reported under its id and
     /// not kept (FR-NEW-015). A picture that cannot be kept leaves its id
-    /// unused; reporting why is US-0006's.
+    /// unused and its failure reported (US-0006).
     pub(crate) fn converter(conversion: &'a Conversion, source: &str) -> Self {
         let text = conversion.markdown.as_str();
         let parsed = parse(text);
         let paged = extension(source).is_some_and(|e| PAGED_SOURCES.contains(&e.as_str()));
-        let images = parsed.pictures.iter().filter_map(|p| picture(conversion, p, paged)).collect();
         let mut failures = Vec::new();
+        let mut images = Vec::with_capacity(parsed.pictures.len());
+        for r in &parsed.pictures {
+            match picture(conversion, r, paged) {
+                Ok(image) => {
+                    if image.caption_failed {
+                        failures.push(format!("image-{}: caption unavailable", image.seq));
+                    }
+                    images.push(image);
+                }
+                Err(reason) => failures.push(format!("image-{}: {reason}", r.seq)),
+            }
+        }
         let tables = parsed
             .tables
             .into_iter()
@@ -193,22 +207,31 @@ impl<'a> PendingSet<'a> {
     }
 }
 
-/// The image a picture reference yields, `None` when its target resolves to
-/// no file of the conversion or its format is not a picture format.
-fn picture<'a>(conversion: &'a Conversion, r: &PictureRef, paged: bool) -> Option<SetImage<'a>> {
-    let key = resolve_target(&r.target)?;
-    let bytes = conversion.files.get(&key)?;
-    let format = picture_format(&key)?;
+/// The image a picture reference yields, or the FR-NEW-015 reason it cannot
+/// be kept: its target resolves to nothing inside the converter's output, no
+/// file of the conversion carries that key, or its format is not a picture
+/// format.
+fn picture<'a>(
+    conversion: &'a Conversion,
+    r: &PictureRef,
+    paged: bool,
+) -> std::result::Result<SetImage<'a>, String> {
+    let unavailable = || "picture unavailable".to_string();
+    let key = resolve_target(&r.target).ok_or_else(unavailable)?;
+    let bytes = conversion.files.get(&key).ok_or_else(unavailable)?;
+    let ext = extension(&key).unwrap_or_default();
+    let format = picture_format(&key).ok_or_else(|| format!("unsupported picture format {ext}"))?;
     // The manifest is keyed by the target as written; a converter keying it
     // by the resolved file path is read the same way.
     let meta = conversion
         .manifest
         .as_ref()
         .and_then(|m| m.pictures.get(&r.target).or_else(|| m.pictures.get(&key)));
+    let caption_failed = meta.is_some_and(|m| m.caption_failed);
     // A failed description leaves the caption empty (FR-NEW-033).
     let caption = meta.filter(|m| !m.caption_failed).map(|m| m.caption.clone()).unwrap_or_default();
     let page = if paged { meta.and_then(|m| m.page) } else { None };
-    Some(SetImage { seq: r.seq, caption, page, format, bytes, line: r.line })
+    Ok(SetImage { seq: r.seq, caption, page, format, bytes, line: r.line, caption_failed })
 }
 
 /// The `Conversion.files` key a target names (DEC-007): its relative path
@@ -403,7 +426,7 @@ mod tests {
         };
         let set = PendingSet::converter(&conversion, "/r.pdf");
         assert!(set.images.iter().all(|i| i.caption.is_empty()));
-        assert_eq!(set.report(), "2 images, 0 tables");
+        assert_eq!(set.report(), "2 images, 0 tables\nimage-1: caption unavailable");
         assert_eq!(set.bytes(), (4 + 2 + conversion.markdown.len()) as i64);
     }
 }
