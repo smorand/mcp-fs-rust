@@ -7,6 +7,9 @@
 
 pub(crate) mod capture;
 pub(crate) mod parse;
+pub(crate) mod render;
+
+pub(crate) use render::{table_csv, table_markdown, width};
 
 use crate::errors::{Result, ToolError};
 use base64::Engine as _;
@@ -82,68 +85,9 @@ pub(crate) fn decode_marker(raw: &str, project: &str, kind: ListKind, path: &str
     offset.parse::<usize>().map_err(|_| invalid())
 }
 
-/// A cell as both renderings show it: a CR LF pair, a lone CR or a lone LF
-/// becomes one space (FR-NEW-002).
-fn flatten_newlines(cell: &str) -> String {
-    cell.replace("\r\n", " ").replace(['\r', '\n'], " ")
-}
-
-/// The widest row's cell count, header included (FR-NEW-002).
-pub(crate) fn width(cells: &[Vec<String>]) -> usize {
-    cells.iter().map(Vec::len).max().unwrap_or(0)
-}
-
-/// The Markdown rendering of a table (FR-NEW-002): header, separator, one line
-/// per data row, short rows padded, `|` escaped, no trailing newline.
-pub(crate) fn table_markdown(cells: &[Vec<String>]) -> String {
-    let cols = width(cells);
-    let line = |row: &[String]| {
-        let parts: Vec<String> = (0..cols)
-            .map(|i| {
-                row.get(i).map_or_else(String::new, |c| flatten_newlines(c).replace('|', "\\|"))
-            })
-            .collect();
-        format!("| {} |", parts.join(" | "))
-    };
-    let mut lines = Vec::with_capacity(cells.len() + 1);
-    if let Some(header) = cells.first() {
-        lines.push(line(header));
-        lines.push(format!("| {} |", vec!["---"; cols].join(" | ")));
-    }
-    lines.extend(cells.iter().skip(1).map(|r| line(r)));
-    lines.join("\n")
-}
-
-/// The CSV rendering of a table (FR-NEW-002): comma separated, quoted only
-/// when needed, LF between lines, no trailing newline, short rows padded.
-pub(crate) fn table_csv(cells: &[Vec<String>]) -> String {
-    let cols = width(cells);
-    let field = |c: &str| {
-        if c.contains([',', '"', '\r', '\n']) {
-            format!("\"{}\"", c.replace('"', "\"\""))
-        } else {
-            c.to_string()
-        }
-    };
-    cells
-        .iter()
-        .map(|row| {
-            (0..cols)
-                .map(|i| row.get(i).map_or_else(String::new, |c| field(c)))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn cells(rows: &[&[&str]]) -> Vec<Vec<String>> {
-        rows.iter().map(|r| r.iter().map(|c| (*c).to_string()).collect()).collect()
-    }
 
     #[test]
     fn marker_round_trips_and_is_scoped() {
@@ -156,18 +100,5 @@ mod tests {
         for raw in ["", "!!", "djE", &URL_SAFE_NO_PAD.encode("v1\nproj\ntables\n/x\nnope")] {
             assert!(decode_marker(raw, "proj", ListKind::Tables, "/x").is_err(), "{raw}");
         }
-    }
-
-    #[test]
-    fn markdown_pads_escapes_and_flattens_newlines() {
-        let t = cells(&[&["h1", "h2"], &["a|b", "x\r\ny\rz\nw"], &["c"]]);
-        assert_eq!(table_markdown(&t), "| h1 | h2 |\n| --- | --- |\n| a\\|b | x y z w |\n| c |  |");
-        assert_eq!(table_markdown(&cells(&[&["h"]])), "| h |\n| --- |");
-    }
-
-    #[test]
-    fn csv_quotes_only_when_needed_and_pads() {
-        let t = cells(&[&["h1", "h2"], &["a,b", "say \"hi\""], &["line\nbreak"]]);
-        assert_eq!(table_csv(&t), "h1,h2\n\"a,b\",\"say \"\"hi\"\"\"\n\"line\nbreak\",");
     }
 }

@@ -804,6 +804,10 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     let page = m.list_artifact_tables(&set.set_id, 1, 1).await?;
     assert_eq!(page.iter().map(|t| t.seq).collect::<Vec<_>>(), vec![2], "{who}: paging");
     assert!(other.list_artifact_tables(&set.set_id, 10, 0).await?.is_empty(), "{who}: scoped");
+    let cells = m.artifact_table_cells(&set.set_id, 1).await?;
+    assert_eq!(cells.as_deref(), Some(r#"[["h1","h2"],["a","b"]]"#), "{who}: cells round trip");
+    assert_eq!(m.artifact_table_cells(&set.set_id, 3).await?, None, "{who}: no such table");
+    assert_eq!(other.artifact_table_cells(&set.set_id, 1).await?, None, "{who}: cells scoped");
 
     // A same bytes rewrite changes rev, so the set is no longer served.
     m.put_file("/b.xlsx", Some("sha-b"), 3, MODE_FILE).await?;

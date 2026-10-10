@@ -143,6 +143,11 @@ fs.find_references
   params: mount_id:string, name:string, root:string="/"
   required: ['mount_id', 'name']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.get_table
+  desc: Get one table kept from a document's last conversion, as Markdown or CSV.
+  params: mount_id:string, path:string, id:string, format:string=null
+  required: ['mount_id', 'path', 'id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.glob
   desc: Find files by glob pattern, newest first (cap 100).
   params: mount_id:string, pattern:string, root:string="/", exclude_patterns:<untyped>=null
@@ -607,6 +612,7 @@ fs.exists: {"exists": true, "kind": "file"}
 fs.export_zip: {"url": "/exports/0b7e2f4c-1a3d-4e5f-8a9b-0c1d2e3f4a5b"}
 fs.extract_archive: {"destination": "/uploads/report", "files_written": 2, "dirs_created": 1, "bytes_written": 10}
 fs.list_tables: {"tables": [{"id": "table-1", "caption": "Q1", "rows": 2, "columns": 2, "csv_quality": "CSV quality: exact"}], "marker": null}
+fs.get_table: {"id": "table-2", "format": "csv", "content": "Item,EUR\nRent,900\nPower,120"}
 fs.stat: {"path": "/empty.txt", "size": 0, "mode": "0o644", "kind": "file", "mtime": "<volatile>", "ctime": "<volatile>", "atime": "<volatile>", "uid": 1000, "gid": 1000}
 fs.create_empty: {"path": "/empty.txt", "created": true}
 fs.edit: {"path": "/a.txt", "applied": true, "diff": "--- /a.txt\n+++ /a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n"}

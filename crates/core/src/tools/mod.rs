@@ -396,13 +396,14 @@ mod tests {
         "fs.export_zip",
         "fs.extract_archive",
         "fs.list_tables",
+        "fs.get_table",
     ];
 
     #[test]
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        assert_eq!(reg.len(), 40);
+        assert_eq!(reg.len(), 41);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -475,8 +476,8 @@ mod tests {
         super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("fs."),
-            // 40 since SPEC-0019 added fs.list_tables.
-            40,
+            // 41 since SPEC-0019 added fs.list_tables and fs.get_table.
+            41,
             "fs.* tools",
         );
     }

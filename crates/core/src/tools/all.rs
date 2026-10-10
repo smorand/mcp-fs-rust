@@ -111,8 +111,8 @@ mod tests {
         };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 40 fs (SPEC-0019 adds fs.list_tables) + 14 admin + 5 web + 2 context7 = 61
-        assert_eq!(reg.len(), 61);
+        // 41 fs (SPEC-0019 adds fs.list_tables, fs.get_table) + 14 admin + 5 web + 2 context7 = 62
+        assert_eq!(reg.len(), 62);
         assert!(reg.resolve("web.search").is_some());
         assert!(reg.resolve("context7.resolve_library_id").is_some());
     }
@@ -131,12 +131,12 @@ mod tests {
         };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 40 fs (SPEC-0019) + 14 admin + 49 git (39 git.* + 4 git.auth* + 6 git.pr_*) + 5 web
-        // + 2 context7 + 8 sqlite + 5 db = 123
+        // 41 fs (SPEC-0019) + 14 admin + 49 git (39 git.* + 4 git.auth* + 6 git.pr_*) + 5 web
+        // + 2 context7 + 8 sqlite + 5 db = 124
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 123 + doc_count + 3);
+        assert_eq!(reg.len(), 124 + doc_count + 3);
     }
 
     #[test]
@@ -154,8 +154,8 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        // Base 123 + doc + 3 editor + 4 search.*
-        assert_eq!(reg.len(), 123 + doc_count + 3 + 4);
+        // Base 124 + doc + 3 editor + 4 search.*
+        assert_eq!(reg.len(), 124 + doc_count + 3 + 4);
         assert!(reg.resolve("search.index").is_some());
         assert!(reg.resolve("search.query").is_some());
         assert!(reg.resolve("search.delete").is_some());

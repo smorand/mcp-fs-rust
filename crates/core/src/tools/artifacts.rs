@@ -1,10 +1,11 @@
 //! Document artifacts (SPEC-0019): the tables a conversion kept, listed per
-//! document.
+//! document and read one by one.
 //!
-//! Typed functions only: the `#[tool]` method in `mcp::server` authorizes and
-//! normalizes the path, then calls straight through to [`list_tables`], so
-//! every door shares this one implementation (DEC-001).
+//! Typed functions only: the `#[tool]` methods in `mcp::server` authorize and
+//! normalize the path, then call straight through to [`list_tables`] and
+//! [`get_table`], so every door shares this one implementation (DEC-001).
 
+use crate::docs::artifacts::render::TableFormat;
 use crate::docs::artifacts::{
     ARTIFACT_PAGE_SIZE, CsvQuality, ListKind, NO_ARTIFACTS, decode_marker, encode_marker,
 };
@@ -38,6 +39,25 @@ pub(crate) fn register(reg: &mut ToolRegistry) {
             let mount = authorize_only(&ctx, &a).await?;
             let path = crate::tools::norm(&ctx, &a, "path")?;
             list_tables(&ctx.state, &mount, &path, a.opt_str("marker").as_deref()).await
+        }),
+    );
+    reg.add(
+        ToolSchema::new(
+            "fs.get_table",
+            "Get one table kept from a document's last conversion, as Markdown or CSV.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("path", "Absolute POSIX path of the source document.")
+        .req_str("id", "Table id from fs.list_tables, e.g. table-1.")
+        .opt_str_null("format", "markdown (default) or csv.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx, a| async move {
+            let mount = authorize_only(&ctx, &a).await?;
+            let path = crate::tools::norm(&ctx, &a, "path")?;
+            let id = a.str("id")?;
+            get_table(&ctx.state, &mount, &path, &id, a.opt_str("format").as_deref()).await
         }),
     );
 }
@@ -95,6 +115,49 @@ pub(crate) async fn list_tables(
     Ok(json!({"tables": tables, "marker": next}))
 }
 
+/// `fs.get_table(mount_id, path, id, format)` (FR-NEW-006). The caller has
+/// authorized `mount_id` and normalized `path`; the remaining refusals come in
+/// the FR-NEW-031 order: not a file, unsupported format, no artifacts, unknown
+/// id.
+///
+/// Time: O(1) queries plus O(cells) to decode and render the one table.
+/// Space: O(cells).
+pub(crate) async fn get_table(
+    state: &AppState,
+    mount_id: &str,
+    path: &str,
+    id: &str,
+    format: Option<&str>,
+) -> Result<Value> {
+    let client = state.stores.client(mount_id).await?;
+    if !client.is_file(path).await? {
+        return Err(ToolError::not_found(format!("not a file: {path}")));
+    }
+    let format = TableFormat::parse(format)?;
+    let store = client
+        .trash
+        .as_ref()
+        .ok_or_else(|| ToolError::internal("volume has no relational meta store attached"))?;
+    let set_id = store
+        .current_artifact_set(path)
+        .await?
+        .ok_or_else(|| ToolError::not_found(NO_ARTIFACTS))?;
+    let not_found = || ToolError::not_found(format!("Not found: {id}"));
+    let seq = table_seq(id).ok_or_else(not_found)?;
+    let raw = store.artifact_table_cells(&set_id, seq).await?.ok_or_else(not_found)?;
+    let cells: Vec<Vec<String>> = serde_json::from_str(&raw)
+        .map_err(|e| ToolError::internal(format!("stored table cells: {e}")))?;
+    Ok(json!({"id": id, "format": format.as_str(), "content": format.render(&cells)}))
+}
+
+/// The `n` of a canonical `table-<n>` id, `n` at least 1 with no sign or
+/// leading zero, so `table-01` is not an alias of `table-1`.
+fn table_seq(id: &str) -> Option<i64> {
+    let digits = id.strip_prefix("table-")?;
+    let n: i64 = digits.parse().ok()?;
+    (n >= 1 && n.to_string() == digits).then_some(n)
+}
+
 #[cfg(test)]
 mod e2e {
     //! SPEC-0019 acceptance tests, driven through the real `McpServer` tool
@@ -103,7 +166,7 @@ mod e2e {
     use crate::docs::DocService;
     use crate::docs::service::StubDocService;
     use crate::mcp::server::{
-        DocumentizeArgs, ExtractTextArgs, ListTablesArgs, McpServer, WriteBytesArgs,
+        DocumentizeArgs, ExtractTextArgs, GetTableArgs, ListTablesArgs, McpServer, WriteBytesArgs,
     };
     use crate::state::AppState;
     use crate::tools::admin::test_support::Fixture;
@@ -772,5 +835,297 @@ mod e2e {
             ok_json(server.fs_extract_text(Parameters(extract_args("/two.xlsx", 200_000))).await);
         assert_eq!(cached["cached"], true);
         assert!(cached.get("artifacts_report").is_none(), "got: {cached}");
+    }
+
+    // ── get a table (US-0003) ───────────────────────────────────────────────
+
+    /// The conversion text of the shared `report.pdf` (spec section 9).
+    const REPORT_MD: &str = "# Report\n\nTable 1: Q1 sales\n\n\
+        | Region | Jan | Feb | Mar |\n| --- | --- | --- | --- |\n\
+        | North | 10 | 11 | 12 |\n| South | 20 | 21 | 22 |\n| West | 30 | 31 | 32 |\n\n\
+        Table 2: Costs\n\n| Item | EUR |\n| --- | --- |\n| Rent | 900 |\n| Power | 120 |\n";
+
+    async fn report() -> (Fixture, McpServer) {
+        let (f, server) = converting("/report.pdf", REPORT_MD, None).await;
+        convert(&server, "/report.pdf").await;
+        (f, server)
+    }
+
+    fn get_args(path: &str, id: &str, format: Option<&str>) -> GetTableArgs {
+        GetTableArgs {
+            mount_id: PROJECT.into(),
+            path: path.into(),
+            id: id.into(),
+            format: format.map(str::to_string),
+        }
+    }
+
+    async fn get(server: &McpServer, path: &str, id: &str, format: Option<&str>) -> Value {
+        ok_json(server.fs_get_table(Parameters(get_args(path, id, format))).await)
+    }
+
+    async fn content(server: &McpServer, path: &str, id: &str, format: Option<&str>) -> String {
+        get(server, path, id, format).await["content"].as_str().expect("content").to_string()
+    }
+
+    /// Extract `path` with the built-in conversion (no converter needed).
+    async fn extracted(f: &Fixture, server: &McpServer, path: &str, bytes: &[u8]) {
+        put(f, path, bytes).await;
+        ok_json(server.fs_extract_text(Parameters(extract_args(path, 200_000))).await);
+    }
+
+    /// An RFC 4180 reader, independent of the renderer, to read a CSV back.
+    fn read_csv(text: &str) -> Vec<Vec<String>> {
+        let (mut rows, mut row, mut field) = (Vec::new(), Vec::new(), String::new());
+        let mut chars = text.chars().peekable();
+        let mut quoted = false;
+        while let Some(c) = chars.next() {
+            match (quoted, c) {
+                (true, '"') if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                (true, '"') => quoted = false,
+                (true, c) => field.push(c),
+                (false, '"') => quoted = true,
+                (false, ',') => row.push(std::mem::take(&mut field)),
+                (false, '\n') => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
+                (false, c) => field.push(c),
+            }
+        }
+        row.push(field);
+        rows.push(row);
+        rows
+    }
+
+    /// SPEC-0019/E2E-034: the two converted tables, captioned, approximate.
+    #[tokio::test]
+    async fn spec_0019_e2e_034_report_tables_are_listed_approximate() {
+        let (_f, server) = report().await;
+        assert_eq!(
+            tables(&server, "/report.pdf").await,
+            json!({
+                "tables": [
+                    {"id": "table-1", "caption": "Q1 sales", "rows": 3, "columns": 4, "csv_quality": "CSV quality: approximate"},
+                    {"id": "table-2", "caption": "Costs", "rows": 2, "columns": 2, "csv_quality": "CSV quality: approximate"},
+                ],
+                "marker": null,
+            })
+        );
+    }
+
+    /// SPEC-0019/E2E-035: no format means Markdown, byte exact (FR-NEW-006).
+    #[tokio::test]
+    async fn spec_0019_e2e_035_no_format_returns_markdown() {
+        let (_f, server) = report().await;
+        let out = get(&server, "/report.pdf", "table-1", None).await;
+        assert_eq!(
+            out,
+            json!({
+                "id": "table-1",
+                "format": "markdown",
+                "content": "| Region | Jan | Feb | Mar |\n| --- | --- | --- | --- |\n\
+                            | North | 10 | 11 | 12 |\n| South | 20 | 21 | 22 |\n| West | 30 | 31 | 32 |",
+            })
+        );
+    }
+
+    /// SPEC-0019/E2E-036: CSV is a header and 3 rows of 4 fields.
+    #[tokio::test]
+    async fn spec_0019_e2e_036_csv_has_four_lines_of_four_fields() {
+        let (_f, server) = report().await;
+        let out = get(&server, "/report.pdf", "table-1", Some("csv")).await;
+        assert_eq!(out["id"], "table-1");
+        assert_eq!(out["format"], "csv");
+        let csv = out["content"].as_str().unwrap();
+        let lines: Vec<&str> = csv.split('\n').collect();
+        assert_eq!(lines.len(), 4, "got: {csv:?}");
+        assert!(lines.iter().all(|l| l.split(',').count() == 4), "got: {csv:?}");
+        assert_eq!(lines[0], "Region,Jan,Feb,Mar");
+        assert_eq!(lines[3], "West,30,31,32");
+    }
+
+    /// SPEC-0019/E2E-037: an id the set does not hold is not found.
+    #[tokio::test]
+    async fn spec_0019_e2e_037_an_unknown_table_is_not_found() {
+        let (_f, server) = report().await;
+        let err = err_text(
+            server.fs_get_table(Parameters(get_args("/report.pdf", "table-9", None))).await,
+        );
+        assert!(err.contains("ERR_NOT_FOUND") && err.contains("Not found: table-9"), "got: {err}");
+    }
+
+    async fn refused_format(format: &str) {
+        let (_f, server) = report().await;
+        let err = err_text(
+            server.fs_get_table(Parameters(get_args("/report.pdf", "table-1", Some(format)))).await,
+        );
+        assert!(
+            err.contains("ERR_INVALID_ARGUMENT")
+                && err.contains(&format!("Unsupported format: {format} (use markdown or csv)")),
+            "got: {err}"
+        );
+        assert!(!err.contains("Region"), "no table content on a refusal: {err}");
+    }
+
+    /// SPEC-0019/E2E-039: `xml` is refused.
+    #[tokio::test]
+    async fn spec_0019_e2e_039_xml_is_refused() {
+        refused_format("xml").await;
+    }
+
+    /// SPEC-0019/E2E-040: the format is case sensitive, `CSV` is refused.
+    #[tokio::test]
+    async fn spec_0019_e2e_040_upper_case_csv_is_refused() {
+        refused_format("CSV").await;
+    }
+
+    /// SPEC-0019/E2E-041: `md` is no alias of `markdown`.
+    #[tokio::test]
+    async fn spec_0019_e2e_041_md_is_refused() {
+        refused_format("md").await;
+    }
+
+    /// SPEC-0019/E2E-044: pipes, quotes, commas, accents and emoji survive
+    /// both formats; the CSV reads back to the original cells.
+    #[tokio::test]
+    async fn spec_0019_e2e_044_special_cells_survive_both_formats() {
+        let (f, server) = setup(None).await;
+        let original = ["a|b", "Dupont, \"Jr\"", "Zoë 🚀"];
+        let rows = vec![
+            vec!["h1".to_string(), "h2".into(), "h3".into()],
+            original.iter().map(|c| (*c).to_string()).collect(),
+        ];
+        extracted(&f, &server, "/names.xlsx", &xlsx(&[("Names", rows.clone())])).await;
+
+        let md = content(&server, "/names.xlsx", "table-1", Some("markdown")).await;
+        let last = md.lines().last().unwrap();
+        assert!(last.contains("a\\|b"), "got: {md:?}");
+        assert_eq!(last, "| a\\|b | Dupont, \"Jr\" | Zoë 🚀 |");
+        assert_eq!(last.replace("\\|", "").matches('|').count(), 4, "3 columns: {last}");
+
+        let csv = content(&server, "/names.xlsx", "table-1", Some("csv")).await;
+        assert!(csv.contains("\"Dupont, \"\"Jr\"\"\""), "got: {csv:?}");
+        assert!(csv.contains("Zoë 🚀"), "got: {csv:?}");
+        assert_eq!(read_csv(&csv), rows);
+    }
+
+    /// The `empty.xlsx` of the spec: header `A`, `B`, 0 data rows.
+    fn empty_xlsx() -> Vec<u8> {
+        xlsx(&[("Empty", vec![vec!["A".to_string(), "B".to_string()]])])
+    }
+
+    /// SPEC-0019/E2E-046: a header only table lists 0 rows, CSV is the header.
+    #[tokio::test]
+    async fn spec_0019_e2e_046_a_header_only_table_is_its_header_line_in_csv() {
+        let (f, server) = setup(None).await;
+        extracted(&f, &server, "/empty.xlsx", &empty_xlsx()).await;
+        assert_eq!(tables(&server, "/empty.xlsx").await["tables"][0]["rows"], 0);
+        assert_eq!(content(&server, "/empty.xlsx", "table-1", Some("csv")).await, "A,B");
+    }
+
+    /// SPEC-0019/E2E-140: a header only table is header and separator in
+    /// Markdown.
+    #[tokio::test]
+    async fn spec_0019_e2e_140_a_header_only_table_is_two_markdown_lines() {
+        let (f, server) = setup(None).await;
+        extracted(&f, &server, "/empty.xlsx", &empty_xlsx()).await;
+        assert_eq!(
+            content(&server, "/empty.xlsx", "table-1", Some("markdown")).await,
+            "| A | B |\n| --- | --- |"
+        );
+    }
+
+    /// SPEC-0019/E2E-047: an Excel table past the 400 row sibling cap keeps
+    /// every row in its CSV.
+    #[tokio::test]
+    async fn spec_0019_e2e_047_excel_rows_past_the_sibling_cap_are_kept() {
+        let (f, server) = with_no_converter().await;
+        let book = xlsx(&[("Ledger", grid(&["d", "k", "v"], 401, "r"))]);
+        extracted(&f, &server, "/ledger.xlsx", &book).await;
+        assert_eq!(tables(&server, "/ledger.xlsx").await["tables"][0]["rows"], 401);
+        let csv = content(&server, "/ledger.xlsx", "table-1", Some("csv")).await;
+        assert_eq!(csv.split('\n').count(), 402);
+        assert!(csv.ends_with("rd400,rk400,rv400"), "the last row is kept");
+    }
+
+    /// A project whose server has no external converter configured.
+    async fn with_no_converter() -> (Fixture, McpServer) {
+        let (f, _) = setup(None).await;
+        let server = with_doc(&f, None);
+        (f, server)
+    }
+
+    /// SPEC-0019/E2E-048: the second table in Markdown, byte exact.
+    #[tokio::test]
+    async fn spec_0019_e2e_048_costs_as_markdown() {
+        let (_f, server) = report().await;
+        assert_eq!(
+            content(&server, "/report.pdf", "table-2", Some("markdown")).await,
+            "| Item | EUR |\n| --- | --- |\n| Rent | 900 |\n| Power | 120 |"
+        );
+    }
+
+    /// SPEC-0019/E2E-112: the second table in CSV, byte exact, nothing quoted.
+    #[tokio::test]
+    async fn spec_0019_e2e_112_costs_as_csv() {
+        let (_f, server) = report().await;
+        let csv = content(&server, "/report.pdf", "table-2", Some("csv")).await;
+        assert_eq!(csv, "Item,EUR\nRent,900\nPower,120");
+        assert!(!csv.contains('"'));
+    }
+
+    /// SPEC-0019/E2E-147: a CSV source past the 400 row sibling cap keeps every
+    /// row.
+    #[tokio::test]
+    async fn spec_0019_e2e_147_csv_rows_past_the_sibling_cap_are_kept() {
+        let (f, server) = with_no_converter().await;
+        let mut source = String::from("d,k,v\n");
+        for r in 0..401 {
+            source.push_str(&format!("d{r},k{r},v{r}\n"));
+        }
+        extracted(&f, &server, "/ledger.csv", source.as_bytes()).await;
+        assert_eq!(tables(&server, "/ledger.csv").await["tables"][0]["rows"], 401);
+        let csv = content(&server, "/ledger.csv", "table-1", Some("csv")).await;
+        assert_eq!(csv.split('\n').count(), 402);
+    }
+
+    /// SPEC-0019/E2E-154: a CR LF inside a cell is one space in Markdown and
+    /// kept inside quotes in CSV.
+    #[tokio::test]
+    async fn spec_0019_e2e_154_a_cr_lf_cell_in_both_formats() {
+        let (f, server) = with_no_converter().await;
+        extracted(&f, &server, "/crlf.csv", b"k,v\nx,\"a\r\nb\"\n").await;
+        let md = content(&server, "/crlf.csv", "table-1", Some("markdown")).await;
+        assert_eq!(md.rsplit('\n').next().unwrap(), "| x | a b |", "got: {md:?}");
+        let csv = content(&server, "/crlf.csv", "table-1", Some("csv")).await;
+        assert!(csv.contains("\"a\r\nb\""), "got: {csv:?}");
+    }
+
+    /// SPEC-0019/E2E-158: a fully blank Excel row is dropped from the table.
+    #[tokio::test]
+    async fn spec_0019_e2e_158_a_blank_excel_row_is_dropped() {
+        let (f, server) = with_no_converter().await;
+        let rows = [["a", "b"], ["1", "2"], ["", ""], ["3", "4"]]
+            .iter()
+            .map(|r| r.iter().map(|c| (*c).to_string()).collect())
+            .collect();
+        extracted(&f, &server, "/gaps.xlsx", &xlsx(&[("Gaps", rows)])).await;
+        assert_eq!(tables(&server, "/gaps.xlsx").await["tables"][0]["rows"], 2);
+        assert_eq!(content(&server, "/gaps.xlsx", "table-1", Some("csv")).await, "a,b\n1,2\n3,4");
+    }
+
+    /// The id is matched exactly: `table-01`, `image-1` and `1` are no table.
+    #[tokio::test]
+    async fn only_the_canonical_table_id_is_found() {
+        let (_f, server) = report().await;
+        for id in ["table-01", "table-0", "image-1", "1", "table-", "table-1 "] {
+            let err =
+                err_text(server.fs_get_table(Parameters(get_args("/report.pdf", id, None))).await);
+            assert!(err.contains(&format!("Not found: {id}")), "{id}: {err}");
+        }
     }
 }
