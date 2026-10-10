@@ -1127,6 +1127,20 @@ pub struct ListTablesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DocumentViewArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path of the source document.
+    pub path: String,
+    /// Show each image's caption in its image line.
+    #[serde(default = "def_true")]
+    pub captions: bool,
+    /// markdown (default), csv-reference or both.
+    #[serde(default)]
+    pub table_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TrashRestoreArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2290,6 +2304,31 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.get_table", out)
+    }
+
+    #[tool(
+        name = "fs.get_document_view",
+        description = "Get a converted document's whole text with an image line at each image and each table in the chosen table mode."
+    )]
+    #[tracing::instrument(skip(self, a), fields(mcp.tool = "fs.get_document_view"))]
+    pub(crate) async fn fs_get_document_view(
+        &self,
+        Parameters(a): Parameters<DocumentViewArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            let path = self.norm(&a.path)?;
+            crate::tools::artifacts::document_view(
+                &self.state,
+                &a.mount_id,
+                &path,
+                a.captions,
+                a.table_mode.as_deref(),
+            )
+            .await
+        }
+        .await;
+        to_call_result("fs.get_document_view", out)
     }
 
     #[tool(
@@ -3703,8 +3742,8 @@ mod tests {
             .collect();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37; SPEC-0015 adds
         // fs.extract_archive, 38 to 39; SPEC-0019 adds fs.list_tables, 39 to 40, then fs.get_table, 41,
-        // then fs.list_images and fs.get_image, 43.
-        assert_eq!(names.len(), 43, "got: {names:?}");
+        // then fs.list_images and fs.get_image, 43, then fs.get_document_view, 44.
+        assert_eq!(names.len(), 44, "got: {names:?}");
     }
 
     #[test]
@@ -3720,12 +3759,12 @@ mod tests {
         // the total 103->104.
         // SPEC-0015 adds fs.extract_archive: fs 39, total 106.
         // SPEC-0019 adds fs.list_tables: fs 40, total 107; fs.get_table: fs 41, total 108;
-        // fs.list_images and fs.get_image: fs 43, total 110.
-        assert_eq!(fs_count, 43, "got: {names:?}");
+        // fs.list_images and fs.get_image: fs 43, total 110; fs.get_document_view: fs 44, total 111.
+        assert_eq!(fs_count, 44, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 110, "got: {names:?}");
+        assert_eq!(names.len(), 111, "got: {names:?}");
     }
 
     #[test]
@@ -4057,7 +4096,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 106, "the frozen contract covers 106 non-search tools");
+        assert_eq!(checked, 107, "the frozen contract covers 107 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4078,8 +4117,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 106, "got: {names:?}");
-        assert_eq!(expected.len(), 106, "the golden contract itself must hold 106 names");
+        assert_eq!(names.len(), 107, "got: {names:?}");
+        assert_eq!(expected.len(), 107, "the golden contract itself must hold 107 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

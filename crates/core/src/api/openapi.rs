@@ -1083,6 +1083,30 @@ const OPERATIONS: &[Op] = &[
         ],
         body: "",
     },
+    Op {
+        method: "GET",
+        sub: "document-view",
+        path: "/api/fs/{mount_id}/document-view",
+        tool: "fs.get_document_view",
+        params: &[
+            Param { name: "path", required: true, ty: "string", format: "", default: Def::Absent },
+            Param {
+                name: "captions",
+                required: false,
+                ty: "boolean",
+                format: "",
+                default: Def::Bool(true),
+            },
+            Param {
+                name: "table_mode",
+                required: false,
+                ty: "string",
+                format: "",
+                default: Def::Str("markdown"),
+            },
+        ],
+        body: "",
+    },
     // SPEC-0015 FR-NEW-029: extract-archive mirrors export-zip exactly.
     Op {
         method: "POST",

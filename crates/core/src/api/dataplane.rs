@@ -74,6 +74,7 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("GET", "image"),
     ("GET", "tables"),
     ("GET", "table"),
+    ("GET", "document-view"),
     // tool parity, write and compute side
     ("POST", "read-many"),
     ("POST", "write"),
@@ -142,6 +143,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/image", get(get_image))
         .route("/api/fs/{mount_id}/tables", get(list_tables))
         .route("/api/fs/{mount_id}/table", get(get_table))
+        .route("/api/fs/{mount_id}/document-view", get(document_view))
         // tool parity, write and compute side
         .route("/api/fs/{mount_id}/read-many", post(read_many))
         .route("/api/fs/{mount_id}/write", post(write))
@@ -721,6 +723,30 @@ async fn get_table(
         let norm = r.norm(q.req_str("path")?)?;
         let id = q.req_str("id")?;
         crate::tools::artifacts::get_table(&r.state, &r.mount, &norm, id, q.opt("format")).await
+    })
+    .await
+}
+
+/// A converted document's whole text with its image lines and tables in the
+/// chosen mode. Same function as `fs.get_document_view`.
+async fn document_view(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let q = Q(q);
+    guarded_json(state, headers, mount, |r| async move {
+        let norm = r.norm(q.req_str("path")?)?;
+        let captions = q.bool_or("captions", true)?;
+        crate::tools::artifacts::document_view(
+            &r.state,
+            &r.mount,
+            &norm,
+            captions,
+            q.opt("table_mode"),
+        )
+        .await
     })
     .await
 }
@@ -2494,8 +2520,9 @@ mod tests {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
         // 42 since SPEC-0019 US-0004 added tables and table, 44 since US-0005
-        // added images and image.
-        assert_eq!(REST_ROUTES.len(), 44);
+        // added images and image, 45 since US-0008 added document-view.
+        assert_eq!(REST_ROUTES.len(), 45);
+        assert!(REST_ROUTES.contains(&("GET", "document-view")));
         assert!(REST_ROUTES.contains(&("GET", "images")));
         assert!(REST_ROUTES.contains(&("GET", "image")));
         assert!(REST_ROUTES.contains(&("GET", "tables")));
@@ -2934,6 +2961,56 @@ mod tests {
         let (s, v) = h.get(&u("table?path=/report.pdf&id=table-1&format=csv")).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["content"], "Region,Jan\nNorth,10");
+    }
+
+    /// `GET document-view` answers what `fs.get_document_view` answers, in
+    /// every table mode, captions on by default (SPEC-0019 US-0008).
+    #[tokio::test]
+    async fn document_view_route_renders_each_table_mode() {
+        let h = converted_report().await;
+        let md = "| Region | Jan |\n| --- | --- |\n| North | 10 |";
+        let (s, v) = h.get(&u("document-view?path=/report.pdf")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v, json!({"path": "/report.pdf", "text": format!("Table 1: Sales\n\n{md}\n")}));
+        let (s, v) = h
+            .get(&u("document-view?path=/report.pdf&table_mode=csv-reference&captions=false"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["text"], "Table 1: Sales\n\n[Table table-1: Sales (CSV)]\n");
+        let (s, v) = h.get(&u("document-view?path=/report.pdf&table_mode=both")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["text"], format!("Table 1: Sales\n\n{md}\n[Table table-1: Sales (CSV)]\n"));
+    }
+
+    /// An unsupported mode is a 400 invalid argument with no text; a missing
+    /// document 404, checked first; a stranger 403 (FR-NEW-025, FR-NEW-031).
+    #[tokio::test]
+    async fn document_view_route_refusals() {
+        let h = converted_report().await;
+        let (s, v) = h.get(&u("document-view?path=/report.pdf&table_mode=html")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        let detail = v["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("Unsupported table mode: html (use markdown, csv-reference or both)"),
+            "{v}"
+        );
+        assert!(v.get("text").is_none());
+        let (s, v) = h.get(&u("document-view?path=/ghost.pdf&table_mode=html")).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+        assert!(v["detail"].as_str().unwrap().contains("not a file: /ghost.pdf"), "{v}");
+        let (s, b) = h
+            .send(
+                Request::builder()
+                    .uri(u("document-view?path=/report.pdf"))
+                    .header("Authorization", format!("Bearer {}", h.stranger_token))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["error"], code::FORBIDDEN);
     }
 
     /// The US-0004 independent test: `xml` is a 400 invalid argument, checked

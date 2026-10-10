@@ -7,7 +7,7 @@
 | US-0005 | SPEC-0019 | list and get images | US-0004 | 1 | done | story/US-0005-list-and-get-images | story/US-0004-table-refusals-and-table-routes |
 | US-0006 | SPEC-0019 | image failures and picture formats | US-0005 | 2 | done | story/US-0006-image-failures-and-picture-formats | story/US-0005-list-and-get-images |
 | US-0007 | SPEC-0019 | images through every conversion path | US-0006 | 1 | done | story/US-0007-images-through-every-conversion-path | story/US-0006-image-failures-and-picture-formats |
-| US-0008 | SPEC-0019 | full document view | US-0007 | 1 | todo | | |
+| US-0008 | SPEC-0019 | full document view | US-0007 | 1 | done | story/US-0008-full-document-view | story/US-0007-images-through-every-conversion-path |
 | US-0009 | SPEC-0019 | view line rules and sibling independence | US-0008 | 2 | todo | | |
 | US-0010 | SPEC-0019 | re-conversion replaces the set | US-0009 | 1 | todo | | |
 | US-0011 | SPEC-0019 | refused and overtaken re-conversions | US-0010 | 1 | todo | | |

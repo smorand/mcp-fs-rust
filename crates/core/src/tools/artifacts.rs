@@ -3,10 +3,10 @@
 //!
 //! Typed functions only: the `#[tool]` methods in `mcp::server` authorize and
 //! normalize the path, then call straight through to [`list_images`],
-//! [`get_image`], [`list_tables`] and [`get_table`], so every door shares this
-//! one implementation (DEC-001).
+//! [`get_image`], [`list_tables`], [`get_table`] and [`document_view`], so
+//! every door shares this one implementation (DEC-001).
 
-use crate::docs::artifacts::render::TableFormat;
+use crate::docs::artifacts::render::{self, TableFormat, TableMode, ViewImage, ViewTable};
 use crate::docs::artifacts::{
     ARTIFACT_PAGE_SIZE, CsvQuality, ListKind, NO_ARTIFACTS, decode_marker, encode_marker,
 };
@@ -102,6 +102,26 @@ pub(crate) fn register(reg: &mut ToolRegistry) {
             let path = crate::tools::norm(&ctx, &a, "path")?;
             let id = a.str("id")?;
             get_table(&ctx.state, &mount, &path, &id, a.opt_str("format").as_deref()).await
+        }),
+    );
+    reg.add(
+        ToolSchema::new(
+            "fs.get_document_view",
+            "Get a converted document's whole text with an image line at each image and each table in the chosen table mode.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("path", "Absolute POSIX path of the source document.")
+        .opt_bool("captions", true, "Show each image's caption in its image line.")
+        .opt_str_null("table_mode", "markdown (default), csv-reference or both.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx, a| async move {
+            let mount = authorize_only(&ctx, &a).await?;
+            let path = crate::tools::norm(&ctx, &a, "path")?;
+            let captions = a.bool_or("captions", true);
+            let mode = a.opt_str("table_mode");
+            document_view(&ctx.state, &mount, &path, captions, mode.as_deref()).await
         }),
     );
 }
@@ -274,6 +294,63 @@ pub(crate) async fn get_table(
     Ok(json!({"id": id, "format": format.as_str(), "content": format.render(&cells)}))
 }
 
+/// `fs.get_document_view(mount_id, path, captions, table_mode)` (FR-NEW-007,
+/// FR-NEW-008): the conversion text of the current set with its image lines
+/// and its tables in `table_mode`. Built from the stored conversion text only,
+/// so the Markdown sibling is never read nor written (FR-NEW-009, FR-NEW-022).
+/// Refusals in the FR-NEW-031 order: not a file, unsupported mode, no
+/// artifacts.
+///
+/// Time: O(1) queries, one blob read, then O(text + cells) to assemble.
+/// Space: O(text + cells).
+pub(crate) async fn document_view(
+    state: &AppState,
+    mount_id: &str,
+    path: &str,
+    captions: bool,
+    table_mode: Option<&str>,
+) -> Result<Value> {
+    let client = state.stores.client(mount_id).await?;
+    ensure_file(&client, path).await?;
+    let mode = TableMode::parse(table_mode)?;
+    let (store, set_id) = current_set(&client, path).await?;
+    let text = match store.artifact_text_sha(&set_id).await? {
+        Some(sha) => String::from_utf8(client.blob.get(&sha, 0, None).await?)
+            .map_err(|e| ToolError::internal(format!("stored conversion text: {e}")))?,
+        None => String::new(),
+    };
+    let images: Vec<ViewImage> = store
+        .artifact_view_images(&set_id)
+        .await?
+        .into_iter()
+        .map(|i| ViewImage { seq: i.seq, caption: i.caption, line: position(i.line) })
+        .collect();
+    let tables = store
+        .artifact_view_tables(&set_id)
+        .await?
+        .into_iter()
+        .map(|t| {
+            let cells: Vec<Vec<String>> = serde_json::from_str(&t.cells)
+                .map_err(|e| ToolError::internal(format!("stored table cells: {e}")))?;
+            Ok(ViewTable {
+                seq: t.seq,
+                caption: t.caption,
+                cells,
+                line_start: position(t.line_start),
+                line_count: position(t.line_count),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let text = render::document_view(&text, &images, &tables, captions, mode);
+    Ok(json!({"path": path, "text": text}))
+}
+
+/// A stored line position; a negative one (never written) lands past any
+/// text, so the view ignores it.
+fn position(stored: i64) -> usize {
+    usize::try_from(stored).unwrap_or(usize::MAX)
+}
+
 /// The `n` of a canonical `<prefix><n>` id (`table-<n>`, `image-<n>`), `n`
 /// at least 1 with no sign or leading zero, so `table-01` is not an alias of
 /// `table-1`.
@@ -291,8 +368,8 @@ mod e2e {
     use crate::docs::DocService;
     use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
     use crate::mcp::server::{
-        DocumentizeArgs, ExtractTextArgs, GetImageArgs, GetTableArgs, ListImagesArgs,
-        ListTablesArgs, McpServer, WriteBytesArgs,
+        DocumentViewArgs, DocumentizeArgs, ExtractTextArgs, GetImageArgs, GetTableArgs,
+        ListImagesArgs, ListTablesArgs, McpServer, WriteBytesArgs,
     };
     use crate::state::AppState;
     use crate::tools::admin::test_support::Fixture;
@@ -2348,5 +2425,362 @@ mod e2e {
             image_ids(&images(&server, "/report.pdf", None).await),
             vec!["image-1", "image-2"]
         );
+    }
+
+    // ── full document view (US-0008) ────────────────────────────────────────
+
+    /// The Markdown rendering of `report.pdf`'s first table (E2E-035).
+    const Q1_MD: [&str; 5] = [
+        "| Region | Jan | Feb | Mar |",
+        "| --- | --- | --- | --- |",
+        "| North | 10 | 11 | 12 |",
+        "| South | 20 | 21 | 22 |",
+        "| West | 30 | 31 | 32 |",
+    ];
+    /// The Markdown rendering of `report.pdf`'s second table (E2E-048).
+    const COSTS_MD: [&str; 4] =
+        ["| Item | EUR |", "| --- | --- |", "| Rent | 900 |", "| Power | 120 |"];
+
+    fn view_args(path: &str, captions: bool, mode: Option<&str>) -> DocumentViewArgs {
+        DocumentViewArgs {
+            mount_id: PROJECT.into(),
+            path: path.into(),
+            captions,
+            table_mode: mode.map(str::to_string),
+        }
+    }
+
+    async fn view(server: &McpServer, path: &str, captions: bool, mode: Option<&str>) -> String {
+        let out =
+            ok_json(server.fs_get_document_view(Parameters(view_args(path, captions, mode))).await);
+        assert_eq!(out["path"], path, "got: {out}");
+        out["text"].as_str().expect("text").to_string()
+    }
+
+    async fn view_err(server: &McpServer, path: &str, mode: Option<&str>) -> String {
+        err_text(server.fs_get_document_view(Parameters(view_args(path, true, mode))).await)
+    }
+
+    /// The index of the only line equal to `want`, failing on none or several.
+    fn only_line(lines: &[&str], want: &str) -> usize {
+        let at: Vec<usize> = (0..lines.len()).filter(|i| lines[*i] == want).collect();
+        assert_eq!(at.len(), 1, "{want:?} must stand exactly once in {lines:?}");
+        at[0]
+    }
+
+    /// The non empty lines following line `at`, as many as `want` holds.
+    fn next_non_empty<'a>(lines: &[&'a str], at: usize, n: usize) -> Vec<&'a str> {
+        lines[at + 1..].iter().copied().filter(|l| !l.trim().is_empty()).take(n).collect()
+    }
+
+    /// An image line stands between empty lines, or at an end of the view.
+    fn between_empty_lines(lines: &[&str], at: usize) {
+        assert!(at == 0 || lines[at - 1].trim().is_empty(), "before {:?}: {lines:?}", lines[at]);
+        assert!(
+            at + 1 == lines.len() || lines[at + 1].trim().is_empty(),
+            "after {:?}: {lines:?}",
+            lines[at]
+        );
+    }
+
+    /// SPEC-0019/E2E-050: by default the first image line stands at the first
+    /// image's place and both tables render as Markdown at theirs (FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_050_default_view_places_images_and_markdown_tables() {
+        let (_f, server, _) = report_with_images().await;
+        let text = view(&server, "/report.pdf", true, None).await;
+        let lines: Vec<&str> = text.lines().collect();
+        let first = lines.iter().position(|l| !l.trim().is_empty()).expect("a non empty line");
+        assert_eq!(lines[first], "[Image image-1: Figure 1: Revenue 2024]", "got: {text}");
+        let q1 = only_line(&lines, "Table 1: Q1 sales");
+        assert_eq!(next_non_empty(&lines, q1, 5), Q1_MD, "got: {text}");
+        let costs = only_line(&lines, "Table 2: Costs");
+        assert_eq!(next_non_empty(&lines, costs, 4), COSTS_MD, "got: {text}");
+        // The block is rendered whole, contiguous, as FR-NEW-002 writes it.
+        assert!(text.contains(&format!("{}\n", Q1_MD.join("\n"))), "got: {text}");
+        assert!(text.contains(&format!("{}\n", COSTS_MD.join("\n"))), "got: {text}");
+        assert!(!text.contains("figures/f1.png") && !text.contains("figures/f2.png"));
+    }
+
+    /// SPEC-0019/E2E-051: `csv-reference` renders each table as its reference
+    /// line and no Markdown table (FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_051_csv_reference_replaces_tables_by_reference_lines() {
+        let (_f, server, _) = report_with_images().await;
+        let text = view(&server, "/report.pdf", true, Some("csv-reference")).await;
+        let lines: Vec<&str> = text.lines().collect();
+        let q1 = only_line(&lines, "Table 1: Q1 sales");
+        assert_eq!(next_non_empty(&lines, q1, 1), ["[Table table-1: Q1 sales (CSV)]"]);
+        let costs = only_line(&lines, "Table 2: Costs");
+        assert_eq!(next_non_empty(&lines, costs, 1), ["[Table table-2: Costs (CSV)]"]);
+        assert!(lines.iter().all(|l| !l.trim_start().starts_with('|')), "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-052: `both` with captions off: each Markdown table then
+    /// its reference line, and image lines without captions (FR-NEW-007, 008).
+    #[tokio::test]
+    async fn spec_0019_e2e_052_both_mode_with_captions_off() {
+        let (_f, server, _) = report_with_images().await;
+        let text = view(&server, "/report.pdf", false, Some("both")).await;
+        let mut q1 = Q1_MD.join("\n");
+        q1.push_str("\n[Table table-1: Q1 sales (CSV)]\n");
+        let mut costs = COSTS_MD.join("\n");
+        costs.push_str("\n[Table table-2: Costs (CSV)]\n");
+        assert!(text.contains(&q1), "got: {text}");
+        assert!(text.contains(&costs), "got: {text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let one = only_line(&lines, "[Image image-1]");
+        let two = only_line(&lines, "[Image image-2]");
+        assert!(one < two);
+    }
+
+    /// SPEC-0019/E2E-053: captions off in `markdown` mode hides every caption
+    /// and keeps both Markdown tables (FR-NEW-008).
+    #[tokio::test]
+    async fn spec_0019_e2e_053_captions_off_hides_image_captions() {
+        let (_f, server, _) = report_with_images().await;
+        let text = view(&server, "/report.pdf", false, Some("markdown")).await;
+        let lines: Vec<&str> = text.lines().collect();
+        only_line(&lines, "[Image image-1]");
+        only_line(&lines, "[Image image-2]");
+        assert!(!text.contains("Figure 1: Revenue 2024"), "got: {text}");
+        assert!(!text.contains("Schéma réseau 🌐"), "got: {text}");
+        assert!(text.contains(&Q1_MD.join("\n")) && text.contains(&COSTS_MD.join("\n")));
+    }
+
+    async fn unsupported_mode(mode: &str) {
+        let (_f, server, _) = report_with_images().await;
+        let err = view_err(&server, "/report.pdf", Some(mode)).await;
+        assert!(err.contains("ERR_INVALID_ARGUMENT"), "got: {err}");
+        assert!(
+            err.contains(&format!(
+                "Unsupported table mode: {mode} (use markdown, csv-reference or both)"
+            )),
+            "got: {err}"
+        );
+        assert!(!err.contains("Report") && !err.contains("[Image"), "no text: {err}");
+    }
+
+    /// SPEC-0019/E2E-054: `html` is no table mode (FR-NEW-025).
+    #[tokio::test]
+    async fn spec_0019_e2e_054_html_is_refused() {
+        unsupported_mode("html").await;
+    }
+
+    /// SPEC-0019/E2E-055: modes are case sensitive (FR-NEW-025).
+    #[tokio::test]
+    async fn spec_0019_e2e_055_upper_case_mode_is_refused() {
+        unsupported_mode("CSV-REFERENCE").await;
+    }
+
+    /// SPEC-0019/E2E-056: a list of modes is no mode (FR-NEW-025).
+    #[tokio::test]
+    async fn spec_0019_e2e_056_a_list_of_modes_is_refused() {
+        unsupported_mode("markdown,both").await;
+    }
+
+    /// SPEC-0019/E2E-057: a never converted document has no view, and asking
+    /// creates no sibling (FR-NEW-023).
+    #[tokio::test]
+    async fn spec_0019_e2e_057_a_never_converted_document_has_no_view() {
+        let (f, server) = converting_bundle("/notes.pdf", report_bundle()).await;
+        let err = view_err(&server, "/notes.pdf", None).await;
+        assert!(
+            err.contains("ERR_NOT_FOUND") && err.contains("No artifacts: document not extracted"),
+            "got: {err}"
+        );
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert!(!client.exists("/notes.md").await.unwrap(), "no sibling created");
+    }
+
+    /// SPEC-0019/E2E-058: a non member gets the usual refusal, no text
+    /// (FR-NEW-016).
+    #[tokio::test]
+    async fn spec_0019_e2e_058_a_non_member_gets_the_usual_refusal() {
+        let (f, _, _) = report_with_images().await;
+        let olga = McpServer::new(f.state.clone(), "olga@test.com".to_string());
+        let usual =
+            err_text(olga.fs_extract_text(Parameters(extract_args("/report.pdf", 200_000))).await);
+        assert!(usual.contains("ERR_FORBIDDEN"), "got: {usual}");
+        let err = err_text(
+            olga.fs_get_document_view(Parameters(view_args("/report.pdf", true, Some("both"))))
+                .await,
+        );
+        let refusal = |e: &str| e.split_once("': ").map(|(_, r)| r.to_string()).unwrap();
+        assert_eq!(refusal(&err), refusal(&usual));
+        assert!(!err.contains("Report") && !err.contains("[Image"), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-059: after the sibling is deleted and the source
+    /// overwritten, the document is not extracted (FR-NEW-009, FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_059_an_overwritten_source_has_no_view() {
+        let (f, server, _) = report_with_images().await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        client.delete_file("/report.md").await.unwrap();
+        put(&f, "/report.pdf", b"%PDF-1.4 rewritten").await;
+        let err = view_err(&server, "/report.pdf", None).await;
+        assert!(err.contains("No artifacts: document not extracted"), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-060: a table without caption has a reference line
+    /// without caption (FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_060_an_uncaptioned_table_reference() {
+        let md = format!("{REPORT_MD}\nNotes\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n");
+        let (_f, server) = converting("/report3.pdf", &md, None).await;
+        convert(&server, "/report3.pdf").await;
+        let text = view(&server, "/report3.pdf", true, Some("csv-reference")).await;
+        let lines: Vec<&str> = text.lines().collect();
+        let first = only_line(&lines, "[Table table-1: Q1 sales (CSV)]");
+        let second = only_line(&lines, "[Table table-2: Costs (CSV)]");
+        let third = only_line(&lines, "[Table table-3 (CSV)]");
+        assert!(first < second && second < third, "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-061: with no image, captions on and off give the same
+    /// bytes (FR-NEW-008).
+    #[tokio::test]
+    async fn spec_0019_e2e_061_no_image_captions_change_nothing() {
+        let md =
+            "# Plain\n\nTable 1: Q1 sales\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nJust prose.\n";
+        let (_f, server) = converting("/plain.pdf", md, None).await;
+        convert(&server, "/plain.pdf").await;
+        for mode in [None, Some("csv-reference"), Some("both")] {
+            let off = view(&server, "/plain.pdf", false, mode).await;
+            let on = view(&server, "/plain.pdf", true, mode).await;
+            assert_eq!(off, on, "{mode:?}");
+        }
+        // Table reference lines keep their caption with captions off.
+        let off = view(&server, "/plain.pdf", false, Some("csv-reference")).await;
+        assert!(off.contains("\n[Table table-1: Q1 sales (CSV)]\n"), "got: {off}");
+    }
+
+    /// SPEC-0019/E2E-062: an image without caption has an image line without
+    /// caption, even with captions on (FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_062_an_uncaptioned_image_line() {
+        let conversion = bundle(
+            "Intro\n\n![](img/a.png)\n",
+            &[Pic { target: "img/a.png", bytes: b"one", caption: "", page: Some(2) }],
+        );
+        let (_f, server) = converting_bundle("/one.pdf", conversion).await;
+        convert(&server, "/one.pdf").await;
+        let text = view(&server, "/one.pdf", true, None).await;
+        let lines: Vec<&str> = text.lines().collect();
+        only_line(&lines, "[Image image-1]");
+        assert!(text.starts_with("Intro\n"), "got: {text}");
+        assert!(!text.contains("img/a.png"), "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-063: each image line stands once, in reading order,
+    /// between empty lines (FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_063_image_lines_stand_once_between_empty_lines() {
+        let (_f, server, _) = report_with_images().await;
+        let text = view(&server, "/report.pdf", true, None).await;
+        let lines: Vec<&str> = text.lines().collect();
+        let one = only_line(&lines, "[Image image-1: Figure 1: Revenue 2024]");
+        let two = only_line(&lines, "[Image image-2: Schéma réseau 🌐]");
+        assert!(one < two, "got: {text}");
+        between_empty_lines(&lines, one);
+        between_empty_lines(&lines, two);
+    }
+
+    /// SPEC-0019/E2E-068: views never change the sibling (FR-NEW-022).
+    #[tokio::test]
+    async fn spec_0019_e2e_068_views_leave_the_sibling_unchanged() {
+        let (f, server, _) = report_with_images().await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        let before = client.read_text("/report.md").await.unwrap();
+        for mode in ["markdown", "csv-reference", "both"] {
+            view(&server, "/report.pdf", true, Some(mode)).await;
+            view(&server, "/report.pdf", false, Some(mode)).await;
+        }
+        assert_eq!(client.read_text("/report.md").await.unwrap(), before);
+    }
+
+    /// SPEC-0019/E2E-116: a text extraction with refresh replaces the set with
+    /// an empty built-in one, and the default view is then the sibling byte for
+    /// byte (FR-NEW-030, FR-MOD-002).
+    #[tokio::test]
+    async fn spec_0019_e2e_116_a_refreshed_extraction_views_as_its_sibling() {
+        let (f, _) = setup(None).await;
+        put(&f, "/report.pdf", &crate::docs::extract::tests::tiny_pdf()).await;
+        let server = bundling(&f, report_bundle());
+        convert(&server, "/report.pdf").await;
+        let mut args = extract_args("/report.pdf", 200_000);
+        args.refresh = true;
+        let out = ok_json(server.fs_extract_text(Parameters(args)).await);
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables");
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        let sibling = client.read_text("/report.md").await.unwrap();
+        assert!(!sibling.is_empty());
+        assert_eq!(view(&server, "/report.pdf", true, Some("markdown")).await, sibling);
+    }
+
+    /// SPEC-0019/E2E-119: a missing document is `not a file`, before the mode
+    /// is checked (FR-NEW-031).
+    #[tokio::test]
+    async fn spec_0019_e2e_119_not_a_file_before_the_mode() {
+        let (_f, server) = setup(None).await;
+        let err = view_err(&server, "/ghost.pdf", Some("html")).await;
+        assert!(err.contains("ERR_NOT_FOUND") && err.contains("not a file: /ghost.pdf"), "{err}");
+        assert!(!err.contains("Unsupported table mode"), "{err}");
+    }
+
+    /// SPEC-0019/E2E-132: a cut extraction views up to its cut, its one kept
+    /// table once (FR-NEW-034).
+    #[tokio::test]
+    async fn spec_0019_e2e_132_a_cut_extraction_views_to_its_cut() {
+        let (f, server) = setup(None).await;
+        put(&f, "/two.xlsx", &two_xlsx()).await;
+        let full =
+            ok_json(server.fs_extract_text(Parameters(extract_args("/two.xlsx", 200_000))).await);
+        let text = full["preview"].as_str().unwrap().to_string();
+        let at = text.find("| bx0").expect("B's first data row");
+        let cut = text[..at].chars().count() as i64;
+        let mut args = extract_args("/two.xlsx", cut);
+        args.refresh = true;
+        ok_json(server.fs_extract_text(Parameters(args)).await);
+
+        let viewed = view(&server, "/two.xlsx", true, None).await;
+        assert_eq!(viewed.trim_end(), text[..at].trim_end(), "the view ends at the cut");
+        let refs = view(&server, "/two.xlsx", true, Some("csv-reference")).await;
+        assert_eq!(refs.matches("table-1").count(), 1, "got: {refs}");
+        assert!(!refs.contains("table-2"), "got: {refs}");
+        assert_eq!(refs.matches("| ax0").count(), 0, "table A is its reference: {refs}");
+    }
+
+    /// FR-NEW-007: a caption repeated on the first non empty line after the
+    /// picture reference is removed with it; nothing else is.
+    #[tokio::test]
+    async fn a_caption_line_after_the_picture_is_removed_with_it() {
+        let conversion = bundle(
+            "Intro\n![](a.png)\n\nFigure 1: Chart\n\nFigure 1: Chart\nOutro\n",
+            &[Pic { target: "a.png", bytes: b"a", caption: "Figure 1: Chart", page: None }],
+        );
+        let (_f, server) = converting_bundle("/c.pdf", conversion).await;
+        convert(&server, "/c.pdf").await;
+        let text = view(&server, "/c.pdf", false, None).await;
+        let lines: Vec<&str> = text.lines().collect();
+        only_line(&lines, "[Image image-1]");
+        only_line(&lines, "Figure 1: Chart");
+        assert!(text.starts_with("Intro\n") && text.ends_with("Figure 1: Chart\nOutro\n"));
+    }
+
+    /// FR-NEW-037 not broken: a picture reference kept as no image stays as
+    /// written.
+    #[tokio::test]
+    async fn a_reference_kept_as_no_image_stays_verbatim() {
+        let conversion = bundle(
+            "![](missing.png)\n\n![](a.png)\n",
+            &[Pic { target: "a.png", bytes: b"a", caption: "", page: None }],
+        );
+        let (_f, server) = converting_bundle("/m.pdf", conversion).await;
+        convert(&server, "/m.pdf").await;
+        let text = view(&server, "/m.pdf", true, None).await;
+        assert!(text.starts_with("![](missing.png)\n"), "got: {text}");
+        only_line(&text.lines().collect::<Vec<_>>(), "[Image image-2]");
     }
 }
