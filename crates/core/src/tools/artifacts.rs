@@ -2990,4 +2990,354 @@ mod e2e {
         let text = view(&server, "/url.pdf", false, None).await;
         assert!(text.lines().any(|l| l == "![x](https://example.com/a.png)"), "got: {text}");
     }
+
+    // ── re-conversion replaces the set (US-0010) ────────────────────────────
+
+    /// A fake converter that answers `conversion` only once the test releases
+    /// it, after telling the test it started, so overlapping re-conversions
+    /// interleave in an order the test decides, without sleeping.
+    struct GatedDoc {
+        conversion: Conversion,
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        /// Extensions and size cap, borrowed from the canned service.
+        stub: StubDocService,
+    }
+
+    /// The gate's two ends: wait for the conversion to start, then let it end.
+    struct Gate {
+        started: tokio::sync::oneshot::Receiver<()>,
+        release: tokio::sync::oneshot::Sender<()>,
+    }
+
+    fn gated(conversion: Conversion) -> (Arc<dyn DocService>, Gate) {
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let doc = GatedDoc {
+            conversion,
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+            stub: StubDocService::ok(""),
+        };
+        (Arc::new(doc), Gate { started, release })
+    }
+
+    #[async_trait::async_trait]
+    impl DocService for GatedDoc {
+        async fn convert(
+            &self,
+            _bytes: &[u8],
+            _file_name: &str,
+        ) -> crate::errors::Result<Conversion> {
+            let started = self.started.lock().unwrap().take();
+            if let Some(tx) = started {
+                let _ = tx.send(());
+            }
+            let release = self.release.lock().await.take();
+            if let Some(rx) = release {
+                let _ = rx.await;
+            }
+            Ok(self.conversion.clone())
+        }
+
+        fn accepted_extensions(&self) -> &[String] {
+            self.stub.accepted_extensions()
+        }
+
+        fn max_input_bytes(&self) -> u64 {
+            self.stub.max_input_bytes()
+        }
+    }
+
+    const BOB: &str = "bob@test.com";
+
+    /// `report.pdf`'s two tables with one PNG picture per caption before them.
+    fn report_pictures(captions: &[&str]) -> Conversion {
+        let targets: Vec<String> = (1..=captions.len()).map(|i| format!("n/{i}.png")).collect();
+        let bytes: Vec<Vec<u8>> =
+            captions.iter().map(|c| format!("png {c}").into_bytes()).collect();
+        let mut md: String = targets.iter().map(|t| format!("![]({t})\n\n")).collect();
+        md.push_str(REPORT_MD);
+        let pics: Vec<Pic<'_>> = targets
+            .iter()
+            .zip(&bytes)
+            .zip(captions)
+            .map(|((t, b), c)| Pic { target: t, bytes: b, caption: c, page: Some(1) })
+            .collect();
+        bundle(&md, &pics)
+    }
+
+    async fn reconvert(server: &McpServer, path: &str) -> Value {
+        ok_json(server.fs_documentize(Parameters(documentize_args(path, true))).await)
+    }
+
+    fn captions(list: &Value) -> Vec<String> {
+        list["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["caption"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// SPEC-0019/E2E-069: a re-conversion replaces every image, numbered from
+    /// 1, and no former caption remains (FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_069_a_reconversion_replaces_and_renumbers_the_images() {
+        let (f, _, _) = report_with_images().await;
+        let server = bundling(&f, report_pictures(&["A", "B", "C"]));
+        reconvert(&server, "/report.pdf").await;
+        let list = images(&server, "/report.pdf", None).await;
+        assert_eq!(image_ids(&list), numbered("image", 3));
+        assert_eq!(captions(&list), vec!["A", "B", "C"]);
+        assert!(!list.to_string().contains("Schéma réseau 🌐"), "got: {list}");
+    }
+
+    /// SPEC-0019/E2E-070: an extraction with refresh replaces the set with the
+    /// built-in one, which finds no image and no PDF table (FR-NEW-026).
+    #[tokio::test]
+    async fn spec_0019_e2e_070_a_refreshed_extraction_keeps_the_builtin_set() {
+        let (f, _) = setup(None).await;
+        put(&f, "/report.pdf", &crate::docs::extract::tests::tiny_pdf()).await;
+        let server = bundling(&f, report_bundle());
+        assert_eq!(convert(&server, "/report.pdf").await["artifacts_report"], "2 images, 2 tables");
+        let mut args = extract_args("/report.pdf", 200_000);
+        args.refresh = true;
+        ok_json(server.fs_extract_text(Parameters(args)).await);
+        assert_eq!(images(&server, "/report.pdf", None).await, empty_images());
+        assert_eq!(tables(&server, "/report.pdf").await, json!({"tables": [], "marker": null}));
+    }
+
+    /// The shared report's two images, two tables and sibling, unchanged.
+    async fn report_unchanged(f: &Fixture, server: &McpServer, sibling: &str) {
+        assert_eq!(
+            images(server, "/report.pdf", None).await,
+            json!({
+                "images": [
+                    {"id": "image-1", "caption": "Figure 1: Revenue 2024", "page": 1},
+                    {"id": "image-2", "caption": "Schéma réseau 🌐", "page": 3},
+                ],
+                "marker": null,
+            })
+        );
+        assert_eq!(ids(&tables(server, "/report.pdf").await), vec!["table-1", "table-2"]);
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        assert_eq!(client.read_text("/report.md").await.unwrap(), sibling);
+    }
+
+    async fn sibling(f: &Fixture) -> String {
+        f.state.stores.client(PROJECT).await.unwrap().read_text("/report.md").await.unwrap()
+    }
+
+    /// SPEC-0019/E2E-072: an unreachable converter fails the re-conversion with
+    /// its usual message and keeps the set and the sibling (FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_072_a_failed_reconversion_keeps_the_set() {
+        let (f, _, _) = report_with_images().await;
+        let before = sibling(&f).await;
+        let message = "document service request failed: connection refused";
+        let doc: Arc<dyn DocService> =
+            Arc::new(StubDocService::failing(crate::errors::ToolError::internal(message)));
+        let server = with_doc(&f, Some(doc));
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/report.pdf", true))).await,
+        );
+        assert!(err.contains(message), "got: {err}");
+        report_unchanged(&f, &server, &before).await;
+    }
+
+    /// SPEC-0019/E2E-073: a convert action without overwrite is refused
+    /// verbatim and keeps the former images (FR-NEW-027).
+    #[tokio::test]
+    async fn spec_0019_e2e_073_convert_without_overwrite_keeps_the_set() {
+        let (f, _, _) = report_with_images().await;
+        let before = sibling(&f).await;
+        let server = bundling(&f, report_pictures(&["A", "B", "C"]));
+        let err = err_text(
+            server.fs_documentize(Parameters(documentize_args("/report.pdf", false))).await,
+        );
+        assert!(err.contains("'/report.md' exists (pass overwrite=true)"), "got: {err}");
+        report_unchanged(&f, &server, &before).await;
+    }
+
+    /// SPEC-0019/E2E-074: a non member re-converting gets the usual refusal
+    /// and the set is unchanged (FR-NEW-016).
+    #[tokio::test]
+    async fn spec_0019_e2e_074_a_non_member_reconversion_keeps_the_set() {
+        let (f, server, _) = report_with_images().await;
+        let before = sibling(&f).await;
+        let doc: Arc<dyn DocService> = Arc::new(StubDocService::bundle(report_pictures(&["X"])));
+        let olga = with_doc_as(&f, Some(doc), "olga@test.com");
+        let usual =
+            err_text(olga.fs_extract_text(Parameters(extract_args("/report.pdf", 200_000))).await);
+        let got =
+            err_text(olga.fs_documentize(Parameters(documentize_args("/report.pdf", true))).await);
+        let refusal = |e: &str| e.split_once("': ").map(|(_, r)| r.to_string()).unwrap();
+        assert!(got.contains("ERR_FORBIDDEN"), "got: {got}");
+        assert_eq!(refusal(&got), refusal(&usual));
+        report_unchanged(&f, &server, &before).await;
+    }
+
+    /// SPEC-0019/E2E-079: an id the new set no longer holds is not found
+    /// (FR-NEW-010, FR-NEW-019).
+    #[tokio::test]
+    async fn spec_0019_e2e_079_a_dropped_id_is_not_found_after_reconversion() {
+        let (f, _, _) = report_with_images().await;
+        let server = bundling(&f, report_pictures(&["Only"]));
+        reconvert(&server, "/report.pdf").await;
+        let err = err_text(
+            server.fs_get_image(Parameters(get_image_args("/report.pdf", "image-2"))).await,
+        );
+        assert!(err.contains("ERR_NOT_FOUND") && err.contains("Not found: image-2"), "got: {err}");
+    }
+
+    /// A project holding the converted `report.pdf` with Bob as a member.
+    async fn report_with_bob() -> (Fixture, McpServer) {
+        let (f, server, _) = report_with_images().await;
+        f.state.admin.add_member(PROJECT, BOB, ALICE).await.unwrap();
+        (f, server)
+    }
+
+    /// SPEC-0019/E2E-080: two overlapping re-conversions both finish and leave
+    /// exactly one set, each id once (FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_080_overlapping_reconversions_leave_one_set() {
+        let (f, server) = report_with_bob().await;
+        let (alice_doc, alice_gate) = gated(report_bundle());
+        let (bob_doc, bob_gate) = gated(report_bundle());
+        let alice = with_doc_as(&f, Some(alice_doc), ALICE);
+        let bob = with_doc_as(&f, Some(bob_doc), BOB);
+        let drive = async {
+            // Both conversions are in flight before either may finish.
+            alice_gate.started.await.unwrap();
+            bob_gate.started.await.unwrap();
+            alice_gate.release.send(()).unwrap();
+            bob_gate.release.send(()).unwrap();
+        };
+        let (a, b, ()) =
+            tokio::join!(reconvert(&alice, "/report.pdf"), reconvert(&bob, "/report.pdf"), drive);
+        assert_eq!(a["artifacts_report"], "2 images, 2 tables");
+        assert_eq!(b["artifacts_report"], "2 images, 2 tables");
+        assert_eq!(image_ids(&images(&server, "/report.pdf", None).await), numbered("image", 2));
+    }
+
+    /// SPEC-0019/E2E-081: a reader listing during a re-conversion sees the
+    /// whole old set or the whole new one, never a mix (FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_081_a_reader_never_sees_a_mix() {
+        let (f, server) = report_with_bob().await;
+        let new = ["N1", "N2", "N3", "N4", "N5"];
+        let (doc, gate) = gated(report_pictures(&new));
+        let alice = with_doc(&f, Some(doc));
+        let bob = with_doc_as(&f, None, BOB);
+        let old = vec!["Figure 1: Revenue 2024".to_string(), "Schéma réseau 🌐".to_string()];
+        let new: Vec<String> = new.iter().map(|c| (*c).to_string()).collect();
+        let read = async {
+            gate.started.await.unwrap();
+            let mut release = Some(gate.release);
+            let mut answers = Vec::new();
+            for i in 0..20 {
+                if i == 10 {
+                    // Half the reads overlap the commit itself.
+                    release.take().unwrap().send(()).unwrap();
+                }
+                answers.push(images(&bob, "/report.pdf", None).await);
+                tokio::task::yield_now().await;
+            }
+            answers
+        };
+        let (_, answers) = tokio::join!(reconvert(&alice, "/report.pdf"), read);
+        assert_eq!(answers.len(), 20);
+        for list in &answers {
+            let got = captions(list);
+            assert!(got == old || got == new, "a mixed or partial answer: {list}");
+            assert_eq!(image_ids(list), numbered("image", got.len()));
+        }
+        assert_eq!(captions(&images(&server, "/report.pdf", None).await), new);
+    }
+
+    /// SPEC-0019/E2E-082 and E2E-126: an extraction answered by the existing
+    /// sibling keeps the set and carries no report (FR-NEW-026, FR-NEW-030).
+    #[tokio::test]
+    async fn spec_0019_e2e_082_126_a_cache_hit_keeps_the_set_and_reports_nothing() {
+        let (f, server, _) = report_with_images().await;
+        let before = sibling(&f).await;
+        let out =
+            ok_json(server.fs_extract_text(Parameters(extract_args("/report.pdf", 200_000))).await);
+        assert!(out.get("artifacts_report").is_none(), "got: {out}");
+        report_unchanged(&f, &server, &before).await;
+    }
+
+    /// SPEC-0019/E2E-083: convert with overwrite reports and keeps the new set
+    /// only (FR-NEW-027).
+    #[tokio::test]
+    async fn spec_0019_e2e_083_convert_with_overwrite_replaces_the_set() {
+        let (f, _, _) = report_with_images().await;
+        let server = bundling(&f, report_pictures(&["Only"]));
+        let out = reconvert(&server, "/report.pdf").await;
+        assert_eq!(out["artifacts_report"], "1 images, 2 tables");
+        assert_eq!(image_ids(&images(&server, "/report.pdf", None).await), vec!["image-1"]);
+    }
+
+    /// SPEC-0019/E2E-084: a documented upload of a new `report.pdf` discards
+    /// the former set (FR-NEW-010, FR-NEW-011).
+    #[tokio::test]
+    async fn spec_0019_e2e_084_a_documented_upload_replaces_the_set() {
+        let (f, _, _) = report_with_images().await;
+        let server = bundling(&f, report_pictures(&["New picture"]));
+        let mut args = write_args("/report.pdf", b"%PDF-1.4 new source", true);
+        args.overwrite = true;
+        let out = ok_json(server.fs_write_bytes(Parameters(args)).await);
+        assert_eq!(out["documentation"]["artifacts_report"], "1 images, 2 tables", "got: {out}");
+        let list = images(&server, "/report.pdf", None).await;
+        assert_eq!(image_ids(&list), vec!["image-1"]);
+        assert_eq!(captions(&list), vec!["New picture"]);
+        assert!(!list.to_string().contains("Schéma réseau 🌐"), "got: {list}");
+    }
+
+    /// SPEC-0019/E2E-136: a page marker past the end of the new set answers an
+    /// empty page with no marker (FR-NEW-003).
+    #[tokio::test]
+    async fn spec_0019_e2e_136_a_marker_past_the_new_set_is_an_empty_page() {
+        let (f, server) = converting_bundle("/atlas2.pdf", many_pictures(101)).await;
+        convert(&server, "/atlas2.pdf").await;
+        let first = images(&server, "/atlas2.pdf", None).await;
+        let marker = first["marker"].as_str().expect("a marker").to_string();
+        let server = bundling(&f, many_pictures(3));
+        reconvert(&server, "/atlas2.pdf").await;
+        assert_eq!(images(&server, "/atlas2.pdf", Some(&marker)).await, empty_images());
+    }
+
+    /// SPEC-0019/E2E-157: two overlapping re-conversions each report their own
+    /// set; the one finishing last supplies the set and the sibling (FR-NEW-010).
+    #[tokio::test]
+    async fn spec_0019_e2e_157_the_last_commit_supplies_set_and_sibling() {
+        let (f, server) = report_with_bob().await;
+        let bob_conversion = report_pictures(&["B1", "B2", "B3", "B4"]);
+        let bob_markdown = bob_conversion.markdown.clone();
+        let (alice_doc, alice_gate) = gated(report_pictures(&["A1", "A2", "A3"]));
+        let (bob_doc, bob_gate) = gated(bob_conversion);
+        let alice = with_doc_as(&f, Some(alice_doc), ALICE);
+        let bob = with_doc_as(&f, Some(bob_doc), BOB);
+        let (alice_done_tx, alice_done) = tokio::sync::oneshot::channel();
+        let alice_call = async {
+            let out = reconvert(&alice, "/report.pdf").await;
+            alice_done_tx.send(()).unwrap();
+            out
+        };
+        let drive = async {
+            alice_gate.started.await.unwrap();
+            bob_gate.started.await.unwrap();
+            alice_gate.release.send(()).unwrap();
+            alice_done.await.unwrap();
+            bob_gate.release.send(()).unwrap();
+        };
+        let (a, b, ()) = tokio::join!(alice_call, reconvert(&bob, "/report.pdf"), drive);
+        assert_eq!(a["artifacts_report"], "3 images, 2 tables");
+        assert_eq!(b["artifacts_report"], "4 images, 2 tables");
+        let list = images(&server, "/report.pdf", None).await;
+        assert_eq!(image_ids(&list), numbered("image", 4));
+        assert_eq!(captions(&list), vec!["B1", "B2", "B3", "B4"]);
+        assert_eq!(sibling(&f).await, bob_markdown);
+    }
 }

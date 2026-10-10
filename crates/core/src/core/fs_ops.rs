@@ -763,7 +763,9 @@ struct Companion {
 /// before anything is written (DEC-005), so a refusal leaves no companion and
 /// no set. The source revision is read before converting: `data` is what the
 /// caller just read or wrote, so a write landing since makes the commit refuse
-/// rather than keep a set built from other bytes (DEC-008).
+/// rather than keep a set built from other bytes (DEC-008). The sibling write
+/// and the commit run under the document's artifact lock, so of overlapping
+/// conversions the one committing last also wrote the sibling (FR-NEW-010).
 #[allow(clippy::too_many_arguments)]
 async fn write_companion(
     client: &VolumeClient,
@@ -793,6 +795,12 @@ async fn write_companion(
     let kept = store.zip(rev.as_deref());
     let set_bytes = if kept.is_some() { set.bytes() } else { 0 };
     safety.charge_write(person, mount_id, markdown.len() as i64 + set_bytes)?;
+    // Held until the commit: an overlapping conversion of this document waits
+    // here, so the last one to commit also wrote the sibling (DEC-008).
+    let _commit_order = match kept {
+        Some((store, _)) => Some(store.lock_artifacts(norm).await),
+        None => None,
+    };
     client.write_bytes_atomic(&md, markdown.as_bytes()).await?;
     client.touch_atime_mtime(&md);
     safety.record_audit(person, mount_id, "doc_service", &md, "");
@@ -1618,6 +1626,11 @@ pub async fn extract_document(
     if total > 0 {
         safety.charge_write(person, mount_id, total)?;
     }
+    // Held until the commit, as in `write_companion` (DEC-008).
+    let _commit_order = match &capture {
+        Some((store, _, _)) => Some(store.lock_artifacts(norm).await),
+        None => None,
+    };
     fresh.write_sibling(client).await?;
     if let Some(md) = fresh.md_path() {
         safety.record_read(person, mount_id, md);
@@ -3741,6 +3754,101 @@ mod tests {
         let r2 = documentize(&f.v, &f.s, Some(&second), P, M, "/report.pdf", true).await.unwrap();
         assert_eq!(r2["overwritten"], true);
         assert_eq!(f.v.read_text("/report.md").await.unwrap(), "# rewritten\n");
+    }
+
+    /// A blob store that pauses the second put of `pause` (the first conversion's
+    /// text, stored by its commit after its sibling) until released.
+    struct PausingBlob {
+        inner: crate::storage::blob::local::LocalBlobStore,
+        pause: String,
+        puts: AtomicUsize,
+        paused: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl crate::storage::traits::BlobBackend for PausingBlob {
+        async fn put(&self, sha256: &str, data: &[u8]) -> Result<()> {
+            if sha256 == self.pause && self.puts.fetch_add(1, Ordering::SeqCst) == 1 {
+                let paused = self.paused.lock().unwrap().take();
+                paused.unwrap().send(()).unwrap();
+                let release = self.release.lock().await.take();
+                release.unwrap().await.unwrap();
+            }
+            self.inner.put(sha256, data).await
+        }
+        async fn get(&self, sha256: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(sha256, offset, length).await
+        }
+        async fn exists(&self, sha256: &str) -> Result<bool> {
+            self.inner.exists(sha256).await
+        }
+        async fn delete(&self, sha256: &str) -> Result<()> {
+            self.inner.delete(sha256).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+    }
+
+    /// SPEC-0019 DEC-008 behind E2E-157: Alice's conversion is paused between
+    /// its sibling write and its commit while Bob converts the same document.
+    /// Bob must wait for Alice's commit, so the current set and the sibling
+    /// come from the same conversion; without the lock Bob's sibling would sit
+    /// beside Alice's set.
+    #[tokio::test]
+    async fn overlapping_conversions_keep_set_and_sibling_from_one_conversion() {
+        const ALICE_MD: &str = "# alice\n";
+        const BOB_MD: &str = "# bob\n";
+        let meta =
+            Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
+        let d = tempfile::tempdir().unwrap();
+        let (paused_tx, paused) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let blob = Arc::new(PausingBlob {
+            inner: crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"),
+            pause: VolumeClient::sha256_hex(ALICE_MD.as_bytes()),
+            puts: AtomicUsize::new(0),
+            paused: StdMutex::new(Some(paused_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        });
+        let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta.clone());
+        let s = SafetyManager::new(SafetyConfig::default(), None);
+        v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
+        let (alice, bob) = (StubDocService::ok(ALICE_MD), StubDocService::ok(BOB_MD));
+        let bob_may_start = tokio::sync::Notify::new();
+        let bob_done = std::sync::atomic::AtomicBool::new(false);
+
+        let alice_call = documentize(&v, &s, Some(&alice), P, M, "/report.pdf", true);
+        let bob_call = async {
+            bob_may_start.notified().await;
+            let out = documentize(&v, &s, Some(&bob), P, M, "/report.pdf", true).await;
+            bob_done.store(true, Ordering::SeqCst);
+            out
+        };
+        let drive = async {
+            paused.await.unwrap();
+            bob_may_start.notify_one();
+            // Bob either finished, sibling and set, or waits on the lock.
+            while !bob_done.load(Ordering::SeqCst)
+                && meta.artifact_lock_contenders("/report.pdf") < 2
+            {
+                tokio::task::yield_now().await;
+            }
+            release.send(()).unwrap();
+        };
+        let (a, b, ()) = tokio::join!(alice_call, bob_call, drive);
+        a.unwrap();
+        b.unwrap();
+
+        let sibling = v.read_bytes("/report.md").await.unwrap();
+        let set = meta.current_artifact_set("/report.pdf").await.unwrap().unwrap();
+        let text = meta.artifact_text_sha(&set).await.unwrap();
+        assert_eq!(text, Some(VolumeClient::sha256_hex(&sibling)), "set and sibling disagree");
+        assert_eq!(sibling, BOB_MD.as_bytes(), "Bob committed last");
     }
 
     /// The companion path is deliberately the one `fs.extract_text` looks at, so a

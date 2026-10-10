@@ -17,6 +17,7 @@ use crate::storage::traits::{
 };
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A project id is at most 32 characters (see `admin::validate_project_id`), so
@@ -402,12 +403,44 @@ pub(crate) struct DocTableRow {
 pub struct RelationalMetaStore {
     db: Arc<dyn RelationalDb>,
     volume_id: String,
+    /// Serializes each document's sibling write and set commit (DEC-008).
+    artifact_locks: PathLocks,
+}
+
+/// One async lock per path, so the conversion that commits last also wrote
+/// the last sibling (SPEC-0019 DEC-008, FR-NEW-010). The store lives in the
+/// cached volume client, so every request of the process shares these locks.
+#[derive(Default)]
+struct PathLocks {
+    /// The std mutex only guards the map and is never held across an await;
+    /// the per path tokio mutex is what a conversion waits on.
+    map: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl PathLocks {
+    /// Wait for `path`'s lock. Entries nobody holds or awaits are dropped on
+    /// the way, so the map only holds paths being converted right now.
+    async fn lock(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.retain(|_, l| Arc::strong_count(l) > 1);
+            map.entry(path.to_string()).or_default().clone()
+        };
+        lock.lock_owned().await
+    }
+
+    /// How many conversions hold or await `path`'s lock.
+    #[cfg(test)]
+    fn contenders(&self, path: &str) -> usize {
+        let map = self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(path).map_or(0, |l| Arc::strong_count(l) - 1)
+    }
 }
 
 impl RelationalMetaStore {
     /// Apply the schema, ensure the root directory row, and return the store.
     pub async fn open(db: Arc<dyn RelationalDb>, volume_id: impl Into<String>) -> Result<Self> {
-        let store = Self { db, volume_id: volume_id.into() };
+        let store = Self { db, volume_id: volume_id.into(), artifact_locks: PathLocks::default() };
         store.db.migrate(&schema()).await?;
         store.ensure_root().await?;
         Ok(store)
@@ -727,6 +760,19 @@ impl RelationalMetaStore {
         )
         .await?;
         tx.commit().await
+    }
+
+    /// Hold `path`'s artifact lock across a sibling write and the set commit
+    /// that goes with it, so overlapping conversions of one document commit in
+    /// the order they wrote their siblings (DEC-008).
+    pub(crate) async fn lock_artifacts(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.artifact_locks.lock(path).await
+    }
+
+    /// How many conversions hold or await `path`'s artifact lock.
+    #[cfg(test)]
+    pub(crate) fn artifact_lock_contenders(&self, path: &str) -> usize {
+        self.artifact_locks.contenders(path)
     }
 
     /// The id of the set `path` currently points at, only while the node still
