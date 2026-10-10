@@ -2783,4 +2783,211 @@ mod e2e {
         assert!(text.starts_with("![](missing.png)\n"), "got: {text}");
         only_line(&text.lines().collect::<Vec<_>>(), "[Image image-2]");
     }
+
+    /// SPEC-0019/E2E-064: the default view holds no picture reference or
+    /// figure path, and every line outside image and table positions equals
+    /// the conversion text, in order (FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_064_no_reference_or_figure_path_remains() {
+        let conversion = report_bundle();
+        let original = conversion.markdown.clone();
+        let (_f, server) = converting_bundle("/report.pdf", conversion).await;
+        convert(&server, "/report.pdf").await;
+        let text = view(&server, "/report.pdf", true, None).await;
+        assert!(!text.contains("![Figure]") && !text.contains("![Diagram]"), "got: {text}");
+        assert!(
+            !text.contains("figures/f1.png") && !text.contains("figures/f2.png"),
+            "got: {text}"
+        );
+        for line in ["# Report", "Table 1: Q1 sales", "Table 2: Costs"] {
+            assert!(text.contains(line), "missing {line:?}: {text}");
+        }
+
+        // Image positions (the 2 picture references) and table positions
+        // (header, separator and rows, both tables) in the conversion text;
+        // every other line must survive, unchanged and in order, in the view.
+        let original_lines: Vec<&str> = original.lines().collect();
+        let image_or_table_lines: std::collections::HashSet<usize> =
+            [0usize, 19].into_iter().chain(6..=10).chain(14..=17).collect();
+        let expected: Vec<&str> = original_lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !image_or_table_lines.contains(i))
+            .map(|(_, l)| *l)
+            .collect();
+        let text_lines: Vec<&str> = text.lines().collect();
+        let mut j = 0;
+        for exp in &expected {
+            while j < text_lines.len() && text_lines[j] != *exp {
+                j += 1;
+            }
+            assert!(j < text_lines.len(), "line {exp:?} not found in order in: {text}");
+            j += 1;
+        }
+    }
+
+    /// SPEC-0019/E2E-065: after the sibling is replaced, the view is still
+    /// built from the conversion text, not the sibling (FR-NEW-009).
+    #[tokio::test]
+    async fn spec_0019_e2e_065_a_rewritten_sibling_is_ignored() {
+        let (f, server, _) = report_with_images().await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        client.write_bytes_atomic("/report.md", b"edited").await.unwrap();
+        let text = view(&server, "/report.pdf", true, None).await;
+        assert!(text.contains("[Image image-1: Figure 1: Revenue 2024]"), "got: {text}");
+        assert!(!text.lines().any(|l| l == "edited"), "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-066: after the sibling is deleted, the view is still
+    /// built from the conversion text, in `csv-reference` mode (FR-NEW-009).
+    #[tokio::test]
+    async fn spec_0019_e2e_066_a_deleted_sibling_is_ignored() {
+        let (f, server, _) = report_with_images().await;
+        let client = f.state.stores.client(PROJECT).await.unwrap();
+        client.delete_file("/report.md").await.unwrap();
+        let text = view(&server, "/report.pdf", true, Some("csv-reference")).await;
+        assert!(text.contains("[Table table-1: Q1 sales (CSV)]"), "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-139: an image between plain text lines, with its caption
+    /// right after, reads exactly the 5 described lines (FR-NEW-036).
+    #[tokio::test]
+    async fn spec_0019_e2e_139_an_image_between_text_lines_has_one_blank_each_side() {
+        let conversion = bundle(
+            "Intro\n![](a.png)\nFigure 1: Revenue 2024\nBody text",
+            &[Pic { target: "a.png", bytes: b"a", caption: "Figure 1: Revenue 2024", page: None }],
+        );
+        let (_f, server) = converting_bundle("/fig.pdf", conversion).await;
+        convert(&server, "/fig.pdf").await;
+        let text = view(&server, "/fig.pdf", true, None).await;
+        assert_eq!(
+            text, "Intro\n\n[Image image-1: Figure 1: Revenue 2024]\n\nBody text",
+            "got: {text}"
+        );
+    }
+
+    /// SPEC-0019/E2E-144: an image written inside a line of other text stays
+    /// as text, and is kept as no image (FR-NEW-033, FR-NEW-007).
+    #[tokio::test]
+    async fn spec_0019_e2e_144_an_inline_image_reference_stays_as_text() {
+        let conversion = bundle(
+            "See ![chart](figures/figure_1.png) here",
+            &[Pic { target: "figures/figure_1.png", bytes: b"p", caption: "", page: None }],
+        );
+        let (_f, server) = converting_bundle("/inline.pdf", conversion).await;
+        let out = convert(&server, "/inline.pdf").await;
+        assert_eq!(out["artifacts_report"], "0 images, 0 tables");
+        let text = view(&server, "/inline.pdf", true, None).await;
+        assert_eq!(text, "See ![chart](figures/figure_1.png) here", "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-159: a picture surrounded by empty lines on both sides,
+    /// with its caption on its own line further surrounded by empty lines,
+    /// collapses to exactly one empty line each side (FR-NEW-036).
+    #[tokio::test]
+    async fn spec_0019_e2e_159_surrounding_empty_lines_collapse_to_one_each_side() {
+        let conversion = bundle(
+            "Intro\n\n![](a.png)\n\nFigure 1: Revenue 2024\n\nBody text",
+            &[Pic { target: "a.png", bytes: b"a", caption: "Figure 1: Revenue 2024", page: None }],
+        );
+        let (_f, server) = converting_bundle("/gap.pdf", conversion).await;
+        convert(&server, "/gap.pdf").await;
+        let text = view(&server, "/gap.pdf", true, None).await;
+        assert_eq!(
+            text, "Intro\n\n[Image image-1: Figure 1: Revenue 2024]\n\nBody text",
+            "got: {text}"
+        );
+    }
+
+    /// SPEC-0019/E2E-160: a picture reference as the first line of the
+    /// conversion text has no empty line before its image line (FR-NEW-036).
+    #[tokio::test]
+    async fn spec_0019_e2e_160_a_first_line_image_has_no_leading_empty_line() {
+        let conversion = bundle(
+            "![](a.png)\n\nBody text",
+            &[Pic { target: "a.png", bytes: b"a", caption: "", page: None }],
+        );
+        let (_f, server) = converting_bundle("/top.pdf", conversion).await;
+        convert(&server, "/top.pdf").await;
+        let text = view(&server, "/top.pdf", true, None).await;
+        assert_eq!(text, "[Image image-1]\n\nBody text", "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-161: a picture reference as the last line of the
+    /// conversion text has no empty line after its image line (FR-NEW-036).
+    #[tokio::test]
+    async fn spec_0019_e2e_161_a_last_line_image_has_no_trailing_empty_line() {
+        let conversion = bundle(
+            "Intro\n\n\n![](a.png)",
+            &[Pic { target: "a.png", bytes: b"a", caption: "", page: None }],
+        );
+        let (_f, server) = converting_bundle("/end.pdf", conversion).await;
+        convert(&server, "/end.pdf").await;
+        let text = view(&server, "/end.pdf", true, None).await;
+        assert_eq!(text, "Intro\n\n[Image image-1]", "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-162: a target escaping the converter's output is left
+    /// unchanged, and its id renders no image line (FR-NEW-037).
+    #[tokio::test]
+    async fn spec_0019_e2e_162_a_traversal_target_stays_verbatim() {
+        let secret = b"top secret pixels";
+        let home = tempfile::tempdir().expect("a temp dir for the fake converter script");
+        let sh = write_traversal_bundle_script(home.path(), secret);
+        let cli = crate::docs::CliDocService::new(
+            crate::config::DocServiceCliConfig {
+                command: vec![
+                    sh.display().to_string(),
+                    crate::config::OUTDIR_PLACEHOLDER.into(),
+                    crate::config::DOC_PLACEHOLDER.into(),
+                ],
+                timeout_secs: 30,
+            },
+            crate::docs::DOC_SERVICE_EXTS.iter().map(|e| (*e).to_string()).collect(),
+            u64::MAX,
+        );
+        let (f, _) = setup(None).await;
+        put(&f, "/trav.pdf", b"%PDF-1.4 source").await;
+        let server = with_doc(&f, Some(Arc::new(cli)));
+        convert(&server, "/trav.pdf").await;
+        let text = view(&server, "/trav.pdf", true, None).await;
+        assert!(text.lines().any(|l| l == "![x](../../secret.png)"), "got: {text}");
+        assert!(text.contains("[Image image-2]"), "got: {text}");
+        assert!(!text.lines().any(|l| l.starts_with("[Image image-1")), "got: {text}");
+        let _ = std::fs::remove_file(std::env::temp_dir().join("secret.png"));
+    }
+
+    /// SPEC-0019/E2E-163: an unsupported picture format's reference line
+    /// stands unchanged, and its id renders no image line (FR-NEW-037).
+    #[tokio::test]
+    async fn spec_0019_e2e_163_an_unsupported_format_reference_stays_verbatim() {
+        let md = "![](a.jpg)\n\n![](b.svg)\n";
+        let files: std::collections::BTreeMap<String, Vec<u8>> = [
+            ("a.jpg".to_string(), b"jpeg bytes".to_vec()),
+            ("b.svg".to_string(), b"<svg/>".to_vec()),
+        ]
+        .into();
+        let conversion = Conversion { markdown: md.to_string(), files, manifest: None };
+        let (_f, server) = converting_bundle("/mixed.pdf", conversion).await;
+        convert(&server, "/mixed.pdf").await;
+        let text = view(&server, "/mixed.pdf", true, None).await;
+        assert!(text.lines().any(|l| l == "![](b.svg)"), "got: {text}");
+        assert!(!text.lines().any(|l| l.starts_with("[Image image-2")), "got: {text}");
+    }
+
+    /// SPEC-0019/E2E-164: a URL target's reference line stands unchanged with
+    /// captions off (FR-NEW-037).
+    #[tokio::test]
+    async fn spec_0019_e2e_164_a_url_reference_stays_verbatim_with_captions_off() {
+        let md = "![x](https://example.com/a.png)\n";
+        let conversion = Conversion {
+            markdown: md.to_string(),
+            files: std::collections::BTreeMap::new(),
+            manifest: None,
+        };
+        let (_f, server) = converting_bundle("/url.pdf", conversion).await;
+        convert(&server, "/url.pdf").await;
+        let text = view(&server, "/url.pdf", false, None).await;
+        assert!(text.lines().any(|l| l == "![x](https://example.com/a.png)"), "got: {text}");
+    }
 }

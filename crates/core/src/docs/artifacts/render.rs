@@ -84,11 +84,12 @@ pub(crate) struct ViewTable {
 }
 
 /// What the view does with one line of the conversion text.
-enum LineAction {
+enum LineAction<'a> {
     Keep,
     Drop,
-    /// Write this image line, between empty lines, instead of the line.
-    Image(String),
+    /// Write this image line, with this terminator (the one its removed
+    /// block's last line carried), between empty lines (FR-NEW-036).
+    Image(String, &'a str),
     /// Write this rendering, terminator included, instead of the line.
     Table(String),
 }
@@ -111,7 +112,10 @@ pub(crate) fn document_view(
     mode: TableMode,
 ) -> String {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let mut actions: Vec<LineAction> = lines.iter().map(|_| LineAction::Keep).collect();
+    // The terminator synthetic blank lines are written with, matching the
+    // text's own line ending style (FR-NEW-036).
+    let line_sep = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut actions: Vec<LineAction<'_>> = lines.iter().map(|_| LineAction::Keep).collect();
     for t in tables {
         let end = t.line_start.saturating_add(t.line_count);
         if t.line_count == 0 || end > lines.len() {
@@ -129,25 +133,70 @@ pub(crate) fn document_view(
         if !matches!(actions.get(i.line), Some(LineAction::Keep)) {
             continue;
         }
-        actions[i.line] = LineAction::Image(image_line(i, captions));
-        let next = (i.line + 1..lines.len()).find(|&n| !content(lines[n]).trim().is_empty());
-        if let Some(n) = next.filter(|&n| !i.caption.is_empty() && content(lines[n]) == i.caption)
-            && matches!(actions[n], LineAction::Keep)
+        // The matched caption line (FR-NEW-007), if any.
+        let next =
+            (i.line + 1..lines.len()).find(|&n| !content(lines[n]).trim_matches(' ').is_empty());
+        let cap_line = next
+            .filter(|&n| !i.caption.is_empty() && content(lines[n]) == i.caption)
+            .filter(|&n| matches!(actions[n], LineAction::Keep));
+        // Every empty line directly before, between or after the removed
+        // lines is removed too (FR-NEW-036); nothing else is touched.
+        let mut start = i.line;
+        while start > 0
+            && content(lines[start - 1]).trim_matches(' ').is_empty()
+            && matches!(actions[start - 1], LineAction::Keep)
         {
-            actions[n] = LineAction::Drop;
+            start -= 1;
         }
+        let mut end = cap_line.unwrap_or(i.line);
+        while end + 1 < lines.len()
+            && content(lines[end + 1]).trim_matches(' ').is_empty()
+            && matches!(actions[end + 1], LineAction::Keep)
+        {
+            end += 1;
+        }
+        let image_terminator = terminator(lines[end]);
+        for a in &mut actions[start..=end] {
+            *a = LineAction::Drop;
+        }
+        actions[i.line] = LineAction::Image(image_line(i, captions), image_terminator);
     }
+    // Written in order, skipping drops; an empty line is owed before an
+    // image unless it is the very first thing written, and one after unless
+    // nothing follows, but two images back to back (nothing else between
+    // them) share that single empty line rather than stacking two
+    // (FR-NEW-036).
     let mut out = String::with_capacity(text.len());
-    for (line, action) in lines.iter().zip(&actions) {
+    let mut wrote_anything = false;
+    let mut after_image = false;
+    for (idx, action) in actions.iter().enumerate() {
         match action {
-            LineAction::Keep => out.push_str(line),
-            LineAction::Drop => {}
-            LineAction::Image(image) => {
-                out.push('\n');
-                out.push_str(image);
-                out.push_str("\n\n");
+            LineAction::Keep => {
+                if after_image {
+                    out.push_str(line_sep);
+                }
+                out.push_str(lines[idx]);
+                after_image = false;
+                wrote_anything = true;
             }
-            LineAction::Table(rendered) => out.push_str(rendered),
+            LineAction::Drop => {}
+            LineAction::Image(image, image_terminator) => {
+                if wrote_anything {
+                    out.push_str(line_sep);
+                }
+                out.push_str(image);
+                out.push_str(image_terminator);
+                after_image = true;
+                wrote_anything = true;
+            }
+            LineAction::Table(rendered) => {
+                if after_image {
+                    out.push_str(line_sep);
+                }
+                out.push_str(rendered);
+                after_image = false;
+                wrote_anything = true;
+            }
         }
     }
     out
@@ -370,21 +419,54 @@ mod tests {
 
     #[test]
     fn an_image_line_replaces_the_reference_and_a_repeated_caption() {
+        // Updated for FR-NEW-036 (SPEC-0019/US-0009): the blank line between
+        // the ref and the removed caption no longer survives alongside the
+        // synthetic one, so exactly one empty line stands on each side.
         let text = "a\n![](p.png)\n\nCap\nCap\n";
         let img = |caption: &str| ViewImage { seq: 3, caption: caption.into(), line: 1 };
         assert_eq!(
             document_view(text, &[img("Cap")], &[], true, TableMode::Markdown),
-            "a\n\n[Image image-3: Cap]\n\n\nCap\n"
+            "a\n\n[Image image-3: Cap]\n\nCap\n"
         );
         assert_eq!(
             document_view(text, &[img("Cap")], &[], false, TableMode::Markdown),
-            "a\n\n[Image image-3]\n\n\nCap\n"
+            "a\n\n[Image image-3]\n\nCap\n"
         );
         // An empty caption matches no line, not even an empty one.
         let first = ViewImage { seq: 1, caption: String::new(), line: 0 };
         assert_eq!(
             document_view("![](p.png)\n\nx\n", &[first], &[], true, TableMode::Markdown),
-            "\n[Image image-1]\n\n\nx\n"
+            "[Image image-1]\n\nx\n"
+        );
+    }
+
+    #[test]
+    fn an_image_collapses_surrounding_empty_lines_to_one_each_side() {
+        let text = "Intro\n\n![](p.png)\n\nFigure 1: Revenue 2024\n\nBody text";
+        let img = ViewImage { seq: 1, caption: "Figure 1: Revenue 2024".into(), line: 2 };
+        assert_eq!(
+            document_view(text, &[img], &[], true, TableMode::Markdown),
+            "Intro\n\n[Image image-1: Figure 1: Revenue 2024]\n\nBody text"
+        );
+    }
+
+    #[test]
+    fn an_image_as_the_first_line_has_no_leading_empty_line() {
+        let text = "![](p.png)\n\nBody text";
+        let img = ViewImage { seq: 1, caption: String::new(), line: 0 };
+        assert_eq!(
+            document_view(text, &[img], &[], true, TableMode::Markdown),
+            "[Image image-1]\n\nBody text"
+        );
+    }
+
+    #[test]
+    fn an_image_as_the_last_line_has_no_trailing_empty_line() {
+        let text = "Intro\n\n\n![](p.png)";
+        let img = ViewImage { seq: 1, caption: String::new(), line: 3 };
+        assert_eq!(
+            document_view(text, &[img], &[], true, TableMode::Markdown),
+            "Intro\n\n[Image image-1]"
         );
     }
 
@@ -394,5 +476,62 @@ mod tests {
         let images = [ViewImage { seq: 1, caption: String::new(), line: usize::MAX }];
         let tables = [table(1, "", 1, 5), table(2, "", usize::MAX, 2), table(3, "", 0, 0)];
         assert_eq!(document_view(text, &images, &tables, true, TableMode::Both), text);
+    }
+
+    #[test]
+    fn adjacent_images_have_exactly_one_blank_line_between() {
+        let text = "x\n![](a)\n![](b)\ny\n";
+        let imgs = [
+            ViewImage { seq: 1, caption: String::new(), line: 1 },
+            ViewImage { seq: 2, caption: String::new(), line: 2 },
+        ];
+        assert_eq!(
+            document_view(text, &imgs, &[], true, TableMode::Markdown),
+            "x\n\n[Image image-1]\n\n[Image image-2]\n\ny\n"
+        );
+    }
+
+    #[test]
+    fn adjacent_images_with_a_blank_line_between_still_get_exactly_one() {
+        let text = "x\n![](a)\n\n![](b)\ny\n";
+        let imgs = [
+            ViewImage { seq: 1, caption: String::new(), line: 1 },
+            ViewImage { seq: 2, caption: String::new(), line: 3 },
+        ];
+        assert_eq!(
+            document_view(text, &imgs, &[], true, TableMode::Markdown),
+            "x\n\n[Image image-1]\n\n[Image image-2]\n\ny\n"
+        );
+    }
+
+    #[test]
+    fn an_image_directly_before_a_table_gets_its_blank_lines() {
+        let text = "x\n![](a)\n| h |\n| --- |\n| 1 |\ny\n";
+        let img = ViewImage { seq: 1, caption: String::new(), line: 1 };
+        let t = table(1, "", 2, 3);
+        assert_eq!(
+            document_view(text, &[img], &[t], true, TableMode::Markdown),
+            "x\n\n[Image image-1]\n\n| a |\n| --- |\n| 1 |\ny\n"
+        );
+    }
+
+    #[test]
+    fn a_tab_only_line_next_to_an_image_is_not_treated_as_empty() {
+        let text = "a\n![](p.png)\n\t\nb\n";
+        let img = ViewImage { seq: 1, caption: String::new(), line: 1 };
+        assert_eq!(
+            document_view(text, &[img], &[], true, TableMode::Markdown),
+            "a\n\n[Image image-1]\n\n\t\nb\n"
+        );
+    }
+
+    #[test]
+    fn crlf_text_gets_crlf_blank_lines_around_an_image() {
+        let text = "Intro\r\n![](p.png)\r\nBody\r\n";
+        let img = ViewImage { seq: 1, caption: String::new(), line: 1 };
+        assert_eq!(
+            document_view(text, &[img], &[], true, TableMode::Markdown),
+            "Intro\r\n\r\n[Image image-1]\r\n\r\nBody\r\n"
+        );
     }
 }
