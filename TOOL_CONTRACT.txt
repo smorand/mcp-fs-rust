@@ -591,10 +591,10 @@ search.status
 
 === EXACT RETURN SHAPES (the contract this server keeps; sample values are illustrative) ===
 fs.write: {"path": "/a.txt", "bytes_written": 12, "overwritten": false, "diff": ""}
-fs.write_bytes: {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": {"md_path": "/deck.md", "bytes_written": 517}}
+fs.write_bytes: {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": {"md_path": "/deck.md", "bytes_written": 517, "artifacts_report": "0 images, 1 tables"}}
 fs.write_bytes(flag off): {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": null}
 fs.write_bytes(conversion failed): {"path": "/deck.pptx", "bytes_written": 20480, "overwritten": false, "documentation": {"error": {"code": "ERR_INTERNAL_ERROR", "message": "document service exited with exit code 1: ..."}}}
-fs.documentize: {"path": "/report.pdf", "md_path": "/report.md", "bytes_written": 517, "overwritten": false}
+fs.documentize: {"path": "/report.pdf", "md_path": "/report.md", "bytes_written": 517, "overwritten": false, "artifacts_report": "0 images, 2 tables\ntable-2: malformed table"}
 fs.read: {"content": "1\thello\n2\tworld", "total_lines": 2, "truncated": false, "next_offset": null}
 fs.read_bytes: {"base64": "aGVsbG8Kd29ybGQK", "mime_type": "text/plain", "length": 12}
 fs.read_lines: {"content": "1\thello\n2\tworld", "total_lines": 2}

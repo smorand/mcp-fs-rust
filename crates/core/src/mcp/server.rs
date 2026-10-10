@@ -1570,7 +1570,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.write_bytes", description = "Write raw bytes (base64) to a file.")]
-    async fn fs_write_bytes(
+    pub(crate) async fn fs_write_bytes(
         &self,
         Parameters(a): Parameters<WriteBytesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2224,7 +2224,7 @@ impl McpServer {
         name = "fs.documentize",
         description = "Generate the Markdown companion of a stored document."
     )]
-    async fn fs_documentize(
+    pub(crate) async fn fs_documentize(
         &self,
         Parameters(a): Parameters<DocumentizeArgs>,
     ) -> Result<CallToolResult, ErrorData> {

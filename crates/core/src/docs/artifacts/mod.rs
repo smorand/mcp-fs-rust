@@ -1,14 +1,14 @@
 //! Document artifacts (SPEC-0019): the tables a conversion keeps beside the
-//! Markdown sibling, their continuation markers, and the capture of the set
-//! the built-in conversion produces.
+//! Markdown sibling, their renderings and continuation markers. `parse` reads
+//! the external converter's text, `capture` builds, weighs and commits a set.
 //!
 //! Artifacts are rows of the meta store plus content addressed blobs, never
 //! `nodes` (DEC-002), so no enumerator of files ever sees them.
 
-use crate::docs::extract::BuiltinTable;
+pub(crate) mod capture;
+pub(crate) mod parse;
+
 use crate::errors::{Result, ToolError};
-use crate::storage::VolumeClient;
-use crate::storage::meta::{NewArtifactSet, NewDocTable, RelationalMetaStore};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -24,6 +24,8 @@ const MARKER_VERSION: &str = "v1";
 pub(crate) enum CsvQuality {
     /// Built from the original cells.
     Exact,
+    /// Derived from the Markdown text of an external conversion.
+    Approximate,
 }
 
 impl CsvQuality {
@@ -31,6 +33,7 @@ impl CsvQuality {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Exact => "exact",
+            Self::Approximate => "approximate",
         }
     }
 
@@ -86,7 +89,7 @@ fn flatten_newlines(cell: &str) -> String {
 }
 
 /// The widest row's cell count, header included (FR-NEW-002).
-fn width(cells: &[Vec<String>]) -> usize {
+pub(crate) fn width(cells: &[Vec<String>]) -> usize {
     cells.iter().map(Vec::len).max().unwrap_or(0)
 }
 
@@ -134,85 +137,6 @@ pub(crate) fn table_csv(cells: &[Vec<String>]) -> String {
         .join("\n")
 }
 
-/// The set the built-in conversion yields for one text extraction
-/// (FR-NEW-017): its tables, no images, and the conversion text.
-pub(crate) struct BuiltinSet<'a> {
-    text: &'a str,
-    tables: Vec<&'a BuiltinTable>,
-}
-
-impl<'a> BuiltinSet<'a> {
-    /// Keep only the tables whose whole Markdown lies before the cut, when the
-    /// text was cut (FR-NEW-034); they keep reading order and every row.
-    pub(crate) fn new(
-        text: &'a str,
-        tables: &'a [BuiltinTable],
-        truncated_at: Option<usize>,
-    ) -> Self {
-        let tables =
-            tables.iter().filter(|t| truncated_at.is_none_or(|cut| t.char_end <= cut)).collect();
-        Self { text, tables }
-    }
-
-    /// What this set adds to the session write quota beside the sibling
-    /// (FR-NEW-013): each table's CSV, Markdown and caption bytes, plus the
-    /// conversion text.
-    pub(crate) fn bytes(&self) -> i64 {
-        let set: usize = self
-            .tables
-            .iter()
-            .map(|t| table_csv(&t.cells).len() + table_markdown(&t.cells).len() + t.caption.len())
-            .sum();
-        (set + self.text.len()) as i64
-    }
-
-    /// Store the conversion text blob, then commit the set as the current one
-    /// for `path`, refused when the node no longer carries `rev` (DEC-008).
-    pub(crate) async fn commit(
-        &self,
-        client: &VolumeClient,
-        store: &RelationalMetaStore,
-        path: &str,
-        rev: &str,
-    ) -> Result<()> {
-        let text_sha = if self.text.is_empty() {
-            None
-        } else {
-            let sha = VolumeClient::sha256_hex(self.text.as_bytes());
-            client.blob.put(&sha, self.text.as_bytes()).await?;
-            Some(sha)
-        };
-        let tables = self
-            .tables
-            .iter()
-            .zip(1i64..)
-            .map(|(t, seq)| {
-                Ok(NewDocTable {
-                    seq,
-                    caption: t.caption.clone(),
-                    rows: t.cells.len().saturating_sub(1) as i64,
-                    cols: width(&t.cells) as i64,
-                    quality: CsvQuality::Exact.as_str().to_string(),
-                    cells: serde_json::to_string(&t.cells)
-                        .map_err(|e| ToolError::internal(format!("table cells: {e}")))?,
-                    line_start: t.line_start as i64,
-                    line_count: t.line_count as i64,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let set = NewArtifactSet {
-            set_id: uuid::Uuid::new_v4().to_string(),
-            path: path.to_string(),
-            node_rev: rev.to_string(),
-            text_sha,
-            text_len: self.text.len() as i64,
-            report: format!("0 images, {} tables", tables.len()),
-            tables,
-        };
-        store.commit_artifact_set(&set).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,34 +169,5 @@ mod tests {
     fn csv_quotes_only_when_needed_and_pads() {
         let t = cells(&[&["h1", "h2"], &["a,b", "say \"hi\""], &["line\nbreak"]]);
         assert_eq!(table_csv(&t), "h1,h2\n\"a,b\",\"say \"\"hi\"\"\"\n\"line\nbreak\",");
-    }
-
-    #[test]
-    fn a_cut_keeps_only_tables_ending_before_it() {
-        let table = |end| BuiltinTable {
-            caption: String::new(),
-            cells: cells(&[&["h"]]),
-            line_start: 0,
-            line_count: 2,
-            char_end: end,
-        };
-        let tables = vec![table(10), table(20)];
-        assert_eq!(BuiltinSet::new("", &tables, None).tables.len(), 2);
-        assert_eq!(BuiltinSet::new("", &tables, Some(20)).tables.len(), 2);
-        assert_eq!(BuiltinSet::new("", &tables, Some(19)).tables.len(), 1);
-        assert_eq!(BuiltinSet::new("", &tables, Some(9)).tables.len(), 0);
-    }
-
-    #[test]
-    fn bytes_count_csv_markdown_caption_and_text() {
-        let tables = vec![BuiltinTable {
-            caption: "Q1".into(),
-            cells: cells(&[&["h"], &["v"]]),
-            line_start: 0,
-            line_count: 3,
-            char_end: 5,
-        }];
-        // csv "h\nv" (3) + markdown "| h |\n| --- |\n| v |" (19) + caption (2) + text (4)
-        assert_eq!(BuiltinSet::new("abcd", &tables, None).bytes(), 3 + 19 + 2 + 4);
     }
 }

@@ -193,7 +193,7 @@ doc_service:
   extensions: []                 # empty = the built-in eligible set
   max_input_bytes: 536870912     # 512 MiB
   cli:
-    command: ["doc-convert", "--stdout", "--quiet", "{document}"]
+    command: ["doc-convert", "--quiet", "-o", "{outdir}", "{document}"]
     timeout_secs: 900
   api:
     url: "https://converter.internal/convert"
@@ -212,7 +212,17 @@ kills and reaps the child first. That contains a tool which writes beside its in
 not a hard OS sandbox, so wrap argv[0] in `sandbox-exec`, `bwrap` or `docker run` if you
 need one. In `api` mode the request is `POST {url}`, `multipart/form-data`, one part named
 `file`; `scripts/doc_service_fake.py` implements exactly that contract for local
-development.
+development (`--bundle` answers the JSON bundle below).
+
+The converter may return a **bundle** rather than bare Markdown. In `cli` mode an optional
+`{outdir}` placeholder (the default command uses it) names a fresh empty directory inside
+the sandbox: the server reads `{outdir}/document.md` as the Markdown, every regular file
+below it (symlinks not followed, total capped by `max_input_bytes`), and
+`{outdir}/artifacts.json` as the manifest; without `{outdir}` stdout is the Markdown, as
+before. In `api` mode an `application/json` answer (with `response_field` empty) is
+`{"markdown": "...", "files": {"figures/f1.png": "<base64>"}, "manifest": {...}}`. Pipe
+tables of the Markdown are kept as table artifacts (`fs.list_tables`, `CSV quality:
+approximate`), and every conversion result carries an `artifacts_report`.
 
 Two tools and two routes:
 

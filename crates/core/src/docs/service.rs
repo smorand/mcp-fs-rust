@@ -30,6 +30,8 @@
 use crate::config::{DocServiceApiConfig, DocServiceCliConfig, DocServiceConfig, doc_service_mode};
 use crate::errors::{Result, ToolError};
 use async_trait::async_trait;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,11 +58,57 @@ const STDERR_CAP: usize = 8 * 1024;
 /// says what went wrong in its first line.
 const BODY_CAP: usize = 2 * 1024;
 
+/// The name of the converter's output manifest inside its bundle (DEC-006).
+pub const MANIFEST_FILE: &str = "artifacts.json";
+/// The Markdown a converter writes inside `{outdir}` (DEC-006).
+pub const OUTDIR_MARKDOWN: &str = "document.md";
+
+/// What one conversion returns (SPEC-0019 DEC-006): the conversion text, every
+/// file the converter wrote beside it keyed by its relative `/` separated path,
+/// and the optional manifest describing its pictures.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Conversion {
+    pub markdown: String,
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub manifest: Option<Manifest>,
+}
+
+impl Conversion {
+    /// A conversion that is only text, which is what a stdout converter yields.
+    pub fn text(markdown: impl Into<String>) -> Self {
+        Self { markdown: markdown.into(), ..Self::default() }
+    }
+}
+
+/// The optional `artifacts.json` of a bundle. Absent fields mean an empty
+/// caption, no failure marker and an empty page.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Manifest {
+    /// Keyed by the picture reference's target, as written in the text.
+    pub pictures: BTreeMap<String, PictureMeta>,
+}
+
+/// What the converter says about one picture.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PictureMeta {
+    pub caption: String,
+    pub caption_failed: bool,
+    pub page: Option<i64>,
+}
+
 /// A stateless document to Markdown converter.
 #[async_trait]
 pub trait DocService: Send + Sync {
-    /// Convert `bytes` (a document named `file_name`) to Markdown. Stateless.
-    async fn to_markdown(&self, bytes: &[u8], file_name: &str) -> Result<String>;
+    /// Convert `bytes` (a document named `file_name`) to a [`Conversion`]
+    /// bundle. Stateless.
+    async fn convert(&self, bytes: &[u8], file_name: &str) -> Result<Conversion>;
+
+    /// The Markdown of [`Self::convert`], for callers that need nothing else.
+    async fn to_markdown(&self, bytes: &[u8], file_name: &str) -> Result<String> {
+        Ok(self.convert(bytes, file_name).await?.markdown)
+    }
 
     /// The extensions this service accepts, resolved once at construction from
     /// `doc_service.extensions` and never empty.
@@ -147,7 +195,7 @@ impl CliDocService {
 #[async_trait]
 impl DocService for CliDocService {
     #[tracing::instrument(skip(self, bytes), fields(doc.mode = "cli", doc.file = file_name))]
-    async fn to_markdown(&self, bytes: &[u8], file_name: &str) -> Result<String> {
+    async fn convert(&self, bytes: &[u8], file_name: &str) -> Result<Conversion> {
         // Rule 1: a fresh directory per call, removed on every exit path because
         // it is dropped when this function returns.
         let dir = tempfile::TempDir::new().map_err(|e| {
@@ -162,10 +210,28 @@ impl DocService for CliDocService {
             ToolError::internal(format!("document service: cannot stage the input document: {e}"))
         })?;
 
+        // With `{outdir}` the converter writes a bundle into a fresh empty
+        // directory inside the sandbox (DEC-006). A sanitized input name never
+        // starts with a dot, so it cannot collide with this one.
+        let outdir = self
+            .config
+            .command
+            .iter()
+            .any(|a| a.contains(crate::config::OUTDIR_PLACEHOLDER))
+            .then(|| dir.path().join(".bundle"));
+        if let Some(out) = &outdir {
+            tokio::fs::create_dir(out).await.map_err(|e| {
+                ToolError::internal(format!(
+                    "document service: cannot create the output directory: {e}"
+                ))
+            })?;
+        }
+
         // Rules 3 and 5: an argv list, never a shell string, with `{document}`
         // expanded to a RELATIVE name so a tool writing beside its input stays in
         // the sandbox.
-        let argv = expand_argv(&self.config.command, &format!("./{name}"));
+        let out_arg = outdir.as_ref().map(|o| o.display().to_string()).unwrap_or_default();
+        let argv = expand_argv(&self.config.command, &format!("./{name}"), &out_arg);
         let Some((program, args)) = argv.split_first() else {
             return Err(ToolError::internal("doc_service.cli.command is empty"));
         };
@@ -236,14 +302,17 @@ impl DocService for CliDocService {
                 exit_label(&status)
             )));
         }
-        let markdown = String::from_utf8_lossy(&stdout).to_string();
-        if markdown.trim().is_empty() {
+        let conversion = match outdir {
+            Some(out) => read_bundle(out, self.max_input_bytes).await?,
+            None => Conversion::text(String::from_utf8_lossy(&stdout).to_string()),
+        };
+        if conversion.markdown.trim().is_empty() {
             return Err(ToolError::internal(format!(
                 "document service exited with {} but produced no output: {tail}",
                 exit_label(&status)
             )));
         }
-        Ok(markdown)
+        Ok(conversion)
     }
 
     fn accepted_extensions(&self) -> &[String] {
@@ -283,7 +352,7 @@ impl ApiDocService {
 #[async_trait]
 impl DocService for ApiDocService {
     #[tracing::instrument(skip(self, bytes), fields(doc.mode = "api", doc.file = file_name))]
-    async fn to_markdown(&self, bytes: &[u8], file_name: &str) -> Result<String> {
+    async fn convert(&self, bytes: &[u8], file_name: &str) -> Result<Conversion> {
         let mime = crate::docs::mime::guess(file_name).unwrap_or("application/octet-stream");
         let part = reqwest::multipart::Part::bytes(bytes.to_vec())
             .file_name(file_name.to_string())
@@ -310,6 +379,11 @@ impl DocService for ApiDocService {
             ToolError::internal(format!("document service request failed: {}", transport_kind(&e)))
         })?;
         let status = response.status();
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim_start().starts_with("application/json"));
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(ToolError::internal(format!(
@@ -319,9 +393,15 @@ impl DocService for ApiDocService {
             )));
         }
 
+        // A configured `response_field` keeps its meaning; otherwise a JSON
+        // answer is a bundle (DEC-006) and anything else is the Markdown body.
         let field = self.config.response_field.trim();
         if field.is_empty() {
-            return Ok(body);
+            return if is_json {
+                parse_api_bundle(&body, self.max_input_bytes)
+            } else {
+                Ok(Conversion::text(body))
+            };
         }
         let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             ToolError::internal(format!(
@@ -329,11 +409,13 @@ impl DocService for ApiDocService {
                  doc_service.api.response_field is set: {e}"
             ))
         })?;
-        parsed.get(field).and_then(serde_json::Value::as_str).map(str::to_string).ok_or_else(|| {
-            ToolError::internal(format!(
-                "document service response carries no string field '{field}'"
-            ))
-        })
+        parsed.get(field).and_then(serde_json::Value::as_str).map(Conversion::text).ok_or_else(
+            || {
+                ToolError::internal(format!(
+                    "document service response carries no string field '{field}'"
+                ))
+            },
+        )
     }
 
     fn accepted_extensions(&self) -> &[String] {
@@ -370,10 +452,139 @@ fn sanitize_file_name(file_name: &str) -> String {
     format!("{stem}{ext}")
 }
 
-/// Expand `{document}` in every argument. Config validation guarantees exactly
-/// one occurrence, but a service built without it must still behave.
-fn expand_argv(command: &[String], document: &str) -> Vec<String> {
-    command.iter().map(|a| a.replace(crate::config::DOC_PLACEHOLDER, document)).collect()
+/// Expand `{document}` and `{outdir}` in every argument. Config validation
+/// guarantees exactly one `{document}` and at most one `{outdir}`, but a
+/// service built without it must still behave.
+fn expand_argv(command: &[String], document: &str, outdir: &str) -> Vec<String> {
+    command
+        .iter()
+        .map(|a| {
+            a.replace(crate::config::DOC_PLACEHOLDER, document)
+                .replace(crate::config::OUTDIR_PLACEHOLDER, outdir)
+        })
+        .collect()
+}
+
+/// The bundle a converter wrote into `out`: `document.md` as the Markdown,
+/// every regular file under `out` by its relative `/` separated path (symlinks
+/// are never followed), and `artifacts.json` as the manifest. The files are
+/// capped at `cap` bytes in total, like the input.
+async fn read_bundle(out: std::path::PathBuf, cap: u64) -> Result<Conversion> {
+    tokio::task::spawn_blocking(move || read_bundle_blocking(&out, cap))
+        .await
+        .map_err(|e| ToolError::internal(format!("document service: bundle read failed: {e}")))?
+}
+
+fn read_bundle_blocking(out: &std::path::Path, cap: u64) -> Result<Conversion> {
+    let io = |e: std::io::Error| {
+        ToolError::internal(format!("document service: cannot read its output: {e}"))
+    };
+    // `read_dir` follows a symlink, so a converter that swapped its output
+    // folder for a link would make us read outside the sandbox.
+    let root = std::fs::symlink_metadata(out).map_err(io)?;
+    if !root.file_type().is_dir() {
+        return Err(ToolError::internal(
+            "document service output folder is not a real directory, refused",
+        ));
+    }
+    let mut files = BTreeMap::new();
+    let mut total: u64 = 0;
+    let mut pending = vec![out.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            // `file_type` does not follow a symlink, so a link is skipped here.
+            let kind = entry.file_type().map_err(io)?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(out) else { continue };
+            let key: Vec<String> = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            // Checked on the length before reading, so an oversized file is
+            // never pulled into memory.
+            let len = entry.metadata().map_err(io)?.len();
+            if len > cap - total {
+                return Err(ToolError::internal(format!(
+                    "document service output is over the doc_service.max_input_bytes limit of {cap}"
+                )));
+            }
+            let bytes = std::fs::read(&path).map_err(io)?;
+            // The file may have grown since its length was taken.
+            total += bytes.len() as u64;
+            if total > cap {
+                return Err(ToolError::internal(format!(
+                    "document service output is over the doc_service.max_input_bytes limit of {cap}"
+                )));
+            }
+            files.insert(key.join("/"), bytes);
+        }
+    }
+    let markdown = files.get(OUTDIR_MARKDOWN).ok_or_else(|| {
+        ToolError::internal(format!("document service wrote no {OUTDIR_MARKDOWN} in its output"))
+    })?;
+    let markdown = String::from_utf8_lossy(markdown).into_owned();
+    let manifest = files.get(MANIFEST_FILE).and_then(|raw| manifest_from(raw));
+    Ok(Conversion { markdown, files, manifest })
+}
+
+/// A manifest that does not parse is ignored, as if absent: captions and pages
+/// are lost, the conversion is not.
+fn manifest_from(raw: &[u8]) -> Option<Manifest> {
+    match serde_json::from_slice(raw) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(error = %e, "document service manifest ignored");
+            None
+        }
+    }
+}
+
+/// The JSON bundle of an api mode answer:
+/// `{"markdown": "...", "files": {"<path>": "<base64>"}, "manifest": {...}}`.
+fn parse_api_bundle(body: &str, cap: u64) -> Result<Conversion> {
+    #[derive(Deserialize)]
+    struct Bundle {
+        markdown: String,
+        #[serde(default)]
+        files: BTreeMap<String, String>,
+        #[serde(default)]
+        manifest: Option<serde_json::Value>,
+    }
+    use base64::Engine as _;
+    let bundle: Bundle = serde_json::from_str(body).map_err(|e| {
+        ToolError::internal(format!("document service returned a malformed bundle: {e}"))
+    })?;
+    let mut files = BTreeMap::new();
+    let mut total: u64 = 0;
+    for (key, encoded) in bundle.files {
+        let bytes =
+            base64::engine::general_purpose::STANDARD.decode(encoded.trim()).map_err(|e| {
+                ToolError::internal(format!(
+                    "document service bundle file '{key}' is not base64: {e}"
+                ))
+            })?;
+        total += bytes.len() as u64;
+        if total > cap {
+            return Err(ToolError::internal(format!(
+                "document service output is over the doc_service.max_input_bytes limit of {cap}"
+            )));
+        }
+        files.insert(key, bytes);
+    }
+    let manifest = bundle.manifest.and_then(|v| {
+        serde_json::from_value(v)
+            .map_err(|e| tracing::warn!(error = %e, "document service manifest ignored"))
+            .ok()
+    });
+    Ok(Conversion { markdown: bundle.markdown, files, manifest })
 }
 
 /// The last `cap` bytes, decoded lossily. Byte slicing is safe here because
@@ -417,7 +628,7 @@ fn transport_kind(e: &reqwest::Error) -> &'static str {
 /// or a fixed error, without touching a process or the network.
 #[cfg(test)]
 pub struct StubDocService {
-    outcome: Result<String>,
+    outcome: Result<Conversion>,
     extensions: Vec<String>,
     max_input_bytes: u64,
 }
@@ -427,7 +638,7 @@ impl StubDocService {
     /// A service that always converts to `markdown`.
     pub fn ok(markdown: impl Into<String>) -> Self {
         Self {
-            outcome: Ok(markdown.into()),
+            outcome: Ok(Conversion::text(markdown)),
             extensions: resolve_extensions(&[]),
             max_input_bytes: u64::MAX,
         }
@@ -436,6 +647,23 @@ impl StubDocService {
     /// A service that always fails, for the "the upload is never rolled back" path.
     pub fn failing(error: ToolError) -> Self {
         Self { outcome: Err(error), extensions: resolve_extensions(&[]), max_input_bytes: u64::MAX }
+    }
+
+    /// A service that always returns `conversion`, files and manifest included.
+    pub fn bundle(conversion: Conversion) -> Self {
+        Self {
+            outcome: Ok(conversion),
+            extensions: resolve_extensions(&[]),
+            max_input_bytes: u64::MAX,
+        }
+    }
+
+    /// Narrow the accepted extensions, as `doc_service.extensions` does.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: &[&str]) -> Self {
+        let configured: Vec<String> = extensions.iter().map(|e| (*e).to_string()).collect();
+        self.extensions = resolve_extensions(&configured);
+        self
     }
 
     /// Narrow the input size cap, for the pre-write validation tests.
@@ -449,7 +677,7 @@ impl StubDocService {
 #[cfg(test)]
 #[async_trait]
 impl DocService for StubDocService {
-    async fn to_markdown(&self, _bytes: &[u8], _file_name: &str) -> Result<String> {
+    async fn convert(&self, _bytes: &[u8], _file_name: &str) -> Result<Conversion> {
         self.outcome.clone()
     }
 
@@ -666,6 +894,122 @@ mod tests {
         assert!(e.message.contains("no output"), "{}", e.message);
     }
 
+    /// SPEC-0019 DEC-006: with `{outdir}` the bundle is read from a fresh
+    /// directory inside the sandbox: `document.md`, every regular file by its
+    /// relative path, and `artifacts.json` as the manifest.
+    #[tokio::test]
+    async fn cli_outdir_mode_reads_the_bundle_the_converter_wrote() {
+        let home = tempfile::tempdir().unwrap();
+        let sh = script(
+            home.path(),
+            "bundle.sh",
+            "out=\"$1\"\n\
+             test -z \"$(ls -A \"$out\")\" || exit 9\n\
+             mkdir -p \"$out/figures\"\n\
+             printf '# doc\\n![c](figures/f1.png)\\n' > \"$out/document.md\"\n\
+             printf 'PNG' > \"$out/figures/f1.png\"\n\
+             printf '{\"pictures\":{\"figures/f1.png\":{\"caption\":\"Chart\",\"page\":3}}}' > \"$out/artifacts.json\"\n\
+             ln -s /etc/hosts \"$out/escape.txt\"\n\
+             echo 'stdout is ignored'\n",
+        );
+        let svc = cli_service(
+            vec![
+                sh.display().to_string(),
+                crate::config::OUTDIR_PLACEHOLDER.into(),
+                crate::config::DOC_PLACEHOLDER.into(),
+            ],
+            30,
+        );
+
+        let c = svc.convert(b"body", "deck.pdf").await.unwrap();
+        assert_eq!(c.markdown, "# doc\n![c](figures/f1.png)\n");
+        assert_eq!(c.files.get("figures/f1.png").map(Vec::as_slice), Some(&b"PNG"[..]));
+        assert!(!c.files.contains_key("escape.txt"), "a symlink is never followed");
+        let meta = &c.manifest.expect("the manifest").pictures["figures/f1.png"];
+        assert_eq!(
+            meta,
+            &PictureMeta { caption: "Chart".into(), caption_failed: false, page: Some(3) }
+        );
+        // `to_markdown` stays the bundle's Markdown.
+        assert_eq!(svc.to_markdown(b"body", "deck.pdf").await.unwrap(), c.markdown);
+    }
+
+    #[tokio::test]
+    async fn cli_outdir_mode_without_document_md_is_a_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let sh = script(home.path(), "nodoc.sh", "echo '# on stdout'\n");
+        let svc = cli_service(
+            vec![
+                sh.display().to_string(),
+                crate::config::OUTDIR_PLACEHOLDER.into(),
+                crate::config::DOC_PLACEHOLDER.into(),
+            ],
+            30,
+        );
+        let e = svc.convert(b"body", "deck.pdf").await.unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert!(e.message.contains("document.md"), "{}", e.message);
+    }
+
+    /// The bundle is capped by `max_input_bytes`, like the input.
+    #[tokio::test]
+    async fn cli_outdir_mode_caps_the_bundle_size() {
+        let home = tempfile::tempdir().unwrap();
+        let sh = script(
+            home.path(),
+            "big.sh",
+            "printf '# doc' > \"$1/document.md\"\nprintf '0123456789' > \"$1/big.bin\"\n",
+        );
+        let svc = CliDocService::new(
+            DocServiceCliConfig {
+                command: vec![
+                    sh.display().to_string(),
+                    crate::config::OUTDIR_PLACEHOLDER.into(),
+                    crate::config::DOC_PLACEHOLDER.into(),
+                ],
+                timeout_secs: 30,
+            },
+            resolve_extensions(&[]),
+            8,
+        );
+        let e = svc.convert(b"body", "deck.pdf").await.unwrap_err();
+        assert!(e.message.contains("max_input_bytes"), "{}", e.message);
+    }
+
+    /// A converter that swaps its output folder for a symlink to a directory
+    /// outside the sandbox is refused: nothing behind the link is read.
+    #[test]
+    fn bundle_outdir_replaced_by_a_symlink_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join(OUTDIR_MARKDOWN), b"# secret").unwrap();
+        std::fs::write(outside.path().join("secret.bin"), b"SECRET").unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let out = sandbox.path().join(".bundle");
+        std::os::unix::fs::symlink(outside.path(), &out).unwrap();
+
+        let e = read_bundle_blocking(&out, 1024).unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert!(e.message.contains("not a real directory"), "{}", e.message);
+        assert!(!e.message.contains("secret"), "{}", e.message);
+    }
+
+    /// The size cap is checked on the entry length before any byte is read: an
+    /// oversized unreadable file is refused on its size, never opened.
+    #[test]
+    fn bundle_size_cap_is_checked_before_reading() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let out = sandbox.path().join(".bundle");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join(OUTDIR_MARKDOWN), b"# doc").unwrap();
+        let big = out.join("big.bin");
+        std::fs::write(&big, vec![0u8; 64]).unwrap();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let e = read_bundle_blocking(&out, 16).unwrap_err();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(e.message.contains("max_input_bytes"), "{}", e.message);
+    }
+
     // ── api mode, in process stub server ─────────────────────────────────────
 
     /// What the stub server saw, so the request itself can be asserted.
@@ -791,6 +1135,33 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(field.to_markdown(b"x", "a.pdf").await.unwrap(), "# from the field");
+    }
+
+    /// SPEC-0019 DEC-006: an `application/json` answer is a bundle.
+    #[tokio::test]
+    async fn api_json_answer_is_a_bundle() {
+        use axum::routing::post;
+        let body = r##"{"markdown":"# b\n![x](f/a.png)\n","files":{"f/a.png":"UE5H"},"manifest":{"pictures":{"f/a.png":{"caption_failed":true}}}}"##;
+        let app = axum::Router::new().route(
+            "/convert",
+            post(move || async move { ([("content-type", "application/json")], body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let svc = api_service(DocServiceApiConfig {
+            url: format!("http://{addr}/convert"),
+            ..Default::default()
+        });
+        let c = svc.convert(b"x", "a.pdf").await.unwrap();
+        assert_eq!(c.markdown, "# b\n![x](f/a.png)\n");
+        assert_eq!(c.files.get("f/a.png").map(Vec::as_slice), Some(&b"PNG"[..]));
+        let meta = &c.manifest.unwrap().pictures["f/a.png"];
+        assert!(meta.caption_failed);
+        assert_eq!(meta.caption, "");
+        assert_eq!(meta.page, None);
     }
 
     #[tokio::test]
