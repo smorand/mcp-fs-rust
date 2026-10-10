@@ -69,6 +69,9 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("GET", "find-definition"),
     ("GET", "find-references"),
     ("GET", "audit-log"),
+    // SPEC-0019 DEC-001: document artifacts, the same functions as the tools.
+    ("GET", "tables"),
+    ("GET", "table"),
     // tool parity, write and compute side
     ("POST", "read-many"),
     ("POST", "write"),
@@ -133,6 +136,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/find-definition", get(find_definition))
         .route("/api/fs/{mount_id}/find-references", get(find_references))
         .route("/api/fs/{mount_id}/audit-log", get(audit_log))
+        .route("/api/fs/{mount_id}/tables", get(list_tables))
+        .route("/api/fs/{mount_id}/table", get(get_table))
         // tool parity, write and compute side
         .route("/api/fs/{mount_id}/read-many", post(read_many))
         .route("/api/fs/{mount_id}/write", post(write))
@@ -648,6 +653,38 @@ async fn export_zip(
         }
         let paths = a.req_str_array("paths")?;
         crate::tools::export::export_zip(&r.state, &r.mount, &paths).await
+    })
+    .await
+}
+
+/// The tables kept from a document's last conversion. Same function as
+/// `fs.list_tables`, so the refusal order and categories cannot drift apart.
+async fn list_tables(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let q = Q(q);
+    guarded_json(state, headers, mount, |r| async move {
+        let norm = r.norm(q.req_str("path")?)?;
+        crate::tools::artifacts::list_tables(&r.state, &r.mount, &norm, q.opt("marker")).await
+    })
+    .await
+}
+
+/// One kept table as Markdown or CSV. Same function as `fs.get_table`.
+async fn get_table(
+    State(state): State<Arc<AppState>>,
+    Path(mount): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let q = Q(q);
+    guarded_json(state, headers, mount, |r| async move {
+        let norm = r.norm(q.req_str("path")?)?;
+        let id = q.req_str("id")?;
+        crate::tools::artifacts::get_table(&r.state, &r.mount, &norm, id, q.opt("format")).await
     })
     .await
 }
@@ -2420,8 +2457,10 @@ mod tests {
     async fn the_route_inventory_covers_every_registered_path() {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
-        // 40 since SPEC-0015 FR-NEW-029 added extract-archive.
-        assert_eq!(REST_ROUTES.len(), 40);
+        // 42 since SPEC-0019 US-0004 added tables and table.
+        assert_eq!(REST_ROUTES.len(), 42);
+        assert!(REST_ROUTES.contains(&("GET", "tables")));
+        assert!(REST_ROUTES.contains(&("GET", "table")));
         assert!(REST_ROUTES.contains(&("POST", "export-zip")));
         assert!(REST_ROUTES.contains(&("POST", "extract-archive")));
         assert!(REST_ROUTES.contains(&("GET", "download-zip")));
@@ -2813,6 +2852,101 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
         assert_eq!(v["error"], code::PATH_OUT_OF_BOUNDS);
         assert_eq!(export_blob_count(&h), 0);
+    }
+
+    // ── tables (SPEC-0019 US-0004) ──────────────────────────────────────────────
+
+    /// A harness whose converter turns `/report.pdf` into one captioned table,
+    /// already converted through the REST door.
+    async fn converted_report() -> Harness {
+        let md = "Table 1: Sales\n\n| Region | Jan |\n| --- | --- |\n| North | 10 |\n";
+        let stub = crate::docs::service::StubDocService::ok(md);
+        let h = Harness::with_doc_service(Some(Arc::new(stub))).await;
+        h.seed("/report.pdf", "%PDF-1.4 source").await;
+        let (s, v) = h.post(&u("documentize"), json!({"path": "/report.pdf"})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        h
+    }
+
+    /// `GET tables` answers what `fs.list_tables` answers.
+    #[tokio::test]
+    async fn tables_route_lists_the_kept_tables() {
+        let h = converted_report().await;
+        let (s, v) = h.get(&u("tables?path=/report.pdf")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"tables": [{"id": "table-1", "caption": "Sales", "rows": 1, "columns": 2,
+                "csv_quality": "CSV quality: approximate"}], "marker": null})
+        );
+    }
+
+    /// `GET table` answers what `fs.get_table` answers, in both formats.
+    #[tokio::test]
+    async fn table_route_returns_markdown_and_csv() {
+        let h = converted_report().await;
+        let (s, v) = h.get(&u("table?path=/report.pdf&id=table-1")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"id": "table-1", "format": "markdown",
+                "content": "| Region | Jan |\n| --- | --- |\n| North | 10 |"})
+        );
+        let (s, v) = h.get(&u("table?path=/report.pdf&id=table-1&format=csv")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["content"], "Region,Jan\nNorth,10");
+    }
+
+    /// The US-0004 independent test: `xml` is a 400 invalid argument, checked
+    /// before the unknown id (FR-NEW-024, FR-NEW-031, FR-NEW-032).
+    #[tokio::test]
+    async fn table_route_refuses_an_unsupported_format_with_400() {
+        let h = converted_report().await;
+        let (s, v) = h.get(&u("table?path=/report.pdf&id=table-9&format=xml")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert!(
+            v["detail"].as_str().unwrap().contains("Unsupported format: xml (use markdown or csv)"),
+            "{v}"
+        );
+        assert!(v.get("content").is_none());
+    }
+
+    /// Not found refusals are 404 on both routes (FR-NEW-019, FR-NEW-028).
+    #[tokio::test]
+    async fn table_routes_answer_not_found_with_404() {
+        let h = converted_report().await;
+        let cases = [
+            (u("table?path=/report.pdf&id=table-9"), "Not found: table-9"),
+            (u("tables?path=/ghost.pdf"), "not a file: /ghost.pdf"),
+            (u("table?path=/ghost.pdf&id=table-1"), "not a file: /ghost.pdf"),
+        ];
+        for (uri, want) in cases {
+            let (s, v) = h.get(&uri).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{uri}: {v}");
+            assert_eq!(v["error"], code::NOT_FOUND);
+            assert!(v["detail"].as_str().unwrap().contains(want), "{uri}: {v}");
+        }
+    }
+
+    /// A non member is 403 on both table routes.
+    #[tokio::test]
+    async fn table_routes_refuse_a_stranger_with_403() {
+        let h = converted_report().await;
+        for uri in [u("tables?path=/report.pdf"), u("table?path=/report.pdf&id=table-1")] {
+            let (s, b) = h
+                .send(
+                    Request::builder()
+                        .uri(&uri)
+                        .header("Authorization", format!("Bearer {}", h.stranger_token))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{uri}");
+            let v: Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!(v["error"], code::FORBIDDEN);
+        }
     }
 
     // ── extract-archive (SPEC-0015 US-0011) ──────────────────────────────────

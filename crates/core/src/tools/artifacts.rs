@@ -1128,4 +1128,97 @@ mod e2e {
             assert!(err.contains(&format!("Not found: {id}")), "{id}: {err}");
         }
     }
+
+    // ── refusal order and categories (US-0004) ──────────────────────────────
+
+    async fn get_err(server: &McpServer, path: &str, id: &str, format: Option<&str>) -> String {
+        err_text(server.fs_get_table(Parameters(get_args(path, id, format))).await)
+    }
+
+    /// SPEC-0019/E2E-038: a non member gets the same refusal as for any other
+    /// operation on the project, on both table tools (FR-NEW-016).
+    #[tokio::test]
+    async fn spec_0019_e2e_038_a_non_member_gets_the_usual_refusal() {
+        let (f, _) = report().await;
+        let olga = McpServer::new(f.state.clone(), "olga@test.com".to_string());
+        let usual =
+            err_text(olga.fs_extract_text(Parameters(extract_args("/report.pdf", 200_000))).await);
+        assert!(usual.contains("ERR_FORBIDDEN"), "got: {usual}");
+        // The wrapper names the tool; the refusal after it must be identical.
+        let refusal = |e: &str| e.split_once("': ").map(|(_, r)| r.to_string()).unwrap();
+        let listed = err_text(olga.fs_list_tables(Parameters(list_args("/report.pdf"))).await);
+        assert_eq!(refusal(&listed), refusal(&usual));
+        for format in ["markdown", "csv"] {
+            let got = get_err(&olga, "/report.pdf", "table-1", Some(format)).await;
+            assert_eq!(refusal(&got), refusal(&usual));
+        }
+    }
+
+    /// SPEC-0019/E2E-042: a never converted document has no artifacts, on both
+    /// table tools (FR-NEW-023).
+    #[tokio::test]
+    async fn spec_0019_e2e_042_a_never_converted_document_has_no_artifacts() {
+        let (_f, server) = converting("/notes.pdf", REPORT_MD, None).await;
+        let listed = err_text(server.fs_list_tables(Parameters(list_args("/notes.pdf"))).await);
+        let got = get_err(&server, "/notes.pdf", "table-1", Some("csv")).await;
+        for err in [listed, got] {
+            assert!(
+                err.contains("ERR_NOT_FOUND")
+                    && err.contains("No artifacts: document not extracted"),
+                "got: {err}"
+            );
+        }
+    }
+
+    /// SPEC-0019/E2E-105: a path holding no file is `not a file` (FR-NEW-028).
+    #[tokio::test]
+    async fn spec_0019_e2e_105_a_missing_document_is_not_a_file() {
+        let (_f, server) = setup(None).await;
+        let err = err_text(server.fs_list_tables(Parameters(list_args("/ghost.pdf"))).await);
+        assert!(err.contains("ERR_NOT_FOUND") && err.contains("not a file: /ghost.pdf"), "{err}");
+    }
+
+    fn assert_unsupported_xml(err: &str) {
+        assert!(
+            err.contains("ERR_INVALID_ARGUMENT")
+                && err.contains("Unsupported format: xml (use markdown or csv)"),
+            "got: {err}"
+        );
+    }
+
+    /// SPEC-0019/E2E-117: the format is checked before the set (FR-NEW-031).
+    #[tokio::test]
+    async fn spec_0019_e2e_117_format_before_no_artifacts() {
+        let (_f, server) = converting("/notes.pdf", REPORT_MD, None).await;
+        assert_unsupported_xml(&get_err(&server, "/notes.pdf", "table-9", Some("xml")).await);
+    }
+
+    /// SPEC-0019/E2E-118: the format is checked before the id (FR-NEW-031).
+    #[tokio::test]
+    async fn spec_0019_e2e_118_format_before_unknown_id() {
+        let (_f, server) = report().await;
+        assert_unsupported_xml(&get_err(&server, "/report.pdf", "table-9", Some("xml")).await);
+    }
+
+    /// SPEC-0019/E2E-121: an unsupported format is an invalid argument, not a
+    /// not found refusal (FR-NEW-032).
+    #[tokio::test]
+    async fn spec_0019_e2e_121_unsupported_format_is_an_invalid_argument() {
+        let (_f, server) = report().await;
+        let err = get_err(&server, "/report.pdf", "table-1", Some("xml")).await;
+        assert_unsupported_xml(&err);
+        assert!(!err.contains("ERR_NOT_FOUND"), "got: {err}");
+    }
+
+    /// SPEC-0019/E2E-142: an escaped pipe and Markdown emphasis survive as cell
+    /// text; padding is trimmed (FR-NEW-002).
+    #[tokio::test]
+    async fn spec_0019_e2e_142_escaped_pipe_and_emphasis_in_both_formats() {
+        let md = "| k | v |\n| --- | --- |\n|  a\\|b  | **x** |\n";
+        let (_f, server) = converting("/esc.pdf", md, None).await;
+        convert(&server, "/esc.pdf").await;
+        assert_eq!(content(&server, "/esc.pdf", "table-1", Some("csv")).await, "k,v\na|b,**x**");
+        let markdown = content(&server, "/esc.pdf", "table-1", Some("markdown")).await;
+        assert_eq!(markdown.lines().last(), Some("| a\\|b | **x** |"));
+    }
 }

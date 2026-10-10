@@ -1019,6 +1019,42 @@ const OPERATIONS: &[Op] = &[
         params: NO_PARAMS,
         body: "ExportZipBody",
     },
+    // SPEC-0019 DEC-001: the table routes call the same functions as the tools.
+    Op {
+        method: "GET",
+        sub: "tables",
+        path: "/api/fs/{mount_id}/tables",
+        tool: "fs.list_tables",
+        params: &[
+            Param { name: "path", required: true, ty: "string", format: "", default: Def::Absent },
+            Param {
+                name: "marker",
+                required: false,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+        ],
+        body: "",
+    },
+    Op {
+        method: "GET",
+        sub: "table",
+        path: "/api/fs/{mount_id}/table",
+        tool: "fs.get_table",
+        params: &[
+            Param { name: "path", required: true, ty: "string", format: "", default: Def::Absent },
+            Param { name: "id", required: true, ty: "string", format: "", default: Def::Absent },
+            Param {
+                name: "format",
+                required: false,
+                ty: "string",
+                format: "",
+                default: Def::Str("markdown"),
+            },
+        ],
+        body: "",
+    },
     // SPEC-0015 FR-NEW-029: extract-archive mirrors export-zip exactly.
     Op {
         method: "POST",
