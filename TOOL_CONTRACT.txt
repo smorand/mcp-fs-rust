@@ -143,6 +143,11 @@ fs.find_references
   params: mount_id:string, name:string, root:string="/"
   required: ['mount_id', 'name']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.get_image
+  desc: Get one image kept from a document's last conversion: its picture as base64, its format and its caption.
+  params: mount_id:string, path:string, id:string
+  required: ['mount_id', 'path', 'id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.get_table
   desc: Get one table kept from a document's last conversion, as Markdown or CSV.
   params: mount_id:string, path:string, id:string, format:string=null
@@ -182,6 +187,11 @@ fs.list_dir
   desc: Flat directory listing with kinds and optional sizes.
   params: mount_id:string, path:string="/", include_hidden:boolean=false, sort_by:string="name", with_sizes:boolean=false
   required: ['mount_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.list_images
+  desc: List the images kept from a document's last conversion, in reading order, 100 per page.
+  params: mount_id:string, path:string, marker:string=null
+  required: ['mount_id', 'path']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.list_tables
   desc: List the tables kept from a document's last conversion, in reading order, 100 per page.
@@ -611,6 +621,8 @@ fs.hash: {"path": "/a.txt", "algo": "sha256", "hash": "4a1e67f2fe1d1cc7b31d0ca2e
 fs.exists: {"exists": true, "kind": "file"}
 fs.export_zip: {"url": "/exports/0b7e2f4c-1a3d-4e5f-8a9b-0c1d2e3f4a5b"}
 fs.extract_archive: {"destination": "/uploads/report", "files_written": 2, "dirs_created": 1, "bytes_written": 10}
+fs.list_images: {"images": [{"id": "image-1", "caption": "Figure 1: Revenue 2024", "page": 1}, {"id": "image-2", "caption": "Schéma réseau 🌐", "page": 3}], "marker": null}
+fs.get_image: {"id": "image-2", "format": "png", "caption": "Schéma réseau 🌐", "page": 3, "base64": "iVBORw0KGgo..."}
 fs.list_tables: {"tables": [{"id": "table-1", "caption": "Q1", "rows": 2, "columns": 2, "csv_quality": "CSV quality: exact"}], "marker": null}
 fs.get_table: {"id": "table-2", "format": "csv", "content": "Item,EUR\nRent,900\nPower,120"}
 fs.stat: {"path": "/empty.txt", "size": 0, "mode": "0o644", "kind": "file", "mtime": "<volatile>", "ctime": "<volatile>", "atime": "<volatile>", "uid": 1000, "gid": 1000}

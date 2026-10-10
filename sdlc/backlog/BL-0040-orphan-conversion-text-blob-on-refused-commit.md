@@ -7,7 +7,7 @@ Created: 2026-10-10
 ---
 
 ## What
-`crates/core/src/docs/artifacts/mod.rs:177` writes the conversion text blob before
+`crates/core/src/docs/artifacts/mod.rs:177` (now `capture.rs`) writes the conversion text blob, and since US-0005 every picture blob, before
 `commit_artifact_set`; when the commit refuses (rev changed, database error) the blob has no
 `blob_refs` row, so no sweep ever collects it.
 

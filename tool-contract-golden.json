@@ -867,6 +867,37 @@
       }
     },
     {
+      "name": "fs.get_image",
+      "description": "Get one image kept from a document's last conversion: its picture as base64, its format and its caption.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path of the source document.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Image id from fs.list_images, e.g. image-1.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "path",
+          "id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "fs.get_table",
       "description": "Get one table kept from a document's last conversion, as Markdown or CSV.",
       "inputSchema": {
@@ -1156,6 +1187,37 @@
         },
         "required": [
           "mount_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "fs.list_images",
+      "description": "List the images kept from a document's last conversion, in reading order, 100 per page.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute POSIX path of the source document.",
+            "type": "string"
+          },
+          "marker": {
+            "description": "Continuation marker returned by the previous page; omit for the first page.",
+            "type": "string",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id",
+          "path"
         ]
       },
       "annotations": {

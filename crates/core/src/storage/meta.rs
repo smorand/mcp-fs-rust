@@ -98,6 +98,21 @@ const DOC_TABLE_COLS: [&str; 10] = [
     "line_count",
 ];
 
+/// Every column of `doc_images`, in the order the insert binds them.
+const DOC_IMAGE_COLS: [&str; 11] = [
+    "volume_id",
+    "set_id",
+    "seq",
+    "caption",
+    "page",
+    "format",
+    "sha256",
+    "size",
+    "line_start",
+    "line_count",
+    "caption_line",
+];
+
 /// A fresh node revision: a node insert, path change or byte write calls this.
 fn new_rev() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -313,6 +328,37 @@ pub(crate) struct NewDocTable {
     pub line_count: i64,
 }
 
+/// One image of an artifact set about to be committed; its picture blob is
+/// already stored under `sha256` (SPEC-0019 DEC-004).
+pub(crate) struct NewDocImage {
+    /// The n of `image-n`.
+    pub seq: i64,
+    pub caption: String,
+    /// `None` when the document has no pages (FR-NEW-001).
+    pub page: Option<i64>,
+    pub format: String,
+    pub sha256: String,
+    pub size: i64,
+    /// 0 based line of the picture reference in the conversion text.
+    pub line_start: i64,
+    pub line_count: i64,
+}
+
+/// A listed image: what `fs.list_images` reports.
+pub(crate) struct DocImageRow {
+    pub seq: i64,
+    pub caption: String,
+    pub page: Option<i64>,
+}
+
+/// A stored image: its listed fields plus where its picture lives.
+pub(crate) struct DocImage {
+    pub caption: String,
+    pub page: Option<i64>,
+    pub format: String,
+    pub sha256: String,
+}
+
 /// A conversion's whole artifact set, committed at once.
 pub(crate) struct NewArtifactSet {
     pub set_id: String,
@@ -321,6 +367,7 @@ pub(crate) struct NewArtifactSet {
     pub text_sha: Option<String>,
     pub text_len: i64,
     pub report: String,
+    pub images: Vec<NewDocImage>,
     pub tables: Vec<NewDocTable>,
 }
 
@@ -562,7 +609,9 @@ impl RelationalMetaStore {
     /// transaction that first checks the node still carries `set.node_rev`
     /// (SPEC-0019 DEC-008). The set it replaces is marked superseded, never
     /// deleted here, so a reader that already resolved it keeps reading whole
-    /// rows. The conversion text blob gains its reference here (DEC-004).
+    /// rows. The conversion text blob and every picture blob gain their
+    /// reference here, one per image row (DEC-004), so a set deletion drops
+    /// exactly what this commit added.
     pub(crate) async fn commit_artifact_set(&self, set: &NewArtifactSet) -> Result<()> {
         let dialect = self.db.dialect();
         let volume = self.volume_id.as_str();
@@ -621,6 +670,28 @@ impl RelationalMetaStore {
                     .bind(t.line_count),
             )
             .await?;
+        }
+        let insert_image = format!(
+            "INSERT INTO doc_images ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            DOC_IMAGE_COLS.join(", ")
+        );
+        for i in &set.images {
+            tx.execute(
+                &Query::new(insert_image.clone())
+                    .bind(volume)
+                    .bind(&set.set_id)
+                    .bind(i.seq)
+                    .bind(&i.caption)
+                    .bind(i.page)
+                    .bind(&i.format)
+                    .bind(&i.sha256)
+                    .bind(i.size)
+                    .bind(i.line_start)
+                    .bind(i.line_count)
+                    .bind(None::<i64>),
+            )
+            .await?;
+            tx_incref(&mut *tx, dialect, volume, Some(&i.sha256), i.size).await?;
         }
         tx_incref(&mut *tx, dialect, volume, set.text_sha.as_deref(), set.text_len).await?;
         let pointer = dialect.render_upsert(&Upsert::replace(
@@ -689,6 +760,56 @@ impl RelationalMetaStore {
                 })
             })
             .collect()
+    }
+
+    /// One page of a set's images, in reading order.
+    pub(crate) async fn list_artifact_images(
+        &self,
+        set_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DocImageRow>> {
+        let page = self.db.dialect().render_limit_offset(limit, offset);
+        let rows = self
+            .db
+            .query(
+                &Query::new(format!(
+                    "SELECT seq, caption, page FROM doc_images \
+                     WHERE volume_id=?1 AND set_id=?2 ORDER BY seq {page}"
+                ))
+                .bind(&self.volume_id)
+                .bind(set_id),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| Ok(DocImageRow { seq: r.i64(0)?, caption: r.text(1)?, page: r.opt_i64(2)? }))
+            .collect()
+    }
+
+    /// Image `seq` of a set, `None` when the set has no such image (a gap or
+    /// past the end).
+    pub(crate) async fn artifact_image(&self, set_id: &str, seq: i64) -> Result<Option<DocImage>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT caption, page, format, sha256 FROM doc_images \
+                     WHERE volume_id=?1 AND set_id=?2 AND seq=?3",
+                )
+                .bind(&self.volume_id)
+                .bind(set_id)
+                .bind(seq),
+            )
+            .await?;
+        row.map(|r| {
+            Ok(DocImage {
+                caption: r.text(0)?,
+                page: r.opt_i64(1)?,
+                format: r.text(2)?,
+                sha256: r.text(3)?,
+            })
+        })
+        .transpose()
     }
 
     /// The JSON cells of table `seq` in a set, `None` when the set has no such
@@ -1589,6 +1710,20 @@ impl RelationalMetaStore {
         let rows = list_trash_entries(&mut *tx, &self.volume_id, "", i64::MAX, 0).await?;
         tx.commit().await?;
         Ok(rows.len())
+    }
+
+    /// The `blob_refs` count of `sha` in this volume, `None` when it has no
+    /// row, for the SPEC-0019 DEC-004 conformance case.
+    pub(crate) async fn blob_refcount_for_test(&self, sha: &str) -> Result<Option<i64>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT refcount FROM blob_refs WHERE volume_id=?1 AND sha256=?2")
+                    .bind(&self.volume_id)
+                    .bind(sha),
+            )
+            .await?;
+        row.map(|r| r.i64(0)).transpose()
     }
 
     /// Remove one `trash_entries` row directly, for a `fs_ops.rs` test

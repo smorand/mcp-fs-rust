@@ -1,4 +1,4 @@
-# Tool reference (104 tools)
+# Tool reference (106 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -169,6 +169,8 @@ untouched on failure). The password is never logged. REST twin: `POST
 
 | Tool | Purpose | Params | Returns | Annotations | Who |
 |---|---|---|---|---|---|
+| `fs.list_images` | images kept by a document's last conversion, `page` null outside PDF/PowerPoint | `path`, `marker?` | `images[{id,caption,page}],marker` | RO,I,!OW | member |
+| `fs.get_image` | one kept image, picture byte identical as base64, format `png`/`jpeg`/`gif`/`webp`/`tiff`/`bmp` | `path`, `id` | `id,format,caption,page,base64` | RO,I,!OW | member |
 | `fs.list_tables` | tables kept by a document's last conversion | `path`, `marker?` | `tables[{id,caption,rows,columns,csv_quality}],marker` | RO,I,!OW | member |
 | `fs.get_table` | one kept table, `markdown` (default) or `csv`, FR-NEW-002 bytes | `path`, `id`, `format?` | `id,format,content` | RO,I,!OW | member |
 

@@ -1082,6 +1082,27 @@ pub struct TrashListArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetImageArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path of the source document.
+    pub path: String,
+    /// Image id from fs.list_images, e.g. image-1.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListImagesArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Absolute POSIX path of the source document.
+    pub path: String,
+    /// Continuation marker returned by the previous page; omit for the first page.
+    #[serde(default)]
+    pub marker: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetTableArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2178,6 +2199,48 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.extract_text", out)
+    }
+
+    #[tool(
+        name = "fs.list_images",
+        description = "List the images kept from a document's last conversion, in reading order, 100 per page."
+    )]
+    #[tracing::instrument(skip(self, a), fields(mcp.tool = "fs.list_images"))]
+    pub(crate) async fn fs_list_images(
+        &self,
+        Parameters(a): Parameters<ListImagesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            let path = self.norm(&a.path)?;
+            crate::tools::artifacts::list_images(
+                &self.state,
+                &a.mount_id,
+                &path,
+                a.marker.as_deref(),
+            )
+            .await
+        }
+        .await;
+        to_call_result("fs.list_images", out)
+    }
+
+    #[tool(
+        name = "fs.get_image",
+        description = "Get one image kept from a document's last conversion: its picture as base64, its format and its caption."
+    )]
+    #[tracing::instrument(skip(self, a), fields(mcp.tool = "fs.get_image"))]
+    pub(crate) async fn fs_get_image(
+        &self,
+        Parameters(a): Parameters<GetImageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = async {
+            self.authorize_only(&a.mount_id).await?;
+            let path = self.norm(&a.path)?;
+            crate::tools::artifacts::get_image(&self.state, &a.mount_id, &path, &a.id).await
+        }
+        .await;
+        to_call_result("fs.get_image", out)
     }
 
     #[tool(
@@ -3639,8 +3702,9 @@ mod tests {
             .filter(|n| n.starts_with("fs."))
             .collect();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37; SPEC-0015 adds
-        // fs.extract_archive, 38 to 39; SPEC-0019 adds fs.list_tables, 39 to 40, then fs.get_table, 41.
-        assert_eq!(names.len(), 41, "got: {names:?}");
+        // fs.extract_archive, 38 to 39; SPEC-0019 adds fs.list_tables, 39 to 40, then fs.get_table, 41,
+        // then fs.list_images and fs.get_image, 43.
+        assert_eq!(names.len(), 43, "got: {names:?}");
     }
 
     #[test]
@@ -3655,12 +3719,13 @@ mod tests {
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping fs_count 36->37 and
         // the total 103->104.
         // SPEC-0015 adds fs.extract_archive: fs 39, total 106.
-        // SPEC-0019 adds fs.list_tables: fs 40, total 107; fs.get_table: fs 41, total 108.
-        assert_eq!(fs_count, 41, "got: {names:?}");
+        // SPEC-0019 adds fs.list_tables: fs 40, total 107; fs.get_table: fs 41, total 108;
+        // fs.list_images and fs.get_image: fs 43, total 110.
+        assert_eq!(fs_count, 43, "got: {names:?}");
         assert_eq!(admin_count, 14, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 108, "got: {names:?}");
+        assert_eq!(names.len(), 110, "got: {names:?}");
     }
 
     #[test]
@@ -3992,7 +4057,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 104, "the frozen contract covers 104 non-search tools");
+        assert_eq!(checked, 106, "the frozen contract covers 106 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4013,8 +4078,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 104, "got: {names:?}");
-        assert_eq!(expected.len(), 104, "the golden contract itself must hold 104 names");
+        assert_eq!(names.len(), 106, "got: {names:?}");
+        assert_eq!(expected.len(), 106, "the golden contract itself must hold 106 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(
