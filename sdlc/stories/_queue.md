@@ -14,3 +14,9 @@
 | US-0012 | SPEC-0019 | changed documents lose their artifacts | US-0011 | 1 | landed | story/US-0012-changed-documents-lose-their-artifacts | story/US-0011-refused-and-overtaken-re-conversions |
 | US-0013 | SPEC-0019 | artifacts are not files, stale sets swept | US-0012 | 2 | landed | story/US-0013-artifacts-are-not-files-stale-sets-swept | story/US-0012-changed-documents-lose-their-artifacts |
 | US-0014 | SPEC-0019 | consumer parity, marker scope and docs | US-0013 | 1 | landed | story/US-0014-consumer-parity-marker-scope-and-docs | story/US-0013-artifacts-are-not-files-stale-sets-swept |
+| US-0015 | SPEC-0020 | project usage and quota read | main | 1 | todo | | |
+| US-0016 | SPEC-0020 | single file writes refused over the limit | US-0015 | 1 | todo | | |
+| US-0017 | SPEC-0020 | conversion markdown under the limit | US-0016 | 2 | todo | | |
+| US-0018 | SPEC-0020 | archive and folder copy all or nothing | US-0017 | 2 | todo | | |
+| US-0019 | SPEC-0020 | version control operations under the limit | US-0018 | 1 | todo | | |
+| US-0020 | SPEC-0020 | lowered limit, exempt operations, concurrency | US-0019 | 1 | todo | | |

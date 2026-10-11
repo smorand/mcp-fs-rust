@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: L
 > Depth evidence: FEAT / depth L: 6 areas touched (file writes, archive extraction, conversion, version control, trash, project administration), a new observable refusal contract, 15 requirements.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-11
 > Project: existing
 > From backlog: BL-0039
