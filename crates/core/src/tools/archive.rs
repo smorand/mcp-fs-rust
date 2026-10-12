@@ -12,6 +12,7 @@
 //! the real result shape land in later stories (US-0006 onward).
 
 use crate::errors::{Result, ToolError};
+use crate::quota;
 use crate::state::AppState;
 use crate::util::PosixPath;
 use serde_json::{Value, json};
@@ -180,12 +181,27 @@ pub(crate) async fn extract_archive(
         }
     }
 
-    // FR-NEW-019: one charge for the archive's total declared uncompressed
-    // size, after the conflict check, before any write (DEC-005). A failed
-    // charge is `charge_write`'s own fail-closed behavior: nothing mutated.
-    let total_declared: i64 =
-        entries.iter().filter(|e| !e.is_dir).map(|e| e.declared_size as i64).sum();
-    state.safety.charge_write(person, mount_id, total_declared)?;
+    // FR-NEW-019 / SPEC-0020 FR-NEW-007: one admission for the archive's
+    // total net change, after the conflict check, before any write
+    // (DEC-005, DEC-002). The project limit is checked against every
+    // entry's destination at once; the session charge keeps the declared
+    // total, unchanged from before SPEC-0020. A failed admission is
+    // `admit_paths`'s own fail-closed behavior: nothing mutated.
+    let entry_targets: Vec<(String, i64)> = entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| (join_entry_destination(&dest, &e.rel_path), e.declared_size as i64))
+        .collect();
+    let total_declared: i64 = entry_targets.iter().map(|(_, s)| *s).sum();
+    let _admission = quota::admit_paths(
+        &client,
+        &state.safety,
+        person,
+        mount_id,
+        total_declared,
+        &entry_targets,
+    )
+    .await?;
 
     // FR-NEW-021: directories first (destination root, then every directory
     // entry, both in archive order), then files, each via `VolumeClient`

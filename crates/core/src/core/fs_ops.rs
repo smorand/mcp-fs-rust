@@ -1300,7 +1300,9 @@ pub async fn move_path(
 }
 
 /// Copy a file or, with `recursive`, a whole tree. Keys: `source`, `destination`.
-/// Only the single-file path charges the write quota, as in the C# original.
+/// A folder copy charges nothing to the session budget, as in the C#
+/// original (FR-NEW-006); both branches still check the project limit once
+/// for their total net change before writing anything (FR-NEW-007).
 pub async fn copy_path(
     client: &VolumeClient,
     safety: &SafetyManager,
@@ -1323,6 +1325,17 @@ pub async fn copy_path(
                 "'{src}' is a directory (pass recursive=true)"
             )));
         }
+        let nodes = client.meta.subtree(src).await?;
+        let targets: Vec<(String, i64)> = nodes
+            .iter()
+            .filter(|n| !n.is_dir())
+            .map(|n| {
+                let rel = &n.path[src.len()..];
+                let target = if rel.is_empty() { dst.to_string() } else { format!("{dst}{rel}") };
+                (target, n.size)
+            })
+            .collect();
+        let _admission = quota::admit_paths(client, safety, person, mount_id, 0, &targets).await?;
         client.copy_tree(src, dst).await?;
         client.touch_atime_mtime(dst);
     } else {

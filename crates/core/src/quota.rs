@@ -111,6 +111,50 @@ async fn check_and_charge(
     safety.charge_write(person, mount_id, session_bytes)
 }
 
+/// [`admit`] for a multi file operation (SPEC-0020 FR-NEW-007): the net
+/// change is the sum, over every `(path, new_size)` pair, of `new_size` minus
+/// whatever file currently sits at `path` (0 if none), each previous size
+/// read under the lock so a concurrent writer cannot change it between the
+/// read and the check (DEC-003). The project limit is checked once for the
+/// total, before any of the operation's writes (DEC-002). Used by a folder
+/// copy (`session_bytes` 0: a folder copy charges nothing to the session
+/// today, FR-NEW-006) and by archive extraction (`session_bytes` the
+/// already unchanged total declared size).
+///
+/// `paths` may list the same destination more than once (a tar archive
+/// allows duplicate entries; the extraction loop writes them in order, so
+/// only the LAST occurrence's size is what lands on disk). Only that last
+/// occurrence is counted: walking in reverse and skipping a path already
+/// seen keeps the last one written per path before summing, so a duplicate
+/// never double-charges the project limit.
+///
+/// Time: O(n) over `paths`, one `meta.get` per distinct path.
+pub(crate) async fn admit_paths(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    session_bytes: i64,
+    paths: &[(String, i64)],
+) -> Result<Admission> {
+    let guard = client.admission.clone().lock_owned().await;
+
+    let mut seen = std::collections::HashSet::with_capacity(paths.len());
+    let mut delta = 0i64;
+    for (path, new_size) in paths.iter().rev() {
+        if !seen.insert(path.as_str()) {
+            continue;
+        }
+        let previous = match client.meta.get(path).await? {
+            Some(node) if node.is_file() => node.size,
+            _ => 0,
+        };
+        delta += new_size - previous;
+    }
+    check_and_charge(client, safety, person, mount_id, session_bytes, delta).await?;
+    Ok(Admission { _guard: guard })
+}
+
 /// The bytes `client`'s project uses right now: every file's declared size,
 /// trashed files included (FR-NEW-002). A volume whose counter row is missing
 /// is backfilled from its nodes, under the lock.

@@ -9,9 +9,9 @@ use crate::docs::DocService;
 use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
 use crate::mcp::server::{
     AppendArgs, ApplyPatchArgs, CopyArgs, DeleteArgs, DocumentizeArgs, EditArgs, ExportZipArgs,
-    ExtractTextArgs, GetProjectQuotaArgs, GitCommitArgs, ListImagesArgs, ListTablesArgs, McpServer,
-    MountOnlyArgs, MultiEditArgs, ReadArgs, SetProjectQuotaArgs, WriteArgs, WriteBytesArgs,
-    WriteDocxArgs,
+    ExtractArchiveArgs, ExtractTextArgs, GetProjectQuotaArgs, GitCommitArgs, ListImagesArgs,
+    ListTablesArgs, McpServer, MountOnlyArgs, MultiEditArgs, ReadArgs, SetProjectQuotaArgs,
+    WriteArgs, WriteBytesArgs, WriteDocxArgs,
 };
 use crate::state::AppState;
 use crate::tools::admin::test_support::Fixture;
@@ -1131,4 +1131,223 @@ async fn spec_0020_extract_text_sibling_over_the_limit_is_refused() {
         "table listing unchanged by the refusal"
     );
     assert_eq!(w.used().await, used_before, "usage unchanged except for the source rewrite");
+}
+
+// ── US-0018: archive and folder copy all or nothing ──────────────────────────
+
+impl World {
+    /// Setup write of raw bytes, straight into the volume (no session budget
+    /// spent, mirrors [`Self::seed`]).
+    async fn put(&self, path: &str, bytes: &[u8]) {
+        let client = self.f.state.stores.client(ATLAS).await.unwrap();
+        client.write_bytes_atomic(path, bytes).await.unwrap();
+    }
+
+    async fn exists(&self, path: &str) -> bool {
+        let client = self.f.state.stores.client(ATLAS).await.unwrap();
+        client.exists(path).await.unwrap()
+    }
+
+    async fn extract(&self, person: &str, path: &str) -> RawResult {
+        let args = ExtractArchiveArgs {
+            mount_id: ATLAS.into(),
+            path: path.into(),
+            destination: None,
+            overwrite: false,
+            password: None,
+        };
+        self.as_(person).fs_extract_archive(Parameters(args)).await
+    }
+
+    async fn copy(
+        &self,
+        person: &str,
+        source: &str,
+        destination: &str,
+        recursive: bool,
+    ) -> RawResult {
+        let args = CopyArgs {
+            mount_id: ATLAS.into(),
+            source: source.into(),
+            destination: destination.into(),
+            overwrite: false,
+            recursive,
+        };
+        self.as_(person).fs_copy(Parameters(args)).await
+    }
+}
+
+/// A zip with every entry stored uncompressed, so its total declared size is
+/// exactly the sum of `entries`' content lengths.
+fn build_zip_entries(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in entries {
+            writer.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut writer, content).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+/// Atlas at its 1 MB limit, usage exactly 1 000 000 bytes, `/pack.zip`
+/// (whose bytes are part of that 1 000 000) holding `entries`.
+async fn archive_world(entries: &[(&str, Vec<u8>)]) -> (World, Vec<u8>) {
+    let zip = build_zip_entries(entries);
+    let w = World::new(false).await;
+    w.limit(Some(MB)).await;
+    w.seed("/seed.bin", 1_000_000 - zip.len()).await;
+    w.put("/pack.zip", &zip).await;
+    assert_eq!(w.used().await, 1_000_000);
+    (w, zip)
+}
+
+/// Atlas at its 1 MB limit, usage exactly 1 000 000 bytes, `/src` holding
+/// `file_sizes.len()` files totalling `file_sizes`' sum (part of that
+/// 1 000 000).
+async fn folder_world(file_sizes: &[usize]) -> World {
+    let total: usize = file_sizes.iter().sum();
+    let w = World::new(false).await;
+    w.limit(Some(MB)).await;
+    w.seed("/seed.bin", 1_000_000 - total).await;
+    for (i, size) in file_sizes.iter().enumerate() {
+        w.seed(&format!("/src/f{i}.bin"), *size).await;
+    }
+    assert_eq!(w.used().await, 1_000_000);
+    w
+}
+
+/// SPEC-0020/E2E-027: an extraction whose entries fit under the limit is
+/// accepted and counted once, by their net total (FR-NEW-007, FR-NEW-003).
+#[tokio::test]
+async fn spec_0020_e2e_027_an_extraction_that_fits_is_accepted_and_counted() {
+    let (w, _zip) =
+        archive_world(&[("x", noise(10_000, 1)), ("y", noise(10_000, 2)), ("z", noise(20_000, 3))])
+            .await;
+
+    let out = ok_json(w.extract(MIA, "/pack.zip").await);
+    assert_eq!(out["destination"], json!("/pack"), "got: {out}");
+    assert_eq!(w.content("/pack/x").await.map(|b| b.len()), Some(10_000));
+    assert_eq!(w.content("/pack/y").await.map(|b| b.len()), Some(10_000));
+    assert_eq!(w.content("/pack/z").await.map(|b| b.len()), Some(20_000));
+    assert_eq!(w.used().await, 1_040_000);
+}
+
+/// SPEC-0020/E2E-028: an extraction whose entries total over the limit is
+/// refused as one operation, writing none of its files (FR-NEW-007,
+/// FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_e2e_028_an_extraction_over_the_limit_writes_nothing() {
+    let (w, _zip) =
+        archive_world(&[("x", noise(20_000, 1)), ("y", noise(20_000, 2)), ("z", noise(10_000, 3))])
+            .await;
+
+    let err = err_text(w.extract(MIA, "/pack.zip").await);
+    assert!(err.ends_with(&refusal(1_000_000, 50_000)), "got: {err}");
+    assert!(!w.exists("/pack").await, "the archive's folder was not created");
+    assert!(!w.exists("/pack/x").await, "no node at the refused path");
+    assert!(!w.exists("/pack/y").await, "no node at the refused path");
+    assert!(!w.exists("/pack/z").await, "no node at the refused path");
+    assert_eq!(w.used().await, 1_000_000);
+
+    // SPEC-0020/E2E-062: the refusal charged nothing to the session budget
+    // (FR-NEW-007, FR-NEW-006); once the project limit is lifted, the full
+    // session budget is still available, exactly as before the refusal.
+    w.remove_limit().await;
+    w.write(MIA, "/full.bin", SESSION_BUDGET as usize).await;
+    let err = err_text(w.try_write(MIA, "/one.bin", 1).await);
+    assert!(err.ends_with(SESSION_REFUSAL), "got: {err}");
+}
+
+/// SPEC-0020/E2E-029: an extraction whose entries total exactly the
+/// remaining headroom is accepted (FR-NEW-007, FR-NEW-005).
+#[tokio::test]
+async fn spec_0020_e2e_029_an_extraction_to_exactly_the_limit_is_accepted() {
+    let (w, _zip) =
+        archive_world(&[("x", noise(20_000, 1)), ("y", noise(20_000, 2)), ("z", noise(8_576, 3))])
+            .await;
+
+    ok_json(w.extract(MIA, "/pack.zip").await);
+    assert_eq!(w.used().await, MB);
+}
+
+/// SPEC-0020/E2E-030: a recursive folder copy whose total over the limit is
+/// refused as one operation, leaving the destination absent (FR-NEW-007,
+/// FR-NEW-003).
+#[tokio::test]
+async fn spec_0020_e2e_030_a_folder_copy_over_the_limit_writes_nothing() {
+    let w = folder_world(&[20_000, 20_000, 20_000]).await;
+
+    let err = err_text(w.copy(MIA, "/src", "/dst", true).await);
+    assert!(err.ends_with(&refusal(1_000_000, 60_000)), "got: {err}");
+    assert!(!w.exists("/dst").await, "the destination was not created");
+    assert_eq!(w.used().await, 1_000_000);
+}
+
+/// A tar archive (uncompressed) with `entries` written in order; a path may
+/// appear more than once, exactly as `admit_paths`' caller (`extract_archive`)
+/// writes it: in archive order, so the LAST occurrence is what ends up on
+/// disk (FR-NEW-007).
+fn build_tar_entries(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut buf);
+        for (name, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder.append(&header, content.as_slice()).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    buf
+}
+
+/// Atlas at its 1 MB limit, usage exactly 1 000 000 bytes (so 48 576 bytes
+/// of headroom), `/pack.tar` (whose bytes are part of that 1 000 000)
+/// holding `entries`.
+async fn tar_world(entries: &[(&str, Vec<u8>)]) -> (World, Vec<u8>) {
+    let tar = build_tar_entries(entries);
+    let w = World::new(false).await;
+    w.limit(Some(MB)).await;
+    w.seed("/seed.bin", 1_000_000 - tar.len()).await;
+    w.put("/pack.tar", &tar).await;
+    assert_eq!(w.used().await, 1_000_000);
+    (w, tar)
+}
+
+/// SPEC-0020/E2E-063: a tar archive listing the same destination path twice
+/// (tar permits duplicate entries; the last one written wins, FR-NEW-007) is
+/// admitted by its NET change, the last occurrence's size minus whatever sat
+/// there before, not the sum of every occurrence. Atlas has exactly 48 576
+/// bytes of headroom; the archive's two occurrences of `/pack/x` sum to
+/// 50 000 bytes (over headroom) but net to 20 000 (under it, last write
+/// wins), so the extraction is accepted and usage grows by 20 000 only.
+#[tokio::test]
+async fn spec_0020_us_0018_duplicate_tar_path_netted_not_summed() {
+    let (w, _tar) = tar_world(&[("x", noise(30_000, 1)), ("x", noise(20_000, 2))]).await;
+
+    ok_json(w.extract(MIA, "/pack.tar").await);
+    assert_eq!(w.content("/pack/x").await.map(|b| b.len()), Some(20_000));
+    assert_eq!(w.used().await, 1_020_000);
+}
+
+/// SPEC-0020/E2E-064: the same duplicate-path tar, but the LAST occurrence
+/// alone already exceeds the 48 576 bytes of headroom. The refusal reports
+/// the netted requested bytes (50 000), never the summed total of every
+/// occurrence (60 000).
+#[tokio::test]
+async fn spec_0020_us_0018_duplicate_tar_path_refused_with_netted_total() {
+    let (w, _tar) = tar_world(&[("x", noise(10_000, 1)), ("x", noise(50_000, 2))]).await;
+
+    let err = err_text(w.extract(MIA, "/pack.tar").await);
+    assert!(err.ends_with(&refusal(1_000_000, 50_000)), "got: {err}");
+    assert!(!w.exists("/pack").await, "the archive's folder was not created");
+    assert!(!w.exists("/pack/x").await, "no node at the refused path");
+    assert_eq!(w.used().await, 1_000_000);
 }
