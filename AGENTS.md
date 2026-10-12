@@ -86,6 +86,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (`web`/`context7`/`sqlite`/`db`/`doc`) production `catalog()` read by `/api/swagger.json`.
 - `config.rs` : full `ServerConfig` + `${VAR}` expansion + `Dsn` (redacts in Debug and
   Display) + boot validation of every `infra.*` store.
+- `quota.rs` : project storage quota (SPEC-0020): `admit`/`admit_file`/`admit_paths`/
+  `admit_sibling` take the volume's admission lock, check the `volume_usage` counter against
+  the limit, then charge the session; `used_bytes` backs `admin.get_project_quota`.
 - `errors.rs` : the 16 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
   flag for transient database failures (no new code).
 - `migrate.rs` : the `migrate` verb, offline row for row copy between backends.
@@ -216,8 +219,8 @@ keyed text has a length ceiling there).
 The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
 
 ## Documentation index
-- `.agent_docs/architecture.md` : storage model, document artifact store, request lifecycle,
-  safety, error logging.
+- `.agent_docs/architecture.md` : storage model, project usage and quota admission, document
+  artifact store, request lifecycle, safety, error logging.
 - `.agent_docs/tools.md` : the 108 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, the

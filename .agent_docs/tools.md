@@ -235,6 +235,8 @@ are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
 | `admin.set_project_quota` | set or clear a project's maximum storage size (SPEC-0010) | `project_id`, `max_mb`? | `project_id`, `max_mb` | !D,!RO,I,!OW | admin |
 | `admin.get_project_quota` | read a project's limit and current usage, trashed files included (SPEC-0020); also `GET /api/admin/projects/{project_id}/quota` | `project_id` | `project_id`, `max_mb` (null when unlimited), `used_bytes` | RO,I,!OW | admin or owner; a non admin gets the owner refusal even for a missing project |
 
+2026-10-12 (SPEC-0020): the limit refuses every growing `fs.*`/`git.*` operation on its net change with `ERR_PROJECT_QUOTA_EXCEEDED` (`project storage quota of <N> MB exceeded: <U> bytes used, <W> bytes requested`, HTTP 507), before the session quota. Moves, trash, restore, aborts and pushes are never checked; a limit below usage removes nothing.
+
 `project_id` must be 3 to 32 characters of lowercase letters, digits and hyphens,
 with alphanumeric first and last characters. Creation provisions the volume and
 rolls the ACL row back if provisioning fails. Deletion also purges

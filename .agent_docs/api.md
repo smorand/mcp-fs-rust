@@ -150,7 +150,7 @@ reference.
 | `ERR_NO_CLOBBER` | 409 |
 | `ERR_PASSWORD_REQUIRED` | 428 (SPEC-0015: missing or wrong archive password, retry with it) |
 | `ERR_PATH_OUT_OF_BOUNDS`, `ERR_INVALID_ARGUMENT` | 400 |
-| `ERR_PROJECT_QUOTA_EXCEEDED` | 507 (SPEC-0020: the write would push the project over its storage limit) |
+| `ERR_PROJECT_QUOTA_EXCEEDED` | 507 (SPEC-0020: the write would push the project over its storage limit; `/upload`, `/extract-archive` and the other growing routes share the tool path, so the same message; `/move` and `/delete` are never refused for quota) |
 | `ERR_EDIT_WITHOUT_PRIOR_READ`, `ERR_AMBIGUOUS_MATCH`, `ERR_NO_MATCH`, `ERR_WRITE_QUOTA_EXCEEDED`, `ERR_NOT_SUPPORTED`, `ERR_PROJECT_EXISTS`, `ERR_INTERNAL_ERROR` | 500 (no explicit mapping, fallback) |
 
 The 500 fallback row is a faithful copy of the reference map and part of the

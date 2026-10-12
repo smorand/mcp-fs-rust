@@ -1321,7 +1321,7 @@ async fn tar_world(entries: &[(&str, Vec<u8>)]) -> (World, Vec<u8>) {
     (w, tar)
 }
 
-/// SPEC-0020/E2E-063: a tar archive listing the same destination path twice
+/// US-0018 (SPEC-0020/FR-NEW-007): a tar archive listing the same destination path twice
 /// (tar permits duplicate entries; the last one written wins, FR-NEW-007) is
 /// admitted by its NET change, the last occurrence's size minus whatever sat
 /// there before, not the sum of every occurrence. Atlas has exactly 48 576
@@ -1337,7 +1337,7 @@ async fn spec_0020_us_0018_duplicate_tar_path_netted_not_summed() {
     assert_eq!(w.used().await, 1_020_000);
 }
 
-/// SPEC-0020/E2E-064: the same duplicate-path tar, but the LAST occurrence
+/// US-0018 (SPEC-0020/FR-NEW-007): the same duplicate path tar, but the LAST occurrence
 /// alone already exceeds the 48 576 bytes of headroom. The refusal reports
 /// the netted requested bytes (50 000), never the summed total of every
 /// occurrence (60 000).
@@ -1722,4 +1722,474 @@ async fn spec_0020_e2e_069_a_file_restore_over_the_limit_is_refused() {
     assert_refused(vc::tool_checkout_file(v.w.f.ctx(MIA), args, v.g()).await, 1_000_000, 50_000);
     assert_eq!(v.size("/r.md").await, Some(100_000));
     assert_eq!(v.w.used().await, 1_000_000);
+}
+
+// ── US-0020: lowered limit, exempt operations, concurrency ──────────────────
+
+use crate::mcp::server::{MoveArgs, TrashRestoreArgs};
+
+impl World {
+    async fn delete_to_trash(&self, person: &str, path: &str) -> RawResult {
+        let args =
+            DeleteArgs { mount_id: ATLAS.into(), path: path.into(), recursive: false, trash: true };
+        self.as_(person).fs_delete(Parameters(args)).await
+    }
+
+    async fn move_(&self, person: &str, source: &str, destination: &str) -> RawResult {
+        let args = MoveArgs {
+            mount_id: ATLAS.into(),
+            source: source.into(),
+            destination: destination.into(),
+            overwrite: false,
+        };
+        self.as_(person).fs_move(Parameters(args)).await
+    }
+
+    /// The current path of the one trashed file whose original name is
+    /// `name`: trash paths are generated, so they are looked up in the tree.
+    async fn trashed(&self, name: &str) -> String {
+        let client = self.f.state.stores.client(ATLAS).await.unwrap();
+        let hits: Vec<String> = client
+            .meta
+            .subtree("/")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.is_file() && n.path != format!("/{name}") && n.path.contains(name))
+            .map(|n| n.path)
+            .collect();
+        assert_eq!(hits.len(), 1, "one trashed {name}: {hits:?}");
+        hits[0].clone()
+    }
+
+    /// Ada sets Atlas's limit through the tool, as FR-MOD-001 describes.
+    async fn admin_limit(&self, max_mb: Option<u32>) {
+        let args = SetProjectQuotaArgs { project_id: ATLAS.into(), max_mb };
+        ok_json(self.as_(ADA).admin_set_project_quota(Parameters(args)).await);
+    }
+
+    /// Atlas with no limit using exactly 1 500 000 bytes: `/r.md` (100 000
+    /// bytes of text), `/a.txt` (40 000), `/b.txt` (10 000), `/s.bin` (10).
+    async fn over() -> World {
+        let w = World::new(false).await;
+        w.seed("/seed.bin", 1_349_990).await;
+        w.seed_text("/r.md", &text(100_000, 3)).await;
+        w.seed("/a.txt", 40_000).await;
+        w.seed("/b.txt", 10_000).await;
+        w.seed("/s.bin", 10).await;
+        assert_eq!(w.used().await, 1_500_000);
+        w
+    }
+
+    /// [`Self::over`] after Ada lowered the limit to 1 MB (E2E-044's state).
+    async fn lowered() -> World {
+        let w = World::over().await;
+        w.admin_limit(Some(1)).await;
+        w
+    }
+}
+
+/// Whether a tool call succeeded, for races where either side may win.
+fn accepted(r: &RawResult) -> bool {
+    r.as_ref().expect("a tool result, not a protocol error").is_error != Some(true)
+}
+
+/// Run `a` and `b` as two tasks released by one barrier, so both reach the
+/// admission together; no sleep decides the interleaving.
+async fn race<A, B>(a: A, b: B) -> (RawResult, RawResult)
+where
+    A: std::future::Future<Output = RawResult> + Send + 'static,
+    B: std::future::Future<Output = RawResult> + Send + 'static,
+{
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let (ba, bb) = (barrier.clone(), barrier);
+    let ta = tokio::spawn(async move {
+        ba.wait().await;
+        a.await
+    });
+    let tb = tokio::spawn(async move {
+        bb.wait().await;
+        b.await
+    });
+    (ta.await.unwrap(), tb.await.unwrap())
+}
+
+/// A new file write of `len` bytes by `person`, as an owned future.
+fn spawnable_write(
+    w: &World,
+    person: &str,
+    path: &str,
+    len: usize,
+) -> impl std::future::Future<Output = RawResult> + Send + 'static {
+    let server = w.as_(person);
+    let args = WriteBytesArgs {
+        mount_id: ATLAS.into(),
+        path: path.into(),
+        base64: base64::engine::general_purpose::STANDARD.encode(noise(len, 13)),
+        overwrite: false,
+        create_parents: true,
+        trigger_documentation_service: false,
+    };
+    async move { server.fs_write_bytes(Parameters(args)).await }
+}
+
+/// SPEC-0020/E2E-022: a delete to the trash is accepted and keeps the bytes
+/// counted (FR-NEW-002, FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_e2e_022_a_delete_keeps_the_bytes_in_the_trash() {
+    let w = World::new(false).await;
+    w.limit(Some(MB)).await;
+    w.seed("/seed.bin", 900_000).await;
+    w.seed("/old.txt", 100_000).await;
+    ok_json(w.delete_to_trash(MIA, "/old.txt").await);
+    assert!(!w.exists("/old.txt").await);
+    let trashed = w.trashed("old.txt").await;
+    assert_eq!(w.content(&trashed).await.map(|b| b.len()), Some(100_000));
+    assert_eq!(w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/E2E-023: a permanent purge lowers the usage and frees room
+/// (FR-NEW-012, FR-NEW-002).
+#[tokio::test]
+async fn spec_0020_e2e_023_a_purge_frees_room() {
+    let w = World::new(false).await;
+    w.limit(Some(MB)).await;
+    w.seed("/seed.bin", 900_000).await;
+    w.seed("/old.txt", 100_000).await;
+    ok_json(w.delete_to_trash(OLIVIA, "/old.txt").await);
+    let trashed = w.trashed("old.txt").await;
+
+    let purge =
+        DeleteArgs { mount_id: ATLAS.into(), path: trashed, recursive: false, trash: false };
+    ok_json(w.as_(OLIVIA).fs_delete(Parameters(purge)).await);
+    assert_eq!(w.used().await, 900_000);
+
+    w.write(MIA, "/new.bin", 148_576).await;
+    assert_eq!(w.used().await, MB);
+}
+
+/// SPEC-0020/E2E-024: a move over the limit is accepted and changes nothing
+/// (FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_e2e_024_a_move_over_the_limit_is_accepted() {
+    let w = World::new(false).await;
+    w.seed("/seed.bin", 1_460_000).await;
+    w.seed("/a.txt", 40_000).await;
+    w.seed("/arch/keep", 0).await;
+    w.limit(Some(MB)).await;
+    ok_json(w.move_(MIA, "/a.txt", "/arch/a.txt").await);
+    assert!(w.exists("/arch/a.txt").await && !w.exists("/a.txt").await);
+    assert_eq!(w.used().await, 1_500_000);
+}
+
+/// SPEC-0020/E2E-025: a trash restore over the limit is accepted and
+/// changes nothing (FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_e2e_025_a_restore_over_the_limit_is_accepted() {
+    let w = World::new(false).await;
+    w.seed("/seed.bin", 1_470_000).await;
+    w.seed("/t.txt", 30_000).await;
+    ok_json(w.delete_to_trash(OLIVIA, "/t.txt").await);
+    let trashed = w.trashed("t.txt").await;
+    w.limit(Some(MB)).await;
+    assert_eq!(w.used().await, 1_500_000);
+
+    let args = TrashRestoreArgs { mount_id: ATLAS.into(), trash_path: trashed };
+    ok_json(w.as_(MIA).fs_trash_restore(Parameters(args)).await);
+    assert_eq!(w.content("/t.txt").await.map(|b| b.len()), Some(30_000));
+    assert_eq!(w.used().await, 1_500_000);
+}
+
+/// SPEC-0020/E2E-026: a push over the limit succeeds with no quota message
+/// (FR-NEW-012). Driven through the real git HTTP smart server
+/// (`git::http::router`, `POST /git/Atlas/git-receive-pack`) with Mia's
+/// bearer token, carrying a pack built by a scratch libgit2 repository.
+#[tokio::test]
+async fn spec_0020_e2e_026_a_push_over_the_limit_succeeds() {
+    use crate::git::http::pktline;
+    use tower::ServiceExt as _;
+
+    let w = World::new(true).await;
+    w.seed("/seed.bin", 1_500_000).await;
+    w.limit(Some(MB)).await;
+    let keys = tempfile::tempdir().unwrap();
+    let (key, public) = crate::keys::write_keypair(keys.path()).unwrap();
+    let mut config = (*w.f.state.config).clone();
+    config.auth.jwt.public_key_path = public.display().to_string();
+    let config = Arc::new(config);
+    let s = &w.f.state;
+    let state = AppState {
+        config: config.clone(),
+        admin: s.admin.clone(),
+        stores: s.stores.clone(),
+        safety: s.safety.clone(),
+        identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+        editors: s.editors.clone(),
+        doc_service: None,
+        search: None,
+    };
+    let git = Arc::new(GitRepoStore::new(config, s.stores.relational().clone()));
+    git.init_repo(ATLAS).await.unwrap();
+    let app = crate::git::http::router(Arc::new(state), git.clone());
+    let token = crate::keys::mint_token_from_file(
+        &key,
+        MIA,
+        crate::keys::DEFAULT_ISSUER,
+        crate::keys::DEFAULT_CLAIM,
+        3600,
+    )
+    .unwrap();
+
+    // Two new commits, 200 000 bytes of new content, built client side.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = git2::Repository::init_bare(src_dir.path()).unwrap();
+    vc_remote_commit(&src, &[("one.bin", 100_000)]);
+    vc_remote_commit(&src, &[("one.bin", 100_000), ("two.bin", 100_000)]);
+    let tip = src.refname_to_id("refs/heads/main").unwrap();
+    let mut pack = git2::Buf::new();
+    {
+        let mut pb = src.packbuilder().unwrap();
+        let mut walk = src.revwalk().unwrap();
+        walk.push(tip).unwrap();
+        pb.insert_walk(&mut walk).unwrap();
+        pb.write_buf(&mut pack).unwrap();
+    }
+    let mut body = pktline::encode_raw(
+        format!("{} {tip} refs/heads/main\0report-status\n", "0".repeat(40)).as_bytes(),
+    );
+    body.extend_from_slice(&pktline::flush());
+    body.extend_from_slice(&pack);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/git/{ATLAS}/git-receive-pack"))
+        .header("X-Forwarded-Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/x-git-receive-pack-request")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let r = app.oneshot(req).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    let report = String::from_utf8_lossy(&bytes);
+    assert!(report.contains("unpack ok"), "got: {report}");
+    assert!(report.contains("ok refs/heads/main"), "got: {report}");
+    assert!(!report.contains("quota"), "got: {report}");
+    let entry = git.get_or_open_repo(ATLAS).await.unwrap();
+    assert_eq!(entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target, tip.to_string());
+    assert_eq!(w.used().await, 1_500_000);
+}
+
+/// SPEC-0020/E2E-044: a limit below the usage is accepted and removes
+/// nothing (FR-MOD-001).
+#[tokio::test]
+async fn spec_0020_e2e_044_a_limit_below_the_usage_removes_nothing() {
+    let w = World::over().await;
+    w.admin_limit(Some(1)).await;
+    for path in ["/seed.bin", "/r.md", "/a.txt", "/b.txt", "/s.bin"] {
+        assert!(w.exists(path).await, "{path} still present");
+    }
+    assert_eq!(w.independent_sum().await, 1_500_000);
+    assert_eq!(
+        ok_json(w.quota(ADA, ATLAS).await),
+        json!({"project_id": "Atlas", "max_mb": 1, "used_bytes": 1_500_000})
+    );
+}
+
+/// SPEC-0020/E2E-045: after the lowering any growth is refused
+/// (FR-MOD-001, FR-NEW-001).
+#[tokio::test]
+async fn spec_0020_e2e_045_a_one_byte_write_is_refused_after_the_lowering() {
+    let w = World::lowered().await;
+    let err = err_text(w.try_write(MIA, "/one.txt", 1).await);
+    assert!(err.ends_with(&refusal(1_500_000, 1)), "got: {err}");
+    assert!(!w.exists("/one.txt").await);
+}
+
+/// SPEC-0020/E2E-046: a shrinking overwrite is accepted over the limit
+/// (FR-MOD-001, FR-NEW-004).
+#[tokio::test]
+async fn spec_0020_e2e_046_a_shrinking_overwrite_is_accepted_over_the_limit() {
+    let w = World::lowered().await;
+    w.read_as_mia("/r.md").await;
+    ok_json(w.try_write_text("/r.md", &text(40_000, 5), true).await);
+    assert_eq!(w.used().await, 1_440_000);
+}
+
+/// SPEC-0020/E2E-047: a delete to the trash and a move are accepted over the
+/// limit and change nothing (FR-MOD-001, FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_e2e_047_delete_and_move_are_accepted_over_the_limit() {
+    let w = World::lowered().await;
+    ok_json(w.delete_to_trash(MIA, "/a.txt").await);
+    ok_json(w.move_(MIA, "/b.txt", "/c.txt").await);
+    assert!(!w.exists("/a.txt").await && !w.exists("/b.txt").await && w.exists("/c.txt").await);
+    assert_eq!(w.used().await, 1_500_000);
+}
+
+/// SPEC-0020/E2E-048: a limit equal to the usage is accepted and leaves no
+/// room (FR-MOD-001, FR-NEW-005).
+#[tokio::test]
+async fn spec_0020_e2e_048_a_limit_equal_to_the_usage_leaves_no_room() {
+    let w = World::new(false).await;
+    w.seed("/seed.bin", MB as usize).await;
+    w.admin_limit(Some(1)).await;
+    let err = err_text(w.try_write(MIA, "/one.txt", 1).await);
+    assert!(err.ends_with(&refusal(MB, 1)), "got: {err}");
+}
+
+/// SPEC-0020/E2E-049 and E2E-063: of two writes that fit alone but not
+/// together exactly one is accepted; the loser's session budget is intact
+/// once the limit is gone (FR-NEW-008, FR-NEW-006).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spec_0020_e2e_049_063_one_of_two_racing_writes_is_refused() {
+    let w = World::shared().await;
+    let (mia, olivia) = race(
+        spawnable_write(&w, MIA, "/mia.bin", 40_000),
+        spawnable_write(&w, OLIVIA, "/olivia.bin", 40_000),
+    )
+    .await;
+    assert_ne!(accepted(&mia), accepted(&olivia), "exactly one write is accepted");
+    let (loser, loser_result) = if accepted(&mia) { (OLIVIA, olivia) } else { (MIA, mia) };
+    let err = err_text(loser_result);
+    assert!(err.ends_with(&refusal(1_040_000, 40_000)), "got: {err}");
+    assert_eq!(w.used().await, 1_040_000);
+    assert_eq!(w.independent_sum().await, 1_040_000);
+
+    // E2E-063: the refusal charged nothing, so the whole budget is left.
+    w.remove_limit().await;
+    let r = spawnable_write(&w, loser, "/retry.bin", SESSION_BUDGET as usize).await;
+    ok_json(r);
+}
+
+/// SPEC-0020/E2E-050: two racing writes that fit together are both accepted
+/// (FR-NEW-008).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spec_0020_e2e_050_two_racing_writes_that_fit_are_accepted() {
+    let w = World::shared().await;
+    let (mia, olivia) = race(
+        spawnable_write(&w, MIA, "/mia.bin", 24_000),
+        spawnable_write(&w, OLIVIA, "/olivia.bin", 24_000),
+    )
+    .await;
+    ok_json(mia);
+    ok_json(olivia);
+    assert_eq!(w.used().await, 1_048_000);
+}
+
+/// SPEC-0020/E2E-051: an extraction racing a write: exactly one lands, and a
+/// refused extraction writes no entry (FR-NEW-008, FR-NEW-007).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spec_0020_e2e_051_an_extraction_racing_a_write() {
+    let (w, _zip) = archive_world(&[("x", noise(10_000, 1)), ("y", noise(20_000, 2))]).await;
+    let mia = w.as_(MIA);
+    let extract = async move {
+        let args = ExtractArchiveArgs {
+            mount_id: ATLAS.into(),
+            path: "/pack.zip".into(),
+            destination: None,
+            overwrite: false,
+            password: None,
+        };
+        mia.fs_extract_archive(Parameters(args)).await
+    };
+    let (ex, wr) = race(extract, spawnable_write(&w, OLIVIA, "/w.bin", 30_000)).await;
+    assert_ne!(accepted(&ex), accepted(&wr), "exactly one operation is accepted");
+    assert_eq!(w.used().await, 1_030_000);
+    if accepted(&ex) {
+        assert!(err_text(wr).ends_with(&refusal(1_030_000, 30_000)));
+        assert!(!w.exists("/w.bin").await);
+    } else {
+        assert!(err_text(ex).ends_with(&refusal(1_030_000, 30_000)));
+        let client = w.f.state.stores.client(ATLAS).await.unwrap();
+        let names: Vec<String> = client
+            .meta
+            .subtree("/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|n| n.path)
+            .filter(|p| p.ends_with("/x") || p.ends_with("/y"))
+            .collect();
+        assert!(names.is_empty(), "no entry of the refused extraction: {names:?}");
+    }
+}
+
+/// SPEC-0020/E2E-052: 20 concurrent pairs of 8 000 byte writes with 8 576
+/// bytes left: exactly one is accepted and the usage, sampled while they
+/// run, never exceeds the limit (FR-NEW-008).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spec_0020_e2e_052_twenty_racing_pairs_admit_exactly_one() {
+    let w = Arc::new(World::shared().await);
+    w.seed("/fill.bin", 40_000).await;
+    assert_eq!(w.used().await, 1_040_000);
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = tokio::task::JoinSet::new();
+    for person in [MIA, OLIVIA] {
+        let (w, barrier) = (w.clone(), barrier.clone());
+        writers.spawn(async move {
+            barrier.wait().await;
+            let mut ok = 0;
+            for i in 0..20 {
+                let path = format!("/{}-{i}.bin", &person[..3]);
+                if accepted(&spawnable_write(&w, person, &path, 8_000).await) {
+                    ok += 1;
+                }
+                tokio::task::yield_now().await;
+            }
+            ok
+        });
+    }
+    let watcher = {
+        let (w, barrier, done) = (w.clone(), barrier.clone(), done.clone());
+        tokio::spawn(async move {
+            barrier.wait().await;
+            let mut peak = 0;
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                peak = peak.max(w.used().await);
+                tokio::task::yield_now().await;
+            }
+            peak
+        })
+    };
+    let mut accepted_total = 0;
+    while let Some(ok) = writers.join_next().await {
+        accepted_total += ok.unwrap();
+    }
+    done.store(true, std::sync::atomic::Ordering::Release);
+    let peak = watcher.await.unwrap();
+
+    assert_eq!(accepted_total, 1, "exactly one write is accepted");
+    assert_eq!(w.used().await, 1_048_000);
+    assert_eq!(w.independent_sum().await, 1_048_000);
+    assert!(peak <= MB, "usage peaked at {peak}");
+}
+
+/// SPEC-0020/E2E-061: a copy after the lowering is refused and writes
+/// nothing (FR-MOD-001, FR-NEW-003).
+#[tokio::test]
+async fn spec_0020_e2e_061_a_copy_after_the_lowering_is_refused() {
+    let w = World::lowered().await;
+    let err = err_text(w.copy(MIA, "/s.bin", "/s3.bin", false).await);
+    assert!(err.ends_with(&refusal(1_500_000, 10)), "got: {err}");
+    assert!(!w.exists("/s3.bin").await);
+}
+
+/// SPEC-0020/E2E-064: two racing writes that each overshoot are both refused
+/// with the same figures (FR-NEW-008).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spec_0020_e2e_064_two_racing_overshoots_are_both_refused() {
+    let w = World::shared().await;
+    w.seed("/fill.bin", 48_000).await;
+    let (mia, olivia) = race(
+        spawnable_write(&w, MIA, "/mia.bin", 1_000),
+        spawnable_write(&w, OLIVIA, "/olivia.bin", 1_000),
+    )
+    .await;
+    for r in [mia, olivia] {
+        let err = err_text(r);
+        assert!(err.ends_with(&refusal(1_048_000, 1_000)), "got: {err}");
+    }
+    assert_eq!(w.used().await, 1_048_000);
 }

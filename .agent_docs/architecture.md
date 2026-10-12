@@ -89,6 +89,16 @@ nothing. Export zips, git objects and artifact blobs are not nodes, so not usage
 * **Read.** `quota::used_bytes` takes the volume's admission lock (`VolumeClient::admission`,
   one tokio mutex per cached client) then reads one row. `admin.get_project_quota` and
   `GET /api/admin/projects/{project_id}/quota` call `tools::admin::get_project_quota`.
+* **Admission (2026-10-12, US-0020).** Every growing operation goes through
+  `quota::admit*`: take `VolumeClient::admission`, compute the net change from the current
+  sizes, check the project limit, THEN charge the session budget, and hold the lock until
+  the last write landed, so two racing writes that fit alone but not together see each
+  other (one refused) and usage never overshoots. A multi file operation (folder copy,
+  extraction, every git apply) is admitted once for its total, all or nothing. Moves,
+  trash, trash restore, git aborts and receive pack never call `admit` (DEC-009): they add
+  no project bytes. A limit lowered below usage removes nothing; every positive delta is
+  then refused. Fail closed: an error reading the limit or the counter refuses the
+  operation rather than letting it through unchecked.
 * **Gap.** Two processes sharing one PostgreSQL or SQL Server database can lose an update
   only during the very first backfill of a volume, if the other process writes between the
   SUM and the insert; the in process lock does not cross processes.

@@ -6,7 +6,7 @@
 > Depends on: US-0019
 > min_tier: 1
 > Files touched: 6
-> Closes spec: yes
+> Closes spec: no
 
 ## Objective
 Closes SPEC-0020: a limit lowered below usage evicts nothing and refuses growing operations, moves, deletes, restores and pushes always pass, a purge frees space, and concurrent writes never overshoot. Updates the docs.

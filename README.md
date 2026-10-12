@@ -291,6 +291,32 @@ checked before the first write, so a symlink or device entry, an entry escaping 
 destination (zip slip), a collision without `overwrite`, or a declared total above the write
 quota rejects the call with nothing written.
 
+## Project quota enforcement
+
+A platform admin caps a project's storage with `admin.set_project_quota` (`max_mb`, or
+none for unlimited). Usage is the sum of the declared sizes of the project's files, each path
+counted once even when content is shared, trashed files included; export zips, version
+control history and conversion artifacts do not count. Every operation that grows the
+project (writes, edits, appends, uploads, copies, archive extraction, conversion siblings,
+clone, pull, merge, switch, cherry pick, stash pop, file restore) is checked on its net
+change and refused, with nothing written, by `ERR_PROJECT_QUOTA_EXCEEDED` (HTTP 507):
+
+```
+project storage quota of 1 MB exceeded: 1040000 bytes used, 40000 bytes requested
+```
+
+The project limit is checked before the per session write quota, so a refusal spends no
+session budget. A shrinking or same size change always passes; reaching the limit exactly is
+allowed. Moves, deletes to the trash, trash restores, version control aborts and pushes are
+never checked. A delete keeps the bytes counted until the trash is purged permanently. A
+limit lowered below the current usage is accepted and removes nothing; every growing
+operation is refused until usage drops. Concurrent operations on one project are admitted
+one at a time, so they never leave usage above the limit.
+
+`admin.get_project_quota` (also `GET /api/admin/projects/{project_id}/quota`) returns
+`{project_id, max_mb, used_bytes}`, `max_mb` null when unlimited; it answers a platform
+admin or the project owner only.
+
 ## Security model
 
 - **Authentication**: RS256 JWT, signature, issuer and expiry verified (30s clock skew,
