@@ -201,6 +201,9 @@ async fn cmd_purge(
         config.safety.clone(),
         crate::storage::meta::max_path_len(&config.infra.meta.backend),
     );
+    // The purge verb only deletes, so no project limit can ever be consulted;
+    // the explicit opt out keeps a forgotten attach elsewhere failing closed.
+    safety.attach_no_limits();
 
     match project {
         Some(project_id) => {

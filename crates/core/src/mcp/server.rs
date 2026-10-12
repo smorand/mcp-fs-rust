@@ -1379,7 +1379,7 @@ impl McpServer {
     // ── read family ──────────────────────────────────────────────────────────
 
     #[tool(name = "fs.read", description = "Read a text file with line-numbered, paged output.")]
-    async fn fs_read(
+    pub(crate) async fn fs_read(
         &self,
         Parameters(a): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1551,7 +1551,7 @@ impl McpServer {
         name = "fs.write",
         description = "Create or overwrite a file (no-clobber by default, atomic)."
     )]
-    async fn fs_write(
+    pub(crate) async fn fs_write(
         &self,
         Parameters(a): Parameters<WriteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1577,7 +1577,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.append", description = "Append content to a file (optionally create it).")]
-    async fn fs_append(
+    pub(crate) async fn fs_append(
         &self,
         Parameters(a): Parameters<AppendArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1602,7 +1602,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.create_empty", description = "Create an empty file (touch).")]
-    async fn fs_create_empty(
+    pub(crate) async fn fs_create_empty(
         &self,
         Parameters(a): Parameters<CreateEmptyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1694,7 +1694,7 @@ impl McpServer {
         name = "fs.multi_edit",
         description = "Apply several edits atomically (all or nothing)."
     )]
-    async fn fs_multi_edit(
+    pub(crate) async fn fs_multi_edit(
         &self,
         Parameters(a): Parameters<MultiEditArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1782,7 +1782,7 @@ impl McpServer {
         name = "fs.apply_patch",
         description = "Apply a multi-file V4A patch within one volume."
     )]
-    async fn fs_apply_patch(
+    pub(crate) async fn fs_apply_patch(
         &self,
         Parameters(a): Parameters<ApplyPatchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2341,7 +2341,7 @@ impl McpServer {
         name = "fs.write_docx",
         description = "Render Markdown into a .docx Word document and write it to the volume."
     )]
-    async fn fs_write_docx(
+    pub(crate) async fn fs_write_docx(
         &self,
         Parameters(a): Parameters<WriteDocxArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2782,7 +2782,7 @@ impl McpServer {
              (unlimited); max_mb must be > 0 when present. Lowering the quota \
              below current usage is accepted and evicts nothing."
     )]
-    async fn admin_set_project_quota(
+    pub(crate) async fn admin_set_project_quota(
         &self,
         Parameters(a): Parameters<SetProjectQuotaArgs>,
     ) -> Result<CallToolResult, ErrorData> {

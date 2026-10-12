@@ -163,9 +163,14 @@ Write (`fs.write` and every edit tool through `fs_ops::commit`):
    exists and `overwrite` is false).
 2. If the file exists: read guard (`ERR_EDIT_WITHOUT_PRIOR_READ`), then compute
    the unified diff that the result carries.
-3. `create_parents` walks the parent chain, inserting missing directories.
-4. Charge the session write quota (`ERR_WRITE_QUOTA_EXCEEDED`) **before** any
-   byte is written.
+3. `quota::admit_file` (SPEC-0020, 2026-10-12): under the volume's admission
+   lock, refuse with `ERR_PROJECT_QUOTA_EXCEEDED` (HTTP 507) when the net change
+   (new size minus the path's current size) would push `volume_usage` over the
+   project limit, then charge the session write quota (`ERR_WRITE_QUOTA_EXCEEDED`).
+   Project check first, so a refusal charges no session budget. The lock is held
+   until the write landed. The limit is read through the admin store attached
+   with `SafetyManager::attach_limits` (composition root); unattached means no limit.
+4. `create_parents` walks the parent chain, inserting missing directories.
 5. `VolumeClient::write_bytes_atomic`: hash the bytes, `blob.put` (a temp file
    plus rename locally, so a reader never sees a partial blob; a put of an
    existing sha is a no op), then `meta.put_file`, then GC the sha that the
@@ -277,7 +282,8 @@ caller's fault, so a 4xx stays concise and monitoring is not paged for it.
 
 A remote database adds failure modes an in process SQLite call could not have: a
 serialization conflict, a deadlock victim, a pool timeout and a dropped connection. These
-carry no new `ERR_*` code, so the code list stays at 14. Instead `ToolError` has a
+carry no new `ERR_*` code, so the code list did not grow for them (it is 16 today, after
+`ERR_PASSWORD_REQUIRED` and `ERR_PROJECT_QUOTA_EXCEEDED`). Instead `ToolError` has a
 `retryable` flag, set by `mark_retryable()` at the driver boundary, and
 `rel::run_retrying` is the only thing that reads it.
 

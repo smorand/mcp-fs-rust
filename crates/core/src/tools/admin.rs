@@ -728,6 +728,11 @@ pub(crate) mod test_support {
             let admin_store = Arc::new(RelationalAdminStore::in_memory().await.unwrap());
             admin_store.connect().await.unwrap();
 
+            let safety = Arc::new(SafetyManager::new(
+                config.safety.clone(),
+                crate::storage::meta::max_path_len(&config.infra.meta.backend),
+            ));
+            safety.attach_limits(admin_store.clone());
             let state = Arc::new(AppState {
                 config: config.clone(),
                 admin: admin_store.clone(),
@@ -735,10 +740,7 @@ pub(crate) mod test_support {
                     config.clone(),
                     crate::storage::test_registry(),
                 )),
-                safety: Arc::new(SafetyManager::new(
-                    config.safety.clone(),
-                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
-                )),
+                safety,
                 identity: Arc::new(IdentityResolver::new(&config.auth)),
                 editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
                 doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),

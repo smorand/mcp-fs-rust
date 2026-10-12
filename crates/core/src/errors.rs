@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-/// The 14 stable error codes. These strings are part of the public contract and
+/// The 16 stable error codes. These strings are part of the public contract and
 /// MUST NOT change: MCP clients and REST consumers match on them.
 pub mod code {
     pub const UNAUTHENTICATED: &str = "ERR_UNAUTHENTICATED";
@@ -21,6 +21,7 @@ pub mod code {
     pub const NOT_SUPPORTED: &str = "ERR_NOT_SUPPORTED";
     pub const INTERNAL_ERROR: &str = "ERR_INTERNAL_ERROR";
     pub const PASSWORD_REQUIRED: &str = "ERR_PASSWORD_REQUIRED";
+    pub const PROJECT_QUOTA_EXCEEDED: &str = "ERR_PROJECT_QUOTA_EXCEEDED";
 }
 
 /// An expected, user-facing error (4xx-style). Rendered to the client as
@@ -97,6 +98,17 @@ impl ToolError {
     pub fn password_required(m: impl Into<String>) -> Self {
         Self::new(code::PASSWORD_REQUIRED, m)
     }
+    /// SPEC-0020 FR-NEW-001. `limit_bytes` is set in whole megabytes by
+    /// `admin.set_project_quota`, so the division is exact.
+    pub fn project_quota_exceeded(limit_bytes: i64, used: i64, requested: i64) -> Self {
+        Self::new(
+            code::PROJECT_QUOTA_EXCEEDED,
+            format!(
+                "project storage quota of {} MB exceeded: {used} bytes used, {requested} bytes requested",
+                limit_bytes / 1_048_576
+            ),
+        )
+    }
 
     /// HTTP status for the REST data plane.
     ///
@@ -128,6 +140,9 @@ impl ToolError {
             // An archive member is encrypted and no (or the wrong) password was
             // supplied: a precondition the caller can satisfy and retry.
             code::PASSWORD_REQUIRED => 428,
+            // The project's storage is full (SPEC-0020 DEC-005): 507 names storage
+            // exhaustion, distinct from the 429 of a spent session budget.
+            code::PROJECT_QUOTA_EXCEEDED => 507,
             // A new code must be mapped explicitly, so this stays exhaustive in
             // spirit: an unmapped code is a bug, not a silent 500.
             _ => 500,
@@ -199,6 +214,17 @@ mod tests {
         assert_eq!(ToolError::no_match("x").http_status(), 422);
         assert_eq!(ToolError::not_supported("x").http_status(), 501);
         assert_eq!(ToolError::internal("x").http_status(), 500);
+        assert_eq!(ToolError::password_required("x").http_status(), 428);
+        assert_eq!(ToolError::project_quota_exceeded(1_048_576, 1, 2).http_status(), 507);
+    }
+
+    #[test]
+    fn project_quota_exceeded_formats_the_spec_message() {
+        assert_eq!(
+            ToolError::project_quota_exceeded(2 * 1_048_576, 1_000_000, 50_000).to_string(),
+            "ERR_PROJECT_QUOTA_EXCEEDED: project storage quota of 2 MB exceeded: \
+             1000000 bytes used, 50000 bytes requested"
+        );
     }
 
     /// A client caused error must never be reported as a server failure: an operator

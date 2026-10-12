@@ -403,10 +403,10 @@ went wrong.
 Stated on their own terms; the full record is in
 [`.agent_docs/lineage.md`](.agent_docs/lineage.md), and each is documented at its call site.
 
-**Errors are usable.** Every failure carries one of the 15 `ERR_*` codes, and the REST
+**Errors are usable.** Every failure carries one of the 16 `ERR_*` codes, and the REST
 status suggests a remedy rather than a generic 400: a missing file is 404, a spent quota
 429, a missing read before write or a missing archive password 428, a duplicate project 409, an unsupported extraction
-format 501, and an edit that matched nothing or matched ambiguously 422.
+format 501, a project over its storage limit 507, and an edit that matched nothing or matched ambiguously 422.
 
 **A real `git clone` and `git push` work.** Smart HTTP is unforgiving: `upload-pack`
 advertises `multi_ack_detailed`, the pack is built from a revwalk so a commit's ancestry is

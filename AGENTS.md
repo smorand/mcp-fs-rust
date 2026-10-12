@@ -86,7 +86,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (`web`/`context7`/`sqlite`/`db`/`doc`) production `catalog()` read by `/api/swagger.json`.
 - `config.rs` : full `ServerConfig` + `${VAR}` expansion + `Dsn` (redacts in Debug and
   Display) + boot validation of every `infra.*` store.
-- `errors.rs` : the 15 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
+- `errors.rs` : the 16 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
   flag for transient database failures (no new code).
 - `migrate.rs` : the `migrate` verb, offline row for row copy between backends.
 - `identity.rs` : RS256 verification, 30s clock skew, forwarded header then `Authorization`.

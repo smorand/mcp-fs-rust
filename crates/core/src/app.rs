@@ -86,6 +86,8 @@ pub(crate) async fn build_with_state(
         config.safety.clone(),
         crate::storage::meta::max_path_len(&config.infra.meta.backend),
     ));
+    // Every write admission reads the project's storage limit here (SPEC-0020).
+    safety.attach_limits(admin.clone());
     let identity = Arc::new(IdentityResolver::new(&config.auth));
     // A configured algorithm this build cannot verify would otherwise be ignored in
     // silence, leaving the operator believing a policy is in force when it is not.

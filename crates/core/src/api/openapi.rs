@@ -1547,15 +1547,19 @@ mod tests {
 
         Arc::new(AppState {
             config: config.clone(),
-            admin,
+            admin: admin.clone(),
             stores: Arc::new(crate::storage::StoreManager::new(
                 config.clone(),
                 crate::storage::test_registry(),
             )),
-            safety: Arc::new(SafetyManager::new(
-                config.safety.clone(),
-                crate::storage::meta::max_path_len(&config.infra.meta.backend),
-            )),
+            safety: {
+                let safety = SafetyManager::new(
+                    config.safety.clone(),
+                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
+                );
+                safety.attach_limits(admin);
+                Arc::new(safety)
+            },
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),
@@ -1719,15 +1723,19 @@ mod tests {
         admin.connect().await.unwrap();
         let all_on = Arc::new(AppState {
             config: config.clone(),
-            admin,
+            admin: admin.clone(),
             stores: Arc::new(crate::storage::StoreManager::new(
                 config.clone(),
                 crate::storage::test_registry(),
             )),
-            safety: Arc::new(SafetyManager::new(
-                config.safety.clone(),
-                crate::storage::meta::max_path_len(&config.infra.meta.backend),
-            )),
+            safety: {
+                let safety = SafetyManager::new(
+                    config.safety.clone(),
+                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
+                );
+                safety.attach_limits(admin);
+                Arc::new(safety)
+            },
             identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
             editors: Arc::new(crate::tools::editor::EditorRegistry::new()),
             doc_service: crate::docs::service::from_config(&config.doc_service).unwrap(),

@@ -408,6 +408,7 @@ mod tests {
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         admin.create_project("proj", "owner@t.c").await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
         Fix { _dir: dir, meta, client, admin, safety }
     }
 
@@ -792,6 +793,7 @@ mod tests {
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         admin.create_project("proj", "owner@t.c").await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
 
         client.write_text_atomic("/stale2.txt", "data").await.unwrap();
         meta.set_atime_for_test("/stale2.txt", now_unix() - 8.0 * DAY).await.unwrap();
@@ -935,6 +937,7 @@ mod tests {
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
 
         admin.create_project("p1", "owner@t.c").await.unwrap();
         admin.create_project("p2", "owner@t.c").await.unwrap();
@@ -966,6 +969,7 @@ mod tests {
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
 
         let summary = run_cycle(&stores, &admin, &safety).await.unwrap();
         assert_eq!(summary, CycleSummary::default());
@@ -982,6 +986,7 @@ mod tests {
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
 
         const N: usize = 50;
         for i in 0..N {
@@ -1346,6 +1351,7 @@ mod tests {
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
         admin.create_project("proj", "owner@t.c").await.unwrap();
         ExportFix { _dir: dir, stores, admin, safety }
     }

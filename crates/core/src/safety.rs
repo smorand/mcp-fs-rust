@@ -8,7 +8,7 @@ use crate::errors::{Result, ToolError};
 use crate::util::{PosixPath, now_unix};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const AUDIT_CAP: usize = 500;
 
@@ -35,6 +35,19 @@ pub struct SafetyManager {
     /// unbounded text, which is every engine except SQL Server.
     max_path_len: Option<usize>,
     sessions: Mutex<HashMap<(String, String), SessionState>>,
+    /// Where a project's storage limit is read (SPEC-0020). Attached once, at
+    /// composition, because the engine functions only receive this manager and a
+    /// volume, never the whole state. Unattached is a composition bug and makes
+    /// a growing write fail closed; a caller where no limit applies says so
+    /// with [`SafetyManager::attach_no_limits`].
+    limits: OnceLock<LimitsSource>,
+}
+
+/// Where project limits come from, once a composition has decided.
+enum LimitsSource {
+    Admin(Arc<dyn crate::storage::traits::AdminBackend>),
+    /// Explicit opt out: no project has a limit (unit tests, the purge CLI).
+    Unlimited,
 }
 
 impl SafetyManager {
@@ -42,7 +55,36 @@ impl SafetyManager {
     /// state the backend's ceiling: a call site that silently defaulted to no limit
     /// would let an over long path reach the database and fail there instead.
     pub fn new(config: SafetyConfig, max_path_len: Option<usize>) -> Self {
-        Self { config, max_path_len, sessions: Mutex::new(HashMap::new()) }
+        Self { config, max_path_len, sessions: Mutex::new(HashMap::new()), limits: OnceLock::new() }
+    }
+
+    /// Read project storage limits from `admin` (SPEC-0020). A second call is
+    /// ignored: the composition root attaches the one store the process has.
+    pub fn attach_limits(&self, admin: Arc<dyn crate::storage::traits::AdminBackend>) {
+        let _ = self.limits.set(LimitsSource::Admin(admin));
+    }
+
+    /// Declare that no project limit applies to this manager. Only for callers
+    /// that never admit a growing write against a real project store: engine
+    /// unit tests and the purge CLI, which only deletes. A second call, or a
+    /// call after `attach_limits`, is ignored.
+    pub fn attach_no_limits(&self) {
+        let _ = self.limits.set(LimitsSource::Unlimited);
+    }
+
+    /// The project's storage limit in bytes, `None` when it has none.
+    ///
+    /// `ERR_INTERNAL_ERROR` when no limits source was attached: answering "no
+    /// limit" there would silently disable enforcement for every project.
+    pub async fn project_limit(&self, project: &str) -> Result<Option<i64>> {
+        match self.limits.get() {
+            Some(LimitsSource::Admin(admin)) => admin.get_quota(project).await,
+            Some(LimitsSource::Unlimited) => Ok(None),
+            None => Err(ToolError::internal(
+                "project storage limits are not attached to the safety manager; \
+                 refusing the write rather than skipping the project limit check",
+            )),
+        }
     }
 
     pub fn config(&self) -> &SafetyConfig {
@@ -190,6 +232,24 @@ mod tests {
 
     fn mgr() -> SafetyManager {
         SafetyManager::new(SafetyConfig::default(), None)
+    }
+
+    /// A manager nobody attached a limits source to must refuse to answer, so a
+    /// composition that forgot `attach_limits` fails loudly instead of letting
+    /// every project write without a ceiling (SPEC-0020 fail closed).
+    #[tokio::test]
+    async fn unattached_manager_refuses_the_limit_lookup() {
+        let m = mgr();
+        let err = m.project_limit("p").await.unwrap_err();
+        assert_eq!(err.code, crate::errors::code::INTERNAL_ERROR);
+        assert!(err.message.contains("limits"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn explicit_opt_out_means_no_limit() {
+        let m = mgr();
+        m.attach_no_limits();
+        assert_eq!(m.project_limit("p").await.unwrap(), None);
     }
 
     #[test]

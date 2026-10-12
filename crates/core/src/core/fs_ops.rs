@@ -14,6 +14,7 @@ use crate::core::diff;
 use crate::docs::artifacts::capture::PendingSet;
 use crate::docs::service::{DocService, eligible_in};
 use crate::errors::{Result, ToolError};
+use crate::quota;
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
 use crate::storage::meta::RelationalMetaStore;
@@ -560,8 +561,9 @@ pub async fn list_dir(
 
 // ─────────────────────────────────────────────────────────── write / edit ─────
 
-/// Charge the quota, write, audit. The single mutation tail shared by the edit
-/// family, so quota accounting can never be skipped.
+/// Admit, write, audit. The single mutation tail shared by the edit family, so
+/// quota accounting can never be skipped. The admission (project limit, then
+/// session budget) is held until the write landed.
 async fn commit(
     client: &VolumeClient,
     safety: &SafetyManager,
@@ -572,7 +574,8 @@ async fn commit(
     op: &str,
 ) -> Result<()> {
     let data = new_text.as_bytes();
-    safety.charge_write(person, mount_id, data.len() as i64)?;
+    let _admission =
+        quota::admit_file(client, safety, person, mount_id, norm, data.len() as i64).await?;
     client.write_bytes_atomic(norm, data).await?;
     client.touch_atime_mtime(norm);
     safety.record_audit(person, mount_id, op, norm, "");
@@ -605,10 +608,12 @@ pub async fn write_bytes(
     if exists {
         safety.ensure_read_before_write(person, mount_id, norm)?;
     }
+    // Admitted before the parents are made, so a refusal creates nothing.
+    let _admission =
+        quota::admit_file(client, safety, person, mount_id, norm, data.len() as i64).await?;
     if create_parents {
         ensure_parents(client, norm).await?;
     }
-    safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, data).await?;
     client.touch_atime_mtime(norm);
     safety.record_read(person, mount_id, norm);
@@ -898,11 +903,13 @@ pub async fn write_text(
         let old = client.read_text(norm).await?;
         diff_text = diff::unified(&old, content, norm);
     }
+    let data = content.as_bytes();
+    // Admitted before the parents are made, so a refusal creates nothing.
+    let _admission =
+        quota::admit_file(client, safety, person, mount_id, norm, data.len() as i64).await?;
     if create_parents {
         ensure_parents(client, norm).await?;
     }
-    let data = content.as_bytes();
-    safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, data).await?;
     client.touch_atime_mtime(norm);
     // A fresh write counts as a read, so a follow-up edit passes the guard.
@@ -931,7 +938,9 @@ pub async fn append_text(
         return Err(ToolError::not_found(format!("'{norm}' does not exist (pass create=true)")));
     }
     let data = content.as_bytes();
-    safety.charge_write(person, mount_id, data.len() as i64)?;
+    // An append grows the file by exactly its own bytes, whatever the file held.
+    let len = data.len() as i64;
+    let _admission = quota::admit(client, safety, person, mount_id, len, len).await?;
     let mut combined = if exists { client.read_bytes(norm).await? } else { Vec::new() };
     combined.extend_from_slice(data);
     client.write_bytes_atomic(norm, &combined).await?;
@@ -1292,7 +1301,8 @@ pub async fn copy_path(
         client.touch_atime_mtime(dst);
     } else {
         let data = client.read_bytes(src).await?;
-        safety.charge_write(person, mount_id, data.len() as i64)?;
+        let _admission =
+            quota::admit_file(client, safety, person, mount_id, dst, data.len() as i64).await?;
         // No explicit makedirs: the metadata store creates missing parents on
         // put_file, exactly like the C# path.
         client.write_bytes_atomic(dst, &data).await?;
@@ -1739,6 +1749,9 @@ pub async fn write_docx(
         safety.ensure_read_before_write(person, mount_id, norm)?;
     }
     let data = crate::docs::render_markdown_to_docx(markdown, title)?;
+    // Admitted before the parent is made, so a refusal creates nothing.
+    let _admission =
+        quota::admit_file(client, safety, person, mount_id, norm, data.len() as i64).await?;
     let parent = match norm.rfind('/') {
         Some(0) | None => "/".to_string(),
         Some(i) => norm[..i].to_string(),
@@ -1746,7 +1759,6 @@ pub async fn write_docx(
     if parent != "/" {
         client.makedirs(&parent, true).await?;
     }
-    safety.charge_write(person, mount_id, data.len() as i64)?;
     client.write_bytes_atomic(norm, &data).await?;
     client.touch_atime_mtime(norm);
     safety.record_read(person, mount_id, norm);
@@ -1777,7 +1789,9 @@ pub async fn apply_patch(
         match op.kind {
             OpKind::Add => {
                 let data = op.add_content.as_bytes();
-                safety.charge_write(person, mount, data.len() as i64)?;
+                let _admission =
+                    quota::admit_file(client, safety, person, mount, &norm, data.len() as i64)
+                        .await?;
                 client.write_bytes_atomic(&norm, data).await?;
                 client.touch_atime_mtime(&norm);
                 touched.push(json!({"path": norm, "op": "add"}));
@@ -1792,7 +1806,9 @@ pub async fn apply_patch(
                 let old = client.read_text(&norm).await?;
                 let neu = apply_update(&old, op)?;
                 let data = neu.as_bytes();
-                safety.charge_write(person, mount, data.len() as i64)?;
+                let _admission =
+                    quota::admit_file(client, safety, person, mount, &norm, data.len() as i64)
+                        .await?;
                 client.write_bytes_atomic(&norm, data).await?;
                 client.touch_atime_mtime(&norm);
                 // Two audit entries per updated file, because the C# writes one
@@ -2041,7 +2057,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta);
-        Fix { _dir: d, v, s: SafetyManager::new(cfg, None) }
+        let s = SafetyManager::new(cfg, None);
+        s.attach_no_limits();
+        Fix { _dir: d, v, s }
     }
 
     /// Seed a file and mark it read, the usual precondition for the edit family.
@@ -3884,6 +3902,7 @@ mod tests {
         });
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta.clone());
         let s = SafetyManager::new(SafetyConfig::default(), None);
+        s.attach_no_limits();
         v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
         let (alice, bob) = (StubDocService::ok(ALICE_MD), StubDocService::ok(BOB_MD));
         let bob_may_start = tokio::sync::Notify::new();
@@ -3938,6 +3957,7 @@ mod tests {
         });
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta.clone());
         let s = SafetyManager::new(SafetyConfig::default(), None);
+        s.attach_no_limits();
         v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
         if let Some(bytes) = former_sibling {
             v.write_bytes_atomic("/report.md", bytes).await.unwrap();
