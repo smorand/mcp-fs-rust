@@ -118,8 +118,11 @@ async fn check_and_charge(
 /// read and the check (DEC-003). The project limit is checked once for the
 /// total, before any of the operation's writes (DEC-002). Used by a folder
 /// copy (`session_bytes` 0: a folder copy charges nothing to the session
-/// today, FR-NEW-006) and by archive extraction (`session_bytes` the
-/// already unchanged total declared size).
+/// today, FR-NEW-006), by archive extraction (`session_bytes` the
+/// already unchanged total declared size), and by every version control
+/// operation that changes project files: a clone and
+/// `git::merge::charge_and_apply` (`session_bytes` the written blobs, a
+/// removed path listed with a new size of 0 so its bytes leave the usage).
 ///
 /// `paths` may list the same destination more than once (a tar archive
 /// allows duplicate entries; the extraction loop writes them in order, so

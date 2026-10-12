@@ -1351,3 +1351,375 @@ async fn spec_0020_us_0018_duplicate_tar_path_refused_with_netted_total() {
     assert!(!w.exists("/pack/x").await, "no node at the refused path");
     assert_eq!(w.used().await, 1_000_000);
 }
+
+// ── US-0019: version control operations under the limit ─────────────────────
+
+use crate::errors::ToolError;
+use crate::git::GitRepoStore;
+use crate::mcp::server::{
+    GitBranchCreateArgs, GitBranchSwitchArgs, GitCheckoutFileArgs, GitCherryPickArgs, GitMergeArgs,
+    GitStashIdArgs, GitStashSaveArgs,
+};
+use crate::tools::git as vc;
+
+/// The refusal message of FR-NEW-001 as a version control tool returns it.
+fn vc_refusal(used: i64, requested: i64) -> String {
+    format!(
+        "project storage quota of 1 MB exceeded: {used} bytes used, {requested} bytes requested"
+    )
+}
+
+fn assert_refused(r: crate::errors::Result<Value>, used: i64, requested: i64) {
+    let e: ToolError = r.expect_err("the operation must be refused");
+    assert_eq!(e.code, "ERR_PROJECT_QUOTA_EXCEEDED", "got: {e:?}");
+    assert_eq!(e.message, vc_refusal(used, requested));
+}
+
+/// Atlas with version control on. Setup steps (commits, branch moves) run as
+/// Olivia, so Mia's session budget is untouched when she runs the operation
+/// under test.
+struct Vc {
+    w: World,
+    store: Arc<GitRepoStore>,
+}
+
+impl Vc {
+    async fn new() -> Vc {
+        let w = World::new(true).await;
+        let store = Arc::new(GitRepoStore::new(
+            w.f.state.config.clone(),
+            w.f.state.stores.relational().clone(),
+        ));
+        Vc { w, store }
+    }
+
+    fn g(&self) -> Option<Arc<GitRepoStore>> {
+        Some(self.store.clone())
+    }
+
+    async fn init(&self) {
+        let init = MountOnlyArgs { mount_id: ATLAS.into() };
+        vc::tool_init(self.w.f.ctx(OLIVIA), init, self.g()).await.unwrap();
+    }
+
+    async fn commit(&self, message: &str) -> String {
+        let args = GitCommitArgs {
+            mount_id: ATLAS.into(),
+            message: message.into(),
+            author_name: None,
+            author_email: None,
+        };
+        let out = vc::tool_commit(self.w.f.ctx(OLIVIA), args, self.g()).await.unwrap();
+        out["commit_sha"].as_str().expect("a commit sha").to_string()
+    }
+
+    /// Olivia creates `name` at HEAD and checks it out.
+    async fn branch_out(&self, name: &str) {
+        let args = GitBranchCreateArgs {
+            mount_id: ATLAS.into(),
+            name: name.into(),
+            start_point: String::new(),
+            checkout: true,
+        };
+        vc::tool_branch_create(self.w.f.ctx(OLIVIA), args, self.g()).await.unwrap();
+    }
+
+    async fn switch(&self, person: &str, name: &str) -> crate::errors::Result<Value> {
+        let args = GitBranchSwitchArgs { mount_id: ATLAS.into(), name: name.into() };
+        vc::tool_branch_switch(self.w.f.ctx(person), args, self.g()).await
+    }
+
+    async fn head(&self) -> String {
+        let entry = self.store.get_or_open_repo(ATLAS).await.unwrap();
+        entry.db.get_ref("HEAD").await.unwrap().expect("a HEAD").target
+    }
+
+    async fn delete(&self, path: &str) {
+        let client = self.w.f.state.stores.client(ATLAS).await.unwrap();
+        client.delete_file(path).await.unwrap();
+    }
+
+    async fn size(&self, path: &str) -> Option<usize> {
+        self.w.content(path).await.map(|b| b.len())
+    }
+}
+
+/// A bare repository at `dir` whose `main` is one commit per tree in `trees`,
+/// in order, each tree replacing the previous one; returns its `file://` url.
+fn vc_remote(dir: &std::path::Path, trees: &[&[(&str, usize)]]) -> String {
+    let repo = git2::Repository::init_bare(dir).unwrap();
+    for files in trees {
+        vc_remote_commit(&repo, files);
+    }
+    repo.set_head("refs/heads/main").unwrap();
+    format!("file://{}", dir.display())
+}
+
+/// One more commit on `repo`'s `main` whose tree is exactly `files`.
+fn vc_remote_commit(repo: &git2::Repository, files: &[(&str, usize)]) {
+    let parent = repo.find_reference("refs/heads/main").ok().map(|r| r.peel_to_commit().unwrap());
+    let mut builder = repo.treebuilder(None).unwrap();
+    for (name, len) in files {
+        let blob = repo.blob(&noise(*len, *len as u64 ^ name.len() as u64)).unwrap();
+        builder.insert(*name, blob, 0o100_644).unwrap();
+    }
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let sig =
+        git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_000, 0)).unwrap();
+    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    repo.commit(Some("refs/heads/main"), &sig, &sig, "remote\n", &tree, &parents).unwrap();
+}
+
+/// SPEC-0020/E2E-031: a clone whose files exceed the room left is refused and
+/// imports no file (FR-NEW-003, FR-NEW-007).
+#[tokio::test]
+async fn spec_0020_e2e_031_a_clone_over_the_limit_imports_nothing() {
+    let v = Vc::new().await;
+    v.w.limit(Some(MB)).await;
+    v.w.seed("/seed.bin", 1_000_000).await;
+    let url =
+        vc_remote(&v.w.f.dir.path().join("remote-031"), &[&[("a.bin", 30_000), ("b.bin", 30_000)]]);
+
+    let r = vc::test_support::clone_from(&v.w.f.ctx(MIA), v.store.clone(), ATLAS, &url).await;
+    assert_refused(r, 1_000_000, 60_000);
+    assert!(v.w.content("/a.bin").await.is_none());
+    assert!(v.w.content("/b.bin").await.is_none());
+    assert_eq!(v.w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/E2E-036: a clone counts its files, never its history
+/// (FR-NEW-002, FR-NEW-003).
+#[tokio::test]
+async fn spec_0020_e2e_036_a_clone_counts_files_not_history() {
+    let v = Vc::new().await;
+    v.w.limit(Some(MB)).await;
+    v.w.seed("/seed.bin", 1_000_000).await;
+    let old: &[(&str, usize)] = &[("old.bin", 460_000)];
+    let now: &[(&str, usize)] = &[("a.bin", 20_000), ("b.bin", 20_000)];
+    let url = vc_remote(&v.w.f.dir.path().join("remote-036"), &[old, now]);
+
+    vc::test_support::clone_from(&v.w.f.ctx(MIA), v.store.clone(), ATLAS, &url).await.unwrap();
+    assert_eq!(v.size("/a.bin").await, Some(20_000));
+    assert_eq!(v.w.used().await, 1_040_000);
+}
+
+/// SPEC-0020/E2E-032: a pull bringing more than the room left is refused and
+/// the files stay at their previous commit (FR-NEW-007, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_e2e_032_a_pull_over_the_limit_keeps_the_previous_commit() {
+    let v = Vc::new().await;
+    let dir = v.w.f.dir.path().join("remote-032");
+    let url = vc_remote(&dir, &[&[("c.txt", 10)]]);
+    vc::test_support::clone_from(&v.w.f.ctx(OLIVIA), v.store.clone(), ATLAS, &url).await.unwrap();
+    // Local work committed on top of the clone brings usage to 1 000 000.
+    v.w.seed("/seed.bin", 999_990).await;
+    v.commit("local").await;
+    v.w.limit(Some(MB)).await;
+    let remote = git2::Repository::open_bare(&dir).unwrap();
+    vc_remote_commit(&remote, &[("c.txt", 10), ("new.bin", 50_000)]);
+    let before = v.w.content("/c.txt").await;
+
+    let r = vc::test_support::pull_from(&v.w.f.ctx(MIA), &v.store, ATLAS, &url, "main").await;
+    assert_refused(r, 1_000_000, 50_000);
+    assert!(v.w.content("/new.bin").await.is_none());
+    assert_eq!(v.w.content("/c.txt").await, before);
+    assert_eq!(v.w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/E2E-033: a merge adding more than the room left is refused and
+/// the target branch's files are unchanged (FR-NEW-003, FR-NEW-007).
+#[tokio::test]
+async fn spec_0020_e2e_033_a_merge_over_the_limit_leaves_main_unchanged() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 1_000_000).await;
+    v.init().await;
+    v.commit("base").await;
+    v.branch_out("feature").await;
+    v.w.seed("/f.bin", 49_000).await;
+    v.commit("feature").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    v.w.limit(Some(MB)).await;
+    let seed = v.w.content("/seed.bin").await;
+
+    let args = GitMergeArgs {
+        mount_id: ATLAS.into(),
+        source_ref: "feature".into(),
+        squash: false,
+        message: None,
+    };
+    assert_refused(vc::tool_merge(v.w.f.ctx(MIA), args, v.g()).await, 1_000_000, 49_000);
+    assert!(v.w.content("/f.bin").await.is_none());
+    assert_eq!(v.w.content("/seed.bin").await, seed);
+    assert_eq!(v.w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/E2E-034: a branch switch growing a file past the room left is
+/// refused; the branch and its files stay (FR-NEW-003, FR-NEW-007).
+#[tokio::test]
+async fn spec_0020_e2e_034_a_switch_over_the_limit_keeps_the_branch() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 900_000).await;
+    v.w.seed("/r.md", 100_000).await;
+    v.init().await;
+    v.commit("base").await;
+    v.branch_out("big").await;
+    v.w.seed("/r.md", 150_000).await;
+    v.commit("big").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    v.w.limit(Some(MB)).await;
+    let r_md = v.w.content("/r.md").await;
+    assert_eq!(v.w.used().await, 1_000_000);
+
+    assert_refused(v.switch(MIA, "big").await, 1_000_000, 50_000);
+    assert_eq!(v.head().await, "refs/heads/main");
+    assert_eq!(v.w.content("/r.md").await, r_md);
+    assert_eq!(v.w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/E2E-035: a switch that shrinks the project is accepted even over
+/// the limit (FR-NEW-004).
+#[tokio::test]
+async fn spec_0020_e2e_035_a_shrinking_switch_over_the_limit_is_accepted() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 1_300_000).await;
+    v.w.seed("/x.bin", 200_000).await;
+    v.init().await;
+    v.commit("base").await;
+    v.branch_out("slim").await;
+    v.delete("/x.bin").await;
+    v.commit("slim").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    v.w.limit(Some(MB)).await;
+    assert_eq!(v.w.used().await, 1_500_000);
+
+    v.switch(MIA, "slim").await.unwrap();
+    assert_eq!(v.w.used().await, 1_300_000);
+    assert_eq!(v.w.independent_sum().await, 1_300_000);
+}
+
+/// SPEC-0020/E2E-065: a cherry pick over the limit is refused and writes
+/// nothing (FR-NEW-003, FR-NEW-007).
+#[tokio::test]
+async fn spec_0020_e2e_065_a_cherry_pick_over_the_limit_writes_nothing() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 1_500_000).await;
+    v.init().await;
+    v.commit("base").await;
+    v.branch_out("feature").await;
+    v.w.seed("/k.txt", 10).await;
+    let pick = v.commit("k").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    v.w.limit(Some(MB)).await;
+
+    let args = GitCherryPickArgs { mount_id: ATLAS.into(), commit_sha: pick, mainline: 0 };
+    let r = vc::tool_cherry_pick(v.w.f.ctx(MIA), args, 0, v.g()).await;
+    assert_refused(r, 1_500_000, 10);
+    assert!(v.w.content("/k.txt").await.is_none());
+    assert_eq!(v.w.used().await, 1_500_000);
+}
+
+/// SPEC-0020/E2E-066: a stash pop over the limit is refused, writes nothing
+/// and keeps the stash (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_e2e_066_a_stash_pop_over_the_limit_keeps_the_stash() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 1_000_000).await;
+    v.init().await;
+    v.commit("base").await;
+    v.w.seed("/st.txt", 50_000).await;
+    let args = GitStashSaveArgs { mount_id: ATLAS.into(), message: None };
+    let saved = vc::tool_stash_save(v.w.f.ctx(OLIVIA), args, v.g()).await.unwrap();
+    let stash_id = saved["stash_id"].as_str().expect("a stash id").to_string();
+    v.w.limit(Some(MB)).await;
+    assert_eq!(v.w.used().await, 1_000_000);
+
+    let args = GitStashIdArgs { mount_id: ATLAS.into(), stash_id };
+    let r = vc::tool_stash_apply_or_pop(v.w.f.ctx(MIA), args, v.g(), "git.stash_pop", true).await;
+    assert_refused(r, 1_000_000, 50_000);
+    assert!(v.w.content("/st.txt").await.is_none());
+    let list = MountOnlyArgs { mount_id: ATLAS.into() };
+    let stashes = vc::tool_stash_list(v.w.f.ctx(MIA), list, v.g()).await.unwrap();
+    assert_eq!(stashes["count"], 1, "the stash still exists: {stashes}");
+}
+
+/// SPEC-0020/E2E-067: a removed path leaves the usage at once, not to the
+/// trash, so a switch whose net change is negative is accepted
+/// (FR-NEW-003, FR-NEW-004).
+#[tokio::test]
+async fn spec_0020_e2e_067_a_removed_path_leaves_the_usage_at_once() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 1_400_000).await;
+    v.w.seed("/r.md", 100_000).await;
+    v.init().await;
+    v.commit("base").await;
+    v.branch_out("swap").await;
+    v.delete("/r.md").await;
+    v.w.seed("/n2.txt", 50_000).await;
+    v.commit("swap").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    v.w.limit(Some(MB)).await;
+    assert_eq!(v.w.used().await, 1_500_000);
+
+    v.switch(MIA, "swap").await.unwrap();
+    assert!(v.w.content("/r.md").await.is_none());
+    assert_eq!(v.size("/n2.txt").await, Some(50_000));
+    assert_eq!(v.w.used().await, 1_450_000);
+    // A trashed `/r.md` would still be counted by the sum over the tree.
+    assert_eq!(v.w.independent_sum().await, 1_450_000);
+}
+
+/// SPEC-0020/E2E-068: a merge abort is accepted whatever the limit
+/// (FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_e2e_068_a_merge_abort_is_accepted_over_the_limit() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 1_299_990).await;
+    v.w.seed("/big.bin", 100_000).await;
+    v.w.seed_text("/c.txt", "base text\n").await;
+    v.init().await;
+    v.commit("base").await;
+    v.branch_out("feature").await;
+    v.delete("/big.bin").await;
+    v.w.seed_text("/c.txt", "featurexx\n").await;
+    v.commit("feature").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    v.w.seed_text("/c.txt", "main text\n").await;
+    v.commit("main").await;
+    assert_eq!(v.w.used().await, 1_400_000);
+
+    let args = GitMergeArgs {
+        mount_id: ATLAS.into(),
+        source_ref: "feature".into(),
+        squash: false,
+        message: None,
+    };
+    let out = vc::tool_merge(v.w.f.ctx(MIA), args, v.g()).await.unwrap();
+    assert_eq!(out["status"], "conflict", "got: {out}");
+    v.w.limit(Some(MB)).await;
+
+    let abort = MountOnlyArgs { mount_id: ATLAS.into() };
+    let out = vc::tool_merge_abort(v.w.f.ctx(MIA), abort, v.g()).await.unwrap();
+    assert_eq!(out["status"], "aborted", "got: {out}");
+    assert_eq!(v.size("/big.bin").await, Some(100_000));
+    assert_eq!(v.w.used().await, 1_400_000);
+}
+
+/// SPEC-0020/E2E-069: restoring a file from a commit is checked for its
+/// growth (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_e2e_069_a_file_restore_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    v.w.seed("/seed.bin", 900_000).await;
+    v.w.seed("/r.md", 150_000).await;
+    v.init().await;
+    let last = v.commit("base").await;
+    v.w.seed("/r.md", 100_000).await;
+    v.w.limit(Some(MB)).await;
+    assert_eq!(v.w.used().await, 1_000_000);
+
+    let args =
+        GitCheckoutFileArgs { mount_id: ATLAS.into(), commit_sha: last, path: "/r.md".into() };
+    assert_refused(vc::tool_checkout_file(v.w.f.ctx(MIA), args, v.g()).await, 1_000_000, 50_000);
+    assert_eq!(v.size("/r.md").await, Some(100_000));
+    assert_eq!(v.w.used().await, 1_000_000);
+}

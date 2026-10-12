@@ -1398,8 +1398,18 @@ pub(crate) async fn tool_checkout_file(
         on_git_thread(move || async move { read_from_commit(&entry, &commit_sha, &norm).await })
             .await?
     };
-    // A restore is a write, so it is charged like any other.
-    ctx.state.safety.charge_write(&ctx.person, &mount_id, bytes.len() as i64)?;
+    // A restore is a write, so it is admitted like any other: the project
+    // limit on its growth over the current file, then the session charge
+    // (SPEC-0020 FR-NEW-003), the admission held until the write landed.
+    let _admission = crate::quota::admit_file(
+        &client,
+        &ctx.state.safety,
+        &ctx.person,
+        &mount_id,
+        &norm,
+        bytes.len() as i64,
+    )
+    .await?;
     client.write_bytes_atomic(&norm, &bytes).await?;
     ctx.state.safety.record_audit(
         &ctx.person,
@@ -3098,10 +3108,6 @@ async fn clone_and_import_inner(
                 "git.remote_clone imported {imported_objects} objects into '{mount_owned}'"
             );
 
-            let tip_sha = tip.id().to_string();
-            entry.db.set_ref("HEAD", &format!("refs/heads/{target_branch}"), true).await?;
-            entry.db.set_ref(&format!("refs/heads/{target_branch}"), &tip_sha, false).await?;
-
             // Working tree files into the volume, one by one, isolating failures so a
             // single unwritable path does not abort the whole import.
             let client = state.stores.client(&mount_owned).await?;
@@ -3109,16 +3115,33 @@ async fn clone_and_import_inner(
             let mut files = Vec::new();
             collect_blobs(&cloned, &tree, "", &mut files)?;
 
-            // Charge the whole import against the session quota BEFORE writing anything.
-            // Writing first and charging per file would leave a half populated volume when
-            // the budget runs out; a clone either fits or is refused cleanly. Importing a
-            // large repository therefore needs safety.write_quota_bytes raised, which is
-            // the honest trade: a bulk write is still a write.
-            let total_bytes: i64 = files
+            // Admit the whole import BEFORE writing anything, and before the refs move:
+            // the project limit on the net change of the working tree files (history is
+            // not project storage, SPEC-0020 FR-NEW-002, FR-NEW-003), then the session
+            // charge of their total. Writing first and charging per file would leave a
+            // half populated volume when the budget runs out; a clone either fits or is
+            // refused cleanly. The admission is held until the last file landed (DEC-002).
+            let sized: Vec<(String, i64)> = files
                 .iter()
-                .filter_map(|(_, oid)| cloned.find_blob(*oid).ok().map(|b| b.size() as i64))
-                .sum();
-            state.safety.charge_write(&person_owned, &mount_owned, total_bytes)?;
+                .map(|(rel, oid)| {
+                    let size = cloned.find_blob(*oid).map(|b| b.size() as i64).unwrap_or(0);
+                    (format!("/{rel}"), size)
+                })
+                .collect();
+            let total_bytes: i64 = sized.iter().map(|(_, size)| size).sum();
+            let _admission = crate::quota::admit_paths(
+                &client,
+                &state.safety,
+                &person_owned,
+                &mount_owned,
+                total_bytes,
+                &sized,
+            )
+            .await?;
+
+            let tip_sha = tip.id().to_string();
+            entry.db.set_ref("HEAD", &format!("refs/heads/{target_branch}"), true).await?;
+            entry.db.set_ref(&format!("refs/heads/{target_branch}"), &tip_sha, false).await?;
 
             let mut imported = 0usize;
             let mut skipped: Vec<String> = Vec::new();

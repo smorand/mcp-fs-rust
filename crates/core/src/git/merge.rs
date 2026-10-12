@@ -659,13 +659,19 @@ pub fn diff_tree_changes(
     Ok(changes)
 }
 
-/// Charge the quota, then apply, giving the charge back when the apply refused
+/// Admit, then apply, giving the session charge back when the apply refused
 /// (FR-NEW-184, FR-NEW-185).
 ///
-/// The charge must come first, so an over-quota operation is rejected before a
-/// byte moves. The refund is what makes the pair all-or-nothing including its
-/// cost: pass 1 of [`apply_changes_atomically`] pre-checks every target, so a
-/// refusal there provably wrote nothing and must not consume quota.
+/// The admission must come first, so an over-limit operation is rejected before
+/// a byte moves, and it is held until the last change landed (SPEC-0020
+/// DEC-002): a writer admitted in between would be checked against a usage
+/// about to change. The refund is what makes the pair all-or-nothing including
+/// its cost: pass 1 of [`apply_changes_atomically`] pre-checks every target, so
+/// a refusal there provably wrote nothing and must not consume budget.
+///
+/// Lock order: the repository's write lock and its `repo` mutex, both taken by
+/// every caller, are outer; the volume's admission lock is inner. No path that
+/// holds the admission lock ever takes a git lock, so the order cannot invert.
 pub async fn charge_and_apply(
     operation: &str,
     repo: &Repository,
@@ -674,7 +680,10 @@ pub async fn charge_and_apply(
     client: &VolumeClient,
     changes: &[TreeChange],
 ) -> Result<()> {
-    let charged = charge_quota(repo, safety, person, client, changes)?;
+    let (charged, net) = quota_basis(repo, changes);
+    let _admission =
+        crate::quota::admit_paths(client, safety, person, &client.project_id, charged, &net)
+            .await?;
     match apply_changes_atomically(operation, client, repo, changes).await {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -684,26 +693,32 @@ pub async fn charge_and_apply(
     }
 }
 
-/// FR-NEW-069: the single authority on the basis of a combine operation's
-/// write-quota charge, fast-forward or merged. Sums only the size of the blobs
-/// actually written (`TreeChange::Write`); a deleted path never adds bytes.
-/// Returns what was charged, so a caller that fails to apply can give it back.
-pub fn charge_quota(
-    repo: &Repository,
-    safety: &SafetyManager,
-    person: &str,
-    client: &VolumeClient,
-    changes: &[TreeChange],
-) -> Result<i64> {
-    let charge_bytes: i64 = changes
-        .iter()
-        .filter_map(|c| match c {
-            TreeChange::Write { oid, .. } => repo.find_blob(*oid).ok().map(|b| b.size() as i64),
-            TreeChange::Delete { .. } => None,
-        })
-        .sum();
-    safety.charge_write(person, &client.project_id, charge_bytes)?;
-    Ok(charge_bytes)
+/// The two bases of a combine operation's admission, fast-forward or merged.
+///
+/// The session charge (FR-NEW-069, unchanged by SPEC-0020) sums only the
+/// blobs actually written: a deleted path never adds bytes. The project's net
+/// change (SPEC-0020 FR-NEW-003, DEC-003) is every touched path at its new
+/// size, a removed path at 0, handed to [`crate::quota::admit_paths`], which
+/// subtracts each path's current size under the admission lock. Removed paths
+/// come first so a path both removed and written (a type change) counts its
+/// written size once: `admit_paths` keeps the last occurrence. A removal is a
+/// hard delete, so its bytes leave the usage at once rather than to the trash.
+fn quota_basis(repo: &Repository, changes: &[TreeChange]) -> (i64, Vec<(String, i64)>) {
+    let mut charged = 0i64;
+    let mut removed = Vec::new();
+    let mut written = Vec::new();
+    for change in changes {
+        match change {
+            TreeChange::Write { path, oid } => {
+                let size = repo.find_blob(*oid).map(|b| b.size() as i64).unwrap_or(0);
+                charged += size;
+                written.push((path.clone(), size));
+            }
+            TreeChange::Delete { path } => removed.push((path.clone(), 0)),
+        }
+    }
+    removed.extend(written);
+    (charged, removed)
 }
 
 /// Apply every change to the volume, or none of them (FR-NEW-035, DEC-023).
