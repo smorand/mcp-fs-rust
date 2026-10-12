@@ -1725,7 +1725,7 @@ impl McpServer {
         name = "fs.search_replace",
         description = "Replace a multi-line block (optional fuzzy match)."
     )]
-    async fn fs_search_replace(
+    pub(crate) async fn fs_search_replace(
         &self,
         Parameters(a): Parameters<SearchReplaceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1754,7 +1754,7 @@ impl McpServer {
         name = "fs.insert_at_line",
         description = "Insert content before a 1-based line number."
     )]
-    async fn fs_insert_at_line(
+    pub(crate) async fn fs_insert_at_line(
         &self,
         Parameters(a): Parameters<InsertAtLineArgs>,
     ) -> Result<CallToolResult, ErrorData> {

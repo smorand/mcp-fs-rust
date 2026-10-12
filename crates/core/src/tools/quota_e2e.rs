@@ -2193,3 +2193,456 @@ async fn spec_0020_e2e_064_two_racing_overshoots_are_both_refused() {
     }
     assert_eq!(w.used().await, 1_048_000);
 }
+
+// ── US-0021: remaining version control operations under the limit ───────────
+
+use crate::mcp::server::{
+    GitBranchResetArgs, GitMergeResolveArgs, GitRebaseArgs, GitResetArgs, GitResolutionsArgs,
+    GitRevertArgs, RebaseTodoItem, ResolutionArg,
+};
+
+/// Every US-0021 setup lands at this usage before the limit drops to 1 MB, as
+/// SPEC-0020/E2E-044 does.
+const OVER: i64 = 1_500_000;
+
+/// A 10 byte resolution of `/c.txt`, the same size as every version of it, so
+/// the only growth an operation brings is `/k.txt`.
+fn resolved_c() -> Vec<ResolutionArg> {
+    vec![ResolutionArg {
+        path: "/c.txt".into(),
+        strategy: None,
+        content: Some("resolved!\n".into()),
+    }]
+}
+
+impl Vc {
+    /// The commit the checked out branch points at.
+    async fn head_sha(&self) -> String {
+        let entry = self.store.get_or_open_repo(ATLAS).await.unwrap();
+        let branch = self.head().await;
+        entry.db.get_ref(&branch).await.unwrap().expect("a branch tip").target
+    }
+
+    /// `/seed.bin` and a 10 byte `/c.txt`, committed on `main`: exactly
+    /// [`OVER`] bytes.
+    async fn base(&self) {
+        self.w.seed("/seed.bin", 1_499_990).await;
+        self.w.seed_text("/c.txt", "base text\n").await;
+        self.init().await;
+        self.commit("base").await;
+    }
+
+    /// A `feature` branch rewriting `/c.txt` (adding `/k.txt` too when
+    /// `with_k`), and `main` adding `/k.txt` when `!with_k`, rewriting
+    /// `/c.txt` when `main_edits_c`. Leaves `main` checked out; returns the
+    /// feature commit.
+    async fn diverge(&self, with_k: bool, main_edits_c: bool) -> String {
+        self.base().await;
+        self.branch_out("feature").await;
+        self.w.seed_text("/c.txt", "featurexx\n").await;
+        if with_k {
+            self.w.seed("/k.txt", 10).await;
+        }
+        let feature = self.commit("feature").await;
+        self.switch(OLIVIA, "main").await.unwrap();
+        if main_edits_c {
+            self.w.seed_text("/c.txt", "main text\n").await;
+        }
+        if !with_k {
+            self.w.seed("/k.txt", 10).await;
+        }
+        self.commit("main").await;
+        feature
+    }
+
+    /// `/k.txt` committed at the returned sha, then removed by the next
+    /// commit, so usage ends at [`OVER`] with `/k.txt` one commit back.
+    /// `/c.txt` is rewritten by the removal and again after when `conflict`,
+    /// so reverting the removal conflicts on it.
+    async fn k_then_removed(&self, conflict: bool) -> (String, String) {
+        self.w.seed("/seed.bin", 1_499_990).await;
+        self.w.seed_text("/c.txt", "base text\n").await;
+        self.w.seed("/k.txt", 10).await;
+        self.init().await;
+        let with_k = self.commit("with k").await;
+        self.delete("/k.txt").await;
+        if conflict {
+            self.w.seed_text("/c.txt", "aaaa text\n").await;
+        }
+        let removal = self.commit("remove k").await;
+        if conflict {
+            self.w.seed_text("/c.txt", "bbbb text\n").await;
+            self.commit("after").await;
+        }
+        (with_k, removal)
+    }
+
+    /// The paused rebase of `feature` onto `main`, both rewriting `/c.txt`.
+    async fn paused_rebase(&self) {
+        let feature = self.diverge(false, true).await;
+        self.switch(OLIVIA, "feature").await.unwrap();
+        let out =
+            vc::tool_rebase(self.w.f.ctx(OLIVIA), rebase_args(&feature), self.g()).await.unwrap();
+        assert_eq!(out["status"], "conflict", "got: {out}");
+    }
+
+    /// The paused cherry pick onto `main` of a feature commit adding `/k.txt`.
+    async fn paused_cherry_pick(&self) {
+        let feature = self.diverge(true, true).await;
+        let args = GitCherryPickArgs { mount_id: ATLAS.into(), commit_sha: feature, mainline: 0 };
+        let out = vc::tool_cherry_pick(self.w.f.ctx(OLIVIA), args, 0, self.g()).await.unwrap();
+        assert_eq!(out["status"], "conflict", "got: {out}");
+    }
+
+    /// The paused revert of the commit that removed `/k.txt`.
+    async fn paused_revert(&self) {
+        let (_, removal) = self.k_then_removed(true).await;
+        let out = vc::tool_revert(self.w.f.ctx(OLIVIA), revert_args(&removal), 0, self.g())
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "conflict", "got: {out}");
+    }
+
+    /// Drops the limit to 1 MB and checks the usage is [`OVER`]; returns
+    /// `/c.txt` as it stands, the file every test checks is left alone.
+    async fn lower(&self) -> Option<Vec<u8>> {
+        self.w.limit(Some(MB)).await;
+        assert_eq!(self.w.used().await, OVER);
+        self.w.content("/c.txt").await
+    }
+
+    /// FR-NEW-013: neither `/k.txt` nor `/c.txt` nor the usage moved.
+    async fn unchanged(&self, c_txt: Option<Vec<u8>>) {
+        assert!(self.w.content("/k.txt").await.is_none());
+        assert_eq!(self.w.content("/c.txt").await, c_txt);
+        assert_eq!(self.w.used().await, OVER);
+        assert_eq!(self.w.independent_sum().await, OVER);
+    }
+}
+
+fn rebase_args(pick: &str) -> GitRebaseArgs {
+    GitRebaseArgs {
+        mount_id: ATLAS.into(),
+        onto: "main".into(),
+        todo: vec![RebaseTodoItem { action: "pick".into(), sha: pick.into(), message: None }],
+    }
+}
+
+fn revert_args(commit: &str) -> GitRevertArgs {
+    GitRevertArgs { mount_id: ATLAS.into(), commit_sha: commit.into(), mainline: 0 }
+}
+
+fn resolutions() -> GitResolutionsArgs {
+    GitResolutionsArgs { mount_id: ATLAS.into(), resolutions: Some(resolved_c()) }
+}
+
+/// SPEC-0020/US-0021: a rebase whose landing adds `/k.txt` is refused
+/// (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_rebase_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    let feature = v.diverge(false, false).await;
+    v.switch(OLIVIA, "feature").await.unwrap();
+    let c_txt = v.lower().await;
+
+    let r = vc::tool_rebase(v.w.f.ctx(MIA), rebase_args(&feature), v.g()).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: a rebase continue after Mia resolves the conflict is
+/// refused for the `/k.txt` it lands (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_rebase_continue_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    v.paused_rebase().await;
+    let c_txt = v.lower().await;
+
+    let r = vc::tool_rebase_continue(v.w.f.ctx(MIA), resolutions(), v.g()).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: reverting the commit that removed `/k.txt` is refused
+/// (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_revert_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    let (_, removal) = v.k_then_removed(false).await;
+    let c_txt = v.lower().await;
+
+    let r = vc::tool_revert(v.w.f.ctx(MIA), revert_args(&removal), 0, v.g()).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: a revert continue landing `/k.txt` is refused
+/// (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_revert_continue_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    v.paused_revert().await;
+    let c_txt = v.lower().await;
+
+    let r = vc::tool_revert_continue(v.w.f.ctx(MIA), resolutions(), v.g()).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: a cherry pick continue landing `/k.txt` is refused
+/// (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_cherry_pick_continue_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    v.paused_cherry_pick().await;
+    let c_txt = v.lower().await;
+
+    let r = vc::tool_cherry_pick_continue(v.w.f.ctx(MIA), resolutions(), v.g()).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: resolving a merge conflict whose merge adds `/k.txt` is
+/// refused (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_merge_resolve_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    v.diverge(true, true).await;
+    let args = GitMergeArgs {
+        mount_id: ATLAS.into(),
+        source_ref: "feature".into(),
+        squash: false,
+        message: None,
+    };
+    let out = vc::tool_merge(v.w.f.ctx(OLIVIA), args, v.g()).await.unwrap();
+    assert_eq!(out["status"], "conflict", "got: {out}");
+    let c_txt = v.lower().await;
+
+    let args = GitMergeResolveArgs { mount_id: ATLAS.into(), resolutions: resolved_c() };
+    let r = vc::tool_merge_resolve(v.w.f.ctx(MIA), args, v.g()).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: a hard reset to a commit holding `/k.txt` is refused
+/// and the branch stays (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_reset_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    let (with_k, removal) = v.k_then_removed(false).await;
+    let c_txt = v.lower().await;
+
+    let args = GitResetArgs { mount_id: ATLAS.into(), target_ref: with_k, mode: "hard".into() };
+    assert_refused(vc::tool_reset(v.w.f.ctx(MIA), args, v.g()).await, OVER, 10);
+    v.unchanged(c_txt).await;
+    let entry = v.store.get_or_open_repo(ATLAS).await.unwrap();
+    assert_eq!(entry.db.get_ref("refs/heads/main").await.unwrap().unwrap().target, removal);
+}
+
+/// SPEC-0020/US-0021: creating and checking out a branch at a commit holding
+/// `/k.txt` is refused and HEAD stays on `main` (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_branch_create_checkout_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    let c_txt = v.lower().await;
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k,
+        checkout: true,
+    };
+    assert_refused(vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await, OVER, 10);
+    v.unchanged(c_txt).await;
+    assert_eq!(v.head().await, "refs/heads/main");
+}
+
+/// SPEC-0020/US-0021: moving the checked out branch forward onto `/k.txt` is
+/// refused and the branch stays (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_branch_reset_over_the_limit_is_refused() {
+    let v = Vc::new().await;
+    v.base().await;
+    let main = v.head_sha().await;
+    v.branch_out("feature").await;
+    v.w.seed("/k.txt", 10).await;
+    let feature = v.commit("k").await;
+    v.switch(OLIVIA, "main").await.unwrap();
+    let c_txt = v.lower().await;
+
+    let args = GitBranchResetArgs {
+        mount_id: ATLAS.into(),
+        name: "main".into(),
+        target_commit: feature,
+        force: false,
+    };
+    assert_refused(vc::tool_branch_reset(v.w.f.ctx(MIA), args, v.g()).await, OVER, 10);
+    v.unchanged(c_txt).await;
+    assert_eq!(v.head_sha().await, main);
+}
+
+/// SPEC-0020/US-0021: stashing an uncommitted `/k.txt` over the limit is
+/// accepted, it only removes bytes, and applying that stash is then refused
+/// (FR-NEW-003, FR-NEW-004, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_stash_save_accepted_then_apply_refused() {
+    let v = Vc::new().await;
+    v.base().await;
+    v.w.seed("/k.txt", 10).await;
+    v.w.limit(Some(MB)).await;
+    assert_eq!(v.w.used().await, OVER + 10);
+
+    let args = GitStashSaveArgs { mount_id: ATLAS.into(), message: None };
+    let saved = vc::tool_stash_save(v.w.f.ctx(MIA), args, v.g()).await.unwrap();
+    let stash_id = saved["stash_id"].as_str().expect("a stash id").to_string();
+    let c_txt = v.w.content("/c.txt").await;
+    v.unchanged(c_txt.clone()).await;
+
+    let args = GitStashIdArgs { mount_id: ATLAS.into(), stash_id };
+    let r =
+        vc::tool_stash_apply_or_pop(v.w.f.ctx(MIA), args, v.g(), "git.stash_apply", false).await;
+    assert_refused(r, OVER, 10);
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: a rebase abort over the limit is accepted and puts the
+/// branch and its files back (FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_us_0021_rebase_abort_over_the_limit_is_accepted() {
+    let v = Vc::new().await;
+    let before = {
+        let feature = v.diverge(false, true).await;
+        v.switch(OLIVIA, "feature").await.unwrap();
+        let tip = v.head_sha().await;
+        let out = vc::tool_rebase(v.w.f.ctx(OLIVIA), rebase_args(&feature), v.g()).await.unwrap();
+        assert_eq!(out["status"], "conflict", "got: {out}");
+        tip
+    };
+    let c_txt = v.lower().await;
+
+    let abort = MountOnlyArgs { mount_id: ATLAS.into() };
+    let out = vc::tool_rebase_abort(v.w.f.ctx(MIA), abort, v.g()).await.unwrap();
+    assert_eq!(out["status"], "aborted", "got: {out}");
+    assert_eq!(c_txt.as_deref(), Some(&b"featurexx\n"[..]));
+    v.unchanged(c_txt).await;
+    assert_eq!(v.head_sha().await, before);
+}
+
+/// SPEC-0020/US-0021: a cherry pick abort over the limit is accepted and puts
+/// the branch and its files back (FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_us_0021_cherry_pick_abort_over_the_limit_is_accepted() {
+    let v = Vc::new().await;
+    v.paused_cherry_pick().await;
+    let c_txt = v.lower().await;
+    assert_eq!(c_txt.as_deref(), Some(&b"main text\n"[..]));
+
+    let abort = MountOnlyArgs { mount_id: ATLAS.into() };
+    let out = vc::tool_cherry_pick_abort(v.w.f.ctx(MIA), abort, v.g()).await.unwrap();
+    assert_eq!(out["status"], "aborted", "got: {out}");
+    assert_eq!(out["restored_sha"].as_str(), Some(v.head_sha().await.as_str()));
+    v.unchanged(c_txt).await;
+}
+
+/// SPEC-0020/US-0021: a revert abort over the limit is accepted and puts the
+/// branch and its files back (FR-NEW-012).
+#[tokio::test]
+async fn spec_0020_us_0021_revert_abort_over_the_limit_is_accepted() {
+    let v = Vc::new().await;
+    v.paused_revert().await;
+    let c_txt = v.lower().await;
+    assert_eq!(c_txt.as_deref(), Some(&b"bbbb text\n"[..]));
+
+    let abort = MountOnlyArgs { mount_id: ATLAS.into() };
+    let out = vc::tool_revert_abort(v.w.f.ctx(MIA), abort, v.g()).await.unwrap();
+    assert_eq!(out["status"], "aborted", "got: {out}");
+    assert_eq!(out["restored_sha"].as_str(), Some(v.head_sha().await.as_str()));
+    v.unchanged(c_txt).await;
+}
+
+use crate::mcp::server::{InsertAtLineArgs, SearchReplaceArgs};
+
+impl World {
+    /// The shared setup with a one byte `/r.md` Mia has read, so an edit tool
+    /// may grow it: usage stays at 1 000 000 bytes.
+    async fn shared_with_x() -> World {
+        let w = World::new(false).await;
+        w.limit(Some(MB)).await;
+        w.seed("/seed.bin", 999_999).await;
+        w.seed_text("/r.md", "X").await;
+        w.read_as_mia("/r.md").await;
+        assert_eq!(w.used().await, 1_000_000);
+        w
+    }
+}
+
+/// SPEC-0020/US-0021: an insert at line growing `/r.md` past the limit is
+/// refused and changes nothing (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_insert_at_line_over_the_limit_is_refused() {
+    let w = World::shared_with_x().await;
+    // 48 576 bytes plus the newline the tool keeps: a 48 577 byte growth.
+    let args = InsertAtLineArgs {
+        mount_id: ATLAS.into(),
+        path: "/r.md".into(),
+        line: 1,
+        content: format!("{}\n", text(48_576, 8)),
+    };
+    let err = err_text(w.as_(MIA).fs_insert_at_line(Parameters(args)).await);
+    assert!(err.ends_with(&refusal(1_000_000, 48_577)), "got: {err}");
+    assert_eq!(w.content("/r.md").await.unwrap(), b"X");
+    assert_eq!(w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/US-0021: a search and replace growing `/r.md` past the limit is
+/// refused and changes nothing (FR-NEW-003, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_us_0021_search_replace_over_the_limit_is_refused() {
+    let w = World::shared_with_x().await;
+    let args = SearchReplaceArgs {
+        mount_id: ATLAS.into(),
+        path: "/r.md".into(),
+        search_block: "X".into(),
+        replace_block: text(48_578, 8),
+        fuzzy: false,
+    };
+    let err = err_text(w.as_(MIA).fs_search_replace(Parameters(args)).await);
+    assert!(err.ends_with(&refusal(1_000_000, 48_577)), "got: {err}");
+    assert_eq!(w.content("/r.md").await.unwrap(), b"X");
+    assert_eq!(w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/US-0021: a pull request merge happens on the provider only, so
+/// over a lowered limit it still succeeds and the project's files and usage
+/// do not move. Bringing the merged files in is a later pull, refused over
+/// the limit by SPEC-0020/E2E-032: the PR fixture's remotes are provider
+/// URLs a pull cannot reach, so that half is not repeated here.
+#[test]
+fn spec_0020_us_0021_pr_merge_writes_no_project_file() {
+    use crate::tools::git_pr::tests::{PrEnv, gh_merge_ok, route_gh_merge, with_hosts_lock};
+    const MOUNT: &str = "acme-api";
+    with_hosts_lock(async {
+        let e = PrEnv::new().await;
+        let client = e.f.state.stores.client(MOUNT).await.unwrap();
+        client.write_bytes_atomic("/seed.bin", &noise(1_500_000, 5)).await.unwrap();
+        e.f.state.admin.set_quota(MOUNT, Some(MB)).await.unwrap();
+        let before = client.meta.subtree("/").await.unwrap();
+        let used = crate::quota::used_bytes(&client).await.unwrap();
+        assert_eq!(used, 1_500_000);
+        route_gh_merge(&e, 200, gh_merge_ok());
+
+        let out = e
+            .merge(json!({"mount_id": MOUNT, "pr_number": 42, "strategy": "merge"}))
+            .await
+            .unwrap();
+        assert_eq!(out["state"], "merged", "got: {out}");
+
+        let after = client.meta.subtree("/").await.unwrap();
+        let names = |v: &[crate::storage::traits::NodeRow]| {
+            v.iter().map(|n| (n.path.clone(), n.size)).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&after), names(&before));
+        assert_eq!(crate::quota::used_bytes(&client).await.unwrap(), used);
+    });
+}

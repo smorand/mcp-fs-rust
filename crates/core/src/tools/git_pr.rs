@@ -1543,4 +1543,4 @@ fn is_merged(raw: &Value) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

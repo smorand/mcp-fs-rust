@@ -160,7 +160,7 @@ fn query_key(query: &[(String, String)]) -> String {
 }
 
 #[derive(Clone, Default)]
-struct MockProviderApi {
+pub(crate) struct MockProviderApi {
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     routes: Arc<Mutex<Routes>>,
 }
@@ -254,17 +254,17 @@ impl ProviderClient for MockProviderApi {
 
 // ── environment ─────────────────────────────────────────────────────────────
 
-struct PrEnv {
-    f: Fixture,
+pub(crate) struct PrEnv {
+    pub(crate) f: Fixture,
     reg: ToolRegistry,
-    api: Arc<MockProviderApi>,
+    pub(crate) api: Arc<MockProviderApi>,
     tokens: Arc<OAuthTokenStore>,
 }
 
 impl PrEnv {
     /// Four initialized mounts, each with its `origin` row, and a token for
     /// every host with the scopes the write surface needs.
-    async fn new() -> PrEnv {
+    pub(crate) async fn new() -> PrEnv {
         Self::build(&[
             ("github.com", "github", GH_TOKEN, &["repo"]),
             ("github.ibm.com", "github", GH_TOKEN, &["repo"]),
@@ -350,7 +350,7 @@ impl PrEnv {
         self.f.call(&self.reg, OWNER, "git.pr_diff", args).await
     }
 
-    async fn merge(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn merge(&self, args: Value) -> Result<Value> {
         self.f.call(&self.reg, OWNER, "git.pr_merge", args).await
     }
 
@@ -361,7 +361,7 @@ impl PrEnv {
 
 /// Serialize against every other test touching the process wide `git.hosts`
 /// map, then run the body on a fresh single test runtime.
-fn with_hosts_lock<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn with_hosts_lock<F: std::future::Future>(f: F) -> F::Output {
     let _guard = crate::git::remote::tests::lock_for_test();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
 }
@@ -1960,7 +1960,7 @@ const GL_REBASE: &str = "/projects/acme%2Fapi/merge_requests/42/rebase";
 const MERGE_SHA: &str = "3c0ffee1234567890abcdef1234567890abcdef1";
 
 /// GitHub's merge answer: a merge result, not a pull request payload.
-fn gh_merge_ok() -> Value {
+pub(crate) fn gh_merge_ok() -> Value {
     json!({"sha": MERGE_SHA, "merged": true, "message": "Pull Request successfully merged"})
 }
 
@@ -1978,7 +1978,7 @@ fn step(method: &str, path: &str) -> (String, String) {
 
 /// The GitHub pre-read plus a canned merge answer, the two routes every GitHub
 /// merge test needs.
-fn route_gh_merge(e: &PrEnv, status: u16, answer: Value) {
+pub(crate) fn route_gh_merge(e: &PrEnv, status: u16, answer: Value) {
     e.api.route("GET", GH_PR, 200, gh_pr_42_detail());
     e.api.route("PUT", GH_MERGE, status, answer);
 }
