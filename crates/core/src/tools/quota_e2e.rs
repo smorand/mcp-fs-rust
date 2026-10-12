@@ -5,10 +5,13 @@
 //! No limit is enforced in this story: the tests that write only prove the
 //! write is accepted and the usage figure is exact.
 
+use crate::docs::DocService;
+use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
 use crate::mcp::server::{
-    AppendArgs, ApplyPatchArgs, CopyArgs, DeleteArgs, EditArgs, ExportZipArgs, GetProjectQuotaArgs,
-    GitCommitArgs, McpServer, MountOnlyArgs, MultiEditArgs, ReadArgs, SetProjectQuotaArgs,
-    WriteArgs, WriteBytesArgs, WriteDocxArgs,
+    AppendArgs, ApplyPatchArgs, CopyArgs, DeleteArgs, DocumentizeArgs, EditArgs, ExportZipArgs,
+    ExtractTextArgs, GetProjectQuotaArgs, GitCommitArgs, ListImagesArgs, ListTablesArgs, McpServer,
+    MountOnlyArgs, MultiEditArgs, ReadArgs, SetProjectQuotaArgs, WriteArgs, WriteBytesArgs,
+    WriteDocxArgs,
 };
 use crate::state::AppState;
 use crate::tools::admin::test_support::Fixture;
@@ -105,6 +108,24 @@ impl World {
         McpServer::new(self.f.state.clone(), person.to_string())
     }
 
+    /// [`Self::as_`] with `doc` as the document service (SPEC-0020 US-0017),
+    /// sharing the fixture's stores and session accounting, so a conversion's
+    /// sibling and the usage read see the same state.
+    fn as_with_doc(&self, person: &str, doc: Option<Arc<dyn DocService>>) -> McpServer {
+        let s = &self.f.state;
+        let state = AppState {
+            config: s.config.clone(),
+            admin: s.admin.clone(),
+            stores: s.stores.clone(),
+            safety: s.safety.clone(),
+            identity: s.identity.clone(),
+            editors: s.editors.clone(),
+            doc_service: doc,
+            search: None,
+        };
+        McpServer::new(Arc::new(state), person.to_string())
+    }
+
     async fn quota(&self, person: &str, project: &str) -> Result<CallToolResult, rmcp::ErrorData> {
         let args = GetProjectQuotaArgs { project_id: project.into() };
         self.as_(person).admin_get_project_quota(Parameters(args)).await
@@ -119,6 +140,23 @@ impl World {
     async fn independent_sum(&self) -> i64 {
         let client = self.f.state.stores.client(ATLAS).await.unwrap();
         client.meta.subtree("/").await.unwrap().iter().filter(|n| n.is_file()).map(|n| n.size).sum()
+    }
+
+    /// Write real text straight into the volume: setup, not the operation
+    /// tested, so no session budget is spent (mirrors [`Self::seed`]).
+    async fn put_text(&self, path: &str, content: &str) {
+        let client = self.f.state.stores.client(ATLAS).await.unwrap();
+        client.write_text_atomic(path, content).await.unwrap();
+    }
+
+    async fn list_images(&self, person: &str, path: &str) -> Value {
+        let args = ListImagesArgs { mount_id: ATLAS.into(), path: path.into(), marker: None };
+        ok_json(self.as_(person).fs_list_images(Parameters(args)).await)
+    }
+
+    async fn list_tables(&self, person: &str, path: &str) -> Value {
+        let args = ListTablesArgs { mount_id: ATLAS.into(), path: path.into(), marker: None };
+        ok_json(self.as_(person).fs_list_tables(Parameters(args)).await)
     }
 
     async fn write(&self, person: &str, path: &str, len: usize) -> Value {
@@ -837,4 +875,260 @@ fn rest(w: &World, person: &str) -> (axum::Router, String) {
     )
     .unwrap();
     (crate::api::dataplane::router(Arc::new(state)), token)
+}
+
+// ── US-0017: conversion Markdown under the limit ────────────────────────────
+
+/// The refusal message of FR-NEW-001 alone, the shape a documentation outcome
+/// or `fs.documentize` carries (no `ERR_*` prefix: that lives in `code`).
+fn refusal_message(used: i64, requested: i64) -> String {
+    format!(
+        "project storage quota of 1 MB exceeded: {used} bytes used, {requested} bytes requested"
+    )
+}
+
+/// A conversion's Markdown of exactly `len` bytes, no image or table: the
+/// artifact set it captures is empty, so its only weight is its own text.
+fn plain_markdown(len: usize) -> String {
+    "x".repeat(len)
+}
+
+/// A Markdown of exactly `total_len` bytes holding 4 picture references and 2
+/// pipe tables, plus the 4 pictures themselves, the 4 images totalling
+/// exactly 120 000 bytes (SPEC-0020/E2E-019): the pictures and tables are
+/// session weight only (DEC-008), never counted against the project.
+fn markdown_with_pictures(total_len: usize) -> (String, Vec<(String, Vec<u8>, String)>) {
+    let mut md = String::new();
+    let mut pics = Vec::new();
+    for n in 1..=4 {
+        md.push_str(&format!("![fig{n}](figures/f{n}.png)\n\n"));
+        pics.push((format!("figures/f{n}.png"), noise(30_000, n as u64), format!("Figure {n}")));
+    }
+    md.push_str("| Region | Jan |\n| --- | --- |\n| North | 10 |\n\n");
+    md.push_str("| Item | EUR |\n| --- | --- |\n| Rent | 900 |\n\n");
+    let pad = total_len.saturating_sub(md.len());
+    md.push_str(&"x".repeat(pad));
+    (md, pics)
+}
+
+/// The fake converter's bundle for `markdown`, `pics` keyed `(target, bytes,
+/// caption)`.
+fn bundle_conversion(markdown: String, pics: Vec<(String, Vec<u8>, String)>) -> Conversion {
+    let files = pics.iter().map(|(t, b, _)| (t.clone(), b.clone())).collect();
+    let pictures = pics
+        .into_iter()
+        .map(|(t, _, caption)| (t, PictureMeta { caption, caption_failed: false, page: None }))
+        .collect();
+    Conversion { markdown, files, manifest: Some(Manifest { pictures }) }
+}
+
+/// Mia uploads `len` bytes to `path` requesting conversion through `doc`.
+async fn upload_pdf(
+    w: &World,
+    person: &str,
+    path: &str,
+    len: usize,
+    doc: Arc<dyn DocService>,
+) -> RawResult {
+    let args = WriteBytesArgs {
+        mount_id: ATLAS.into(),
+        path: path.into(),
+        base64: base64::engine::general_purpose::STANDARD.encode(noise(len, 99)),
+        overwrite: false,
+        create_parents: true,
+        trigger_documentation_service: true,
+    };
+    w.as_with_doc(person, Some(doc)).fs_write_bytes(Parameters(args)).await
+}
+
+/// SPEC-0020/E2E-018: an upload whose conversion sibling would exceed the
+/// limit is accepted, keeps the source, writes no Markdown, and reports the
+/// refusal as the documentation outcome (FR-NEW-014, FR-NEW-013).
+#[tokio::test]
+async fn spec_0020_e2e_018_a_refused_sibling_keeps_the_upload_and_reports_the_refusal() {
+    let w = World::shared().await;
+    let doc: Arc<dyn DocService> = Arc::new(StubDocService::ok(plain_markdown(20_000)));
+    let out = ok_json(upload_pdf(&w, MIA, "/d.pdf", 30_000, doc).await);
+    assert_eq!(
+        out["documentation"]["error"]["message"],
+        json!(refusal_message(1_030_000, 20_000)),
+        "got: {out}"
+    );
+    assert!(w.content("/d.pdf").await.is_some(), "the upload is kept");
+    assert!(w.content("/d.md").await.is_none(), "no markdown sibling");
+    assert_eq!(w.used().await, 1_030_000);
+}
+
+/// SPEC-0020/E2E-019: a conversion's pictures and tables stay out of the
+/// project delta, only the Markdown sibling counts (FR-NEW-002).
+#[tokio::test]
+async fn spec_0020_e2e_019_artifacts_are_not_counted_against_the_project() {
+    let w = World::shared().await;
+    let (markdown, pics) = markdown_with_pictures(5_000);
+    let doc: Arc<dyn DocService> =
+        Arc::new(StubDocService::bundle(bundle_conversion(markdown, pics)));
+    let out = ok_json(upload_pdf(&w, MIA, "/e.pdf", 10_000, doc).await);
+    assert_eq!(out["documentation"]["md_path"], json!("/e.md"), "got: {out}");
+    assert_eq!(w.used().await, 1_015_000);
+    // The 4 images and 2 tables are kept as artifacts, out of the project
+    // delta: 120 000 bytes of pictures plus 2 tables that never land in
+    // usage (DEC-008).
+    let images = w.list_images(MIA, "/e.pdf").await;
+    assert_eq!(images["images"].as_array().unwrap().len(), 4, "got: {images}");
+    let tables = w.list_tables(MIA, "/e.pdf").await;
+    assert_eq!(tables["tables"].as_array().unwrap().len(), 2, "got: {tables}");
+}
+
+/// SPEC-0020/E2E-058: an upload and its Markdown sibling, both under the
+/// limit, are both accepted (FR-NEW-014).
+#[tokio::test]
+async fn spec_0020_e2e_058_an_upload_and_its_sibling_are_both_accepted() {
+    let w = World::shared().await;
+    let doc: Arc<dyn DocService> = Arc::new(StubDocService::ok(plain_markdown(5_000)));
+    let out = ok_json(upload_pdf(&w, MIA, "/f.pdf", 10_000, doc).await);
+    assert_eq!(out["documentation"]["md_path"], json!("/f.md"), "got: {out}");
+    assert_eq!(w.used().await, 1_015_000);
+}
+
+/// SPEC-0020/E2E-059: the source itself is refused before any conversion is
+/// attempted (FR-NEW-014, FR-NEW-001).
+#[tokio::test]
+async fn spec_0020_e2e_059_an_upload_over_the_limit_on_its_own_bytes_is_refused() {
+    let w = World::shared().await;
+    let doc: Arc<dyn DocService> = Arc::new(StubDocService::ok(plain_markdown(1)));
+    let err = err_text(upload_pdf(&w, MIA, "/g.pdf", 50_000, doc).await);
+    assert!(err.ends_with(&refusal(1_000_000, 50_000)), "got: {err}");
+    assert!(w.content("/g.pdf").await.is_none());
+    assert!(w.content("/g.md").await.is_none());
+    assert_eq!(w.used().await, 1_000_000);
+}
+
+/// SPEC-0020/E2E-060: the upload and its sibling may together land exactly at
+/// the limit (FR-NEW-014, FR-NEW-005).
+#[tokio::test]
+async fn spec_0020_e2e_060_the_upload_and_its_sibling_may_land_exactly_at_the_limit() {
+    let w = World::shared().await;
+    let doc: Arc<dyn DocService> = Arc::new(StubDocService::ok(plain_markdown(8_576)));
+    let out = ok_json(upload_pdf(&w, MIA, "/h.pdf", 40_000, doc).await);
+    assert_eq!(out["documentation"]["md_path"], json!("/h.md"), "got: {out}");
+    assert_eq!(w.used().await, MB);
+}
+
+/// `fs.documentize` applies the same project check as the upload path, the
+/// refusal reported as the tool's own error (no source write to protect). A
+/// re-conversion over the limit, with an existing sibling and artifact set
+/// already in place, leaves both exactly as they were (FR-NEW-014,
+/// FR-NEW-002).
+#[tokio::test]
+async fn spec_0020_documentize_over_the_limit_is_refused_as_the_tool_error() {
+    let w = World::shared().await;
+    w.seed("/doc.pdf", 20_000).await;
+    assert_eq!(w.used().await, 1_020_000);
+
+    // A first, accepted conversion leaves a sibling and an artifact set in place.
+    let (first_markdown, first_pics) = markdown_with_pictures(5_000);
+    let first_doc: Arc<dyn DocService> =
+        Arc::new(StubDocService::bundle(bundle_conversion(first_markdown, first_pics)));
+    let args =
+        DocumentizeArgs { mount_id: ATLAS.into(), path: "/doc.pdf".into(), overwrite: false };
+    let out = ok_json(w.as_with_doc(MIA, Some(first_doc)).fs_documentize(Parameters(args)).await);
+    assert_eq!(out["md_path"], json!("/doc.md"), "got: {out}");
+    assert_eq!(w.used().await, 1_025_000);
+    let sibling_before = w.content("/doc.md").await.expect("the first sibling");
+    let images_before = w.list_images(MIA, "/doc.pdf").await;
+    let tables_before = w.list_tables(MIA, "/doc.pdf").await;
+
+    let doc: Arc<dyn DocService> = Arc::new(StubDocService::ok(plain_markdown(40_000)));
+    let args = DocumentizeArgs { mount_id: ATLAS.into(), path: "/doc.pdf".into(), overwrite: true };
+    let err = err_text(w.as_with_doc(MIA, Some(doc)).fs_documentize(Parameters(args)).await);
+    // The delta is checked against the sibling's own growth, 40 000 minus
+    // the 5 000 byte sibling already there (SPEC-0020 FR-NEW-014).
+    assert_eq!(
+        err,
+        format!("An error occurred invoking 'fs.documentize': {}", refusal(1_025_000, 35_000)),
+        "got: {err}"
+    );
+
+    assert_eq!(w.content("/doc.md").await, Some(sibling_before), "sibling bytes unchanged");
+    assert_eq!(w.list_images(MIA, "/doc.pdf").await, images_before, "images unchanged");
+    assert_eq!(w.list_tables(MIA, "/doc.pdf").await, tables_before, "tables unchanged");
+    assert_eq!(w.used().await, 1_025_000);
+}
+
+/// A conversion's Markdown table of one column, `header` then `cell`
+/// (SPEC-0020): the exact byte shape `fs.extract_text`'s CSV path renders,
+/// so the test can predict the sibling's size without reading it back.
+fn one_column_table_md(header: &str, cell: &str) -> String {
+    format!("| {header} |\n| --- |\n| {cell} |")
+}
+
+/// SPEC-0020: `fs.extract_text` on a document whose Markdown sibling would
+/// exceed the limit is refused with the exact project quota message,
+/// computed against the sibling's own growth over what was there before
+/// (FR-NEW-014), even though the source rewrite that triggers the refresh
+/// fits under the limit on its own. The previous sibling and its captured
+/// table stay exactly as they were (FR-NEW-002).
+#[tokio::test]
+async fn spec_0020_extract_text_sibling_over_the_limit_is_refused() {
+    let w = World::shared().await;
+    let extract_args = |refresh: bool| ExtractTextArgs {
+        mount_id: ATLAS.into(),
+        path: "/wide.csv".into(),
+        max_chars: 200_000,
+        preview_chars: 4_000,
+        ocr: false,
+        refresh,
+    };
+
+    // A small source whose first conversion leaves a sibling and a captured table.
+    w.put_text("/wide.csv", "a\n1").await;
+    let out = ok_json(w.as_(MIA).fs_extract_text(Parameters(extract_args(false))).await);
+    assert_eq!(out["md_path"], json!("/wide.md"), "got: {out}");
+    let old_sibling = w.content("/wide.md").await.expect("the first sibling");
+    assert_eq!(old_sibling, one_column_table_md("a", "1").into_bytes());
+    let old_sibling_len = old_sibling.len() as i64;
+    assert_eq!(old_sibling_len, 19);
+    assert_eq!(w.used().await, 1_000_022);
+
+    // Rewrite the source larger: a fresh write of it alone still fits under
+    // the limit, but the new sibling it produces grows far more than that
+    // over the sibling already there. The rewrite bumps the source's
+    // revision, which already orphans the table captured against the old
+    // one (FR-NEW-023, the current set is only valid while the node still
+    // carries the revision it was built from): the refused re-extraction
+    // below must leave that exactly as the rewrite alone left it.
+    let long = "x".repeat(48_000);
+    w.put_text("/wide.csv", &format!("a\n{long}")).await;
+    let used_before = w.used().await;
+    assert_eq!(used_before, 1_048_021);
+
+    let list_tables_args =
+        || ListTablesArgs { mount_id: ATLAS.into(), path: "/wide.csv".into(), marker: None };
+    let tables_after_rewrite =
+        err_text(w.as_(MIA).fs_list_tables(Parameters(list_tables_args())).await);
+    assert!(
+        tables_after_rewrite.ends_with("No artifacts: document not extracted"),
+        "got: {tables_after_rewrite}"
+    );
+
+    let requested_md = one_column_table_md("a", &long);
+    assert_eq!(requested_md.len(), 48_018);
+    let delta = requested_md.len() as i64 - old_sibling_len;
+    assert_eq!(delta, 47_999);
+
+    let err = err_text(w.as_(MIA).fs_extract_text(Parameters(extract_args(true))).await);
+    assert_eq!(
+        err,
+        format!("An error occurred invoking 'fs.extract_text': {}", refusal(used_before, delta)),
+        "got: {err}"
+    );
+
+    assert_eq!(w.content("/wide.md").await, Some(old_sibling), "sibling bytes unchanged");
+    let tables_after_refusal =
+        err_text(w.as_(MIA).fs_list_tables(Parameters(list_tables_args())).await);
+    assert_eq!(
+        tables_after_refusal, tables_after_rewrite,
+        "table listing unchanged by the refusal"
+    );
+    assert_eq!(w.used().await, used_before, "usage unchanged except for the source rewrite");
 }

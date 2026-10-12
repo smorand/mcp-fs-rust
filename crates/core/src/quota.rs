@@ -60,6 +60,37 @@ pub(crate) async fn admit_file(
     Ok(Admission { _guard: guard })
 }
 
+/// [`admit`] for a Markdown companion of `md_len` bytes written to the
+/// optional sibling `md`: the delta is the sibling's current size read
+/// under the lock (SPEC-0020 FR-NEW-002, FR-NEW-014), so a concurrent write
+/// to the sibling cannot land between that read and the check. `md` of
+/// `None` means no sibling is written, so the delta is always 0.
+/// `session_bytes` is the separate conversion-text weight charged to
+/// `person`'s session budget (DEC-008).
+pub(crate) async fn admit_sibling(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    md: Option<&str>,
+    md_len: i64,
+    session_bytes: i64,
+) -> Result<Admission> {
+    let guard = client.admission.clone().lock_owned().await;
+    let delta = match md {
+        Some(path) => {
+            let previous = match client.meta.get(path).await? {
+                Some(node) if node.is_file() => node.size,
+                _ => 0,
+            };
+            md_len - previous
+        }
+        None => 0,
+    };
+    check_and_charge(client, safety, person, mount_id, session_bytes, delta).await?;
+    Ok(Admission { _guard: guard })
+}
+
 /// The body of an admission; the caller holds the lock.
 async fn check_and_charge(
     client: &VolumeClient,

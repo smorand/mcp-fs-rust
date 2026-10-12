@@ -808,8 +808,19 @@ async fn write_companion(
     };
     let landing = kept.map(|(store, rev)| (store, rev, &set));
     let charge = markdown.len() as i64 + set_bytes;
-    land_conversion(client, safety, person, mount_id, norm, landing, Some(&md), charge, write)
-        .await?;
+    land_conversion(
+        client,
+        safety,
+        person,
+        mount_id,
+        norm,
+        landing,
+        Some(&md),
+        markdown.len() as i64,
+        charge,
+        write,
+    )
+    .await?;
     safety.record_audit(person, mount_id, "doc_service", &md, "");
     // A fresh companion counts as read, so a follow-up edit passes the guard.
     safety.record_read(person, mount_id, &md);
@@ -839,21 +850,36 @@ async fn land_conversion(
     norm: &str,
     landing: Option<(&RelationalMetaStore, &str, &PendingSet<'_>)>,
     md: Option<&str>,
+    md_len: i64,
     charge: i64,
     write_sibling: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let Some((store, rev, set)) = landing else {
-        safety.charge_write(person, mount_id, charge)?;
+        let _project_admission =
+            quota::admit_sibling(client, safety, person, mount_id, md, md_len, charge).await?;
         return write_sibling.await;
     };
+    // Lock order (avoids deadlock, SPEC-0020 US-0017): the artifact lock is
+    // outer, the admission lock `quota::admit` takes is inner. No other site
+    // holds the artifact lock while admitting, so this is the only order ever
+    // taken.
     let _commit_order = store.lock_artifacts(norm).await;
     store.ensure_rev_unchanged(norm, rev).await?;
-    // Snapshot before charging, so a failed read leaks no charge.
+    // Snapshot before charging, so a failed read leaks no charge. The same
+    // snapshot gives the sibling's previous size for the project delta
+    // (FR-NEW-014): artifacts and the conversion text are session weight
+    // only (DEC-008), so the project check never sees `charge`, only the
+    // sibling's own growth.
     let before = match md {
         Some(md) if client.exists(md).await? => Some(client.read_bytes(md).await?),
         _ => None,
     };
-    safety.charge_write(person, mount_id, charge)?;
+    // The project check re-reads the sibling's current size under the
+    // admission lock (SPEC-0020 FR-NEW-002, FR-NEW-014), rather than trusting
+    // `before`: a concurrent write to the sibling landing between the
+    // snapshot above and here would otherwise go unseen.
+    let _project_admission =
+        quota::admit_sibling(client, safety, person, mount_id, md, md_len, charge).await?;
     let landed = async {
         write_sibling.await?;
         set.commit(client, store, norm, rev).await
@@ -1708,6 +1734,7 @@ pub async fn extract_document(
         norm,
         landing,
         fresh.md_path(),
+        sibling,
         total,
         fresh.write_sibling(client),
     )
