@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: S
 > Depth evidence: 1 module (git tools), 1 defective behavior, 4 requirements, no public contract change, no data model change
-> Status: specified
+> Status: designed
 > Verdict: no authority
 > Defect class: absent
 > Severity: Medium
