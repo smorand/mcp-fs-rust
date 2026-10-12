@@ -491,8 +491,10 @@ impl StoreManager {
         }
 
         // On a shared database the volume is a set of rows, so they are deleted
-        // explicitly. Both tables go in one transaction: a half torn down volume
-        // would leave refcounts referring to nodes that no longer exist.
+        // explicitly. Every table goes in one transaction: a half torn down volume
+        // would leave refcounts referring to nodes that no longer exist, and a
+        // `volume_usage` row left behind would hand a project recreated under the
+        // same id the old project's usage (SPEC-0020).
         let db = build_relational_db(
             &self.relational,
             "meta",
@@ -506,7 +508,7 @@ impl StoreManager {
         )
         .await?;
         let mut tx = db.begin().await?;
-        for table in ["nodes", "blob_refs"] {
+        for table in ["nodes", "blob_refs", "volume_usage"] {
             tx.execute(
                 &rel::Query::new(format!("DELETE FROM {table} WHERE volume_id=?1"))
                     .bind(project_id),
@@ -590,6 +592,37 @@ mod tests {
                 "{name} must take the shared registry, not build one, found {built}"
             );
         }
+    }
+
+    /// SPEC-0020: on a shared database a torn down volume takes its usage row
+    /// with it, so a project recreated under the same id starts at 0 bytes
+    /// instead of inheriting the old figure. Skipped without PostgreSQL.
+    #[tokio::test]
+    async fn teardown_on_a_shared_database_drops_the_usage_row() {
+        let Ok(dsn) = std::env::var("MCPFS_TEST_PG_DSN") else {
+            eprintln!("skipping the shared teardown check: MCPFS_TEST_PG_DSN is unset");
+            return;
+        };
+        if !cfg!(feature = "postgres") {
+            eprintln!("skipping the shared teardown check: built without --features postgres");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let mut c = (*cfg(d.path())).clone();
+        c.infra.meta.backend = backend::POSTGRES.to_string();
+        c.infra.meta.dsn = Dsn::new(dsn);
+        let m = StoreManager::new(Arc::new(c), Arc::new(RelationalRegistry::new()));
+        let project = format!("usage-{}", uuid::Uuid::new_v4().simple());
+
+        let client = m.client(&project).await.unwrap();
+        client.write_bytes_atomic("/a.bin", &[7u8; 1_000]).await.unwrap();
+        assert_eq!(client.meta.used_bytes().await.unwrap(), 1_000);
+        drop(client);
+        m.teardown_volume(&project).await.unwrap();
+
+        let again = m.client(&project).await.unwrap();
+        assert_eq!(again.meta.used_bytes().await.unwrap(), 0, "a recreated project starts empty");
+        m.teardown_volume(&project).await.unwrap();
     }
 
     /// The behavioural half of the sharing guarantee: one registry across the ACL

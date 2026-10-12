@@ -74,6 +74,25 @@ Rules that the on disk contract depends on (`storage/meta.rs`,
   canonical `{type} {len}\0{payload}` bytes. A sha256 is plain hex, so the prefix
   makes a collision impossible. See `.agent_docs/git.md`.
 
+## Project usage (SPEC-0020, 2026-10-12)
+
+`volume_usage` (`volume_id` PK, `used_bytes`) holds a project's usage: the sum of the
+declared sizes of its files, trashed files included (trash is a rename), each path once even
+when content is shared. `put_file` adds `size - old_size`, `delete_file` subtracts the size,
+`remove_subtree` the sum of its files, each in its own node transaction; `rename` changes
+nothing. Export zips, git objects and artifact blobs are not nodes, so not usage.
+
+* **Derived data.** A missing row (a volume written before the table existed) is rebuilt by
+  `MetaBackend::used_bytes` from `SUM(size)` over the volume's files, in one transaction, at
+  `RelationalMetaStore::open` and on read. An update that finds no row is a no-op: the
+  backfill reads `nodes`, which already holds it. Dropping the table loses nothing.
+* **Read.** `quota::used_bytes` takes the volume's admission lock (`VolumeClient::admission`,
+  one tokio mutex per cached client) then reads one row. `admin.get_project_quota` and
+  `GET /api/admin/projects/{project_id}/quota` call `tools::admin::get_project_quota`.
+* **Gap.** Two processes sharing one PostgreSQL or SQL Server database can lose an update
+  only during the very first backfill of a volume, if the other process writes between the
+  SUM and the insert; the in process lock does not cross processes.
+
 ## Document artifacts (SPEC-0019, 2026-10-10)
 
 The images and tables a conversion keeps live in four meta tables, every row keyed by

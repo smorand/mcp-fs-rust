@@ -24,6 +24,7 @@ pub mod logging;
 pub mod mcp;
 pub mod migrate;
 pub mod purge;
+pub mod quota;
 pub mod safety;
 pub mod search;
 pub mod state;

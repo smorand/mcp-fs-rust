@@ -20,6 +20,10 @@ pub struct VolumeClient {
     /// injection mock): such a client is already exercising a different code
     /// path and the trash write is skipped rather than panicking.
     pub trash: Option<Arc<RelationalMetaStore>>,
+    /// The per volume admission lock of SPEC-0020 DEC-002. The client is cached
+    /// once per project by `StoreManager`, so every request of the process
+    /// shares it. A tokio mutex: it is held across awaits.
+    pub admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl VolumeClient {
@@ -28,7 +32,7 @@ impl VolumeClient {
         meta: Arc<dyn MetaBackend>,
         blob: Arc<dyn BlobBackend>,
     ) -> Self {
-        Self { project_id: project_id.into(), meta, blob, trash: None }
+        Self { project_id: project_id.into(), meta, blob, trash: None, admission: Arc::default() }
     }
 
     /// Attach the concrete relational metadata store, so trash-entry recording

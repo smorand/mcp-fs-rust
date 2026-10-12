@@ -120,6 +120,27 @@
       }
     },
     {
+      "name": "admin.get_project_quota",
+      "description": "Show a project's storage quota and current usage (platform admin or project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the sum of every file's size, trashed files included.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Id of the project whose storage quota and usage are read.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "admin.list_all_projects",
       "description": "List every project (platform admin only).",
       "inputSchema": {

@@ -254,6 +254,17 @@ fn operation(op: &Op, catalog: &HashMap<String, ToolDoc>) -> Value {
             describe("mount_id"),
         ));
     }
+    if op.path.contains("{project_id}") {
+        parameters.push(parameter(
+            "project_id",
+            "path",
+            true,
+            "string",
+            "",
+            Def::Absent,
+            describe("project_id"),
+        ));
+    }
     for p in op.params {
         parameters.push(parameter(
             p.name,
@@ -1115,6 +1126,15 @@ const OPERATIONS: &[Op] = &[
         tool: "fs.extract_archive",
         params: NO_PARAMS,
         body: "ExtractArchiveBody",
+    },
+    // SPEC-0020 DEC-006: the one admin route, on the same function as the tool.
+    Op {
+        method: "GET",
+        sub: "quota",
+        path: "/api/admin/projects/{project_id}/quota",
+        tool: "admin.get_project_quota",
+        params: NO_PARAMS,
+        body: "",
     },
     Op {
         method: "GET",

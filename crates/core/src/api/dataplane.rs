@@ -93,6 +93,9 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "export-zip"),
     // SPEC-0015 FR-NEW-029: extract-archive mirrors export-zip exactly.
     ("POST", "extract-archive"),
+    // SPEC-0020 DEC-006: `/api/admin/projects/{project_id}/quota`, the same
+    // function as `admin.get_project_quota`.
+    ("GET", "quota"),
 ];
 
 /// Request body ceiling for the JSON endpoints. Axum defaults to 2 MiB, which is
@@ -161,6 +164,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/documentize", post(documentize))
         .route("/api/fs/{mount_id}/export-zip", post(export_zip))
         .route("/api/fs/{mount_id}/extract-archive", post(extract_archive))
+        .route("/api/admin/projects/{project_id}/quota", get(project_quota))
         // Applied outside the routes so the upload keeps its own larger ceiling.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
@@ -344,6 +348,25 @@ async fn roots(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                 projects.iter().map(|p| json!({"mount_id": p.id, "owner": p.owner})).collect();
             Json(json!({"person": person, "roots": roots})).into_response()
         }
+    }
+}
+
+/// `GET /api/admin/projects/{project_id}/quota` (SPEC-0020 DEC-006). Bearer
+/// only: the project gate is the tool's own (DEC-007), not membership, so the
+/// body and the refusals are byte for byte the MCP tool's.
+async fn project_quota(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let person = match person_of(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return unauthorized(&e),
+    };
+    let ctx = crate::tools::registry_support::ToolCtx { person, state };
+    match crate::tools::admin::get_project_quota(&ctx, &project_id).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error_response(&e),
     }
 }
 
@@ -2520,8 +2543,10 @@ mod tests {
         // Guards the OpenAPI table: a route added here without a doc entry fails
         // the matching test in `super::openapi`.
         // 42 since SPEC-0019 US-0004 added tables and table, 44 since US-0005
-        // added images and image, 45 since US-0008 added document-view.
-        assert_eq!(REST_ROUTES.len(), 45);
+        // added images and image, 45 since US-0008 added document-view, 46 since
+        // SPEC-0020 US-0015 added the admin quota read.
+        assert_eq!(REST_ROUTES.len(), 46);
+        assert!(REST_ROUTES.contains(&("GET", "quota")));
         assert!(REST_ROUTES.contains(&("GET", "document-view")));
         assert!(REST_ROUTES.contains(&("GET", "images")));
         assert!(REST_ROUTES.contains(&("GET", "image")));

@@ -219,6 +219,11 @@ pub trait MetaBackend: Send + Sync {
     /// `before`, excluding `exclude_root` itself and every strict descendant of
     /// it (SPEC-0014 US-0005: the sweep must never purge trash it just created).
     async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>>;
+
+    /// The sum of the declared sizes of every file in the volume, trashed files
+    /// included, each path once (SPEC-0020 FR-NEW-002). O(1) once the counter
+    /// row exists; rebuilt from the nodes when it does not.
+    async fn used_bytes(&self) -> Result<i64>;
 }
 
 /// A content-addressed byte store, keyed by sha256, scoped to one volume.

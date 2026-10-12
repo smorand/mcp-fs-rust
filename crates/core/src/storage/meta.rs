@@ -209,6 +209,17 @@ pub fn schema() -> SchemaSet {
                 ],
                 vec!["volume_id", "trash_path"],
             ),
+            // SPEC-0020 DEC-002: a project's usage, kept by the node
+            // transactions so a read is O(1). Derived data: a missing row is
+            // rebuilt from `nodes`, so dropping the table loses nothing.
+            Table::new(
+                "volume_usage",
+                vec![
+                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("used_bytes", ColumnType::BigInt).default("0"),
+                ],
+                vec!["volume_id"],
+            ),
             Table::new(
                 "export_links",
                 vec![
@@ -443,6 +454,9 @@ impl RelationalMetaStore {
         let store = Self { db, volume_id: volume_id.into(), artifact_locks: PathLocks::default() };
         store.db.migrate(&schema()).await?;
         store.ensure_root().await?;
+        // Backfill before this process writes anything, so no write of ours
+        // can land between the SUM and the insert and be counted twice or lost.
+        store.used_bytes().await?;
         Ok(store)
     }
 
@@ -1159,6 +1173,22 @@ async fn tx_incref(
     Ok(())
 }
 
+/// Move a volume's usage by `delta` bytes inside the node transaction that
+/// caused it (SPEC-0020 DEC-002). A volume with no row yet is left alone: the
+/// backfill reads `nodes`, which already holds this transaction's change.
+async fn tx_add_usage(tx: &mut dyn RelationalTx, volume: &str, delta: i64) -> Result<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    tx.execute(
+        &Query::new("UPDATE volume_usage SET used_bytes=used_bytes+?1 WHERE volume_id=?2")
+            .bind(delta)
+            .bind(volume),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Drop one reference. Returns true when it reached zero, so the caller GCs.
 async fn tx_decref(tx: &mut dyn RelationalTx, volume: &str, sha: Option<&str>) -> Result<bool> {
     let Some(sha) = sha else { return Ok(false) };
@@ -1593,6 +1623,48 @@ impl MetaBackend for RelationalMetaStore {
         rows.iter().map(Self::read_row).collect()
     }
 
+    async fn used_bytes(&self) -> Result<i64> {
+        let read = Query::new("SELECT used_bytes FROM volume_usage WHERE volume_id=?1")
+            .bind(&self.volume_id);
+        if let Some(row) = self.db.query_opt(&read).await? {
+            return row.i64(0);
+        }
+        // DEC-002 backfill, once per volume: a volume written before the
+        // counter existed. The sum and the insert share one transaction, and
+        // the insert ignores a row a concurrent backfill already wrote.
+        let insert = self.db.dialect().render_upsert(&Upsert::ignore(
+            "volume_usage",
+            vec!["volume_id", "used_bytes"],
+            vec!["volume_id"],
+        ));
+        let volume = self.volume_id.clone();
+        run_retrying(&*self.db, move |tx| {
+            let (volume, insert) = (volume.clone(), insert.clone());
+            Box::pin(async move {
+                // CAST: PostgreSQL widens SUM(BIGINT) to NUMERIC.
+                let total = tx
+                    .query_opt(
+                        &Query::new(
+                            "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM nodes \
+                             WHERE volume_id=?1 AND kind='file'",
+                        )
+                        .bind(&volume),
+                    )
+                    .await?
+                    .map_or(Ok(0), |r| r.i64(0))?;
+                tx.execute(&Query::new(insert).bind(&volume).bind(total)).await?;
+                let row = tx
+                    .query_opt(
+                        &Query::new("SELECT used_bytes FROM volume_usage WHERE volume_id=?1")
+                            .bind(&volume),
+                    )
+                    .await?;
+                row.map_or(Ok(total), |r| r.i64(0))
+            })
+        })
+        .await
+    }
+
     async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
         let rows = self
             .db
@@ -1684,6 +1756,9 @@ impl MetaBackend for RelationalMetaStore {
                         .bind(new_rev()),
                 )
                 .await?;
+                // FR-NEW-002: the declared size per path, so an overwrite moves
+                // usage by the difference and shared content counts once per path.
+                tx_add_usage(tx, &volume, size - old_size).await?;
                 Ok(PutFileResult { gc, old_size })
             })
         })
@@ -1699,7 +1774,7 @@ impl MetaBackend for RelationalMetaStore {
                 let found = tx
                     .query_opt(
                         &Query::new(
-                            "SELECT kind, sha256 FROM nodes WHERE volume_id=?1 AND path=?2",
+                            "SELECT kind, sha256, size FROM nodes WHERE volume_id=?1 AND path=?2",
                         )
                         .bind(&volume)
                         .bind(&path),
@@ -1712,6 +1787,7 @@ impl MetaBackend for RelationalMetaStore {
                     return Err(ToolError::invalid_argument(format!("'{path}' is a directory")));
                 }
                 let sha = row.opt_text(1)?;
+                let size = row.i64(2)?;
                 let gc = if tx_decref(tx, &volume, sha.as_deref()).await? { sha } else { None };
                 tx.execute(
                     &Query::new("DELETE FROM nodes WHERE volume_id=?1 AND path=?2")
@@ -1719,6 +1795,7 @@ impl MetaBackend for RelationalMetaStore {
                         .bind(&path),
                 )
                 .await?;
+                tx_add_usage(tx, &volume, -size).await?;
                 Ok(gc)
             })
         })
@@ -1737,7 +1814,7 @@ impl MetaBackend for RelationalMetaStore {
                 let rows = tx
                     .query(
                         &Query::new(
-                            "SELECT sha256 FROM nodes \
+                            "SELECT sha256, kind, size FROM nodes \
                              WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\')",
                         )
                         .bind(&volume)
@@ -1747,6 +1824,12 @@ impl MetaBackend for RelationalMetaStore {
                     .await?;
                 let shas: Vec<Option<String>> =
                     rows.iter().map(|r| r.opt_text(0)).collect::<Result<_>>()?;
+                let mut removed = 0i64;
+                for r in &rows {
+                    if r.text(1)? == "file" {
+                        removed += r.i64(2)?;
+                    }
+                }
 
                 let mut gc = Vec::new();
                 for sha in &shas {
@@ -1764,6 +1847,7 @@ impl MetaBackend for RelationalMetaStore {
                     .bind(&pattern),
                 )
                 .await?;
+                tx_add_usage(tx, &volume, -removed).await?;
                 Ok(gc)
             })
         })
@@ -2010,6 +2094,17 @@ impl RelationalMetaStore {
         let mut tx = self.db.begin().await?;
         delete_trash_entry(&mut *tx, &self.volume_id, trash_path).await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drop this volume's `volume_usage` row, the state of a volume written
+    /// before SPEC-0020, so a test can prove the backfill rebuilds it.
+    pub(crate) async fn clear_usage_row_for_test(&self) -> Result<()> {
+        self.db
+            .execute(
+                &Query::new("DELETE FROM volume_usage WHERE volume_id=?1").bind(&self.volume_id),
+            )
+            .await?;
         Ok(())
     }
 }

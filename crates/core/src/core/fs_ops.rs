@@ -3138,6 +3138,9 @@ mod tests {
         async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
             self.inner.stale_files(before, exclude_root).await
         }
+        async fn used_bytes(&self) -> Result<i64> {
+            self.inner.used_bytes().await
+        }
     }
 
     #[tokio::test]

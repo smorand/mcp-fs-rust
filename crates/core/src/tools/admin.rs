@@ -20,6 +20,7 @@
 //! | get_index_mode           | member, or platform admin (project must exist)  |
 //! | set_purge_config         | owner or platform admin                         |
 //! | set_project_quota        | platform admin only (SPEC-0010)                 |
+//! | get_project_quota        | platform admin, or the owner (SPEC-0020 DEC-007)|
 //!
 //! `create_project` provisions the volume and rolls the ACL row back if that
 //! fails, so a project row never points at a volume that was never created.
@@ -326,6 +327,23 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
             set_project_quota(&ctx, &project_id, max_mb).await
         }),
     );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.get_project_quota",
+            "Show a project's storage quota and current usage (platform admin or project \
+             owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the \
+             sum of every file's size, trashed files included.",
+        )
+        .req_str("project_id", "Id of the project whose storage quota and usage are read.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            get_project_quota(&ctx, &project_id).await
+        }),
+    );
 }
 
 // ── implementations ─────────────────────────────────────────────────────────
@@ -621,6 +639,38 @@ async fn set_project_quota(ctx: &ToolCtx, project_id: &str, max_mb: Option<u32>)
     }))
 }
 
+/// SPEC-0020 FR-NEW-009/010: a project's limit and the bytes it uses now.
+/// Production code: `admin.get_project_quota` and `GET
+/// /api/admin/projects/{project_id}/quota` both call it.
+pub(crate) async fn get_project_quota(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
+    let project = ctx.state.admin.get_project(project_id).await?;
+    // DEC-007: an admin learns the project is missing; anyone else gets the
+    // same owner refusal whether it is missing or not theirs, so a project id
+    // cannot be probed. Unlike `require_owner_or_admin`, which reports a
+    // missing project before checking the caller.
+    let project = if ctx.state.is_admin(&ctx.person) {
+        project.ok_or_else(|| ToolError::project_not_found(project_id))?
+    } else {
+        match project {
+            Some(p) if p.owner == normalize_identity(&ctx.person) => p,
+            _ => {
+                return Err(ToolError::forbidden(format!(
+                    "'{}' is not the owner of '{project_id}'",
+                    ctx.person
+                )));
+            }
+        }
+    };
+    let client = ctx.state.stores.client(&project.id).await?;
+    let used_bytes = crate::quota::used_bytes(&client).await?;
+    Ok(json!({
+        "project_id": project.id,
+        // Set in whole megabytes by `admin.set_project_quota`, so exact.
+        "max_mb": project.quota_bytes.map(|b| b / 1_048_576),
+        "used_bytes": used_bytes,
+    }))
+}
+
 // ── shared test fixtures ────────────────────────────────────────────────────
 
 /// Fixtures shared by the `admin.*`, `git.*` and `git.auth*` test modules: a real
@@ -748,7 +798,7 @@ mod tests {
         r
     }
 
-    const ALL_ADMIN_TOOLS: [&str; 14] = [
+    const ALL_ADMIN_TOOLS: [&str; 15] = [
         "admin.create_project",
         "admin.delete_project",
         "admin.list_projects",
@@ -763,12 +813,13 @@ mod tests {
         "admin.get_index_mode",
         "admin.set_purge_config",
         "admin.set_project_quota",
+        "admin.get_project_quota",
     ];
 
     #[test]
     fn every_admin_tool_is_registered() {
         let r = registry();
-        assert_eq!(r.len(), 14);
+        assert_eq!(r.len(), 15);
         for name in ALL_ADMIN_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }

@@ -70,7 +70,8 @@ mod tests {
     fn admin_tools_register_without_git() {
         let mut reg = ToolRegistry::new();
         super::super::admin::register(&mut reg);
-        assert_eq!(reg.len(), 14);
+        // SPEC-0020 adds admin.get_project_quota: 15 admin tools.
+        assert_eq!(reg.len(), 15);
         assert!(reg.resolve("git.init").is_none());
         assert!(reg.resolve("git.auth").is_none());
         for name in ["git.token_set", "git.remote_push", "git.remote_fetch", "git.remote_pull"] {
@@ -85,7 +86,7 @@ mod tests {
         super::super::git::register(&mut reg);
         super::super::git_auth::register(&mut reg);
         super::super::git_pr::register(&mut reg);
-        assert_eq!(reg.len(), 14 + 39 + 4 + 6);
+        assert_eq!(reg.len(), 15 + 39 + 4 + 6);
         assert!(reg.resolve("git.remote_clone").is_some());
         assert!(reg.resolve("git.auth_revoke").is_some());
         assert!(reg.resolve("git.token_set").is_some());
@@ -112,8 +113,8 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         // 44 fs (SPEC-0019 adds fs.list_tables, fs.get_table, fs.list_images, fs.get_image,
-        // fs.get_document_view) + 14 admin + 5 web + 2 context7 = 65
-        assert_eq!(reg.len(), 65);
+        // fs.get_document_view) + 15 admin (SPEC-0020) + 5 web + 2 context7 = 66
+        assert_eq!(reg.len(), 66);
         assert!(reg.resolve("web.search").is_some());
         assert!(reg.resolve("context7.resolve_library_id").is_some());
     }
@@ -132,12 +133,12 @@ mod tests {
         };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 44 fs (SPEC-0019) + 14 admin + 49 git (39 git.* + 4 git.auth* + 6 git.pr_*) + 5 web
-        // + 2 context7 + 8 sqlite + 5 db = 127
+        // 44 fs (SPEC-0019) + 15 admin (SPEC-0020) + 49 git (39 git.* + 4 git.auth* + 6 git.pr_*)
+        // + 5 web + 2 context7 + 8 sqlite + 5 db = 128
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 127 + doc_count + 3);
+        assert_eq!(reg.len(), 128 + doc_count + 3);
     }
 
     #[test]
@@ -155,8 +156,8 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        // Base 127 + doc + 3 editor + 4 search.*
-        assert_eq!(reg.len(), 127 + doc_count + 3 + 4);
+        // Base 128 + doc + 3 editor + 4 search.*
+        assert_eq!(reg.len(), 128 + doc_count + 3 + 4);
         assert!(reg.resolve("search.index").is_some());
         assert!(reg.resolve("search.query").is_some());
         assert!(reg.resolve("search.delete").is_some());
@@ -232,7 +233,7 @@ mod tests {
         super::super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("admin.") || name.starts_with("git."),
-            63,
+            64,
             "admin.* and git.* tools",
         );
     }

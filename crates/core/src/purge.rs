@@ -498,6 +498,7 @@ mod tests {
             // SPEC-0011 US-0002 added this field; this mock has no real relational
             // store behind it, and the trash write is a no-op without one.
             trash: None,
+            admission: Arc::default(),
         };
 
         let purged = sweep_project_files(&flaky_client, &f.admin, &f.safety, "proj").await.unwrap();
@@ -686,6 +687,9 @@ mod tests {
         }
         async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
             self.inner.stale_files(before, exclude_root).await
+        }
+        async fn used_bytes(&self) -> Result<i64> {
+            self.inner.used_bytes().await
         }
     }
 
@@ -1317,6 +1321,9 @@ mod tests {
         }
         async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
             self.inner.stale_files(before, exclude_root).await
+        }
+        async fn used_bytes(&self) -> Result<i64> {
+            self.inner.used_bytes().await
         }
     }
 

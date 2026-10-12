@@ -1,7 +1,7 @@
 # mcp-fs (Rust)
 
 A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem**:
-107 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
+108 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
@@ -348,7 +348,7 @@ store behaves identically on all three. See
 
 ## Interactive CLI agent
 
-`crates/agent` builds an `agent` binary that drives the 107 tools through an LLM. It is a
+`crates/agent` builds an `agent` binary that drives the 108 tools through an LLM. It is a
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash

@@ -14,6 +14,7 @@ Implementation: `api/dataplane.rs` (routes), `api/openapi.rs` (spec plus UI).
 |---|---|---|
 | `/api/fs/roots` | required | none (the answer *is* the ACL for the caller) |
 | `/api/fs/{mount_id}/**` | required | `require_member(mount_id, person)` |
+| `/api/admin/projects/{project_id}/quota` | required | none: the tool's own gate (admin, or owner; a non admin gets 403 even for a missing project) |
 | `/api/swagger.json`, `/api/docs`, `/api/docs/*` | none | none |
 
 The bearer comes from the configured header (`auth.jwt.header`, default
@@ -35,6 +36,7 @@ token as the password. A 401 body is `{"error": "ERR_UNAUTHENTICATED", "detail":
 | GET | `/api/fs/{mount_id}/download-zip` | query `path` (default `/`) | subtree as a zip, entry names relative to that root |
 | POST | `/api/fs/{mount_id}/export-zip` | body `{"paths": [...]}` | `{"url"}` single use link, same function as `fs.export_zip` |
 | POST | `/api/fs/{mount_id}/extract-archive` | body `{"path", "destination"?, "overwrite"?, "password"?}` | `{destination, files_written, dirs_created, bytes_written}`, same function as `fs.extract_archive` (SPEC-0015) |
+| GET | `/api/admin/projects/{project_id}/quota` | none | `{project_id, max_mb, used_bytes}`, the body of `admin.get_project_quota` byte for byte, same function (SPEC-0020 DEC-006) |
 
 `trigger_documentation_service` on the upload applies to **every** file of the
 form, and only `"true"` or `"1"` turn it on, because a form field is free text and

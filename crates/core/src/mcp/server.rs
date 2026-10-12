@@ -1296,6 +1296,12 @@ pub struct SetProjectQuotaArgs {
     pub max_mb: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetProjectQuotaArgs {
+    /// Id of the project whose storage quota and usage are read.
+    pub project_id: String,
+}
+
 // ── search.* parameter structs ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2797,6 +2803,20 @@ impl McpServer {
         to_call_result("admin.set_project_quota", out)
     }
 
+    #[tool(
+        name = "admin.get_project_quota",
+        description = "Show a project's storage quota and current usage (platform admin or \
+             project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes \
+             is the sum of every file's size, trashed files included."
+    )]
+    pub(crate) async fn admin_get_project_quota(
+        &self,
+        Parameters(a): Parameters<GetProjectQuotaArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = crate::tools::admin::get_project_quota(&self.git_ctx(), &a.project_id).await;
+        to_call_result("admin.get_project_quota", out)
+    }
+
     // ── search.* family ────────────────────────────────────────────
 
     #[tool(
@@ -3760,11 +3780,12 @@ mod tests {
         // SPEC-0015 adds fs.extract_archive: fs 39, total 106.
         // SPEC-0019 adds fs.list_tables: fs 40, total 107; fs.get_table: fs 41, total 108;
         // fs.list_images and fs.get_image: fs 43, total 110; fs.get_document_view: fs 44, total 111.
+        // SPEC-0020 adds admin.get_project_quota: admin 15, total 112.
         assert_eq!(fs_count, 44, "got: {names:?}");
-        assert_eq!(admin_count, 14, "got: {names:?}");
+        assert_eq!(admin_count, 15, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 111, "got: {names:?}");
+        assert_eq!(names.len(), 112, "got: {names:?}");
     }
 
     #[test]
@@ -4096,7 +4117,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 107, "the frozen contract covers 107 non-search tools");
+        assert_eq!(checked, 108, "the frozen contract covers 108 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4117,8 +4138,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 107, "got: {names:?}");
-        assert_eq!(expected.len(), 107, "the golden contract itself must hold 107 names");
+        assert_eq!(names.len(), 108, "got: {names:?}");
+        assert_eq!(expected.len(), 108, "the golden contract itself must hold 108 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

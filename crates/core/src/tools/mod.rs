@@ -52,6 +52,8 @@ pub(crate) mod listing;
 #[cfg(test)]
 pub(crate) mod metadata;
 #[cfg(test)]
+mod quota_e2e;
+#[cfg(test)]
 pub(crate) mod read;
 pub mod registry_support;
 #[cfg(test)]

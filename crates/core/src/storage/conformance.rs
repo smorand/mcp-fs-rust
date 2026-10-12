@@ -319,6 +319,58 @@ async fn meta_volume_isolation(engine: &Engine, tag: &str) -> Result<()> {
     Ok(())
 }
 
+// ── usage counter case (SPEC-0020 US-0015, DEC-002) ─────────────────────────────
+
+/// The per volume usage counter moves with every node transaction that changes
+/// a file's declared size, and with nothing else, on every engine: put,
+/// overwrite larger and smaller, shared content counted per path, rename
+/// unchanged, delete, subtree removal, volume isolation, and the backfill of a
+/// missing row from `nodes`.
+async fn meta_usage_counter(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let a = RelationalMetaStore::open(db.clone(), format!("{tag}-use-a")).await?;
+    let b = RelationalMetaStore::open(db, format!("{tag}-use-b")).await?;
+    assert_eq!(a.used_bytes().await?, 0, "{who}: a new volume uses nothing");
+
+    a.put_file("/x.bin", Some("sha-x1"), 1_000, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 1_000, "{who}: a new path adds its size");
+    a.put_file("/x.bin", Some("sha-x2"), 1_500, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 1_500, "{who}: a larger overwrite adds the difference");
+    a.put_file("/x.bin", Some("sha-x3"), 400, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 400, "{who}: a smaller overwrite subtracts the difference");
+
+    // Same content at a second path: counted once per path (FR-NEW-002).
+    a.put_file("/y.bin", Some("sha-x3"), 400, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 800, "{who}: shared content counts per path");
+
+    a.rename("/x.bin", "/moved/x.bin").await?;
+    assert_eq!(a.used_bytes().await?, 800, "{who}: a rename changes nothing");
+
+    a.delete_file("/y.bin").await?;
+    assert_eq!(a.used_bytes().await?, 400, "{who}: a delete subtracts the file size");
+
+    a.put_file("/d/p.bin", Some("sha-p"), 100, MODE_FILE).await?;
+    a.put_file("/d/e/q.bin", Some("sha-q"), 200, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 700, "{who}: nested files are counted");
+    a.remove_subtree("/d").await?;
+    assert_eq!(a.used_bytes().await?, 400, "{who}: a subtree removal subtracts every file");
+
+    b.put_file("/z.bin", Some("sha-z"), 5_000, MODE_FILE).await?;
+    assert_eq!(b.used_bytes().await?, 5_000, "{who}: volume b counts its own file");
+    assert_eq!(a.used_bytes().await?, 400, "{who}: volume a is untouched by b's write");
+
+    // A volume written before the counter existed: the row is rebuilt from
+    // the nodes, and a write made while it was missing is not lost.
+    a.clear_usage_row_for_test().await?;
+    a.put_file("/late.bin", Some("sha-late"), 50, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 450, "{who}: the backfill sums the files");
+    a.put_file("/late2.bin", Some("sha-late2"), 5, MODE_FILE).await?;
+    assert_eq!(a.used_bytes().await?, 455, "{who}: the rebuilt row keeps counting");
+    assert_eq!(b.used_bytes().await?, 5_000, "{who}: the backfill does not touch volume b");
+    Ok(())
+}
+
 // ── ACL cases ───────────────────────────────────────────────────────────────────
 
 async fn admin_projects_and_members(engine: &Engine, tag: &str) -> Result<()> {
@@ -957,6 +1009,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     meta_like_escaping(engine, &tag).await?;
     meta_rename_deep_tree(engine, &tag).await?;
     meta_volume_isolation(engine, &tag).await?;
+    meta_usage_counter(engine, &tag).await?;
     meta_concurrent_writes(engine, &tag).await?;
     admin_projects_and_members(engine, &tag).await?;
     admin_column_migration_is_idempotent(engine, &tag).await?;

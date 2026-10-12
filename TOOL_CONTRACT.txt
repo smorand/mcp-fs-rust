@@ -18,6 +18,11 @@ admin.get_index_mode
   params: project_id:string
   required: ['project_id']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+admin.get_project_quota
+  desc: Show a project's storage quota and current usage (platform admin or project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the sum of every file's size, trashed files included.
+  params: project_id:string
+  required: ['project_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.list_all_projects
   desc: List every project (platform admin only).
   params: (none)
@@ -660,3 +665,4 @@ admin.list_users: {"users": [{"person": "admin@example.com", "is_admin": true}, 
 admin.list_members: {"project_id": "parity-probe", "members": [{"person": "admin@example.com", "role": "owner", "added_by": "admin@example.com"}]}
 admin.set_index_mode: {"project_id": "parity-probe", "index_mode": "bm25", "previous_mode": "none", "reindex_started": true}
 admin.get_index_mode: {"project_id": "parity-probe", "index_mode": "bm25"}
+admin.get_project_quota: {"project_id": "parity-probe", "max_mb": null, "used_bytes": 1234}
