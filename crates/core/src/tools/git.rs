@@ -2289,16 +2289,22 @@ async fn branch_create(
         None
     };
 
-    entry.db.set_ref(&branch_ref, &sha, false).await?;
-    // Keep the on disk refs in step, the same way git.commit does, so libgit2
-    // based reads and an operator running `git branch` agree with the index.
-    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.branch_create");
-
+    // SPEC-0021/BR-001, BR-002: the checkout is admitted and applied before
+    // the branch is written anywhere, so a refusal or an apply failure has
+    // nothing to undo: no ref in the index, none on disk, no HEAD move.
     if let Some(old_tree) = old_tree {
         let new_tree = commit.tree().map_err(|e| git_err("start point tree", e))?;
         let changes = merge::diff_tree_changes(&repo, &old_tree, &new_tree)?;
         merge::charge_and_apply("git.branch_create", &repo, safety, person, client, &changes)
             .await?;
+    }
+
+    entry.db.set_ref(&branch_ref, &sha, false).await?;
+    // Keep the on disk refs in step, the same way git.commit does, so libgit2
+    // based reads and an operator running `git branch` agree with the index.
+    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.branch_create");
+
+    if checkout {
         entry.db.set_ref("HEAD", &branch_ref, true).await?;
         let _ = repo.set_head(&branch_ref);
     }

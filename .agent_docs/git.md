@@ -750,3 +750,11 @@ documented at its call site. Headlines only:
 
 The authoritative list, with the reasoning and the non git divergences, is in
 [`.agent_docs/parity.md`](parity.md). Do not restate it elsewhere.
+
+## SPEC-0021 (2026-10-12): a refused branch checkout creates no branch
+
+`git.branch_create` with `checkout: true` now admits and applies the checkout
+(`merge::charge_and_apply`) before writing the branch anywhere: a refusal
+(`ERR_PROJECT_QUOTA_EXCEEDED`, `ERR_WRITE_QUOTA_EXCEEDED`) or an apply failure
+leaves no row in the git index, no on disk ref and HEAD unmoved, so a retry
+after the cause is gone succeeds instead of failing with `ERR_NO_CLOBBER`.

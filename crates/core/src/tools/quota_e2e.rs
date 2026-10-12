@@ -1442,6 +1442,18 @@ impl Vc {
     async fn size(&self, path: &str) -> Option<usize> {
         self.w.content(path).await.map(|b| b.len())
     }
+
+    /// `git.branches`' `full_ref` of every listed branch, as Olivia reads it.
+    async fn branches(&self) -> Vec<String> {
+        let args = MountOnlyArgs { mount_id: ATLAS.into() };
+        let out = vc::tool_branches(self.w.f.ctx(OLIVIA), args, self.g()).await.unwrap();
+        out["branches"]
+            .as_array()
+            .expect("a branches array")
+            .iter()
+            .map(|b| b["full_ref"].as_str().expect("a full_ref").to_string())
+            .collect()
+    }
 }
 
 /// A bare repository at `dir` whose `main` is one commit per tree in `trees`,
@@ -2645,4 +2657,179 @@ fn spec_0020_us_0021_pr_merge_writes_no_project_file() {
         assert_eq!(names(&after), names(&before));
         assert_eq!(crate::quota::used_bytes(&client).await.unwrap(), used);
     });
+}
+
+// ── SPEC-0021/US-0022: a refused branch checkout creates no branch ─────────
+
+/// SPEC-0021/BT-001: a refusal over the project limit leaves no branch, and
+/// the same call succeeds once the limit is lifted (BR-001, BR-003).
+#[tokio::test]
+async fn spec_0021_bt_001_retry_after_a_refused_branch_checkout_succeeds() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    v.lower().await;
+
+    let refused = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k.clone(),
+        checkout: true,
+    };
+    assert_refused(vc::tool_branch_create(v.w.f.ctx(MIA), refused, v.g()).await, OVER, 10);
+    assert_eq!(v.branches().await, vec!["refs/heads/main"]);
+
+    v.w.limit(None).await;
+    let retry = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k.clone(),
+        checkout: true,
+    };
+    let out = vc::tool_branch_create(v.w.f.ctx(MIA), retry, v.g()).await.unwrap();
+    assert_eq!(out, json!({"branch": "old", "sha": with_k, "checked_out": true}));
+    assert_eq!(v.head().await, "refs/heads/old");
+}
+
+/// SPEC-0021/BT-010: a refusal for the session write budget leaves no branch
+/// either, and changes nothing else (BR-001, BR-004).
+#[tokio::test]
+async fn spec_0021_bt_010_session_budget_refusal_leaves_no_branch() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    v.w.write(MIA, "/full.bin", SESSION_BUDGET as usize).await;
+    // Spending the budget leaves `/full.bin` in the volume, which the dirty
+    // check would refuse before the session budget is ever reached; removing
+    // it restores a clean volume without refunding the already spent budget.
+    v.delete("/full.bin").await;
+    let used_before = v.w.used().await;
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k,
+        checkout: true,
+    };
+    let e: ToolError = vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await.unwrap_err();
+    assert_eq!(e.code, "ERR_WRITE_QUOTA_EXCEEDED", "got: {e:?}");
+    assert_eq!(e.message, format!("session write quota of {SESSION_BUDGET} bytes exceeded"));
+
+    assert_eq!(v.branches().await, vec!["refs/heads/main"]);
+    assert_eq!(v.head().await, "refs/heads/main");
+    assert!(v.w.content("/k.txt").await.is_none());
+    assert_eq!(v.w.used().await, used_before);
+}
+
+/// SPEC-0021/BT-011: a checkout that is admitted but fails while applying
+/// (DEC-002: the target blob of `/k.txt` is missing from the git object
+/// store) leaves no branch either (BR-002, BR-004).
+#[tokio::test]
+async fn spec_0021_bt_011_apply_failure_leaves_no_branch() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    let entry = v.store.get_or_open_repo(ATLAS).await.unwrap();
+    let k_sha = crate::git::odb::object_id(git2::ObjectType::Blob, &noise(10, 10)).unwrap();
+    entry.objects.delete(&k_sha).await.unwrap();
+    // `hydrate` already exported the blob into the bare repo's on disk loose
+    // object store, so the blob store deletion alone leaves `repo.find_blob`
+    // still able to read it; the loose object file is removed too, DEC-002's
+    // "equivalent fault reachable from the test harness without a production
+    // hook".
+    let loose =
+        v.w.f.state.config.git_repo_dir(ATLAS).join("objects").join(&k_sha[..2]).join(&k_sha[2..]);
+    std::fs::remove_file(&loose).unwrap();
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k,
+        checkout: true,
+    };
+    vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await.unwrap_err();
+
+    assert_eq!(v.branches().await, vec!["refs/heads/main"]);
+    assert_eq!(v.head().await, "refs/heads/main");
+}
+
+/// SPEC-0021/BT-012: the project limit refusal of BT-001 keeps every file,
+/// the usage and HEAD exactly as before the call (BR-001, BR-004).
+#[tokio::test]
+async fn spec_0021_bt_012_project_limit_refusal_keeps_files_usage_and_head() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    let c_txt = v.lower().await;
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k,
+        checkout: true,
+    };
+    assert_refused(vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await, OVER, 10);
+    v.unchanged(c_txt).await;
+    assert_eq!(v.head().await, "refs/heads/main");
+}
+
+/// SPEC-0021/BT-020: without a checkout the creation still succeeds over the
+/// limit, exactly as before this story (non regression).
+#[tokio::test]
+async fn spec_0021_bt_020_creation_without_checkout_over_the_limit_still_succeeds() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    v.lower().await;
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k.clone(),
+        checkout: false,
+    };
+    let out = vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await.unwrap();
+    assert_eq!(out, json!({"branch": "old", "sha": with_k, "checked_out": false}));
+    assert_eq!(v.head().await, "refs/heads/main");
+}
+
+/// SPEC-0021/BT-021: a dirty volume refusal still writes nothing, exactly as
+/// before this story (non regression).
+#[tokio::test]
+async fn spec_0021_bt_021_dirty_volume_refusal_still_writes_nothing() {
+    let v = Vc::new().await;
+    let (with_k, _) = v.k_then_removed(false).await;
+    v.w.put_text("/c.txt", "dirty uncommitted\n").await;
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "old".into(),
+        start_point: with_k,
+        checkout: true,
+    };
+    let e: ToolError = vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await.unwrap_err();
+    assert_eq!(e.code, "ERR_INVALID_ARGUMENT", "got: {e:?}");
+    assert!(e.message.contains("uncommitted changes"), "got: {}", e.message);
+
+    assert_eq!(v.branches().await, vec!["refs/heads/main"]);
+    assert_eq!(v.head().await, "refs/heads/main");
+}
+
+/// SPEC-0021/BT-022: a duplicate branch name is still refused before any
+/// write, and the existing branch does not move (non regression).
+#[tokio::test]
+async fn spec_0021_bt_022_duplicate_name_still_refused_without_moving_the_ref() {
+    let v = Vc::new().await;
+    v.base().await;
+    let c1 = v.head_sha().await;
+    v.w.seed_text("/c.txt", "second\n").await;
+    let c2 = v.commit("second").await;
+    assert_ne!(c2, c1, "the second commit must differ from the first");
+
+    let args = GitBranchCreateArgs {
+        mount_id: ATLAS.into(),
+        name: "main".into(),
+        start_point: c1,
+        checkout: true,
+    };
+    let e: ToolError = vc::tool_branch_create(v.w.f.ctx(MIA), args, v.g()).await.unwrap_err();
+    assert_eq!(e.code, "ERR_NO_CLOBBER", "got: {e:?}");
+    assert_eq!(e.message, "branch 'main' already exists");
+
+    assert_eq!(v.head_sha().await, c2);
 }
