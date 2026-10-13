@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: S
 > Depth evidence: one module (metadata store schema), one defective behavior, 4 requirements, no public contract change, no persisted data change (SQL Server never kept the table, see Rollback posture)
-> Status: specified
+> Status: designed
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High
