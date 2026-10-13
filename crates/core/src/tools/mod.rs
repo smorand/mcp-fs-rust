@@ -70,6 +70,8 @@ pub mod sqlite;
 #[cfg(test)]
 mod teardown_e2e;
 pub(crate) mod trash;
+#[cfg(test)]
+mod trash_search_e2e;
 pub mod web;
 #[cfg(test)]
 pub(crate) mod write;

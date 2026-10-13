@@ -27,6 +27,17 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
+/// True when `path` is the top level trash folder or lives directly under it.
+///
+/// Top level only, by design: `fs_ops::iter_files` exclusions match a segment
+/// at any depth, which would also drop a live file at `/docs/.mcp_trash/a.txt`.
+/// An index walk must skip the trash, not every folder that happens to share
+/// its name.
+pub(crate) fn is_trash_path(path: &str, trash_dir: &str) -> bool {
+    let prefix = format!("/{trash_dir}");
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
 /// Chunk window used by auto indexing, matching the `search.index` tool defaults.
 /// There is no per project chunk configuration in this iteration.
 pub const AUTO_CHUNK_SIZE: usize = 1000;
@@ -57,6 +68,7 @@ impl<'a> ProjectIndexer<'a> {
         old_mode: IndexMode,
         new_mode: IndexMode,
         client: Arc<VolumeClient>,
+        trash_dir: &str,
     ) -> Result<bool> {
         if old_mode == new_mode {
             // Same mode twice: wiping here would throw away a good index for nothing.
@@ -80,8 +92,9 @@ impl<'a> ProjectIndexer<'a> {
 
         let backend = self.backend.clone();
         let vol = volume_id.to_string();
+        let trash_dir = trash_dir.to_string();
         tokio::task::spawn(async move {
-            match full_index(&backend, &vol, &client).await {
+            match full_index(&backend, &vol, &client, &trash_dir).await {
                 Ok(n) => {
                     tracing::info!(volume_id = %vol, chunks = n, "initial full index finished")
                 }
@@ -132,10 +145,14 @@ pub async fn full_index(
     backend: &Arc<dyn SearchBackend>,
     volume_id: &str,
     client: &VolumeClient,
+    trash_dir: &str,
 ) -> Result<usize> {
     let files = fs_ops::iter_files(client, "/", &[]).await?;
     let mut chunks = 0usize;
     for (path, _mtime) in files {
+        if is_trash_path(&path, trash_dir) {
+            continue;
+        }
         let Some(text) = read_utf8(client, &path).await else { continue };
         match backend.index_path(volume_id, &path, &text, AUTO_CHUNK_SIZE, AUTO_CHUNK_OVERLAP).await
         {
@@ -350,7 +367,8 @@ pub async fn after_move(
         }
     }
 
-    index_tree(backend, volume_id, destination, client).await;
+    let trash_dir = &state.safety.config().trash_dir;
+    index_tree(backend, volume_id, destination, client, trash_dir).await;
 }
 
 /// Index the destination of a copy. The source keeps the entries it had, which
@@ -362,7 +380,8 @@ pub async fn after_copy(
     client: &VolumeClient,
 ) {
     if let Some(backend) = active_backend(state, volume_id).await {
-        index_tree(backend, volume_id, destination, client).await;
+        let trash_dir = &state.safety.config().trash_dir;
+        index_tree(backend, volume_id, destination, client, trash_dir).await;
     }
 }
 
@@ -389,9 +408,13 @@ async fn index_tree(
     volume_id: &str,
     root: &str,
     client: &VolumeClient,
+    trash_dir: &str,
 ) {
     let indexer = ProjectIndexer::new(backend);
     for path in files_under(client, root).await {
+        if is_trash_path(&path, trash_dir) {
+            continue;
+        }
         let Some(text) = read_utf8(client, &path).await else { continue };
         drop(indexer.on_write(volume_id, &path, &text));
     }
@@ -521,7 +544,7 @@ mod tests {
         let (backend, rec) = recording();
         let client = client().await;
         let started = ProjectIndexer::new(&backend)
-            .on_mode_change("proj", IndexMode::Bm25, IndexMode::None, client)
+            .on_mode_change("proj", IndexMode::Bm25, IndexMode::None, client, ".mcp_trash")
             .await
             .expect("the wipe must succeed");
         assert!(!started, "none must not start a reindex");
@@ -536,7 +559,7 @@ mod tests {
         client.write_text_atomic("/b.md", "beta").await.expect("seed");
 
         let started = ProjectIndexer::new(&backend)
-            .on_mode_change("proj", IndexMode::None, IndexMode::Bm25, client)
+            .on_mode_change("proj", IndexMode::None, IndexMode::Bm25, client, ".mcp_trash")
             .await
             .expect("the transition must succeed");
         assert!(started, "an active mode must start a reindex");
@@ -553,7 +576,7 @@ mod tests {
         let (backend, rec) = recording();
         let client = client().await;
         let started = ProjectIndexer::new(&backend)
-            .on_mode_change("proj", IndexMode::Both, IndexMode::Both, client)
+            .on_mode_change("proj", IndexMode::Both, IndexMode::Both, client, ".mcp_trash")
             .await
             .expect("a no op must succeed");
         assert!(!started);
@@ -569,7 +592,7 @@ mod tests {
         client.write_text_atomic("/good.md", "readable").await.expect("seed");
         client.write_bytes_atomic("/bad.bin", &[0xFF, 0xFE, 0x00]).await.expect("seed");
 
-        full_index(&backend, "proj", &client).await.expect("the pass must succeed");
+        full_index(&backend, "proj", &client, ".mcp_trash").await.expect("the pass must succeed");
         let calls = rec.calls();
         assert_eq!(calls.len(), 1, "only the readable file is indexed: {calls:?}");
         assert!(calls[0].contains("/good.md"), "{calls:?}");
@@ -582,7 +605,7 @@ mod tests {
         let client = client().await;
         client.write_text_atomic("/moved.md", "arrived").await.expect("seed");
 
-        index_tree(&backend, "proj", "/moved.md", &client).await;
+        index_tree(&backend, "proj", "/moved.md", &client, ".mcp_trash").await;
         let calls = wait_for(&rec, 1).await;
         assert_eq!(calls, vec!["index proj /moved.md 'arrived' 1000/100"]);
     }
@@ -595,7 +618,7 @@ mod tests {
         client.write_text_atomic("/dst/a.md", "alpha").await.expect("seed");
         client.write_text_atomic("/dst/deep/b.md", "beta").await.expect("seed");
 
-        index_tree(&backend, "proj", "/dst", &client).await;
+        index_tree(&backend, "proj", "/dst", &client, ".mcp_trash").await;
         let calls = wait_for(&rec, 2).await;
         assert!(calls.iter().any(|c| c.contains("index proj /dst/a.md 'alpha'")), "{calls:?}");
         assert!(calls.iter().any(|c| c.contains("index proj /dst/deep/b.md 'beta'")), "{calls:?}");
@@ -609,7 +632,7 @@ mod tests {
         client.write_text_atomic("/dst/good.md", "readable").await.expect("seed");
         client.write_bytes_atomic("/dst/bad.bin", &[0xFF, 0xFE, 0x00]).await.expect("seed");
 
-        index_tree(&backend, "proj", "/dst", &client).await;
+        index_tree(&backend, "proj", "/dst", &client, ".mcp_trash").await;
         let calls = wait_for(&rec, 1).await;
         assert_eq!(calls.len(), 1, "only the readable file is indexed: {calls:?}");
         assert!(calls[0].contains("/dst/good.md"), "{calls:?}");
@@ -621,7 +644,7 @@ mod tests {
     async fn index_tree_on_a_missing_path_indexes_nothing() {
         let (backend, rec) = recording();
         let client = client().await;
-        index_tree(&backend, "proj", "/nowhere.md", &client).await;
+        index_tree(&backend, "proj", "/nowhere.md", &client, ".mcp_trash").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(rec.calls().is_empty(), "{:?}", rec.calls());
     }

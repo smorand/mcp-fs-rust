@@ -2698,8 +2698,9 @@ impl McpServer {
             self.state.admin.set_index_mode(&a.project_id, new_mode).await?;
 
             let client = self.state.stores.client(&a.project_id).await?;
+            let trash_dir = self.state.safety.config().trash_dir.clone();
             let reindex_started = crate::search::indexer::ProjectIndexer::new(backend)
-                .on_mode_change(&a.project_id, old_mode, new_mode, client)
+                .on_mode_change(&a.project_id, old_mode, new_mode, client, &trash_dir)
                 .await?;
 
             Ok(serde_json::json!({
@@ -2821,7 +2822,7 @@ impl McpServer {
         name = "search.index",
         description = "Index a file or directory into the search engine for this volume."
     )]
-    async fn search_index(
+    pub(crate) async fn search_index(
         &self,
         Parameters(a): Parameters<SearchIndexArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2843,11 +2844,13 @@ impl McpServer {
             let mut skipped = 0usize;
 
             let paths_to_index: Vec<String> = if a.recursive {
+                let trash_dir = &self.state.safety.config().trash_dir;
                 fs_ops::iter_files(&client, &path, &[])
                     .await
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(p, _mtime)| p)
+                    .filter(|p| !crate::search::indexer::is_trash_path(p, trash_dir))
                     .collect()
             } else {
                 vec![path.clone()]
