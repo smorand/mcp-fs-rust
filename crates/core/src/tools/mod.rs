@@ -52,6 +52,8 @@ pub(crate) mod listing;
 #[cfg(test)]
 pub(crate) mod metadata;
 #[cfg(test)]
+mod mssql_trash_e2e;
+#[cfg(test)]
 mod pg_null_e2e;
 #[cfg(test)]
 mod quota_e2e;

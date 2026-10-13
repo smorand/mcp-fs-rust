@@ -62,6 +62,9 @@ const EXPORT_TOKEN_LEN: u32 = 36;
 const UUID_LEN: u32 = 36;
 /// `exact` or `approximate` (SPEC-0019 FR-NEW-002).
 const QUALITY_LEN: u32 = 16;
+/// An RFC 3339 timestamp as `util::now_iso` writes it is 32 characters. Doubled,
+/// so another offset or precision stays storable (SPEC-0023 DEC-001).
+const TIMESTAMP_LEN: u32 = 64;
 /// Refusal when the document changed between reading it and committing its
 /// artifacts (SPEC-0019 FR-NEW-035).
 const CHANGED_DURING_CONVERSION: &str = "Document changed during conversion";
@@ -204,7 +207,10 @@ pub fn schema() -> SchemaSet {
                     Column::required("original_path", ColumnType::Text),
                     Column::required("size", ColumnType::BigInt).default("0"),
                     Column::required("kind", ColumnType::Text),
-                    Column::required("deleted_at", ColumnType::Text),
+                    // Indexed by `idx_trash_entries_deleted_at`, so it is keyed:
+                    // SQL Server refuses an unbounded column in an index (1919).
+                    // SQLite and PostgreSQL still render TEXT (SPEC-0023 DEC-001).
+                    Column::required("deleted_at", ColumnType::TextKey(TIMESTAMP_LEN)),
                     Column::new("deleted_by", ColumnType::Text),
                 ],
                 vec!["volume_id", "trash_path"],

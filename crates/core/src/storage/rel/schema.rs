@@ -457,4 +457,88 @@ mod tests {
         assert!(stmts[0].contains("CREATE TABLE"), "{:?}", stmts[0]);
         assert!(stmts[1].contains("CREATE INDEX"), "{:?}", stmts[1]);
     }
+
+    /// Every production schema, by the name the guard reports.
+    fn production_schemas() -> Vec<(&'static str, SchemaSet)> {
+        vec![
+            ("storage::meta", crate::storage::meta::schema()),
+            ("storage::admin", crate::storage::admin::schema()),
+            ("git::db", crate::git::db::schema()),
+            ("git::oauth::persistence", crate::git::oauth::persistence::schema()),
+        ]
+    }
+
+    /// `table.column` pairs a primary key or an index declares on unbounded
+    /// text. SQL Server renders `Text` as `NVARCHAR(MAX)` and refuses it as a key
+    /// column (error 1919), so the store fails to open there (SPEC-0023 DEC-002).
+    fn unbounded_keys(set: &SchemaSet) -> Vec<String> {
+        let column_type = |table: &str, column: &str| {
+            set.tables
+                .iter()
+                .find(|t| t.name == table)
+                .and_then(|t| t.columns.iter().find(|c| c.name == column))
+                .map(|c| c.ty)
+        };
+        let keys = set.tables.iter().flat_map(|t| t.primary_key.iter().map(move |c| (t.name, *c)));
+        let indexed = set.indexes.iter().flat_map(|i| i.columns.iter().map(move |c| (i.table, *c)));
+        let typed =
+            set.typed_indexes.iter().flat_map(|i| i.columns.iter().map(move |c| (i.table, *c)));
+        let mut out: Vec<String> = keys
+            .chain(indexed)
+            .chain(typed)
+            .filter(|(t, c)| column_type(t, c) == Some(ColumnType::Text))
+            .map(|(t, c)| format!("{t}.{c}"))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// SPEC-0023 DEC-002: no primary key or index column of a production schema
+    /// is unbounded text, so a store never fails to open on SQL Server.
+    #[test]
+    fn no_production_schema_keys_unbounded_text() {
+        let offenders: Vec<String> = production_schemas()
+            .iter()
+            .flat_map(|(name, set)| {
+                unbounded_keys(set).into_iter().map(move |k| format!("{name}: {k}"))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "unbounded text used as a key column, declare it ColumnType::TextKey(n): {offenders:?}"
+        );
+    }
+
+    /// The guard itself: an indexed `Text` column is reported by table and column.
+    #[test]
+    fn unbounded_key_guard_names_table_and_column() {
+        let set = SchemaSet::new(
+            vec![nodes()],
+            vec![Index { name: "idx_nodes_parent", table: "nodes", columns: vec!["parent"] }],
+        );
+        assert_eq!(unbounded_keys(&set), vec!["nodes.parent".to_string()]);
+    }
+
+    /// SPEC-0023/BT-021: the SQLite and PostgreSQL DDL of `trash_entries` is the
+    /// one rendered before the fix, so an existing store needs no migration.
+    #[test]
+    fn trash_entries_ddl_is_unchanged_on_sqlite_and_postgres() {
+        let set = crate::storage::meta::schema();
+        let table = set.tables.iter().find(|t| t.name == "trash_entries").expect("trash_entries");
+        assert_eq!(
+            render_table(Dialect::Sqlite, table),
+            "CREATE TABLE IF NOT EXISTS \"trash_entries\" (\"volume_id\" TEXT NOT NULL, \
+             \"trash_path\" TEXT NOT NULL, \"original_path\" TEXT NOT NULL, \"size\" INTEGER NOT \
+             NULL DEFAULT 0, \"kind\" TEXT NOT NULL, \"deleted_at\" TEXT NOT NULL, \"deleted_by\" \
+             TEXT, PRIMARY KEY (\"volume_id\", \"trash_path\"))"
+        );
+        assert_eq!(
+            render_table(Dialect::Postgres, table),
+            "CREATE TABLE IF NOT EXISTS \"trash_entries\" (\"volume_id\" TEXT NOT NULL, \
+             \"trash_path\" TEXT NOT NULL, \"original_path\" TEXT NOT NULL, \"size\" BIGINT NOT \
+             NULL DEFAULT 0, \"kind\" TEXT NOT NULL, \"deleted_at\" TEXT NOT NULL, \"deleted_by\" \
+             TEXT, PRIMARY KEY (\"volume_id\", \"trash_path\"))"
+        );
+    }
 }

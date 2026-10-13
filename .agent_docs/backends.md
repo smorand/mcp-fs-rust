@@ -89,6 +89,11 @@ Five of those deserve the reason, because getting them wrong is silent:
 * **`TextKey` exists because SQL Server cannot index `NVARCHAR(MAX)`.** A column in a
   primary key or an index needs a bounded length there, while the same column is plain
   `TEXT` elsewhere. Use `ColumnType::TextKey(n)` for any keyed text.
+  (2026-10-12, SPEC-0023) Secondary indexes count too: `trash_entries.deleted_at` was
+  `Text` inside `idx_trash_entries_deleted_at`, so a SQL Server metadata store failed to
+  open with error 1919. It is now `TextKey(TIMESTAMP_LEN)`, and the unit test
+  `no_production_schema_keys_unbounded_text` in `rel/schema.rs` fails `make check` on any
+  primary key or index column declared `Text` in the four production schemas.
 * **`MERGE` needs `WITH (HOLDLOCK)`.** Without it, `MERGE` races a concurrent insert and
   raises a duplicate key error instead of updating.
 * **`[` matters only on SQL Server**, where it opens a character class in `LIKE`.

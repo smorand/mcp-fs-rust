@@ -1047,6 +1047,76 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// SPEC-0023/BT-010: applying the metadata schema a second time is a no op,
+/// on every engine. Only the declared names are probed, so a shared server
+/// holding other tables cannot disturb the comparison.
+async fn meta_schema_applies_twice(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let schema = crate::storage::meta::schema();
+    let declared: Vec<&str> =
+        schema.tables.iter().map(|t| t.name).chain(schema.indexes.iter().map(|i| i.name)).collect();
+    let mut expected: Vec<String> = declared.iter().map(|n| (*n).to_string()).collect();
+    expected.sort();
+
+    RelationalMetaStore::open(db.clone(), format!("{tag}-twice")).await?;
+    let first = catalog_names(&*db, &declared).await?;
+    assert_eq!(first, expected, "{who}: the first apply creates every table and index");
+
+    db.migrate(&schema).await?;
+    RelationalMetaStore::open(db.clone(), format!("{tag}-twice")).await?;
+    let second = catalog_names(&*db, &declared).await?;
+    assert_eq!(second, first, "{who}: a second apply leaves tables and indexes unchanged");
+    Ok(())
+}
+
+/// The subset of `names` the engine's catalog holds as a table or an index.
+async fn catalog_names(db: &dyn RelationalDb, names: &[&str]) -> Result<Vec<String>> {
+    use crate::storage::rel::{Dialect, Query};
+    let list = names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+    let sql = match db.dialect() {
+        Dialect::Sqlite => format!(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name IN ({list})"
+        ),
+        Dialect::Postgres => format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = \
+             current_schema() AND table_name IN ({list}) UNION ALL SELECT indexname FROM \
+             pg_indexes WHERE schemaname = current_schema() AND indexname IN ({list})"
+        ),
+        Dialect::SqlServer => format!(
+            "SELECT name FROM sys.tables WHERE name IN ({list}) UNION ALL \
+             SELECT name FROM sys.indexes WHERE name IN ({list})"
+        ),
+    };
+    let mut out =
+        db.query(&Query::new(sql)).await?.iter().map(|r| r.text(0)).collect::<Result<Vec<_>>>()?;
+    out.sort();
+    Ok(out)
+}
+
+/// SPEC-0023/BT-011: a recorded `deleted_at` comes back byte for byte, and the
+/// listing is newest first, on every engine.
+async fn trash_timestamps_round_trip(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let m = RelationalMetaStore::open(engine.db().await?, format!("{tag}-trash")).await?;
+    let older = "2026-10-11T08:00:00.000000+00:00";
+    let newer = "2026-10-12T22:11:27.123456+00:00";
+    // Older first, so insertion order alone cannot pass the ordering assertion.
+    m.record_trash_entry("/.trash/old", "/old.txt", 3, "file", older, Some("ada")).await?;
+    m.record_trash_entry("/.trash/new", "/new.txt", 4, "file", newer, None).await?;
+
+    let (rows, total) = m.list_trash_entries_page("", 10, 0).await?;
+    assert_eq!(total, 2, "{who}: both entries are counted");
+    let listed: Vec<(&str, &str)> =
+        rows.iter().map(|r| (r.original_path.as_str(), r.deleted_at.as_str())).collect();
+    assert_eq!(
+        listed,
+        vec![("/new.txt", newer), ("/old.txt", older)],
+        "{who}: deleted_at is verbatim and the newest delete is listed first"
+    );
+    Ok(())
+}
+
 // ── the suite ───────────────────────────────────────────────────────────────────
 
 async fn run_suite(engine: &Engine) -> Result<()> {
@@ -1068,6 +1138,8 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     oauth_legacy_table_is_rebuilt_identically(engine, &tag).await?;
     export_links_round_trip(engine, &tag).await?;
     doc_artifacts_round_trip(engine, &tag).await?;
+    meta_schema_applies_twice(engine, &tag).await?;
+    trash_timestamps_round_trip(engine, &tag).await?;
     Ok(())
 }
 
