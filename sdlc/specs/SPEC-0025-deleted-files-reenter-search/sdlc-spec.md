@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: L
 > Depth evidence: 3 modules (search indexer, auto purge, trash restore), 6 requirements, no public contract change, no data model change
-> Status: specified
+> Status: designed
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: Medium
