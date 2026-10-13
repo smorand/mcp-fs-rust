@@ -25,7 +25,6 @@ use serde_json::Value;
 
 use crate::core::fs_ops;
 use crate::errors::ToolError;
-use crate::git::GitRepoStore;
 use crate::search::fusion::rrf_merge;
 use crate::search::indexer;
 use crate::state::AppState;
@@ -2115,7 +2114,7 @@ impl McpServer {
         name = "fs.trash_list",
         description = "List trashed files, paginated and filterable by original path prefix."
     )]
-    async fn fs_trash_list(
+    pub(crate) async fn fs_trash_list(
         &self,
         Parameters(a): Parameters<TrashListArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2447,21 +2446,20 @@ impl McpServer {
         name = "admin.delete_project",
         description = "Delete a project and recursively tear down its volume (owner or platform admin)."
     )]
-    async fn admin_delete_project(
+    pub(crate) async fn admin_delete_project(
         &self,
         Parameters(a): Parameters<ProjectIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let out = async {
             self.state.require_owner_or_admin(&a.project_id, &self.person).await?;
-            self.state.stores.teardown_volume(&a.project_id).await?;
-            if self.state.config.git.enabled {
-                let store = GitRepoStore::shared(
-                    self.state.config.clone(),
-                    self.state.stores.relational().clone(),
-                );
-                store.purge_repo(&a.project_id).await?;
-            }
-            self.state.admin.delete_project(&a.project_id).await?;
+            crate::purge::remove_project(
+                &a.project_id,
+                &self.state.stores,
+                self.state.admin.as_ref(),
+                &self.state.config,
+                self.state.search.as_ref(),
+            )
+            .await?;
             Ok(serde_json::json!({"project_id": a.project_id, "deleted": true}))
         }
         .await;
@@ -2676,7 +2674,7 @@ impl McpServer {
              Switching to an active mode triggers an initial full index of existing files in \
              the background. Switching to none wipes the index immediately."
     )]
-    async fn admin_set_index_mode(
+    pub(crate) async fn admin_set_index_mode(
         &self,
         Parameters(a): Parameters<SetIndexModeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2886,7 +2884,7 @@ impl McpServer {
         name = "search.query",
         description = "Search indexed content. mode overrides the server default (bm25, rag, both)."
     )]
-    async fn search_query(
+    pub(crate) async fn search_query(
         &self,
         Parameters(a): Parameters<SearchQueryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -3002,7 +3000,7 @@ impl McpServer {
     }
 
     #[tool(name = "search.status", description = "Report index statistics for this volume.")]
-    async fn search_status(
+    pub(crate) async fn search_status(
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {

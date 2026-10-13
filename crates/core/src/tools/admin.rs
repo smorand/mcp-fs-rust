@@ -376,16 +376,17 @@ async fn delete_project(
     git: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
     ctx.state.require_owner_or_admin(project_id, &ctx.person).await?;
-    ctx.state.stores.teardown_volume(project_id).await?;
-    // The C# only dropped the in process git entry, so state/git/{id}.db survived
-    // and a project recreated under the same id inherited stale refs. Purge it.
-    if ctx.state.config.git.enabled {
-        let store = git.unwrap_or_else(|| {
-            GitRepoStore::shared(ctx.state.config.clone(), ctx.state.stores.relational().clone())
-        });
-        store.purge_repo(project_id).await?;
-    }
-    ctx.state.admin.delete_project(project_id).await?;
+    // The same removal production runs (SPEC-0024 DEC-003), with the git store
+    // this registry injected so its entry cache is the one purged.
+    crate::purge::remove_project_with_git(
+        project_id,
+        &ctx.state.stores,
+        ctx.state.admin.as_ref(),
+        &ctx.state.config,
+        ctx.state.search.as_ref(),
+        git,
+    )
+    .await?;
     Ok(json!({"project_id": project_id, "deleted": true}))
 }
 

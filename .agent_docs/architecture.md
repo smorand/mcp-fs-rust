@@ -200,6 +200,26 @@ path}`, which keeps the blob and its refcount untouched. A hard delete
 `ERR_NOT_SUPPORTED`; it removes the nodes and deletes every blob whose refcount
 reached 0.
 
+## Project removal (SPEC-0024, 2026-10-13)
+
+`purge::remove_project` is the ONE permanent removal, called by `admin.delete_project`
+(`mcp/server.rs`) and by the grace period purge (`purge::sweep_grace_period`, from the
+background loop in `app.rs` and the `purge` CLI verb). Steps, in order:
+
+1. `StoreManager::teardown_volume`: every metadata row of the volume (US-0025).
+2. `SearchBackend::delete_all(project_id)` when a search backend is configured: drops the
+   Tantivy directory and its cache entry, the cached sqlite-vec rows, the PostgreSQL
+   `search_fts`/`search_chunks` rows. Without it a project recreated under the same id
+   found the old content through `search.query` (CWE-226).
+3. `GitRepoStore::purge_repo` when `git.enabled`.
+4. `AdminBackend::delete_project`, last, so a failure at any step leaves the project
+   listed and deletable again; every step is idempotent, a retry completes it.
+
+Never add a store wipe to one caller only: add it to `remove_project`. Soft delete
+(`soft_delete_project`) wipes nothing, so `admin.undelete_project` restores the trash,
+artifacts and index unchanged. The `purge` CLI verb builds its search backend with
+`search::build_backend` for the grace sweep. Tests: `tools/project_removal_e2e.rs`.
+
 ## Request lifecycle
 
 | Step | Where | Failure |

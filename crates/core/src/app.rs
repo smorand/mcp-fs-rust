@@ -221,7 +221,7 @@ fn spawn_purge_loop(
                         Err(e) => tracing::warn!(error = %e, "purge loop: cycle failed"),
                     }
                     if let Err(e) =
-                        crate::purge::sweep_grace_period(&state.stores, state.admin.as_ref(), &state.config)
+                        crate::purge::sweep_grace_period(&state.stores, state.admin.as_ref(), &state.config, state.search.as_ref())
                             .await
                     {
                         tracing::warn!(error = %e, "purge loop: grace sweep failed");

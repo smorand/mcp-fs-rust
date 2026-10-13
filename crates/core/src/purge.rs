@@ -11,6 +11,7 @@ use crate::core::fs_ops::rename_with_collision_retry;
 use crate::errors::{Result, ToolError};
 use crate::git::GitRepoStore;
 use crate::safety::SafetyManager;
+use crate::search::SearchBackend;
 use crate::storage::StoreManager;
 use crate::storage::traits::AdminBackend;
 use crate::storage::volume::VolumeClient;
@@ -319,9 +320,10 @@ async fn delete_export_row(
 
 /// Permanently removes every soft-deleted project whose grace period has
 /// elapsed (FR-NEW-012): `now - deleted_at > project_purge_grace_days` (global
-/// config, DEC-008), strictly. Removal runs the same cascade FR-027's
-/// `admin.delete_project` tool runs (volume teardown, then the git repo purge
-/// when `git.enabled`, then the ACL row delete), unconditionally with respect
+/// config, DEC-008), strictly. Removal is [`remove_project`], the very function
+/// FR-027's `admin.delete_project` tool calls (volume teardown, search index
+/// wipe when `search` is configured, git repo purge when `git.enabled`, then
+/// the ACL row delete), unconditionally with respect
 /// to that project's `use_internal_purge` (DEC-007: that flag only gates
 /// whether the file/project sweeps run automatically, never whether an
 /// already-soft-deleted project eventually gets permanently removed). Returns
@@ -334,17 +336,19 @@ pub async fn sweep_grace_period(
     stores: &StoreManager,
     admin: &dyn AdminBackend,
     config: &Arc<ServerConfig>,
+    search: Option<&Arc<dyn SearchBackend>>,
 ) -> Result<usize> {
-    sweep_grace_period_at(now_unix(), stores, admin, config).await
+    sweep_grace_period_at(now_unix(), stores, admin, config, search).await
 }
 
 /// Same as [`sweep_grace_period`], but with an explicit `now`, for the same
 /// boundary-test reason as [`sweep_project_files_at`]/[`sweep_project_at`].
-async fn sweep_grace_period_at(
+pub(crate) async fn sweep_grace_period_at(
     now: f64,
     stores: &StoreManager,
     admin: &dyn AdminBackend,
     config: &Arc<ServerConfig>,
+    search: Option<&Arc<dyn SearchBackend>>,
 ) -> Result<usize> {
     let threshold = (config.safety.project_purge_grace_days as f64) * SECONDS_PER_DAY;
     let mut removed = 0usize;
@@ -354,15 +358,52 @@ async fn sweep_grace_period_at(
         if age <= threshold {
             continue;
         }
-        stores.teardown_volume(&project_id).await?;
-        if config.git.enabled {
-            let store = GitRepoStore::shared(config.clone(), stores.relational().clone());
-            store.purge_repo(&project_id).await?;
-        }
-        admin.delete_project(&project_id).await?;
+        remove_project(&project_id, stores, admin, config, search).await?;
         removed += 1;
     }
     Ok(removed)
+}
+
+/// Permanently removes a project (SPEC-0024 DEC-003), the one implementation
+/// behind both `admin.delete_project` and the grace period purge, so neither
+/// path can forget a store the other wipes. In order: the volume (every
+/// metadata row and blob reference), the search index when search is
+/// configured (Tantivy directory, sqlite-vec cache, PostgreSQL rows), the git
+/// repository when git is enabled, and the project record last.
+///
+/// The record goes last so a failure at any step leaves the project listed and
+/// deletable again: every step is idempotent, so a retry finishes the job
+/// instead of a recreated project inheriting what an earlier step missed.
+pub(crate) async fn remove_project(
+    project_id: &str,
+    stores: &StoreManager,
+    admin: &dyn AdminBackend,
+    config: &Arc<ServerConfig>,
+    search: Option<&Arc<dyn SearchBackend>>,
+) -> Result<()> {
+    remove_project_with_git(project_id, stores, admin, config, search, None).await
+}
+
+/// [`remove_project`] with the git store a caller already holds, so its in
+/// process entry cache is the one purged (the test registry injects its own).
+pub(crate) async fn remove_project_with_git(
+    project_id: &str,
+    stores: &StoreManager,
+    admin: &dyn AdminBackend,
+    config: &Arc<ServerConfig>,
+    search: Option<&Arc<dyn SearchBackend>>,
+    git: Option<Arc<GitRepoStore>>,
+) -> Result<()> {
+    stores.teardown_volume(project_id).await?;
+    if let Some(search) = search {
+        search.delete_all(project_id).await?;
+    }
+    if config.git.enabled {
+        let store = git
+            .unwrap_or_else(|| GitRepoStore::shared(config.clone(), stores.relational().clone()));
+        store.purge_repo(project_id).await?;
+    }
+    admin.delete_project(project_id).await
 }
 
 /// True when `path` is `root` itself or a strict descendant of it.
@@ -1055,7 +1096,8 @@ mod tests {
         let now = now_unix();
         seed_soft_deleted(&f, "proj", now, 31.0 * DAY).await;
 
-        let removed = sweep_grace_period_at(now, &f.stores, &f.admin, &f.config).await.unwrap();
+        let removed =
+            sweep_grace_period_at(now, &f.stores, &f.admin, &f.config, None).await.unwrap();
         assert_eq!(removed, 1);
         assert!(f.admin.get_project("proj").await.unwrap().is_none(), "permanently removed");
     }
@@ -1066,7 +1108,8 @@ mod tests {
         let now = now_unix();
         seed_soft_deleted(&f, "proj", now, 30.0 * DAY).await;
 
-        let removed = sweep_grace_period_at(now, &f.stores, &f.admin, &f.config).await.unwrap();
+        let removed =
+            sweep_grace_period_at(now, &f.stores, &f.admin, &f.config, None).await.unwrap();
         assert_eq!(removed, 0, "strict > required, not >=");
         assert!(f.admin.get_project("proj").await.unwrap().is_some(), "not yet removed");
     }
@@ -1077,7 +1120,8 @@ mod tests {
         let now = now_unix();
         seed_soft_deleted(&f, "proj", now, 30.0 * DAY + 1.0).await;
 
-        let removed = sweep_grace_period_at(now, &f.stores, &f.admin, &f.config).await.unwrap();
+        let removed =
+            sweep_grace_period_at(now, &f.stores, &f.admin, &f.config, None).await.unwrap();
         assert_eq!(removed, 1);
         assert!(f.admin.get_project("proj").await.unwrap().is_none());
     }
@@ -1089,7 +1133,8 @@ mod tests {
         seed_soft_deleted(&f, "proj", now, 31.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, false, None, None).await.unwrap();
 
-        let removed = sweep_grace_period_at(now, &f.stores, &f.admin, &f.config).await.unwrap();
+        let removed =
+            sweep_grace_period_at(now, &f.stores, &f.admin, &f.config, None).await.unwrap();
         assert_eq!(removed, 1, "use_internal_purge=false never gates the grace sweep off");
         assert!(f.admin.get_project("proj").await.unwrap().is_none());
     }
@@ -1115,7 +1160,8 @@ mod tests {
         let swept_client = f.stores.client("swept").await.unwrap();
         swept_client.write_text_atomic("/keep.txt", "data").await.unwrap();
 
-        let removed = sweep_grace_period_at(now, &f.stores, &f.admin, &f.config).await.unwrap();
+        let removed =
+            sweep_grace_period_at(now, &f.stores, &f.admin, &f.config, None).await.unwrap();
 
         assert_eq!(removed, 1);
         assert!(baseline_gone, "baseline cascade actually removed the project");
@@ -1255,7 +1301,8 @@ mod tests {
         seed_soft_deleted(&f, "proj", now, 31.0 * DAY).await;
 
         let failing = FailingDeleteAdmin { inner: f.admin, fail_project: "proj".to_string() };
-        let err = sweep_grace_period_at(now, &f.stores, &failing, &f.config).await.unwrap_err();
+        let err =
+            sweep_grace_period_at(now, &f.stores, &failing, &f.config, None).await.unwrap_err();
         assert!(
             err.to_string().contains("simulated locked row"),
             "the failure surfaces, not swallowed"

@@ -214,7 +214,15 @@ async fn cmd_purge(
             // since a soft-deleted project is already past that decision point
             // (FR-NEW-012's grace-period comparison, unconditional on
             // `use_internal_purge` too).
-            let removed = crate::purge::sweep_grace_period(&stores, &*admin, &config).await?;
+            // SPEC-0024 DEC-003: a project removed here loses its search index
+            // too, exactly as through `admin.delete_project`, so the backend is
+            // built from the same config the server would use (None when
+            // search is disabled).
+            let http = std::sync::Arc::new(reqwest::Client::new());
+            let search = crate::search::build_backend(&config, &relational, http).await?;
+            let removed =
+                crate::purge::sweep_grace_period(&stores, &*admin, &config, search.as_ref())
+                    .await?;
             println!("purge summary: global grace sweep, projects_permanently_removed={removed}");
             Ok(())
         }
