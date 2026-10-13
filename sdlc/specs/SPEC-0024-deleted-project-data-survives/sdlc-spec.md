@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: M
 > Depth evidence: 2 modules (volume teardown in the storage layer, search indexes), 3 deletion entry points (`admin.delete_project`, grace period purge, the purge cycle that sweeps artifacts), 8 requirements, no public contract change, no data model change
-> Status: specified
+> Status: designed
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High
