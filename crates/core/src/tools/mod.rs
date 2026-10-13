@@ -65,6 +65,8 @@ pub(crate) mod search;
 #[cfg(test)]
 pub(crate) mod search_semantic;
 pub mod sqlite;
+#[cfg(test)]
+mod teardown_e2e;
 pub(crate) mod trash;
 pub mod web;
 #[cfg(test)]

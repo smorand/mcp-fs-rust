@@ -494,7 +494,10 @@ impl StoreManager {
         // explicitly. Every table goes in one transaction: a half torn down volume
         // would leave refcounts referring to nodes that no longer exist, and a
         // `volume_usage` row left behind would hand a project recreated under the
-        // same id the old project's usage (SPEC-0020).
+        // same id the old project's usage (SPEC-0020). Every table keyed by
+        // volume goes, not a chosen few: a surviving `trash_entries`,
+        // `export_links` or `doc_*` row would leak the old project into the
+        // new one (SPEC-0024).
         let db = build_relational_db(
             &self.relational,
             "meta",
@@ -508,7 +511,7 @@ impl StoreManager {
         )
         .await?;
         let mut tx = db.begin().await?;
-        for table in ["nodes", "blob_refs", "volume_usage"] {
+        for table in meta::volume_tables() {
             tx.execute(
                 &rel::Query::new(format!("DELETE FROM {table} WHERE volume_id=?1"))
                     .bind(project_id),

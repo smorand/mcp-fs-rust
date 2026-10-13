@@ -24,5 +24,5 @@
 | US-0022 | SPEC-0021 | Refused branch checkout creates no branch | main | 2 | landed | story/US-0022-refused-branch-checkout-creates-no-branch | main |
 | US-0023 | SPEC-0022 | Absent values accepted on PostgreSQL | main | 1 | landed | story/US-0023-absent-values-accepted-on-postgresql | main |
 | US-0024 | SPEC-0023 | SQL Server metadata store opens and lists the trash | main | 1 | landed | story/US-0024-sqlserver-metadata-store-opens | main |
-| US-0025 | SPEC-0024 | Volume teardown removes every metadata row | main | 1 | todo | | |
+| US-0025 | SPEC-0024 | Volume teardown removes every metadata row | main | 1 | landed | story/US-0025-volume-teardown-removes-every-row | main |
 | US-0026 | SPEC-0024 | Project removal wipes the search index | US-0025 | 1 | todo | | |

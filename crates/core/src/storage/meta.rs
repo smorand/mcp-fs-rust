@@ -165,6 +165,21 @@ fn ensure_storable_path(dialect: Dialect, path: &str) -> Result<()> {
     )))
 }
 
+/// Every table of [`schema`] holding rows of one volume, in schema order.
+///
+/// Derived rather than listed by hand: a shared database teardown that names
+/// its tables forgot six of them, so a recreated project inherited the old
+/// trash, export links and artifact sets (SPEC-0024 DEC-001). A table added to
+/// the schema with a `volume_id` column is torn down without another edit.
+pub(crate) fn volume_tables() -> Vec<&'static str> {
+    schema()
+        .tables
+        .into_iter()
+        .filter(|t| t.columns.iter().any(|c| c.name == "volume_id"))
+        .map(|t| t.name)
+        .collect()
+}
+
 /// The tables this store owns.
 pub fn schema() -> SchemaSet {
     SchemaSet::new(
@@ -2120,6 +2135,26 @@ mod tests {
     use super::*;
     use crate::storage::rel::{Dialect, SqliteRelationalDb};
     use crate::storage::traits::MODE_FILE;
+
+    /// SPEC-0024 DEC-001: the shared database teardown deletes from exactly these
+    /// tables, so a table added to `schema()` with a `volume_id` must show up here.
+    #[test]
+    fn volume_tables_lists_every_table_keyed_by_volume() {
+        assert_eq!(
+            volume_tables(),
+            vec![
+                "nodes",
+                "blob_refs",
+                "trash_entries",
+                "volume_usage",
+                "export_links",
+                "doc_artifact_current",
+                "doc_artifact_sets",
+                "doc_images",
+                "doc_tables",
+            ]
+        );
+    }
 
     async fn store() -> RelationalMetaStore {
         RelationalMetaStore::in_memory("proj").await.unwrap()
