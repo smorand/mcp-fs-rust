@@ -204,22 +204,30 @@ async fn cmd_purge(
     // The purge verb only deletes, so no project limit can ever be consulted;
     // the explicit opt out keeps a forgotten attach elsewhere failing closed.
     safety.attach_no_limits();
+    // SPEC-0024 DEC-003 / SPEC-0025 DEC-004: both branches use the backend the
+    // server would use (None when search is disabled). The global branch needs
+    // it to drop a removed project's index, so a build failure stays fatal
+    // there, as before. The project branch only keeps the index in step with
+    // the sweep (BR-004): an unreachable search backend must not stop a file
+    // purge that never depended on it, so it is a warning there.
+    let http = std::sync::Arc::new(reqwest::Client::new());
+    let search = crate::search::build_backend(&config, &relational, http).await;
 
     match project {
         Some(project_id) => {
-            cmd_purge_project(&*admin, &stores, &safety, &project_id, on_demand).await
+            let search = search.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "purge: search backend unavailable, index left as is");
+                None
+            });
+            cmd_purge_project(&*admin, &stores, &safety, &project_id, on_demand, search.as_ref())
+                .await
         }
         None => {
             // FR-NEW-011: the global form ignores `autopurge_enabled` entirely,
             // since a soft-deleted project is already past that decision point
             // (FR-NEW-012's grace-period comparison, unconditional on
             // `use_internal_purge` too).
-            // SPEC-0024 DEC-003: a project removed here loses its search index
-            // too, exactly as through `admin.delete_project`, so the backend is
-            // built from the same config the server would use (None when
-            // search is disabled).
-            let http = std::sync::Arc::new(reqwest::Client::new());
-            let search = crate::search::build_backend(&config, &relational, http).await?;
+            let search = search?;
             let removed =
                 crate::purge::sweep_grace_period(&stores, &*admin, &config, search.as_ref())
                     .await?;
@@ -237,6 +245,7 @@ async fn cmd_purge_project(
     safety: &crate::safety::SafetyManager,
     project_id: &str,
     on_demand: bool,
+    search: Option<&std::sync::Arc<dyn crate::search::SearchBackend>>,
 ) -> anyhow::Result<()> {
     if admin.get_project(project_id).await?.is_none() {
         anyhow::bail!("ERR_PROJECT_NOT_FOUND: project '{project_id}' does not exist");
@@ -250,7 +259,7 @@ async fn cmd_purge_project(
     }
     let client = stores.client(project_id).await?;
     let files_purged =
-        crate::purge::sweep_project_files(&client, admin, safety, project_id).await?;
+        crate::purge::sweep_project_files(&client, admin, safety, project_id, search).await?;
     let project_soft_deleted =
         crate::purge::sweep_project(&client, admin, safety, project_id).await?;
     println!(

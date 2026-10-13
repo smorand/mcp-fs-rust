@@ -212,7 +212,14 @@ fn spawn_purge_loop(
                     break;
                 }
                 _ = ticker.tick() => {
-                    match crate::purge::run_cycle(&state.stores, state.admin.as_ref(), &state.safety).await {
+                    match crate::purge::run_cycle(
+                        &state.stores,
+                        state.admin.as_ref(),
+                        &state.safety,
+                        state.search.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(summary) => tracing::info!(
                             files_purged = summary.files_purged,
                             projects_soft_deleted = summary.projects_soft_deleted,

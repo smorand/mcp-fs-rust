@@ -40,8 +40,9 @@ pub async fn sweep_project_files(
     admin: &dyn AdminBackend,
     safety: &SafetyManager,
     project_id: &str,
+    search: Option<&Arc<dyn SearchBackend>>,
 ) -> Result<usize> {
-    sweep_project_files_at(now_unix(), client, admin, safety, project_id).await
+    sweep_project_files_at(now_unix(), client, admin, safety, project_id, search).await
 }
 
 /// Same as [`sweep_project_files`], but with an explicit `now` rather than
@@ -54,6 +55,7 @@ async fn sweep_project_files_at(
     admin: &dyn AdminBackend,
     safety: &SafetyManager,
     project_id: &str,
+    search: Option<&Arc<dyn SearchBackend>>,
 ) -> Result<usize> {
     let config = admin.get_purge_config(project_id).await?;
     if !config.autopurge_enabled || !config.use_internal_purge {
@@ -98,6 +100,31 @@ async fn sweep_project_files_at(
             if recorded.is_err() {
                 let _ = client.rename(&final_dst, &node.path).await;
                 continue;
+            }
+        }
+        // DEC-002: the index follows the trash the same way `fs.delete` does,
+        // but only when the project's mode is active; an index failure here is
+        // logged, never allowed to undo or fail the move that already happened.
+        if let Some(search) = search {
+            match admin.get_index_mode(project_id).await {
+                Ok(mode) if mode.is_active() => {
+                    if let Err(e) = search.delete_path(project_id, &node.path).await {
+                        tracing::warn!(
+                            project = project_id,
+                            path = %node.path,
+                            error = %e,
+                            "purge cycle: search delete_path failed"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        project = project_id,
+                        error = %e,
+                        "purge cycle: could not read index mode"
+                    );
+                }
             }
         }
         purged += 1;
@@ -184,6 +211,7 @@ pub async fn run_cycle(
     stores: &StoreManager,
     admin: &dyn AdminBackend,
     safety: &SafetyManager,
+    search: Option<&Arc<dyn SearchBackend>>,
 ) -> Result<CycleSummary> {
     let mut summary = CycleSummary::default();
     for project in admin.list_all_projects().await? {
@@ -198,7 +226,7 @@ pub async fn run_cycle(
                 continue;
             }
         };
-        match sweep_project_files(&client, admin, safety, &project.id).await {
+        match sweep_project_files(&client, admin, safety, &project.id, search).await {
             Ok(n) => summary.files_purged += n,
             Err(e) => {
                 tracing::warn!(project = %project.id, error = %e, "purge cycle: file sweep failed");
@@ -472,7 +500,8 @@ mod tests {
         seed_stale_file(&f, "/old.txt", 8.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 1);
         assert!(!f.client.exists("/old.txt").await.unwrap(), "no longer at its original path");
 
@@ -491,8 +520,9 @@ mod tests {
         seed_stale_file_at(&f, "/edge.txt", now, 7.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
 
-        let purged =
-            sweep_project_files_at(now, &f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged = sweep_project_files_at(now, &f.client, &f.admin, &f.safety, "proj", None)
+            .await
+            .unwrap();
         assert_eq!(purged, 0, "strict > required, not >=");
         assert!(f.client.exists("/edge.txt").await.unwrap());
     }
@@ -504,8 +534,9 @@ mod tests {
         seed_stale_file_at(&f, "/past.txt", now, 7.0 * DAY + 1.0).await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
 
-        let purged =
-            sweep_project_files_at(now, &f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged = sweep_project_files_at(now, &f.client, &f.admin, &f.safety, "proj", None)
+            .await
+            .unwrap();
         assert_eq!(purged, 1);
         assert!(!f.client.exists("/past.txt").await.unwrap());
     }
@@ -516,7 +547,8 @@ mod tests {
         seed_stale_file(&f, "/stale.txt", 10.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, false, Some(7), None).await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0);
         assert!(f.client.exists("/stale.txt").await.unwrap());
     }
@@ -543,7 +575,8 @@ mod tests {
             admission: Arc::default(),
         };
 
-        let purged = sweep_project_files(&flaky_client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&flaky_client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 2, "file 1 and file 3 purged, file 2's failure isolated");
         assert!(f.client.exists("/two.txt").await.unwrap(), "file 2 left in place");
         assert!(!f.client.exists("/one.txt").await.unwrap());
@@ -556,12 +589,14 @@ mod tests {
         seed_stale_file(&f, "/old.txt", 8.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
 
-        let first = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let first =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(first, 1);
         let trash_root = format!("/{}", f.safety.config().trash_dir);
         let after_first = f.client.meta.subtree(&trash_root).await.unwrap().len();
 
-        let second = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let second =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(second, 0, "re-purging an already-trashed file is a no-op");
         let after_second = f.client.meta.subtree(&trash_root).await.unwrap().len();
         assert_eq!(after_first, after_second, "no duplicate trash entry");
@@ -572,7 +607,8 @@ mod tests {
         let f = fixture().await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(7), None).await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0);
     }
 
@@ -582,7 +618,8 @@ mod tests {
         seed_stale_file(&f, "/stale.txt", 100.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, true, None, Some(30)).await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0, "file step skipped independently of project_retention_days");
         assert!(f.client.exists("/stale.txt").await.unwrap());
     }
@@ -593,7 +630,8 @@ mod tests {
         seed_stale_file(&f, "/stale.txt", 100.0 * DAY).await;
         // No seed_purge_config_for_test call: the project has never been configured.
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0);
         assert!(f.client.exists("/stale.txt").await.unwrap());
     }
@@ -627,7 +665,8 @@ mod tests {
         seed_stale_file(&f, "/old.txt", 3.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 1);
 
         let trash_root = format!("/{}", f.safety.config().trash_dir);
@@ -642,7 +681,8 @@ mod tests {
         seed_stale_file(&f, "/stale.txt", 5.0 * DAY).await;
         f.admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 1);
 
         // TODO(US-0004/US-0005): once fs.trash_list/fs.trash_restore exist, extend
@@ -662,7 +702,8 @@ mod tests {
         let store = f.client.trash.as_ref().unwrap();
         let before = store.count_trash_entries_for_test().await.unwrap();
 
-        let purged = sweep_project_files(&f.client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0);
         let after = store.count_trash_entries_for_test().await.unwrap();
         assert_eq!(before, after, "a no-op sweep writes nothing");
@@ -746,8 +787,9 @@ mod tests {
         let colliding_client = VolumeClient::new("proj", Arc::new(mock), f.client.blob.clone())
             .with_trash_store(f.meta.clone());
 
-        let purged =
-            sweep_project_files(&colliding_client, &f.admin, &f.safety, "proj").await.unwrap();
+        let purged = sweep_project_files(&colliding_client, &f.admin, &f.safety, "proj", None)
+            .await
+            .unwrap();
         assert_eq!(purged, 0, "the colliding file's failure is isolated, not propagated");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -840,7 +882,7 @@ mod tests {
         meta.set_atime_for_test("/stale2.txt", now_unix() - 8.0 * DAY).await.unwrap();
         admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
 
-        let purged = sweep_project_files(&client, &admin, &safety, "proj").await.unwrap();
+        let purged = sweep_project_files(&client, &admin, &safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0, "the per-file failure is isolated, matching purge.rs:26");
         assert!(client.exists("/stale2.txt").await.unwrap(), "the file remains live, not trashed");
         assert_eq!(
@@ -996,7 +1038,7 @@ mod tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
         admin.seed_created_at_for_test("p2", &created_at).await.unwrap();
 
-        let summary = run_cycle(&stores, &admin, &safety).await.unwrap();
+        let summary = run_cycle(&stores, &admin, &safety, None).await.unwrap();
         assert_eq!(summary.files_purged, 1, "p1's stale file was swept");
         assert_eq!(summary.projects_soft_deleted, 1, "p2's staleness soft-deleted it");
         assert!(admin.deleted_at_for_test("p2").await.unwrap().is_some());
@@ -1012,7 +1054,7 @@ mod tests {
         let safety = SafetyManager::new(SafetyConfig::default(), None);
         safety.attach_no_limits();
 
-        let summary = run_cycle(&stores, &admin, &safety).await.unwrap();
+        let summary = run_cycle(&stores, &admin, &safety, None).await.unwrap();
         assert_eq!(summary, CycleSummary::default());
     }
 
@@ -1043,7 +1085,7 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        let summary = run_cycle(&stores, &admin, &safety).await.unwrap();
+        let summary = run_cycle(&stores, &admin, &safety, None).await.unwrap();
         let elapsed = start.elapsed();
 
         assert_eq!(summary.files_purged, N / 2, "exactly the stale half, no skip, no duplicate");
@@ -1460,7 +1502,7 @@ mod tests {
     async fn e2e_new_031_sweep_deletes_expired_never_downloaded_export() {
         let f = export_fixture().await;
         seed_export(&f, "T", -3600.0, b"zip bytes").await;
-        let result = run_cycle(&f.stores, &f.admin, &f.safety).await;
+        let result = run_cycle(&f.stores, &f.admin, &f.safety, None).await;
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -1470,7 +1512,7 @@ mod tests {
         let f = export_fixture().await;
         seed_export(&f, "T", -3600.0, b"zip bytes").await;
         assert_eq!(export_row_count(&f, "T").await, 1, "row present before the sweep");
-        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety, None).await.unwrap();
         assert_eq!(export_row_count(&f, "T").await, 0);
         assert_eq!(summary.exports_swept, 1);
     }
@@ -1481,7 +1523,7 @@ mod tests {
         let f = export_fixture().await;
         seed_export(&f, "T", -3600.0, b"zip bytes").await;
         assert!(export_blob_present(&f, "T").await, "blob present before the sweep");
-        run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        run_cycle(&f.stores, &f.admin, &f.safety, None).await.unwrap();
         assert!(!export_blob_present(&f, "T").await);
     }
 
@@ -1495,7 +1537,7 @@ mod tests {
         let client = f.stores.client("proj").await.unwrap();
         client.blob.delete("export:T1").await.unwrap();
 
-        let result = run_cycle(&f.stores, &f.admin, &f.safety).await;
+        let result = run_cycle(&f.stores, &f.admin, &f.safety, None).await;
         assert!(result.is_ok(), "{result:?}");
         let summary = result.unwrap();
         assert_eq!(summary.exports_swept, 2, "both rows removed regardless of T1's blob outcome");
@@ -1511,7 +1553,7 @@ mod tests {
         seed_export(&f, "T_expired", -3600.0, b"expired bytes").await;
         seed_export(&f, "T_live", 4.0 * 60.0, b"live bytes").await;
 
-        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety, None).await.unwrap();
         assert_eq!(summary.exports_swept, 1);
         assert_eq!(export_row_count(&f, "T_expired").await, 0);
         assert!(!export_blob_present(&f, "T_expired").await);
@@ -1526,7 +1568,7 @@ mod tests {
     #[tokio::test]
     async fn e2e_new_036_zero_export_links_rows_is_a_no_op() {
         let f = export_fixture().await;
-        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety, None).await.unwrap();
         assert_eq!(summary.exports_swept, 0);
     }
 
@@ -1582,7 +1624,7 @@ mod tests {
         let client = f.stores.client("proj").await.unwrap();
         client.rename("/report.pdf", "/moved.pdf").await.unwrap();
 
-        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety, None).await.unwrap();
 
         assert!(summary.artifact_sets_swept >= 1, "{summary:?}");
         assert!(!client.blob.exists(&image_sha).await.unwrap(), "the orphaned image is GC'd");
@@ -1643,7 +1685,7 @@ mod tests {
         store.commit_artifact_set(&current).await.unwrap();
 
         // Too soon: the just superseded first set must survive this cycle.
-        let summary = run_cycle(&f.stores, &f.admin, &f.safety).await.unwrap();
+        let summary = run_cycle(&f.stores, &f.admin, &f.safety, None).await.unwrap();
         assert_eq!(summary.artifact_sets_swept, 0, "inside the 10 minute grace period");
         assert!(client.blob.exists(&old_sha).await.unwrap(), "not yet GC'd");
         assert!(client.blob.exists(new_sha).await.unwrap(), "the current image is untouched");

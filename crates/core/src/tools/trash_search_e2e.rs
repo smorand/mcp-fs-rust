@@ -129,6 +129,53 @@ impl Fixture {
         ok_json(self.server().fs_trash_list(args(json!({"mount_id": ATLAS}))).await)
     }
 
+    async fn trash_restore(&self, trash_path: &str) -> Value {
+        let a = args(json!({"mount_id": ATLAS, "trash_path": trash_path}));
+        ok_json(self.server().fs_trash_restore(a).await)
+    }
+
+    /// Ages `path`'s `atime` by `age_seconds` so the auto purge sweep sees it
+    /// as stale (SPEC-0014's staleness threshold is `now - atime`).
+    async fn age_atime(&self, path: &str, age_seconds: f64) {
+        let client = self.state.stores.client(ATLAS).await.unwrap();
+        client
+            .trash
+            .as_ref()
+            .expect("the test harness attaches a trash store")
+            .set_atime_for_test(path, crate::util::now_unix() - age_seconds)
+            .await
+            .unwrap();
+    }
+
+    async fn set_purge_config(&self, file_retention_days: i64) {
+        self.state
+            .admin
+            .set_purge_config(
+                ATLAS,
+                crate::storage::traits::PurgeConfig {
+                    autopurge_enabled: true,
+                    use_internal_purge: true,
+                    file_retention_days: Some(file_retention_days),
+                    project_retention_days: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Runs the real purge cycle (DEC-004): the same `run_cycle` the background
+    /// loop and the CLI `purge` verb call.
+    async fn run_purge_cycle(&self) {
+        crate::purge::run_cycle(
+            &self.state.stores,
+            self.state.admin.as_ref(),
+            &self.state.safety,
+            self.state.search.as_ref(),
+        )
+        .await
+        .unwrap();
+    }
+
     /// The current `trash_path` of the entry whose `original_path` is `original`.
     async fn trash_path_of(&self, original: &str) -> String {
         let listed = self.trash_list().await;
@@ -340,6 +387,73 @@ async fn spec_0025_bt_020_delete_still_clears_write_still_indexes() {
     assert_eq!(results_of(&found), vec!["/b.txt".to_string()], "got: {found}");
 }
 
+/// SPEC-0025/BT-002: a restored file is found again.
+#[tokio::test]
+async fn spec_0025_bt_002_a_restored_file_is_found_again() {
+    let f = Fixture::new(None).await;
+    f.write("/memo.txt", "quarterly forecast draft").await;
+    f.write("/plan.txt", "merger with Borealis").await;
+    f.set_mode("bm25").await;
+    f.await_bm25_docs(2).await;
+    f.delete("/memo.txt").await;
+    f.await_bm25_docs(1).await;
+
+    let trash_path = f.trash_path_of("/memo.txt").await;
+    f.trash_restore(&trash_path).await;
+    f.await_bm25_docs(2).await;
+
+    let found = f.query("forecast").await;
+    assert_eq!(results_of(&found), vec!["/memo.txt".to_string()], "got: {found}");
+}
+
+/// SPEC-0025/BT-013: the auto purge removes the stale file from search.
+#[tokio::test]
+async fn spec_0025_bt_013_auto_purge_removes_the_stale_file_from_search() {
+    let f = Fixture::new(None).await;
+    f.set_mode("bm25").await;
+    f.write("/old.txt", "obsolete roadmap").await;
+    f.await_bm25_docs(1).await;
+    f.age_atime("/old.txt", 2.0 * 86_400.0).await;
+    f.set_purge_config(1).await;
+
+    f.run_purge_cycle().await;
+    f.await_bm25_docs(0).await;
+
+    let found = f.query("roadmap").await;
+    assert_eq!(results_of(&found), Vec::<String>::new(), "got: {found}");
+    let listed = f.trash_list().await;
+    let originals: Vec<&str> = listed["entries"]
+        .as_array()
+        .expect("entries is an array")
+        .iter()
+        .map(|e| e["original_path"].as_str().unwrap_or_default())
+        .collect();
+    assert!(originals.contains(&"/old.txt"), "got: {listed}");
+}
+
+/// SPEC-0025/BT-014: restoring onto a taken path keeps both files searchable.
+#[tokio::test]
+async fn spec_0025_bt_014_restore_onto_a_taken_path() {
+    let f = Fixture::new(None).await;
+    f.write("/memo.txt", "quarterly forecast draft").await;
+    f.set_mode("bm25").await;
+    f.await_bm25_docs(1).await;
+    f.delete("/memo.txt").await;
+    f.await_bm25_docs(0).await;
+
+    let trash_path = f.trash_path_of("/memo.txt").await;
+    f.write("/memo.txt", "fresh notes").await;
+    f.await_bm25_docs(1).await;
+
+    f.trash_restore(&trash_path).await;
+    f.await_bm25_docs(2).await;
+
+    let forecast = f.query("forecast").await;
+    assert_eq!(results_of(&forecast), vec!["/memo.txt_restored".to_string()], "got: {forecast}");
+    let fresh = f.query("fresh").await;
+    assert_eq!(results_of(&fresh), vec!["/memo.txt".to_string()], "got: {fresh}");
+}
+
 // ── PostgreSQL BM25 variant (optional) ──────────────────────────────────────
 
 /// A PostgreSQL twin of the [`Fixture`], the metadata store on a fresh schema
@@ -471,4 +585,28 @@ async fn spec_0025_bt_001_pg_a_deleted_file_does_not_come_back_after_a_mode_chan
     assert_eq!(results_of(&found), Vec::<String>::new(), "got: {found}");
     assert_eq!(f.inner.status().await["bm25_docs"], json!(1));
     f.cleanup().await;
+}
+
+/// SPEC-0025/BT-021: non regression, the trash listing and the restore answer
+/// exactly what they answered before the index started following the trash.
+#[tokio::test]
+async fn spec_0025_bt_021_trash_listing_and_restore_unchanged() {
+    let f = Fixture::new(None).await;
+    f.set_mode("bm25").await;
+    f.write("/memo.txt", "quarterly forecast draft").await;
+    f.await_bm25_docs(1).await;
+    f.delete("/memo.txt").await;
+
+    let listed = f.trash_list().await;
+    assert_eq!(listed["total"], json!(1), "got: {listed}");
+    let entry = &listed["entries"][0];
+    assert_eq!(entry["original_path"], json!("/memo.txt"), "got: {listed}");
+    assert_eq!(entry["size"], json!(24), "got: {listed}");
+    assert_eq!(entry["kind"], json!("file"), "got: {listed}");
+    let trash_path = entry["trash_path"].as_str().expect("trash_path is a string").to_string();
+    assert!(trash_path.starts_with("/.mcp_trash/"), "got: {trash_path}");
+
+    let restored = f.trash_restore(&trash_path).await;
+    assert_eq!(restored, json!({"restored_path": "/memo.txt", "trash_path": trash_path}));
+    assert_eq!(f.trash_list().await["total"], json!(0));
 }

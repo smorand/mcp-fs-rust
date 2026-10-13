@@ -405,9 +405,14 @@ async fn spec_0024_bt_008_the_artifact_sweep_spares_the_new_projects_blobs() {
 
     // Far past the artifact grace period: `run_cycle` sweeps with the wall clock,
     // and an orphan set (its node is gone) is stale whatever its age.
-    crate::purge::run_cycle(&f.state.stores, f.state.admin.as_ref(), &f.state.safety)
-        .await
-        .unwrap();
+    crate::purge::run_cycle(
+        &f.state.stores,
+        f.state.admin.as_ref(),
+        &f.state.safety,
+        f.state.search.as_ref(),
+    )
+    .await
+    .unwrap();
 
     let args = ReadBytesArgs {
         mount_id: ATLAS.into(),

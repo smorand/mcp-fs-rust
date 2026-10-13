@@ -254,3 +254,32 @@ mode integration tests, use `scripts/search_embedding_fake.py` as a stub server.
    because the directory is always rebuildable. The cached open index is evicted with
    it, so the next write reopens a fresh one.
 
+## The trash rule (2026-10-13)
+
+"The trash" is every path at or under `/{trash_dir}` (`safety.trash_dir`, default
+`.mcp_trash`), top level only: `/docs/.mcp_trash/a.txt` is an ordinary, indexed file
+(SPEC-0025). Five places that used to disagree with this now all follow it:
+
+- A mode change backfill and a recursive `search.index` skip the trash
+  (`search::indexer::is_trash_path`, used by `full_index` and `files_under`).
+- `fs.move` into the trash folder drops the source's chunks and does not index the
+  destination (same walkers).
+- The auto purge sweep (`purge::sweep_project_files`) removes the original path's
+  chunks with `SearchBackend::delete_path`, right after the move to the trash
+  succeeds, when the project's index mode is active (`admin.get_index_mode(..).
+  is_active()`). A failed delete is a WARN log, never a reason to undo the move or
+  fail the sweep: an index failure never blocks a purge.
+- `fs.trash_restore` calls `search::indexer::after_move` after the rename, exactly
+  like `fs.move`: it clears the trash path's chunks and indexes the restored path,
+  `_restored`/`_restoredN` collisions included. Same failure rule: detached, logged,
+  never fails the restore.
+
+An explicit, non recursive `search.index` on one named trash path still indexes it:
+the caller named it, so `search.query` can legitimately return a trash path in that
+one case.
+
+`purge::sweep_project_files` and `purge::run_cycle` both take an
+`Option<&Arc<dyn SearchBackend>>`; the background loop (`app.rs`) and the CLI `purge`
+verb (`cli.rs`, same backend the grace sweep already built) pass the server's
+configured backend, `None` when search is disabled.
+

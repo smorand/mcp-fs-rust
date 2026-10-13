@@ -210,6 +210,19 @@ pub(crate) async fn trash_restore(
     let restored_path = restore_with_collision_retry(&client, trash_path, &destination).await?;
     store.delete_trash_entry(trash_path).await?;
 
+    // DEC-003: the same hook `fs.move` uses, so a restore clears the trash
+    // path's chunks and indexes the restored path, `_restored` collisions
+    // included. Detached and failure-swallowed like every indexer hook: an
+    // index failure never fails a restore.
+    crate::search::indexer::after_move(
+        state,
+        mount_id,
+        &[trash_path.to_string()],
+        &restored_path,
+        &client,
+    )
+    .await;
+
     tracing::info!(trash_path, restored_path = %restored_path, "fs.trash_restore");
     Ok(json!({"restored_path": restored_path, "trash_path": trash_path}))
 }
