@@ -19,7 +19,12 @@ use super::schema::SchemaSet;
 use super::{PoolSettings, Query, RelationalDb, RelationalTx, RowValues, SqlValue};
 use crate::errors::{Result, ToolError};
 use async_trait::async_trait;
-use sqlx::postgres::{PgArguments, PgConnectOptions, PgPoolOptions, PgRow};
+use sqlx::encode::IsNull;
+use sqlx::error::BoxDynError;
+use sqlx::postgres::types::Oid;
+use sqlx::postgres::{
+    PgArgumentBuffer, PgArguments, PgConnectOptions, PgPoolOptions, PgRow, PgTypeInfo,
+};
 use sqlx::{Arguments, AssertSqlSafe, Column, Executor, Postgres, Row, Transaction, ValueRef};
 use std::sync::Arc;
 
@@ -153,11 +158,35 @@ fn map_error(e: sqlx::Error) -> ToolError {
 
 // ── value mapping ───────────────────────────────────────────────────────────────
 
+/// A null whose type the server infers from where it lands.
+///
+/// `SqlValue::Null` carries no type, so binding it as any concrete one is a
+/// guess: a `TEXT` null was refused by every `BIGINT` column (42804), which broke
+/// clearing a quota and every nullable number. OID 0 is the protocol's
+/// "unspecified" parameter type, so the server types it from context, exactly
+/// as SQLite accepts a null anywhere (SPEC-0022 DEC-001).
+struct UntypedNull;
+
+impl sqlx::Type<Postgres> for UntypedNull {
+    fn type_info() -> PgTypeInfo {
+        PgTypeInfo::with_oid(Oid(0))
+    }
+}
+
+impl sqlx::Encode<'_, Postgres> for UntypedNull {
+    fn encode_by_ref(
+        &self,
+        _buf: &mut PgArgumentBuffer,
+    ) -> std::result::Result<IsNull, BoxDynError> {
+        Ok(IsNull::Yes)
+    }
+}
+
 fn bind_all(query: &Query) -> Result<PgArguments> {
     let mut args = PgArguments::default();
     for value in &query.params {
         let added = match value {
-            SqlValue::Null => args.add(None::<String>),
+            SqlValue::Null => args.add(UntypedNull),
             SqlValue::Int(v) => args.add(*v),
             SqlValue::Real(v) => args.add(*v),
             SqlValue::Text(v) => args.add(v.clone()),
@@ -461,6 +490,30 @@ mod tests {
         assert_eq!(r.opt_text(4).unwrap(), None);
         // Names come back from the server, which is what a store maps on.
         assert_eq!(r.columns(), ["k", "n", "r", "b", "t"]);
+
+        // SPEC-0022 BT-020: a null bound where the server expects a number. `n` is
+        // NOT NULL, so the null reaches it through COALESCE, which needs the
+        // parameter untyped; `r` takes a stored null directly.
+        db.execute(
+            &Query::new("INSERT INTO probe (k, n, r) VALUES (?1, COALESCE(?2, ?3), ?4)")
+                .bind("nulls")
+                .bind(None::<i64>)
+                .bind(7i64)
+                .bind(None::<f64>),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            &Query::new("UPDATE probe SET n = COALESCE(?1, n) WHERE k=?2")
+                .bind(None::<i64>)
+                .bind("nulls"),
+        )
+        .await
+        .unwrap();
+        let rows =
+            db.query(&Query::new("SELECT n, r FROM probe WHERE k=?1").bind("nulls")).await.unwrap();
+        assert_eq!(rows[0].i64(0).unwrap(), 7);
+        assert_eq!(rows[0].value(1).unwrap(), &SqlValue::Null);
     }
 
     #[tokio::test]

@@ -2400,7 +2400,7 @@ impl McpServer {
         name = "admin.create_project",
         description = "Create a project for a designated owner and provision its volume (platform admin only)."
     )]
-    async fn admin_create_project(
+    pub(crate) async fn admin_create_project(
         &self,
         Parameters(a): Parameters<CreateProjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2744,7 +2744,7 @@ impl McpServer {
              driver choice, and the two independent retention thresholds (owner or platform \
              admin). Either retention value may be absent to disable that axis independently."
     )]
-    async fn admin_set_purge_config(
+    pub(crate) async fn admin_set_purge_config(
         &self,
         Parameters(a): Parameters<SetPurgeConfigArgs>,
     ) -> Result<CallToolResult, ErrorData> {

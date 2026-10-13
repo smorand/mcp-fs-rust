@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: S
 > Depth evidence: one root cause line in one module (relational layer, PostgreSQL engine), 6 requirements, no public contract change, no data model change; 3 tool families expose the same defect
-> Status: designed
+> Status: implemented
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High

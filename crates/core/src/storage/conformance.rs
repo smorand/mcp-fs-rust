@@ -31,7 +31,7 @@ use crate::storage::meta::{
     insert_export_link, select_expired_export_links,
 };
 use crate::storage::rel::{RelationalDb, SqliteRelationalDb};
-use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend};
+use crate::storage::traits::{AdminBackend, IndexMode, MODE_FILE, MetaBackend, PurgeConfig};
 use crate::util::now_unix;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -466,6 +466,53 @@ async fn admin_column_migration_is_idempotent(engine: &Engine, tag: &str) -> Res
     );
 
     store.delete_project(&proj).await?;
+    Ok(())
+}
+
+/// A null written to a nullable numeric column must round trip on every engine
+/// (SPEC-0022 DEC-002): clearing a quota, and a purge config with one then both
+/// retention axes disabled, at update and at creation.
+async fn admin_null_values_round_trip(engine: &Engine, tag: &str) -> Result<()> {
+    let who = engine.name();
+    let db = engine.db().await?;
+    let store = RelationalAdminStore::new(db.clone());
+    store.connect().await?;
+
+    let proj = format!("{tag}-nulls");
+    store.create_project(&proj, "owner@test.com").await?;
+    store.set_quota(&proj, Some(5 * 1024 * 1024)).await?;
+    assert_eq!(store.get_quota(&proj).await?, Some(5 * 1024 * 1024), "{who}: quota set");
+    store.set_quota(&proj, None).await?;
+    assert_eq!(store.get_quota(&proj).await?, None, "{who}: a cleared quota reads back null");
+
+    let one_null = PurgeConfig {
+        autopurge_enabled: true,
+        use_internal_purge: true,
+        file_retention_days: Some(30),
+        project_retention_days: None,
+    };
+    store.set_purge_config(&proj, one_null).await?;
+    assert_eq!(store.get_purge_config(&proj).await?, one_null, "{who}: one null axis");
+    let both_null = PurgeConfig { file_retention_days: None, ..one_null };
+    store.set_purge_config(&proj, both_null).await?;
+    assert_eq!(store.get_purge_config(&proj).await?, both_null, "{who}: both axes null");
+
+    let created = format!("{tag}-nullc");
+    let at_creation = PurgeConfig {
+        autopurge_enabled: true,
+        use_internal_purge: false,
+        file_retention_days: Some(7),
+        project_retention_days: None,
+    };
+    store.create_project_with_purge_config(&created, "owner@test.com", at_creation).await?;
+    assert_eq!(
+        store.get_purge_config(&created).await?,
+        at_creation,
+        "{who}: a null axis survives project creation"
+    );
+
+    store.delete_project(&proj).await?;
+    store.delete_project(&created).await?;
     Ok(())
 }
 
@@ -1013,6 +1060,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     meta_concurrent_writes(engine, &tag).await?;
     admin_projects_and_members(engine, &tag).await?;
     admin_column_migration_is_idempotent(engine, &tag).await?;
+    admin_null_values_round_trip(engine, &tag).await?;
     git_objects_refs_remotes(engine, &tag).await?;
     git_operation_row_round_trips(engine, &tag).await?;
     git_purge_is_scoped_to_one_volume(engine, &tag).await?;

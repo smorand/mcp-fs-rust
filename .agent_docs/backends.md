@@ -82,8 +82,9 @@ Every item is a real difference between the three engines, each with tests in
 | Upsert | `ON CONFLICT ... DO UPDATE / DO NOTHING` | same | `MERGE ... WITH (HOLDLOCK)` |
 | String length | `length()` | `length()` | `LEN()` |
 | `LIKE` escaping | `\`, `%`, `_` | same | plus `[` |
+| Null parameter | untyped | untyped (OID 0, `UntypedNull`) | per driver |
 
-Four of those deserve the reason, because getting them wrong is silent:
+Five of those deserve the reason, because getting them wrong is silent:
 
 * **`TextKey` exists because SQL Server cannot index `NVARCHAR(MAX)`.** A column in a
   primary key or an index needs a bounded length there, while the same column is plain
@@ -94,6 +95,12 @@ Four of those deserve the reason, because getting them wrong is silent:
   Escaping it on the other engines would be wrong, because there it is a literal.
 * **Placeholder rendering skips quoted literals.** A `?` inside a string literal is not a
   parameter. The renderer tracks single quoted literals, doubled quote escapes included.
+* **A null parameter must be untyped (2026-10-12, SPEC-0022).** `SqlValue::Null` carries no
+  type. PostgreSQL once bound it as a `TEXT` null, which every `BIGINT` column refused with
+  42804 (clearing a quota, null retention days, `superseded_at`). `rel/postgres.rs` now binds
+  it with OID 0 so the server infers the type from context; never bind a null as a concrete
+  type, and never cast per call site. The conformance case `admin_null_values_round_trip`
+  pins it on every engine.
 
 ## Multi tenancy: `volume_id`
 
