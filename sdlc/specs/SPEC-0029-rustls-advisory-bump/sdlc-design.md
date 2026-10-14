@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, one file (`Cargo.lock`, 1 entry), no public contract change, no persisted data change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-14
 > Behavior change: none
 > From backlog: BL-0012
@@ -135,3 +135,30 @@ Empty.
 Inline checklist (depth S): 1 PASS, 2 PASS (both sides of the version spelled), 3 n/a (DEBT), 4 PASS, 5 n/a (DEBT), 6 PASS, 7 PASS, 8 PASS (no behavior change), 9 PASS (counts recounted), 10 PASS, 11 PASS, 12 PASS (Security field set), 13 PASS (two searches, every hit disposed, the triggering occurrence in the lot, exploit tests with literal advisory ids and a second channel), 14 PASS.
 
 **Amendments applied:** none.
+
+## Design additions (2026-10-14)
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `Cargo.lock` | modify: rustls `0.23.45` to `0.23.46` via `cargo update -p rustls` | DR-001 | US-0032 |
+
+Affected existing tests: none modified. Affected documentation: none (no doc names the rustls version).
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010 | structural | git diff assertion | story DoD | US-0032 |
+| DT-020 | integration | `cargo test` running `make security` | `crates/mcp-fs/tests/security_gate.rs::make_security_passes` | US-0032 |
+| DT-021 | structural | `cargo tree`, `rg` on `Cargo.lock` | story DoD | US-0032 |
+| 8.1 | non regression | `make check` with DB DSNs | whole workspace | US-0032 |
+
+- **DEC-003:** One story for the whole lot, `min_tier: 3`. **Obliged by:** SPEC-0029/DR-001, DR-002. **Rationale:** one file, one command; the only judgment is reading `make check` output with the database suites enabled. **Alternatives considered:** `min_tier: 4`, rejected because the full gate with the PostgreSQL and SQL Server suites needs log interpretation. **Source:** design. **Evidence:** Section 2.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0032 | Bump rustls past the four advisories | P1 | DR-001, DR-002, DR-003 | main | 3 | yes |
