@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: L
 > Depth evidence: 3 modules (MCP server listing and dispatch, the git tools, the five optional tool families), 6 requirements, public tool listing changes per configuration (restored), no data model change
-> Status: designed
+> Status: implemented
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High

@@ -14,10 +14,12 @@
 
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use rmcp::ErrorData;
-use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,7 +33,7 @@ use crate::state::AppState;
 use crate::storage::VolumeClient;
 use crate::storage::admin::validate_project_id;
 use crate::storage::traits::IndexMode;
-use crate::tools::registry_support::ToolCtx;
+use crate::tools::registry_support::{Args, ToolCtx, ToolRegistry};
 
 /// Server name advertised by `initialize`, matching the old hand-rolled transport.
 const SERVER_NAME: &str = "mcp-fs";
@@ -52,6 +54,61 @@ fn to_call_result(
         Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
             "An error occurred invoking '{tool}': {e}"
         ))])),
+    }
+}
+
+/// SPEC-0027 DEC-003: route every tool of each enabled optional family
+/// through that family's own production `register()`, so the served schema is
+/// byte for byte the one `/api/swagger.json` reads from `catalog()`, and a
+/// call runs the family's handler (which authorizes `mount_id` itself).
+/// A disabled family adds no route, so its calls answer `tool not found`.
+fn add_optional_families(router: &mut ToolRouter<McpServer>, config: &crate::config::ServerConfig) {
+    let mut registry = ToolRegistry::new();
+    if config.web.enabled {
+        crate::tools::web::register(&mut registry, &config.web);
+    }
+    if config.context7.enabled {
+        crate::tools::context7::register(&mut registry, &config.context7);
+    }
+    if config.sqlite.enabled {
+        crate::tools::sqlite::register(&mut registry, &config.sqlite);
+    }
+    if config.db.enabled {
+        crate::tools::db::register(&mut registry, &config.db);
+    }
+    if config.doc.enabled {
+        crate::tools::doc::register(&mut registry, &config.doc);
+    }
+    // One registry per server, shared by every route it backs.
+    let registry = Arc::new(registry);
+    for name in registry.names() {
+        // `add_route` replaces a route of the same name silently, so a family
+        // tool must never reuse a contract tool's name (guarded by a test too).
+        debug_assert!(
+            !router.has_route(name),
+            "optional tool '{name}' would shadow a contract tool"
+        );
+        let schema = &registry.resolve(name).expect("listed name resolves").schema;
+        // The rmcp `Tool` is deserialized from the family's own `tools/list`
+        // entry, so name, description, input schema and annotations cannot drift.
+        let tool: rmcp::model::Tool = serde_json::from_value(schema.to_list_entry())
+            .expect("a ToolSchema list entry is a valid MCP tool");
+        let registry = registry.clone();
+        router.add_route(ToolRoute::new_dyn(tool, move |ctx: ToolCallContext<'_, McpServer>| {
+            let registry = registry.clone();
+            let name = ctx.name.to_string();
+            let server = ctx.service;
+            let tool_ctx = ToolCtx { person: server.person.clone(), state: server.state.clone() };
+            let args = Args::new(ctx.arguments.map(Value::Object).unwrap_or(Value::Null));
+            let call: BoxFuture<'_, Result<CallToolResponse, ErrorData>> = Box::pin(async move {
+                let result = registry
+                    .call(&name, tool_ctx, args)
+                    .await
+                    .ok_or_else(|| ErrorData::invalid_params("tool not found", None))?;
+                to_call_result(&name, result).map(Into::into)
+            });
+            call
+        }));
     }
 }
 
@@ -99,6 +156,7 @@ impl McpServer {
         for name in &unserved {
             tool_router.remove_route(name);
         }
+        add_optional_families(&mut tool_router, &state.config);
         // Test-only (US-0008, DT-004): the extra router lives in its own
         // `#[cfg(test)]`-gated `impl` block below, so the whole item (macro
         // expansion included) is absent from a non-test build, not merely

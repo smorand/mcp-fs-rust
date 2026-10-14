@@ -352,6 +352,30 @@ separate boolean, never folded into `state`), `base`, `head`, `author`, `url`,
 payload untouched, already scrubbed of the credential). Details and the mapping
 rules: [`git.md`](git.md#the-pull-request-surface-gitpr_-us-025).
 
+## Served set per configuration (2026-10-14, SPEC-0027)
+
+`McpServer::new` serves exactly what the flags enable; a tool not served is
+absent from `tools/list` and its `tools/call` answers `-32602 tool not found`
+before any handler runs.
+
+| Configuration | Served |
+|---|---|
+| default | 59 (44 `fs.*`, 15 `admin.*`) |
+| git flag on | 108 |
+| git and search flags on | 112 |
+| every flag, pandoc on `PATH` | 134 (132 without pandoc: `doc.*` registers nothing) |
+| one optional family alone | 59 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
+
+The optional families (`web`, `context7`, `sqlite`, `db`, `doc`) are not
+`#[tool]` methods: `add_optional_families` in `mcp/server.rs` runs each enabled
+family's production `register()` into one shared `ToolRegistry`, and adds one
+`ToolRoute::new_dyn` per tool. The rmcp `Tool` is deserialized from the
+family's own `ToolSchema::to_list_entry()`, so the served schema equals
+`catalog()` (what `/api/swagger.json` reads); the call goes through
+`ToolRegistry::call` then `to_call_result`. The family handlers authorize
+`mount_id` themselves, unchanged. They are outside the 108 tool golden
+contract. Tests: `tools/tool_surface_e2e.rs`.
+
 ## Authorization model
 
 | Gate | Implementation | Applies to |

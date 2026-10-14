@@ -1,5 +1,6 @@
-//! SPEC-0027 US-0030: the MCP tool surface a server serves follows its
-//! `git.enabled` and `search.enabled` flags. Driven over the real HTTP MCP
+//! SPEC-0027 US-0030 and US-0031: the MCP tool surface a server serves follows
+//! its `git.enabled` and `search.enabled` flags, and the five optional
+//! families (`web`, `context7`, `sqlite`, `db`, `doc`) follow theirs. Driven over the real HTTP MCP
 //! endpoint (initialize, `tools/list`, `tools/call`), the same way
 //! `crate::app`'s own tests drive it, against an app built from the stated
 //! configuration (DEC-005).
@@ -116,14 +117,16 @@ async fn send(app: &Router, token: &str, payload: Value) -> Value {
     sse_json(&body_string(r).await)
 }
 
-async fn list_names(app: &Router, token: &str) -> Vec<String> {
+async fn list_tools(app: &Router, token: &str) -> Vec<Value> {
     let v = send(app, token, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
     v["result"]["tools"]
         .as_array()
         .unwrap_or_else(|| panic!("tools/list must return a tools array: {v}"))
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect()
+        .clone()
+}
+
+async fn list_names(app: &Router, token: &str) -> Vec<String> {
+    list_tools(app, token).await.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
 }
 
 fn assert_tool_not_found(v: &Value) {
@@ -283,4 +286,265 @@ async fn bt_021_git_http_and_token_screen_stay_unrouted_by_default() {
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND, "{uri} must not be routed");
     }
+}
+
+// ── SPEC-0027 US-0031: optional families ────────────────────────────────────
+
+/// One optional family: the prefix its tools carry, the flag that turns it on,
+/// and the catalog `/api/swagger.json` already reads for it.
+struct Family {
+    prefix: &'static str,
+    enable: fn(&mut ServerConfig),
+    catalog: fn(&ServerConfig) -> Vec<crate::tools::catalog::ToolCatalogEntry>,
+}
+
+const FAMILIES: [Family; 5] = [
+    Family {
+        prefix: "web.",
+        enable: |c| c.web.enabled = true,
+        catalog: |c| crate::tools::web::catalog(&c.web),
+    },
+    Family {
+        prefix: "context7.",
+        enable: |c| c.context7.enabled = true,
+        catalog: |c| crate::tools::context7::catalog(&c.context7),
+    },
+    Family {
+        prefix: "sqlite.",
+        enable: |c| c.sqlite.enabled = true,
+        catalog: |c| crate::tools::sqlite::catalog(&c.sqlite),
+    },
+    Family {
+        prefix: "db.",
+        enable: |c| c.db.enabled = true,
+        catalog: |c| crate::tools::db::catalog(&c.db),
+    },
+    Family {
+        prefix: "doc.",
+        enable: |c| c.doc.enabled = true,
+        catalog: |c| crate::tools::doc::catalog(&c.doc),
+    },
+];
+
+/// `doc.*` registers nothing without pandoc (`tools/doc.rs`), so its expected
+/// count follows the machine the test runs on.
+fn pandoc_on_path() -> bool {
+    which::which("pandoc").is_ok()
+}
+
+fn expected_family_count(prefix: &str) -> usize {
+    match prefix {
+        "web." => 5,
+        "context7." => 2,
+        "sqlite." => 8,
+        "db." => 5,
+        "doc." if pandoc_on_path() => 2,
+        "doc." => 0,
+        other => panic!("unknown family {other}"),
+    }
+}
+
+fn served_count(tools: &[Value]) -> usize {
+    tools.iter().filter(|t| !t["name"].as_str().unwrap().starts_with("t.")).count()
+}
+
+async fn call_tool(app: &Router, token: &str, name: &str, arguments: Value) -> Value {
+    send(
+        app,
+        token,
+        json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }),
+    )
+    .await
+}
+
+/// The JSON a successful family call returned, decoded from its text content.
+fn success_payload(v: &Value) -> Value {
+    assert!(v["error"].is_null(), "call must be dispatched: {v}");
+    assert_ne!(v["result"]["isError"], Value::Bool(true), "call must succeed: {v}");
+    let text = v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{v}"));
+    serde_json::from_str(text).unwrap()
+}
+
+// ── SPEC-0027/BT-001 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bt_001_an_enabled_sqlite_family_is_callable() {
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.sqlite.enabled = true;
+    let (app, _state) = app_with_atlas(c).await;
+
+    let names = list_names(&app, &token).await;
+    let sqlite: Vec<&String> = names.iter().filter(|n| n.starts_with("sqlite.")).collect();
+    assert_eq!(sqlite.len(), 8, "the 8 sqlite.* tools must be listed, got {names:?}");
+
+    // The family's own schema names the file `db_path` (tools/sqlite.rs).
+    let created = call_tool(
+        &app,
+        &token,
+        "sqlite.execute",
+        json!({"mount_id": PROJECT, "db_path": "/db.sqlite", "sql": "CREATE TABLE t(a)"}),
+    )
+    .await;
+    success_payload(&created);
+    let listed = call_tool(
+        &app,
+        &token,
+        "sqlite.list_tables",
+        json!({"mount_id": PROJECT, "db_path": "/db.sqlite"}),
+    )
+    .await;
+    let rows = success_payload(&listed);
+    assert!(
+        rows.as_array().unwrap().iter().any(|r| r["name"] == "t"),
+        "the listing must contain table t, got {rows}"
+    );
+}
+
+/// Served over MCP, the family handler still authorizes `mount_id` itself: a
+/// verified identity outside `atlas` gets the membership error and no file.
+#[tokio::test]
+async fn a_served_family_tool_still_requires_membership() {
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, _token) = setup(d.path());
+    c.sqlite.enabled = true;
+    let key = d.path().join("keys").join(keys::PRIVATE_KEY_FILE);
+    let eve = keys::mint_token_from_file(
+        &key,
+        "eve@test.com",
+        keys::DEFAULT_ISSUER,
+        keys::DEFAULT_CLAIM,
+        3600,
+    )
+    .unwrap();
+    let (app, state) = app_with_atlas(c).await;
+
+    let v = call_tool(
+        &app,
+        &eve,
+        "sqlite.execute",
+        json!({"mount_id": PROJECT, "db_path": "/db.sqlite", "sql": "CREATE TABLE t(a)"}),
+    )
+    .await;
+
+    assert!(v["error"].is_null(), "the tool is served, so it is dispatched: {v}");
+    assert_eq!(v["result"]["isError"], Value::Bool(true), "a non member must be refused: {v}");
+    let vol = state.stores.client(PROJECT).await.unwrap();
+    let files: Vec<String> =
+        vol.walk("/").await.unwrap().into_iter().flat_map(|(_, _, f)| f).collect();
+    assert!(files.is_empty(), "atlas must hold no file, found {files:?}");
+}
+
+// ── SPEC-0027/BT-010 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bt_010_each_optional_family_is_listed_with_its_catalog_schema() {
+    for family in &FAMILIES {
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, token) = setup(d.path());
+        (family.enable)(&mut c);
+        let catalog = (family.catalog)(&c);
+        let (app, _state) = app_with_atlas(c).await;
+
+        let tools = list_tools(&app, &token).await;
+        let expected = expected_family_count(family.prefix);
+        assert_eq!(catalog.len(), expected, "{} catalog size", family.prefix);
+        assert_eq!(served_count(&tools), 59 + expected, "{} alone", family.prefix);
+        for entry in &catalog {
+            let served = tools
+                .iter()
+                .find(|t| t["name"] == entry.name.as_str())
+                .unwrap_or_else(|| panic!("{} must be listed", entry.name));
+            assert_eq!(served["description"], entry.description.as_str(), "{}", entry.name);
+            assert_eq!(served["inputSchema"], entry.input_schema, "{}", entry.name);
+        }
+    }
+}
+
+// ── SPEC-0027/BT-011 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bt_011_every_flag_on_serves_the_whole_surface() {
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.git.enabled = true;
+    c.search.enabled = true;
+    for family in &FAMILIES {
+        (family.enable)(&mut c);
+    }
+    let (app, _state) = app_with_atlas(c).await;
+
+    let tools = list_tools(&app, &token).await;
+    let expected = if pandoc_on_path() { 134 } else { 132 };
+    assert_eq!(served_count(&tools), expected, "every flag on (pandoc: {})", pandoc_on_path());
+}
+
+// ── SPEC-0027/BT-012 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bt_012_a_disabled_family_call_is_unknown() {
+    let d = tempfile::tempdir().unwrap();
+    let (c, token) = setup(d.path());
+    let (app, _state) = app_with_atlas(c).await;
+
+    let web = call_tool(&app, &token, "web.search", json!({"query": "x"})).await;
+    assert_tool_not_found(&web);
+    let search =
+        call_tool(&app, &token, "search.query", json!({"mount_id": PROJECT, "query": "x"})).await;
+    assert_tool_not_found(&search);
+}
+
+// ── SPEC-0027/BT-014 ────────────────────────────────────────────────────────
+
+const STUB_BODY: &str = "stub page body";
+
+/// A local plain HTTP server answering `/page` with a fixed text body. The web
+/// family accepts any `http://` or `https://` URL with no host allow list
+/// (tools/web.rs `web_fetch`), so loopback over plain HTTP is a URL it takes.
+async fn spawn_stub() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route("/page", axum::routing::get(|| async { STUB_BODY }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port
+}
+
+#[tokio::test]
+async fn bt_014_web_fetch_is_callable_through_mcp() {
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.web.enabled = true;
+    let (app, _state) = app_with_atlas(c).await;
+    let port = spawn_stub().await;
+
+    let v = call_tool(
+        &app,
+        &token,
+        "web.fetch",
+        json!({"url": format!("http://127.0.0.1:{port}/page")}),
+    )
+    .await;
+    assert_eq!(success_payload(&v), Value::String(STUB_BODY.to_string()));
+}
+
+/// SPEC-0027 DEC-003 guard: `ToolRouter::add_route` replaces a route of the
+/// same name, so no optional family tool may share a contract tool's name.
+#[test]
+fn no_optional_family_tool_shadows_a_contract_tool() {
+    use crate::tools::registry_support::ToolRegistry;
+    let config = crate::config::ServerConfig::default();
+    let mut registry = ToolRegistry::new();
+    crate::tools::web::register(&mut registry, &config.web);
+    crate::tools::context7::register(&mut registry, &config.context7);
+    crate::tools::sqlite::register(&mut registry, &config.sqlite);
+    crate::tools::db::register(&mut registry, &config.db);
+    crate::tools::doc::register(&mut registry, &config.doc);
+    let router = crate::mcp::server::McpServer::tool_router();
+    let clashes: Vec<&str> =
+        registry.names().iter().copied().filter(|n| router.has_route(n)).collect();
+    assert!(clashes.is_empty(), "optional tools shadowing contract tools: {clashes:?}");
+    assert!(registry.names().len() >= 20, "the families registered: {:?}", registry.names());
 }
