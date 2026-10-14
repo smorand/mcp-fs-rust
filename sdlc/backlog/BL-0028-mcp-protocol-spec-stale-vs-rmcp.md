@@ -1,7 +1,7 @@
 ---
 Id: BL-0028
 Title: Re-derive SPEC-0002's MCP protocol requirements against the current rmcp transport
-Nature: BUG
+Nature: DEBT
 Source: retro-spec 2026-10-09, SPEC-0002 (platform-foundation) split
 Created: 2026-10-09
 Severity: Medium
@@ -30,3 +30,14 @@ current tree has no `crates/mcp-fs/src/mcp/mod.rs`, only `crates/core/src/mcp/se
 Recommended follow-up: a dedicated `/sdlc-spec` or targeted retro pass over the current
 `mcp/server.rs` to re-derive FR-012 through FR-019 and their E2E coverage against the `rmcp`
 behaviour, superseding the legacy section in SPEC-0002 rather than patching it in place.
+
+## Decision (2026-10-14, owner)
+- Not a BUG: the current rmcp behaviour is authorized by SPEC-0016 (DEBT, implemented), which
+  declared the protocol breaks (`sdlc/specs/SPEC-0016-rmcp-3x-migration-prep/sdlc-design.md:13-16`,
+  `:63-75`, `:189`): mandatory `initialize`, `-32602 "tool not found"`, SSE framing kept.
+  SPEC-0002 FR-012 to FR-018 are stale text to supersede.
+- SPEC-0002/FR-019 (server side separator variants, `fs_read` resolving to `fs.read`) was dropped by the
+  migration without being declared. Decision: accept the drop. The served names are canonical
+  (dotted) only; the CLI agent keeps its client side fuzzy resolution. Document it in the superseding text.
+- Route: `/sdlc-retro-spec` to re-derive the MCP protocol section of SPEC-0002 from
+  `crates/core/src/mcp/server.rs`, `crates/core/src/app.rs` and SPEC-0016, superseding FR-012 to FR-019.
