@@ -41,3 +41,11 @@ behaviour, superseding the legacy section in SPEC-0002 rather than patching it i
   (dotted) only; the CLI agent keeps its client side fuzzy resolution. Document it in the superseding text.
 - Route: `/sdlc-retro-spec` to re-derive the MCP protocol section of SPEC-0002 from
   `crates/core/src/mcp/server.rs`, `crates/core/src/app.rs` and SPEC-0016, superseding FR-012 to FR-019.
+
+## Update (2026-10-14, /sdlc-retro-spec 20261014-205518)
+The current protocol is now described as-built in `SPEC-0028` (mcp-protocol), including the accepted
+FR-019 drop (`SPEC-0028/FR-012`, `DEC-005`). What remains: amend SPEC-0002 so FR-012 to FR-019 and
+E2E-015 to E2E-042 are marked superseded by SPEC-0028 (a retro pass never rewrites an as-built spec).
+Also stale in the same spec: `spec.md` confidence notes speak of a "current 102-tool contract" while
+`AGENTS.md` states 108 tools after SPEC-0027.
+Suggested next command: `/sdlc-spec --debt BL-0028` (or a manual Status note on SPEC-0002).
