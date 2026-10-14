@@ -78,8 +78,27 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(state: Arc<AppState>, person: String) -> Self {
-        #[allow(unused_mut)]
         let mut tool_router = Self::tool_router();
+        // SPEC-0027 DEC-001: a disabled subsystem is not served at all, so
+        // `tools/list` omits it and `tools/call` answers `tool not found`
+        // before any handler runs. Membership alone never gated git (CWE-284).
+        // The static `tool_router()` stays the full catalog (DEC-002).
+        let disabled: Vec<&str> = [
+            (!state.config.git.enabled).then_some("git."),
+            (!state.config.search.enabled).then_some("search."),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let unserved: Vec<String> = tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|n| disabled.iter().any(|p| n.starts_with(p)))
+            .collect();
+        for name in &unserved {
+            tool_router.remove_route(name);
+        }
         // Test-only (US-0008, DT-004): the extra router lives in its own
         // `#[cfg(test)]`-gated `impl` block below, so the whole item (macro
         // expansion included) is absent from a non-test build, not merely

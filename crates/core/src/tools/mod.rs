@@ -71,6 +71,8 @@ pub(crate) mod search_semantic;
 pub mod sqlite;
 #[cfg(test)]
 mod teardown_e2e;
+#[cfg(test)]
+mod tool_surface_e2e;
 pub(crate) mod trash;
 #[cfg(test)]
 mod trash_search_e2e;

@@ -29,5 +29,5 @@
 | US-0027 | SPEC-0025 | Index walks skip the trash | main | 2 | landed | story/US-0027-index-walks-skip-the-trash | main |
 | US-0028 | SPEC-0025 | Auto purge and restore keep search in step | US-0027 | 2 | landed | story/US-0028-purge-and-restore-keep-search-in-step | story/US-0027-index-walks-skip-the-trash |
 | US-0029 | SPEC-0026 | PostgreSQL store opens without locking a current schema | main | 1 | landed | story/US-0029-postgres-open-without-locking | main |
-| US-0030 | SPEC-0027 | Disabled git and search tools are not served | main | 1 | todo | | |
+| US-0030 | SPEC-0027 | Disabled git and search tools are not served | main | 1 | landed | story/US-0030-disabled-git-search-not-served | main |
 | US-0031 | SPEC-0027 | Enabled optional families are served over MCP | US-0030 | 1 | todo | | |

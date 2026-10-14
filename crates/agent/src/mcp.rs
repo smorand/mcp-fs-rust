@@ -293,6 +293,9 @@ mod tests {
         config.infra.meta.dir = dir.path().join("volumes").display().to_string();
         config.infra.blob.dir = dir.path().join("blobs").display().to_string();
         config.infra.admin.path = dir.path().join("admin.db").display().to_string();
+        // SPEC-0027 US-0030: git tools are served only when git is enabled, and
+        // the 108 count below is the git enabled catalogue.
+        config.git.enabled = true;
 
         let router = mcp_fs_core::app::build(config).await.expect("app::build");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

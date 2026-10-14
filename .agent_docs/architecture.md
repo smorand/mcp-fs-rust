@@ -236,6 +236,17 @@ request in `dataplane::guarded`, and the git routes have their own gate (see
 `.agent_docs/git.md`). A tool failure is a *result* carrying `isError`, not a
 JSON-RPC error: only an unknown tool or an unknown method is a protocol error.
 
+**Served tool set (2026-10-14, SPEC-0027 US-0030).** `McpServer::new` removes
+every `git.*` route (`git.auth*` and `git.pr_*` included) when `git.enabled` is
+false and every `search.*` route when `search.enabled` is false, so `tools/list`
+omits them and `tools/call` answers `-32602` `tool not found` before any handler
+runs. Membership never gated git on its own (CWE-284: any member could clone and
+push with git off). Counts: 59 by default, 108 with git, 112 with git and
+search. The static `McpServer::tool_router()` is still the full catalog the
+golden contract and `/api/swagger.json` read; do not filter it. A test that
+calls a git or search tool over MCP must enable the flag in its config.
+Tests: `tools/tool_surface_e2e.rs`.
+
 **MCP transport (rmcp 3.5.0, SPEC-0013).** `app::build` mounts `rmcp`'s
 `StreamableHttpService` over `mcp::server::McpServer` at `mcp_path`, configured
 with `LocalSessionManager` + `legacy_session_mode: true`. Two real, observed
