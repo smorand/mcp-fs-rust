@@ -107,6 +107,29 @@ Five of those deserve the reason, because getting them wrong is silent:
   type, and never cast per call site. The conformance case `admin_null_values_round_trip`
   pins it on every engine.
 
+## PostgreSQL migrate: probe first, lock only when something is missing (2026-10-14, SPEC-0026)
+
+Every store calls `migrate` on open, and on PostgreSQL `CREATE INDEX IF NOT EXISTS` and
+`ADD COLUMN IF NOT EXISTS` take their table lock even when the object exists. A blind
+replay made each project's first request queue behind every write in flight on `nodes`
+and, with several first requests at once, end in `deadlock detected [40P01]`.
+`PostgresRelationalDb::migrate` now:
+
+1. runs `apply_table_recreations` as before;
+2. probes the catalog of `current_schema()` (one query each on `information_schema.tables`,
+   `pg_indexes`, `information_schema.columns`) against `SchemaSet::declared_objects`, and
+   returns with no DDL when everything exists;
+3. otherwise takes `pg_advisory_xact_lock(hashtext('mcpfs_migrate:' || current_schema()))`
+   in its transaction, probes again, and runs the unchanged rendered DDL;
+4. reruns step 2 and 3 through `with_schema_retry` while the error is retryable, up to
+   `MAX_TX_ATTEMPTS`.
+
+Rules: a new declared object kind must be added to both `declared_objects` and the probe,
+or a missing object is never created. The rendered DDL of every engine is pinned by
+`production_ddl_is_unchanged_on_every_engine` in `rel/schema.rs`. Live tests:
+`tools/pg_open_e2e.rs` (concurrent first requests, open beside an uncommitted write) and
+`spec_0026_bt_012_fresh_schema_and_missing_column` in `rel/postgres.rs`.
+
 ## Multi tenancy: `volume_id`
 
 SQLite gets one database file per volume, so a tenant column is unnecessary there. A

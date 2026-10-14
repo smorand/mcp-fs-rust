@@ -287,6 +287,121 @@ impl RelationalTx for PgTx {
     }
 }
 
+// ── schema application ──────────────────────────────────────────────────────────
+
+/// True when the connection's schema already holds every table, index and
+/// migrated column `schema` declares.
+///
+/// Reads the catalog only, so it takes no lock a writer could hold up. One query
+/// per object kind, compared here, keeps the cost flat in the schema's size.
+async fn is_schema_current(conn: &mut sqlx::PgConnection, schema: &SchemaSet) -> Result<bool> {
+    let declared = schema.declared_objects();
+    let names = |rows: Vec<PgRow>| -> Result<std::collections::HashSet<String>> {
+        rows.iter().map(|r| r.try_get::<String, _>(0).map_err(map_error)).collect()
+    };
+
+    let tables = names(
+        sqlx::query(
+            "SELECT table_name::text FROM information_schema.tables \
+             WHERE table_schema = current_schema()",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(map_error)?,
+    )?;
+    if !declared.tables.iter().all(|t| tables.contains(*t)) {
+        return Ok(false);
+    }
+
+    let indexes = names(
+        sqlx::query("SELECT indexname::text FROM pg_indexes WHERE schemaname = current_schema()")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(map_error)?,
+    )?;
+    if !declared.indexes.iter().all(|i| indexes.contains(*i)) {
+        return Ok(false);
+    }
+
+    if declared.columns.is_empty() {
+        return Ok(true);
+    }
+    // A tab cannot appear in one of our identifiers, so it separates the pair.
+    let columns = names(
+        sqlx::query(
+            "SELECT table_name::text || E'\\t' || column_name::text \
+             FROM information_schema.columns WHERE table_schema = current_schema()",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(map_error)?,
+    )?;
+    Ok(declared.columns.iter().all(|(t, c)| columns.contains(&format!("{t}\t{c}"))))
+}
+
+/// Run one schema application again while it fails with a transient error, up
+/// to [`super::MAX_TX_ATTEMPTS`] attempts in all.
+///
+/// Two opens racing on an old database can still pick a deadlock victim, and
+/// the victim's application was rolled back whole, so running it again is safe.
+async fn with_schema_retry<F, Fut>(mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut n = 1;
+    loop {
+        match attempt().await {
+            Err(e) if e.retryable && n < super::MAX_TX_ATTEMPTS => {
+                // Same linear backoff as `run_retrying`: the winner is about to commit.
+                tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(n))).await;
+                n += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+impl PostgresRelationalDb {
+    /// One attempt at bringing the schema up to `schema`.
+    ///
+    /// `CREATE INDEX IF NOT EXISTS` and `ADD COLUMN IF NOT EXISTS` take their
+    /// table lock even when the object exists, so a blind replay on every open
+    /// queued behind every write in flight and could deadlock against them. The
+    /// catalog probe skips all DDL on a current schema; only a schema really
+    /// missing something runs it, serialized per schema by an advisory lock.
+    async fn apply_schema(&self, schema: &SchemaSet) -> Result<()> {
+        {
+            let mut conn = self.pool.acquire().await.map_err(map_error)?;
+            if is_schema_current(&mut conn, schema).await? {
+                return Ok(());
+            }
+        }
+
+        // One transaction for the whole schema: Postgres has transactional DDL,
+        // so a half applied schema cannot be left behind.
+        let mut tx = self.pool.begin().await.map_err(map_error)?;
+        // Released at commit or rollback. Keyed on the schema, so two deployments
+        // in one database never wait on each other.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mcpfs_migrate:' || current_schema()))")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_error)?;
+        // Whoever held the lock before may have added everything already.
+        if is_schema_current(&mut tx, schema).await? {
+            return tx.commit().await.map_err(map_error);
+        }
+        for statement in schema.render(Dialect::Postgres) {
+            sqlx::query(AssertSqlSafe(statement)).execute(&mut *tx).await.map_err(map_error)?;
+        }
+        // Rendered with their own `IF NOT EXISTS` guard, so a second apply is a no op.
+        for statement in schema.render_column_migrations(Dialect::Postgres) {
+            sqlx::query(AssertSqlSafe(statement)).execute(&mut *tx).await.map_err(map_error)?;
+        }
+        tx.commit().await.map_err(map_error)
+    }
+}
+
 #[async_trait]
 impl RelationalDb for PostgresRelationalDb {
     fn dialect(&self) -> Dialect {
@@ -322,18 +437,7 @@ impl RelationalDb for PostgresRelationalDb {
         // ahead of the transaction below: it is its own DDL step, exactly like
         // the SQLite pragma probe it mirrors.
         super::apply_table_recreations(self, schema).await?;
-
-        // One transaction for the whole schema: Postgres has transactional DDL, so
-        // a half applied schema cannot be left behind.
-        let mut tx = self.pool.begin().await.map_err(map_error)?;
-        for statement in schema.render(Dialect::Postgres) {
-            sqlx::query(AssertSqlSafe(statement)).execute(&mut *tx).await.map_err(map_error)?;
-        }
-        // Rendered with their own `IF NOT EXISTS` guard, so a second apply is a no op.
-        for statement in schema.render_column_migrations(Dialect::Postgres) {
-            sqlx::query(AssertSqlSafe(statement)).execute(&mut *tx).await.map_err(map_error)?;
-        }
-        tx.commit().await.map_err(map_error)
+        with_schema_retry(|| self.apply_schema(schema)).await
     }
 }
 
@@ -595,6 +699,127 @@ mod tests {
             .expect_err("an unknown table cannot be queried");
         assert!(!e.retryable, "a missing table will not appear on a retry");
         assert!(e.message.contains("postgres:"), "{}", e.message);
+    }
+
+    fn deadlock() -> ToolError {
+        ToolError::internal("postgres: deadlock detected [40P01]").mark_retryable()
+    }
+
+    /// SPEC-0026/BT-010: a deadlock on the first schema application is retried,
+    /// and the second attempt's success is the open's result (BR-003).
+    #[tokio::test]
+    async fn spec_0026_bt_010_a_transient_failure_is_retried() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let outcome = with_schema_retry(|| async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == 1 { Err(deadlock()) } else { Ok(()) }
+        })
+        .await;
+        assert!(outcome.is_ok(), "the retry must succeed: {outcome:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// SPEC-0026/BT-011: a deadlock on every attempt gives up after exactly
+    /// `MAX_TX_ATTEMPTS`, with the driver's error unchanged (BR-003).
+    #[tokio::test]
+    async fn spec_0026_bt_011_three_failures_give_up() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let e = with_schema_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(deadlock())
+        })
+        .await
+        .expect_err("every attempt failed");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            super::super::MAX_TX_ATTEMPTS
+        );
+        assert_eq!(e.code, crate::errors::code::INTERNAL_ERROR);
+        assert!(e.message.contains("deadlock detected [40P01]"), "{}", e.message);
+        assert!(e.retryable);
+    }
+
+    /// A permanent failure is not retried: a wrong statement fails the same way
+    /// every time.
+    #[tokio::test]
+    async fn a_permanent_schema_failure_is_not_retried() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let e = with_schema_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ToolError::internal("postgres: syntax error [42601]"))
+        })
+        .await
+        .expect_err("a permanent failure surfaces");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!e.retryable);
+    }
+
+    /// Tables, indexes and columns of `schema`, read straight from the catalog
+    /// independently of the code under test.
+    async fn catalog_snapshot(db: &PostgresRelationalDb) -> Vec<String> {
+        let q = "SELECT 't:' || table_name FROM information_schema.tables \
+                 WHERE table_schema = current_schema() \
+                 UNION ALL SELECT 'i:' || indexname || ':' || indexdef FROM pg_indexes \
+                 WHERE schemaname = current_schema() \
+                 UNION ALL SELECT 'c:' || table_name || '.' || column_name || ':' || data_type \
+                 FROM information_schema.columns WHERE table_schema = current_schema() \
+                 ORDER BY 1";
+        let rows = db.query(&Query::new(q)).await.unwrap();
+        rows.iter().map(|r| r.text(0).unwrap()).collect()
+    }
+
+    async fn drop_live_schema(db: &PostgresRelationalDb, schema: &str) {
+        db.execute(&Query::new(format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")))
+            .await
+            .unwrap();
+    }
+
+    /// SPEC-0026/BT-012: an empty schema gets every declared object, a second
+    /// open changes nothing, and a `nodes` lacking `rev` gets it back (BR-004).
+    #[tokio::test]
+    async fn spec_0026_bt_012_fresh_schema_and_missing_column() {
+        let schema_name = format!("mcpfs_pgopen_bt012_{}", std::process::id());
+        let Some(db) = live_db(&schema_name).await else {
+            eprintln!("skipping spec_0026_bt_012: MCPFS_TEST_PG_DSN is unset");
+            return;
+        };
+        drop_live_schema(&db, &schema_name).await;
+        // The pool pinned the schema at connect; recreate it after the drop. A new
+        // pooled connection may already have recreated it, hence the guard.
+        db.execute(&Query::new(format!("CREATE SCHEMA IF NOT EXISTS \"{schema_name}\"")))
+            .await
+            .unwrap();
+        let set = crate::storage::meta::schema();
+
+        db.migrate(&set).await.unwrap();
+        let first = catalog_snapshot(&db).await;
+        let declared = set.declared_objects();
+        for t in &declared.tables {
+            assert!(first.contains(&format!("t:{t}")), "table {t} missing: {first:?}");
+        }
+        for i in &declared.indexes {
+            assert!(
+                first.iter().any(|o| o.starts_with(&format!("i:{i}:"))),
+                "index {i} missing: {first:?}"
+            );
+        }
+        for (t, c) in &declared.columns {
+            assert!(
+                first.iter().any(|o| o.starts_with(&format!("c:{t}.{c}:"))),
+                "column {t}.{c} missing: {first:?}"
+            );
+        }
+
+        db.migrate(&set).await.unwrap();
+        assert_eq!(catalog_snapshot(&db).await, first, "a second open must change nothing");
+
+        db.execute(&Query::new("ALTER TABLE nodes DROP COLUMN rev")).await.unwrap();
+        assert!(!catalog_snapshot(&db).await.iter().any(|o| o.starts_with("c:nodes.rev:")));
+        db.migrate(&set).await.unwrap();
+        assert_eq!(catalog_snapshot(&db).await, first, "rev must be added back");
+
+        drop_live_schema(&db, &schema_name).await;
     }
 
     #[tokio::test]

@@ -139,6 +139,17 @@ pub struct TableRecreation {
     pub guard_column: &'static str,
 }
 
+/// The names a [`SchemaSet`] declares, which the PostgreSQL migrate probes in
+/// the catalog before deciding whether any DDL has to run (SPEC-0026 DEC-001).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredObjects {
+    pub tables: Vec<&'static str>,
+    /// Plain then typed index names.
+    pub indexes: Vec<&'static str>,
+    /// `(table, column)` of every column migration.
+    pub columns: Vec<(&'static str, &'static str)>,
+}
+
 /// Every table and index one store needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaSet {
@@ -178,6 +189,20 @@ impl SchemaSet {
     ) -> Self {
         self.table_recreations.push(TableRecreation { table, guard_column });
         self
+    }
+
+    /// The tables, indexes and migrated columns this set declares.
+    pub fn declared_objects(&self) -> DeclaredObjects {
+        DeclaredObjects {
+            tables: self.tables.iter().map(|t| t.name).collect(),
+            indexes: self
+                .indexes
+                .iter()
+                .map(|i| i.name)
+                .chain(self.typed_indexes.iter().map(|i| i.name))
+                .collect(),
+            columns: self.column_migrations.iter().map(|m| (m.table, m.column)).collect(),
+        }
     }
 
     /// The `ALTER TABLE ... ADD COLUMN` statements, rendered for this dialect.
@@ -518,6 +543,139 @@ mod tests {
             vec![Index { name: "idx_nodes_parent", table: "nodes", columns: vec!["parent"] }],
         );
         assert_eq!(unbounded_keys(&set), vec!["nodes.parent".to_string()]);
+    }
+
+    /// Every statement a schema renders for one dialect, column migrations last,
+    /// fingerprinted so a byte change anywhere in the DDL shows up.
+    fn ddl_fingerprint(set: &SchemaSet, dialect: Dialect) -> String {
+        use sha2::{Digest, Sha256};
+        let mut all = set.render(dialect);
+        all.extend(set.render_column_migrations(dialect));
+        hex::encode(Sha256::digest(all.join("\n").as_bytes()))
+    }
+
+    /// SPEC-0026/BT-020: the DDL of every production schema, on every engine, is
+    /// byte identical to the one rendered before US-0029 (captured on 2026-10-14,
+    /// before the PostgreSQL migrate change), so SQLite and SQL Server deployments
+    /// see no difference (BR-005).
+    #[test]
+    fn production_ddl_is_unchanged_on_every_engine() {
+        let expected = [
+            (
+                "storage::meta",
+                Dialect::Sqlite,
+                "4211e1149044ce4fc75dce370ead406eeb21a2431e8893b1d3587d8b213d97d8",
+            ),
+            (
+                "storage::meta",
+                Dialect::Postgres,
+                "6891bd41b0390995dc29ba63e43b869f47c2cb109141ae5fa1e0a8216f185d4a",
+            ),
+            (
+                "storage::meta",
+                Dialect::SqlServer,
+                "fd4826b849f765d404f70859782c7e702a2a973a7b9d8935ead634b4b00e92ea",
+            ),
+            (
+                "storage::admin",
+                Dialect::Sqlite,
+                "deeda260cae9c31eede46a62e6f353ddff5cb1384f070061831175217e3f3048",
+            ),
+            (
+                "storage::admin",
+                Dialect::Postgres,
+                "973ea4d49ab1c602220a39606b8dedd1f5018a8593ed2f68915903dafdc338d2",
+            ),
+            (
+                "storage::admin",
+                Dialect::SqlServer,
+                "35bfd583e3d8eab9c06c71270e5804a9d695661922f9b50afedd3010860ee294",
+            ),
+            (
+                "git::db",
+                Dialect::Sqlite,
+                "6f01f500db7313af19b4ea1a2bec52f0614cb37d282d08236f245caf41a892a9",
+            ),
+            (
+                "git::db",
+                Dialect::Postgres,
+                "681558d60d439a5e20efdf8d031ebf7b453cf1569f2def7eba3c7b23f55cd355",
+            ),
+            (
+                "git::db",
+                Dialect::SqlServer,
+                "07b9d371c4fbff99a9b73b479a122c2ebd425e3939c62121601cd1fd6094db1c",
+            ),
+            (
+                "git::oauth::persistence",
+                Dialect::Sqlite,
+                "1eabe2ae2ee3253a3b05b04f5648093b146b9217c3c7ed2a4d65ba12a5bf4d30",
+            ),
+            (
+                "git::oauth::persistence",
+                Dialect::Postgres,
+                "aa10ebe986bc8ca2c326ea82eed065ac6cae8602595eba7de0383fb6497ea9ab",
+            ),
+            (
+                "git::oauth::persistence",
+                Dialect::SqlServer,
+                "be5ad946b61d1d426cc1f06516a18c111cbd3629a8caf5a10acee11f5c93fb54",
+            ),
+        ];
+        let schemas = production_schemas();
+        let actual: Vec<String> = expected
+            .iter()
+            .map(|(name, dialect, _)| {
+                let set = &schemas.iter().find(|(n, _)| n == name).expect("declared schema").1;
+                format!(
+                    "(\"{name}\", Dialect::{dialect:?}, \"{}\"),",
+                    ddl_fingerprint(set, *dialect)
+                )
+            })
+            .collect();
+        let wanted: Vec<String> = expected
+            .iter()
+            .map(|(name, dialect, fp)| format!("(\"{name}\", Dialect::{dialect:?}, \"{fp}\"),"))
+            .collect();
+        assert_eq!(actual, wanted, "rendered DDL changed:\n{}", actual.join("\n"));
+    }
+
+    /// SPEC-0026 DEC-001: what the PostgreSQL probe checks is exactly what the
+    /// schema declares: tables, plain and typed index names, migrated columns.
+    /// Virtual tables are SQLite only and stay out.
+    #[test]
+    fn declared_objects_lists_tables_indexes_and_migrated_columns() {
+        let mut set = SchemaSet::new(
+            vec![nodes()],
+            vec![Index { name: "idx_nodes_parent", table: "nodes", columns: vec!["parent"] }],
+        )
+        .column_migration(ColumnMigration {
+            table: "nodes",
+            column: "rev",
+            ty: ColumnType::Text,
+            not_null: true,
+            default: "''",
+        });
+        set.typed_indexes.push(TypedIndex {
+            name: "idx_nodes_fts",
+            table: "nodes",
+            columns: vec!["sha256"],
+            kind: IndexKind::Gin,
+        });
+        set.virtual_tables.push(VirtualTableDef {
+            name: "vec_nodes",
+            using: "vec0",
+            columns: vec!["embedding float[4]".into()],
+            dialect: Some(Dialect::Sqlite),
+        });
+        assert_eq!(
+            set.declared_objects(),
+            DeclaredObjects {
+                tables: vec!["nodes"],
+                indexes: vec!["idx_nodes_parent", "idx_nodes_fts"],
+                columns: vec![("nodes", "rev")],
+            }
+        );
     }
 
     /// SPEC-0023/BT-021: the SQLite and PostgreSQL DDL of `trash_entries` is the
