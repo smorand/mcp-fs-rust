@@ -28,3 +28,4 @@
 | US-0026 | SPEC-0024 | Project removal wipes the search index | US-0025 | 1 | landed | story/US-0026-project-removal-wipes-search-index | story/US-0025-volume-teardown-removes-every-row |
 | US-0027 | SPEC-0025 | Index walks skip the trash | main | 2 | landed | story/US-0027-index-walks-skip-the-trash | main |
 | US-0028 | SPEC-0025 | Auto purge and restore keep search in step | US-0027 | 2 | landed | story/US-0028-purge-and-restore-keep-search-in-step | story/US-0027-index-walks-skip-the-trash |
+| US-0029 | SPEC-0026 | PostgreSQL store opens without locking a current schema | main | 1 | todo | | |

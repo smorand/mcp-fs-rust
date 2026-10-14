@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: S
 > Depth evidence: 1 module (relational layer, PostgreSQL schema application), 1 defective behavior (store open), 5 requirements, no public contract change, no data model change
-> Status: specified
+> Status: designed
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High
