@@ -64,7 +64,7 @@ BL-0047 (a flaky shared schema test) has the same root cause and is consumed her
     emit statements that take table locks even when the object exists. `crates/core/src/storage/rel/postgres.rs:329-335`
     runs them on every open.
   - **No retry:** `postgres.rs:319-337` runs the schema transaction once. Its errors are marked
-    retryable (`postgres.rs:145-148`), but nothing retries them.
+    retryable (`postgres.rs:150-153`), but nothing retries them.
 - **Contributing factors:** the PostgreSQL suites are opt in and not part of `make check`; most of
   them use the same `public` schema at once (`crates/core/src/storage/mod.rs:604`, `:636`).
 - **Impact:**
