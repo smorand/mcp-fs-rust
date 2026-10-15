@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one test in `crates/core/src/docs/service.rs` (test module), no public contract, no persisted data
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-15
 > Behavior change: none
 > From backlog: BL-0055

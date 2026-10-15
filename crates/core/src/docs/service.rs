@@ -832,9 +832,10 @@ mod tests {
         let sh = script(
             home.path(),
             "slow.sh",
+            // The shell itself keeps writing, so a live process is visible as a
+            // growing tick count; a killed one cannot add a line (SPEC-0032).
             "pwd > \"$1\"\n\
-             sleep 30\n\
-             echo survived >> \"$1\"\n",
+             while :; do echo tick >> \"$1\"; sleep 0.2; done\n",
         );
         let svc = cli_service(
             vec![
@@ -842,22 +843,27 @@ mod tests {
                 marker.display().to_string(),
                 crate::config::DOC_PLACEHOLDER.into(),
             ],
-            // Long enough that a loaded machine still gets the child started, short
-            // enough that the test does not become a wait.
-            3,
+            // 3s was not enough for a child to start under the full parallel suite
+            // (BL-0055); 10s leaves margin and keeps the test short.
+            10,
         );
 
         let e = svc.to_markdown(b"body", "deck.pptx").await.unwrap_err();
         assert_eq!(e.code, code::INTERNAL_ERROR);
-        assert!(e.message.contains("timed out after 3s"), "{}", e.message);
+        assert!(e.message.contains("timed out after 10s"), "{}", e.message);
 
-        let sandbox = PathBuf::from(std::fs::read_to_string(&marker).unwrap().trim());
+        // Read only now that the call returned: the child had the whole timeout
+        // to write its first line.
+        let ticks =
+            || std::fs::read_to_string(&marker).unwrap().lines().filter(|l| *l == "tick").count();
+        let first = std::fs::read_to_string(&marker).unwrap();
+        let sandbox = PathBuf::from(first.lines().next().unwrap_or_default().trim());
         assert!(!sandbox.exists(), "the tempdir must be gone after a timeout: {sandbox:?}");
 
-        // Past the sleep the child would have appended; a reaped child cannot.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let after = std::fs::read_to_string(&marker).unwrap();
-        assert!(!after.contains("survived"), "the child was not killed: {after}");
+        // A live shell adds about ten ticks in 2s; a killed one adds none.
+        let before = ticks();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(ticks(), before, "the child was not killed: it kept ticking");
     }
 
     #[tokio::test]
