@@ -22,6 +22,8 @@ two replicas can each acquire their own lock for the same repository and interle
 corrupting its history. SQLite, the default relational backend, is a single file with one writer;
 PostgreSQL and SQL Server already support concurrent writers.
 
+- (Folded from BL-0043, 2026-10-15.) The project usage counter (SPEC-0020) can lose a write across processes: a write that finds no `volume_usage` row skips the counter update (`crates/core/src/storage/meta.rs:1199-1212`), and the first open recount (`:1653-1686`) runs at READ COMMITTED on PostgreSQL and SQL Server, so a concurrent uncommitted write is neither summed nor counted. Unreachable with one server process, because every store recounts in `RelationalMetaStore::open` before its first write (`:474-480`); it becomes real with two replicas, or during a rolling upgrade from a pre SPEC-0020 binary that never updates the counter. Not a defect: `migrate` not copying `volume_usage` (offline, and the counter is rebuilt on the next open).
+
 ## Notes
 Risk analysis: with more than one replica and no fix, a caller's write quota is effectively
 multiplied by the replica count ([[BL-0015]]); two replicas racing the git write lock can corrupt
