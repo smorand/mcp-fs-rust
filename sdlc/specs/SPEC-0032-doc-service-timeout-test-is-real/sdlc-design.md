@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one test in `crates/core/src/docs/service.rs` (test module), no public contract, no persisted data
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-15
 > Behavior change: none
 > From backlog: BL-0055
@@ -115,3 +115,29 @@ None.
 Inline checklist (depth S): 1 PASS, 2 PASS (both forms spelled), 3 n/a, 4 PASS, 5 n/a, 6 PASS, 7 PASS, 8 PASS (test only), 9 PASS (lines opened), 10 PASS, 11 PASS, 12 PASS, 13 n/a, 14 PASS (one declared test).
 
 **Amendments applied:** A (citation): the kill line is `service.rs:290`, not `:289` as stated in the approval message.
+
+## Design additions (2026-10-15)
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/docs/service.rs` (test module) | rewrite `cli_timeout_kills_the_child_and_removes_the_tempdir` | DR-001..DR-003 | US-0035 |
+
+Docs: none (test only).
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010 | integration | real `/bin/sh` child via `CliDocService::to_markdown` | `crates/core/src/docs/service.rs::tests::cli_timeout_kills_the_child_and_removes_the_tempdir` | US-0035 |
+| DT-011 | structural | diff inspection | story DoD | US-0035 |
+| 8.1 | non regression | `make check` with DB DSNs | workspace | US-0035 |
+
+- **DEC-003:** One story, `min_tier: 2`. **Obliged by:** SPEC-0032/DR-001..DR-004. **Rationale:** one test body in one file; the only judgment is the mutation evidence. **Alternatives considered:** none viable (the requirements share one test). **Source:** design. **Evidence:** `crates/core/src/docs/service.rs:829-861`.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0035 | Doc service timeout test proves the kill | P1 | DR-001..DR-004 | main | 2 | yes |

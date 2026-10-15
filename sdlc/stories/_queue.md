@@ -34,3 +34,4 @@
 | US-0032 | SPEC-0029 | Bump rustls past the four advisories | main | 3 | landed | story/US-0032-bump-rustls-past-advisories | main |
 | US-0033 | SPEC-0030 | Clone failure test runs offline | main | 2 | landed | story/US-0033-clone-failure-test-runs-offline | main |
 | US-0034 | SPEC-0031 | Pin the untested MCP protocol behaviors | main | 2 | landed | story/US-0034-pin-untested-mcp-protocol-behaviors | main |
+| US-0035 | SPEC-0032 | Doc service timeout test proves the kill | main | 2 | todo | | |
