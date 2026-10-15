@@ -691,6 +691,21 @@ impl RelationalMetaStore {
         .await
     }
 
+    /// Whether anything in this volume, a file node or an artifact set,
+    /// holds a reference to `sha`. `tx_decref` drops the row at zero, so the
+    /// row's presence is the answer (SPEC-0033 DEC-002).
+    pub(crate) async fn blob_is_referenced(&self, sha: &str) -> Result<bool> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new("SELECT refcount FROM blob_refs WHERE volume_id=?1 AND sha256=?2")
+                    .bind(&self.volume_id)
+                    .bind(sha),
+            )
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// Commit a conversion's artifact set and point `path` at it, in one
     /// transaction that first checks the node still carries `set.node_rev`
     /// (SPEC-0019 DEC-008). The set it replaces is marked superseded, never

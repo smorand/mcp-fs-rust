@@ -4039,6 +4039,209 @@ mod tests {
         assert_eq!(charged, 0, "charge refunded");
     }
 
+    /// A blob store recording every delete, optionally failing them, and
+    /// optionally pausing the second put of `pause` like [`PausingBlob`]
+    /// (SPEC-0033).
+    struct RecordingBlob {
+        inner: crate::storage::blob::local::LocalBlobStore,
+        pause: Option<String>,
+        puts: AtomicUsize,
+        paused: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        fail_deletes: bool,
+        // Deletes count only once armed, so the harness own rewrites stay out.
+        armed: std::sync::atomic::AtomicBool,
+        deletes: StdMutex<Vec<String>>,
+    }
+
+    impl RecordingBlob {
+        fn deletes_of(&self, sha: &str) -> usize {
+            self.deletes.lock().unwrap().iter().filter(|d| *d == sha).count()
+        }
+
+        async fn holds(&self, sha: &str) -> bool {
+            use crate::storage::traits::BlobBackend;
+            self.inner.exists(sha).await.unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::traits::BlobBackend for RecordingBlob {
+        async fn put(&self, sha256: &str, data: &[u8]) -> Result<()> {
+            if self.pause.as_deref() == Some(sha256)
+                && self.puts.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                let paused = self.paused.lock().unwrap().take();
+                paused.unwrap().send(()).unwrap();
+                let release = self.release.lock().await.take();
+                release.unwrap().await.unwrap();
+            }
+            self.inner.put(sha256, data).await
+        }
+        async fn get(&self, sha256: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(sha256, offset, length).await
+        }
+        async fn exists(&self, sha256: &str) -> Result<bool> {
+            self.inner.exists(sha256).await
+        }
+        async fn delete(&self, sha256: &str) -> Result<()> {
+            if !self.armed.load(Ordering::SeqCst) {
+                return self.inner.delete(sha256).await;
+            }
+            self.deletes.lock().unwrap().push(sha256.to_string());
+            if self.fail_deletes {
+                return Err(ToolError::internal("blob delete refused"));
+            }
+            self.inner.delete(sha256).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+    }
+
+    const PIC: &[u8] = b"PNG picture bytes";
+
+    /// A deck conversion whose text references `p.png` `refs` times.
+    fn deck_conversion(refs: usize) -> crate::docs::service::Conversion {
+        crate::docs::service::Conversion {
+            markdown: format!("# deck\n{}", "\n![p](p.png)\n".repeat(refs)),
+            files: [("p.png".to_string(), PIC.to_vec())].into(),
+            manifest: None,
+        }
+    }
+
+    /// What [`convert_deck`] leaves to assert on.
+    struct Converted {
+        result: Result<Value>,
+        blob: Arc<RecordingBlob>,
+        v: VolumeClient,
+        text_sha: String,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Convert `/deck.pptx`. With `refuse`, the commit is held on its text put
+    /// while the deck is rewritten, so it refuses. `copy` seeds `/copy.md`.
+    async fn convert_deck(
+        conversion: crate::docs::service::Conversion,
+        refuse: bool,
+        fail_deletes: bool,
+        copy: Option<&[u8]>,
+    ) -> Converted {
+        let text_sha = VolumeClient::sha256_hex(conversion.markdown.as_bytes());
+        let meta =
+            Arc::new(crate::storage::meta::RelationalMetaStore::in_memory("test").await.unwrap());
+        let d = tempfile::tempdir().unwrap();
+        let (paused_tx, paused) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let blob = Arc::new(RecordingBlob {
+            inner: crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"),
+            pause: refuse.then(|| text_sha.clone()),
+            puts: AtomicUsize::new(0),
+            paused: StdMutex::new(Some(paused_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+            fail_deletes,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            deletes: StdMutex::new(Vec::new()),
+        });
+        let v = VolumeClient::new("p", meta.clone(), blob.clone()).with_trash_store(meta.clone());
+        let s = SafetyManager::new(SafetyConfig::default(), None);
+        s.attach_no_limits();
+        v.write_bytes_atomic("/deck.pptx", b"PK deck").await.unwrap();
+        if let Some(bytes) = copy {
+            v.write_bytes_atomic("/copy.md", bytes).await.unwrap();
+        }
+        let stub = StubDocService::bundle(conversion);
+        let result = if refuse {
+            let call = documentize(&v, &s, Some(&stub), P, M, "/deck.pptx", true);
+            let drive = async {
+                paused.await.unwrap();
+                v.write_bytes_atomic("/deck.pptx", b"PK deck changed").await.unwrap();
+                blob.armed.store(true, Ordering::SeqCst);
+                release.send(()).unwrap();
+            };
+            tokio::join!(call, drive).0
+        } else {
+            blob.armed.store(true, Ordering::SeqCst);
+            documentize(&v, &s, Some(&stub), P, M, "/deck.pptx", true).await
+        };
+        Converted { result, blob, v, text_sha, _dir: d }
+    }
+
+    /// SPEC-0033 DT-010 and DT-012: a refused commit leaves no unreferenced
+    /// blob, and the caller sees the refusal unchanged.
+    #[tokio::test]
+    async fn a_refused_commit_leaves_no_unreferenced_blob() {
+        let c = convert_deck(deck_conversion(1), true, false, None).await;
+        let e = c.result.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, "Document changed during conversion: /deck.pptx");
+        assert!(!c.blob.holds(&c.text_sha).await, "text blob released");
+        let pic = VolumeClient::sha256_hex(PIC);
+        assert!(!c.blob.holds(&pic).await, "picture blob released");
+    }
+
+    /// SPEC-0033 DT-011: a hash a file node references is kept.
+    #[tokio::test]
+    async fn a_refused_commit_keeps_a_hash_a_file_references() {
+        let conversion = deck_conversion(1);
+        let md = conversion.markdown.clone();
+        let c = convert_deck(conversion, true, false, Some(md.as_bytes())).await;
+        assert!(c.result.is_err());
+        assert!(c.blob.holds(&c.text_sha).await, "shared text blob kept");
+        assert_eq!(c.v.read_text("/copy.md").await.unwrap(), md);
+    }
+
+    /// SPEC-0033 DT-013: a failing delete does not mask the refusal. The
+    /// release deletes the picture; the text is still the sibling's when the
+    /// release runs, so the sibling restore GCs it afterwards.
+    #[tokio::test]
+    async fn a_failing_delete_does_not_mask_the_refusal() {
+        let c = convert_deck(deck_conversion(1), true, true, None).await;
+        let e = c.result.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, "Document changed during conversion: /deck.pptx");
+        assert_eq!(c.blob.deletes.lock().unwrap().len(), 2, "text and picture");
+        assert_eq!(c.blob.deletes_of(&c.text_sha), 1);
+        assert_eq!(c.blob.deletes_of(&VolumeClient::sha256_hex(PIC)), 1);
+    }
+
+    /// SPEC-0033 DR-004: a failing delete does not stop the release; every
+    /// other unreferenced hash is still attempted, and the refusal still wins.
+    #[tokio::test]
+    async fn a_failing_delete_does_not_stop_the_remaining_releases() {
+        const QIC: &[u8] = b"PNG second picture";
+        let conversion = crate::docs::service::Conversion {
+            markdown: "# deck\n\n![p](p.png)\n\n![q](q.png)\n".to_string(),
+            files: [("p.png".to_string(), PIC.to_vec()), ("q.png".to_string(), QIC.to_vec())]
+                .into(),
+            manifest: None,
+        };
+        let c = convert_deck(conversion, true, true, None).await;
+        let e = c.result.unwrap_err();
+        assert_eq!(e.message, "Document changed during conversion: /deck.pptx");
+        assert_eq!(c.blob.deletes_of(&VolumeClient::sha256_hex(PIC)), 1, "first picture");
+        assert_eq!(c.blob.deletes_of(&VolumeClient::sha256_hex(QIC)), 1, "second picture");
+    }
+
+    /// SPEC-0033 DT-014: a hash stored twice in one set is released once, and
+    /// a committed set keeps every blob it stored.
+    #[tokio::test]
+    async fn shared_hashes_are_released_once_and_a_committed_set_keeps_its_blobs() {
+        let pic = VolumeClient::sha256_hex(PIC);
+        let c = convert_deck(deck_conversion(2), true, false, None).await;
+        assert!(c.result.is_err());
+        assert_eq!(c.blob.deletes_of(&pic), 1, "one delete for a shared hash");
+
+        let c = convert_deck(deck_conversion(2), false, false, None).await;
+        c.result.unwrap();
+        assert!(c.blob.deletes.lock().unwrap().is_empty(), "no delete on success");
+        assert!(c.blob.holds(&c.text_sha).await);
+        assert!(c.blob.holds(&pic).await);
+    }
+
     /// The companion path is deliberately the one `fs.extract_text` looks at, so a
     /// doc service companion is served as a cache hit by the built-in extractor.
     #[tokio::test]

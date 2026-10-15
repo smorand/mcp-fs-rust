@@ -35,4 +35,4 @@
 | US-0033 | SPEC-0030 | Clone failure test runs offline | main | 2 | landed | story/US-0033-clone-failure-test-runs-offline | main |
 | US-0034 | SPEC-0031 | Pin the untested MCP protocol behaviors | main | 2 | landed | story/US-0034-pin-untested-mcp-protocol-behaviors | main |
 | US-0035 | SPEC-0032 | Doc service timeout test proves the kill | main | 2 | landed | story/US-0035-doc-service-timeout-test-proves-kill | main |
-| US-0036 | SPEC-0033 | A refused artifact commit releases its blobs | main | 1 | todo | | |
+| US-0036 | SPEC-0033 | A refused artifact commit releases its blobs | main | 1 | landed | story/US-0036-refused-artifact-commit-releases-blobs | main |

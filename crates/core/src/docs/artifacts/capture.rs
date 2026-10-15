@@ -145,8 +145,9 @@ impl<'a> PendingSet<'a> {
 
     /// Store the conversion text and picture blobs, then commit the set as the
     /// current one for `path`, refused when the node no longer carries `rev`
-    /// (DEC-008). A refused commit leaves the blobs unreferenced, as an
-    /// interrupted write does.
+    /// (DEC-008). A refused commit releases the blobs it stored that nothing
+    /// else in the volume references, then returns the refusal unchanged
+    /// (SPEC-0033): left in place they would never be read nor collected.
     pub(crate) async fn commit(
         &self,
         client: &VolumeClient,
@@ -203,7 +204,34 @@ impl<'a> PendingSet<'a> {
             images,
             tables,
         };
-        store.commit_artifact_set(&set).await
+        let committed = store.commit_artifact_set(&set).await;
+        if committed.is_err() {
+            let stored = set.text_sha.iter().chain(set.images.iter().map(|i| &i.sha256));
+            release_unreferenced(client, store, stored).await;
+        }
+        committed
+    }
+}
+
+/// Delete each distinct blob of `stored` that no `blob_refs` row holds, after
+/// a refused commit. Best effort (SPEC-0033 DEC-003): a failure is logged and
+/// skipped, because the refusal is what the caller must see. A referenced hash
+/// is kept, whatever holds it: the same bytes may be a file or another set.
+async fn release_unreferenced<'s>(
+    client: &VolumeClient,
+    store: &RelationalMetaStore,
+    stored: impl Iterator<Item = &'s String>,
+) {
+    let distinct: std::collections::HashSet<&String> = stored.collect();
+    for sha in distinct {
+        let released = match store.blob_is_referenced(sha).await {
+            Ok(true) => Ok(()),
+            Ok(false) => client.blob.delete(sha).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = released {
+            tracing::warn!(sha256 = %sha, error = %e.message, "releasing a refused artifact blob failed");
+        }
     }
 }
 

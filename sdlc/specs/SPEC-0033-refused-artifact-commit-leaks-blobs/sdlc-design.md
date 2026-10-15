@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 2 modules (`docs/artifacts`, `storage/meta`), 7 requirements, no public contract, no persisted data change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-15
 > Behavior change: none
 > From backlog: BL-0040
