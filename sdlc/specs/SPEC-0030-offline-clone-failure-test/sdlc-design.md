@@ -108,8 +108,8 @@ None.
 
 | Round | F | A | Verdict |
 |---|---|---|---|
-| 1 | 0 | 0 | IMPLEMENTABLE |
+| 1 | 0 | 1 | IMPLEMENTABLE |
 
 Inline checklist (depth S): 1 PASS, 2 PASS (both forms spelled), 3 n/a, 4 PASS, 5 n/a, 6 PASS, 7 PASS, 8 PASS (test only, no behavior change), 9 PASS (lines recounted), 10 PASS (`map_err` path cited, assumption stated), 11 PASS, 12 PASS (not security), 13 n/a, 14 PASS (one declared test change).
 
-**Amendments applied:** none.
+**Amendments applied:** A (citations): fn line 8462, host lines 8467, 8471, 8492, generic Env line 8799, comment line 8463 added to the perimeter.
