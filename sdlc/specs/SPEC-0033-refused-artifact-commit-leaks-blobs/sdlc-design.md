@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 2 modules (`docs/artifacts`, `storage/meta`), 7 requirements, no public contract, no persisted data change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-15
 > Behavior change: none
 > From backlog: BL-0040
@@ -137,3 +137,30 @@ Empty.
 **Amendments applied:** none. Auditor: fresh context subagent, path and contract only; every citation opened, no finding.
 
 **Process note:** the test plan was designed in the main run and approved by the owner before the depth M test designer subagent ran; no separate test designer was spawned.
+
+## Design additions (2026-10-15)
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/storage/meta.rs` | add `pub(crate) async fn blob_is_referenced(&self, sha: &str) -> Result<bool>` (`SELECT 1 FROM blob_refs WHERE volume_id=?1 AND sha256=?2`) | DR-001, DR-002 | US-0036 |
+| `crates/core/src/docs/artifacts/capture.rs` | `PendingSet::commit`: on `Err`, release distinct stored hashes not referenced, warn on delete error, return the original error; rewrite the comment at `:147-149` | DR-001..DR-006 | US-0036 |
+| `crates/core/src/core/fs_ops.rs` (test module) | DT-010..DT-014 | DR-001..DR-006 | US-0036 |
+
+Docs: none.
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010..DT-014 | integration | converter path with a pausing (and, for DT-013, delete failing) blob backend | `crates/core/src/core/fs_ops.rs` tests, beside `late_refusal` (`:3984`) | US-0036 |
+| 8.1 | non regression | `make check` with DB DSNs | workspace | US-0036 |
+
+- **DEC-004:** One story at `min_tier: 1`. **Obliged by:** SPEC-0033/DR-001..DR-007. **Rationale:** the release and its two guards (never a referenced blob, never mask the refusal) are not separately assertable, so the unit stays whole (floor check); 7 requirements and a concurrency harness exceed the tier 2 budget. **Alternatives considered:** a reference read story then a release story, rejected because the first would land an unused method with no observable test. **Source:** design. **Evidence:** Section 2.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0036 | A refused artifact commit releases its blobs | P1 | DR-001..DR-007 | main | 1 | yes |
