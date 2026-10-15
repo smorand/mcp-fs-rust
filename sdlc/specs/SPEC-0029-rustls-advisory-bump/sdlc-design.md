@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, one file (`Cargo.lock`, 1 entry), no public contract change, no persisted data change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-14
 > Behavior change: none
 > From backlog: BL-0012
