@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, one file (`crates/core/src/app.rs`, test module only), no public contract, no persisted data
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-15
 > Behavior change: none
 > From backlog: BL-0052

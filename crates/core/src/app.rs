@@ -544,7 +544,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(r.status().is_client_error(), "expected a 4xx, got {}", r.status());
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = body_string(r).await;
         assert!(body.contains("initialize"), "body must mention initialize: {body}");
     }
@@ -558,7 +558,7 @@ mod tests {
             .oneshot(rpc(Some(&t), None, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
             .await
             .unwrap();
-        assert!(r.status().is_client_error(), "expected a 4xx, got {}", r.status());
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = body_string(r).await;
         assert!(body.contains("initialize"), "body must mention initialize: {body}");
     }
@@ -685,6 +685,63 @@ mod tests {
         // (-32602 / INVALID_PARAMS) is unchanged.
         assert_eq!(v["error"]["code"], -32602); // JSON-RPC INVALID_PARAMS
         assert_eq!(v["error"]["message"], "tool not found");
+    }
+
+    /// SPEC-0028/FR-012 (SPEC-0031 DR-001): names resolve by exact match only.
+    /// A separator variant of a served tool is a tool the server does not
+    /// serve; the old transport's tolerant resolution was dropped on purpose.
+    #[tokio::test]
+    async fn a_separator_variant_of_a_served_tool_is_not_served() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, t) = test_setup(d.path());
+        let app = build(c).await.unwrap();
+        let session = establish_session(&app, &t).await;
+        for name in ["fs_read", "fs-read"] {
+            let payload = format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"{name}","arguments":{{"mount_id":"p","path":"/x"}}}}}}"#
+            );
+            let r = app.clone().oneshot(rpc(Some(&t), Some(&session), &payload)).await.unwrap();
+            let v = sse_json(&body_string(r).await);
+            assert_eq!(v["error"]["code"], -32602, "{name}: {v}");
+            assert_eq!(v["error"]["message"], "tool not found", "{name}");
+        }
+    }
+
+    /// SPEC-0028/FR-016 (SPEC-0031 DR-002): sessions live in the memory of the
+    /// process that issued them. A second instance built from the same
+    /// configuration (a restart, or another replica) does not know the id.
+    #[tokio::test]
+    async fn a_session_id_from_another_instance_is_not_found() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, t) = test_setup(d.path());
+        let issuer = build(c.clone()).await.unwrap();
+        let other = build(c).await.unwrap();
+        let session = establish_session(&issuer, &t).await;
+        let r = other
+            .oneshot(rpc(
+                Some(&t),
+                Some(&session),
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let body = body_string(r).await;
+        assert!(body.contains("Session not found"), "body was {body}");
+    }
+
+    /// SPEC-0028/FR-004 (SPEC-0031 DR-003): the handshake answers the requested
+    /// protocol version (supported, so echoed) and the tools capability.
+    #[tokio::test]
+    async fn initialize_answers_the_requested_protocol_version_and_the_tools_capability() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, t) = test_setup(d.path());
+        let app = build(c).await.unwrap();
+        let r = app.oneshot(rpc(Some(&t), None, INITIALIZE_BODY)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = sse_json(&body_string(r).await);
+        assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
+        assert!(v["result"]["capabilities"]["tools"].is_object(), "{v}");
     }
 
     /// `resources/list` is a method the MCP spec itself defines, so `rmcp`
