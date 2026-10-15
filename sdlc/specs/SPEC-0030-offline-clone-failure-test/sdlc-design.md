@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, one file (`crates/core/src/tools/git.rs`, test module only), no public contract, no persisted data
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-14
 > Behavior change: none
 > From backlog: BL-0045
@@ -113,3 +113,30 @@ None.
 Inline checklist (depth S): 1 PASS, 2 PASS (both forms spelled), 3 n/a, 4 PASS, 5 n/a, 6 PASS, 7 PASS, 8 PASS (test only, no behavior change), 9 PASS (lines recounted), 10 PASS (`map_err` path cited, assumption stated), 11 PASS, 12 PASS (not security), 13 n/a, 14 PASS (one declared test change).
 
 **Amendments applied:** A (citations): fn line 8462, host lines 8467, 8471, 8492, generic Env line 8799, comment line 8463 added to the perimeter.
+
+## Design additions (2026-10-15)
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/tools/git.rs` (test module) | add `closing_remote()`; rework the setup of `remote_clone_surfaces_a_failure_without_leaking_the_token` | DR-001, DR-003 | US-0033 |
+
+Docs: none (test only).
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010 | structural | `rg` | story DoD | US-0033 |
+| DT-011 | unit | `cargo test` | `crates/core/src/tools/git.rs::tests::remote_clone_surfaces_a_failure_without_leaking_the_token` | US-0033 |
+| DT-012 | structural | `git diff` | story DoD | US-0033 |
+| 8.1 | non regression | `make check` with DB DSNs | workspace | US-0033 |
+
+- **DEC-003:** One story, `min_tier: 2`. **Obliged by:** SPEC-0030/DR-001, DR-002, DR-003. **Rationale:** one file and one helper; the only judgment is confirming libgit2 surfaces the dropped connection as `clone failed:`. **Alternatives considered:** `min_tier: 3`, rejected because tier 3 has no default model mapping and the story needs no inlined example beyond `silent_remote`. **Source:** design. **Evidence:** `crates/core/src/tools/git.rs:9336-9346`.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0033 | Clone failure test runs offline | P1 | DR-001, DR-002, DR-003 | main | 2 | yes |
