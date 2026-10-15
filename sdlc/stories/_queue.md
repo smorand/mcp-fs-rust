@@ -32,4 +32,4 @@
 | US-0030 | SPEC-0027 | Disabled git and search tools are not served | main | 1 | landed | story/US-0030-disabled-git-search-not-served | main |
 | US-0031 | SPEC-0027 | Enabled optional families are served over MCP | US-0030 | 1 | landed | story/US-0031-optional-families-served-over-mcp | story/US-0030-disabled-git-search-not-served |
 | US-0032 | SPEC-0029 | Bump rustls past the four advisories | main | 3 | landed | story/US-0032-bump-rustls-past-advisories | main |
-| US-0033 | SPEC-0030 | Clone failure test runs offline | main | 2 | todo | | |
+| US-0033 | SPEC-0030 | Clone failure test runs offline | main | 2 | landed | story/US-0033-clone-failure-test-runs-offline | main |

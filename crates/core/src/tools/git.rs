@@ -8460,15 +8460,19 @@ mod tests {
     /// the token either.
     #[test]
     fn remote_clone_surfaces_a_failure_without_leaking_the_token() {
-        // github.com must be declared (US-002, DEC-010): an undeclared host is now
-        // a loud config error, not an implicit fallback, so this test's host is no
-        // longer free—it must be in git.hosts for the clone to even be attempted.
+        // The host must be declared (US-002, DEC-010): an undeclared host is a
+        // loud config error, not an implicit fallback. The remote is a loopback
+        // peer that drops every connection (SPEC-0030), so the clone fails at
+        // once through the real transport, offline, instead of depending on a
+        // public host answering before the remote deadline.
         with_git_hosts_lock(async {
-            let e = Env::with_hosts(&[("github.com", "github")]).await;
+            let (url, srv) = closing_remote().await;
+            let host = url::Url::parse(&url).unwrap().host_str().unwrap().to_string();
+            let e = Env::with_hosts(&[(host.as_str(), "github")]).await;
             e.tokens
                 .store_token(
                     OWNER,
-                    "github.com",
+                    &host,
                     "github",
                     "gho_supersecret",
                     vec!["repo".into()],
@@ -8478,18 +8482,16 @@ mod tests {
                 .await
                 .unwrap();
             let err = e
-                .call(
-                    "git.remote_clone",
-                    json!({"mount_id": MOUNT, "url": "https://github.com/does-not/exist-mcpfs.git"}),
-                )
+                .call("git.remote_clone", json!({"mount_id": MOUNT, "url": url}))
                 .await
                 .unwrap_err();
+            srv.abort();
             assert_eq!(err.code, code::INTERNAL_ERROR);
             assert!(err.message.starts_with("clone failed:"), "got {}", err.message);
             assert!(!err.message.contains("gho_supersecret"), "a token must never surface");
 
             // E2E-NEW-054: a remote-side rejection never deletes the token.
-            let still = e.tokens.get_token(OWNER, "github.com").unwrap();
+            let still = e.tokens.get_token(OWNER, &host).unwrap();
             assert_eq!(still.access_token, "gho_supersecret");
         });
     }
@@ -9343,6 +9345,23 @@ mod tests {
             }
         });
         (format!("https://127.0.0.1:{port}/x.git"), handle)
+    }
+
+    /// A TCP listener that accepts each connection and drops it at once, so
+    /// `git2`'s https transport fails the TLS handshake immediately and the
+    /// clone surfaces `clone failed:` (SPEC-0030), offline and in milliseconds,
+    /// where `silent_remote` would hang until the remote deadline. Returns the
+    /// URL to give the clone and the accept loop's handle, which the caller
+    /// must `abort()` once done.
+    async fn closing_remote() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        (format!("https://127.0.0.1:{port}/does-not/exist-mcpfs.git"), handle)
     }
 
     /// One more commit directly on the bare "remote", simulating another writer
