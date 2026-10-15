@@ -462,3 +462,16 @@ Only requirements whose effect is observable to an operator or caller are listed
 - **Significant known staleness:** the legacy document describes a hand-rolled JSON-RPC/SSE protocol layer (FR-012 through FR-019 above, and the corresponding E2E-015 through E2E-042). The current repository's own index (`AGENTS.md`) states the MCP transport was migrated to the official SDK (`rmcp`), replacing that hand-rolled layer, and that the file this spec's citations point at (`mcp/mod.rs`) was removed in favor of `mcp/server.rs`. FR-012 through FR-019 are therefore retained here as the historical, as-built behaviour the legacy document captured, but they should be treated as **likely superseded** rather than current. See the companion design document's findings section.
 - **Tool/family counts** quoted in the legacy document (e.g. specific tool totals in end-to-end tests) were not re-verified against the current 102-tool contract stated in `AGENTS.md`, and are likely stale for the same reason.
 - Paraphrased throughout: all prose was rewritten to remove file paths, schema and API-shape detail per the functional-only constraint on this document; no factual claim was invented beyond what the legacy document stated.
+
+## 11. Supersession notes (2026-10-14, owner authorized)
+
+- **FR-012 to FR-019 and E2E-015 to E2E-042 are superseded by SPEC-0028 (mcp-protocol, as-built).**
+  The protocol changed with SPEC-0016 (rmcp migration): the handshake is now mandatory, an unknown tool
+  answers `-32602 "tool not found"`, a malformed body answers HTTP 415, and an unimplemented spec method
+  answers the protocol's empty default. FR-019 (separator variants of a tool name) was dropped by that
+  migration; the owner accepted the drop on 2026-10-14 (SPEC-0028/FR-012, DEC-005). The rows above are
+  kept unchanged as history; read SPEC-0028 for the current contract.
+- **Tool count (Section 10, "current 102-tool contract")** is stale: the frozen contract holds 108 tools
+  (44 `fs.*`, 15 `admin.*`, 49 `git.*` including `git.auth*` and `git.pr_*`), plus 4 `search.*` when
+  search is enabled (`AGENTS.md:5`, `tool-contract-golden.json`).
+- Closes BL-0028 and BL-0029.
