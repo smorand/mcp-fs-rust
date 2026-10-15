@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, one file (`crates/core/src/app.rs`, test module only), no public contract, no persisted data
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-15
 > Behavior change: none
 > From backlog: BL-0052
@@ -131,3 +131,31 @@ None.
 Inline checklist (depth S): 1 PASS (exact values for every assertion), 2 PASS (test names and both assertion forms spelled), 3 n/a, 4 PASS, 5 n/a, 6 PASS, 7 PASS, 8 PASS (tests only), 9 PASS (lines recounted), 10 PASS (two instance build uses existing helpers), 11 PASS, 12 PASS, 13 n/a, 14 PASS (two declared, strengthening only).
 
 **Amendments applied:** A (count): guardrail test count in Section 2 recounted to 15.
+
+## Design additions (2026-10-15)
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/app.rs` (test module) | add 3 tests, tighten 2 assertions | DR-001..DR-004 | US-0034 |
+
+Docs: none (tests only).
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010 | integration | axum `oneshot` over the real router | `crates/core/src/app.rs::tests::a_separator_variant_of_a_served_tool_is_not_served` | US-0034 |
+| DT-011 | integration | two routers from one config | `crates/core/src/app.rs::tests::a_session_id_from_another_instance_is_not_found` | US-0034 |
+| DT-012 | integration | axum `oneshot` | `crates/core/src/app.rs::tests::initialize_answers_the_requested_protocol_version_and_the_tools_capability` | US-0034 |
+| DT-013 | integration | axum `oneshot` | the two `mcp_bare_tools_*_without_initialize_*` tests | US-0034 |
+| 8.1 | non regression | `make check` with DB DSNs | workspace | US-0034 |
+
+- **DEC-004:** One story, `min_tier: 2`. **Obliged by:** SPEC-0031/DR-001..DR-005. **Rationale:** one file, helpers exist, five small changes that share setup; splitting would add four stories for one test module. **Alternatives considered:** one story per test, rejected as fragmentation of one file. **Source:** design. **Evidence:** `crates/core/src/app.rs:337`, `:439`, `:461`.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0034 | Pin the untested MCP protocol behaviors | P1 | DR-001..DR-005 | main | 2 | yes |
