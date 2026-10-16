@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 3 bounded areas (dependency manifests and security gate config, the git layer: HTTP server, remote pipeline, tools), 8 requirements, 12 audit findings, no public contract
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-16
 > Behavior change: none
 > From backlog: BL-0053
@@ -184,3 +184,55 @@ DT-012, DT-013 and DT-014 are the advisory tests: each is red before the change 
 **Amendments applied:** A-1 DT-016 example unwraps `Signature::new` (it returns `Result`, `git2-0.21.0/src/signature.rs:47`); A-2 DEC-007 citation corrected to `security_gate.rs:22-26`.
 
 **Gate process:** depth L. Self consistency reviewer (fresh subagent): PASS on every check, including the documented `Nature: DEBT` for the deferred dependency entries. Auditor (fresh subagent, path and contract only): every citation opened, the git2 0.20.4 and 0.21.0 sources diffed for each API named, `cargo audit` and `cargo deny` re run live; 0 F, 2 A amended above. Tests designed by an independent test designer subagent, trimmed and approved by the owner.
+
+## Design additions (2026-10-16)
+
+**Perimeter recount:** Section 2 lists 11 rows over 9 distinct paths (`crates/core/src/tools/git.rs` and `crates/core/src/git/http/mod.rs` appear once for production and once for tests): `Cargo.toml`, `Cargo.lock`, `crates/core/src/git/http/mod.rs`, `crates/core/src/git/remote.rs`, `crates/core/src/tools/git.rs`, `crates/mcp-fs/tests/security_gate.rs`, `.cargo/audit.toml`, `Makefile`, `deny.toml`.
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `Cargo.toml` | `git2 = "0.21"` (`:74`) | DR-001 | US-0040 |
+| `Cargo.lock` | git2 0.21.x, yoke-derive 0.8.4 | DR-001, DR-002 | US-0040 |
+| `crates/core/src/git/http/mod.rs` | `:336` adaptation; DT-017 in its tests module | DR-003 | US-0040 |
+| `crates/core/src/git/remote.rs` | `:557` adaptation | DR-003 | US-0040 |
+| `crates/core/src/tools/git.rs` | `blame_identity` and `:2864-2867`; `:3086`; 4 declared test adaptations; DT-016, DT-018 | DR-003, DR-004, DR-008 | US-0040 |
+| `crates/mcp-fs/tests/security_gate.rs` | DT-010, DT-013 | DR-001, DR-002 | US-0040 |
+| `crates/mcp-fs/tests/security_gate.rs` | DT-012, DT-014, DT-015 | DR-005..DR-007 | US-0041 |
+| `.cargo/audit.toml` | new, 7 ids with reasons | DR-005 | US-0041 |
+| `Makefile` | `:47` drops `--ignore RUSTSEC-2023-0071` | DR-005 | US-0041 |
+| `deny.toml` | drops `:19-20` | DR-006 | US-0041 |
+
+Docs: none (no doc names the git2 version or a RUSTSEC id; `rg -n "RUSTSEC-20|git2 = " --glob '!sdlc/**' --glob '!*.toml' --glob '!Cargo.lock' --glob '!Makefile'` finds none).
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010 | integration | text parse of `Cargo.lock` | `crates/mcp-fs/tests/security_gate.rs` | US-0040 |
+| DT-011 | structural | `git diff main -- Cargo.lock` | story definition of done | US-0040 |
+| DT-013 | integration | `cargo tree -i` | `crates/mcp-fs/tests/security_gate.rs` | US-0040 |
+| DT-016 | unit | direct call | `crates/core/src/tools/git.rs` tests | US-0040 |
+| DT-017 | integration | ref advertisement over a repo with a raw `packed-refs` line | `crates/core/src/git/http/mod.rs` tests | US-0040 |
+| DT-018 | integration | the `:3086` caller over a HEAD on a non UTF-8 branch | `crates/core/src/tools/git.rs` tests | US-0040 |
+| DT-012 | integration | `cargo audit --json` (skips when not installed) | `crates/mcp-fs/tests/security_gate.rs` | US-0041 |
+| DT-014 | integration | `deny.toml` text, `cargo deny check` (skips when not installed) | `crates/mcp-fs/tests/security_gate.rs` | US-0041 |
+| DT-015 | structural | text of `.cargo/audit.toml` and `Makefile` | `crates/mcp-fs/tests/security_gate.rs` | US-0041 |
+| DT-019 | non regression | `make check` with DB DSNs | workspace | US-0041 |
+
+### Security design
+- **Threat surface:** third party code compiled into the server binary; the one live sink is `Remote::list()` on the fetch path (`crates/core/src/git/remote.rs:722`), fixed by the version, not by a call site change (DEC-001).
+- **Per occurrence:** sweep rows 1 to 3 are fixed in US-0040 (version bump; `blame_identity` handles the `Option` RUSTSEC-2026-0184 introduced); rows 4 to 8 are recorded in `.cargo/audit.toml` by US-0041; rows 9 and 10 stay visible (BL-0058, BL-0059).
+- **Second channel:** each fix is read through the audit report (DT-012, first channel) and the resolved graph (`cargo tree`, DT-013) or the lockfile text (DT-010).
+- **Secrets:** none touched.
+
+- **DEC-008:** Two stories along the seam "code that must compile together" then "gate configuration". **Obliged by:** SPEC-0035/DR-001..DR-008. **Rationale:** the 9 git2 edits cannot be split (the workspace does not compile in between), but the audit configuration can follow: after US-0040, `cargo deny check` only warns `advisory-not-detected` on the two stale ignores and still reports `advisories ok` (Section 2 probe), and `cargo audit` with the Makefile flag still exits 0, so main stays green; each story stays within the tier 2 file budget (6 and 4 paths). Section 9's single step is kept as one story for its code part; the split does not change its order. **Alternatives considered:** one story of 9 paths (above every tier budget, and it would mix a code bump with gate policy); splitting the git2 edits (the build breaks in between). **Source:** design. **Evidence:** Section 2 probe.
+- **DEC-009:** Both stories at `min_tier: 2`. **Obliged by:** SPEC-0035/DR-001..DR-008. **Rationale:** decision density is low: the probe fixed every compile edit, and the story inlines them; the only judgment is crafting a raw `packed-refs` line for DT-017 and DT-018. **Alternatives considered:** `min_tier: 1` for US-0040 (6 paths sits at the top of the tier 2 budget; rejected because the edits are dictated, not designed). **Source:** design. **Evidence:** Section 2 probe.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0040 | git2 0.21 and yoke-derive 0.8.4 with unchanged behavior | P1 | DR-001, DR-002, DR-003, DR-004, DR-008 | main | 2 | no |
+| US-0041 | Record the accepted advisories and drop the stale ignores | P1 | DR-005, DR-006, DR-007, DR-008 | US-0040 | 2 | yes |
