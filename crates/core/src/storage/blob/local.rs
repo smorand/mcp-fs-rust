@@ -164,6 +164,25 @@ impl BlobBackend for LocalBlobStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn modified(&self, entry: &BlobEntry) -> Result<f64> {
+        let path = match &entry.shard {
+            Some(shard) => self.root.join(shard).join(&entry.key),
+            None => self.path_for(&entry.key),
+        };
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolError::not_found(format!("blob '{}' not found", entry.key)));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // The last read before an irreversible delete (SPEC-0034/DR-005): a time
+        // that cannot be expressed is an error the sweep skips, never the epoch.
+        metadata.modified()?.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).map_err(
+            |e| ToolError::internal(format!("blob '{}' time before epoch: {e}", entry.key)),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +338,26 @@ mod tests {
         let age = now.duration_since(modified).unwrap_or_default();
         assert!(age.as_secs_f64() < 2.0, "modified time not refreshed: {age:?} old");
         assert_eq!(s.get("existing", 0, None).await.unwrap(), b"data");
+    }
+
+    /// SPEC-0034/DR-005: `modified` reads the file's own time, fresh, and
+    /// reports a deleted entry as not found.
+    #[tokio::test]
+    async fn modified_reads_the_file_time_and_not_found_once_deleted() {
+        let (d, s) = store();
+        s.put("backdated", b"data").await.unwrap();
+        let path = d.path().join("mcpfs-test").join("ba").join("backdated");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        std::fs::File::open(&path).unwrap().set_modified(old).unwrap();
+        let entry = s.list().await.unwrap().into_iter().find(|e| e.key == "backdated").unwrap();
+
+        let read = s.modified(&entry).await.unwrap();
+        let expected = old.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        assert!((read - expected).abs() < 1.0, "read {read}, expected {expected}");
+
+        s.delete_entry(&entry).await.unwrap();
+        let e = s.modified(&entry).await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NOT_FOUND);
     }
 
     /// Blobs whose shard prefix collides still coexist.

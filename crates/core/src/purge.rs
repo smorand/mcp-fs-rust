@@ -13,12 +13,16 @@ use crate::git::GitRepoStore;
 use crate::safety::SafetyManager;
 use crate::search::SearchBackend;
 use crate::storage::StoreManager;
-use crate::storage::traits::AdminBackend;
+use crate::storage::traits::{AdminBackend, BlobEntry};
 use crate::storage::volume::VolumeClient;
 use crate::util::now_unix;
 use std::sync::Arc;
 
 const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// An object must be strictly older than this before the orphan sweep may
+/// delete it (SPEC-0034 DEC-003): the conservative side for a deleting job.
+const ORPHAN_MIN_AGE_SECONDS: f64 = SECONDS_PER_DAY;
 
 /// How long a superseded artifact set survives before the sweep reclaims it
 /// (SPEC-0019 DEC-011): long enough that a reader mid-way through a prior
@@ -317,6 +321,172 @@ async fn sweep_project_exports(
         }
     }
     Ok(swept)
+}
+
+/// What one project's orphan sweep did (SPEC-0034/DR-003, DR-006).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into run_cycle by US-0039"))]
+pub(crate) struct OrphanSweep {
+    /// Objects deleted: content blobs, export zips and temp files.
+    pub(crate) blobs: usize,
+    /// Sum of the listed sizes of those objects.
+    pub(crate) bytes: u64,
+    /// The circuit breaker held back this project's content blobs.
+    pub(crate) breaker_tripped: bool,
+}
+
+/// Deletes the old unreferenced objects of `project_id`'s bucket
+/// (SPEC-0034/DR-003..DR-006, DR-008): content blobs no `blob_refs` row holds,
+/// export zips no `export_links` row holds, and local temp files, each strictly
+/// older than 24 hours. A `git:` key or a key of any other form is never
+/// touched.
+///
+/// The listing is diffed in memory against one bulk read of the referenced
+/// hashes (DEC-001); each candidate is then re checked, age and reference,
+/// right before its delete (DR-005), because a write can land between the
+/// listing and the delete. Too many qualifying content blobs means the
+/// reference read is not trustworthy, so none is deleted that run (DR-006).
+///
+/// A listing or bulk read failure is returned for the caller to log; a backend
+/// that cannot list is skipped silently; a failure on one object is logged
+/// and skips that object only (DR-008).
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into run_cycle by US-0039"))]
+pub(crate) async fn sweep_project_orphans_at(
+    now: f64,
+    stores: &StoreManager,
+    client: &VolumeClient,
+    project_id: &str,
+) -> Result<OrphanSweep> {
+    let mut sweep = OrphanSweep::default();
+    // A client with no relational store behind it has no reference to diff
+    // against, and deleting without one would empty the bucket (DEC-007).
+    let Some(store) = client.trash.as_deref() else { return Ok(sweep) };
+    let listed = match client.blob.list().await {
+        Ok(entries) => entries,
+        Err(e) if e.code == crate::errors::code::NOT_SUPPORTED => return Ok(sweep),
+        Err(e) => return Err(e),
+    };
+    let cutoff = now - ORPHAN_MIN_AGE_SECONDS;
+    let referenced = store.referenced_hashes().await?;
+    let db = crate::storage::open_meta_db(stores.config(), stores.relational(), project_id).await?;
+
+    let content_listed = listed.iter().filter(|e| is_content_key(&e.key)).count();
+    let mut content = Vec::new();
+    let mut others = Vec::new();
+    for entry in listed {
+        if entry.modified >= cutoff {
+            continue;
+        }
+        match orphan_kind(&entry) {
+            Some(OrphanKind::Content) if !referenced.contains(&entry.key) => content.push(entry),
+            // Export rows are few; the re check reads each one, so no bulk read.
+            Some(OrphanKind::Export | OrphanKind::Temp) => others.push(entry),
+            _ => {}
+        }
+    }
+
+    let limit = (content_listed / 10).max(1);
+    if content.len() > limit {
+        tracing::warn!(
+            project = %project_id,
+            qualifying = content.len(),
+            content_blobs = content_listed,
+            "orphan sweep: breaker tripped, no content blob deleted"
+        );
+        sweep.breaker_tripped = true;
+        content.clear();
+    }
+
+    let candidates: Vec<BlobEntry> = content.into_iter().chain(others).collect();
+    if candidates.is_empty() {
+        return Ok(sweep);
+    }
+    for entry in candidates {
+        match still_unreferenced(store, &db, project_id, &entry).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(project = %project_id, key = %entry.key, error = %e, "orphan sweep: reference re check failed");
+                continue;
+            }
+        }
+        // The time is read per object, last thing before the delete: a re put
+        // of existing bytes refreshes it (DR-002), and a second full listing
+        // would miss a refresh landing after that listing but before this
+        // candidate's turn (DR-005). Orchestrator decision: a per object time
+        // read on the blob store rather than a re listing.
+        match client.blob.modified(&entry).await {
+            Ok(m) if m < cutoff => {}
+            Ok(_) => continue,
+            Err(e)
+                if e.code == crate::errors::code::NOT_FOUND
+                    || e.code == crate::errors::code::NOT_SUPPORTED =>
+            {
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(project = %project_id, key = %entry.key, error = %e, "orphan sweep: modified time re read failed");
+                continue;
+            }
+        }
+        if let Err(e) = client.blob.delete_entry(&entry).await {
+            tracing::warn!(project = %project_id, key = %entry.key, error = %e, "orphan sweep: delete failed");
+            continue;
+        }
+        sweep.blobs += 1;
+        sweep.bytes += entry.size;
+    }
+    Ok(sweep)
+}
+
+/// The three object forms the orphan sweep may delete (SPEC-0034/DR-003).
+enum OrphanKind {
+    Content,
+    Export,
+    Temp,
+}
+
+/// `None` for every key the sweep must never touch, `git:` keys included
+/// (DR-004). A temp file only counts on the local store, the one backend that
+/// reports a shard and writes temp names.
+fn orphan_kind(entry: &BlobEntry) -> Option<OrphanKind> {
+    if is_content_key(&entry.key) {
+        return Some(OrphanKind::Content);
+    }
+    if entry.key.strip_prefix("export:").is_some_and(|token| !token.is_empty()) {
+        return Some(OrphanKind::Export);
+    }
+    if entry.shard.is_some() && entry.key.starts_with(".tmp-") {
+        return Some(OrphanKind::Temp);
+    }
+    None
+}
+
+/// Exactly 64 lowercase hex characters: the shape `sha256_hex` produces.
+fn is_content_key(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The DR-005 reference re check, read fresh right before the delete.
+async fn still_unreferenced(
+    store: &crate::storage::meta::RelationalMetaStore,
+    db: &Arc<dyn crate::storage::rel::RelationalDb>,
+    project_id: &str,
+    entry: &BlobEntry,
+) -> Result<bool> {
+    match orphan_kind(entry) {
+        Some(OrphanKind::Content) => Ok(!store.blob_is_referenced(&entry.key).await?),
+        Some(OrphanKind::Export) => {
+            let token = entry.key.strip_prefix("export:").unwrap_or_default();
+            let mut tx = db.begin().await?;
+            let exists =
+                crate::storage::meta::export_link_exists(&mut *tx, project_id, token).await?;
+            tx.commit().await?;
+            Ok(!exists)
+        }
+        Some(OrphanKind::Temp) => Ok(true),
+        None => Ok(false),
+    }
 }
 
 /// Deletes one `export_links` row unconditionally (an empty `now` matches any
@@ -1700,5 +1870,486 @@ mod tests {
             client.blob.exists(new_sha).await.unwrap(),
             "the current set of an unchanged document is never swept"
         );
+    }
+
+    // SPEC-0034 orphan sweep (US-0038). Every key lives in a real local blob
+    // store under a temp dir, behind a real relational meta store; ages are set
+    // with `File::set_modified` against an injected whole second `now`, so a
+    // boundary age reads back exactly.
+
+    const H25: f64 = 25.0 * 3600.0;
+    const H1: f64 = 3600.0;
+    /// Bounds the wait for the sweep's listing, so a sweep that never lists
+    /// fails as an assertion rather than hanging.
+    const PAUSE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    struct OrphanFix {
+        dir: tempfile::TempDir,
+        stores: StoreManager,
+        now: f64,
+    }
+
+    async fn orphan_fixture() -> OrphanFix {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw_config = crate::config::ServerConfig::default();
+        raw_config.infra.meta.dir = dir.path().join("volumes").display().to_string();
+        raw_config.infra.blob.dir = dir.path().join("blobs").display().to_string();
+        let stores = StoreManager::new(
+            Arc::new(raw_config),
+            Arc::new(crate::storage::RelationalRegistry::new()),
+        );
+        OrphanFix { dir, stores, now: now_unix().floor() }
+    }
+
+    impl OrphanFix {
+        async fn client(&self, project: &str) -> Arc<VolumeClient> {
+            self.stores.client(project).await.unwrap()
+        }
+
+        fn bucket_root(&self, project: &str) -> std::path::PathBuf {
+            self.dir.path().join("blobs").join(self.stores.config().volume_bucket(project))
+        }
+
+        /// The one file named `key` anywhere in `project`'s bucket, if any.
+        fn file_of(&self, project: &str, key: &str) -> Option<std::path::PathBuf> {
+            let root = self.bucket_root(project);
+            for shard in std::fs::read_dir(&root).ok()?.flatten() {
+                let candidate = shard.path().join(key);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+
+        fn present(&self, project: &str, key: &str) -> bool {
+            self.file_of(project, key).is_some()
+        }
+
+        fn age(&self, project: &str, key: &str, age_seconds: f64) {
+            let path = self.file_of(project, key).expect("seeded key");
+            let when =
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(self.now - age_seconds);
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+        }
+
+        /// Puts `bytes` under `key` and backdates it by `age_seconds`.
+        async fn put(&self, project: &str, key: &str, bytes: &[u8], age_seconds: f64) {
+            self.client(project).await.blob.put(key, bytes).await.unwrap();
+            self.age(project, key, age_seconds);
+        }
+
+        /// Puts `bytes` under their own hash, returning it.
+        async fn put_content(&self, project: &str, bytes: &[u8], age_seconds: f64) -> String {
+            let sha = VolumeClient::sha256_hex(bytes);
+            self.put(project, &sha, bytes, age_seconds).await;
+            sha
+        }
+
+        /// A temp file written by hand in shard `ab`, where `put` leaves one.
+        fn put_tmp(&self, project: &str, name: &str, bytes: &[u8], age_seconds: f64) {
+            let shard = self.bucket_root(project).join("ab");
+            std::fs::create_dir_all(&shard).unwrap();
+            std::fs::write(shard.join(name), bytes).unwrap();
+            self.age(project, name, age_seconds);
+        }
+
+        async fn add_refs(&self, project: &str, shas: &[String]) {
+            let client = self.client(project).await;
+            client.trash.as_ref().unwrap().add_blob_refs_for_test(shas).await.unwrap();
+        }
+
+        /// `count` referenced content blobs, each `age_seconds` old.
+        async fn put_referenced(
+            &self,
+            project: &str,
+            count: usize,
+            age_seconds: f64,
+        ) -> Vec<String> {
+            let mut shas = Vec::with_capacity(count);
+            for i in 0..count {
+                shas.push(
+                    self.put_content(project, format!("ref-{i}").as_bytes(), age_seconds).await,
+                );
+            }
+            self.add_refs(project, &shas).await;
+            shas
+        }
+
+        async fn add_export_row(&self, project: &str, token: &str) {
+            self.client(project).await;
+            let db = crate::storage::open_meta_db(
+                self.stores.config(),
+                self.stores.relational(),
+                project,
+            )
+            .await
+            .unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let now = chrono::Utc::now();
+            crate::storage::meta::insert_export_link(
+                &mut *tx,
+                token,
+                project,
+                &crate::tools::export::iso(now),
+                &crate::tools::export::iso(now + chrono::Duration::days(7)),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        async fn sweep(&self, project: &str) -> Result<OrphanSweep> {
+            let client = self.client(project).await;
+            sweep_project_orphans_at(self.now, &self.stores, &client, project).await
+        }
+    }
+
+    /// A blob double over the real local store: optionally pauses once right
+    /// after its first listing, and optionally fails its `n`th `delete_entry`.
+    struct SweepBlob {
+        inner: Arc<dyn crate::storage::traits::BlobBackend>,
+        pause_armed: std::sync::atomic::AtomicBool,
+        listed: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+        deletes: std::sync::atomic::AtomicUsize,
+        fail_delete: Option<usize>,
+        delete_pause_armed: std::sync::atomic::AtomicBool,
+        deleting: tokio::sync::Notify,
+        first_deleted: std::sync::Mutex<Option<String>>,
+    }
+
+    impl SweepBlob {
+        fn new(
+            inner: Arc<dyn crate::storage::traits::BlobBackend>,
+            pause: bool,
+            fail_delete: Option<usize>,
+        ) -> Self {
+            Self {
+                inner,
+                pause_armed: std::sync::atomic::AtomicBool::new(pause),
+                listed: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+                deletes: std::sync::atomic::AtomicUsize::new(0),
+                fail_delete,
+                delete_pause_armed: std::sync::atomic::AtomicBool::new(false),
+                deleting: tokio::sync::Notify::new(),
+                first_deleted: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// Also pause once right before the first `delete_entry`, recording
+        /// its key: the window after every listing and before a later
+        /// candidate's delete, whatever number of listings the sweep makes.
+        fn with_delete_pause(self) -> Self {
+            self.delete_pause_armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::traits::BlobBackend for SweepBlob {
+        async fn put(&self, sha256: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(sha256, data).await
+        }
+        async fn get(&self, sha256: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(sha256, offset, length).await
+        }
+        async fn exists(&self, sha256: &str) -> Result<bool> {
+            self.inner.exists(sha256).await
+        }
+        async fn delete(&self, sha256: &str) -> Result<()> {
+            self.inner.delete(sha256).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+        async fn list(&self) -> Result<Vec<crate::storage::traits::BlobEntry>> {
+            let entries = self.inner.list().await;
+            if self.pause_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.listed.notify_one();
+                self.resume.notified().await;
+            }
+            entries
+        }
+        async fn modified(&self, entry: &crate::storage::traits::BlobEntry) -> Result<f64> {
+            self.inner.modified(entry).await
+        }
+        async fn delete_entry(&self, entry: &crate::storage::traits::BlobEntry) -> Result<()> {
+            if self.delete_pause_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                *self.first_deleted.lock().unwrap() = Some(entry.key.clone());
+                self.deleting.notify_one();
+                self.resume.notified().await;
+            }
+            let n = self.deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.fail_delete == Some(n) {
+                return Err(ToolError::internal("injected delete failure"));
+            }
+            self.inner.delete_entry(entry).await
+        }
+    }
+
+    /// A client over `project`'s real stores whose blob backend is `blob`.
+    async fn client_with_blob(f: &OrphanFix, project: &str, blob: Arc<SweepBlob>) -> VolumeClient {
+        let real = f.client(project).await;
+        VolumeClient::new(project, real.meta.clone(), blob)
+            .with_trash_store(real.trash.clone().unwrap())
+    }
+
+    /// SPEC-0034/DT-014: exactly the old orphan, the rowless export zip and
+    /// the old temp file go; every other key stays.
+    #[tokio::test]
+    async fn dt_014_sweep_deletes_exactly_the_qualifying_objects() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 20, H25).await;
+        let a = f.put_content(p, b"referenced A", H25).await;
+        f.add_refs(p, std::slice::from_ref(&a)).await;
+        let o = f.put_content(p, b"orphan O", H25).await;
+        let y = f.put_content(p, b"young Y", H1).await;
+        let git = format!("git:{}", VolumeClient::sha256_hex(b"a git object"));
+        f.put(p, &git, b"a git object", H25).await;
+        f.put(p, "export:t1", b"zip one", H25).await;
+        f.add_export_row(p, "t1").await;
+        f.put(p, "export:t2", b"zip two", H25).await;
+        f.put_tmp(p, ".tmp-x", b"partial", H25);
+        f.put_tmp(p, ".tmp-y", b"partial", H1);
+        f.put(p, "misc:k", b"other", H25).await;
+
+        let swept = f.sweep(p).await.unwrap();
+
+        for gone in [o.as_str(), "export:t2", ".tmp-x"] {
+            assert!(!f.present(p, gone), "{gone} is swept");
+        }
+        for kept in [a.as_str(), y.as_str(), git.as_str(), "export:t1", ".tmp-y", "misc:k"] {
+            assert!(f.present(p, kept), "{kept} is kept");
+        }
+        assert_eq!(swept.blobs, 3);
+        assert!(!swept.breaker_tripped);
+    }
+
+    /// SPEC-0034/DT-015: "older than 24 hours" is strict.
+    #[tokio::test]
+    async fn dt_015_exactly_24_hours_is_kept_one_second_more_is_swept() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 20, H1).await;
+        let at = f.put_content(p, b"exactly a day", DAY).await;
+        let past = f.put_content(p, b"a day and a second", DAY + 1.0).await;
+
+        f.sweep(p).await.unwrap();
+
+        assert!(f.present(p, &at), "86 400 s old is kept");
+        assert!(!f.present(p, &past), "86 401 s old is swept");
+    }
+
+    /// SPEC-0034/DT-016: only 64 lowercase hex characters make a content key.
+    #[tokio::test]
+    async fn dt_016_near_miss_content_keys_are_never_candidates() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 20, H1).await;
+        let sha = VolumeClient::sha256_hex(b"near miss");
+        let upper = sha.to_uppercase();
+        let short = sha[..63].to_string();
+        f.put(p, &upper, b"near miss", H25).await;
+        f.put(p, &short, b"near miss", H25).await;
+        let control = f.put_content(p, b"real orphan", H25).await;
+
+        f.sweep(p).await.unwrap();
+
+        assert!(f.present(p, &upper), "uppercase hex is not a content key");
+        assert!(f.present(p, &short), "63 characters is not a content key");
+        assert!(!f.present(p, &control), "the control orphan is swept");
+    }
+
+    /// SPEC-0034/DT-017: a file written between the listing and the delete
+    /// keeps its bytes.
+    #[tokio::test]
+    async fn dt_017_a_write_during_the_sweep_keeps_its_blob() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 20, H1).await;
+        let bytes = "orphan O, soon written";
+        let o = f.put_content(p, bytes.as_bytes(), H25).await;
+        let real = f.client(p).await;
+        let double = Arc::new(SweepBlob::new(real.blob.clone(), true, None));
+        let client = client_with_blob(&f, p, double.clone()).await;
+
+        let sweep = sweep_project_orphans_at(f.now, &f.stores, &client, p);
+        let writer = async {
+            let listed = tokio::time::timeout(PAUSE_WAIT, double.listed.notified()).await;
+            assert!(listed.is_ok(), "the sweep lists the bucket before deleting");
+            real.write_text_atomic("/doc.txt", bytes).await.unwrap();
+            double.resume.notify_one();
+        };
+        let (swept, ()) = tokio::join!(sweep, writer);
+
+        swept.unwrap();
+        assert!(f.present(p, &o), "the blob the new file references is kept");
+        let read = real.read_text("/doc.txt").await.unwrap();
+        assert_eq!(read, bytes);
+    }
+
+    /// SPEC-0034/DT-017b (DR-005): a re put refreshing an orphan's time after
+    /// every listing, but before that orphan's own delete, keeps it, even with
+    /// no reference added. A fresh time read per candidate is the only check
+    /// that sees it.
+    #[tokio::test]
+    async fn dt_017b_a_time_refresh_just_before_the_delete_keeps_the_blob() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 20, H1).await;
+        let a = f.put_content(p, b"orphan A", H25).await;
+        let b = f.put_content(p, b"orphan B", H25).await;
+        let real = f.client(p).await;
+        let double = Arc::new(SweepBlob::new(real.blob.clone(), false, None).with_delete_pause());
+        let client = client_with_blob(&f, p, double.clone()).await;
+
+        let sweep = sweep_project_orphans_at(f.now, &f.stores, &client, p);
+        let writer = async {
+            let paused = tokio::time::timeout(PAUSE_WAIT, double.deleting.notified()).await;
+            assert!(paused.is_ok(), "the sweep deletes a first orphan");
+            let first = double.first_deleted.lock().unwrap().clone().unwrap();
+            let (other, bytes): (&str, &[u8]) =
+                if first == a { (&b, b"orphan B") } else { (&a, b"orphan A") };
+            real.blob.put(other, bytes).await.unwrap();
+            double.resume.notify_one();
+            (first, other.to_string())
+        };
+        let (swept, (first, refreshed)) = tokio::join!(sweep, writer);
+
+        swept.unwrap();
+        assert!(!f.present(p, &first), "the untouched orphan is swept");
+        assert!(f.present(p, &refreshed), "the orphan refreshed before its delete is kept");
+    }
+
+    /// SPEC-0034/DT-018: a reference added between the listing and the delete
+    /// keeps the blob, even with no time refresh.
+    #[tokio::test]
+    async fn dt_018_a_reference_added_during_the_sweep_keeps_the_blob() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 20, H1).await;
+        let o = f.put_content(p, b"orphan O", H25).await;
+        let control = f.put_content(p, b"still an orphan", H25).await;
+        let real = f.client(p).await;
+        let double = Arc::new(SweepBlob::new(real.blob.clone(), true, None));
+        let client = client_with_blob(&f, p, double.clone()).await;
+
+        let sweep = sweep_project_orphans_at(f.now, &f.stores, &client, p);
+        let referrer = async {
+            let listed = tokio::time::timeout(PAUSE_WAIT, double.listed.notified()).await;
+            assert!(listed.is_ok(), "the sweep lists the bucket before deleting");
+            f.add_refs(p, std::slice::from_ref(&o)).await;
+            double.resume.notify_one();
+        };
+        let (swept, ()) = tokio::join!(sweep, referrer);
+
+        swept.unwrap();
+        assert!(f.present(p, &o), "the newly referenced blob is kept");
+        assert!(!f.present(p, &control), "the control orphan is swept");
+    }
+
+    /// SPEC-0034/DT-019: at the breaker limit, everything qualifying goes.
+    #[tokio::test]
+    async fn dt_019_orphans_at_the_limit_are_swept() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 18, H1).await;
+        let o1 = f.put_content(p, b"orphan 1", H25).await;
+        let o2 = f.put_content(p, b"orphan 2", H25).await;
+
+        let swept = f.sweep(p).await.unwrap();
+
+        assert!(!f.present(p, &o1) && !f.present(p, &o2), "both orphans are swept");
+        assert!(!swept.breaker_tripped, "2 of 20 is at the limit, not over it");
+        assert_eq!(swept.blobs, 2);
+    }
+
+    /// SPEC-0034/DT-020: over the limit, no content blob goes, the export zip
+    /// and the temp file still do.
+    #[tokio::test]
+    async fn dt_020_over_the_limit_trips_the_breaker_for_content_only() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 17, H1).await;
+        let mut orphans = Vec::new();
+        for i in 0..3 {
+            orphans.push(f.put_content(p, format!("orphan {i}").as_bytes(), H25).await);
+        }
+        f.put(p, "export:t2", b"zip two", H25).await;
+        f.put_tmp(p, ".tmp-x", b"partial", H25);
+
+        let swept = f.sweep(p).await.unwrap();
+
+        assert!(swept.breaker_tripped, "3 of 20 is over the limit of 2");
+        for o in &orphans {
+            assert!(f.present(p, o), "{o} is held back by the breaker");
+        }
+        assert!(!f.present(p, "export:t2"), "the export zip is outside the breaker");
+        assert!(!f.present(p, ".tmp-x"), "the temp file is outside the breaker");
+        assert_eq!(swept.blobs, 2);
+    }
+
+    /// SPEC-0034/DT-021: the limit never drops below one.
+    #[tokio::test]
+    async fn dt_021_the_limit_is_at_least_one() {
+        let f = orphan_fixture().await;
+        let lone = f.put_content("p1", b"the only blob", H25).await;
+        let pair =
+            [f.put_content("p2", b"first", H25).await, f.put_content("p2", b"second", H25).await];
+
+        let one = f.sweep("p1").await.unwrap();
+        let two = f.sweep("p2").await.unwrap();
+
+        assert!(!f.present("p1", &lone), "a lone orphan is within the limit of 1");
+        assert!(!one.breaker_tripped);
+        assert!(two.breaker_tripped, "2 orphans of 2 blobs exceed the limit of 1");
+        for o in &pair {
+            assert!(f.present("p2", o), "{o} is held back");
+        }
+    }
+
+    /// SPEC-0034/DT-024: a failing delete skips that object only.
+    #[tokio::test]
+    async fn dt_024_a_failed_delete_skips_only_that_object() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.put_referenced(p, 27, H1).await;
+        let mut orphans = Vec::new();
+        for i in 0..3 {
+            orphans.push(f.put_content(p, format!("orphan {i}").as_bytes(), H25).await);
+        }
+        let real = f.client(p).await;
+        let double = Arc::new(SweepBlob::new(real.blob.clone(), false, Some(2)));
+        let client = client_with_blob(&f, p, double).await;
+
+        let swept = sweep_project_orphans_at(f.now, &f.stores, &client, p).await.unwrap();
+
+        assert_eq!(swept.blobs, 2);
+        assert!(!swept.breaker_tripped, "3 of 30 is at the limit");
+        assert_eq!(orphans.iter().filter(|o| f.present(p, o)).count(), 1, "one orphan remains");
+    }
+
+    /// SPEC-0034/DT-027: the diff scales; exactly the orphans go.
+    #[tokio::test]
+    async fn dt_027_ten_thousand_referenced_blobs_and_five_orphans() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        let referenced = f.put_referenced(p, 10_000, H25).await;
+        let mut orphans = Vec::new();
+        for i in 0..5 {
+            orphans.push(f.put_content(p, format!("orphan {i}").as_bytes(), H25).await);
+        }
+
+        let swept = f.sweep(p).await.unwrap();
+
+        assert_eq!(swept.blobs, 5);
+        assert!(orphans.iter().all(|o| !f.present(p, o)), "every orphan is swept");
+        assert!(referenced.iter().all(|r| f.present(p, r)), "every referenced blob is kept");
     }
 }

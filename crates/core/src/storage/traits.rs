@@ -263,6 +263,16 @@ pub trait BlobBackend: Send + Sync {
     async fn delete_entry(&self, entry: &BlobEntry) -> Result<()> {
         self.delete(&entry.key).await
     }
+
+    /// The listed entry's current modified time, unix seconds. The orphan
+    /// sweep reads it right before each delete (SPEC-0034/DR-005): a second
+    /// full listing would miss a refresh landing after it. `ERR_NOT_FOUND`
+    /// when the object is gone; a backend without a per object stat returns
+    /// `ERR_NOT_SUPPORTED` and the sweep then deletes nothing.
+    async fn modified(&self, entry: &BlobEntry) -> Result<f64> {
+        let _ = entry;
+        Err(ToolError::not_supported("this blob backend cannot read an object's modified time"))
+    }
 }
 
 /// ACL registry of projects and their members.

@@ -17,7 +17,7 @@ use crate::storage::traits::{
 };
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A project id is at most 32 characters (see `admin::validate_project_id`), so
@@ -694,6 +694,20 @@ impl RelationalMetaStore {
     /// Whether anything in this volume, a file node or an artifact set,
     /// holds a reference to `sha`. `tx_decref` drops the row at zero, so the
     /// row's presence is the answer (SPEC-0033 DEC-002).
+    /// Every hash this volume holds a reference to, in one query, so the
+    /// orphan sweep diffs a whole listing in memory instead of querying once
+    /// per listed object (SPEC-0034 DEC-001).
+    pub(crate) async fn referenced_hashes(&self) -> Result<HashSet<String>> {
+        let rows = self
+            .db
+            .query(
+                &Query::new("SELECT sha256 FROM blob_refs WHERE volume_id=?1")
+                    .bind(&self.volume_id),
+            )
+            .await?;
+        rows.iter().map(|r| r.text(0)).collect()
+    }
+
     pub(crate) async fn blob_is_referenced(&self, sha: &str) -> Result<bool> {
         let row = self
             .db
@@ -1564,6 +1578,24 @@ pub(crate) async fn insert_export_link(
     Ok(())
 }
 
+/// Whether `volume_id` still holds an `export_links` row for `token`, expired
+/// or not, so the orphan sweep never deletes a zip a row still points at
+/// (SPEC-0034/DR-004, DR-005); expiry is the export sweep's business.
+pub(crate) async fn export_link_exists(
+    tx: &mut dyn RelationalTx,
+    volume_id: &str,
+    token: &str,
+) -> Result<bool> {
+    let row = tx
+        .query_opt(
+            &Query::new("SELECT token FROM export_links WHERE volume_id=?1 AND token=?2")
+                .bind(volume_id)
+                .bind(token),
+        )
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Atomically delete and report whether `token` was a live, unexpired row
 /// (FR-NEW-009/FR-NEW-010/FR-NEW-011/FR-NEW-013's shared storage primitive).
 ///
@@ -2077,6 +2109,18 @@ impl RelationalMetaStore {
         let rows = list_trash_entries(&mut *tx, &self.volume_id, "", i64::MAX, 0).await?;
         tx.commit().await?;
         Ok(rows.len())
+    }
+
+    /// Give each of `shas` one `blob_refs` row in this volume, in one
+    /// transaction, so a SPEC-0034 sweep test can seed thousands of referenced
+    /// blobs without writing a file node per blob.
+    pub(crate) async fn add_blob_refs_for_test(&self, shas: &[String]) -> Result<()> {
+        let dialect = self.db.dialect();
+        let mut tx = self.db.begin().await?;
+        for sha in shas {
+            tx_incref(&mut *tx, dialect, &self.volume_id, Some(sha), 1).await?;
+        }
+        tx.commit().await
     }
 
     /// The `blob_refs` count of `sha` in this volume, `None` when it has no

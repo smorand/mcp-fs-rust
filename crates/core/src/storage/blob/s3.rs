@@ -198,6 +198,23 @@ impl BlobBackend for S3BlobStore {
         }
         Ok(entries)
     }
+
+    async fn modified(&self, entry: &BlobEntry) -> Result<f64> {
+        let key = &entry.key;
+        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
+            // This is the last read before an irreversible delete (SPEC-0034/DR-005):
+            // a missing time must never default to the epoch, which would make a
+            // just refreshed object look infinitely old. The sweep skips on error.
+            Ok(out) => out.last_modified().map(|d| d.as_secs_f64()).ok_or_else(|| {
+                ToolError::not_supported(format!("s3 head '{key}': no last modified time"))
+            }),
+            // Same raw status classification as `exists`: a HEAD 404 has no body.
+            Err(e) if e.raw_response().map(|r| r.status().as_u16()) == Some(404) => {
+                Err(ToolError::not_found(format!("blob '{key}' not found")))
+            }
+            Err(e) => Err(ToolError::internal(format!("s3 head '{key}': {e}"))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +284,25 @@ mod tests {
             assert_eq!(e.size, e.key.len() as u64);
         }
 
+        s.remove_bucket().await.unwrap();
+    }
+
+    /// SPEC-0034/DR-005: `modified` is the object's `last_modified`, and a
+    /// deleted object is not found.
+    #[tokio::test]
+    #[ignore = "requires a live MinIO/S3 on 127.0.0.1:9000 and MCPFS_MINIO_SECRET_KEY"]
+    async fn integration_modified_reads_last_modified() {
+        let bucket = format!("mcpfs-rust-it-{}", uuid::Uuid::new_v4().simple());
+        let s = S3BlobStore::new(&cfg(), bucket).unwrap();
+        s.ensure_bucket().await.unwrap();
+        s.put("stat-me", b"x").await.unwrap();
+        let entry = s.list().await.unwrap().into_iter().find(|e| e.key == "stat-me").unwrap();
+
+        let read = s.modified(&entry).await.unwrap();
+        assert!((read - entry.modified).abs() < 1.0, "head {read}, list {}", entry.modified);
+
+        s.delete("stat-me").await.unwrap();
+        assert_eq!(s.modified(&entry).await.unwrap_err().code, crate::errors::code::NOT_FOUND);
         s.remove_bucket().await.unwrap();
     }
 }
