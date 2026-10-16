@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 4 modules (storage traits, local and S3 blob backends, storage meta, purge), a deleting background job, 10 requirements, no public contract (owner chose option (i): no setting, no command)
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-15
 > Behavior change: none for users and API consumers; the purge cycle log gains three counters
 > From backlog: BL-0056
@@ -188,3 +188,42 @@ Empty. `put_is_idempotent` (`local.rs` tests) asserts bytes, not time, so DR-002
 **Amendments applied:** round 1: F-001 caller count recounted to 14 (Section 2, DEC-005); F-002 test citations corrected (`local.rs:124-227`, `s3.rs:194-212`); self consistency check 1: DBT-001 referenced from 8.3. Before the gate, the author added `delete_entry` and `BlobEntry.shard` (DR-001) after finding that a temp file's name does not map to its directory (`local.rs:41-48`).
 
 **Gate process:** depth L. Round 1: self consistency reviewer (fresh subagent) FAIL on check 1 only (DBT-001 not referenced by the tests section), auditor (fresh subagent, path and contract only) 2 F (perimeter count, citations). Round 2: a new auditor, path and contract only, every citation reopened and every count recounted: no finding. Tests designed by an independent test designer subagent before owner approval.
+
+## Design additions (2026-10-16)
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/storage/traits.rs` | `list`, `delete_entry`, `BlobEntry` | DR-001 | US-0037 |
+| `crates/core/src/storage/blob/local.rs` | `list`, `delete_entry`, `put` refresh | DR-001, DR-002 | US-0037 |
+| `crates/core/src/storage/blob/s3.rs` | `list` | DR-001 | US-0037 |
+| `crates/core/src/core/fs_ops.rs` (tests) | DT-011 | DR-001 | US-0037 |
+| `crates/core/src/storage/meta.rs` | `referenced_hashes`, `export_link_exists` | DR-003, DR-005 | US-0038 |
+| `crates/core/src/purge.rs` | `sweep_project_orphans_at`, `OrphanSweep` | DR-003..DR-006, DR-008 | US-0038 |
+| `crates/core/src/storage/mod.rs` | schedule in `StoreManager` | DR-007 | US-0039 |
+| `crates/core/src/purge.rs` | `run_cycle` wiring, `run_cycle_at`, `CycleSummary` counters | DR-007..DR-009 | US-0039 |
+| `crates/core/src/app.rs` | cycle log counters | DR-009 | US-0039 |
+| `.agent_docs/architecture.md` | the sweep next to GC at refcount 0 | DR-010 (docs) | US-0039 |
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-010, DT-013 | unit | direct call | `storage/blob/local.rs` tests | US-0037 |
+| DT-011 | unit | direct call on a test double | `core/fs_ops.rs` tests | US-0037 |
+| DT-012 | integration (`#[ignore]`, MinIO) | direct call | `storage/blob/s3.rs` tests | US-0037 |
+| DT-014..DT-021, DT-024, DT-027 | integration | `sweep_project_orphans_at` over a real local store and relational store | `purge.rs` tests | US-0038 |
+| DT-022, DT-023, DT-025, DT-026 | integration | `run_cycle_at` | `purge.rs` tests | US-0039 |
+| DT-028 | non regression | `make check` with DB DSNs | workspace | US-0039 |
+
+- **DEC-009:** Three stories along Section 9, the middle one at `min_tier: 1`. **Obliged by:** SPEC-0034/DR-001..DR-010. **Rationale:** each step leaves main green and is independently testable (the listing before any caller, the sweep tested directly before wiring); the sweep combines a concurrency harness, a breaker and a re check whose halves are not separately assertable, above the tier 2 decision budget. **Alternatives considered:** one story (above every tier budget: 10 requirements, 19 tests, 8 files); splitting the sweep into breaker and re check stories (not separately assertable). **Source:** design. **Evidence:** Section 9.
+- **DEC-010:** A test only `run_cycle_at(now, ...)` beside `run_cycle`, which passes the current time. **Obliged by:** SPEC-0034/DR-007 (DT-022 needs an injected clock). **Rationale:** the `_at` pattern already exists (`purge.rs:268`) and the 14 callers keep `run_cycle`. **Alternatives considered:** a clock trait object on `StoreManager` (more surface for one test). **Source:** existing code `purge.rs:268`. **Evidence:** cited.
+
+### Stories
+
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0037 | The blob store lists its objects and refreshes re stored blobs | P1 | DR-001, DR-002, DR-010 | main | 2 | no |
+| US-0038 | Sweep the unreferenced blobs of one project | P1 | DR-003..DR-006, DR-008, DR-010 | US-0037 | 1 | no |
+| US-0039 | The purge cycle runs the orphan sweep once a day | P1 | DR-007..DR-010 | US-0038 | 2 | yes |
