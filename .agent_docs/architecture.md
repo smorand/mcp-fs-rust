@@ -73,6 +73,19 @@ Rules that the on disk contract depends on (`storage/meta.rs`,
 * **Git objects share the bucket** under the key `git:{sha}`, holding the
   canonical `{type} {len}\0{payload}` bytes. A sha256 is plain hex, so the prefix
   makes a collision impossible. See `.agent_docs/git.md`.
+* **Orphan sweep, once a day per project (SPEC-0034, 2026-10-16).** A crash or
+  database error between a blob's write and its metadata transaction can leave
+  bytes nothing references. The purge cycle lists each project's bucket and
+  deletes, strictly older than 24 hours, a content blob with no `blob_refs`
+  row, an `export:{token}` zip with no `export_links` row, and a local
+  `.tmp-*` leftover; `git:` keys are excluded on purpose (git's own
+  reachability rules apply). Each candidate is re-checked, age and reference,
+  right before its delete, since a write can land between the listing and the
+  delete. A circuit breaker holds back every content blob of a project (export
+  zips and temp files are unaffected) when the qualifying count exceeds
+  max(1, floor(10% of that project's listed content blobs)), counted in
+  `CycleSummary::orphan_breakers_tripped`. The schedule (last sweep per
+  project) lives in memory on `StoreManager`, so it resets with the process.
 
 ## Project usage (SPEC-0020, 2026-10-12)
 

@@ -223,6 +223,9 @@ fn spawn_purge_loop(
                         Ok(summary) => tracing::info!(
                             files_purged = summary.files_purged,
                             projects_soft_deleted = summary.projects_soft_deleted,
+                            orphan_blobs_swept = summary.orphan_blobs_swept,
+                            orphan_bytes_swept = summary.orphan_bytes_swept,
+                            orphan_breakers_tripped = summary.orphan_breakers_tripped,
                             "purge loop: cycle complete"
                         ),
                         Err(e) => tracing::warn!(error = %e, "purge loop: cycle failed"),

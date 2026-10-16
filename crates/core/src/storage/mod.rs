@@ -421,11 +421,43 @@ pub struct StoreManager {
     /// private pool, and the process would then open `max_connections` once per
     /// owner while the operator configured that number once.
     relational: Arc<RelationalRegistry>,
+    /// Last orphan sweep (SPEC-0034/DR-007) of each project, by project id, in
+    /// unix seconds; a process that has not swept a project yet has no entry.
+    /// In memory only, per process (a fresh manager has no memory of a prior
+    /// one's sweeps, DEC-005): a std `Mutex` is enough since every access is a
+    /// plain map read or write, never held across an `.await`.
+    orphan_sweeps: std::sync::Mutex<HashMap<String, f64>>,
 }
 
 impl StoreManager {
     pub fn new(config: Arc<ServerConfig>, relational: Arc<RelationalRegistry>) -> Self {
-        Self { config, clients: Mutex::new(HashMap::new()), relational }
+        Self {
+            config,
+            clients: Mutex::new(HashMap::new()),
+            relational,
+            orphan_sweeps: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// When `project_id`'s orphan sweep last ran (succeeded or failed) in this
+    /// process, or `None` if it has not run yet (SPEC-0034/DR-007).
+    pub(crate) fn last_orphan_sweep(&self, project_id: &str) -> Option<f64> {
+        self.orphan_sweeps.lock().unwrap().get(project_id).copied()
+    }
+
+    /// Records that `project_id`'s orphan sweep ran at `now`. Called whether
+    /// the sweep succeeded or failed, so a failing project is retried after
+    /// 24 hours rather than every cycle (SPEC-0034/DR-007).
+    pub(crate) fn record_orphan_sweep(&self, project_id: &str, now: f64) {
+        self.orphan_sweeps.lock().unwrap().insert(project_id.to_string(), now);
+    }
+
+    /// Inserts a pre-built client into the cache, bypassing `client`'s normal
+    /// construction, so a test can swap in a double over a real project's
+    /// stores (e.g. a `BlobBackend` whose `list` fails).
+    #[cfg(test)]
+    pub(crate) async fn insert_client_for_test(&self, project_id: &str, client: Arc<VolumeClient>) {
+        self.clients.lock().await.insert(project_id.to_string(), client);
     }
 
     /// The shared pool cache, so a caller that builds another relational consumer

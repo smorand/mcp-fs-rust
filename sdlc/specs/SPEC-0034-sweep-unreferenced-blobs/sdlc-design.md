@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 4 modules (storage traits, local and S3 blob backends, storage meta, purge), a deleting background job, 10 requirements, no public contract (owner chose option (i): no setting, no command)
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-15
 > Behavior change: none for users and API consumers; the purge cycle log gains three counters
 > From backlog: BL-0056

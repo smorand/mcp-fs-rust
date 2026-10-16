@@ -204,6 +204,14 @@ pub struct CycleSummary {
     pub projects_soft_deleted: usize,
     pub exports_swept: usize,
     pub artifact_sets_swept: usize,
+    /// Orphan content blobs, export zips and temp files deleted by the sweep
+    /// (SPEC-0034/DR-009), summed over every project swept this cycle.
+    pub orphan_blobs_swept: usize,
+    /// Sum of the listed sizes of `orphan_blobs_swept` (SPEC-0034/DR-009).
+    pub orphan_bytes_swept: u64,
+    /// Number of projects whose orphan sweep tripped the circuit breaker
+    /// this cycle (SPEC-0034/DR-006, DR-009).
+    pub orphan_breakers_tripped: usize,
 }
 
 /// Runs the FR-NEW-007 file sweep then the FR-NEW-008 project sweep for every
@@ -212,6 +220,19 @@ pub struct CycleSummary {
 /// rest of the cycle, the same per-item isolation `sweep_project_files` already
 /// applies within one project (DEC-013).
 pub async fn run_cycle(
+    stores: &StoreManager,
+    admin: &dyn AdminBackend,
+    safety: &SafetyManager,
+    search: Option<&Arc<dyn SearchBackend>>,
+) -> Result<CycleSummary> {
+    run_cycle_at(now_unix(), stores, admin, safety, search).await
+}
+
+/// Same as [`run_cycle`], but with an explicit `now`, so the orphan sweep's
+/// once-a-day gate (SPEC-0034/DR-007) can be driven by a test clock instead
+/// of the wall clock (DEC-010).
+async fn run_cycle_at(
+    now: f64,
     stores: &StoreManager,
     admin: &dyn AdminBackend,
     safety: &SafetyManager,
@@ -254,6 +275,27 @@ pub async fn run_cycle(
             Err(e) => {
                 tracing::warn!(project = %project.id, error = %e, "purge cycle: artifact sweep failed");
             }
+        }
+        // At most once every 24 hours per project per process (SPEC-0034/DR-007);
+        // a process that has not swept this project yet sweeps it now.
+        let due =
+            stores.last_orphan_sweep(&project.id).is_none_or(|last| now - last >= SECONDS_PER_DAY);
+        if due {
+            match sweep_project_orphans_at(now, stores, &client, &project.id).await {
+                Ok(sweep) => {
+                    summary.orphan_blobs_swept += sweep.blobs;
+                    summary.orphan_bytes_swept += sweep.bytes;
+                    if sweep.breaker_tripped {
+                        summary.orphan_breakers_tripped += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(project = %project.id, error = %e, "purge cycle: orphan sweep failed");
+                }
+            }
+            // Recorded whether the sweep succeeded or failed, so a failing
+            // project is retried after 24 hours, not every cycle (DR-007).
+            stores.record_orphan_sweep(&project.id, now);
         }
     }
     Ok(summary)
@@ -325,7 +367,6 @@ async fn sweep_project_exports(
 
 /// What one project's orphan sweep did (SPEC-0034/DR-003, DR-006).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into run_cycle by US-0039"))]
 pub(crate) struct OrphanSweep {
     /// Objects deleted: content blobs, export zips and temp files.
     pub(crate) blobs: usize,
@@ -350,7 +391,6 @@ pub(crate) struct OrphanSweep {
 /// A listing or bulk read failure is returned for the caller to log; a backend
 /// that cannot list is skipped silently; a failure on one object is logged
 /// and skips that object only (DR-008).
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into run_cycle by US-0039"))]
 pub(crate) async fn sweep_project_orphans_at(
     now: f64,
     stores: &StoreManager,
@@ -1886,6 +1926,8 @@ mod tests {
     struct OrphanFix {
         dir: tempfile::TempDir,
         stores: StoreManager,
+        admin: RelationalAdminStore,
+        safety: SafetyManager,
         now: f64,
     }
 
@@ -1898,12 +1940,21 @@ mod tests {
             Arc::new(raw_config),
             Arc::new(crate::storage::RelationalRegistry::new()),
         );
-        OrphanFix { dir, stores, now: now_unix().floor() }
+        let admin = RelationalAdminStore::in_memory().await.unwrap();
+        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        safety.attach_no_limits();
+        OrphanFix { dir, stores, admin, safety, now: now_unix().floor() }
     }
 
     impl OrphanFix {
         async fn client(&self, project: &str) -> Arc<VolumeClient> {
             self.stores.client(project).await.unwrap()
+        }
+
+        /// Runs a full purge cycle at `now` over this fixture's real admin
+        /// and safety stores (SPEC-0034 DT-022, DT-023, DT-025, DT-026).
+        async fn run_cycle_at(&self, now: f64) -> Result<CycleSummary> {
+            run_cycle_at(now, &self.stores, &self.admin, &self.safety, None).await
         }
 
         fn bucket_root(&self, project: &str) -> std::path::PathBuf {
@@ -2351,5 +2402,154 @@ mod tests {
         assert_eq!(swept.blobs, 5);
         assert!(orphans.iter().all(|o| !f.present(p, o)), "every orphan is swept");
         assert!(referenced.iter().all(|r| f.present(p, r)), "every referenced blob is kept");
+    }
+
+    // ── orphan sweep wired into the purge cycle (US-0039) ──────────────────────
+
+    /// A blob double whose `list` always fails; everything else forwards to
+    /// `inner` (SPEC-0034/DT-023).
+    struct FailListBlob {
+        inner: Arc<dyn crate::storage::traits::BlobBackend>,
+    }
+
+    impl FailListBlob {
+        fn new(inner: Arc<dyn crate::storage::traits::BlobBackend>) -> Self {
+            Self { inner }
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::traits::BlobBackend for FailListBlob {
+        async fn put(&self, sha256: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(sha256, data).await
+        }
+        async fn get(&self, sha256: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(sha256, offset, length).await
+        }
+        async fn exists(&self, sha256: &str) -> Result<bool> {
+            self.inner.exists(sha256).await
+        }
+        async fn delete(&self, sha256: &str) -> Result<()> {
+            self.inner.delete(sha256).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+        async fn list(&self) -> Result<Vec<crate::storage::traits::BlobEntry>> {
+            Err(ToolError::internal("injected list failure"))
+        }
+        async fn modified(&self, entry: &crate::storage::traits::BlobEntry) -> Result<f64> {
+            self.inner.modified(entry).await
+        }
+        async fn delete_entry(&self, entry: &crate::storage::traits::BlobEntry) -> Result<()> {
+            self.inner.delete_entry(entry).await
+        }
+    }
+
+    /// SPEC-0034/DT-022: the sweep runs on the first cycle, is gated for 24
+    /// hours, runs again once past that window, and a fresh `StoreManager`
+    /// over the same store has no memory of the schedule.
+    #[tokio::test]
+    async fn dt_022_schedule_gates_the_sweep_once_a_day_per_project() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.admin.create_project(p, "owner@t.c").await.unwrap();
+        f.put_referenced(p, 20, H1).await;
+
+        let o1 = f.put_content(p, b"orphan one", H25).await;
+        let s1 = f.run_cycle_at(f.now).await.unwrap();
+        assert_eq!(s1.orphan_blobs_swept, 1, "nothing scheduled yet, swept on the first cycle");
+        assert!(!f.present(p, &o1));
+
+        let o2 = f.put_content(p, b"orphan two", H25).await;
+        let s2 = f.run_cycle_at(f.now + 23.0 * 3600.0).await.unwrap();
+        assert_eq!(s2.orphan_blobs_swept, 0, "inside 24h of the last sweep, skipped");
+        assert!(f.present(p, &o2), "kept: the sweep was skipped, not run and empty-handed");
+
+        let s3 = f.run_cycle_at(f.now + 24.0 * 3600.0 + 60.0).await.unwrap();
+        assert_eq!(s3.orphan_blobs_swept, 1, "past 24h since the last sweep, runs again");
+        assert!(!f.present(p, &o2));
+
+        let o3 = f.put_content(p, b"orphan three", H25).await;
+        let fresh = StoreManager::new(f.stores.config().clone(), f.stores.relational().clone());
+        let s4 = run_cycle_at(f.now + 24.0 * 3600.0 + 61.0, &fresh, &f.admin, &f.safety, None)
+            .await
+            .unwrap();
+        assert_eq!(s4.orphan_blobs_swept, 1, "a fresh process sweeps on its first cycle");
+        assert!(!f.present(p, &o3));
+    }
+
+    /// SPEC-0034/DT-023: a project whose backend fails to list is skipped and
+    /// logged, but the cycle still succeeds and still sweeps every other
+    /// project (its orphan sweep and its existing file sweep both).
+    #[tokio::test]
+    async fn dt_023_a_failing_project_is_isolated_from_the_rest_of_the_cycle() {
+        let f = orphan_fixture().await;
+        f.admin.create_project("p1", "owner@t.c").await.unwrap();
+        f.admin.create_project("p2", "owner@t.c").await.unwrap();
+        f.admin.seed_purge_config_for_test("p1", true, true, None, None).await.unwrap();
+        f.admin.seed_purge_config_for_test("p2", true, true, Some(7), None).await.unwrap();
+
+        let real1 = f.client("p1").await;
+        let failing: Arc<dyn crate::storage::traits::BlobBackend> =
+            Arc::new(FailListBlob::new(real1.blob.clone()));
+        let client1 = VolumeClient::new("p1", real1.meta.clone(), failing)
+            .with_trash_store(real1.trash.clone().unwrap());
+        f.stores.insert_client_for_test("p1", Arc::new(client1)).await;
+
+        let o = f.put_content("p2", b"orphan", H25).await;
+        let c2 = f.client("p2").await;
+        c2.write_text_atomic("/old.txt", "data").await.unwrap();
+        c2.trash
+            .as_ref()
+            .unwrap()
+            .set_atime_for_test("/old.txt", now_unix() - 8.0 * DAY)
+            .await
+            .unwrap();
+
+        let result = f.run_cycle_at(f.now).await;
+        assert!(result.is_ok(), "{result:?}");
+        let summary = result.unwrap();
+        assert_eq!(summary.files_purged, 1, "p2's stale file purged despite p1's failure");
+        assert_eq!(summary.orphan_blobs_swept, 1, "p2's orphan swept despite p1's listing failure");
+        assert!(!f.present("p2", &o));
+    }
+
+    /// SPEC-0034/DT-025: `CycleSummary` sums the orphan sweep's objects and
+    /// bytes across the cycle (the DT-014 setup, trimmed to the three
+    /// deleted keys with sizes that add to a distinctive total).
+    #[tokio::test]
+    async fn dt_025_cycle_summary_counts_blobs_and_bytes_swept() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.admin.create_project(p, "owner@t.c").await.unwrap();
+        f.put_referenced(p, 20, H25).await;
+        f.put_content(p, b"orphan1", H25).await; // O: 7 bytes
+        f.put(p, "export:t2", b"elevenbytes", H25).await; // 11 bytes, no row
+        f.put_tmp(p, ".tmp-x", b"fiveb", H25); // 5 bytes
+
+        let summary = f.run_cycle_at(f.now).await.unwrap();
+
+        assert_eq!(summary.orphan_blobs_swept, 3);
+        assert_eq!(summary.orphan_bytes_swept, 23);
+    }
+
+    /// SPEC-0034/DT-026: an empty bucket is a zero-count no-op, cycle `Ok`.
+    #[tokio::test]
+    async fn dt_026_an_empty_bucket_is_a_zero_count_no_op() {
+        let f = orphan_fixture().await;
+        let p = "proj";
+        f.admin.create_project(p, "owner@t.c").await.unwrap();
+        f.client(p).await;
+
+        let result = f.run_cycle_at(f.now).await;
+        assert!(result.is_ok(), "{result:?}");
+        let summary = result.unwrap();
+        assert_eq!(summary.orphan_blobs_swept, 0);
+        assert_eq!(summary.orphan_bytes_swept, 0);
+        assert_eq!(summary.orphan_breakers_tripped, 0);
     }
 }

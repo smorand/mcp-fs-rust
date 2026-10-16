@@ -38,4 +38,4 @@
 | US-0036 | SPEC-0033 | A refused artifact commit releases its blobs | main | 1 | landed | story/US-0036-refused-artifact-commit-releases-blobs | main |
 | US-0037 | SPEC-0034 | The blob store lists its objects and refreshes re stored blobs | main | 2 | landed | story/US-0037-blob-store-lists-and-refreshes | main |
 | US-0038 | SPEC-0034 | Sweep the unreferenced blobs of one project | US-0037 | 1 | landed | story/US-0038-orphan-sweep-for-one-project | story/US-0037-blob-store-lists-and-refreshes |
-| US-0039 | SPEC-0034 | The purge cycle runs the orphan sweep once a day | US-0038 | 2 | todo | | |
+| US-0039 | SPEC-0034 | The purge cycle runs the orphan sweep once a day | US-0038 | 2 | landed | story/US-0039-purge-cycle-runs-orphan-sweep-daily | story/US-0038-orphan-sweep-for-one-project |
