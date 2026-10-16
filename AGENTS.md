@@ -69,8 +69,12 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `cli.rs` : clap verbs (serve/keys/token/migrate/purge/version), config path resolution.
 - `purge.rs` : the auto-purge engine — `sweep_project_files`/`sweep_project`/`sweep_grace_period`,
   each driven by `atime`/`created_at`/`deleted_at` against the per-project `PurgeConfig` and the
-  global `project_purge_grace_days`; `run_cycle` is the one entry point both the background loop
-  (`app.rs`) and the CLI `purge` verb call, so neither reimplements the sweep (SPEC-0014). Also
+  global `project_purge_grace_days`; `run_cycle` is the background loop's entry point (`app.rs`);
+  the CLI `purge` verb calls the same sweep functions directly (`--project`: files then project;
+  no flag: grace period) and never `run_cycle` (SPEC-0014). Once a day per project `run_cycle`
+  also runs `sweep_project_orphans_at`: blobs no reference holds (content without `blob_refs`,
+  `export:` without `export_links`, local `.tmp-*`), older than 24 h, re checked just before each
+  delete, behind a 10% breaker; `git:` keys are never touched (SPEC-0034). Also
   writes/reconciles `trash_entries` rows as files move through soft-delete, backfill and permanent
   removal, the same bookkeeping `tools/trash.rs` reads (SPEC-0011).
 - `app.rs` : axum Router assembly, shared state, the MCP route (an `rmcp` `StreamableHttpService`

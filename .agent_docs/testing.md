@@ -186,8 +186,8 @@ The other `docs::service` tests need nothing: the cli ones build a three line
 
 ### S3
 
-`storage::blob::s3::tests::integration_put_get_range_delete`
-needs a live S3 compatible service, because faking S3 would test the fake and
+`storage::blob::s3::tests::integration_put_get_range_delete`, `integration_list_follows_pagination`
+and `integration_modified_reads_last_modified` (SPEC-0034) need a live S3 compatible service, because faking S3 would test the fake and
 not the SDK wiring (path style addressing, range requests, bucket lifecycle).
 
 Requirements: a server on `http://127.0.0.1:9000` with access key `admin` (both
@@ -199,8 +199,22 @@ docker run -d -p 9000:9000 -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=secre
   quay.io/minio/minio server /data
 
 MCPFS_MINIO_SECRET_KEY=secret \
-  cargo test -p mcp-fs --lib storage::blob::s3 -- --ignored
+  cargo test -p mcp-fs-core --lib storage::blob::s3 -- --ignored
 ```
+
+(2026-10-16) Two traps. The Homebrew `minio` is MinIO AIStor: without a license it starts
+but denies every S3 operation (`No valid license found ... All S3 operations are denied`), which
+the SDK reports only as `service error`; recent releases also require a root password of at least
+8 characters. When no MinIO image can be pulled, the `moto` S3 server is a working stand in (any
+credentials accepted, path style addressing):
+
+```bash
+uvx --from 'moto[server]' moto_server -H 127.0.0.1 -p 9000 &
+MCPFS_MINIO_SECRET_KEY=any cargo test -p mcp-fs-core --lib storage::blob::s3 -- --ignored
+```
+
+The three tests passed against it on 2026-10-16. It is an emulator: the full stack e2e below
+still wants a real MinIO.
 
 Without the service the test does not run at all (`--ignored` is required), which
 is why `./test.sh` is green on a machine with nothing installed.
