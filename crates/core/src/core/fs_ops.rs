@@ -3919,6 +3919,24 @@ mod tests {
         }
     }
 
+    /// SPEC-0034/DT-011: a double not overriding `list` falls through to the
+    /// trait's default body, which is `ERR_NOT_SUPPORTED` (DEC-002).
+    #[tokio::test]
+    async fn blob_backend_default_list_is_not_supported() {
+        let d = tempfile::tempdir().unwrap();
+        let (paused_tx, _paused) = tokio::sync::oneshot::channel();
+        let (_release, release_rx) = tokio::sync::oneshot::channel();
+        let blob = PausingBlob {
+            inner: crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"),
+            pause: "unused".to_string(),
+            puts: AtomicUsize::new(0),
+            paused: StdMutex::new(Some(paused_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+        let e = crate::storage::traits::BlobBackend::list(&blob).await.unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+    }
+
     /// SPEC-0019 DEC-008 behind E2E-157: Alice's conversion is paused between
     /// its sibling write and its commit while Bob converts the same document.
     /// Bob must wait for Alice's commit, so the current set and the sibling

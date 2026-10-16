@@ -36,6 +36,6 @@
 | US-0034 | SPEC-0031 | Pin the untested MCP protocol behaviors | main | 2 | landed | story/US-0034-pin-untested-mcp-protocol-behaviors | main |
 | US-0035 | SPEC-0032 | Doc service timeout test proves the kill | main | 2 | landed | story/US-0035-doc-service-timeout-test-proves-kill | main |
 | US-0036 | SPEC-0033 | A refused artifact commit releases its blobs | main | 1 | landed | story/US-0036-refused-artifact-commit-releases-blobs | main |
-| US-0037 | SPEC-0034 | The blob store lists its objects and refreshes re stored blobs | main | 2 | todo | | |
+| US-0037 | SPEC-0034 | The blob store lists its objects and refreshes re stored blobs | main | 2 | landed | story/US-0037-blob-store-lists-and-refreshes | main |
 | US-0038 | SPEC-0034 | Sweep the unreferenced blobs of one project | US-0037 | 1 | todo | | |
 | US-0039 | SPEC-0034 | The purge cycle runs the orphan sweep once a day | US-0038 | 2 | todo | | |

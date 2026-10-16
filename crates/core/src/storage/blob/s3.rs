@@ -6,7 +6,7 @@
 
 use crate::config::BlobConfig;
 use crate::errors::{Result, ToolError};
-use crate::storage::traits::BlobBackend;
+use crate::storage::traits::{BlobBackend, BlobEntry};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -164,6 +164,40 @@ impl BlobBackend for S3BlobStore {
         let _ = self.client.delete_bucket().bucket(&self.bucket).send().await;
         Ok(())
     }
+
+    async fn list(&self) -> Result<Vec<BlobEntry>> {
+        let mut entries = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self.client.list_objects_v2().bucket(&self.bucket);
+            if let Some(t) = &continuation {
+                req = req.continuation_token(t);
+            }
+            let out = req
+                .send()
+                .await
+                .map_err(|e| ToolError::internal(format!("s3 list '{}': {e}", self.bucket)))?;
+            for obj in out.contents() {
+                let Some(key) = obj.key() else { continue };
+                let modified = obj.last_modified().map(|d| d.as_secs_f64()).unwrap_or_default();
+                entries.push(BlobEntry {
+                    key: key.to_string(),
+                    size: obj.size().unwrap_or_default().max(0) as u64,
+                    modified,
+                    shard: None,
+                });
+            }
+            if out.is_truncated().unwrap_or(false) {
+                continuation = out.next_continuation_token().map(str::to_string);
+                if continuation.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +242,30 @@ mod tests {
             s.get("deadbeef", 0, None).await.unwrap_err().code,
             crate::errors::code::NOT_FOUND
         );
+
+        s.remove_bucket().await.unwrap();
+    }
+
+    /// SPEC-0034/DT-012: `list()` follows pagination (`list_objects_v2` pages at
+    /// 1000 keys), returning every key with its correct size.
+    #[tokio::test]
+    #[ignore = "requires a live MinIO/S3 on 127.0.0.1:9000 and MCPFS_MINIO_SECRET_KEY"]
+    async fn integration_list_follows_pagination() {
+        let bucket = format!("mcpfs-rust-it-{}", uuid::Uuid::new_v4().simple());
+        let s = S3BlobStore::new(&cfg(), bucket).unwrap();
+        s.ensure_bucket().await.unwrap();
+
+        const COUNT: usize = 1001;
+        for i in 0..COUNT {
+            let key = format!("key-{i:04}");
+            s.put(&key, key.as_bytes()).await.unwrap();
+        }
+
+        let entries = s.list().await.unwrap();
+        assert_eq!(entries.len(), COUNT);
+        for e in &entries {
+            assert_eq!(e.size, e.key.len() as u64);
+        }
 
         s.remove_bucket().await.unwrap();
     }

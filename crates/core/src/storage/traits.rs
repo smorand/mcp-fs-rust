@@ -226,6 +226,19 @@ pub trait MetaBackend: Send + Sync {
     async fn used_bytes(&self) -> Result<i64>;
 }
 
+/// One object listed by [`BlobBackend::list`].
+///
+/// `modified` is unix seconds (fractional); `shard` is the directory the local
+/// store found the entry in, which a temp file's own name does not encode
+/// (SPEC-0034/DR-001).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlobEntry {
+    pub key: String,
+    pub size: u64,
+    pub modified: f64,
+    pub shard: Option<String>,
+}
+
 /// A content-addressed byte store, keyed by sha256, scoped to one volume.
 #[async_trait]
 pub trait BlobBackend: Send + Sync {
@@ -236,6 +249,20 @@ pub trait BlobBackend: Send + Sync {
     async fn delete(&self, sha256: &str) -> Result<()>;
     async fn ensure_bucket(&self) -> Result<()>;
     async fn remove_bucket(&self) -> Result<()>;
+
+    /// Every object of the bucket (SPEC-0034/DR-001). A backend that cannot
+    /// enumerate its objects returns `ERR_NOT_SUPPORTED` (DEC-002); nothing in
+    /// production calls this yet.
+    async fn list(&self) -> Result<Vec<BlobEntry>> {
+        Err(ToolError::not_supported("this blob backend cannot list its objects"))
+    }
+
+    /// Delete exactly the listed entry, defaulting to `delete(&entry.key)`.
+    /// The local store overrides this because a temp file's name does not map
+    /// to its own shard directory (SPEC-0034/DR-001).
+    async fn delete_entry(&self, entry: &BlobEntry) -> Result<()> {
+        self.delete(&entry.key).await
+    }
 }
 
 /// ACL registry of projects and their members.

@@ -10,9 +10,10 @@
 //! the S3 backend (or a key mapping landed in both implementations at once).
 
 use crate::errors::{Result, ToolError};
-use crate::storage::traits::BlobBackend;
+use crate::storage::traits::{BlobBackend, BlobEntry};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub struct LocalBlobStore {
     root: PathBuf,
@@ -41,7 +42,15 @@ impl BlobBackend for LocalBlobStore {
         let dir = final_path.parent().unwrap_or(&self.root).to_path_buf();
         tokio::fs::create_dir_all(&dir).await?;
         // Content-addressed: an existing blob with this sha has identical bytes.
+        // Re-stored bytes still refresh the modified time (SPEC-0034/DR-002),
+        // so an age check against it stays trustworthy.
         if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+            let refresh_path = final_path.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::open(&refresh_path)?.set_modified(SystemTime::now())
+            })
+            .await
+            .map_err(|e| ToolError::internal(format!("join error refreshing mtime: {e}")))??;
             return Ok(());
         }
         // Write to a temp name then rename, so a reader never sees a partial blob.
@@ -104,6 +113,52 @@ impl BlobBackend for LocalBlobStore {
 
     async fn remove_bucket(&self) -> Result<()> {
         match tokio::fs::remove_dir_all(&self.root).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn list(&self) -> Result<Vec<BlobEntry>> {
+        let mut entries = Vec::new();
+        let mut shards = match tokio::fs::read_dir(&self.root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(shard_entry) = shards.next_entry().await? {
+            if !shard_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let shard = shard_entry.file_name().to_string_lossy().to_string();
+            let mut files = tokio::fs::read_dir(shard_entry.path()).await?;
+            while let Some(file_entry) = files.next_entry().await? {
+                if !file_entry.file_type().await?.is_file() {
+                    continue;
+                }
+                let metadata = file_entry.metadata().await?;
+                let modified = metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                entries.push(BlobEntry {
+                    key: file_entry.file_name().to_string_lossy().to_string(),
+                    size: metadata.len(),
+                    modified,
+                    shard: Some(shard.clone()),
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn delete_entry(&self, entry: &BlobEntry) -> Result<()> {
+        let path = match &entry.shard {
+            Some(shard) => self.root.join(shard).join(&entry.key),
+            None => self.root.join(&entry.key),
+        };
+        match tokio::fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
@@ -207,6 +262,63 @@ mod tests {
             "a flat layout would orphan the blobs of every existing deployment"
         );
         assert_eq!(s.get(sha, 0, None).await.unwrap(), b"hello");
+    }
+
+    /// SPEC-0034/DT-010: `list()` enumerates every file under every shard,
+    /// `.tmp-*` files included, and `delete_entry` removes exactly the listed
+    /// file although a temp file's name does not map to its own shard.
+    #[tokio::test]
+    async fn list_enumerates_every_shard_entry_including_temp_files() {
+        let (d, s) = store();
+        assert_eq!(s.list().await.unwrap(), Vec::new());
+
+        s.put("3bytes", b"abc").await.unwrap();
+        s.put("5bytes", b"abcde").await.unwrap();
+        let shard_dir = d.path().join("mcpfs-test").join("ab");
+        tokio::fs::create_dir_all(&shard_dir).await.unwrap();
+        tokio::fs::write(shard_dir.join(".tmp-ab-x"), b"partial").await.unwrap();
+
+        let mut entries = s.list().await.unwrap();
+        entries.sort_by_key(|e| e.size);
+        assert_eq!(entries.len(), 3);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        for e in &entries {
+            assert!((now - e.modified).abs() < 2.0, "{} not within 2s of now", e.key);
+        }
+
+        let sizes: Vec<u64> = entries.iter().map(|e| e.size).collect();
+        assert_eq!(sizes, vec![3, 5, 7]);
+
+        let tmp = entries.iter().find(|e| e.key == ".tmp-ab-x").expect("temp entry listed");
+        assert_eq!(tmp.shard, Some("ab".to_string()));
+
+        s.delete_entry(tmp).await.unwrap();
+        assert!(!shard_dir.join(".tmp-ab-x").exists());
+    }
+
+    /// SPEC-0034/DT-013: `put` of bytes already present refreshes the modified
+    /// time and leaves the bytes unchanged.
+    #[tokio::test]
+    async fn put_of_existing_bytes_refreshes_the_modified_time() {
+        let (d, s) = store();
+        s.put("existing", b"data").await.unwrap();
+        let path = d.path().join("mcpfs-test").join("ex").join("existing");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        let f = std::fs::File::open(&path).unwrap();
+        f.set_modified(old).unwrap();
+
+        s.put("existing", b"data").await.unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        let now = std::time::SystemTime::now();
+        let age = now.duration_since(modified).unwrap_or_default();
+        assert!(age.as_secs_f64() < 2.0, "modified time not refreshed: {age:?} old");
+        assert_eq!(s.get("existing", 0, None).await.unwrap(), b"data");
     }
 
     /// Blobs whose shard prefix collides still coexist.
