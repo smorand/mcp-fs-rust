@@ -16,8 +16,11 @@ unmaintained = "workspace"
 # this lot. Revisit at the next dependency upgrade pass.
 ignore = [
     "RUSTSEC-2023-0071", # rsa (Marvin timing side-channel; used for JWT signing keys, no fix released)
-    "RUSTSEC-2026-0183", # git2 unsound Remote::list() (no fix released yet)
-    "RUSTSEC-2026-0184", # git2 unsound BlameHunk signature (no fix released yet)
+    # zip 2.4.2/3.0.0: only ZipArchive::extract and ZipStreamReader::extract are
+    # affected and neither is called (owner acceptance 2026-10-17, until BL-0058).
+    "RUSTSEC-2026-0367", # zip SUID/SGID bits kept on extract
+    "RUSTSEC-2026-0368", # zip symlink target escape on extract
+    "RUSTSEC-2026-0369", # zip permissions applied through symlinks on extract
 ]
 
 [licenses]

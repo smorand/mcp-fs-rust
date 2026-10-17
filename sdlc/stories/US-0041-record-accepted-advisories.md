@@ -80,3 +80,4 @@ With git2 and yoke-derive fixed, record each remaining accepted advisory once in
 
 ## Owner amendment (2026-10-17)
 Also accept, in `.cargo/audit.toml`, RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369 (zip 2.4.2 and 3.0.0, published 2026-10-09/10, patched >=9.0.0), reason: only `ZipArchive::extract`/`ZipStreamReader::extract` are affected, never called (`tools/archive.rs:386` decodes entries itself and refuses symlinks at `:398`); removed by BL-0058 (zip 9). DR-005's list is therefore 10 ids. DT-012 still expects exactly the 2 yanked zip warnings and no vulnerability.
+Update (2026-10-17, during implement): crates.io un-yanked zip 2.4.2 and 3.0.0 (API `yanked: false`), so `cargo audit` reports 0 warnings; DT-012 asserts no vulnerability and no warning, per the spec assumption on DT-012. `cargo deny check` also needed the 3 zip ids, added to `deny.toml` with the same reason.

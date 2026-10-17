@@ -44,7 +44,7 @@ typecheck:
 
 ## security: Dependency advisory and license gate
 security:
-	cargo audit --ignore RUSTSEC-2023-0071
+	cargo audit
 	cargo deny check
 
 ## check: Full quality gate (format-check, lint, typecheck, security, test)

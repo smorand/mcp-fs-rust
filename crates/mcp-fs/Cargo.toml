@@ -22,3 +22,6 @@ all-backends = ["mcp-fs-core/all-backends"]
 [dependencies]
 tokio = { workspace = true }
 mcp-fs-core = { path = "../core" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -3604,6 +3604,7 @@ name = "mcp-fs"
 version = "0.1.0"
 dependencies = [
  "mcp-fs-core",
+ "serde_json",
  "tokio",
 ]
 

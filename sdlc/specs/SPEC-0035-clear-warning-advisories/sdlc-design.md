@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 3 bounded areas (dependency manifests and security gate config, the git layer: HTTP server, remote pipeline, tools), 8 requirements, 12 audit findings, no public contract
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-16
 > Behavior change: none
 > From backlog: BL-0053
