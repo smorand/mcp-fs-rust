@@ -2861,10 +2861,7 @@ async fn blame(entry: &GitRepoEntry, norm: &str, ref_name: Option<&str>) -> Resu
 
     let mut lines = Vec::new();
     for hunk in blame.iter() {
-        let sig = hunk.final_signature();
-        let author = sig.name().unwrap_or_default().to_string();
-        let email = sig.email().unwrap_or_default().to_string();
-        let date = format_git_time(sig.when(), "%Y-%m-%d");
+        let (author, email, date) = blame_identity(hunk.final_signature().as_ref());
         let sha = short(&hunk.final_commit_id().to_string());
         let first = hunk.final_start_line();
         for n in first..first + hunk.lines_in_hunk() {
@@ -2878,6 +2875,26 @@ async fn blame(entry: &GitRepoEntry, norm: &str, ref_name: Option<&str>) -> Resu
         }
     }
     Ok(json!({"path": norm, "lines": lines}))
+}
+
+/// Author, email and date of a blame hunk; empty strings when the hunk has no
+/// final signature.
+fn blame_identity(sig: Option<&git2::Signature<'_>>) -> (String, String, String) {
+    let Some(sig) = sig else { return (String::new(), String::new(), String::new()) };
+    (
+        sig.name().unwrap_or_default().to_string(),
+        sig.email().unwrap_or_default().to_string(),
+        format_git_time(sig.when(), "%Y-%m-%d"),
+    )
+}
+
+/// Branch name of a HEAD, or `None` for a detached HEAD, an unborn one, or a
+/// shorthand that is not valid UTF-8 (git2 0.21 returns a `Result`, which must
+/// keep meaning "no branch" as the `Option` did).
+fn head_branch(head: Option<&git2::Reference<'_>>) -> Option<String> {
+    head.and_then(|h| h.shorthand().ok())
+        .filter(|n| !n.is_empty() && *n != "(no branch)")
+        .map(str::to_string)
 }
 
 /// Resolve a remote clone URL to its credential policy (FR-NEW-006/007/008):
@@ -3081,11 +3098,7 @@ async fn clone_and_import_inner(
             )?;
 
             let head = cloned.head().ok();
-            let target_branch = head
-                .as_ref()
-                .and_then(|h| h.shorthand())
-                .filter(|n| !n.is_empty() && *n != "(no branch)")
-                .map(str::to_string)
+            let target_branch = head_branch(head.as_ref())
                 .or_else(|| branch_owned.clone())
                 .unwrap_or_else(|| "main".to_string());
 
@@ -8316,6 +8329,51 @@ mod tests {
         assert!(err.message.contains("not found in repository history"), "got {}", err.message);
     }
 
+    /// SPEC-0035/DT-016: a hunk without a signature reports empty strings.
+    #[test]
+    fn blame_identity_is_empty_without_a_signature_and_unchanged_with_one() {
+        assert_eq!(blame_identity(None), (String::new(), String::new(), String::new()));
+        let sig =
+            git2::Signature::new("Ada", "ada@x.test", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        assert_eq!(
+            blame_identity(Some(&sig)),
+            ("Ada".to_string(), "ada@x.test".to_string(), "2023-11-14".to_string())
+        );
+    }
+
+    /// SPEC-0035/DT-018: a HEAD on a branch whose name is not UTF-8 is "no branch".
+    /// Pin: the `Option` of git2 0.20 and the `Result` of 0.21 give the same answer.
+    #[test]
+    fn head_branch_treats_a_non_utf8_shorthand_as_no_branch() {
+        assert_eq!(head_branch(None), None);
+
+        let d = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(d.path()).unwrap();
+        let sig = git2::Signature::now("Ada", "ada@x.test").unwrap();
+        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+        let tip = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        repo.reference("refs/heads/main", tip, true, "main").unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        assert_eq!(head_branch(repo.head().ok().as_ref()), Some("main".to_string()));
+
+        // Plain file writes: macOS refuses a loose ref file with such a name.
+        let git_dir = repo.path().to_path_buf();
+        let loose = git_dir.join("refs/heads/main");
+        let _ = std::fs::remove_file(&loose);
+        let mut packed = b"# pack-refs with: peeled fully-peeled sorted \n".to_vec();
+        packed.extend_from_slice(format!("{tip} refs/heads/").as_bytes());
+        packed.extend_from_slice(&[0xff, b'\n']);
+        std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
+        let mut head = b"ref: refs/heads/".to_vec();
+        head.extend_from_slice(&[0xff, b'\n']);
+        std::fs::write(git_dir.join("HEAD"), head).unwrap();
+
+        let repo = git2::Repository::open(d.path()).unwrap();
+        let resolved = repo.head();
+        assert!(resolved.is_ok(), "libgit2 must resolve the non UTF-8 HEAD: {:?}", resolved.err());
+        assert_eq!(head_branch(resolved.ok().as_ref()), None);
+    }
+
     // ── remote_clone ────────────────────────────────────────────────────────
 
     /// Build a real local repository to clone from, so no network is involved.
@@ -10893,7 +10951,7 @@ mod tests {
     #[test]
     fn dir_node_nests_by_path_segment() {
         let mut root = DirNode::default();
-        let oid = Oid::zero();
+        let oid = Oid::ZERO_SHA1;
         root.insert("a.txt", oid);
         root.insert("src/lib.rs", oid);
         root.insert("src/deep/mod.rs", oid);
@@ -13734,7 +13792,7 @@ mod tests {
                     Oid::from_str(&o.hash)
                         .ok()
                         .and_then(|oid| repo.find_commit(oid).ok())
-                        .and_then(|c| c.message().map(|m| m.contains("Merge")))
+                        .and_then(|c| c.message().ok().map(|m| m.contains("Merge")))
                         .unwrap_or(false)
                 })
                 .count()
@@ -18418,8 +18476,12 @@ mod tests {
             let entry = self.entry().await;
             let repo = entry.repo.lock().await;
             let commit = repo.find_commit(parse_oid(sha).unwrap()).unwrap();
-            let mut names: Vec<String> =
-                commit.tree().unwrap().iter().filter_map(|e| e.name().map(String::from)).collect();
+            let mut names: Vec<String> = commit
+                .tree()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e.name().ok().map(String::from))
+                .collect();
             names.sort();
             names
         }
@@ -20076,8 +20138,8 @@ mod tests {
             for c in &commits[..2] {
                 let commit =
                     repo.find_commit(parse_oid(c["sha"].as_str().unwrap()).unwrap()).unwrap();
-                assert_eq!(commit.committer().email(), Some(SECOND), "{c}");
-                assert_eq!(commit.author().email(), Some(OWNER), "{c}");
+                assert_eq!(commit.committer().email().ok(), Some(SECOND), "{c}");
+                assert_eq!(commit.author().email().ok(), Some(OWNER), "{c}");
             }
         }
         let second_audit = e.f.state.safety.audit(SECOND, MOUNT);
@@ -23059,7 +23121,7 @@ mod tests {
             .references()
             .unwrap()
             .filter_map(|r| r.ok())
-            .filter_map(|r| r.name().map(str::to_string))
+            .filter_map(|r| r.name().ok().map(str::to_string))
             .collect();
         names.sort();
         names

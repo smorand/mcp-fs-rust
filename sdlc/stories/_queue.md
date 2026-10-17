@@ -39,5 +39,5 @@
 | US-0037 | SPEC-0034 | The blob store lists its objects and refreshes re stored blobs | main | 2 | landed | story/US-0037-blob-store-lists-and-refreshes | main |
 | US-0038 | SPEC-0034 | Sweep the unreferenced blobs of one project | US-0037 | 1 | landed | story/US-0038-orphan-sweep-for-one-project | story/US-0037-blob-store-lists-and-refreshes |
 | US-0039 | SPEC-0034 | The purge cycle runs the orphan sweep once a day | US-0038 | 2 | landed | story/US-0039-purge-cycle-runs-orphan-sweep-daily | story/US-0038-orphan-sweep-for-one-project |
-| US-0040 | SPEC-0035 | git2 0.21 and yoke-derive 0.8.4 with unchanged behavior | main | 2 | todo | | |
+| US-0040 | SPEC-0035 | git2 0.21 and yoke-derive 0.8.4 with unchanged behavior | main | 2 | done | story/US-0040-git2-021-and-yoke-derive-084 | main |
 | US-0041 | SPEC-0035 | Record the accepted advisories and drop the stale ignores | US-0040 | 2 | todo | | |

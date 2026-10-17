@@ -37,3 +37,55 @@ fn make_security_passes() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn lock_packages(name: &str) -> Vec<String> {
+    let raw = fs::read_to_string(repo_root().join("Cargo.lock")).expect("Cargo.lock");
+    let mut found = Vec::new();
+    let mut current: Option<String> = None;
+    for line in raw.lines() {
+        if let Some(n) = line.strip_prefix("name = ") {
+            current = Some(n.trim_matches('"').to_string());
+        } else if let Some(v) = line.strip_prefix("version = ")
+            && current.as_deref() == Some(name)
+        {
+            found.push(v.trim_matches('"').to_string());
+        }
+    }
+    found
+}
+
+/// SPEC-0035/DT-010: the advisory fix is read from the lockfile text.
+#[test]
+fn lockfile_pins_git2_0_21_and_libgit2_sys_unchanged() {
+    let git2 = lock_packages("git2");
+    assert_eq!(git2.len(), 1, "exactly one git2 package: {git2:?}");
+    assert!(git2[0].starts_with("0.21."), "git2 must be 0.21.x, got {}", git2[0]);
+    assert_eq!(lock_packages("libgit2-sys"), vec!["0.18.8+1.9.7".to_string()]);
+}
+
+/// SPEC-0035/DT-013: the resolved graph agrees with the lockfile, second channel.
+#[test]
+fn resolved_graph_has_no_vulnerable_git2_and_no_yanked_yoke_derive() {
+    let tree = |spec: &str| {
+        Command::new("cargo")
+            .args(["tree", "-i", spec, "--all-features"])
+            .current_dir(repo_root())
+            .output()
+            .expect("run cargo tree")
+    };
+    for old in ["git2@0.20.4", "yoke-derive@0.8.3"] {
+        let out = tree(old);
+        assert!(!out.status.success(), "{old} must no longer resolve");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("did not match"),
+            "unexpected cargo tree failure for {old}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let new = tree("git2@0.21.0");
+    assert!(
+        new.status.success(),
+        "git2@0.21.0 must resolve: {}",
+        String::from_utf8_lossy(&new.stderr)
+    );
+}

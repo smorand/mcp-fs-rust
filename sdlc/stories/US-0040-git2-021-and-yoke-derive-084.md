@@ -96,3 +96,12 @@ The scratch worktree probe (2026-10-16) compiled the whole workspace with all fe
 - [ ] Docs updated: none.
 - [ ] Self review: full.
 - [ ] One commit `US-0040: git2 0.21 and yoke-derive 0.8.4 with unchanged behavior`, body `Spec: SPEC-0035` and the DR ids.
+
+## Blocked
+
+Category: environment (new advisories, not a code defect). `make check` exits 2 at `security` on this branch AND on main `9f85ede`: `cargo audit` reports RUSTSEC-2026-0367, 0368, 0369 (zip 2.4.2 and 3.0.0, published 2026-10-09/10, patched >=9.0.0) plus lru RUSTSEC-2026-0253/0002 already planned for US-0041. Story work is green otherwise: tools::git 678/0, git:: 731/0, clippy clean, workspace 2768 passed 1 failed (make_security_passes, same cause).
+Exposure: the three zip advisories hit `ZipArchive::extract` / `ZipStreamReader::extract`; our code never calls them (`tools/archive.rs:386` decodes entries itself and refuses symlinks at :398); utoipa-swagger-ui build.rs unpacks only its vendored Swagger zip.
+Question: accept the three zip ids in `.cargo/audit.toml` (beyond SPEC-0035's 7) with BL-0058 (zip 9) as the real fix?
+Recommendation: yes, add them to US-0041 with that justification. Default: same.
+Also note: git2 0.21 has `default = []`; the branch pins `features = ["https", "ssh"]` (DR-008) with a transport guard test; lockfile also moved tempfile's getrandom 0.4.3 to 0.3.4 (cargo forced, DT-011 wording too strict).
+Answer: (owner, 2026-10-17) go: accept RUSTSEC-2026-0367/0368/0369 in US-0041's .cargo/audit.toml, real fix BL-0058. Interim: US-0040's make check is red only at security and make_security_passes, both identical on main 9f85ede; full green proven at US-0041.

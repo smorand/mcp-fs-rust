@@ -554,7 +554,8 @@ pub fn push_to_remote(
     let mut callbacks = credential_callbacks(token, deadline);
     callbacks.push_negotiation(move |updates| {
         for u in updates {
-            if u.dst_refname() == Some(dst_for_negotiation.as_str()) {
+            // git2 0.21 returns a Result: a non UTF-8 destination never matches.
+            if u.dst_refname().ok() == Some(dst_for_negotiation.as_str()) {
                 *before_cell.borrow_mut() = Some(u.src());
                 // The lease is checked HERE, against the transport's own
                 // pre-push advertisement of the ref, which costs no second
@@ -1289,5 +1290,15 @@ pub(crate) mod tests {
         let other = classify_push_rejection("GH006: Protected branch update failed.", "main");
         assert_eq!(ff.code, crate::errors::code::INVALID_ARGUMENT);
         assert_ne!(ff.code, other.code);
+    }
+
+    /// SPEC-0035 DR-008: git2 0.21 turned its default features off. Without `https` and
+    /// `ssh` libgit2 has no remote transport and every clone, push, fetch and pull fails
+    /// at runtime, so the build must carry both.
+    #[test]
+    fn libgit2_is_built_with_the_https_and_ssh_transports() {
+        let v = git2::Version::get();
+        assert!(v.https(), "libgit2 lacks HTTPS: enable the git2 `https` feature");
+        assert!(v.ssh(), "libgit2 lacks SSH: enable the git2 `ssh` feature");
     }
 }

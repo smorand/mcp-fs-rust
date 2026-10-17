@@ -71,7 +71,10 @@ rand = "0.8"
 rmcp = { version = "3.5.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 
 # ── git ────────────────────────────────────────────────────────────────────────
-git2 = "0.20"
+# git2 0.21 changed its default features from ["ssh", "https"] to []. Without them
+# libgit2 has no HTTPS and no SSH transport and every remote clone, push, fetch and
+# pull fails at runtime, so the 0.20 defaults are listed explicitly (SPEC-0035/DR-008).
+git2 = { version = "0.21", features = ["https", "ssh"] }
 # Host key validation and, later, remote URL parsing (git::remote). Was already
 # a transitive dependency of several other crates; promoted to direct because
 # the crate reads it by name (DRIFT-003).
