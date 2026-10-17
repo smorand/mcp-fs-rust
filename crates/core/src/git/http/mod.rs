@@ -333,7 +333,8 @@ pub async fn concrete_refs(
         let repo = entry.repo.lock().await;
         if let Ok(refs) = repo.references() {
             for r in refs.flatten() {
-                let Some(name) = r.name() else { continue };
+                // git2 0.21 returns a Result: a non UTF-8 ref name is skipped exactly as before.
+                let Ok(name) = r.name() else { continue };
                 if direct.iter().any(|d| d.name == name) {
                     continue;
                 }
@@ -782,6 +783,33 @@ mod tests {
         // HEAD points at a branch that does not exist yet (fresh repo)
         let refs = concrete_refs(&e, true).await.unwrap();
         assert!(refs.is_empty(), "an unborn HEAD advertises nothing");
+    }
+
+    /// SPEC-0035/DT-017: a ref whose raw name is not UTF-8 is skipped, never an error.
+    /// Pin: green before and after the git2 0.21 move (`name()` went from `Option` to `Result`).
+    #[tokio::test]
+    async fn a_ref_with_a_non_utf8_name_is_left_out_of_the_advertisement() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        let ok_sha = "4".repeat(40);
+        let bad_sha = "5".repeat(40);
+        // macOS refuses a loose ref file with a non UTF-8 name, so the raw bytes go
+        // through `packed-refs`.
+        let mut packed = b"# pack-refs with: peeled fully-peeled sorted \n".to_vec();
+        packed.extend_from_slice(format!("{ok_sha} refs/heads/ok\n").as_bytes());
+        packed.extend_from_slice(format!("{bad_sha} refs/heads/").as_bytes());
+        packed.extend_from_slice(&[0xff, b'\n']);
+        let path = e.repo.lock().await.path().join("packed-refs");
+        std::fs::write(path, packed).unwrap();
+
+        let refs = concrete_refs(&e, false).await.unwrap();
+        assert!(refs.contains(&("refs/heads/ok".to_string(), ok_sha.clone())));
+        assert_eq!(refs.len(), 1, "the non UTF-8 ref is omitted: {refs:?}");
+
+        let body = advertise_upload_pack(&e).await.unwrap();
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(text.contains(&format!("{ok_sha} refs/heads/ok")));
+        assert!(!text.contains(&bad_sha));
     }
 
     #[test]
