@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one function (`LocalBlobStore::put`, `crates/core/src/storage/blob/local.rs:40-70`), one module, no public contract, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-18
 > Behavior change: declared delta, see Section 7 (a race that returned an error now succeeds)
 > From backlog: BL-0057
@@ -108,3 +108,24 @@ None.
 | 1 | 0 | 0 | IMPLEMENTABLE (inline, depth S): no forced choice; names and both forms spelled; tests concrete with a second channel; no open question; EARS clean, no forbidden modal; delta declared (Section 7); citations opened (`local.rs:40-70`, `:188`, `:199`, `:237`, `:325`, `s3.rs:48-58`, `traits.rs:244`); G13 not triggered; existing tests untouched |
 
 **Amendments applied:** none.
+
+## Design additions (2026-10-18)
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/storage/blob/local.rs` | `put` restructure, test hook, DT-001..DT-003 | DR-001..DR-004 | US-0045 |
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001, DT-002, DT-003 | unit | `LocalBlobStore` direct call, tempdir | `local.rs` tests | US-0045 |
+| DT-004 | guardrail | full suite | `make check` | US-0045 |
+
+### Additional decisions
+- **DEC-003:** One story at `min_tier: 2`, the hook as a `thread_local!` `Cell<Option<fn(&Path)>>` read in async context before `spawn_blocking`, so a `#[tokio::test]` (current thread runtime) sets it on the same thread. **Obliged by:** SPEC-0038/DR-001..DR-004. **Alternatives considered:** a global `static` hook (rejected: parallel tests would race on it). **Source:** design. **Evidence:** `local.rs:47-53`.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0045 | local put rewrites a blob deleted mid call | P1 | DR-001..DR-004 | main | 2 | yes |

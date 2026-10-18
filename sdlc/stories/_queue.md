@@ -44,3 +44,4 @@
 | US-0042 | SPEC-0036 | zip 9 with declared decoding, dedup and writer changes | main | 1 | landed | story/US-0042-zip-9-upgrade | main |
 | US-0043 | SPEC-0036 | narrow the zip acceptances and drop stale citations | US-0042 | 2 | landed | story/US-0043-narrow-zip-acceptances | story/US-0042-zip-9-upgrade |
 | US-0044 | SPEC-0037 | pin the docx envelope and the zip size message | main | 2 | landed | story/US-0044-pin-docx-envelope-and-zip-message | main |
+| US-0045 | SPEC-0038 | local put rewrites a blob deleted mid call | main | 2 | todo | | |
