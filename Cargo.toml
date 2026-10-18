@@ -84,7 +84,7 @@ url = "2.5"
 regex = "1"
 globset = "0.4"
 similar = "2"
-zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
+zip = { version = "9", default-features = false, features = ["deflate", "aes-crypto"] }
 # Pure-Rust tar reader (SPEC-0015 US-0006): `.tar`/`.tar.gz`/`.tar.bz2`/`.tar.xz` entries.
 tar = "0.4"
 # `.tar.gz`/`.tgz` decompression. Default features pull the pure-Rust `miniz_oxide`

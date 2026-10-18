@@ -317,6 +317,22 @@ pub(crate) struct DecodedEntry {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// zip 9 enforces the declared size inside its reader and stops at the limit
+/// (`zip-9.0.5/src/crc32.rs:44-50`), so a declared size lie surfaces as an
+/// `InvalidData` read error before `ensure_decoded_size_matches` sees the
+/// bytes. Keep FR-NEW-020's error naming the entry and its declared size
+/// (SPEC-0036 DR-005); the decoded total is unknown because reading stopped.
+fn zip_read_error(rel_path: &str, declared: u64, e: std::io::Error) -> ToolError {
+    if e.kind() == std::io::ErrorKind::InvalidData
+        && e.to_string().contains("larger than its declared")
+    {
+        return ToolError::invalid_argument(format!(
+            "archive entry '{rel_path}' decompressed to more bytes than declared {declared}"
+        ));
+    }
+    corrupt("zip", e)
+}
+
 /// FR-NEW-020: an entry's decoded byte length must never exceed its
 /// declared uncompressed size, independently of the quota charge (DEC-010):
 /// a declared-size lie is a distinct amplification vector from a merely
@@ -392,15 +408,23 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
     // are both already known from the raw metadata, with no password.
     let mut any_encrypted = false;
     let mut entries = Vec::with_capacity(archive.len());
+    // zip 9 already drops entries with identical raw name bytes (DR-008), but
+    // distinct raw bytes can still decode to one name (UTF-8 versus CP437);
+    // writing both would let the second silently replace the first, so the
+    // clash is refused as corruption before any write (SPEC-0036 DR-009).
+    let mut seen_names = std::collections::HashSet::with_capacity(archive.len());
     for i in 0..archive.len() {
         let file = archive.by_index_raw(i).map_err(|e| corrupt("zip", e))?;
-        let raw_path = file.name().to_string();
+        let raw_path = file.name().map_err(|e| corrupt("zip", e))?.into_owned();
         if file.is_symlink() {
             return Err(ToolError::not_supported(format!(
                 "archive entry '{raw_path}' is a symlink, which is not supported"
             )));
         }
         ensure_entry_path_safe(&raw_path)?;
+        if !seen_names.insert(raw_path.clone()) {
+            return Err(corrupt("zip", format!("duplicate entry name '{raw_path}'")));
+        }
         if file.encrypted() {
             any_encrypted = true;
         }
@@ -431,7 +455,8 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
                 continue;
             }
             let mut buf = Vec::new();
-            file.read_to_end(&mut buf).map_err(|e| corrupt("zip", e))?;
+            file.read_to_end(&mut buf)
+                .map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
             ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
             entries[i].bytes = buf;
             continue;
@@ -445,7 +470,8 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
                     continue;
                 }
                 let mut buf = Vec::new();
-                file.read_to_end(&mut buf).map_err(|e| corrupt("zip", e))?;
+                file.read_to_end(&mut buf)
+                    .map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
                 ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
                 entries[i].bytes = buf;
             }
@@ -949,7 +975,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         assert_eq!(archive.len(), 1);
         let file = archive.by_index_raw(0).unwrap();
-        assert_eq!(file.name(), "secret.txt");
+        assert_eq!(file.name().unwrap(), "secret.txt");
         assert_eq!(file.size(), 10);
         assert!(file.encrypted());
     }
@@ -1284,11 +1310,11 @@ mod tests {
             build_zip_with_special_entry("good.txt", b"benign", "link", b"/etc/passwd", true);
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let link_index = (0..archive.len())
-            .find(|&i| archive.by_index_raw(i).unwrap().name() == "link")
+            .find(|&i| archive.by_index_raw(i).unwrap().name().unwrap() == "link")
             .unwrap();
         assert!(archive.by_index_raw(link_index).unwrap().is_symlink());
         let good_index = (0..archive.len())
-            .find(|&i| archive.by_index_raw(i).unwrap().name() == "good.txt")
+            .find(|&i| archive.by_index_raw(i).unwrap().name().unwrap() == "good.txt")
             .unwrap();
         assert!(!archive.by_index_raw(good_index).unwrap().is_symlink());
     }
@@ -2266,5 +2292,198 @@ mod tests {
             assert_eq!((first.code, first.message), (second.code, second.message));
             assert!(!exists(&f, "/uploads/twice").await);
         }
+    }
+
+    // ── SPEC-0036: zip 9 name decoding, dedup and mode guardrails ─────────
+
+    /// A zip whose entry names are exactly the given raw bytes, with general
+    /// purpose bit 11 (UTF-8) set or cleared per entry. The writer only takes
+    /// a `&str`, so each entry is written under a distinct ASCII placeholder
+    /// of the same byte length, then the placeholder bytes are overwritten in
+    /// the local header (name at offset 30) and the central directory entry
+    /// (name at offset 46), and bit 11 is patched at offsets 6 and 8. Names
+    /// are not covered by the CRC, so the archive stays valid.
+    fn zip_with_raw_names(entries: &[(&[u8], bool, &[u8])]) -> Vec<u8> {
+        let placeholders: Vec<String> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (raw, _, _))| {
+                let mut p = i.to_string();
+                assert!(p.len() <= raw.len(), "raw name too short for its placeholder");
+                while p.len() < raw.len() {
+                    p.push('X');
+                }
+                p
+            })
+            .collect();
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            for (p, (_, _, content)) in placeholders.iter().zip(entries) {
+                writer.start_file(p.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+                writer.write_all(content).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        // (signature, name length offset, name offset, flags offset)
+        let headers = [(0x0403_4b50u32, 26usize, 30usize, 6usize), (0x0201_4b50u32, 28, 46, 8)];
+        let mut patched = 0;
+        let mut at = 0;
+        while at + 4 <= buf.len() {
+            let sig = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            for (want, len_off, name_off, flags_off) in headers {
+                if sig != want || at + name_off > buf.len() {
+                    continue;
+                }
+                let len = u16::from_le_bytes([buf[at + len_off], buf[at + len_off + 1]]) as usize;
+                let name = &buf[at + name_off..at + name_off + len];
+                let Some(i) = placeholders.iter().position(|p| p.as_bytes() == name) else {
+                    continue;
+                };
+                let (raw, utf8, _) = entries[i];
+                buf[at + name_off..at + name_off + len].copy_from_slice(raw);
+                let mut flags = u16::from_le_bytes([buf[at + flags_off], buf[at + flags_off + 1]]);
+                if utf8 {
+                    flags |= 1 << 11;
+                } else {
+                    flags &= !(1 << 11);
+                }
+                buf[at + flags_off..at + flags_off + 2].copy_from_slice(&flags.to_le_bytes());
+                patched += 1;
+            }
+            at += 1;
+        }
+        assert_eq!(patched, entries.len() * 2, "every local and central name patched");
+        buf
+    }
+
+    async fn extract_to_out(f: &Fixture, bytes: &[u8]) -> Result<Value> {
+        seed_bytes(f, "/uploads/names.zip", bytes).await;
+        extract_full(f, "/uploads/names.zip", Some("/out"), false).await
+    }
+
+    async fn root_has_out(f: &Fixture) -> bool {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let listing = crate::core::fs_ops::list_dir(&c, "/", false, "name", false).await.unwrap();
+        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "out")
+    }
+
+    /// SPEC-0036/DT-032: a symlink entry next to a traversal entry voids the
+    /// whole call before any write.
+    #[tokio::test]
+    async fn dt_032_symlink_plus_traversal_archive_refused_nothing_written() {
+        let f = fixture().await;
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default();
+            writer.start_file("ok.txt", opts).unwrap();
+            writer.write_all(b"fine").unwrap();
+            writer
+                .add_symlink("link", "../../../etc/passwd", opts.unix_permissions(0o777))
+                .unwrap();
+            writer.start_file("../../evil.txt", opts).unwrap();
+            writer.write_all(b"pwned").unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.clone())).unwrap();
+        assert_eq!(archive.by_index_raw(1).unwrap().unix_mode(), Some(0o120777));
+        let e = extract_to_out(&f, &buf).await.unwrap_err();
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert_eq!(e.message, "archive entry 'link' is a symlink, which is not supported");
+        assert!(!root_has_out(&f).await);
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let globbed = crate::core::fs_ops::glob_files(&c, "/", "**/*.txt", &[]).await.unwrap();
+        assert_eq!(globbed["matches"], json!([]), "{globbed}");
+    }
+
+    /// SPEC-0036/DT-033: setuid bits in the external attributes never reach
+    /// the stored node, which keeps the default file mode.
+    #[tokio::test]
+    async fn dt_033_setuid_mode_bits_not_carried_onto_stored_file() {
+        let f = fixture().await;
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            writer.start_file("tool.sh", zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(b"#!/bin/sh").unwrap();
+            writer.finish().unwrap();
+        }
+        let cd = (0..buf.len() - 4)
+            .find(|&i| buf[i..i + 4] == 0x0201_4b50u32.to_le_bytes())
+            .expect("central directory entry");
+        buf[cd + 5] = 3;
+        buf[cd + 38..cd + 42].copy_from_slice(&(0o104755u32 << 16).to_le_bytes());
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.clone())).unwrap();
+        // The raw attributes carry the setuid bit; zip 9's `unix_mode()` already
+        // clears it (`zip-9.0.5/src/format/functions.rs:26-45`), so the
+        // precondition reads the attributes, not the derived mode.
+        assert_eq!(archive.by_index_raw(0).unwrap().external_attributes() >> 16, 0o104755);
+        extract_to_out(&f, &buf).await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let st = crate::core::fs_ops::stat_info(&c, "/out/tool.sh").await.unwrap();
+        assert_eq!(st["mode"], "0o644", "{st}");
+    }
+
+    /// SPEC-0036/DT-034: a valid UTF-8 name without bit 11 extracts under
+    /// its UTF-8 decoding (DR-006).
+    #[tokio::test]
+    async fn dt_034_utf8_name_without_flag_extracts_readable() {
+        let f = fixture().await;
+        let bytes = zip_with_raw_names(&[(b"\xC3\xA9.txt", false, b"hello")]);
+        extract_to_out(&f, &bytes).await.unwrap();
+        assert_eq!(read(&f, "/out/\u{e9}.txt").await, b"hello");
+    }
+
+    /// SPEC-0036/DT-035: an invalid UTF-8 name with bit 11 set extracts
+    /// under its CP437 decoding (DR-006).
+    #[tokio::test]
+    async fn dt_035_invalid_utf8_flagged_name_extracts_under_cp437() {
+        let f = fixture().await;
+        let bytes = zip_with_raw_names(&[(b"\xFF.txt", true, b"x")]);
+        extract_to_out(&f, &bytes).await.unwrap();
+        assert_eq!(read(&f, "/out/\u{a0}.txt").await, b"x");
+    }
+
+    /// SPEC-0036/DT-039 case a: distinct raw bytes, distinct decoded names,
+    /// both entries extracted.
+    #[tokio::test]
+    async fn dt_039_a_distinct_raw_names_both_extracted() {
+        let f = fixture().await;
+        let bytes = zip_with_raw_names(&[(b"\xFF.txt", true, b"1"), (b"\xFE.txt", true, b"2")]);
+        let r = extract_to_out(&f, &bytes).await.unwrap();
+        assert_eq!(r["files_written"], 2, "{r}");
+        assert_eq!(read(&f, "/out/\u{a0}.txt").await, b"1");
+        assert_eq!(read(&f, "/out/\u{25a0}.txt").await, b"2");
+    }
+
+    /// SPEC-0036/DT-039 case b: identical raw bytes, whatever the flags, keep
+    /// only the last entry (DR-008).
+    #[tokio::test]
+    async fn dt_039_b_identical_raw_names_keep_the_last_entry() {
+        let f = fixture().await;
+        let bytes = zip_with_raw_names(&[
+            (b"\xC3\xA9.txt", true, b"first"),
+            (b"\xC3\xA9.txt", false, b"second"),
+        ]);
+        let r = extract_to_out(&f, &bytes).await.unwrap();
+        assert_eq!(r["files_written"], 1, "{r}");
+        assert_eq!(read(&f, "/out/\u{e9}.txt").await, b"second");
+    }
+
+    /// SPEC-0036/DT-039 case c: distinct raw bytes decoding to the same name
+    /// are refused before any write (DR-009).
+    #[tokio::test]
+    async fn dt_039_c_decoded_name_clash_is_refused_before_any_write() {
+        let f = fixture().await;
+        let bytes =
+            zip_with_raw_names(&[(b"\xC2\xA0.txt", false, b"1"), (b"\xFF.txt", true, b"2")]);
+        let e = extract_to_out(&f, &bytes).await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            e.message,
+            "archive is corrupt or not a valid zip file: duplicate entry name '\u{a0}.txt'"
+        );
+        assert!(!root_has_out(&f).await);
     }
 }

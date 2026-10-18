@@ -2506,8 +2506,9 @@ mod tests {
 
         // The archive holds both files, named relative to the requested root.
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
-        let mut names: Vec<String> =
-            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
+            .collect();
         names.sort();
         assert_eq!(names, vec!["a.txt", "inner/b.txt"]);
     }
@@ -2636,7 +2637,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
         assert_eq!(archive.len(), 1, "zip must contain exactly one entry");
         let entry = archive.by_index(0).unwrap();
-        assert_eq!(entry.name(), "only.txt");
+        assert_eq!(entry.name().unwrap(), "only.txt");
     }
 
     // ── the document service plane ───────────────────────────────────────────
@@ -2908,7 +2909,8 @@ mod tests {
         let client = h.state.stores.client(MOUNT).await.unwrap();
         let bytes = client.blob.get(&format!("export:{token}"), 0, None).await.unwrap();
         let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        let mut names: Vec<&str> = archive.file_names().collect();
+        let mut names: Vec<String> =
+            archive.file_names().map(|n| n.unwrap().into_owned()).collect();
         names.sort_unstable();
         assert_eq!(names, ["docs/notes/todo.txt", "docs/readme.md", "src/main.rs"]);
     }

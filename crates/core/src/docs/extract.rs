@@ -550,7 +550,9 @@ fn entry_text(zip: &mut Zip, name: &str) -> Option<String> {
 }
 
 fn entry_names(zip: &Zip) -> Vec<String> {
-    zip.file_names().map(str::to_string).collect()
+    // zip 9 decodes names fallibly; a name that cannot be decoded is left out
+    // of the listing rather than failing the whole extraction (SPEC-0036 DR-002).
+    zip.file_names().filter_map(std::result::Result::ok).map(std::borrow::Cow::into_owned).collect()
 }
 
 /// XML text content. No unescaping here: quick-xml surfaces entity and character

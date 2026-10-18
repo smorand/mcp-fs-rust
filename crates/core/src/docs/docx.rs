@@ -375,12 +375,36 @@ mod tests {
         let mut out = std::collections::BTreeMap::new();
         for i in 0..zip.len() {
             let mut f = zip.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut s = String::new();
             f.read_to_string(&mut s).unwrap();
             out.insert(name, s);
         }
         out
+    }
+
+    /// SPEC-0036/DT-038: the writer keeps entry names, entry order and
+    /// contents across the zip upgrade (DR-007); compressed bytes may differ.
+    #[test]
+    fn dt_038_writer_output_keeps_entries_and_contents() {
+        let md = "# Hello\n\nbody\n";
+        let bytes = render_markdown_to_docx(md, None).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let names: Vec<String> =
+            (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().unwrap().to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "[Content_Types].xml",
+                "_rels/.rels",
+                "word/_rels/document.xml.rels",
+                "word/document.xml",
+                "word/styles.xml"
+            ]
+        );
+        let mut document = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut document).unwrap();
+        assert!(document.contains(&build_body(md, None)), "{document}");
     }
 
     /// Full pull-parse of the XML: any imbalance or bad escape fails here, which

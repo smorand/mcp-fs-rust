@@ -246,7 +246,7 @@ mod tests {
                 let mut e = a.by_index(i).unwrap();
                 let mut d = Vec::new();
                 e.read_to_end(&mut d).unwrap();
-                (e.name().to_string(), d)
+                (e.name().unwrap().to_string(), d)
             })
             .collect();
         out.sort();

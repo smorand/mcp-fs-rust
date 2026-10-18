@@ -4150,8 +4150,9 @@ mod e2e {
         let client = f.state.stores.client(PROJECT).await.unwrap();
         let bytes = client.blob.get(&format!("export:{token}"), 0, None).await.unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        let mut names: Vec<String> =
-            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
+            .collect();
         names.sort();
         assert_eq!(names, vec!["report.md", "report.pdf"], "export zip: {names:?}");
     }

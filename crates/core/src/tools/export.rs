@@ -283,7 +283,7 @@ mod tests {
                 let mut e = archive.by_index(i).unwrap();
                 let mut data = Vec::new();
                 e.read_to_end(&mut data).unwrap();
-                (e.name().to_string(), data)
+                (e.name().unwrap().to_string(), data)
             })
             .collect()
     }

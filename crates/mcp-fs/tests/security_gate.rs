@@ -178,3 +178,36 @@ fn accepted_advisories_are_recorded_once_with_a_reason() {
     assert!(!make.contains("cargo audit --ignore"), "Makefile still passes --ignore");
     assert!(make.contains("\tcargo audit\n"));
 }
+
+/// SPEC-0036/DT-030: zip 9 is the only zip among normal dependencies; 3.0.0
+/// stays as a build dependency, read from the lockfile then the graph.
+#[test]
+fn lockfile_and_graph_carry_zip_9_only_for_normal_dependencies() {
+    let mut zips = lock_packages("zip");
+    zips.sort_unstable();
+    assert_eq!(zips.len(), 2, "exactly two zip packages: {zips:?}");
+    assert_eq!(zips[0], "3.0.0", "{zips:?}");
+    assert!(zips[1].starts_with("9."), "zip must be 9.x, got {zips:?}");
+
+    let old = Command::new("cargo")
+        .args(["tree", "-i", "zip@2.4.2", "--all-features"])
+        .current_dir(repo_root())
+        .output()
+        .expect("run cargo tree");
+    assert!(!old.status.success(), "zip@2.4.2 must no longer resolve");
+    let stderr = String::from_utf8_lossy(&old.stderr);
+    assert!(stderr.contains("did not match any packages"), "{stderr}");
+
+    let graph = Command::new("cargo")
+        .args(["tree", "--workspace", "--all-features", "-e", "normal", "--prefix", "none"])
+        .current_dir(repo_root())
+        .output()
+        .expect("run cargo tree");
+    assert!(graph.status.success(), "{}", String::from_utf8_lossy(&graph.stderr));
+    let stdout = String::from_utf8_lossy(&graph.stdout);
+    let zip_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("zip v")).collect();
+    assert!(!zip_lines.is_empty(), "zip absent from the normal graph");
+    for line in zip_lines {
+        assert!(line.starts_with("zip v9."), "non 9.x zip in the normal graph: {line}");
+    }
+}
