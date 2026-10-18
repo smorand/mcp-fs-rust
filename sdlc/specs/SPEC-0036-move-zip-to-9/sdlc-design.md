@@ -296,3 +296,10 @@ One story suffices; the build is broken between the bump and the adaptations, so
 |---|---|---|---|---|---|---|
 | US-0042 | zip 9 with declared decoding, dedup and writer changes | P1 | DR-001, DR-002, DR-005, DR-006, DR-007, DR-008, DR-009 | main | 1 | no |
 | US-0043 | narrow the zip acceptances and drop stale citations | P1 | DR-003, DR-004, DR-005 | US-0042 | 2 | yes |
+
+## As-built notes (2026-10-18, owner authorized)
+
+What landed (US-0042 `c6de04e`, US-0043 `8bc6d55`) differs from the text above in these points; the text is kept as history.
+- **FR-NEW-020 message (DR-005):** zip 9 enforces the declared uncompressed size inside its reader (`zip-9.0.5/src/crc32.rs:44-50`). `zip_read_error` (`crates/core/src/tools/archive.rs`) keeps `ERR_INVALID_ARGUMENT` naming the entry and the declared size, but the message reads `archive entry '<name>' decompressed to more bytes than declared <D>` instead of `... decompressed to <N> bytes but declared <D>` (the decoded total is unknown once zip stops). It is an observable change not listed in Section 7; SPEC-0037/DT-041 pins the exact text.
+- **DT-033:** the precondition reads `external_attributes() >> 16 == 0o104755`; `unix_mode()` cannot return the setuid bit on zip 9 (`zip-9.0.5/src/format/functions.rs:26-45`).
+- **DT-038:** asserts that `word/document.xml` contains the body, since the body sits inside the document envelope; SPEC-0037/DT-040 pins the exact document.

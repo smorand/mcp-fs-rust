@@ -236,3 +236,12 @@ Docs: none (no doc names the git2 version or a RUSTSEC id; `rg -n "RUSTSEC-20|gi
 |---|---|---|---|---|---|---|
 | US-0040 | git2 0.21 and yoke-derive 0.8.4 with unchanged behavior | P1 | DR-001, DR-002, DR-003, DR-004, DR-008 | main | 2 | no |
 | US-0041 | Record the accepted advisories and drop the stale ignores | P1 | DR-005, DR-006, DR-007, DR-008 | US-0040 | 2 | yes |
+
+## As-built notes (2026-10-18, owner authorized)
+
+What landed (US-0040 `4905e0c`, US-0041 `4ebc36e`) differs from the text above in these points; the text is kept as history.
+- **git2 features:** `Cargo.toml` pins `git2 = { version = "0.21", features = ["https", "ssh"] }`, not bare `"0.21"`: git2 0.21 has `default = []`, so the bare form drops HTTPS and SSH (DR-008). Guard test `libgit2_is_built_with_the_https_and_ssh_transports` (`crates/core/src/git/remote.rs`); it only fails on a vendored libgit2 build, a system libgit2 with both transports masks it.
+- **DR-005:** 10 accepted ids, not 7: RUSTSEC-2026-0367/0368/0369 (zip) added by owner acceptance on 2026-10-17, also in `deny.toml` because cargo deny reported them too. Since SPEC-0036 they cover only the build time zip 3.0.0 of utoipa-swagger-ui (BL-0059, parked).
+- **DR-007, DEC-004:** zip 2.4.2 and 3.0.0 were un-yanked upstream; `cargo audit` shows 0 warnings, and DT-012 asserts none.
+- **DT-011:** Cargo.lock also moved tempfile's `getrandom` 0.4.3 to 0.3.4 (cargo resolution) and gained a `serde_json` dev dependency for `crates/mcp-fs`.
+- **Section 8.4:** one undeclared test edit, `dir_node_nests_by_path_segment`, `Oid::zero()` to `Oid::ZERO_SHA1` (deprecated in 0.21, same value).
