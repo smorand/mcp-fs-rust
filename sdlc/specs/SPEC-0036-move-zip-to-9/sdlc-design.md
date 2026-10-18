@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: one area (zip readers: 2 production sites, 7 test files), 6 requirements, no persisted change, one declared observable delta on archive entry names (Section 7)
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-18
 > Behavior change: BREAKING on `fs.extract_archive` entry name decoding and deduplication, and on compressed archive bytes of the zip writers, see Section 7
 > From backlog: BL-0058
@@ -264,3 +264,35 @@ One story suffices; the build is broken between the bump and the adaptations, so
 | 4 | 1 | 1 | NOT-IMPLEMENTABLE: F-1 entry deduplication moves from decoded name (2.x) to raw bytes (`zip-9.0.5/src/read/zip_archive.rs:82-85`), undeclared; A-1 applied. STOPPED: second consecutive round of only new F findings, scope decision needed |
 | 5 | | | after owner decision (DEC-006): DR-008, DR-009, DT-039 added; audit F-1 (check order) and F-2 (probe audit run, verified clean) applied as precision, A-1, A-2 applied |
 | 6 | 0 | 2 | IMPLEMENTABLE: A-1 raw name construction helper, A-2 lockfile set informative, applied |
+
+## Design additions (2026-10-18)
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `Cargo.toml`, `Cargo.lock` | zip `"2"` to `"9"` | DR-001 | US-0042 |
+| `crates/core/src/docs/extract.rs` | `:553` Result adaptation | DR-002 | US-0042 |
+| `crates/core/src/tools/archive.rs` | `:397` adaptation, DR-009 refusal in `:395-410`, tests `:952`, `:1287`, `:1291`, new DT-032..035, DT-039, helper `zip_with_raw_names` | DR-002, DR-006, DR-008, DR-009 | US-0042 |
+| `crates/core/src/api/dataplane.rs`, `docs/docx.rs`, `exports.rs`, `tools/export.rs`, `tools/artifacts.rs` | 8.4 test adaptations; DT-038 in `docx.rs` | DR-005, DR-007 | US-0042 |
+| `crates/core/src/tools/archive.rs` | 6 `zip-2.4.2` comment citations | DR-003 | US-0043 |
+| `.cargo/audit.toml`, `deny.toml` | reasons name utoipa-swagger-ui and BL-0059 | DR-004 | US-0043 |
+| `crates/mcp-fs/tests/security_gate.rs` | DT-030 (US-0042), DT-031, DT-036 (US-0043) | DR-001, DR-003, DR-004 | both |
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-030 | structural | lockfile text + `cargo tree` | `security_gate.rs` | US-0042 |
+| DT-032, DT-033, DT-034, DT-035, DT-039 | integration | `fs.extract_archive` engine, archive test harness | `tools/archive.rs` tests | US-0042 |
+| DT-038 | unit | `render_markdown_to_docx` | `docs/docx.rs` tests | US-0042 |
+| DT-031, DT-036 | structural | file text, `make security` | `security_gate.rs` | US-0043 |
+| DT-037 | guardrail | full suite | `make check` | US-0043 |
+
+### Additional decisions
+- **DEC-007:** Two stories: (1) bump plus every compile forced edit plus behavior tests, (2) comments and audit reasons. **Obliged by:** SPEC-0036/DR-001..DR-009. **Rationale:** Section 9 step 2 cannot be split (nothing compiles in between); steps 3 and 4 can follow with main green, since DT-036 and DT-031 are only added in story 2 and the old reasons keep `make security` green. **Alternatives considered:** one story of 12 paths (above every tier budget). **Source:** design. **Evidence:** Section 9.
+- **DEC-008:** US-0042 at `min_tier: 1`: 10 paths and 7 new tests including byte patched archives exceed the tier 2 file budget, and cannot be split. US-0043 at `min_tier: 2`. **Obliged by:** SPEC-0036/DR-001, DR-002, DR-009. **Alternatives considered:** tier 2 for both (file budget broken). **Source:** design. **Evidence:** table above.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0042 | zip 9 with declared decoding, dedup and writer changes | P1 | DR-001, DR-002, DR-005, DR-006, DR-007, DR-008, DR-009 | main | 1 | no |
+| US-0043 | narrow the zip acceptances and drop stale citations | P1 | DR-003, DR-004, DR-005 | US-0042 | 2 | yes |
