@@ -35,6 +35,25 @@ impl LocalBlobStore {
     }
 }
 
+// Test seam (SPEC-0038/DR-003): lets a test delete the blob between the
+// moment `put` decides it exists and the refresh, which is otherwise a race
+// no test can hit on demand. Thread local so parallel tests never fire each
+// other's hook; compiled out of non test builds.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REFRESH: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn before_refresh(path: &Path) {
+    if let Some(hook) = BEFORE_REFRESH.with(std::cell::Cell::get) {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn before_refresh(_: &Path) {}
+
 #[async_trait]
 impl BlobBackend for LocalBlobStore {
     async fn put(&self, sha256: &str, data: &[u8]) -> Result<()> {
@@ -43,14 +62,20 @@ impl BlobBackend for LocalBlobStore {
         tokio::fs::create_dir_all(&dir).await?;
         // Content-addressed: an existing blob with this sha has identical bytes.
         // Re-stored bytes still refresh the modified time (SPEC-0034/DR-002),
-        // so an age check against it stays trustworthy.
-        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            let refresh_path = final_path.clone();
-            tokio::task::spawn_blocking(move || {
-                std::fs::File::open(&refresh_path)?.set_modified(SystemTime::now())
+        // so an age check against it stays trustworthy. Opening directly, not
+        // checking then opening: a blob deleted in between (orphan sweep, GC)
+        // is simply written again below instead of failing the put (SPEC-0038).
+        before_refresh(&final_path);
+        let refresh_path = final_path.clone();
+        let refreshed =
+            tokio::task::spawn_blocking(move || match std::fs::File::open(&refresh_path) {
+                Ok(f) => f.set_modified(SystemTime::now()).map(|()| true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
             })
             .await
             .map_err(|e| ToolError::internal(format!("join error refreshing mtime: {e}")))??;
+        if refreshed {
             return Ok(());
         }
         // Write to a temp name then rename, so a reader never sees a partial blob.
@@ -193,6 +218,63 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = LocalBlobStore::new(d.path(), "mcpfs-test");
         (d, s)
+    }
+
+    /// SPEC-0038/DT-001: a blob deleted after `put` decided it exists is
+    /// rewritten instead of failing the write.
+    #[tokio::test]
+    async fn put_rewrites_a_blob_deleted_mid_call() {
+        let (d, s) = store();
+        s.put("racy", b"data").await.unwrap();
+        BEFORE_REFRESH.with(|h| h.set(Some(|p: &Path| std::fs::remove_file(p).unwrap())));
+        let r = s.put("racy", b"data").await;
+        BEFORE_REFRESH.with(|h| h.set(None));
+        r.unwrap();
+        assert_eq!(s.get("racy", 0, None).await.unwrap(), b"data");
+        assert!(std::fs::metadata(d.path().join("mcpfs-test").join("ra").join("racy")).is_ok());
+    }
+
+    /// SPEC-0038/DT-002: the refresh path keeps its bytes and leaves no temp file.
+    #[tokio::test]
+    async fn refresh_path_leaves_no_temp_file() {
+        let (d, s) = store();
+        s.put("kept", b"data").await.unwrap();
+        let shard = d.path().join("mcpfs-test").join("ke");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        std::fs::File::open(shard.join("kept")).unwrap().set_modified(old).unwrap();
+
+        s.put("kept", b"data").await.unwrap();
+
+        let modified = std::fs::metadata(shard.join("kept")).unwrap().modified().unwrap();
+        let age = std::time::SystemTime::now().duration_since(modified).unwrap_or_default();
+        assert!(age.as_secs_f64() < 2.0, "not refreshed: {age:?}");
+        assert_eq!(s.get("kept", 0, None).await.unwrap(), b"data");
+        let tmp = std::fs::read_dir(&shard)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".tmp-"));
+        assert!(!tmp, "temp file left in {shard:?}");
+    }
+
+    /// SPEC-0038/DT-003: an open error other than not found is returned, never
+    /// papered over by a rewrite.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn put_does_not_rewrite_on_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, s) = store();
+        s.put("locked", b"data").await.unwrap();
+        let path = d.path().join("mcpfs-test").join("lo").join("locked");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root opens a 000 file anyway, so the refusal cannot be observed.
+        if std::fs::File::open(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let r = s.put("locked", b"data").await;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(r.is_err(), "permission denied swallowed");
+        assert_eq!(mode, 0o000, "blob was rewritten");
     }
 
     #[tokio::test]

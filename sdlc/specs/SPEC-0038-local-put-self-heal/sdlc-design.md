@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one function (`LocalBlobStore::put`, `crates/core/src/storage/blob/local.rs:40-70`), one module, no public contract, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-18
 > Behavior change: declared delta, see Section 7 (a race that returned an error now succeeds)
 > From backlog: BL-0057
