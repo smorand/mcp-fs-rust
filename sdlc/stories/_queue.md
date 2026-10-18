@@ -43,3 +43,4 @@
 | US-0041 | SPEC-0035 | Record the accepted advisories and drop the stale ignores | US-0040 | 2 | landed | story/US-0041-record-accepted-advisories | story/US-0040-git2-021-and-yoke-derive-084 |
 | US-0042 | SPEC-0036 | zip 9 with declared decoding, dedup and writer changes | main | 1 | landed | story/US-0042-zip-9-upgrade | main |
 | US-0043 | SPEC-0036 | narrow the zip acceptances and drop stale citations | US-0042 | 2 | landed | story/US-0043-narrow-zip-acceptances | story/US-0042-zip-9-upgrade |
+| US-0044 | SPEC-0037 | pin the docx envelope and the zip size message | main | 2 | todo | | |

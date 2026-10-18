@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, 2 files (`crates/core/src/docs/docx.rs`, `crates/core/src/tools/archive.rs`), no public contract change, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-18
 > Behavior change: none
 > From backlog: BL-0064
@@ -106,3 +106,26 @@ None.
 | 1 | 0 | 0 | IMPLEMENTABLE (inline checklist, depth S): 1 no forced choice (exact strings, exact inputs); 2 names spelled (`document_xml`, both forms); 3 n/a; 4 tests fully specified; 5 n/a DEBT; 6 no open question; 7 EARS clean, no forbidden modal; 8 DEBT, no behavior change, nothing smuggled; 9 citations opened (`docx.rs:37-44`, `:407`, `archive.rs:325-334`, `:1632`, `:1655`, `:1666-1676`, `:2367`); 10 no missing capability; 11 within budget; 12 G13: test hardening, not an advisory upgrade, Security n/a correct; 14 perimeter 2 files, no existing test modified |
 
 **Amendments applied:** DT-040 structural assertion reworded to the envelope opening (count verified: one occurrence at `docx.rs:41`); DT-041 second channel cited.
+
+## Design additions (2026-10-18)
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/docs/docx.rs` | `document_xml` extracted from `render_markdown_to_docx` (`:39-42`); test DT-040 | DR-001, DR-002 | US-0044 |
+| `crates/core/src/tools/archive.rs` | test DT-041 beside `e2e_new_026` (`:1666`) | DR-003 | US-0044 |
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-040 | unit | `render_markdown_to_docx` + `zip::ZipArchive` | `docs/docx.rs` tests | US-0044 |
+| DT-041 | integration | archive test harness `extract` (`archive.rs:723`) | `tools/archive.rs` tests | US-0044 |
+| DT-042 | guardrail | full suite | `make check` | US-0044 |
+
+### Additional decisions
+- **DEC-004:** One story at `min_tier: 2`. **Obliged by:** SPEC-0037/DR-001..DR-004. **Rationale:** 2 files, one mechanical extraction, two tests; within the tier 2 budget and not further divisible into verifiable halves. **Alternatives considered:** two stories (one per test; rejected, each is a few lines and they share the closing gate). **Source:** design. **Evidence:** table above.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0044 | pin the docx envelope and the zip size message | P1 | DR-001, DR-002, DR-003, DR-004 | main | 2 | yes |
