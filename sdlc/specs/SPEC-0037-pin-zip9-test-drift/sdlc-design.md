@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item, 2 files (`crates/core/src/docs/docx.rs`, `crates/core/src/tools/archive.rs`), no public contract change, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-18
 > Behavior change: none
 > From backlog: BL-0064

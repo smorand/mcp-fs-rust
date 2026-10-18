@@ -1675,6 +1675,37 @@ mod tests {
         assert!(e.message.contains("declared 1"), "{}", e.message);
     }
 
+    /// SPEC-0037/DT-041: the exact message for a declared size lie. zip 9
+    /// refuses it inside its reader and `zip_read_error` recognizes zip's own
+    /// wording, so an upstream rewording fails this test instead of silently
+    /// turning the error into the generic corrupt archive message.
+    #[tokio::test]
+    async fn dt_041_declared_size_lie_message_is_exact() {
+        let f = fixture().await;
+        let mut bytes = build_zip_stored("mismatch.txt", b"0123456789");
+        patch_zip_declared_size(&mut bytes, 1);
+        seed_bytes(&f, "/uploads/mismatch.zip", &bytes).await;
+
+        let e = extract(&f, "/uploads/mismatch.zip").await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            e.message,
+            "archive entry 'mismatch.txt' decompressed to more bytes than declared 1"
+        );
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let listing =
+            crate::core::fs_ops::list_dir(&c, "/uploads", false, "name", false).await.unwrap();
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        // The fixture already seeds other entries under /uploads; what matters
+        // is that the refused archive left no extraction folder behind.
+        assert!(names.contains(&"mismatch.zip") && !names.contains(&"mismatch"), "{names:?}");
+    }
+
     /// E2E-NEW-042/E2E-NEW-043 (tar/7z size mismatch): neither crate's
     /// public writer/reader API allows forging this at the archive level.
     /// tar enforces `header.size()` as a strict read boundary

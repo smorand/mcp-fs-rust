@@ -35,12 +35,17 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 /// Render Markdown into `.docx` bytes. `title` becomes a leading `Title` styled
 /// paragraph, exactly like the C#.
 pub fn render_markdown_to_docx(markdown: &str, title: Option<&str>) -> Result<Vec<u8>> {
-    let body = build_body(markdown, title);
-    let document = format!(
+    pack(&document_xml(&build_body(markdown, title)))
+}
+
+/// `word/document.xml`: the body inside the document envelope (A4 page,
+/// 2 cm margins). One builder, so a test can pin the whole document
+/// (SPEC-0037/DT-040) without a second copy of the envelope.
+fn document_xml(body: &str) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="{W_NS}"><w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:bottom="1134" w:left="1134" w:right="1134"/></w:sectPr></w:body></w:document>"#
-    );
-    pack(&document)
+    )
 }
 
 fn pack(document_xml: &str) -> Result<Vec<u8>> {
@@ -405,6 +410,21 @@ mod tests {
         let mut document = String::new();
         zip.by_name("word/document.xml").unwrap().read_to_string(&mut document).unwrap();
         assert!(document.contains(&build_body(md, None)), "{document}");
+    }
+
+    /// SPEC-0037/DT-040: the whole document is pinned, envelope included, so a
+    /// change to the wrapper around the body fails here, not only a change to
+    /// the body (DT-038 checks containment only).
+    #[test]
+    fn dt_040_document_equals_envelope_around_body() {
+        let md = "# Hello\n\nbody\n";
+        let bytes = render_markdown_to_docx(md, None).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut document = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut document).unwrap();
+        assert_eq!(document, document_xml(&build_body(md, None)));
+        let src = include_str!("docx.rs");
+        assert_eq!(src.matches(concat!("<w:document", " xmlns:w=")).count(), 1);
     }
 
     /// Full pull-parse of the XML: any imbalance or bad escape fails here, which
