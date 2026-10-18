@@ -16,11 +16,11 @@ unmaintained = "workspace"
 # this lot. Revisit at the next dependency upgrade pass.
 ignore = [
     "RUSTSEC-2023-0071", # rsa (Marvin timing side-channel; used for JWT signing keys, no fix released)
-    # zip 2.4.2/3.0.0: only ZipArchive::extract and ZipStreamReader::extract are
-    # affected and neither is called (owner acceptance 2026-10-17, until BL-0058).
-    "RUSTSEC-2026-0367", # zip SUID/SGID bits kept on extract
-    "RUSTSEC-2026-0368", # zip symlink target escape on extract
-    "RUSTSEC-2026-0369", # zip permissions applied through symlinks on extract
+    # The direct zip is 9.x (SPEC-0036); these remain for the build time zip
+    # 3.0.0 that utoipa-swagger-ui unpacks its vendored Swagger UI with.
+    "RUSTSEC-2026-0367", # zip SUID/SGID bits kept on extract, utoipa-swagger-ui build dependency (until BL-0059)
+    "RUSTSEC-2026-0368", # zip symlink target escape on extract, utoipa-swagger-ui build dependency (until BL-0059)
+    "RUSTSEC-2026-0369", # zip permissions applied through symlinks on extract, utoipa-swagger-ui build dependency (until BL-0059)
 ]
 
 [licenses]

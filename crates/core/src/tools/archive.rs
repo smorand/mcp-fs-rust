@@ -283,10 +283,10 @@ fn join_entry_destination(dest: &str, rel_path: &str) -> String {
 /// and keeps the decoded bytes on [`DecodedEntry`] so the write pass
 /// (US-0009) never decodes twice.
 ///
-/// DRIFT-001 (resolved): the pinned `zip` 2.4.2 crate exposes entry name,
+/// DRIFT-001 (resolved): the pinned `zip` 9 crate exposes entry name,
 /// size and the `encrypted` flag without a password via
-/// `ZipArchive::by_index_raw` (`zip-2.4.2/src/read.rs:1097-1107`) backed by
-/// `ZipFileData::encrypted` (`zip-2.4.2/src/types.rs:440`); only decoding an
+/// `ZipArchive::by_index_raw` (`zip-9.0.5/src/read/zip_archive.rs:699`) and
+/// `ZipFile::encrypted` (`zip-9.0.5/src/read/zipfile.rs:167`); only decoding an
 /// encrypted entry's bytes needs the password. `FR-NEW-009` holds as
 /// written; no new requirement was needed.
 fn decode_archive(
@@ -392,9 +392,9 @@ fn ensure_entry_path_safe(raw: &str) -> Result<()> {
 /// decode every regular-file entry, surfacing a wrong password distinctly
 /// from a general corruption error (FR-NEW-011).
 ///
-/// DRIFT-002 (resolved): the pinned `zip` 2.4.2 crate exposes a native
-/// `ZipFile::is_symlink()` (`zip-2.4.2/src/read.rs:1746-1749`), itself built
-/// on `unix_mode()` (`zip-2.4.2/src/types.rs:555-562`, which reads
+/// DRIFT-002 (resolved): the pinned `zip` 9 crate exposes a native
+/// `ZipFile::is_symlink()` (`zip-9.0.5/src/read/zipfile.rs:191`), itself built
+/// on `unix_mode()` (`zip-9.0.5/src/read/zipfile.rs:208`, which reads
 /// `external_attributes >> 16` for `System::Unix`). The native method is
 /// used directly per US-0002's resolution note, rather than re-deriving the
 /// `S_IFLNK` bit-mask by hand.
@@ -1143,7 +1143,7 @@ mod tests {
     /// selects `ZipWriter::add_symlink` (native symlink entry, DRIFT-002) over
     /// a plain file entry: `unix_permissions` alone cannot do this, since it
     /// masks its argument with `& 0o777` and discards the `S_IFLNK` type bit
-    /// (`zip-2.4.2/src/write.rs:472-476`).
+    /// (`zip-9.0.5/src/write/options.rs:334-335`).
     fn build_zip_with_special_entry(
         good_name: &str,
         good_content: &[u8],
@@ -1648,10 +1648,10 @@ mod tests {
 
     /// Patches both the local file header's and the central directory
     /// record's declared uncompressed-size field to `declared`, leaving the
-    /// data (and `Stored` method's `compressed_size`, which bounds the
-    /// actual read per `zip-2.4.2/src/read.rs:347`) untouched: the archive
-    /// still decodes its full content, which is now larger than what it
-    /// declares (FR-NEW-020, E2E-NEW-026).
+    /// data (and `Stored` method's `compressed_size`) untouched: the content
+    /// is now larger than what it declares, and zip 9's reader refuses it at
+    /// the declared size (`zip-9.0.5/src/crc32.rs:44-50`, FR-NEW-020,
+    /// E2E-NEW-026).
     fn patch_zip_declared_size(bytes: &mut [u8], declared: u32) {
         let local = find_bytes(bytes, &[0x50, 0x4b, 0x03, 0x04]);
         bytes[local + 22..local + 26].copy_from_slice(&declared.to_le_bytes());

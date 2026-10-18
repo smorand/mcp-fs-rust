@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: one area (zip readers: 2 production sites, 7 test files), 6 requirements, no persisted change, one declared observable delta on archive entry names (Section 7)
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-18
 > Behavior change: BREAKING on `fs.extract_archive` entry name decoding and deduplication, and on compressed archive bytes of the zip writers, see Section 7
 > From backlog: BL-0058

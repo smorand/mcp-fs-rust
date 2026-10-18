@@ -10,7 +10,7 @@ ignore = [
     "RUSTSEC-2026-0253", # lru unsound pop, via tantivy 0.26.2 (no fix) and aws-sdk-s3 (until BL-0060)
     "RUSTSEC-2026-0002", # lru unsound IterMut, via aws-sdk-s3 (until BL-0060)
     "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained, via serde_yaml (until BL-0061)
-    "RUSTSEC-2026-0367", # zip SUID/SGID kept by ZipArchive::extract, never called here (until BL-0058)
-    "RUSTSEC-2026-0368", # zip symlink escape in ZipArchive::extract, never called, symlinks refused (until BL-0058)
-    "RUSTSEC-2026-0369", # zip permissions through symlinks in extract, never called here (until BL-0058)
+    "RUSTSEC-2026-0367", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
+    "RUSTSEC-2026-0368", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
+    "RUSTSEC-2026-0369", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
 ]

@@ -211,3 +211,29 @@ fn lockfile_and_graph_carry_zip_9_only_for_normal_dependencies() {
         assert!(line.starts_with("zip v9."), "non 9.x zip in the normal graph: {line}");
     }
 }
+
+/// SPEC-0036/DT-031: no comment still cites zip 2.4.2 source locations.
+#[test]
+fn archive_rs_cites_no_zip_2_4_2_source() {
+    let raw = fs::read_to_string(repo_root().join("crates/core/src/tools/archive.rs"))
+        .expect("archive.rs");
+    assert!(!raw.contains("zip-2.4.2"), "stale zip-2.4.2 citation in archive.rs");
+}
+
+/// SPEC-0036/DT-036: the three zip ids stay accepted only for the build time
+/// zip 3.0.0 of utoipa-swagger-ui, tracked by BL-0059.
+#[test]
+fn zip_acceptances_name_the_build_time_copy() {
+    for file in [".cargo/audit.toml", "deny.toml"] {
+        let raw = fs::read_to_string(repo_root().join(file)).expect(file);
+        assert!(!raw.contains("BL-0058"), "{file} still names BL-0058");
+        for id in ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"] {
+            let line =
+                raw.lines().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{file} lacks {id}"));
+            assert!(
+                line.contains("utoipa-swagger-ui") && line.contains("BL-0059"),
+                "{file}: {line}"
+            );
+        }
+    }
+}

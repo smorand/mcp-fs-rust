@@ -41,5 +41,5 @@
 | US-0039 | SPEC-0034 | The purge cycle runs the orphan sweep once a day | US-0038 | 2 | landed | story/US-0039-purge-cycle-runs-orphan-sweep-daily | story/US-0038-orphan-sweep-for-one-project |
 | US-0040 | SPEC-0035 | git2 0.21 and yoke-derive 0.8.4 with unchanged behavior | main | 2 | landed | story/US-0040-git2-021-and-yoke-derive-084 | main |
 | US-0041 | SPEC-0035 | Record the accepted advisories and drop the stale ignores | US-0040 | 2 | landed | story/US-0041-record-accepted-advisories | story/US-0040-git2-021-and-yoke-derive-084 |
-| US-0042 | SPEC-0036 | zip 9 with declared decoding, dedup and writer changes | main | 1 | done | story/US-0042-zip-9-upgrade | main |
-| US-0043 | SPEC-0036 | narrow the zip acceptances and drop stale citations | US-0042 | 2 | todo | | |
+| US-0042 | SPEC-0036 | zip 9 with declared decoding, dedup and writer changes | main | 1 | landed | story/US-0042-zip-9-upgrade | main |
+| US-0043 | SPEC-0036 | narrow the zip acceptances and drop stale citations | US-0042 | 2 | landed | story/US-0043-narrow-zip-acceptances | story/US-0042-zip-9-upgrade |
