@@ -374,6 +374,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dt_012_a_node_moved_without_a_row_is_still_listed_and_gets_one() {
+        let f = Fixture::new().await;
+        f.seed_project("proj-dt012", OWNER).await;
+        let client = f.state.stores.client("proj-dt012").await.unwrap();
+        client.write_text_atomic("/orphan.txt", "x").await.unwrap();
+        client.makedirs("/.mcp_trash", true).await.unwrap();
+        // A plain rename is the pre SPEC-0044 crash window: moved, never recorded.
+        client.rename("/orphan.txt", "/.mcp_trash/1700000000000__orphan.txt").await.unwrap();
+        let store = client.trash.as_ref().unwrap();
+        assert!(
+            store
+                .get_trash_entry_for_test("/.mcp_trash/1700000000000__orphan.txt")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let r = trash_list(&f.state, "proj-dt012", "", 200, 0).await.unwrap();
+        let entries = r["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["original_path"], "orphan.txt");
+        assert!(
+            store
+                .get_trash_entry_for_test("/.mcp_trash/1700000000000__orphan.txt")
+                .await
+                .unwrap()
+                .is_some(),
+            "the backfill recorded the row"
+        );
+    }
+
+    #[tokio::test]
     async fn backfill_is_idempotent() {
         let f = Fixture::new().await;
         f.seed_project("proj-backfill", OWNER).await;

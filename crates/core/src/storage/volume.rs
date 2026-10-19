@@ -4,7 +4,7 @@
 
 use crate::errors::{Result, ToolError};
 use crate::storage::meta::RelationalMetaStore;
-use crate::storage::traits::{BlobBackend, MODE_FILE, MetaBackend, NodeRow};
+use crate::storage::traits::{BlobBackend, MODE_FILE, MetaBackend, NodeRow, TrashEntry};
 use crate::util::PosixPath;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -207,6 +207,13 @@ impl VolumeClient {
 
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         self.meta.rename(src, dst).await
+    }
+
+    /// Rename and record the `trash_entries` row in one transaction (SPEC-0044
+    /// DR-001). Goes through `self.meta`, never `self.trash`: `trash` is only the
+    /// flag telling a caller whether to pass an entry at all.
+    pub async fn rename_into_trash(&self, src: &str, dst: &str, entry: &TrashEntry) -> Result<()> {
+        self.meta.rename_into_trash(src, dst, entry).await
     }
 
     /// Copy one file: metadata only, the blob is shared (refcount incremented).

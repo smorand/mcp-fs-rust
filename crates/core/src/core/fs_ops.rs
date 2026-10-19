@@ -1165,6 +1165,10 @@ fn trash_destination(trash_dir: &str, path: &str, now: f64) -> String {
 /// occupied (FR-NEW-005), leaving `src` untouched. Returns the destination that
 /// actually received `src`.
 ///
+/// With `trash` set, every attempt is one `rename_into_trash` transaction, so the
+/// `trash_entries` row exists exactly when the move does and a refused attempt
+/// leaves neither (SPEC-0044 DR-002, DR-006).
+///
 /// Time complexity: O(k) `rename` calls, k <= 51 in the worst case (one bare
 /// attempt plus 50 suffixed retries), each itself O(subtree size) for a
 /// directory. Space: O(1) beyond the formatted candidate path.
@@ -1172,17 +1176,24 @@ pub(crate) async fn rename_with_collision_retry(
     client: &VolumeClient,
     src: &str,
     dst: &str,
+    trash: Option<&crate::storage::traits::TrashEntry>,
 ) -> Result<String> {
     const MAX_RETRIES: u32 = 50;
-    match client.rename(src, dst).await {
-        Ok(()) => return Ok(dst.to_string()),
+    let attempt = |to: String| async move {
+        match trash {
+            Some(entry) => client.rename_into_trash(src, &to, entry).await,
+            None => client.rename(src, &to).await,
+        }
+        .map(|()| to)
+    };
+    match attempt(dst.to_string()).await {
+        Ok(done) => return Ok(done),
         Err(e) if e.code == crate::errors::code::NO_CLOBBER => {}
         Err(e) => return Err(e),
     }
     for n in 1..=MAX_RETRIES {
-        let candidate = format!("{dst}~{n}");
-        match client.rename(src, &candidate).await {
-            Ok(()) => return Ok(candidate),
+        match attempt(format!("{dst}~{n}")).await {
+            Ok(done) => return Ok(done),
             Err(e) if e.code == crate::errors::code::NO_CLOBBER => continue,
             Err(e) => return Err(e),
         }
@@ -1261,20 +1272,17 @@ async fn delete_path_at(
         let dst = trash_destination(&safety.config().trash_dir, norm, now);
         let parent = &dst[..dst.rfind('/').unwrap_or(0)];
         client.makedirs(parent, true).await?;
-        let dst = rename_with_collision_retry(client, norm, &dst).await?;
-        if let Some(store) = &client.trash {
-            tracing::debug!(trash_path = %dst, original_path = norm, "trash_entries insert");
-            store
-                .record_trash_entry(
-                    &dst,
-                    norm,
-                    node.size,
-                    &node.kind,
-                    &crate::util::now_iso(),
-                    Some(person),
-                )
-                .await?;
-        }
+        // Present only when a trash store is attached, so a client built without
+        // one keeps its plain rename (SPEC-0044 DEC-002).
+        let entry = client.trash.as_ref().map(|_| crate::storage::traits::TrashEntry {
+            original_path: norm.to_string(),
+            size: node.size,
+            kind: node.kind.clone(),
+            deleted_at: crate::util::now_iso(),
+            deleted_by: Some(person.to_string()),
+        });
+        let dst = rename_with_collision_retry(client, norm, &dst, entry.as_ref()).await?;
+        tracing::debug!(trash_path = %dst, original_path = norm, "trash_entries written with the rename");
         Some(dst)
     };
     let detail = match &destination {
@@ -3316,7 +3324,9 @@ mod tests {
             calls: calls.clone(),
         };
         let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
-        let e = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/x").await.unwrap_err();
+        let e = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/x", None)
+            .await
+            .unwrap_err();
         assert_eq!(e.code, code::INTERNAL_ERROR);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry on a non-collision error");
     }
@@ -3402,10 +3412,174 @@ mod tests {
             calls: calls.clone(),
         };
         let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
-        let e =
-            rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst").await.unwrap_err();
+        let e = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst", None)
+            .await
+            .unwrap_err();
         assert_eq!(e.code, code::INTERNAL_ERROR);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "aborts after exactly one retry attempt");
+    }
+
+    // ── SPEC-0044 US-0053: soft delete uses the joint rename and trash entry ───
+
+    fn dt_entry(original: &str) -> crate::storage::traits::TrashEntry {
+        crate::storage::traits::TrashEntry {
+            original_path: original.to_string(),
+            size: 1,
+            kind: "file".to_string(),
+            deleted_at: "2026-10-19T00:00:00Z".to_string(),
+            deleted_by: Some("ada".to_string()),
+        }
+    }
+
+    /// Records, per transaction, which statements ran in it.
+    struct RecordingDb {
+        inner: Arc<dyn crate::storage::rel::RelationalDb>,
+        log: Arc<StdMutex<Vec<(usize, String)>>>,
+        next: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::storage::rel::RelationalDb for RecordingDb {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+        async fn execute(&self, q: &crate::storage::rel::Query) -> Result<u64> {
+            self.inner.execute(q).await
+        }
+        async fn query(
+            &self,
+            q: &crate::storage::rel::Query,
+        ) -> Result<Vec<crate::storage::rel::RowValues>> {
+            self.inner.query(q).await
+        }
+        async fn begin(&self) -> Result<Box<dyn crate::storage::rel::RelationalTx>> {
+            let tx = self.inner.begin().await?;
+            let id = self.next.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(RecordingTx { inner: tx, id, log: self.log.clone() }))
+        }
+        async fn migrate(&self, schema: &crate::storage::rel::SchemaSet) -> Result<()> {
+            self.inner.migrate(schema).await
+        }
+    }
+
+    struct RecordingTx {
+        inner: Box<dyn crate::storage::rel::RelationalTx>,
+        id: usize,
+        log: Arc<StdMutex<Vec<(usize, String)>>>,
+    }
+
+    #[async_trait]
+    impl crate::storage::rel::RelationalTx for RecordingTx {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+        async fn execute(&mut self, q: &crate::storage::rel::Query) -> Result<u64> {
+            self.log.lock().unwrap().push((self.id, q.sql.clone()));
+            self.inner.execute(q).await
+        }
+        async fn query(
+            &mut self,
+            q: &crate::storage::rel::Query,
+        ) -> Result<Vec<crate::storage::rel::RowValues>> {
+            self.inner.query(q).await
+        }
+        async fn commit(self: Box<Self>) -> Result<()> {
+            self.inner.commit().await
+        }
+    }
+
+    #[tokio::test]
+    async fn dt_002_soft_delete_moves_and_records_in_one_transaction() {
+        let real: Arc<dyn crate::storage::rel::RelationalDb> =
+            Arc::new(crate::storage::rel::SqliteRelationalDb::open_in_memory().unwrap());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let db: Arc<dyn crate::storage::rel::RelationalDb> =
+            Arc::new(RecordingDb { inner: real, log: log.clone(), next: Arc::default() });
+        let meta = Arc::new(RelationalMetaStore::open(db, "p").await.unwrap());
+        let d = tempfile::tempdir().unwrap();
+        let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
+        let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta);
+        let s = SafetyManager::new(SafetyConfig::default(), None);
+        s.attach_no_limits();
+        v.write_text_atomic("/a.txt", "x").await.unwrap();
+        log.lock().unwrap().clear();
+
+        delete_path(&v, &s, P, M, "/a.txt", false, true).await.unwrap();
+
+        let log = log.lock().unwrap();
+        let moved: Vec<usize> = log
+            .iter()
+            .filter(|(_, q)| q.contains("UPDATE nodes SET path"))
+            .map(|(i, _)| *i)
+            .collect();
+        let recorded: Vec<usize> = log
+            .iter()
+            .filter(|(_, q)| q.contains("INSERT INTO trash_entries"))
+            .map(|(i, _)| *i)
+            .collect();
+        assert_eq!(moved.len(), 1, "one node moved");
+        assert_eq!(recorded.len(), 1, "one row recorded");
+        assert_eq!(moved[0], recorded[0], "the move and the row share one transaction");
+    }
+
+    #[tokio::test]
+    async fn dt_007_a_collision_rolls_back_then_the_retry_records_its_own_row() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        f.v.write_text_atomic("/.mcp_trash/dst", "occupied").await.unwrap();
+        let store = f.v.trash.as_ref().unwrap();
+
+        let entry = dt_entry("/a.txt");
+        let dst = rename_with_collision_retry(&f.v, "/a.txt", "/.mcp_trash/dst", Some(&entry))
+            .await
+            .unwrap();
+        assert_eq!(dst, "/.mcp_trash/dst~1");
+        assert!(store.get_trash_entry_for_test("/.mcp_trash/dst").await.unwrap().is_none());
+        let row = store.get_trash_entry_for_test("/.mcp_trash/dst~1").await.unwrap().unwrap();
+        assert_eq!(row.original_path, "/a.txt");
+        assert_eq!(store.count_trash_entries_for_test().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn dt_008_exhaustion_leaves_the_source_and_no_row() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/x", "real").await.unwrap();
+        for n in 0..=50u32 {
+            let slot =
+                if n == 0 { "/.mcp_trash/s".to_string() } else { format!("/.mcp_trash/s~{n}") };
+            f.v.write_text_atomic(&slot, "occupied").await.unwrap();
+        }
+        let entry = dt_entry("/x");
+        let e = rename_with_collision_retry(&f.v, "/x", "/.mcp_trash/s", Some(&entry))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert!(f.v.exists("/x").await.unwrap(), "src untouched");
+        assert_eq!(f.v.trash.as_ref().unwrap().count_trash_entries_for_test().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dt_009_a_non_collision_error_aborts_the_joint_retry_loop() {
+        let f = fixture().await;
+        f.v.write_text_atomic("/a.txt", "x").await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ScriptedRenameMeta {
+            inner: f.v.meta.clone(),
+            script: StdMutex::new(VecDeque::from([
+                Some(code::NO_CLOBBER),
+                Some(code::INTERNAL_ERROR),
+            ])),
+            calls: calls.clone(),
+        };
+        let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
+        let entry = dt_entry("/a.txt");
+        let e = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst", Some(&entry))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, code::INTERNAL_ERROR);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no third attempt");
+        assert_eq!(f.v.trash.as_ref().unwrap().count_trash_entries_for_test().await.unwrap(), 0);
+        assert!(f.v.exists("/a.txt").await.unwrap());
     }
 
     #[tokio::test]
@@ -3419,7 +3593,8 @@ mod tests {
             calls: calls.clone(),
         };
         let client = VolumeClient::new("p", Arc::new(mock), f.v.blob.clone());
-        let dst = rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst2").await.unwrap();
+        let dst =
+            rename_with_collision_retry(&client, "/a.txt", "/.mcp_trash/dst2", None).await.unwrap();
         assert_eq!(dst, "/.mcp_trash/dst2");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry path stays dormant");
     }

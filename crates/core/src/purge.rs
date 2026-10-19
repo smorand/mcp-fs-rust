@@ -13,6 +13,7 @@ use crate::git::GitRepoStore;
 use crate::safety::SafetyManager;
 use crate::search::SearchBackend;
 use crate::storage::StoreManager;
+use crate::storage::traits::TrashEntry;
 use crate::storage::traits::{AdminBackend, BlobEntry};
 use crate::storage::volume::VolumeClient;
 use crate::util::now_unix;
@@ -77,34 +78,22 @@ async fn sweep_project_files_at(
         let dst = safety.trash_path(&node.path);
         let Some(slash) = dst.rfind('/') else { continue };
         let parent = &dst[..slash];
-        // One commit per file: any failure here (mkdir, rename, or the
-        // trash-entry insert) is swallowed so it never blocks or rolls back
-        // the files before or after it (DEC-013). A failed insert additionally
-        // renames the file back to its original path, so the rename and the
-        // insert still appear atomic to an external observer even though they
-        // are not one database transaction (SPEC-0011 US-0002's logged drift).
+        // One commit per file: any failure here (mkdir or the joint rename and
+        // trash entry write) is swallowed so it never blocks or rolls back the
+        // files before or after it (DEC-013). The rename and the row share one
+        // transaction (SPEC-0044), so a failure leaves the file where it was.
         if client.makedirs(parent, true).await.is_err() {
             continue;
         }
-        let final_dst = match rename_with_collision_retry(client, &node.path, &dst).await {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if let Some(store) = &client.trash {
-            let recorded = store
-                .record_trash_entry(
-                    &final_dst,
-                    &node.path,
-                    node.size,
-                    &node.kind,
-                    &crate::util::now_iso(),
-                    None,
-                )
-                .await;
-            if recorded.is_err() {
-                let _ = client.rename(&final_dst, &node.path).await;
-                continue;
-            }
+        let entry = client.trash.as_ref().map(|_| TrashEntry {
+            original_path: node.path.clone(),
+            size: node.size,
+            kind: node.kind.clone(),
+            deleted_at: crate::util::now_iso(),
+            deleted_by: None,
+        });
+        if rename_with_collision_retry(client, &node.path, &dst, entry.as_ref()).await.is_err() {
+            continue;
         }
         // DEC-002: the index follows the trash the same way `fs.delete` does,
         // but only when the project's mode is active; an index failure here is
@@ -1089,26 +1078,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_new_445_a_failed_trash_entries_insert_leaves_the_file_live() {
-        use crate::storage::meta::RelationalMetaStore;
-        use crate::storage::rel::SqliteRelationalDb;
-
-        let dir = tempfile::tempdir().unwrap();
-        let real_db: Arc<dyn RelationalDb> =
-            Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
-        let meta = Arc::new(RelationalMetaStore::open(real_db.clone(), "proj").await.unwrap());
-        let blob = Arc::new(LocalBlobStore::new(dir.path(), "mcpfs-test"));
-        let client = VolumeClient::new("proj", meta.clone(), blob);
-
-        let failing_db: Arc<dyn RelationalDb> = Arc::new(FailTrashInsertOnceDb {
-            inner: real_db,
-            armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            needle: "INSERT INTO trash_entries",
-            pass: Arc::default(),
-        });
-        let failing_trash = Arc::new(RelationalMetaStore::open(failing_db, "proj").await.unwrap());
-        let client = client.with_trash_store(failing_trash.clone());
-
+    async fn dt_010_a_failed_trash_entries_insert_leaves_the_file_live_and_unmoved() {
+        let (_d, meta, client, armed) = faulty_store("INSERT INTO trash_entries", 0).await;
+        let client = client.with_trash_store(meta.clone());
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         admin.create_project("proj", "owner@t.c").await.unwrap();
         let safety = SafetyManager::new(SafetyConfig::default(), None);
@@ -1117,15 +1089,45 @@ mod tests {
         client.write_text_atomic("/stale2.txt", "data").await.unwrap();
         meta.set_atime_for_test("/stale2.txt", now_unix() - 8.0 * DAY).await.unwrap();
         admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
+        let rev_before = meta.ensure_node_rev("/stale2.txt").await.unwrap();
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let purged = sweep_project_files(&client, &admin, &safety, "proj", None).await.unwrap();
         assert_eq!(purged, 0, "the per-file failure is isolated, matching purge.rs:26");
         assert!(client.exists("/stale2.txt").await.unwrap(), "the file remains live, not trashed");
         assert_eq!(
-            failing_trash.count_trash_entries_for_test().await.unwrap(),
-            0,
-            "no orphaned trash_entries row either"
+            meta.ensure_node_rev("/stale2.txt").await.unwrap(),
+            rev_before,
+            "the file never moved: a rename back would have stamped a new revision"
         );
+        let trash_root = format!("/{}", safety.config().trash_dir);
+        let moved: Vec<_> = meta
+            .subtree(&trash_root)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind != "dir")
+            .collect();
+        assert!(moved.is_empty(), "no file moved into the trash dir: {moved:?}");
+        assert_eq!(meta.count_trash_entries_for_test().await.unwrap(), 0, "no orphaned row");
+    }
+
+    #[tokio::test]
+    async fn dt_011_a_swept_file_gets_a_system_initiated_row_with_the_same_shape() {
+        let f = fixture().await;
+        seed_stale_file(&f, "/shape.txt", 4.0 * DAY).await;
+        f.admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
+
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
+        assert_eq!(purged, 1);
+
+        let trash_root = format!("/{}", f.safety.config().trash_dir);
+        let row = find_trash_row_for(&f, &trash_root, "/shape.txt").await;
+        assert_eq!((row.size, row.kind.as_str()), (4, "file"));
+        assert!(row.deleted_by.is_none());
+        assert!(f.meta.get("/shape.txt").await.unwrap().is_none(), "moved out of its place");
+        assert!(f.meta.get(&row.trash_path).await.unwrap().is_some(), "node sits at the row's key");
     }
 
     // ── SPEC-0044 US-0052: rename_into_trash is one transaction ───────────────

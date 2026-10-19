@@ -604,15 +604,11 @@ impl RelationalMetaStore {
         Ok(())
     }
 
-    /// Record a `trash_entries` row for a trash-destination rename that already
-    /// committed (SPEC-0011 US-0002, FR-NEW-002).
-    ///
-    /// Runs in its own transaction rather than the rename's: `rename_with_
-    /// collision_retry`'s signature is shared, trash-agnostic, and fixed
-    /// (`crates/core/src/core/fs_ops.rs`, reused by the purge sweep), so it only
-    /// knows how to retry [`MetaBackend::rename`] itself, which already commits on
-    /// its own. This is therefore a best-effort companion write immediately after a
-    /// successful rename, not a joint commit with it.
+    /// Record a `trash_entries` row on its own, outside any rename. Fixture helper
+    /// only (SPEC-0044 DR-004): production writes the row inside the rename's
+    /// transaction through [`MetaBackend::rename_into_trash`], and keeping this
+    /// compiled for tests alone stops the two step write coming back.
+    #[cfg(test)]
     pub(crate) async fn record_trash_entry(
         &self,
         trash_path: &str,
