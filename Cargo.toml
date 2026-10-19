@@ -5,7 +5,7 @@ members = ["crates/mcp-fs", "crates/core", "crates/agent"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94.1"
 license = "MIT"
 repository = "https://github.com/smorand/mcp-fs-rust"
 
@@ -97,7 +97,7 @@ bzip2 = "0.6"
 lzma-rs = "0.3"
 # `.7z` decompression. `sevenz-rust2`, not `sevenz-rust` (DEC-007: the latter has
 # an unmaintained advisory and its repository was deleted). Pinned under 0.21 to
-# stay within this workspace's 1.88 MSRV (0.21+ requires a newer rustc).
+# stay within this workspace's MSRV (0.21+ requires a newer rustc than 1.94.1).
 sevenz-rust2 = { version = "0.20", features = ["util", "aes256"] }
 tantivy = "0.26"
 # sqlite-vec is pre-v1: pinned exactly so an upstream breaking change cannot sneak in.

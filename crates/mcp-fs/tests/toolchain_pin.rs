@@ -29,3 +29,13 @@ fn toolchain_channel_matches_workspace_rust_version() {
 
     assert_eq!(channel, rust_version);
 }
+
+/// SPEC-0042/DT-001: the floor is 1.94.1, the least aws-sdk-s3 1.152.0 accepts.
+#[test]
+fn toolchain_channel_is_1_94_1() {
+    let raw = fs::read_to_string(repo_root().join("rust-toolchain.toml")).expect("toolchain");
+    assert!(
+        raw.lines().any(|l| l.trim() == "channel = \"1.94.1\""),
+        "channel is not 1.94.1: {raw}"
+    );
+}

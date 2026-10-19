@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item (toolchain floor), 1 module family of manifests, 0 source changes, no public contract change, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-19
 > Behavior change: none
 > From backlog: BL-0060

@@ -157,7 +157,6 @@ fn accepted_advisories_are_recorded_once_with_a_reason() {
         "RUSTSEC-2023-0071",
         "RUSTSEC-2024-0384",
         "RUSTSEC-2024-0436",
-        "RUSTSEC-2026-0002",
         "RUSTSEC-2026-0192",
         "RUSTSEC-2026-0253",
         "RUSTSEC-2026-0367",
@@ -285,4 +284,15 @@ fn old_yaml_crate_and_unsafe_libyaml_are_gone() {
 fn unsafe_libyaml_advisory_is_not_accepted() {
     let raw = fs::read_to_string(repo_root().join(".cargo/audit.toml")).expect(".cargo/audit.toml");
     assert!(!raw.contains("RUSTSEC-2024-0449"), "advisory still listed in .cargo/audit.toml");
+}
+
+/// SPEC-0042/DT-002: the lock holds the fixed aws-sdk-s3 and no lru 0.12.5.
+#[test]
+fn lock_has_fixed_aws_sdk_s3_and_no_lru_0_12_5() {
+    let raw = fs::read_to_string(repo_root().join("Cargo.lock")).expect("Cargo.lock");
+    let has = |name: &str, version: &str| {
+        raw.contains(&format!("name = \"{name}\"\nversion = \"{version}\"\n"))
+    };
+    assert!(has("aws-sdk-s3", "1.152.0"), "aws-sdk-s3 is not 1.152.0");
+    assert!(!has("lru", "0.12.5"), "lru 0.12.5 is still locked");
 }
