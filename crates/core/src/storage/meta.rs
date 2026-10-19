@@ -13,7 +13,7 @@ use crate::storage::rel::dialect::{Assign, ColumnType, Dialect, Upsert};
 use crate::storage::rel::schema::{Column, ColumnMigration, Index, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb, RelationalTx, RowValues, run_retrying};
 use crate::storage::traits::{
-    ExportLinkRow, MODE_DIR, MetaBackend, NodeRow, PutFileResult, TrashEntryRow,
+    ExportLinkRow, MODE_DIR, MetaBackend, NodeRow, PutFileResult, TrashEntry, TrashEntryRow,
 };
 use crate::util::{PosixPath, now_unix};
 use async_trait::async_trait;
@@ -1393,6 +1393,67 @@ fn trash_path_prefix_pattern(dialect: Dialect, prefix: &str) -> String {
     format!("{base}/%")
 }
 
+/// Move `src` (and its subtree) to `dst` inside the caller's transaction. Shared
+/// by `rename` and `rename_into_trash` so the move logic exists once (SPEC-0044
+/// DR-001). `pattern` is the escaped descendant `LIKE` pattern for `src`.
+async fn tx_rename(
+    tx: &mut dyn RelationalTx,
+    dialect: Dialect,
+    volume: &str,
+    src: &str,
+    dst: &str,
+    pattern: &str,
+) -> Result<()> {
+    // Shortest path first, so a parent is renamed before its children and no
+    // intermediate state collides with a row that has not moved yet.
+    let order = dialect.length_fn();
+    if !tx_exists(tx, volume, src).await? {
+        return Err(ToolError::not_found(format!("'{src}' not found")));
+    }
+    if tx_exists(tx, volume, dst).await? {
+        return Err(ToolError::no_clobber(format!("'{dst}' already exists")));
+    }
+    tx_ensure_parents(tx, dialect, volume, dst).await?;
+
+    let rows = tx
+        .query(
+            &Query::new(format!(
+                "SELECT path FROM nodes \
+                     WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\') \
+                     ORDER BY {order}(path)"
+            ))
+            .bind(volume)
+            .bind(src)
+            .bind(pattern),
+        )
+        .await?;
+    let paths: Vec<String> = rows.iter().map(|r| r.text(0)).collect::<Result<_>>()?;
+
+    for old in paths {
+        let new =
+            if old == src { dst.to_string() } else { format!("{}{}", dst, &old[src.len()..]) };
+        // A descendant grows by however much `dst` is longer than `src`, so
+        // it can overflow the column even though `dst` itself fitted. The
+        // whole rename is one transaction, so refusing here leaves the tree
+        // untouched rather than half moved.
+        ensure_storable_path(dialect, &new)?;
+        tx.execute(
+            &Query::new(
+                "UPDATE nodes SET path=?1, parent=?2, name=?3, rev=?4 \
+                     WHERE volume_id=?5 AND path=?6",
+            )
+            .bind(&new)
+            .bind(PosixPath::parent_of(&new))
+            .bind(PosixPath::name_of(&new))
+            .bind(new_rev())
+            .bind(volume)
+            .bind(&old),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Insert or overwrite one soft-delete record (SPEC-0011 US-0001, DEC-001).
 ///
 /// Takes the caller's open transaction instead of opening one, so US-0002's
@@ -1983,64 +2044,39 @@ impl MetaBackend for RelationalMetaStore {
 
     async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         let pattern = self.descendant_pattern(src);
-        // Shortest path first, so a parent is renamed before its children and no
-        // intermediate state collides with a row that has not moved yet.
-        let order = self.db.dialect().length_fn();
         let dialect = self.db.dialect();
         let volume = self.volume_id.clone();
         let (src, dst) = (src.to_string(), dst.to_string());
         run_retrying(&*self.db, move |tx| {
             let (volume, src, dst, pattern) =
                 (volume.clone(), src.clone(), dst.clone(), pattern.clone());
+            Box::pin(async move { tx_rename(tx, dialect, &volume, &src, &dst, &pattern).await })
+        })
+        .await
+    }
+
+    async fn rename_into_trash(&self, src: &str, dst: &str, entry: &TrashEntry) -> Result<()> {
+        let pattern = self.descendant_pattern(src);
+        let dialect = self.db.dialect();
+        let volume = self.volume_id.clone();
+        let (src, dst, entry) = (src.to_string(), dst.to_string(), entry.clone());
+        run_retrying(&*self.db, move |tx| {
+            let (volume, src, dst, pattern, entry) =
+                (volume.clone(), src.clone(), dst.clone(), pattern.clone(), entry.clone());
             Box::pin(async move {
-                if !tx_exists(tx, &volume, &src).await? {
-                    return Err(ToolError::not_found(format!("'{src}' not found")));
-                }
-                if tx_exists(tx, &volume, &dst).await? {
-                    return Err(ToolError::no_clobber(format!("'{dst}' already exists")));
-                }
-                tx_ensure_parents(tx, dialect, &volume, &dst).await?;
-
-                let rows = tx
-                    .query(
-                        &Query::new(format!(
-                            "SELECT path FROM nodes \
-                             WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\') \
-                             ORDER BY {order}(path)"
-                        ))
-                        .bind(&volume)
-                        .bind(&src)
-                        .bind(&pattern),
-                    )
-                    .await?;
-                let paths: Vec<String> = rows.iter().map(|r| r.text(0)).collect::<Result<_>>()?;
-
-                for old in paths {
-                    let new = if old == src {
-                        dst.clone()
-                    } else {
-                        format!("{}{}", dst, &old[src.len()..])
-                    };
-                    // A descendant grows by however much `dst` is longer than `src`, so
-                    // it can overflow the column even though `dst` itself fitted. The
-                    // whole rename is one transaction, so refusing here leaves the tree
-                    // untouched rather than half moved.
-                    ensure_storable_path(dialect, &new)?;
-                    tx.execute(
-                        &Query::new(
-                            "UPDATE nodes SET path=?1, parent=?2, name=?3, rev=?4 \
-                             WHERE volume_id=?5 AND path=?6",
-                        )
-                        .bind(&new)
-                        .bind(PosixPath::parent_of(&new))
-                        .bind(PosixPath::name_of(&new))
-                        .bind(new_rev())
-                        .bind(&volume)
-                        .bind(&old),
-                    )
-                    .await?;
-                }
-                Ok(())
+                // One transaction: the row exists exactly when the move does.
+                tx_rename(tx, dialect, &volume, &src, &dst, &pattern).await?;
+                insert_trash_entry(
+                    tx,
+                    &volume,
+                    &dst,
+                    &entry.original_path,
+                    entry.size,
+                    &entry.kind,
+                    &entry.deleted_at,
+                    entry.deleted_by.as_deref(),
+                )
+                .await
             })
         })
         .await

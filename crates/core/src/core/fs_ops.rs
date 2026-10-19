@@ -3157,7 +3157,7 @@ mod tests {
     /// Delegates every [`MetaBackend`] method to `inner`, except `rename`,
     /// which consults a queued script of outcomes: `None` delegates to
     /// `inner`, `Some(code)` returns a scripted error without touching
-    /// `inner`'s state. Used to assert `rename_with_collision_retry`'s call
+    /// `inner`'s state; `rename_into_trash` follows the same script. Used to assert `rename_with_collision_retry`'s call
     /// count and its strict ERR_NO_CLOBBER-only retry trigger (E2E-NEW-441,
     /// 449, 450).
     struct ScriptedRenameMeta {
@@ -3207,6 +3207,19 @@ mod tests {
             match next {
                 Some(Some(code)) => Err(ToolError::new(code, "scripted failure")),
                 _ => self.inner.rename(src, dst).await,
+            }
+        }
+        async fn rename_into_trash(
+            &self,
+            src: &str,
+            dst: &str,
+            entry: &crate::storage::traits::TrashEntry,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
+                Some(Some(code)) => Err(ToolError::new(code, "scripted failure")),
+                _ => self.inner.rename_into_trash(src, dst, entry).await,
             }
         }
         async fn touch_atime(&self, path: &str) -> Result<()> {

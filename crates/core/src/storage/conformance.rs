@@ -1117,6 +1117,40 @@ async fn trash_timestamps_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// SPEC-0044/DT-013: `rename_into_trash` moves the node and records its row
+/// together, and a refused move (occupied destination) leaves no row, on every engine.
+async fn rename_into_trash_is_atomic(engine: &Engine, tag: &str) -> Result<()> {
+    use crate::storage::traits::{MetaBackend, TrashEntry};
+    let who = engine.name();
+    let m = RelationalMetaStore::open(engine.db().await?, format!("{tag}-rit")).await?;
+    m.mkdirs("/.trash", true).await?;
+    m.put_file("/a.txt", None, 0, MODE_FILE).await?;
+    m.put_file("/b.txt", None, 0, MODE_FILE).await?;
+    let entry = |p: &str| TrashEntry {
+        original_path: p.to_string(),
+        size: 0,
+        kind: "file".to_string(),
+        deleted_at: "2026-10-19T00:00:00.000000+00:00".to_string(),
+        deleted_by: Some("ada".to_string()),
+    };
+
+    m.rename_into_trash("/a.txt", "/.trash/a", &entry("/a.txt")).await?;
+    assert!(m.get("/a.txt").await?.is_none(), "{who}: src moved");
+    assert!(m.get("/.trash/a").await?.is_some(), "{who}: dst present");
+    let row = m.get_trash_entry("/.trash/a").await?.expect("row recorded with the move");
+    assert_eq!(row.original_path, "/a.txt", "{who}: row names the original path");
+
+    // Occupied destination: refused, and neither the node nor a row changes.
+    let err = m.rename_into_trash("/b.txt", "/.trash/a", &entry("/b.txt")).await.unwrap_err();
+    assert_eq!(err.code, crate::errors::code::NO_CLOBBER, "{who}: collision code");
+    assert!(m.get("/b.txt").await?.is_some(), "{who}: src untouched after the refusal");
+    let kept = m.get_trash_entry("/.trash/a").await?.unwrap();
+    assert_eq!(kept.original_path, "/a.txt", "{who}: dst row not overwritten");
+    let (_, total) = m.list_trash_entries_page("", 10, 0).await?;
+    assert_eq!(total, 1, "{who}: the refused move recorded no row");
+    Ok(())
+}
+
 // ── the suite ───────────────────────────────────────────────────────────────────
 
 async fn run_suite(engine: &Engine) -> Result<()> {
@@ -1140,6 +1174,7 @@ async fn run_suite(engine: &Engine) -> Result<()> {
     doc_artifacts_round_trip(engine, &tag).await?;
     meta_schema_applies_twice(engine, &tag).await?;
     trash_timestamps_round_trip(engine, &tag).await?;
+    rename_into_trash_is_atomic(engine, &tag).await?;
     Ok(())
 }
 

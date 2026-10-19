@@ -57,6 +57,20 @@ pub struct TrashEntryRow {
     pub deleted_by: Option<String>,
 }
 
+/// What `MetaBackend::rename_into_trash` records for a soft delete (SPEC-0044
+/// DR-001). The row's `trash_path` is the destination of the rename itself, so
+/// it is not a field here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrashEntry {
+    pub original_path: String,
+    pub size: i64,
+    /// "dir" | "file"
+    pub kind: String,
+    /// RFC3339.
+    pub deleted_at: String,
+    pub deleted_by: Option<String>,
+}
+
 /// One pending zip export link (SPEC-0012 US-0001, FR-NEW-015).
 ///
 /// A server-side record, not a stateless signed token (DEC-008): the blob
@@ -207,6 +221,12 @@ pub trait MetaBackend: Send + Sync {
     async fn mkdir(&self, path: &str) -> Result<()>;
     async fn rmdir(&self, path: &str) -> Result<()>;
     async fn rename(&self, src: &str, dst: &str) -> Result<()>;
+
+    /// Rename `src` to `dst` and insert the `trash_entries` row for `dst` in ONE
+    /// transaction (SPEC-0044 DR-001): a failure of either undoes both, so a crash
+    /// can never leave a trashed node without its row. Required, with no default,
+    /// so a store cannot silently skip the row (DEC-004).
+    async fn rename_into_trash(&self, src: &str, dst: &str, entry: &TrashEntry) -> Result<()>;
 
     /// Bump `atime` to now. Best-effort only: the caller (`VolumeClient::touch_atime`)
     /// runs this detached and logs rather than surfaces a failure (US-0003, DEC-010).

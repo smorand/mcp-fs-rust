@@ -972,6 +972,15 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(crate::errors::ToolError::no_clobber("simulated collision"))
         }
+        async fn rename_into_trash(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _entry: &crate::storage::traits::TrashEntry,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::errors::ToolError::no_clobber("simulated collision"))
+        }
         async fn touch_atime(&self, path: &str) -> Result<()> {
             self.inner.touch_atime(path).await
         }
@@ -1016,6 +1025,11 @@ mod tests {
     struct FailTrashInsertOnceDb {
         inner: Arc<dyn RelationalDb>,
         armed: Arc<std::sync::atomic::AtomicBool>,
+        /// Statement fragment that triggers the failure (`INSERT INTO trash_entries`
+        /// for E2E-NEW-445, `UPDATE nodes` for SPEC-0044 DT-004).
+        needle: &'static str,
+        /// Matching statements to let through before the one that fails.
+        pass: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -1031,7 +1045,12 @@ mod tests {
         }
         async fn begin(&self) -> Result<Box<dyn RelationalTx>> {
             let tx = self.inner.begin().await?;
-            Ok(Box::new(FailTrashInsertOnceTx { inner: tx, armed: self.armed.clone() }))
+            Ok(Box::new(FailTrashInsertOnceTx {
+                inner: tx,
+                armed: self.armed.clone(),
+                needle: self.needle,
+                pass: self.pass.clone(),
+            }))
         }
         async fn migrate(&self, schema: &crate::storage::rel::SchemaSet) -> Result<()> {
             self.inner.migrate(schema).await
@@ -1041,6 +1060,8 @@ mod tests {
     struct FailTrashInsertOnceTx {
         inner: Box<dyn RelationalTx>,
         armed: Arc<std::sync::atomic::AtomicBool>,
+        needle: &'static str,
+        pass: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -1049,10 +1070,13 @@ mod tests {
             self.inner.dialect()
         }
         async fn execute(&mut self, query: &Query) -> Result<u64> {
-            if query.sql.contains("INSERT INTO trash_entries")
-                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(ToolError::internal("simulated trash_entries insert failure"));
+            use std::sync::atomic::Ordering::SeqCst;
+            if query.sql.contains(self.needle) && self.armed.load(SeqCst) {
+                if self.pass.load(SeqCst) > 0 {
+                    self.pass.fetch_sub(1, SeqCst);
+                } else if self.armed.swap(false, SeqCst) {
+                    return Err(ToolError::internal("simulated statement failure"));
+                }
             }
             self.inner.execute(query).await
         }
@@ -1079,6 +1103,8 @@ mod tests {
         let failing_db: Arc<dyn RelationalDb> = Arc::new(FailTrashInsertOnceDb {
             inner: real_db,
             armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            needle: "INSERT INTO trash_entries",
+            pass: Arc::default(),
         });
         let failing_trash = Arc::new(RelationalMetaStore::open(failing_db, "proj").await.unwrap());
         let client = client.with_trash_store(failing_trash.clone());
@@ -1100,6 +1126,125 @@ mod tests {
             0,
             "no orphaned trash_entries row either"
         );
+    }
+
+    // ── SPEC-0044 US-0052: rename_into_trash is one transaction ───────────────
+
+    /// A store over a database that fails the `n`th-plus-one statement matching
+    /// `needle` once armed, plus the handle that arms it and a client for seeding.
+    async fn faulty_store(
+        needle: &'static str,
+        pass: usize,
+    ) -> (
+        tempfile::TempDir,
+        Arc<RelationalMetaStore>,
+        VolumeClient,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::storage::rel::SqliteRelationalDb;
+        let dir = tempfile::tempdir().unwrap();
+        let real: Arc<dyn RelationalDb> = Arc::new(SqliteRelationalDb::open_in_memory().unwrap());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db: Arc<dyn RelationalDb> = Arc::new(FailTrashInsertOnceDb {
+            inner: real,
+            armed: armed.clone(),
+            needle,
+            pass: Arc::new(std::sync::atomic::AtomicUsize::new(pass)),
+        });
+        let meta = Arc::new(RelationalMetaStore::open(db, "proj").await.unwrap());
+        let blob = Arc::new(LocalBlobStore::new(dir.path(), "mcpfs-test"));
+        let client = VolumeClient::new("proj", meta.clone(), blob);
+        (dir, meta, client, armed)
+    }
+
+    fn entry_for(original: &str, size: i64, kind: &str) -> crate::storage::traits::TrashEntry {
+        crate::storage::traits::TrashEntry {
+            original_path: original.to_string(),
+            size,
+            kind: kind.to_string(),
+            deleted_at: "2026-10-19T00:00:00Z".to_string(),
+            deleted_by: Some("ada".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn dt_003_insert_failure_undoes_the_rename() {
+        let (_d, meta, client, armed) = faulty_store("INSERT INTO trash_entries", 0).await;
+        client.write_text_atomic("/a.txt", "x").await.unwrap();
+        client.makedirs("/.mcp_trash", true).await.unwrap();
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let r = meta
+            .rename_into_trash("/a.txt", "/.mcp_trash/x", &entry_for("/a.txt", 1, "file"))
+            .await;
+        let e = r.unwrap_err();
+        assert!(
+            e.message.contains("simulated statement failure"),
+            "the insert ran and failed: {e}"
+        );
+        assert!(client.exists("/a.txt").await.unwrap(), "src is still live");
+        assert!(!client.exists("/.mcp_trash/x").await.unwrap(), "nothing at dst");
+        assert_eq!(meta.count_trash_entries_for_test().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dt_004_rename_failure_leaves_no_row() {
+        // Let the parent's UPDATE through, fail the next descendant's.
+        let (_d, meta, client, armed) = faulty_store("UPDATE nodes SET path", 1).await;
+        for f in ["/d/1.txt", "/d/2.txt", "/d/3.txt"] {
+            client.write_text_atomic(f, "x").await.unwrap();
+        }
+        client.makedirs("/.mcp_trash", true).await.unwrap();
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let r = meta.rename_into_trash("/d", "/.mcp_trash/d", &entry_for("/d", 0, "dir")).await;
+        let e = r.unwrap_err();
+        assert!(
+            e.message.contains("simulated statement failure"),
+            "the UPDATE failed mid tree: {e}"
+        );
+        for p in ["/d", "/d/1.txt", "/d/2.txt", "/d/3.txt"] {
+            assert!(client.exists(p).await.unwrap(), "{p} did not move");
+        }
+        assert!(!client.exists("/.mcp_trash/d").await.unwrap(), "no half moved tree");
+        assert_eq!(meta.count_trash_entries_for_test().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dt_005_success_is_visible_together() {
+        let f = fixture().await;
+        f.client.write_text_atomic("/a.txt", "x").await.unwrap();
+        f.client.makedirs("/.mcp_trash", true).await.unwrap();
+        let entry = entry_for("/a.txt", 1, "file");
+        f.meta.rename_into_trash("/a.txt", "/.mcp_trash/x", &entry).await.unwrap();
+
+        assert!(!f.client.exists("/a.txt").await.unwrap());
+        assert!(f.client.exists("/.mcp_trash/x").await.unwrap());
+        let row = f.meta.get_trash_entry_for_test("/.mcp_trash/x").await.unwrap().unwrap();
+        assert_eq!(row.original_path, entry.original_path);
+        assert_eq!((row.size, row.kind.as_str()), (1, "file"));
+        assert_eq!(row.deleted_at, entry.deleted_at);
+        assert_eq!(row.deleted_by.as_deref(), Some("ada"));
+    }
+
+    #[tokio::test]
+    async fn dt_006_directory_move_writes_one_row() {
+        let f = fixture().await;
+        for p in ["/d/1.txt", "/d/2.txt", "/d/3.txt"] {
+            f.client.write_text_atomic(p, "x").await.unwrap();
+        }
+        f.client.makedirs("/.mcp_trash", true).await.unwrap();
+        f.meta.rename_into_trash("/d", "/.mcp_trash/d", &entry_for("/d", 0, "dir")).await.unwrap();
+
+        for p in
+            ["/.mcp_trash/d", "/.mcp_trash/d/1.txt", "/.mcp_trash/d/2.txt", "/.mcp_trash/d/3.txt"]
+        {
+            assert!(f.client.exists(p).await.unwrap(), "{p} moved");
+        }
+        assert!(!f.client.exists("/d").await.unwrap());
+        assert_eq!(f.meta.count_trash_entries_for_test().await.unwrap(), 1);
+        let row = f.meta.get_trash_entry_for_test("/.mcp_trash/d").await.unwrap().unwrap();
+        assert_eq!(row.kind, "dir");
     }
 
     /// Backdates `proj`'s `created_at` to `now - age_seconds`, so a project-sweep
@@ -1616,6 +1761,19 @@ mod tests {
                 )));
             }
             self.inner.rename(src, dst).await
+        }
+        async fn rename_into_trash(
+            &self,
+            src: &str,
+            dst: &str,
+            entry: &crate::storage::traits::TrashEntry,
+        ) -> Result<()> {
+            if src == self.fail_path {
+                return Err(crate::errors::ToolError::internal(format!(
+                    "simulated locked row for '{src}'"
+                )));
+            }
+            self.inner.rename_into_trash(src, dst, entry).await
         }
         async fn touch_atime(&self, path: &str) -> Result<()> {
             self.inner.touch_atime(path).await

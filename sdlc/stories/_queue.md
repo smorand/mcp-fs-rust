@@ -51,6 +51,6 @@
 | US-0049 | SPEC-0041 | refuse inconsistent documents on text extraction and conversion | US-0048 | 1 | landed | story/US-0049-refuse-inconsistent-documents | story/US-0048-refuse-inconsistent-zip-extraction |
 | US-0050 | SPEC-0042 | move the toolchain to 1.94.1 and lock aws-sdk-s3 1.152.0 | main | 2 | landed | story/US-0050-rust-toolchain-1-94 | main |
 | US-0051 | SPEC-0043 | send the Accept header on the full-stack e2e MCP calls | main | 2 | landed | story/US-0051-full-stack-e2e-accept-header | main |
-| US-0052 | SPEC-0044 | add the joint rename and trash entry operation | main | 2 | todo | | |
-| US-0053 | SPEC-0044 | route soft delete and purge through the joint operation | US-0052 | 2 | todo | | |
+| US-0052 | SPEC-0044 | add the joint rename and trash entry operation | main | 2 | landed | story/US-0052-joint-rename-trash-entry | main |
+| US-0053 | SPEC-0044 | route soft delete and purge through the joint operation | US-0052 | 2 | done | story/US-0052-joint-rename-trash-entry | main |
 | US-0054 | SPEC-0044 | seal the old write path and document it | US-0053 | 2 | todo | | |
