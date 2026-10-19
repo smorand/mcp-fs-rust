@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item (toolchain floor), 1 module family of manifests, 0 source changes, no public contract change, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-19
 > Behavior change: none
 > From backlog: BL-0060
@@ -110,3 +110,24 @@ None (no public contract).
 | 1 | 0 | 0 | IMPLEMENTABLE (inline checklist, all citations opened, counts recounted 2026-10-19) |
 
 **Amendments applied:** none.
+
+## Design additions (2026-10-19)
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `Cargo.toml` | modify `:8`, `:100` | DR-001 | US-0050 |
+| `rust-toolchain.toml` | modify `:2` | DR-001 | US-0050 |
+| `Cargo.lock` | regenerate | DR-002 | US-0050 |
+| `.cargo/audit.toml` | modify `:10-11` | DR-003 | US-0050 |
+| `crates/mcp-fs/tests/security_gate.rs` | modify `:160`, add DT-002 | DR-002, DR-003 | US-0050 |
+| `crates/mcp-fs/tests/toolchain_pin.rs` | add DT-001 | DR-001 | US-0050 |
+| `.agent_docs/testing.md` or `AGENTS.md` | note the 1.94.1 floor only if either names the old one (`rg 1\.88` found neither) | n/a | US-0050 |
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 | integration | direct file read | `crates/mcp-fs/tests/toolchain_pin.rs` | US-0050 |
+| DT-002 | integration | direct file read | `crates/mcp-fs/tests/security_gate.rs` | US-0050 |
+| DT-003 | functional e2e | existing suite | `make test-e2e-full` | US-0050 |
+
+- **DEC-003:** one story for the whole spec. **Obliged by:** DR-001..DR-004. **Rationale:** steps 1 to 3 of Section 9 cannot land separately on a green main (the audit list test and the lock must move together; the pin test DT-001 fails between step 1 and the new floor otherwise); 5 files fits tier 2. **Alternatives considered:** four stories along Section 9 (rejected: each intermediate state fails `make check`). **Source:** design. **Evidence:** `crates/mcp-fs/tests/security_gate.rs:150-168`.

@@ -49,3 +49,4 @@
 | US-0047 | SPEC-0040 | replace serde_yaml with serde_norway | main | 2 | landed | story/US-0047-replace-serde-yaml | main |
 | US-0048 | SPEC-0041 | refuse inconsistent zips on archive extraction | main | 1 | landed | story/US-0048-refuse-inconsistent-zip-extraction | main |
 | US-0049 | SPEC-0041 | refuse inconsistent documents on text extraction and conversion | US-0048 | 1 | landed | story/US-0049-refuse-inconsistent-documents | story/US-0048-refuse-inconsistent-zip-extraction |
+| US-0050 | SPEC-0042 | move the toolchain to 1.94.1 and lock aws-sdk-s3 1.152.0 | main | 2 | todo | | |
