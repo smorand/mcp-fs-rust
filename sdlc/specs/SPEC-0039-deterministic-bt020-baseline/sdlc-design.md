@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one test function (`others_untouched`, `crates/core/src/tools/project_removal_e2e.rs:764-782`), one file, no production code, no contract, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-18
 > Behavior change: none
 > From backlog: BL-0065 (filed as `BUG (test only)`; routed DEBT by owner decision 2026-10-18: no product authority is violated, the test's timing assumption is)
@@ -99,3 +99,26 @@ None.
 | 1 | 0 | 0 | IMPLEMENTABLE (inline, depth S): exact old and new forms; count 2 justified by cited seed and status sum; mutation procedure literal; one declared test edit; no open question; EARS clean; G13 not triggered; citations opened (`project_removal_e2e.rs:161`, `:228-247`, `:281-283`, `:750-782`, `:788`, `:794`, `indexer.rs:113-124`, `:199-247`) |
 
 **Amendments applied:** none.
+
+## Design additions (2026-10-19)
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/tools/project_removal_e2e.rs` | `others_untouched` wait; `settled_snapshot` removed | DR-001, DR-002 | US-0046 |
+| `crates/core/src/search/indexer.rs` | temporary delay for DT-001 only, never committed | DEC-002 | US-0046 |
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 | integration (mutation) | the two BT-020 tests under a 1 s indexing delay | `project_removal_e2e.rs:788`, `:794` | US-0046 |
+| DT-002 | structural | `rg` on the test file | shell evidence in the commit body | US-0046 |
+| DT-003 | guardrail | full suite | `make check` | US-0046 |
+
+### Additional decisions
+- **DEC-003:** One story at `min_tier: 2`. **Obliged by:** SPEC-0039/DR-001..DR-003. **Rationale:** one committed file, one function; not divisible. **Alternatives considered:** none viable. **Source:** design. **Evidence:** table above.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0046 | BT-020 waits for indexing before its baseline | P1 | DR-001, DR-002, DR-003 | main | 2 | yes |
