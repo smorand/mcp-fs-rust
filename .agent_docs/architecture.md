@@ -213,6 +213,13 @@ path}`, which keeps the blob and its refcount untouched. A hard delete
 `ERR_NOT_SUPPORTED`; it removes the nodes and deletes every blob whose refcount
 reached 0.
 
+Soft delete and the purge sweep move the node and write its `trash_entries` row in ONE
+transaction (`MetaBackend::rename_into_trash`, SPEC-0044, 2026-10-19), so a crash never leaves a
+trashed file untracked; `rename_with_collision_retry` calls it once per `dst`/`dst~n` attempt and a
+refused attempt rolls back both. `record_trash_entry` is `#[cfg(test)]` (fixtures only) and a
+structural test (DT-001) fails if production code calls it. The lazy backfill (FR-NEW-011) remains
+for legacy untracked nodes.
+
 ## Project removal (SPEC-0024, 2026-10-13)
 
 `purge::remove_project` is the ONE permanent removal, called by `admin.delete_project`

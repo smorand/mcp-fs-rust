@@ -3488,6 +3488,22 @@ mod tests {
         }
     }
 
+    /// SPEC-0044/DT-001: the two step write (rename, then a separate row insert)
+    /// cannot come back in production code. Everything before each file's tests
+    /// module is production.
+    #[test]
+    fn dt_001_production_code_never_records_a_trash_entry_on_its_own() {
+        for (name, src) in
+            [("fs_ops.rs", include_str!("fs_ops.rs")), ("purge.rs", include_str!("../purge.rs"))]
+        {
+            let production = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(
+                !production.contains("record_trash_entry"),
+                "{name}: production code must use rename_into_trash, not record_trash_entry"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dt_002_soft_delete_moves_and_records_in_one_transaction() {
         let real: Arc<dyn crate::storage::rel::RelationalDb> =

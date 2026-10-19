@@ -76,7 +76,8 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `export:` without `export_links`, local `.tmp-*`), older than 24 h, re checked just before each
   delete, behind a 10% breaker; `git:` keys are never touched (SPEC-0034). Also
   writes/reconciles `trash_entries` rows as files move through soft-delete, backfill and permanent
-  removal, the same bookkeeping `tools/trash.rs` reads (SPEC-0011).
+  removal, the same bookkeeping `tools/trash.rs` reads (SPEC-0011). A soft delete writes its row in
+  the rename's own transaction (`MetaBackend::rename_into_trash`, SPEC-0044); never rename then insert.
 - `app.rs` : axum Router assembly, shared state, the MCP route (an `rmcp` `StreamableHttpService`
   wrapping `mcp::server::McpServer`, `LocalSessionManager` + `legacy_session_mode: true` so
   `initialize` is mandatory; see `.agent_docs/architecture.md` for the exact wire shapes), `/health`.

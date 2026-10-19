@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 3 modules (`storage/meta`, `core/fs_ops`, `purge`), 0 persisted change, 0 public contract change, 8 requirements. Counted L by the "3 or more modules" rule; one bounded context (trash recording).
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-20
 > Behavior change: none
 > From backlog: BL-0011

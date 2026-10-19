@@ -53,4 +53,4 @@
 | US-0051 | SPEC-0043 | send the Accept header on the full-stack e2e MCP calls | main | 2 | landed | story/US-0051-full-stack-e2e-accept-header | main |
 | US-0052 | SPEC-0044 | add the joint rename and trash entry operation | main | 2 | landed | story/US-0052-joint-rename-trash-entry | main |
 | US-0053 | SPEC-0044 | route soft delete and purge through the joint operation | US-0052 | 2 | landed | story/US-0052-joint-rename-trash-entry | main |
-| US-0054 | SPEC-0044 | seal the old write path and document it | US-0053 | 2 | done | story/US-0053-route-delete-and-purge-through-joint-op | story/US-0052-joint-rename-trash-entry |
+| US-0054 | SPEC-0044 | seal the old write path and document it | US-0053 | 2 | landed | story/US-0053-route-delete-and-purge-through-joint-op | story/US-0052-joint-rename-trash-entry |
