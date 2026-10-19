@@ -7,16 +7,16 @@ Created: 2026-09-21
 ---
 
 ## What
-A consolidated register of every way this server's git behaviour differs from ordinary git, so
-the set can be reviewed together rather than piecemeal: no index (the volume **is** the working
-tree), whole-volume commits instead of staged adds, pull refuses a dirty tree (no stash), no
-single-call discard ([[BL-0024]]), one global ours/theirs merge instead of real conflict
-resolution ([[BL-0021]]), no rebase/cherry-pick/revert/stash, one branch same-name push refspecs
-only ([[BL-0023]]), force push refused outright ([[BL-0018]]), exactly one remote named `origin`
-([[BL-0022]]), HTTPS-only transport, credentials-in-URL rejected, unknown host errors unless
-declared, one credential shape ([[BL-0025]]), no token refresh/rotation, no submodules, and a
-clone/pull atomicity asymmetry (clone tolerates per-file failure and reports `skipped`; pull is
-atomic).
+A consolidated register of the ways this server's git behaviour still differs from ordinary git, so
+the set can be reviewed together: no index (the volume **is** the working tree), whole-volume
+commits instead of staged adds, pull refuses a dirty tree, HTTPS-only transport, credentials-in-URL
+rejected, unknown host errors unless declared, one credential shape (token as password with the
+`oauth2` username), no token refresh/rotation, no submodules, and a clone/pull atomicity asymmetry
+(clone tolerates per-file failure and reports `skipped`; pull is atomic).
+
+Closed since this entry was written (audit 2026-10-19, SPEC-0012): per-file conflict resolution,
+rebase, cherry-pick, revert, stash, `git.reset` (hard covers discard), force push with lease,
+`remote_branch` on push, remote add/list/remove and remotes beyond `origin`, pull requests.
 
 ## Why
 Each divergence is individually justified, but nobody has reviewed the set as a whole, and

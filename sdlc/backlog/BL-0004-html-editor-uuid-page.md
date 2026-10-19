@@ -21,3 +21,6 @@ instead of going through the MCP tool surface or REST API directly.
 This project already has an `htmleditor` MCP server referenced elsewhere; check whether this
 reuses or wraps it rather than building a new editor. Needs a decision on how the UUID maps to
 `mount_id` + path, and whether the editor supports write-back or is read-only.
+
+## Current state (audit 2026-10-19)
+Partly there: the optional `doc.open_editor` tool (`crates/core/src/tools/editor.rs:1-15`, `:245`) spawns an inline editor on its own port, keyed by a fresh `uuid::Uuid::new_v4()` per open. Still missing: a page served by mcp-fs itself (`/app/...`), a stable per file address, the OAuth gate.
