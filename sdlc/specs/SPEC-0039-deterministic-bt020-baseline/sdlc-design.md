@@ -24,7 +24,7 @@
 ## 2. Perimeter: the Current State
 | File | Change | Occurrences |
 |---|---|---|
-| `crates/core/src/tools/project_removal_e2e.rs` | `others_untouched` `:772-775`: after the documentize loop, `f.await_indexed(OLIVIA, project, 2)` for each of `ATLAS`, `ATLAS2`, then `let before = snapshot(&f, ATLAS2).await;`; delete `settled_snapshot` `:750-762` (its only call site is `:775`) | 1 test body, 1 helper removed |
+| `crates/core/src/tools/project_removal_e2e.rs` | `others_untouched` `:772-775`: after the documentize loop, `f.await_indexed(OLIVIA, project, 3)` for each of `ATLAS`, `ATLAS2`, then `let before = snapshot(&f, ATLAS2).await;`; delete `settled_snapshot` `:750-762` (its only call site is `:775`) | 1 test body, 1 helper removed |
 
 **Non source occurrences:** none (`rg -n settled_snapshot` outside this file returns nothing).
 **Contracts touched:** none.
@@ -37,10 +37,10 @@ n/a.
 ## 4. Requirements (EARS)
 ### 4.1 Structural
 #### DR-001 [EARS-U]: Deterministic baseline
-> `others_untouched` SHALL call `f.await_indexed(OLIVIA, project, 2)` for each of `ATLAS` and `ATLAS2` after documentizing and before taking the `ATLAS2` baseline with `snapshot`.
+> `others_untouched` SHALL call `f.await_indexed(OLIVIA, project, 3)` for each of `ATLAS` and `ATLAS2` after documentizing, before taking the `ATLAS2` baseline with `snapshot`, and SHALL assert that baseline status holds `bm25_docs` 3.
 - **Old form:** `let before = settled_snapshot(&f, ATLAS2).await;`
-- **New form:** `for project in [ATLAS, ATLAS2] { f.await_indexed(OLIVIA, project, 2).await; }` then `let before = snapshot(&f, ATLAS2).await;`
-- **Why 2:** `/plan.txt` (seed leaves 1, `:283`) plus the `/memo.docx` companion; `await_indexed` sums `bm25_docs` and `vector_chunks` (`:228-231`).
+- **New form:** `for project in [ATLAS, ATLAS2] { f.await_indexed(OLIVIA, project, 3).await; }` then `let before = snapshot(&f, ATLAS2).await;` and `assert_eq!(before[2]["bm25_docs"], 3)`
+- **Why 3:** `/plan.txt` (seed leaves 1, `:283`), `/memo.docx` itself (its bytes `PK docx` are UTF-8, so the write hook indexes it, `:769`) and its Markdown companion; measured settled value 3 for both projects (owner amendment 2026-10-19, US-0046 evidence). `await_indexed` sums `bm25_docs` and `vector_chunks` (`:228-231`); counts only rise here, so exact 3 is the settled state.
 
 #### DR-002 [EARS-UB]: No heuristic settle
 > `project_removal_e2e.rs` SHALL NOT contain `settled_snapshot`.
@@ -74,8 +74,8 @@ None.
 ### 8.3 Structural and race tests
 #### DT-001: race reproduced, then closed
 - **Validates:** DR-001
-- **Method:** temporarily insert `tokio::time::sleep(std::time::Duration::from_secs(1)).await;` as the first statement of the task spawned in `ProjectIndexer::on_write`; run `cargo test -p mcp-fs-core --lib spec_0024_bt_020_other_projects_untouched` (with the PostgreSQL DSN, so `_pg` runs) on the old test, then on the new one; remove the delay and show `git diff -- crates/core/src/search/indexer.rs` empty.
-- **Red before the fix because:** with the delay the old test panics `atlas2 changed` (`:780`): the companion lands after the baseline. With the fix both tests pass under the same delay.
+- **Method:** temporarily insert `tokio::time::sleep(std::time::Duration::from_secs(1)).await;` as the first statement of the task spawned in `ProjectIndexer::on_write` (`indexer.rs:113-124`); with the new baseline assertion (`bm25_docs` 3) in place, run `cargo test -p mcp-fs-core --lib spec_0024_bt_020_other_projects_untouched` (PostgreSQL DSN set) with the old wait, then with the new wait; remove the delay and show `git diff -- crates/core/src/search/indexer.rs` empty.
+- **Red before the fix because:** with the delay and the old `settled_snapshot` wait the baseline reads `bm25_docs` 1, so `assert_eq!(before[2]["bm25_docs"], 3)` fails; with `await_indexed(..., 3)` both tests pass under the same delay. (The original `atlas2 changed` assertion cannot go red under a fixed delay: baseline and final read both precede the delayed writes, measured 2026-10-19.)
 
 #### DT-002: no heuristic left
 - **Validates:** DR-002, DR-001
@@ -88,7 +88,7 @@ None.
 ### 8.4 Existing tests to modify
 | Test file | Test | Change | Justification |
 |---|---|---|---|
-| `crates/core/src/tools/project_removal_e2e.rs` | `others_untouched` (body of `spec_0024_bt_020_other_projects_untouched_tantivy` and `_pg`) | wait mechanism before the baseline only; assertions `:779-781` unchanged | the heuristic wait is the defect (DBT-001) |
+| `crates/core/src/tools/project_removal_e2e.rs` | `others_untouched` (body of `spec_0024_bt_020_other_projects_untouched_tantivy` and `_pg`) | wait mechanism before the baseline, plus one added assertion that the baseline holds `bm25_docs` 3; assertions `:779-781` unchanged | the heuristic wait is the defect (DBT-001) |
 
 ## 9. Implementation order
 1. Delay mutation on, run old test: RED (DT-001). 2. Rewrite the wait (DR-001, DR-002); same delay: GREEN; delay removed. 3. 8.1 green. One story.
@@ -122,3 +122,6 @@ None.
 | Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
 |---|---|---|---|---|---|---|
 | US-0046 | BT-020 waits for indexing before its baseline | P1 | DR-001, DR-002, DR-003 | main | 2 | yes |
+
+## Amendment (2026-10-19, owner authorized)
+DR-001, DT-001, DT-002 and 8.4 corrected from 2 to 3 entries and given a baseline assertion, after US-0046 measured the settled count (3) and showed a fixed delay cannot turn `atlas2 changed` red (see `sdlc/stories/US-0046-bt020-deterministic-baseline.md`, Blocked).
