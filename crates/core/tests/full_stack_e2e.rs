@@ -61,6 +61,8 @@ use mcp_fs_core::keys;
 use mcp_fs_core::storage::rel::{PoolSettings, PostgresRelationalDb};
 use serde_json::{Value, json};
 
+/// rmcp answers 406 to a `/mcp` POST whose `Accept` lacks both media types.
+const MCP_ACCEPT: &str = "application/json, text/event-stream";
 const ADMIN: &str = "e2e-admin@mcp-fs.test";
 
 // ── environment ──────────────────────────────────────────────────────────────
@@ -168,6 +170,7 @@ async fn establish_session(client: &reqwest::Client, base: &str, token: &str) ->
     let resp = client
         .post(format!("{base}/mcp"))
         .bearer_auth(token)
+        .header("Accept", MCP_ACCEPT)
         .json(&init)
         .send()
         .await
@@ -184,6 +187,7 @@ async fn establish_session(client: &reqwest::Client, base: &str, token: &str) ->
     let notified = client
         .post(format!("{base}/mcp"))
         .bearer_auth(token)
+        .header("Accept", MCP_ACCEPT)
         .header("Mcp-Session-Id", &session_id)
         .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         .send()
@@ -221,6 +225,7 @@ async fn call_tool(
     let resp = client
         .post(format!("{base}/mcp"))
         .bearer_auth(token)
+        .header("Accept", MCP_ACCEPT)
         .header("Mcp-Session-Id", &session_id)
         .json(&body)
         .send()

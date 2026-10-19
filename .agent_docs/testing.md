@@ -250,6 +250,8 @@ make test-e2e-full
 
 Setup provisions nothing ahead of time: the fresh schema and bucket are created lazily by
 the server itself, the same code path a real deployment's first volume goes through.
+(2026-10-19) The `/mcp` calls of this test must send `Accept: application/json, text/event-stream` (`MCP_ACCEPT`); rmcp answers `406 Not Acceptable` otherwise, and the test was dead from SPEC-0013 until SPEC-0043.
+
 Teardown is a `Drop` guard, not a final statement, so a leftover schema or bucket from a
 run that panicked mid-scenario is still removed; verified by re-listing both after an
 intentionally failing run during development (`select schema_name ... where schema_name
