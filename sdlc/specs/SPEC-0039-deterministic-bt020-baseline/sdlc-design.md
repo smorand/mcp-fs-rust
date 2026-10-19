@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one test function (`others_untouched`, `crates/core/src/tools/project_removal_e2e.rs:764-782`), one file, no production code, no contract, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-18
 > Behavior change: none
 > From backlog: BL-0065 (filed as `BUG (test only)`; routed DEBT by owner decision 2026-10-18: no product authority is violated, the test's timing assumption is)

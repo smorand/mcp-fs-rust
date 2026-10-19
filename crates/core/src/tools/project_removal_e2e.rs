@@ -747,20 +747,6 @@ async fn snapshot(f: &Fixture, project: &str) -> Vec<Value> {
     ]
 }
 
-async fn settled_snapshot(f: &Fixture, project: &str) -> Vec<Value> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(INDEX_TIMEOUT_SECS);
-    let mut last = snapshot(f, project).await;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let next = snapshot(f, project).await;
-        if next == last {
-            return next;
-        }
-        last = next;
-    }
-    panic!("{project} never settled: {last:?}");
-}
-
 async fn others_untouched(kind: Kind, test: &str) {
     let Some(f) = Fixture::new(kind, test).await else { return };
     f.create(ATLAS2, OLIVIA).await;
@@ -770,9 +756,15 @@ async fn others_untouched(kind: Kind, test: &str) {
         let a = args(json!({"mount_id": project, "path": "/memo.docx", "overwrite": true}));
         ok_json(f.server(OLIVIA).fs_documentize(a).await);
     }
-    // The documentize hooks index and unindex in the background, so the
-    // baseline is taken once two reads a beat apart agree.
-    let before = settled_snapshot(&f, ATLAS2).await;
+    // Indexing is fire and forget: plan.txt, memo.docx itself (its bytes are
+    // text) and the docx companion land in the background. Wait for that exact
+    // settled count before the baseline, so a late write cannot pass for a
+    // change caused by deleting the other project (SPEC-0039).
+    for project in [ATLAS, ATLAS2] {
+        f.await_indexed(OLIVIA, project, 3).await;
+    }
+    let before = snapshot(&f, ATLAS2).await;
+    assert_eq!(before[2]["bm25_docs"], 3, "baseline taken before indexing settled");
     let pg_before = f.pg_rows(f.pg_table(), ATLAS2).await;
 
     f.delete(ATLAS).await.unwrap();
