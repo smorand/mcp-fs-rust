@@ -289,7 +289,11 @@ or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQ
 calls and the password is never logged. **All or nothing**: the whole archive is decoded and
 checked before the first write, so a symlink or device entry, an entry escaping the
 destination (zip slip), a collision without `overwrite`, or a declared total above the write
-quota rejects the call with nothing written.
+quota rejects the call with nothing written. A zip whose entry headers disagree with its central directory
+(name, sizes, checksum, compression, encryption, modification time), that holds two entries of
+the same name, or whose entries share bytes is refused the same way (`ERR_INVALID_ARGUMENT`,
+`archive is corrupt or not a valid zip file: header inconsistency detected: ...`), after the
+password answer for an encrypted one.
 
 ## Project quota enforcement
 

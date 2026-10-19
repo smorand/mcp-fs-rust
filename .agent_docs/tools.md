@@ -165,6 +165,20 @@ total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
 untouched on failure). The password is never logged. REST twin: `POST
 /api/fs/{mount_id}/extract-archive`.
 
+(2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
+central directory (name, alternate name, compression, encryption, AES settings,
+data descriptor flag, mtime, CRC, sizes), that holds two entries of one raw name
+(was "last wins", SPEC-0036 DR-008), or whose entries overlap is refused whole:
+`ERR_INVALID_ARGUMENT`, `archive is corrupt or not a valid zip file: header
+inconsistency detected: <zip detail>`. Order in `decode_zip`: pre scan (symlink,
+path, decoded name clash) then the missing password answer then this check
+(`docs/zip_check.rs::header_inconsistency`, zip's
+`validate_header_consistency`, headers only, no decryption) then decode; so a
+wrong password on a malformed archive gets the header refusal. Streamed zips
+(zero local sizes plus data descriptor) pass. Test archives are crafted with
+`zip_check::craft` (`rename_local`, `set_local_mtime`,
+`set_local_compressed_size`, `overlap`).
+
 ## fs artifacts (5)
 
 | Tool | Purpose | Params | Returns | Annotations | Who |

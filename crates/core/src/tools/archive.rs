@@ -408,7 +408,8 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
     // are both already known from the raw metadata, with no password.
     let mut any_encrypted = false;
     let mut entries = Vec::with_capacity(archive.len());
-    // zip 9 already drops entries with identical raw name bytes (DR-008), but
+    // zip 9 folds entries with identical raw name bytes, which the header
+    // check below refuses (SPEC-0041 FR-MOD-001), but
     // distinct raw bytes can still decode to one name (UTF-8 versus CP437);
     // writing both would let the second silently replace the first, so the
     // clash is refused as corruption before any write (SPEC-0036 DR-009).
@@ -438,6 +439,15 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
 
     if any_encrypted && password.is_none() {
         return Err(ToolError::password_required("password required to extract this archive"));
+    }
+
+    // SPEC-0041 FR-NEW-001/FR-MOD-001: an entry whose local header disagrees
+    // with the directory, a duplicate name, or entries sharing bytes let two
+    // readers see two archives, so the whole archive is refused before any
+    // decode. It runs after the password answer (FR-NEW-003) and reads
+    // headers only, so a wrong password never masks it.
+    if let Some(reason) = crate::docs::zip_check::header_inconsistency(&mut archive) {
+        return Err(corrupt("zip", reason));
     }
 
     // Indexed, not iterator-driven: `by_index`/`by_index_decrypt` need the
@@ -2335,6 +2345,16 @@ mod tests {
     /// (name at offset 46), and bit 11 is patched at offsets 6 and 8. Names
     /// are not covered by the CRC, so the archive stays valid.
     fn zip_with_raw_names(entries: &[(&[u8], bool, &[u8])]) -> Vec<u8> {
+        zip_with_raw_names_pw(entries, None)
+    }
+
+    /// `zip_with_raw_names`, every entry AES encrypted under `aes_password`
+    /// when given: names sit outside the encrypted data, so patching them
+    /// keeps the archive decryptable.
+    fn zip_with_raw_names_pw(
+        entries: &[(&[u8], bool, &[u8])],
+        aes_password: Option<&str>,
+    ) -> Vec<u8> {
         let placeholders: Vec<String> = entries
             .iter()
             .enumerate()
@@ -2351,7 +2371,12 @@ mod tests {
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
             for (p, (_, _, content)) in placeholders.iter().zip(entries) {
-                writer.start_file(p.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+                let opts = zip::write::SimpleFileOptions::default();
+                let opts = match aes_password {
+                    Some(pw) => opts.with_aes_encryption(zip::AesMode::Aes256, pw),
+                    None => opts,
+                };
+                writer.start_file(p.as_str(), opts).unwrap();
                 writer.write_all(content).unwrap();
             }
             writer.finish().unwrap();
@@ -2488,18 +2513,17 @@ mod tests {
         assert_eq!(read(&f, "/out/\u{25a0}.txt").await, b"2");
     }
 
-    /// SPEC-0036/DT-039 case b: identical raw bytes, whatever the flags, keep
-    /// only the last entry (DR-008).
+    /// SPEC-0041/E2E-MOD-001 (was SPEC-0036 DT-039 case b, "last wins"):
+    /// identical raw bytes, whatever the flags, are now refused (FR-MOD-001).
     #[tokio::test]
-    async fn dt_039_b_identical_raw_names_keep_the_last_entry() {
+    async fn e2e_mod_001_identical_raw_names_refused() {
         let f = fixture().await;
         let bytes = zip_with_raw_names(&[
             (b"\xC3\xA9.txt", true, b"first"),
             (b"\xC3\xA9.txt", false, b"second"),
         ]);
-        let r = extract_to_out(&f, &bytes).await.unwrap();
-        assert_eq!(r["files_written"], 1, "{r}");
-        assert_eq!(read(&f, "/out/\u{e9}.txt").await, b"second");
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        assert!(!root_has_out(&f).await);
     }
 
     /// SPEC-0036/DT-039 case c: distinct raw bytes decoding to the same name
@@ -2515,6 +2539,224 @@ mod tests {
             e.message,
             "archive is corrupt or not a valid zip file: duplicate entry name '\u{a0}.txt'"
         );
+        assert!(!root_has_out(&f).await);
+    }
+
+    // ── SPEC-0041: zips whose two header copies disagree are refused ─────
+
+    use crate::docs::zip_check::craft;
+
+    const HEADER_REFUSAL: &str =
+        "archive is corrupt or not a valid zip file: header inconsistency detected";
+
+    fn assert_header_refused(r: Result<Value>) {
+        let e = r.expect_err("the archive must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{}", e.message);
+        assert!(e.message.starts_with(HEADER_REFUSAL), "{}", e.message);
+    }
+
+    async fn extract_to_out_pw(f: &Fixture, bytes: &[u8], password: &str) -> Result<Value> {
+        seed_bytes(f, "/uploads/names.zip", bytes).await;
+        extract_archive(
+            &f.state,
+            MOUNT,
+            OWNER,
+            "/uploads/names.zip",
+            Some("/out"),
+            false,
+            Some(password),
+        )
+        .await
+    }
+
+    /// E2E-006 and E2E-018: `a.txt` AES encrypted under `s3cret`, named
+    /// `b.txt` in its own header.
+    fn locked_zip() -> Vec<u8> {
+        craft::rename_local(&build_zip(&[("a.txt", b"alpha")], Some("s3cret")), "a.txt", "b.txt")
+    }
+
+    /// SPEC-0041/E2E-001: a well formed archive extracts unchanged.
+    #[tokio::test]
+    async fn spec41_e2e_001_well_formed_archive_extracts_unchanged() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")], None);
+        extract_to_out(&f, &bytes).await.unwrap();
+        assert_eq!(read(&f, "/out/a.txt").await, b"alpha");
+        assert_eq!(read(&f, "/out/b.txt").await, b"beta");
+    }
+
+    /// SPEC-0041/E2E-002: an entry named differently in its own header.
+    #[tokio::test]
+    async fn spec41_e2e_002_local_name_mismatch_refused_nothing_written() {
+        let f = fixture().await;
+        let bytes = craft::rename_local(&build_zip(&[("a.txt", b"alpha")], None), "a.txt", "b.txt");
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-003: a different compressed size in the entry's header.
+    #[tokio::test]
+    async fn spec41_e2e_003_local_compressed_size_mismatch_refused() {
+        let f = fixture().await;
+        let bytes =
+            craft::set_local_compressed_size(&build_zip_stored("a.txt", b"alpha"), "a.txt", 4);
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-004: two entries of one name (FR-MOD-001).
+    #[tokio::test]
+    async fn spec41_e2e_004_duplicate_names_refused_nothing_written() {
+        let f = fixture().await;
+        let bytes =
+            zip_with_raw_names(&[(b"dup.txt", false, b"first"), (b"dup.txt", false, b"second")]);
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-005: only the last of three entries is malformed, and
+    /// none of the three is written.
+    #[tokio::test]
+    async fn spec41_e2e_005_last_entry_malformed_none_written() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")], None);
+        let bytes = craft::rename_local(&bytes, "c.txt", "d.txt");
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        for p in ["/out/a.txt", "/out/b.txt", "/out/c.txt"] {
+            assert!(!exists(&f, p).await, "{p}");
+        }
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-006: encrypted and malformed: the password is asked
+    /// first (FR-NEW-003), then the archive is refused.
+    #[tokio::test]
+    async fn spec41_e2e_006_encrypted_malformed_password_first_then_refused() {
+        let f = fixture().await;
+        let bytes = locked_zip();
+        let e = extract_to_out(&f, &bytes).await.unwrap_err();
+        assert_eq!(e.code, code::PASSWORD_REQUIRED);
+        assert_eq!(e.message, "password required to extract this archive");
+        assert!(!root_has_out(&f).await);
+        assert_header_refused(extract_to_out_pw(&f, &bytes, "s3cret").await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-011: headers differing only in modification time.
+    #[tokio::test]
+    async fn spec41_e2e_011_local_mtime_mismatch_refused() {
+        let f = fixture().await;
+        let bytes =
+            craft::set_local_mtime(&build_zip(&[("a.txt", b"alpha")], None), "a.txt", 0x1234);
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-014: a well formed encrypted archive without password.
+    #[tokio::test]
+    async fn spec41_e2e_014_encrypted_well_formed_asks_for_password() {
+        let f = fixture().await;
+        let bytes = build_zip(&[("a.txt", b"alpha")], Some("s3cret"));
+        let e = extract_to_out(&f, &bytes).await.unwrap_err();
+        assert_eq!(e.code, code::PASSWORD_REQUIRED);
+        assert_eq!(e.message, "password required to extract this archive");
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-015: distinct names reading alike (UTF-8 `é` and CP437
+    /// 0x82) are refused before the password is asked (DR-009 order kept).
+    #[tokio::test]
+    async fn spec41_e2e_015_decoded_clash_refused_before_password() {
+        let f = fixture().await;
+        let bytes = zip_with_raw_names_pw(
+            &[(b"\xC3\xA9.txt", true, b"1"), (b"\x82.txt", false, b"2")],
+            Some("s3cret"),
+        );
+        // Precondition: the archive really is encrypted, so the refusal
+        // proves its order against the password answer.
+        let mut zip = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        assert!(zip.by_index_raw(0).unwrap().encrypted());
+        let e = extract_to_out(&f, &bytes).await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            e.message,
+            "archive is corrupt or not a valid zip file: duplicate entry name '\u{e9}.txt'"
+        );
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-016: three entries of one name next to a distinct
+    /// sibling; the sibling is not written either.
+    #[tokio::test]
+    async fn spec41_e2e_016_triple_duplicate_refused_sibling_not_written() {
+        let f = fixture().await;
+        let bytes = zip_with_raw_names(&[
+            (b"keep.txt", false, b"k"),
+            (b"dup.txt", false, b"1"),
+            (b"dup.txt", false, b"2"),
+            (b"dup.txt", false, b"3"),
+        ]);
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        assert!(!exists(&f, "/out/keep.txt").await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-017: a streamed archive, sizes after the data and zeros
+    /// in the entry's own header, is well formed and extracts unchanged.
+    #[tokio::test]
+    async fn spec41_e2e_017_streamed_archive_extracts_unchanged() {
+        let f = fixture().await;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new_stream(&mut buf);
+            w.start_file("a.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"alpha").unwrap();
+            w.finish().unwrap();
+        }
+        // Precondition: the entry really defers its sizes to a data descriptor.
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]) & 0x08, 0x08);
+        assert_eq!(buf[18..26], [0u8; 8]);
+        extract_to_out(&f, &buf).await.unwrap();
+        assert_eq!(read(&f, "/out/a.txt").await, b"alpha");
+    }
+
+    /// SPEC-0041/E2E-018: encrypted malformed archive with a wrong password:
+    /// the header refusal wins, no decryption is attempted.
+    #[tokio::test]
+    async fn spec41_e2e_018_encrypted_malformed_wrong_password_refused() {
+        let f = fixture().await;
+        assert_header_refused(extract_to_out_pw(&f, &locked_zip(), "wrong").await);
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-019: two directory rows sharing bytes, each matching its
+    /// own header, are refused.
+    #[tokio::test]
+    async fn spec41_e2e_019_overlapping_entries_refused() {
+        let f = fixture().await;
+        let inner = craft::first_local_record(&build_zip_stored("b.txt", b"beta"));
+        let bytes = craft::overlap(&build_zip_stored("a.txt", &inner));
+        let e = extract_to_out(&f, &bytes).await.unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, format!("{HEADER_REFUSAL}: archive contains overlapping entries"));
+        assert!(!root_has_out(&f).await);
+    }
+
+    /// SPEC-0041/E2E-SEC-001: a traversal name hidden in the local header
+    /// behind an innocent directory name cannot be smuggled in. The absence
+    /// is read through a second channel: a project wide glob for `*.txt`.
+    #[tokio::test]
+    async fn spec41_e2e_sec_001_disguised_entry_not_smuggled() {
+        let f = fixture().await;
+        let bytes = craft::rename_local(
+            &build_zip(&[("a.txt", b"alpha")], None),
+            "a.txt",
+            "../../evil.txt",
+        );
+        assert_header_refused(extract_to_out(&f, &bytes).await);
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let globbed = crate::core::fs_ops::glob_files(&c, "/", "*.txt", &[]).await.unwrap();
+        assert_eq!(globbed["matches"], json!([]), "{globbed}");
         assert!(!root_has_out(&f).await);
     }
 }

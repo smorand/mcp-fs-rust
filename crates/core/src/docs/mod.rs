@@ -18,6 +18,7 @@ pub mod mime;
 pub mod ocr;
 pub mod service;
 pub mod symbols;
+pub(crate) mod zip_check;
 
 pub use docx::render_markdown_to_docx;
 pub use extract::{ExtractResult, Extractor, companion_md_path, extract_text};
