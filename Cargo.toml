@@ -22,7 +22,7 @@ bytes = "1"
 # ── serialization / config ─────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml = "0.9"
+serde_norway = "0.9"
 schemars = "1"
 # XDG base directories (config resolution, DR-005). Version resolved via
 # crates.io at implementation time, pinned to the minor series like every

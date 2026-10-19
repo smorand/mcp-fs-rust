@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item (YAML config parsing), 2 crates, 2 production call sites, no public contract change, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-19
 > Behavior change: none
 > From backlog: BL-0061

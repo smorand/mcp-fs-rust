@@ -776,7 +776,7 @@ mod tests {
         c.infra.meta.dir = root.join("volumes").display().to_string();
         c.infra.blob.dir = root.join("blobs").display().to_string();
         c.infra.admin.path = root.join("admin.db").display().to_string();
-        // Hand-written rather than `serde_yaml::to_string(&c)`: `ServerConfig`'s
+        // Hand-written rather than `serde_norway::to_string(&c)`: `ServerConfig`'s
         // default `git.hosts` round-trips through YAML as a sequence, which its
         // own `Deserialize` then rejects (expects a mapping); every other field
         // is left to its `#[serde(default)]`, exactly like the minimal YAML

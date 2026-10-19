@@ -903,7 +903,7 @@ impl ServerConfig {
     }
 
     pub fn from_yaml(raw: &str) -> Result<Self> {
-        // Still `serde_yaml::from_str`, not `figment::providers::Yaml` (DR-005 asked
+        // Still `serde_norway::from_str`, not `figment::providers::Yaml` (DR-005 asked
         // for the swap; DDRIFT-002 records why it is not made: figment always
         // materializes an intermediate keyed `Value` before calling the target's
         // `Deserialize`, which silently collapses a duplicate YAML mapping key
@@ -914,7 +914,7 @@ impl ServerConfig {
         // structural property of any Value-merging config library, not a figment
         // bug, and it was undetectable before implementation: see the drift entry.
         let expanded = expand_env(raw);
-        let config: Self = serde_yaml::from_str(&expanded)
+        let config: Self = serde_norway::from_str(&expanded)
             .map_err(|e| ToolError::invalid_argument(format!("invalid config: {e}")))?;
         // Validation is part of loading: a misconfigured backend must stop the boot
         // rather than surface as a failed request once traffic arrives.
@@ -1214,7 +1214,7 @@ mod tests {
     /// E2E-NEW-075: both keys, when set in YAML, load exactly as configured.
     #[test]
     fn e2e_new_075_safety_purge_config_override() {
-        let parsed: ServerConfig = serde_yaml::from_str(
+        let parsed: ServerConfig = serde_norway::from_str(
             "safety:\n  purge_interval_secs: 60\n  project_purge_grace_days: 7\n",
         )
         .unwrap();
@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     fn e2e_new_076_safety_purge_interval_zero_loads_unvalidated() {
         let parsed: ServerConfig =
-            serde_yaml::from_str("safety:\n  purge_interval_secs: 0\n").unwrap();
+            serde_norway::from_str("safety:\n  purge_interval_secs: 0\n").unwrap();
         assert_eq!(parsed.safety.purge_interval_secs, 0);
     }
 
@@ -1241,18 +1241,18 @@ mod tests {
     #[test]
     fn e2e_new_881_the_requested_scopes_default_to_the_documented_strings() {
         let parsed: crate::config::ServerConfig =
-            serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+            serde_norway::from_str("git:\n  enabled: true\n").unwrap();
         assert_eq!(parsed.git.github_scope, "repo");
         assert_eq!(parsed.git.gitlab_scope, "api read_repository write_repository");
 
         // The emitted YAML re-parses to the same two strings. `hosts` is
         // dropped first: it serializes as a sequence and deserializes from a
         // mapping, a pre-existing asymmetry this assertion is not about.
-        let mut emitted: serde_yaml::Value = serde_yaml::to_value(&parsed.git).unwrap();
+        let mut emitted: serde_norway::Value = serde_norway::to_value(&parsed.git).unwrap();
         if let Some(m) = emitted.as_mapping_mut() {
-            m.remove(serde_yaml::Value::from("hosts"));
+            m.remove(serde_norway::Value::from("hosts"));
         }
-        let round: crate::config::GitConfig = serde_yaml::from_value(emitted).unwrap();
+        let round: crate::config::GitConfig = serde_norway::from_value(emitted).unwrap();
         assert_eq!(round.github_scope, "repo");
         assert_eq!(round.gitlab_scope, "api read_repository write_repository");
     }
@@ -1260,9 +1260,10 @@ mod tests {
     /// E2E-NEW-880: a configured scope overrides the default, per provider.
     #[test]
     fn e2e_new_880_a_configured_scope_overrides_the_default() {
-        let parsed: crate::config::ServerConfig =
-            serde_yaml::from_str("git:\n  github_scope: 'repo public_repo'\n  gitlab_scope: api\n")
-                .unwrap();
+        let parsed: crate::config::ServerConfig = serde_norway::from_str(
+            "git:\n  github_scope: 'repo public_repo'\n  gitlab_scope: api\n",
+        )
+        .unwrap();
         assert_eq!(parsed.git.github_scope, "repo public_repo");
         assert_eq!(parsed.git.gitlab_scope, "api");
     }
@@ -1271,10 +1272,10 @@ mod tests {
     #[test]
     fn the_rebase_todo_bound_defaults_to_200_and_is_configurable() {
         let parsed: crate::config::ServerConfig =
-            serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+            serde_norway::from_str("git:\n  enabled: true\n").unwrap();
         assert_eq!(parsed.git.max_rebase_todo, 200);
         let parsed: crate::config::ServerConfig =
-            serde_yaml::from_str("git:\n  max_rebase_todo: 5\n").unwrap();
+            serde_norway::from_str("git:\n  max_rebase_todo: 5\n").unwrap();
         assert_eq!(parsed.git.max_rebase_todo, 5);
     }
 
@@ -1282,10 +1283,10 @@ mod tests {
     #[test]
     fn the_stash_pool_cap_defaults_to_100_and_is_configurable() {
         let parsed: crate::config::ServerConfig =
-            serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+            serde_norway::from_str("git:\n  enabled: true\n").unwrap();
         assert_eq!(parsed.git.max_stash_entries, 100);
         let parsed: crate::config::ServerConfig =
-            serde_yaml::from_str("git:\n  max_stash_entries: 7\n").unwrap();
+            serde_norway::from_str("git:\n  max_stash_entries: 7\n").unwrap();
         assert_eq!(parsed.git.max_stash_entries, 7);
     }
 
@@ -1293,11 +1294,11 @@ mod tests {
     /// (FR-NEW-044, DEC-032).
     #[test]
     fn e2e_new_157_the_timeout_default_is_120_and_is_configurable() {
-        let parsed: ServerConfig = serde_yaml::from_str("git:\n  enabled: true\n").unwrap();
+        let parsed: ServerConfig = serde_norway::from_str("git:\n  enabled: true\n").unwrap();
         assert_eq!(parsed.git.remote_timeout_secs, 120);
 
         let parsed: ServerConfig =
-            serde_yaml::from_str("git:\n  remote_timeout_secs: 5\n").unwrap();
+            serde_norway::from_str("git:\n  remote_timeout_secs: 5\n").unwrap();
         assert_eq!(parsed.git.remote_timeout_secs, 5);
     }
 
@@ -1415,7 +1416,7 @@ infra:
 "#;
         // Parsing must work regardless of which driver this binary compiled in,
         // so assert on the parsed shape and validate separately below.
-        let parsed: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let parsed: ServerConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(parsed.infra.meta.backend, backend::POSTGRES);
         assert_eq!(parsed.infra.meta.schema, "mcpfs");
         assert_eq!(parsed.infra.meta.pool.max_connections, 25);
@@ -1584,13 +1585,53 @@ infra:
     #[test]
     fn a_dsn_arrives_through_env_expansion() {
         unsafe { std::env::set_var("MCPFS_TEST_META_DSN", "postgres://u:pw@h/db") };
-        let parsed: ServerConfig = serde_yaml::from_str(&expand_env(
+        let parsed: ServerConfig = serde_norway::from_str(&expand_env(
             "infra:\n  meta:\n    backend: postgres\n    dsn: \"${MCPFS_TEST_META_DSN}\"\n",
         ))
         .unwrap();
         assert_eq!(parsed.infra.meta.dsn.expose(), "postgres://u:pw@h/db");
         unsafe { std::env::remove_var("MCPFS_TEST_META_DSN") };
     }
+
+    /// SPEC-0040/DT-003: a tracked template deserializes to the same value whatever
+    /// YAML library parses it. The snapshot was recorded on `serde_norway` before the
+    /// swap to `serde_norway`; it must not change. The env vars are set to fixed
+    /// values here (names unique to this test) and removed after, since
+    /// `expand_env` reads the process environment.
+    fn parse_template(name: &str, vars: &[(&str, &str)]) -> ServerConfig {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config").join(name);
+        let raw = std::fs::read_to_string(path).unwrap();
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let parsed = ServerConfig::from_yaml(&raw);
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+        parsed.unwrap()
+    }
+
+    #[test]
+    fn local_template_parses_to_the_recorded_value() {
+        let parsed = parse_template("local.yaml.template", &[]);
+        assert_eq!(format!("{parsed:?}"), LOCAL_TEMPLATE_SNAPSHOT);
+    }
+
+    #[test]
+    fn minio_template_parses_to_the_recorded_value() {
+        let parsed = parse_template(
+            "minio.yaml.template",
+            &[
+                ("MCPFS_MINIO_ENDPOINT", "http://minio.test:9000"),
+                ("MCPFS_MINIO_ACCESS_KEY", "test-access"),
+                ("MCPFS_MINIO_SECRET_KEY", "test-secret"),
+            ],
+        );
+        assert_eq!(format!("{parsed:?}"), MINIO_TEMPLATE_SNAPSHOT);
+    }
+
+    const LOCAL_TEMPLATE_SNAPSHOT: &str = r#"ServerConfig { server: HttpConfig { host: "0.0.0.0", port: 5002, mcp_path: "/mcp", public_base_url: "" }, auth: AuthConfig { jwt: JwtConfig { public_key_path: ".keys/jwt.pub", header: "X-Forwarded-Authorization", algorithms: ["RS256"], audience: None, issuer: Some("web-a2a"), username_claim: "email" }, admins: ["admin@example.com"] }, infra: InfraConfig { meta: MetaConfig { backend: "sqlite", dir: "state/volumes", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } }, blob: BlobConfig { backend: "local", dir: "state/blobs", endpoint: "", access_key: "", secret_key: "", bucket_prefix: "mcpfs-", region: "us-east-1" }, admin: AdminConfig { backend: "sqlite", path: "state/admin.db", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } }, git: GitStoreConfig { backend: "sqlite", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } }, oauth: OauthStoreConfig { backend: "sqlite", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } } }, safety: SafetyConfig { write_quota_bytes: 52428800, trash_dir: ".mcp_trash", read_guard: true, allow_hard_delete: false, max_read_lines: 2000, purge_interval_secs: 3600, project_purge_grace_days: 30 }, extract: ExtractConfig { ocr: OcrConfig { provider: "none", endpoint: "", model: "", api_key_env: "MCP_FS_OCR_KEY", prompt: "Transcribe this document faithfully into Markdown." } }, api: ApiConfig { enabled: true }, git: GitConfig { enabled: false, object_format: "sha1", anonymous_read: false, max_pack_size_mb: 512, github_client_id: "", github_client_secret_env: "MCPFS_GITHUB_CLIENT_SECRET", gitlab_client_id: "", gitlab_client_secret_env: "GITLAB_CLIENT_SECRET", gitlab_instance_url: "https://gitlab.com", hosts: HostMap([]), remote_timeout_secs: 120, max_stash_entries: 100, max_rebase_todo: 200, github_scope: "repo", gitlab_scope: "api read_repository write_repository", provider_api_timeout_secs: 30, max_pr_diff_mb: 12 }, web: WebConfig { enabled: false, max_results: 10, request_timeout_secs: 10, safe_search: "moderate" }, context7: Context7Config { enabled: false, api_url: "https://context7.com/api", request_timeout_secs: 30 }, sqlite: SqliteConfig { enabled: false, max_result_rows: 1000, statement_timeout_secs: 30 }, db: DbConfig { enabled: false, max_result_rows: 1000, max_file_bytes: 104857600 }, doc: DocConfig { enabled: false, pandoc_bin: "", pandoc_timeout_secs: 30 }, doc_service: DocServiceConfig { enabled: false, mode: "cli", extensions: [], max_input_bytes: 536870912, cli: DocServiceCliConfig { command: ["doc-convert", "--quiet", "-o", "{outdir}", "{document}"], timeout_secs: 900 }, api: DocServiceApiConfig { url: "", auth_header: "Authorization", auth_token: Secret(unset), file_field: "file", response_field: "", timeout_secs: 900 } }, search: SearchConfig { enabled: false, mode: "bm25", tantivy_dir: "state/search", embedding: EmbeddingConfig { endpoint: "", model: "", api_key_env: "", dimensions: 1536 }, reranking: RerankConfig { enabled: false, endpoint: "", model: "", api_key_env: "", top_n: 10 } } }"#;
+    const MINIO_TEMPLATE_SNAPSHOT: &str = r#"ServerConfig { server: HttpConfig { host: "0.0.0.0", port: 5002, mcp_path: "/mcp", public_base_url: "" }, auth: AuthConfig { jwt: JwtConfig { public_key_path: ".keys/jwt.pub", header: "X-Forwarded-Authorization", algorithms: ["RS256"], audience: None, issuer: Some("web-a2a"), username_claim: "email" }, admins: ["admin@example.com"] }, infra: InfraConfig { meta: MetaConfig { backend: "sqlite", dir: "state/volumes", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } }, blob: BlobConfig { backend: "minio", dir: "state/blobs", endpoint: "http://minio.test:9000", access_key: "test-access", secret_key: "test-secret", bucket_prefix: "mcpfs-", region: "us-east-1" }, admin: AdminConfig { backend: "sqlite", path: "state/admin.db", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } }, git: GitStoreConfig { backend: "sqlite", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } }, oauth: OauthStoreConfig { backend: "sqlite", dsn: Dsn(unset), schema: "public", pool: PoolConfig { max_connections: 10, acquire_timeout_secs: 30 } } }, safety: SafetyConfig { write_quota_bytes: 52428800, trash_dir: ".mcp_trash", read_guard: true, allow_hard_delete: false, max_read_lines: 2000, purge_interval_secs: 3600, project_purge_grace_days: 30 }, extract: ExtractConfig { ocr: OcrConfig { provider: "none", endpoint: "", model: "", api_key_env: "MCP_FS_OCR_KEY", prompt: "Transcribe this document faithfully into Markdown." } }, api: ApiConfig { enabled: true }, git: GitConfig { enabled: false, object_format: "sha1", anonymous_read: false, max_pack_size_mb: 512, github_client_id: "", github_client_secret_env: "MCPFS_GITHUB_CLIENT_SECRET", gitlab_client_id: "", gitlab_client_secret_env: "GITLAB_CLIENT_SECRET", gitlab_instance_url: "https://gitlab.com", hosts: HostMap([]), remote_timeout_secs: 120, max_stash_entries: 100, max_rebase_todo: 200, github_scope: "repo", gitlab_scope: "api read_repository write_repository", provider_api_timeout_secs: 30, max_pr_diff_mb: 12 }, web: WebConfig { enabled: false, max_results: 10, request_timeout_secs: 10, safe_search: "moderate" }, context7: Context7Config { enabled: false, api_url: "https://context7.com/api", request_timeout_secs: 30 }, sqlite: SqliteConfig { enabled: false, max_result_rows: 1000, statement_timeout_secs: 30 }, db: DbConfig { enabled: false, max_result_rows: 1000, max_file_bytes: 104857600 }, doc: DocConfig { enabled: false, pandoc_bin: "", pandoc_timeout_secs: 30 }, doc_service: DocServiceConfig { enabled: false, mode: "cli", extensions: [], max_input_bytes: 536870912, cli: DocServiceCliConfig { command: ["doc-convert", "--quiet", "-o", "{outdir}", "{document}"], timeout_secs: 900 }, api: DocServiceApiConfig { url: "", auth_header: "Authorization", auth_token: Secret(unset), file_field: "file", response_field: "", timeout_secs: 900 } }, search: SearchConfig { enabled: false, mode: "bm25", tantivy_dir: "state/search", embedding: EmbeddingConfig { endpoint: "", model: "", api_key_env: "", dimensions: 1536 }, reranking: RerankConfig { enabled: false, endpoint: "", model: "", api_key_env: "", top_n: 10 } } }"#;
 
     // ── doc service ─────────────────────────────────────────────────────────────
 

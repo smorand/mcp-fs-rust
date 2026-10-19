@@ -166,7 +166,7 @@ Validation runs once at boot, from `ServerConfig::validate` calling
 `git::remote::validate_hosts(&self.git)`: every key must be a bare hostname (no
 scheme, path, port or wildcard, checked with `url::Host::parse`), every value
 must be one of the four provider strings, and no host may repeat (a custom
-`HostMap` `Deserialize` keeps every YAML key instead of `serde_yaml`'s default
+`HostMap` `Deserialize` keeps every YAML key instead of `serde_norway`'s default
 of silently folding a repeated key to its last value, so a duplicate survives
 to be rejected). A partial map is never published: a config with one bad entry
 fails boot entirely rather than silently dropping just that entry. The

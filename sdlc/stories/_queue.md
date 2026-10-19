@@ -46,4 +46,4 @@
 | US-0044 | SPEC-0037 | pin the docx envelope and the zip size message | main | 2 | landed | story/US-0044-pin-docx-envelope-and-zip-message | main |
 | US-0045 | SPEC-0038 | local put rewrites a blob deleted mid call | main | 2 | landed | story/US-0045-local-put-self-heal | main |
 | US-0046 | SPEC-0039 | BT-020 waits for indexing before its baseline | main | 2 | landed | story/US-0046-bt020-deterministic-baseline | main |
-| US-0047 | SPEC-0040 | replace serde_yaml with serde_norway | main | 2 | todo | | |
+| US-0047 | SPEC-0040 | replace serde_yaml with serde_norway | main | 2 | landed | story/US-0047-replace-serde-yaml | main |

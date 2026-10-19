@@ -157,7 +157,6 @@ fn accepted_advisories_are_recorded_once_with_a_reason() {
         "RUSTSEC-2023-0071",
         "RUSTSEC-2024-0384",
         "RUSTSEC-2024-0436",
-        "RUSTSEC-2024-0449",
         "RUSTSEC-2026-0002",
         "RUSTSEC-2026-0192",
         "RUSTSEC-2026-0253",
@@ -236,4 +235,54 @@ fn zip_acceptances_name_the_build_time_copy() {
             );
         }
     }
+}
+
+fn rust_and_doc_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in fs::read_dir(dir).expect("read_dir").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_and_doc_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs" || e == "md" || e == "toml") {
+            out.push(path);
+        }
+    }
+}
+
+/// SPEC-0040/DT-001: `serde_norway` replaced the old YAML crate, so neither it nor
+/// `unsafe-libyaml` is in the lockfile or the graph, and no manifest, source or
+/// agent doc names the old crate.
+#[test]
+fn old_yaml_crate_and_unsafe_libyaml_are_gone() {
+    // Built by concat so this file does not itself contain the name it forbids.
+    let old = concat!("serde", "_yaml");
+    assert!(lock_packages(old).is_empty(), "{old} still in Cargo.lock");
+    assert!(lock_packages("unsafe-libyaml").is_empty(), "unsafe-libyaml still in Cargo.lock");
+
+    let tree = Command::new("cargo")
+        .args(["tree", "-i", "unsafe-libyaml", "--all-features"])
+        .current_dir(repo_root())
+        .output()
+        .expect("run cargo tree");
+    assert!(!tree.status.success(), "unsafe-libyaml must no longer resolve");
+    let stderr = String::from_utf8_lossy(&tree.stderr);
+    assert!(stderr.contains("did not match any packages"), "{stderr}");
+
+    let root = repo_root();
+    let mut files = vec![root.join("Cargo.toml")];
+    rust_and_doc_files(&root.join("crates"), &mut files);
+    let mut docs = Vec::new();
+    rust_and_doc_files(&root.join(".agent_docs"), &mut docs);
+    files.extend(docs.into_iter().filter(|p| p.extension().is_some_and(|e| e == "md")));
+    for f in &files {
+        let text = fs::read_to_string(f).expect("read file");
+        assert!(!text.contains(old), "{} still names {old}", f.display());
+    }
+}
+
+/// SPEC-0040/DT-002: the unsafe-libyaml advisory is no longer accepted, because
+/// the crate is gone from the build.
+#[test]
+fn unsafe_libyaml_advisory_is_not_accepted() {
+    let raw = fs::read_to_string(repo_root().join(".cargo/audit.toml")).expect(".cargo/audit.toml");
+    assert!(!raw.contains("RUSTSEC-2024-0449"), "advisory still listed in .cargo/audit.toml");
 }

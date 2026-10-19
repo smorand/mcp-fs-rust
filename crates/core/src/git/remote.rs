@@ -44,7 +44,7 @@ use crate::safety::SafetyManager;
 /// only the last value for a repeated YAML key, which would make FR-NEW-003
 /// (reject a duplicate host) undetectable: the duplicate would already be gone
 /// by the time `validate_hosts` ran. The hand-written [`Deserialize`] below
-/// collects every `(key, value)` pair `serde_yaml` hands it instead of folding
+/// collects every `(key, value)` pair `serde_norway` hands it instead of folding
 /// them into a map, so a duplicate survives to be rejected explicitly.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HostMap(pub Vec<(String, String)>);

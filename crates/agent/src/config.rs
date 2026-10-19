@@ -88,7 +88,7 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("config file not found: {}", path.display()))?;
-        serde_yaml::from_str(&text).with_context(|| format!("invalid YAML in {}", path.display()))
+        serde_norway::from_str(&text).with_context(|| format!("invalid YAML in {}", path.display()))
     }
 
     /// The API key, preferring the environment so the YAML can stay committable.
@@ -198,4 +198,15 @@ mod tests {
         c.llm.api_key_env = "AGENT_CFG_TEST_KEY_B".into();
         assert!(c.api_key().is_none());
     }
+
+    /// SPEC-0040/DT-003: the tracked agent config deserializes to the value recorded
+    /// on `serde_norway` before the swap to `serde_norway`.
+    #[test]
+    fn agent_test_yaml_parses_to_the_recorded_value() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/agent_test.yaml");
+        let c = AgentConfig::load(&path).unwrap();
+        assert_eq!(format!("{c:?}"), AGENT_TEST_SNAPSHOT);
+    }
+
+    const AGENT_TEST_SNAPSHOT: &str = r#"AgentConfig { mcp: McpConfig { url: "http://127.0.0.1:5002/mcp", token: "", auth_header: "X-Forwarded-Authorization", tokens_dir: ".agent_keys" }, llm: LlmConfig { base_url: "https://api.nextgen-beta.ica.ibm.com/ica/v1", model: "claude-haiku-4-5", api_key: "", api_key_env: "IBM_ICA_MODEL_KEY", timeout_seconds: 180 }, system_prompt: "You are a helpful assistant with access to a filesystem via MCP tools (fs.* and admin.*). Use the tools to answer the user's questions about their files. When listing or reading files, always show the results clearly. Important rules: - Always use the exact tool name as provided (e.g. \"admin.list_projects\", not \"admin_list_projects\"). - admin.list_projects lists projects the current user owns or is a member of.\n  admin.list_all_projects lists every project on the platform (works only for platform admins).\n  When the user asks to \"list all projects\" or seems to be an admin and sees an empty list,\n  try admin.list_all_projects. If it returns ERR_FORBIDDEN, fall back to admin.list_projects.\n- A project can exist but not appear in admin.list_projects if the caller is neither its owner\n  nor a member. Use admin.list_all_projects to confirm existence before assuming it is missing.\n- To browse files in a project, first call fs.list_allowed_roots to discover mount_id values,\n  then use fs.list_dir with the correct mount_id.\n", context_compaction_threshold_k: 256 }"#;
 }
