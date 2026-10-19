@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: FEAT / depth M: 2 features (archive extraction, document text extraction), 6 requirements, one modified rule from SPEC-0036, no persisted change
-> Status: draft
+> Status: designed
 > Generated on: 2026-10-19
 > Project: existing
 > From backlog: BL-0063
