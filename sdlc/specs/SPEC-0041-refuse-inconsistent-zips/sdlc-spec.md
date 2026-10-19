@@ -293,7 +293,7 @@ Coverage: happy 3, failure 12 (E2E-002, 003, 004, 008, 009, 013, 014, 015, 018, 
 - **Priority:** Medium
 #### E2E-019: overlapping entries are refused
 - **Category:** edge · **Scenario:** SC-001 · **Requirements:** FR-NEW-001
-- **Given** `/in/overlap.zip` whose directory lists `a.txt` and `b.txt` both pointing at the same entry header and data, each header consistent with its own directory row
+- **Given** `/in/overlap.zip` whose directory lists `a.txt` and a second entry `b.txt` whose header and data lie inside the bytes of `a.txt`, each header consistent with its own directory row
 - **When** Olivia extracts it into `/out`
 - **Then** refused with the message of E2E-002; no `out` folder exists
 - **Priority:** Medium
@@ -302,34 +302,34 @@ Coverage: happy 3, failure 12 (E2E-002, 003, 004, 008, 009, 013, 014, 015, 018, 
 - **Category:** journey · **Scenario:** SC-003 · **Requirements:** FR-NEW-005, FR-NEW-004
 - **Given** the document service enabled and `/docs/memo.docx` of E2E-007
 - **When** Olivia converts it on demand
-- **Then** the companion `/docs/memo.docx.md` exists and the converter was called once
+- **Then** the companion `/docs/memo.md` exists and the converter was called once
 - **Priority:** High
 #### E2E-021: malformed document refused on demand, converter not called
 - **Category:** failure, side effect · **Scenario:** SC-003 · **Requirements:** FR-NEW-005
 - **Given** the document service enabled and `/docs/bad.docx` of E2E-008
 - **When** Olivia converts it on demand
 - **Then** refused with code `ERR_INVALID_ARGUMENT` and a message starting `could not convert /docs/bad.docx: not a valid OOXML package: header inconsistency detected`
-- **And** the converter was never called, and no `/docs/bad.docx.md` exists
+- **And** the converter was never called, and no `/docs/bad.md` exists
 - **Priority:** Critical
 #### E2E-022: malformed deck uploaded with conversion: file stored, conversion refused
 - **Category:** edge, side effect · **Scenario:** SC-003 · **Requirements:** FR-NEW-005
 - **Given** the document service enabled and a `.pptx` deck whose slide part is named differently in its own header
 - **When** Olivia uploads it as `/docs/deck.pptx` with the conversion option
 - **Then** `/docs/deck.pptx` is stored with the uploaded bytes; the report's `documentation.error.code` is `ERR_INVALID_ARGUMENT` and its `documentation.error.message` starts with `could not convert /docs/deck.pptx: not a valid OOXML package: header inconsistency detected`
-- **And** the converter was never called, and no `/docs/deck.pptx.md` exists
+- **And** the converter was never called, and no `/docs/deck.md` exists
 - **Priority:** High
 
 #### E2E-023: operator added extension still checked
 - **Category:** edge · **Scenario:** SC-003 · **Requirements:** FR-NEW-005
 - **Given** the document service enabled with its accepted list set to `.xlsm`, and `/docs/bad.xlsm` of E2E-012
 - **When** Olivia converts it on demand
-- **Then** refused with code `ERR_INVALID_ARGUMENT` and a message starting `could not convert /docs/bad.xlsm: not a valid OOXML package: header inconsistency detected`; the converter was never called; no `/docs/bad.xlsm.md` exists
+- **Then** refused with code `ERR_INVALID_ARGUMENT` and a message starting `could not convert /docs/bad.xlsm: not a valid OOXML package: header inconsistency detected`; the converter was never called; no `/docs/bad.md` exists
 - **Priority:** Medium
 #### E2E-024: document with two parts of the same name refused on demand
 - **Category:** failure · **Scenario:** SC-003 · **Requirements:** FR-NEW-005
 - **Given** the document service enabled and `/docs/dup.docx` of E2E-009
 - **When** Olivia converts it on demand
-- **Then** refused with a message starting `could not convert /docs/dup.docx: not a valid OOXML package: header inconsistency detected`; the converter was never called; no `/docs/dup.docx.md` exists
+- **Then** refused with a message starting `could not convert /docs/dup.docx: not a valid OOXML package: header inconsistency detected`; the converter was never called; no `/docs/dup.md` exists
 - **Priority:** High
 
 ### 9.3 Exploit tests
@@ -420,3 +420,7 @@ Test command: `MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs MC
 - zip 9 offers the check per read (`ZipReadOptions::enforce_header_consistency`, `zip-9.0.5/src/read/mod.rs:324`) and once for the whole archive (`ZipArchive::validate_header_consistency`, `zip_archive.rs:754`); FR-NEW-001 and FR-NEW-002 need the whole archive variant or an equivalent, since parts the reader skips must count.
 - The password rule (FR-NEW-003) means the whole archive check of an encrypted archive runs after the existing missing password answer (`archive.rs:440`).
 - `entry_text` (`extract.rs:545-548`) swallows read errors; a header error must surface instead.
+
+## As built notes (2026-10-19, owner authorized)
+- Companion paths: a document's companion is `<stem>.md` (`/docs/memo.md` for `/docs/memo.docx`), as `companion_md_path` has always written it (`crates/core/src/docs/extract.rs:217`); E2E-020..024 were corrected from `<name>.docx.md`. No behavior changed; the tests also assert nothing exists at the old wording's path.
+- E2E-019: two directory rows cannot point at one entry header and each stay consistent (one header has one name: a name mismatch or a duplicate is reported first). The test nests the second entry inside the first entry's data so only the overlap check fires, asserting `header inconsistency detected: archive contains overlapping entries`.
