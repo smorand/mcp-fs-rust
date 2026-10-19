@@ -339,6 +339,17 @@ pub async fn prepare_extraction(
         && client.exists(md).await?
         && client.stat(md).await?.mtime >= client.stat(path).await?.mtime
     {
+        // A companion stored before the check existed must not answer for a
+        // malformed source (SPEC-0041 E2E-013): the source bytes are read
+        // again, costing one blob read per cached OOXML call.
+        if crate::docs::zip_check::OOXML_EXTS.contains(&ext.as_str()) {
+            let data = client.read_bytes(path).await?;
+            if let Some(reason) = crate::docs::zip_check::ooxml_header_inconsistency(path, &data) {
+                return Err(ToolError::invalid_argument(format!(
+                    "could not extract {path}: not a valid OOXML package: {reason}"
+                )));
+            }
+        }
         let cached = client.read_text(md).await?;
         return Ok(Prepared::Cached(doc_payload(
             path,
@@ -537,8 +548,15 @@ fn decode_pdf_text(raw: &[u8]) -> String {
 type Zip = zip::ZipArchive<std::io::Cursor<Vec<u8>>>;
 
 fn open_zip(data: &[u8]) -> Result<Zip> {
-    zip::ZipArchive::new(std::io::Cursor::new(data.to_vec()))
-        .map_err(|e| ToolError::invalid_argument(format!("not a valid OOXML package: {e}")))
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data.to_vec()))
+        .map_err(|e| ToolError::invalid_argument(format!("not a valid OOXML package: {e}")))?;
+    // The readers below look parts up by their directory name; a part whose
+    // own header says otherwise would make the text depend on which copy a
+    // reader trusts, so the whole package is refused (SPEC-0041 FR-NEW-002).
+    if let Some(reason) = crate::docs::zip_check::header_inconsistency(&mut zip) {
+        return Err(ToolError::invalid_argument(format!("not a valid OOXML package: {reason}")));
+    }
+    Ok(zip)
 }
 
 /// Read one zip entry as text, or `None` when the entry is absent.

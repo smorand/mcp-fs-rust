@@ -631,6 +631,9 @@ pub struct StubDocService {
     outcome: Result<Conversion>,
     extensions: Vec<String>,
     max_input_bytes: u64,
+    /// How many times `convert` ran: the observable for "the converter was
+    /// never called" (SPEC-0041 DEC-008).
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -641,12 +644,18 @@ impl StubDocService {
             outcome: Ok(Conversion::text(markdown)),
             extensions: resolve_extensions(&[]),
             max_input_bytes: u64::MAX,
+            calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// A service that always fails, for the "the upload is never rolled back" path.
     pub fn failing(error: ToolError) -> Self {
-        Self { outcome: Err(error), extensions: resolve_extensions(&[]), max_input_bytes: u64::MAX }
+        Self {
+            outcome: Err(error),
+            extensions: resolve_extensions(&[]),
+            max_input_bytes: u64::MAX,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     /// A service that always returns `conversion`, files and manifest included.
@@ -655,6 +664,7 @@ impl StubDocService {
             outcome: Ok(conversion),
             extensions: resolve_extensions(&[]),
             max_input_bytes: u64::MAX,
+            calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -672,12 +682,18 @@ impl StubDocService {
         self.max_input_bytes = max_input_bytes;
         self
     }
+
+    /// How many conversions this service ran.
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
 #[async_trait]
 impl DocService for StubDocService {
     async fn convert(&self, _bytes: &[u8], _file_name: &str) -> Result<Conversion> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.outcome.clone()
     }
 

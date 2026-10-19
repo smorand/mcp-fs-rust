@@ -223,11 +223,22 @@ already in the volume, converts it and writes the companion at the same path
 Unlike an upload it honours the caller's `overwrite`, so an existing companion is
 `ERR_NO_CLOBBER`. It answers `ERR_NOT_SUPPORTED` when `doc_service` is disabled or
 the extension is not eligible, and `ERR_NOT_FOUND` when the path is not a file.
+(2026-10-19, SPEC-0041 US-0049.) A `.docx`/`.xlsx`/`.xlsm`/`.pptx`/`.pptm`/`.potx`/`.ppsx`
+whose parts disagree with its directory (`zip_check::ooxml_header_inconsistency`, keyed on
+those seven extensions, never on `doc_service.extensions`) is refused before the converter
+runs: `could not convert <path>: not a valid OOXML package: <reason>`
+(`ERR_INVALID_ARGUMENT`), no companion. On a documented `fs.write_bytes` or upload the
+source is still stored and the same error lands in `documentation.error`.
 
 `fs.extract_text` reuses an up to date companion (`cached: true`, nothing
 written) and handles PDF, DOCX, PPTX, XLSX, HTML, CSV, images (OCR through a
 configured multimodal provider, disabled by default) and text. Audio and video
 are unsupported (`ERR_NOT_SUPPORTED`). `fs.write_docx` requires a `.docx` path.
+(2026-10-19, SPEC-0041 US-0049.) A malformed OOXML package (local header vs directory
+mismatch, duplicate part names, overlapping parts) is refused with `could not extract
+<path>: not a valid OOXML package: <reason>` (`ERR_INVALID_ARGUMENT`), even when an up to
+date companion exists: the cached branch re reads the source bytes for those extensions
+(one extra blob read per cached OOXML call) and leaves the companion untouched.
 
 ## admin (15)
 

@@ -660,9 +660,17 @@ pub async fn write_bytes_documented(
         None => Value::Null,
         // The source was just written, so an older companion is stale by
         // definition: the companion always overwrites here.
+        // The check runs after the source write on purpose: a malformed
+        // upload is still stored, only its conversion is refused.
         Some(service) => {
-            match write_companion(client, safety, service, person, mount_id, norm, data, true).await
-            {
+            let converted = match ensure_well_formed(norm, data) {
+                Ok(()) => {
+                    write_companion(client, safety, service, person, mount_id, norm, data, true)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match converted {
                 Ok(done) => json!({
                     "md_path": done.md_path,
                     "bytes_written": done.bytes_written,
@@ -702,6 +710,7 @@ pub async fn documentize(
     let service = ensure_documentable(doc, norm)?;
     let data = client.read_bytes(norm).await?;
     ensure_input_size(service, norm, data.len())?;
+    ensure_well_formed(norm, &data)?;
     client.touch_atime(norm);
 
     let done =
@@ -714,6 +723,19 @@ pub async fn documentize(
         "overwritten": done.overwritten,
         "artifacts_report": done.report,
     }))
+}
+
+/// Refuse an OOXML document whose parts disagree with its directory before
+/// the converter sees it (SPEC-0041 FR-NEW-005). Keyed on the seven OOXML
+/// extensions, never on `doc_service.extensions`, so an operator widening the
+/// list cannot widen what slips through.
+fn ensure_well_formed(norm: &str, data: &[u8]) -> Result<()> {
+    match crate::docs::zip_check::ooxml_header_inconsistency(norm, data) {
+        Some(reason) => Err(ToolError::invalid_argument(format!(
+            "could not convert {norm}: not a valid OOXML package: {reason}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The service, provided it is configured and accepts this path.
@@ -4664,5 +4686,241 @@ mod tests {
         let after = node(&f, "/src.txt").await;
         assert_eq!(after.atime, before.atime);
         assert_eq!(after.mtime, before.mtime);
+    }
+
+    // ── SPEC-0041: inconsistent OOXML packages (US-0049) ──────────────────
+
+    use crate::docs::zip_check::craft;
+
+    const DOC_XML: &str = r#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body></w:document>"#;
+    const EXTRACT_REFUSED: &str = "not a valid OOXML package: header inconsistency detected";
+
+    /// A minimal OOXML package from `(name, xml)` pairs.
+    fn ooxml(parts: &[(&str, &str)]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, xml) in parts {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// The well formed memo of E2E-007.
+    fn memo() -> Vec<u8> {
+        ooxml(&[("word/document.xml", DOC_XML)])
+    }
+
+    /// The memo whose main part calls itself `word/other.xml` in its own header.
+    fn renamed_memo() -> Vec<u8> {
+        craft::rename_local(&memo(), "word/document.xml", "word/other.xml")
+    }
+
+    /// The memo with its main part present twice under one name: written
+    /// under a same length placeholder, then every copy of the placeholder
+    /// (local header and directory row) patched to the real name.
+    fn duplicated_memo() -> Vec<u8> {
+        let mut bytes = ooxml(&[("word/document.xml", DOC_XML), ("word/documenX.xml", DOC_XML)]);
+        let (from, to) = (b"word/documenX.xml", b"word/document.xml");
+        let mut i = 0;
+        while i + from.len() <= bytes.len() {
+            if &bytes[i..i + from.len()] == from {
+                bytes[i..i + from.len()].copy_from_slice(to);
+            }
+            i += 1;
+        }
+        bytes
+    }
+
+    /// A workbook whose worksheet part is named differently in its own header.
+    fn renamed_workbook() -> Vec<u8> {
+        let wb = ooxml(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", r#"<worksheet><sheetData/></worksheet>"#),
+        ]);
+        craft::rename_local(&wb, "xl/worksheets/sheet1.xml", "xl/worksheets/sheetX.xml")
+    }
+
+    async fn extract(f: &Fix, path: &str) -> Result<Value> {
+        extract_document(
+            &f.v,
+            &f.s,
+            &crate::config::OcrConfig::default(),
+            P,
+            M,
+            path,
+            100_000,
+            1_000,
+            false,
+            false,
+        )
+        .await
+    }
+
+    fn assert_refused(e: &ToolError, verb: &str, path: &str) {
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{}", e.message);
+        let prefix = format!("could not {verb} {path}: {EXTRACT_REFUSED}");
+        assert!(e.message.starts_with(&prefix), "{}", e.message);
+    }
+
+    /// SPEC-0041/E2E-007: a well formed document still yields its text.
+    #[tokio::test]
+    async fn e2e_007_well_formed_document_text_unchanged() {
+        let f = fixture().await;
+        f.v.write_bytes_atomic("/docs/memo.docx", &memo()).await.unwrap();
+        let r = extract(&f, "/docs/memo.docx").await.unwrap();
+        assert!(s(&r, "preview").contains("hello"), "{r}");
+    }
+
+    /// SPEC-0041/E2E-008.
+    #[tokio::test]
+    async fn e2e_008_renamed_main_part_is_refused() {
+        let f = fixture().await;
+        f.v.write_bytes_atomic("/docs/bad.docx", &renamed_memo()).await.unwrap();
+        let e = extract(&f, "/docs/bad.docx").await.unwrap_err();
+        assert_refused(&e, "extract", "/docs/bad.docx");
+    }
+
+    /// SPEC-0041/E2E-009.
+    #[tokio::test]
+    async fn e2e_009_duplicated_part_is_refused() {
+        let f = fixture().await;
+        f.v.write_bytes_atomic("/docs/dup.docx", &duplicated_memo()).await.unwrap();
+        let e = extract(&f, "/docs/dup.docx").await.unwrap_err();
+        assert_refused(&e, "extract", "/docs/dup.docx");
+    }
+
+    /// SPEC-0041/E2E-010: the extraction never reads the properties part, the
+    /// whole archive check still sees it.
+    #[tokio::test]
+    async fn e2e_010_malformed_unread_part_still_refuses() {
+        let f = fixture().await;
+        let doc = ooxml(&[("word/document.xml", DOC_XML), ("docProps/core.xml", "<cp/>")]);
+        let bytes = craft::rename_local(&doc, "docProps/core.xml", "docProps/other.xml");
+        f.v.write_bytes_atomic("/docs/props.docx", &bytes).await.unwrap();
+        let e = extract(&f, "/docs/props.docx").await.unwrap_err();
+        assert_refused(&e, "extract", "/docs/props.docx");
+    }
+
+    /// SPEC-0041/E2E-012.
+    #[tokio::test]
+    async fn e2e_012_macro_workbook_with_malformed_part_is_refused() {
+        let f = fixture().await;
+        f.v.write_bytes_atomic("/docs/bad.xlsm", &renamed_workbook()).await.unwrap();
+        let e = extract(&f, "/docs/bad.xlsm").await.unwrap_err();
+        assert_refused(&e, "extract", "/docs/bad.xlsm");
+    }
+
+    /// SPEC-0041/E2E-013: a companion stored before the check existed must not
+    /// answer for a malformed source.
+    #[tokio::test]
+    async fn e2e_013_stored_text_does_not_bypass_the_check() {
+        let f = fixture().await;
+        f.v.write_bytes_atomic("/docs/stale.docx", &renamed_memo()).await.unwrap();
+        f.v.write_text_atomic("/docs/stale.md", "hello").await.unwrap();
+        let (src, md) = (
+            f.v.stat("/docs/stale.docx").await.unwrap(),
+            f.v.stat("/docs/stale.md").await.unwrap(),
+        );
+        assert!(md.mtime >= src.mtime, "precondition: the cached branch is taken");
+
+        let e = extract(&f, "/docs/stale.docx").await.unwrap_err();
+        assert_refused(&e, "extract", "/docs/stale.docx");
+        assert_eq!(f.v.read_text("/docs/stale.md").await.unwrap(), "hello", "left as is");
+    }
+
+    /// SPEC-0041/E2E-SEC-002: a part disguised as `word/other.xml` in its own
+    /// header cannot make the document yield `hello`, and nothing is kept.
+    #[tokio::test]
+    async fn e2e_sec_002_disguised_part_cannot_change_the_text() {
+        let f = fixture().await;
+        f.v.write_bytes_atomic("/docs/smuggle.docx", &renamed_memo()).await.unwrap();
+        let e = extract(&f, "/docs/smuggle.docx").await.unwrap_err();
+        assert_refused(&e, "extract", "/docs/smuggle.docx");
+        // A different channel: the volume, not the tool answer.
+        assert!(!f.v.exists("/docs/smuggle.md").await.unwrap(), "no companion kept");
+        assert!(!f.v.exists("/docs/smuggle.docx.md").await.unwrap());
+    }
+
+    /// SPEC-0041/E2E-020: a well formed document converts once.
+    #[tokio::test]
+    async fn e2e_020_well_formed_document_converts_as_today() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD);
+        f.v.write_bytes_atomic("/docs/memo.docx", &memo()).await.unwrap();
+        let r = documentize(&f.v, &f.s, Some(&stub), P, M, "/docs/memo.docx", false).await.unwrap();
+        assert_eq!(s(&r, "md_path"), "/docs/memo.md");
+        assert!(f.v.exists("/docs/memo.md").await.unwrap());
+        assert_eq!(stub.calls(), 1);
+    }
+
+    async fn assert_documentize_refused(path: &str, bytes: &[u8], stub: &StubDocService) {
+        let f = fixture().await;
+        f.v.write_bytes_atomic(path, bytes).await.unwrap();
+        let e = documentize(&f.v, &f.s, Some(stub), P, M, path, false).await.unwrap_err();
+        assert_refused(&e, "convert", path);
+        assert_eq!(stub.calls(), 0, "the converter was never called");
+        let md = crate::docs::extract::companion_md_path(path);
+        assert!(!f.v.exists(&md).await.unwrap(), "no companion at {md}");
+        assert!(!f.v.exists(&format!("{path}.md")).await.unwrap());
+    }
+
+    /// SPEC-0041/E2E-021.
+    #[tokio::test]
+    async fn e2e_021_malformed_document_refused_on_demand() {
+        assert_documentize_refused("/docs/bad.docx", &renamed_memo(), &StubDocService::ok(MD))
+            .await;
+    }
+
+    /// SPEC-0041/E2E-023: the check ignores which extensions the operator
+    /// accepts, it only needs the service to accept the file at all.
+    #[tokio::test]
+    async fn e2e_023_operator_added_extension_still_checked() {
+        let stub = StubDocService::ok(MD).with_extensions(&[".xlsm"]);
+        assert_documentize_refused("/docs/bad.xlsm", &renamed_workbook(), &stub).await;
+    }
+
+    /// SPEC-0041/E2E-024.
+    #[tokio::test]
+    async fn e2e_024_duplicated_part_refused_on_demand() {
+        assert_documentize_refused("/docs/dup.docx", &duplicated_memo(), &StubDocService::ok(MD))
+            .await;
+    }
+
+    /// SPEC-0041/E2E-022: the upload is stored, only its conversion is refused.
+    #[tokio::test]
+    async fn e2e_022_malformed_deck_upload_stored_conversion_refused() {
+        let f = fixture().await;
+        let stub = StubDocService::ok(MD);
+        let deck = ooxml(&[
+            ("ppt/presentation.xml", "<p:presentation/>"),
+            ("ppt/slides/slide1.xml", "<p:sld><a:t>hello</a:t></p:sld>"),
+        ]);
+        let bytes = craft::rename_local(&deck, "ppt/slides/slide1.xml", "ppt/slides/slideX.xml");
+        let r = write_bytes_documented(
+            &f.v,
+            &f.s,
+            Some(&stub),
+            P,
+            M,
+            "/docs/deck.pptx",
+            &bytes,
+            false,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(f.v.read_bytes("/docs/deck.pptx").await.unwrap(), bytes, "source stored");
+        let err = &r["documentation"]["error"];
+        assert_eq!(err["code"], code::INVALID_ARGUMENT, "{r}");
+        let prefix = format!("could not convert /docs/deck.pptx: {EXTRACT_REFUSED}");
+        assert!(err["message"].as_str().unwrap().starts_with(&prefix), "{r}");
+        assert_eq!(stub.calls(), 0, "the converter was never called");
+        assert!(!f.v.exists("/docs/deck.md").await.unwrap());
+        assert!(!f.v.exists("/docs/deck.pptx.md").await.unwrap());
     }
 }

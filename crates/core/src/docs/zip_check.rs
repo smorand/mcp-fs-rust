@@ -8,7 +8,6 @@
 //! its own message prefix around the returned reason (DEC-002).
 
 /// The seven zip based document extensions (FR-NEW-002, FR-NEW-005).
-#[cfg_attr(not(test), expect(dead_code, reason = "production callers land with US-0049"))]
 pub(crate) const OOXML_EXTS: &[&str] =
     &[".docx", ".xlsx", ".xlsm", ".pptx", ".pptm", ".potx", ".ppsx"];
 
@@ -29,7 +28,6 @@ pub(crate) fn header_inconsistency<R: std::io::Read + std::io::Seek>(
 /// `Some(reason)` when `path` has one of [`OOXML_EXTS`], the bytes open as a
 /// zip, and the check fails. A zip that does not open returns `None`: that
 /// case keeps its existing handling at the caller.
-#[cfg_attr(not(test), expect(dead_code, reason = "production callers land with US-0049"))]
 pub(crate) fn ooxml_header_inconsistency(path: &str, data: &[u8]) -> Option<String> {
     let lower = path.to_ascii_lowercase();
     if !OOXML_EXTS.iter().any(|ext| lower.ends_with(ext)) {
