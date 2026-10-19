@@ -66,7 +66,7 @@
 
 ### 4.2 Invariance
 #### DR-003 [EARS-U]: Behavior invariance
-> The workspace SHALL produce, for every input covered by the existing test suite, byte identical observable output before and after this change; every tracked config file (`config/agent_test.yaml`, `config/local.yaml`) SHALL deserialize to an equal value; `tool-contract-golden.json` SHALL be unchanged.
+> The workspace SHALL produce, for every input covered by the existing test suite, byte identical observable output before and after this change; every tracked config file (`config/agent_test.yaml`, `config/local.yaml.template`, `config/minio.yaml.template`) SHALL deserialize to an equal value, the two templates read after the same `${VAR}` expansion the server applies; `tool-contract-golden.json` SHALL be unchanged.
 
 ### 4.3 Compatibility
 None (no public contract).
@@ -91,7 +91,7 @@ The existing test suite passes, unmodified except the 8.4 rows:
 #### DT-003: config parity
 - **Validates:** DR-003
 - **Location:** `crates/core/src/config.rs` tests (server) and `crates/agent` tests (agent)
-- **Given** `config/local.yaml` and `config/agent_test.yaml` / **When** each is parsed into its config type / **Then** parsing succeeds, and the `Debug` rendering of the parsed value equals a snapshot recorded on the current code before the swap (stored as a test literal).
+- **Given** `config/local.yaml.template`, `config/minio.yaml.template` (server, after `${VAR}` expansion with fixed test values) and `config/agent_test.yaml` (agent) / **When** each is parsed into its config type / **Then** parsing succeeds, and the `Debug` rendering of the parsed value equals a snapshot recorded on the current code before the swap (stored as a test literal).
 - **Red before:** guardrail; recorded on serde_yaml, then must stay equal on serde_norway.
 
 ### 8.3 Structural tests
@@ -124,6 +124,6 @@ The existing test suite passes, unmodified except the 8.4 rows:
 ## 10. Implementability gate
 | Round | F | A | Verdict |
 |---|---|---|---|
-| 1 | 0 | 0 | IMPLEMENTABLE (inline, depth S): both sides of the rename spelled; perimeter recounted (`rg -c serde_yaml`: config.rs 17, agent config 1, cli 1, remote 1, manifests 3, docs 2, audit 1, security gate 1); 2 test exceptions declared with reasons; non regression command literal; sweep with two searches, every hit disposed; security field set (advisory driven upgrade); no open question |
+| 1 | 0 | 1 | IMPLEMENTABLE after amending A-1 (`config/local.yaml` is untracked, `git ls-files config/`: parity now covers the tracked `agent_test.yaml`, `local.yaml.template`, `minio.yaml.template`); inline, depth S: both sides of the rename spelled; perimeter recounted (`rg -c serde_yaml`: config.rs 17, agent config 1, cli 1, remote 1, manifests 3, docs 2, audit 1, security gate 1); 2 test exceptions declared with reasons; non regression command literal; sweep with two searches, every hit disposed; security field set (advisory driven upgrade); no open question |
 
 **Amendments applied:** none.
