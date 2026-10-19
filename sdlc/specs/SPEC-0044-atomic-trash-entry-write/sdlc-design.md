@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: 3 modules (`storage/meta`, `core/fs_ops`, `purge`), 0 persisted change, 0 public contract change, 8 requirements. Counted L by the "3 or more modules" rule; one bounded context (trash recording).
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-20
 > Behavior change: none
 > From backlog: BL-0011
@@ -164,3 +164,24 @@ n/a.
 | 2 | 0 | 5 | IMPLEMENTABLE |
 
 **Amendments applied:** round 1: perimeter total recounted (14 code occurrences, 8 files edited), `VolumeClient` delegates to `meta`, DT-002 and DT-013 sharpened; round 2: doc comment count 4, DT-003 location, DT-004 fault injection, DT-010 proof, heading numbering.
+
+## 11. Design additions (2026-10-19)
+Target tier 2 (default, no `--tier`, no constitution `Tier:`, no `.spec.json`). Skill loaded: rust (`make check`, thiserror/ToolError, no `unwrap` in production). Validation of this design: DEC-001 to DEC-004 each name their DR; citations spot checked `purge.rs:89`, `meta.rs:1644`, `meta.rs:154`.
+
+### 11.1 Test levels
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-003, DT-004 | integration | direct call on `RelationalMetaStore` over faulting `RelationalDb` | `crates/core/src/purge.rs` tests | US-0052 |
+| DT-005, DT-006 | integration | direct call | `crates/core/src/storage/conformance.rs` or `purge.rs` tests | US-0052 |
+| DT-013 | integration (conformance, every engine) | direct call | `crates/core/src/storage/conformance.rs` | US-0052 |
+| DT-002, DT-007, DT-008, DT-009 | integration | `delete_path_at` / `rename_with_collision_retry` | `crates/core/src/core/fs_ops.rs` tests | US-0053 |
+| DT-010, DT-011, DT-012 | integration | `sweep_project_files`, `trash_list` | `crates/core/src/purge.rs`, `tools/trash.rs` tests | US-0053 |
+| DT-001 | structural | source scan test | `crates/core/src/core/fs_ops.rs` tests | US-0054 |
+| 8.1 non regression | all | `make check` | workspace | US-0054 |
+
+### 11.2 Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0052 | add the joint rename and trash entry operation | P1 | DR-001, DR-007 | main | 2 | no |
+| US-0053 | route soft delete and purge through the joint operation | P1 | DR-002, DR-003, DR-006 | US-0052 | 2 | no |
+| US-0054 | seal the old write path and document it | P1 | DR-004, DR-005, DR-008 | US-0053 | 2 | yes |
