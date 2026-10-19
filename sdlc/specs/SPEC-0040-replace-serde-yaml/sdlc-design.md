@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: one debt item (YAML config parsing), 2 crates, 2 production call sites, no public contract change, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-19
 > Behavior change: none
 > From backlog: BL-0061
@@ -127,3 +127,20 @@ The existing test suite passes, unmodified except the 8.4 rows:
 | 1 | 0 | 1 | IMPLEMENTABLE after amending A-1 (`config/local.yaml` is untracked, `git ls-files config/`: parity now covers the tracked `agent_test.yaml`, `local.yaml.template`, `minio.yaml.template`); inline, depth S: both sides of the rename spelled; perimeter recounted (`rg -c serde_yaml`: config.rs 17, agent config 1, cli 1, remote 1, manifests 3, docs 2, audit 1, security gate 1); 2 test exceptions declared with reasons; non regression command literal; sweep with two searches, every hit disposed; security field set (advisory driven upgrade); no open question |
 
 **Amendments applied:** none.
+
+## Design additions (2026-10-19)
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001, DT-002 | structural | lockfile text, `cargo tree`, file text | `crates/mcp-fs/tests/security_gate.rs` | US-0047 |
+| DT-003 | unit | parse the tracked configs, compare `Debug` snapshots | `crates/core/src/config.rs` tests, `crates/agent/src/config.rs` tests | US-0047 |
+| DT-004 | guardrail | full suite | `make check` | US-0047 |
+
+### Additional decisions
+- **DEC-003:** One story at `min_tier: 2`. **Obliged by:** SPEC-0040/DR-001..DR-003. **Rationale:** 12 files but a mechanical rename (decision density low); nothing compiles between the manifest rename and the code rename, so it cannot be split. **Alternatives considered:** two stories (rejected: the first would not build). **Source:** design. **Evidence:** Section 2.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0047 | replace serde_yaml with serde_norway | P1 | DR-001, DR-002, DR-003 | main | 2 | yes |
