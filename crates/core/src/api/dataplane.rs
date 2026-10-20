@@ -380,7 +380,7 @@ async fn diff(
         DIFF_PARAMS.map(|name| value(name).unwrap_or_default());
     let a = crate::tools::diff_files::Side { mount_id: mount_a, path: path_a };
     let b = crate::tools::diff_files::Side { mount_id: mount_b, path: path_b };
-    match crate::tools::diff_files::diff_files(&state, &person, a, b).await {
+    match crate::tools::diff_files::diff_files(&state, &person, a, b, None).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(&e),
     }

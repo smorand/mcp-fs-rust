@@ -598,7 +598,7 @@
     },
     {
       "name": "fs.diff_files",
-      "description": "Compare two text files (same or different project) and return a unified diff with 3 lines of context.",
+      "description": "Compare two text files (same or different project) and return a unified diff. Shows 3 lines of context by default; context_lines (0 to 10000000) chooses another number of unchanged lines around each change.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -617,6 +617,10 @@
           "path_b": {
             "description": "Absolute POSIX path of the new side within its volume.",
             "type": "string"
+          },
+          "context_lines": {
+            "description": "Optional. Number of unchanged lines shown around each change, a whole number from 0 to 10000000. Default 3.",
+            "default": null
           }
         },
         "required": [

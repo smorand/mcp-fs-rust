@@ -179,8 +179,8 @@ fs.hash
   required: ['mount_id', 'path']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.diff_files
-  desc: Compare two text files (same or different project) and return a unified diff with 3 lines of context.
-  params: mount_id_a:string, path_a:string, mount_id_b:string, path_b:string
+  desc: Compare two text files (same or different project) and return a unified diff. Shows 3 lines of context by default; context_lines (0 to 10000000) chooses another number of unchanged lines around each change.
+  params: mount_id_a:string, path_a:string, mount_id_b:string, path_b:string, context_lines:<untyped>=null
   required: ['mount_id_a', 'path_a', 'mount_id_b', 'path_b']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.head

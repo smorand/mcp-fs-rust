@@ -631,6 +631,9 @@ pub struct DiffFilesArgs {
     pub mount_id_b: String,
     /// Absolute POSIX path of the new side within its volume.
     pub path_b: String,
+    /// Optional. Number of unchanged lines shown around each change, a whole number from 0 to 10000000. Default 3.
+    #[serde(default)]
+    pub context_lines: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2043,7 +2046,7 @@ impl McpServer {
 
     #[tool(
         name = "fs.diff_files",
-        description = "Compare two text files (same or different project) and return a unified diff with 3 lines of context."
+        description = "Compare two text files (same or different project) and return a unified diff. Shows 3 lines of context by default; context_lines (0 to 10000000) chooses another number of unchanged lines around each change."
     )]
     pub(crate) async fn fs_diff_files(
         &self,
@@ -2055,6 +2058,7 @@ impl McpServer {
             &self.person,
             Side { mount_id: &a.mount_id_a, path: &a.path_a },
             Side { mount_id: &a.mount_id_b, path: &a.path_b },
+            a.context_lines.as_ref(),
         )
         .await;
         to_call_result("fs.diff_files", out)

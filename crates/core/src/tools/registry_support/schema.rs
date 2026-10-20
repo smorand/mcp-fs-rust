@@ -40,6 +40,9 @@ pub enum ParamType {
     /// Tolerant string array: renders with NO `type` at all (matches the C#
     /// `FlexibleStringArrayConverter`, which accepts array | string | csv | null).
     FlexibleStrArray,
+    /// Any JSON value: renders with NO `type`, matching `schemars` for an
+    /// `Option<serde_json::Value>` (`fs.diff_files`' `context_lines`).
+    Any,
     /// Free-form object array (e.g. `edits`), with a caller-supplied items schema.
     ObjArray(&'static str),
 }
@@ -166,6 +169,11 @@ impl ToolSchema {
         self.push(n, d, ParamType::FlexibleStrArray, false, Some(Value::Null))
     }
 
+    /// Optional value of any JSON type (`context_lines`): no `type`, `"default": null`.
+    pub fn opt_any(self, n: &'static str, d: &'static str) -> Self {
+        self.push(n, d, ParamType::Any, false, Some(Value::Null))
+    }
+
     /// Render the `inputSchema` object.
     pub fn input_schema(&self) -> Value {
         let mut props = Map::new();
@@ -200,7 +208,7 @@ impl ToolSchema {
                 ParamType::NullableInt => {
                     o.insert("type".into(), json!("integer"));
                 }
-                ParamType::FlexibleStrArray => { /* no type, by design */ }
+                ParamType::FlexibleStrArray | ParamType::Any => { /* no type, by design */ }
                 ParamType::ObjArray(items) => {
                     o.insert("type".into(), json!("array"));
                     let items: Value = serde_json::from_str(items)

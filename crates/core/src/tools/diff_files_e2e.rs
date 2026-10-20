@@ -60,6 +60,16 @@ async fn diff(
     a: (&str, &str),
     b: (&str, &str),
 ) -> Result<CallToolResult, rmcp::ErrorData> {
+    diff_with(f, person, a, b, None).await
+}
+
+async fn diff_with(
+    f: &Fixture,
+    person: &str,
+    a: (&str, &str),
+    b: (&str, &str),
+    context_lines: Option<Value>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let server = McpServer::new(f.state.clone(), person.to_string());
     server
         .fs_diff_files(Parameters(DiffFilesArgs {
@@ -67,6 +77,7 @@ async fn diff(
             path_a: a.1.to_string(),
             mount_id_b: b.0.to_string(),
             path_b: b.1.to_string(),
+            context_lines,
         }))
         .await
 }
@@ -871,4 +882,349 @@ async fn spec_0045_e2e_230_large_comparison_within_the_time_bound() {
     }
     assert_eq!((removed, added), (1000, 1000));
     assert!(elapsed < std::time::Duration::from_secs(10), "took {elapsed:?}");
+}
+
+// ── SPEC-0046 US-0061: context_lines ────────────────────────────────────────
+
+const SIZE_REFUSAL: &str =
+    "ERR_INVALID_ARGUMENT: 'context_lines' must be a whole number from 0 to 10000000";
+
+fn numbered(n: usize, replace: &[usize]) -> String {
+    (1..=n)
+        .map(|i| if replace.contains(&i) { format!("L{i}\n") } else { format!("l{i}\n") })
+        .collect()
+}
+
+/// P1 to P7 of SPEC-0046, all in alpha.
+async fn world_46() -> Fixture {
+    let f = world().await;
+    f.state.admin.add_member("beta", ALICE, OWNER).await.unwrap();
+    put(&f, "alpha", "/a.txt", &numbered(10, &[])).await;
+    put(&f, "alpha", "/b.txt", &numbered(10, &[6])).await;
+    put(&f, "alpha", "/same.txt", &numbered(10, &[])).await;
+    put(&f, "beta", "/b.txt", &numbered(10, &[6])).await;
+    put(&f, "alpha", "/c.txt", &numbered(14, &[])).await;
+    put(&f, "alpha", "/d.txt", &numbered(14, &[3, 12])).await;
+    put(&f, "alpha", "/e.txt", &numbered(10, &[])).await;
+    put(&f, "alpha", "/f.txt", &numbered(10, &[1])).await;
+    put(&f, "alpha", "/g.txt", &numbered(15, &[])).await;
+    put(&f, "alpha", "/h.txt", &numbered(15, &[3, 10])).await;
+    put(&f, "alpha", "/i.txt", &numbered(16, &[])).await;
+    put(&f, "alpha", "/j.txt", &numbered(16, &[3, 11])).await;
+    put(&f, "alpha", "/k.txt", &numbered(5, &[])).await;
+    put(&f, "alpha", "/m.txt", &numbered(5, &[2, 3])).await;
+    f
+}
+
+async fn diff_text(f: &Fixture, a: (&str, &str), b: (&str, &str), size: Option<Value>) -> Value {
+    ok_json(diff_with(f, ALICE, a, b, size).await)
+}
+
+async fn assert_diff(a: &str, b: &str, size: Option<Value>, expected: &str) {
+    let f = world_46().await;
+    let v = diff_text(&f, ("alpha", a), ("alpha", b), size).await;
+    assert_eq!(v["diff"], expected);
+    assert_eq!(v["identical"], false);
+}
+
+async fn assert_refused(size: Value) {
+    let f = world_46().await;
+    let e =
+        err_text(diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(size)).await);
+    assert!(e.ends_with(SIZE_REFUSAL), "got: {e}");
+    assert!(!e.contains("@@"), "no diff may be returned: {e}");
+}
+
+const ONE: &str = "--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -5,3 +5,3 @@\n l5\n-l6\n+L6\n l7\n";
+
+#[tokio::test]
+async fn spec_0046_e2e_001_size_1() {
+    assert_diff("/a.txt", "/b.txt", Some(json!(1)), ONE).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_002_no_size() {
+    assert_diff(
+        "/a.txt",
+        "/b.txt",
+        None,
+        "--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -3,7 +3,7 @@\n l3\n l4\n l5\n-l6\n+L6\n l7\n l8\n l9\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_003_size_0() {
+    assert_diff(
+        "/a.txt",
+        "/b.txt",
+        Some(json!(0)),
+        "--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -6 +6 @@\n-l6\n+L6\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_004_two_projects_size_1() {
+    let f = world_46().await;
+    let v = diff_text(&f, ("alpha", "/a.txt"), ("beta", "/b.txt"), Some(json!(1))).await;
+    assert_eq!(v["diff"], ONE.replace("+++ alpha:/b.txt", "+++ beta:/b.txt"));
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_006_largest_accepted_size() {
+    assert_diff(
+        "/a.txt",
+        "/b.txt",
+        Some(json!(10_000_000)),
+        "--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -1,10 +1,10 @@\n l1\n l2\n l3\n l4\n l5\n-l6\n+L6\n l7\n l8\n l9\n l10\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_007_changes_8_apart_size_3() {
+    assert_diff(
+        "/c.txt",
+        "/d.txt",
+        Some(json!(3)),
+        "--- alpha:/c.txt\n+++ alpha:/d.txt\n@@ -1,6 +1,6 @@\n l1\n l2\n-l3\n+L3\n l4\n l5\n l6\n@@ -9,6 +9,6 @@\n l9\n l10\n l11\n-l12\n+L12\n l13\n l14\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_008_same_changes_size_4() {
+    assert_diff(
+        "/c.txt",
+        "/d.txt",
+        Some(json!(4)),
+        "--- alpha:/c.txt\n+++ alpha:/d.txt\n@@ -1,14 +1,14 @@\n l1\n l2\n-l3\n+L3\n l4\n l5\n l6\n l7\n l8\n l9\n l10\n l11\n-l12\n+L12\n l13\n l14\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_009_change_on_first_line() {
+    assert_diff(
+        "/e.txt",
+        "/f.txt",
+        Some(json!(3)),
+        "--- alpha:/e.txt\n+++ alpha:/f.txt\n@@ -1,4 +1,4 @@\n-l1\n+L1\n l2\n l3\n l4\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_010_identical_size_0() {
+    let f = world_46().await;
+    let v = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/same.txt"), Some(json!(0))).await;
+    assert_eq!(v, json!({"identical": true, "diff": ""}));
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_011_negative_size() {
+    assert_refused(json!(-1)).await;
+    // The same call without a size still returns the 3 line diff.
+    let f = world_46().await;
+    let v = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/b.txt"), None).await;
+    assert!(v["diff"].as_str().unwrap().contains("@@ -3,7 +3,7 @@"));
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_012_not_a_number() {
+    assert_refused(json!("abc")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_013_decimal() {
+    assert_refused(json!(2.5)).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_014_just_above_the_maximum() {
+    assert_refused(json!(10_000_001)).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_016_invalid_size_and_missing_file() {
+    let f = world_46().await;
+    let e = err_text(
+        diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/missing.txt"), Some(json!(-1))).await,
+    );
+    assert!(e.ends_with(SIZE_REFUSAL), "got: {e}");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_017_invalid_size_by_a_non_member() {
+    let f = world_46().await;
+    let mallory = "mallory@example.com";
+    let e = err_text(
+        diff_with(&f, mallory, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(json!("abc"))).await,
+    );
+    assert!(e.ends_with(SIZE_REFUSAL), "got: {e}");
+    let alice = err_text(
+        diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(json!("abc"))).await,
+    );
+    assert_eq!(e, alice);
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_019_refusal_touches_nothing() {
+    let f = world_46().await;
+    let_time_pass().await;
+    let (a0, b0) = (atime(&f, "alpha", "/a.txt").await, atime(&f, "alpha", "/b.txt").await);
+    let before = (snapshot(&f, "alpha", "/a.txt").await, snapshot(&f, "alpha", "/b.txt").await);
+    let e = err_text(
+        diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(json!(-1))).await,
+    );
+    assert!(e.ends_with(SIZE_REFUSAL), "got: {e}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(atime(&f, "alpha", "/a.txt").await, a0);
+    assert_eq!(atime(&f, "alpha", "/b.txt").await, b0);
+    let after = (snapshot(&f, "alpha", "/a.txt").await, snapshot(&f, "alpha", "/b.txt").await);
+    assert_eq!(before, after);
+    let v = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(json!(1))).await;
+    assert_eq!(v["diff"], ONE);
+    assert!(atime_after(&f, "alpha", "/a.txt", a0).await, "a later success counts as access");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_021_identical_files_invalid_size() {
+    let f = world_46().await;
+    let e = err_text(
+        diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/same.txt"), Some(json!(-1))).await,
+    );
+    assert!(e.ends_with(SIZE_REFUSAL), "got: {e}");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_022_identical_files_no_size() {
+    let f = world_46().await;
+    let v = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/same.txt"), None).await;
+    assert_eq!(v, json!({"identical": true, "diff": ""}));
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_026_leading_plus_sign() {
+    assert_refused(json!("+3")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_027_leading_zeros() {
+    assert_diff("/a.txt", "/b.txt", Some(json!("001")), ONE).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_028_null_size() {
+    let f = world_46().await;
+    let none = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/b.txt"), None).await;
+    let null = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(Value::Null)).await;
+    assert_eq!(none, null);
+    assert!(null["diff"].as_str().unwrap().contains("@@ -3,7 +3,7 @@"));
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_029_number_3_point_0() {
+    let raw: Value = serde_json::from_str("3.0").unwrap();
+    assert_refused(raw).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_030_number_1e3() {
+    let raw: Value = serde_json::from_str("1e3").unwrap();
+    assert_refused(raw).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_032_leading_space() {
+    assert_refused(json!(" 3")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_033_trailing_space() {
+    assert_refused(json!("3 ")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_034_hex_text() {
+    assert_refused(json!("0x3")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_035_boolean() {
+    assert_refused(json!(true)).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_036_list() {
+    assert_refused(json!([1])).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_037_number_and_text_agree() {
+    assert_diff("/a.txt", "/b.txt", Some(json!(1)), ONE).await;
+    assert_diff("/a.txt", "/b.txt", Some(json!("1")), ONE).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_040_separate_changes_size_0() {
+    assert_diff(
+        "/c.txt",
+        "/d.txt",
+        Some(json!(0)),
+        "--- alpha:/c.txt\n+++ alpha:/d.txt\n@@ -3 +3 @@\n-l3\n+L3\n@@ -12 +12 @@\n-l12\n+L12\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_041_separate_changes_size_1() {
+    assert_diff(
+        "/c.txt",
+        "/d.txt",
+        Some(json!(1)),
+        "--- alpha:/c.txt\n+++ alpha:/d.txt\n@@ -2,3 +2,3 @@\n l2\n-l3\n+L3\n l4\n@@ -11,3 +11,3 @@\n l11\n-l12\n+L12\n l13\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_043_six_unchanged_lines_size_3() {
+    assert_diff(
+        "/g.txt",
+        "/h.txt",
+        Some(json!(3)),
+        "--- alpha:/g.txt\n+++ alpha:/h.txt\n@@ -1,13 +1,13 @@\n l1\n l2\n-l3\n+L3\n l4\n l5\n l6\n l7\n l8\n l9\n-l10\n+L10\n l11\n l12\n l13\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_044_seven_unchanged_lines_size_3() {
+    assert_diff(
+        "/i.txt",
+        "/j.txt",
+        Some(json!(3)),
+        "--- alpha:/i.txt\n+++ alpha:/j.txt\n@@ -1,6 +1,6 @@\n l1\n l2\n-l3\n+L3\n l4\n l5\n l6\n@@ -8,7 +8,7 @@\n l8\n l9\n l10\n-l11\n+L11\n l12\n l13\n l14\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_045_identical_size_3() {
+    let f = world_46().await;
+    let v = diff_text(&f, ("alpha", "/a.txt"), ("alpha", "/same.txt"), Some(json!(3))).await;
+    assert_eq!(v, json!({"identical": true, "diff": ""}));
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_046_adjacent_changes_size_0() {
+    assert_diff(
+        "/k.txt",
+        "/m.txt",
+        Some(json!(0)),
+        "--- alpha:/k.txt\n+++ alpha:/m.txt\n@@ -2,2 +2,2 @@\n-l2\n-l3\n+L2\n+L3\n",
+    )
+    .await;
 }
