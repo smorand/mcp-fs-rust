@@ -238,7 +238,7 @@ async fn bt_007_disabled_tools_are_not_listed() {
     // The `t.*` tools are this crate's own `#[cfg(test)]` router (US-0008),
     // absent from any real build, so they are not part of the served count.
     let served = names.iter().filter(|n| !n.starts_with("t.")).count();
-    assert_eq!(served, 59, "default surface is 44 fs.* plus 15 admin.*, got {names:?}");
+    assert_eq!(served, 60, "default surface is 45 fs.* plus 15 admin.*, got {names:?}");
 }
 
 // ── SPEC-0027/BT-020 ────────────────────────────────────────────────────────
@@ -253,7 +253,7 @@ async fn bt_020_enabled_git_and_search_are_served_unchanged() {
 
     let names = list_names(&app, &token).await;
     let served = names.iter().filter(|n| !n.starts_with("t.")).count();
-    assert_eq!(served, 112, "git and search on serve 112 tools, got {names:?}");
+    assert_eq!(served, 113, "git and search on serve 113 tools, got {names:?}");
 
     for name in ["git.init", "git.status"] {
         let v = send(
@@ -452,7 +452,7 @@ async fn bt_010_each_optional_family_is_listed_with_its_catalog_schema() {
         let tools = list_tools(&app, &token).await;
         let expected = expected_family_count(family.prefix);
         assert_eq!(catalog.len(), expected, "{} catalog size", family.prefix);
-        assert_eq!(served_count(&tools), 59 + expected, "{} alone", family.prefix);
+        assert_eq!(served_count(&tools), 60 + expected, "{} alone", family.prefix);
         for entry in &catalog {
             let served = tools
                 .iter()
@@ -478,7 +478,7 @@ async fn bt_011_every_flag_on_serves_the_whole_surface() {
     let (app, _state) = app_with_atlas(c).await;
 
     let tools = list_tools(&app, &token).await;
-    let expected = if pandoc_on_path() { 134 } else { 132 };
+    let expected = if pandoc_on_path() { 135 } else { 133 };
     assert_eq!(served_count(&tools), expected, "every flag on (pandoc: {})", pandoc_on_path());
 }
 

@@ -54,6 +54,18 @@ pub fn unified(old_text: &str, new_text: &str, path: &str) -> String {
 /// Unified diff with an explicit context size. Returns an empty string when the
 /// two texts are identical, exactly like the C# version.
 pub fn unified_with_context(old_text: &str, new_text: &str, path: &str, context: usize) -> String {
+    unified_labeled(old_text, new_text, path, path, context)
+}
+
+/// Unified diff whose `---` and `+++` headers carry their own label, for a
+/// comparison of two distinct files (`fs.diff_files`). Empty when identical.
+pub fn unified_labeled(
+    old_text: &str,
+    new_text: &str,
+    old_label: &str,
+    new_label: &str,
+    context: usize,
+) -> String {
     let a = split_lines_keep_ends(old_text);
     let b = split_lines_keep_ends(new_text);
     let ops = capture_diff_slices(Algorithm::Myers, &a, &b);
@@ -67,10 +79,10 @@ pub fn unified_with_context(old_text: &str, new_text: &str, path: &str, context:
 
     let mut out = String::new();
     out.push_str("--- ");
-    out.push_str(path);
+    out.push_str(old_label);
     out.push('\n');
     out.push_str("+++ ");
-    out.push_str(path);
+    out.push_str(new_label);
     out.push('\n');
 
     for group in &groups {

@@ -597,6 +597,42 @@
       }
     },
     {
+      "name": "fs.diff_files",
+      "description": "Compare two text files (same or different project) and return a unified diff with 3 lines of context.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id_a": {
+            "description": "Project/volume id of the old side.",
+            "type": "string"
+          },
+          "path_a": {
+            "description": "Absolute POSIX path of the old side within its volume.",
+            "type": "string"
+          },
+          "mount_id_b": {
+            "description": "Project/volume id of the new side.",
+            "type": "string"
+          },
+          "path_b": {
+            "description": "Absolute POSIX path of the new side within its volume.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id_a",
+          "path_a",
+          "mount_id_b",
+          "path_b"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "fs.documentize",
       "description": "Generate the Markdown companion of a stored document.",
       "inputSchema": {

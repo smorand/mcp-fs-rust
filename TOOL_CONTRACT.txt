@@ -178,6 +178,11 @@ fs.hash
   params: mount_id:string, path:string, algo:string="sha256"
   required: ['mount_id', 'path']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+fs.diff_files
+  desc: Compare two text files (same or different project) and return a unified diff with 3 lines of context.
+  params: mount_id_a:string, path_a:string, mount_id_b:string, path_b:string
+  required: ['mount_id_a', 'path_a', 'mount_id_b', 'path_b']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 fs.head
   desc: First N lines of a file.
   params: mount_id:string, path:string, lines:integer=20
@@ -628,6 +633,7 @@ fs.head: {"content": "1\thello"}
 fs.tail: {"content": "2\tworld"}
 fs.count_lines: {"total_lines": 2}
 fs.hash: {"path": "/a.txt", "algo": "sha256", "hash": "4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92", "size": 12}
+fs.diff_files: {"identical": false, "diff": "--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -1 +1 @@\n-a\n+b\n"}
 fs.exists: {"exists": true, "kind": "file"}
 fs.export_zip: {"url": "/exports/0b7e2f4c-1a3d-4e5f-8a9b-0c1d2e3f4a5b"}
 fs.extract_archive: {"destination": "/uploads/report", "files_written": 2, "dirs_created": 1, "bytes_written": 10}

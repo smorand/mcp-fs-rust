@@ -622,6 +622,18 @@ fn def_sha256() -> String {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DiffFilesArgs {
+    /// Project/volume id of the old side.
+    pub mount_id_a: String,
+    /// Absolute POSIX path of the old side within its volume.
+    pub path_a: String,
+    /// Project/volume id of the new side.
+    pub mount_id_b: String,
+    /// Absolute POSIX path of the new side within its volume.
+    pub path_b: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct MkdirArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -2027,6 +2039,25 @@ impl McpServer {
         }
         .await;
         to_call_result("fs.hash", out)
+    }
+
+    #[tool(
+        name = "fs.diff_files",
+        description = "Compare two text files (same or different project) and return a unified diff with 3 lines of context."
+    )]
+    pub(crate) async fn fs_diff_files(
+        &self,
+        Parameters(a): Parameters<DiffFilesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use crate::tools::diff_files::{Side, diff_files};
+        let out = diff_files(
+            &self.state,
+            &self.person,
+            Side { mount_id: &a.mount_id_a, path: &a.path_a },
+            Side { mount_id: &a.mount_id_b, path: &a.path_b },
+        )
+        .await;
+        to_call_result("fs.diff_files", out)
     }
 
     // ── lifecycle family ─────────────────────────────────────────────────────
@@ -3840,8 +3871,9 @@ mod tests {
             .collect();
         // SPEC-0011 US-0005 adds fs.trash_restore, bumping 36 to 37; SPEC-0015 adds
         // fs.extract_archive, 38 to 39; SPEC-0019 adds fs.list_tables, 39 to 40, then fs.get_table, 41,
-        // then fs.list_images and fs.get_image, 43, then fs.get_document_view, 44.
-        assert_eq!(names.len(), 44, "got: {names:?}");
+        // then fs.list_images and fs.get_image, 43, then fs.get_document_view, 44;
+        // SPEC-0045 adds fs.diff_files, 45.
+        assert_eq!(names.len(), 45, "got: {names:?}");
     }
 
     #[test]
@@ -3859,11 +3891,12 @@ mod tests {
         // SPEC-0019 adds fs.list_tables: fs 40, total 107; fs.get_table: fs 41, total 108;
         // fs.list_images and fs.get_image: fs 43, total 110; fs.get_document_view: fs 44, total 111.
         // SPEC-0020 adds admin.get_project_quota: admin 15, total 112.
-        assert_eq!(fs_count, 44, "got: {names:?}");
+        // SPEC-0045 adds fs.diff_files: fs 45, total 113.
+        assert_eq!(fs_count, 45, "got: {names:?}");
         assert_eq!(admin_count, 15, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 112, "got: {names:?}");
+        assert_eq!(names.len(), 113, "got: {names:?}");
     }
 
     #[test]
@@ -4195,7 +4228,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 108, "the frozen contract covers 108 non-search tools");
+        assert_eq!(checked, 109, "the frozen contract covers 109 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4216,8 +4249,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 108, "got: {names:?}");
-        assert_eq!(expected.len(), 108, "the golden contract itself must hold 108 names");
+        assert_eq!(names.len(), 109, "got: {names:?}");
+        assert_eq!(expected.len(), 109, "the golden contract itself must hold 109 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

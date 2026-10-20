@@ -35,6 +35,9 @@ pub mod context7;
 #[cfg(test)]
 pub(crate) mod contract_golden;
 pub mod db;
+pub(crate) mod diff_files;
+#[cfg(test)]
+mod diff_files_e2e;
 pub mod doc;
 #[cfg(test)]
 pub(crate) mod document;
@@ -99,6 +102,7 @@ pub(crate) fn register_fs(reg: &mut crate::tools::registry_support::ToolRegistry
     search::register(reg);
     listing::register(reg);
     metadata::register(reg);
+    diff_files::register(reg);
     lifecycle::register(reg);
     document::register(reg);
     trash::register(reg);
@@ -410,6 +414,7 @@ mod tests {
         "fs.stat",
         "fs.exists",
         "fs.hash",
+        "fs.diff_files",
         "fs.mkdir",
         "fs.delete",
         "fs.move",
@@ -434,8 +439,9 @@ mod tests {
     fn register_fs_registers_every_family_in_order() {
         let mut reg = ToolRegistry::new();
         register_fs(&mut reg);
-        // 44 since SPEC-0019 US-0008 added fs.get_document_view.
-        assert_eq!(reg.len(), 44);
+        // 44 since SPEC-0019 US-0008 added fs.get_document_view, 45 with
+        // SPEC-0045 fs.diff_files.
+        assert_eq!(reg.len(), 45);
         assert_eq!(reg.names(), FS_TOOLS);
     }
 
@@ -452,7 +458,8 @@ mod tests {
     }
 
     /// `mount_id` is required on every fs.* tool, including the two that never
-    /// open a volume.
+    /// open a volume. `fs.diff_files` spans two volumes, so its first required
+    /// argument is the old side's `mount_id_a` (SPEC-0045).
     #[test]
     fn mount_id_is_required_everywhere() {
         let mut reg = ToolRegistry::new();
@@ -460,7 +467,8 @@ mod tests {
         for name in reg.names() {
             let schema = reg.resolve(name).unwrap().schema.input_schema();
             let required = schema["required"].as_array().expect(name);
-            assert_eq!(required[0], "mount_id", "{name} must require mount_id first");
+            let first = if *name == "fs.diff_files" { "mount_id_a" } else { "mount_id" };
+            assert_eq!(required[0], first, "{name} must require {first} first");
         }
     }
 
@@ -509,8 +517,8 @@ mod tests {
             &reg,
             |name| name.starts_with("fs."),
             // 44 since SPEC-0019 added fs.list_tables, fs.get_table, fs.list_images,
-            // fs.get_image and fs.get_document_view.
-            44,
+            // fs.get_image and fs.get_document_view; 45 with SPEC-0045 fs.diff_files.
+            45,
             "fs.* tools",
         );
     }

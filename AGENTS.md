@@ -2,7 +2,7 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (108 tools: 44 `fs.*`, 15 `admin.*`, 39 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
+multi-project filesystem** (109 tools: 45 `fs.*`, 15 `admin.*`, 39 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
 + 4 `search.*` when search enabled),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/` with push,
@@ -153,7 +153,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 108 tool schemas and return shapes, human readable. **This is
+- `TOOL_CONTRACT.txt` : the 109 tool schemas and return shapes, human readable. **This is
   the authoritative contract.**
 - `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
   every name, description and `inputSchema` against it, serialized, so a reordered schema
@@ -226,7 +226,7 @@ The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, project usage and quota admission, document
   artifact store, request lifecycle, safety, error logging.
-- `.agent_docs/tools.md` : the 108 tool reference (families, parameters, authorization).
+- `.agent_docs/tools.md` : the 109 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, the
   `git.hosts` host map, OAuth/PAT tokens (per person+host), the remote pipeline
