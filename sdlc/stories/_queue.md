@@ -54,3 +54,9 @@
 | US-0052 | SPEC-0044 | add the joint rename and trash entry operation | main | 2 | landed | story/US-0052-joint-rename-trash-entry | main |
 | US-0053 | SPEC-0044 | route soft delete and purge through the joint operation | US-0052 | 2 | landed | story/US-0052-joint-rename-trash-entry | main |
 | US-0054 | SPEC-0044 | seal the old write path and document it | US-0053 | 2 | landed | story/US-0053-route-delete-and-purge-through-joint-op | story/US-0052-joint-rename-trash-entry |
+| US-0055 | SPEC-0045 | compare two text files with fs.diff_files | main | 1 | todo | | |
+| US-0056 | SPEC-0045 | refuse what cannot be compared | US-0055 | 2 | todo | | |
+| US-0057 | SPEC-0045 | text only and a size limit | US-0056 | 2 | todo | | |
+| US-0058 | SPEC-0045 | a comparison is read only and counts as access | US-0055 | 2 | todo | | |
+| US-0059 | SPEC-0045 | the same comparison on the REST data plane | US-0056 | 2 | todo | | |
+| US-0060 | SPEC-0045 | large comparison bound, docs, and spec close | US-0057, US-0058, US-0059 | 2 | todo | | |
