@@ -60,3 +60,6 @@
 | US-0058 | SPEC-0045 | a comparison is read only and counts as access | US-0055 | 2 | landed | story/US-0058-diff-is-read-only-and-counts-as-access | story/US-0057-text-only-and-size-limit |
 | US-0059 | SPEC-0045 | the same comparison on the REST data plane | US-0056 | 2 | landed | story/US-0059-rest-route-get-api-fs-diff | story/US-0058-diff-is-read-only-and-counts-as-access |
 | US-0060 | SPEC-0045 | large comparison bound, docs, and spec close | US-0057, US-0058, US-0059 | 2 | landed | story/US-0060-diff-performance-bound-docs-and-spec-close | story/US-0059-rest-route-get-api-fs-diff |
+| US-0061 | SPEC-0046 | choose the context size of a comparison | main | 2 | todo | | |
+| US-0062 | SPEC-0046 | the same context size on the web interface | US-0061 | 2 | todo | | |
+| US-0063 | SPEC-0046 | other diffs unchanged, scale, docs, spec close | US-0061, US-0062 | 2 | todo | | |
