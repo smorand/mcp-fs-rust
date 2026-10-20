@@ -49,6 +49,12 @@ pub(crate) async fn diff_files(
     let old_text = client_a.read_text_checked(&label_a, &path_a, limit).await?;
     let new_text = client_b.read_text_checked(&label_b, &path_b, limit).await?;
 
+    // Success only (DEC-006): both reads passed, so a refusal above never
+    // touches. The bump is the sole record of the access; `record_read` is
+    // deliberately absent so a comparison never satisfies read before edit.
+    client_a.touch_atime(&path_a);
+    client_b.touch_atime(&path_b);
+
     // Both are valid UTF-8 here, so string equality is byte equality (DEC-003).
     if old_text == new_text {
         return Ok(json!({"identical": true, "diff": ""}));

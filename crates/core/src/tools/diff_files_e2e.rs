@@ -2,7 +2,7 @@
 //! `McpServer::fs_diff_files` handler over real storage (SQLite metadata, local
 //! blobs). Nothing is mocked.
 
-use crate::mcp::server::{DiffFilesArgs, McpServer};
+use crate::mcp::server::{DiffFilesArgs, EditArgs, McpServer, ReadArgs};
 use crate::storage::traits::AdminBackend;
 use crate::tools::admin::test_support::Fixture;
 use rmcp::handler::server::wrapper::Parameters;
@@ -486,6 +486,177 @@ async fn spec_0045_e2e_205_one_byte_over_the_limit() {
         e.ends_with(
             "ERR_INVALID_ARGUMENT: 'alpha:/logs/over.log' is 5242881 bytes, over the diff limit of 5242880 bytes"
         ),
+        "got: {e}"
+    );
+}
+
+// ── US-0058: read only, and a comparison counts as access ───────────────────
+
+/// Content and used bytes of one project file, the "nothing changed" snapshot.
+async fn snapshot(f: &Fixture, project: &str, path: &str) -> (Vec<u8>, i64) {
+    let client = f.state.stores.client(project).await.unwrap();
+    let bytes = client.read_bytes(path).await.unwrap();
+    (bytes, crate::quota::used_bytes(&client).await.unwrap())
+}
+
+async fn atime(f: &Fixture, project: &str, path: &str) -> f64 {
+    f.state.stores.client(project).await.unwrap().stat(path).await.unwrap().atime
+}
+
+/// Poll up to 2 s (FR-NEW-012) for the atime of `path` to pass `before`.
+async fn atime_after(f: &Fixture, project: &str, path: &str, before: f64) -> bool {
+    for _ in 0..40 {
+        if atime(f, project, path).await > before {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// The seeded atime is the write instant; waiting a little makes "newer"
+/// distinguishable from it without touching test only meta setters.
+async fn let_time_pass() {
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+}
+
+fn edit_args(path: &str, old: &str, new: &str) -> EditArgs {
+    EditArgs {
+        mount_id: "alpha".into(),
+        path: path.into(),
+        old_string: old.into(),
+        new_string: new.into(),
+        replace_all: false,
+        dry_run: false,
+    }
+}
+
+async fn edit(
+    f: &Fixture,
+    path: &str,
+    old: &str,
+    new: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    McpServer::new(f.state.clone(), ALICE.to_string())
+        .fs_edit(Parameters(edit_args(path, old, new)))
+        .await
+}
+
+async fn read_as_alice(f: &Fixture, path: &str) {
+    let r = McpServer::new(f.state.clone(), ALICE.to_string())
+        .fs_read(Parameters(ReadArgs {
+            mount_id: "alpha".into(),
+            path: path.into(),
+            offset_lines: 0,
+            limit_lines: 10,
+            line_numbered: false,
+        }))
+        .await
+        .unwrap();
+    assert_ne!(r.is_error, Some(true), "read failed: {}", text_of(&r));
+}
+
+/// SPEC-0045/E2E-005: comparing changes nothing. No public accessor exposes the
+/// session write allowance, so this asserts file content and used bytes only.
+#[tokio::test]
+async fn spec_0045_e2e_005_comparing_changes_nothing() {
+    let f = world().await;
+    let a = snapshot(&f, "alpha", "/notes/a.txt").await;
+    let b = snapshot(&f, "alpha", "/notes/b.txt").await;
+    for _ in 0..3 {
+        ok_json(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/b.txt")).await);
+    }
+    assert_eq!(snapshot(&f, "alpha", "/notes/a.txt").await, a);
+    assert_eq!(snapshot(&f, "alpha", "/notes/b.txt").await, b);
+}
+
+/// SPEC-0045/E2E-006: last access updated on success, untouched on a refusal.
+#[tokio::test]
+async fn spec_0045_e2e_006_last_access_updated() {
+    let f = world().await;
+    let_time_pass().await;
+    let (a0, b0) =
+        (atime(&f, "alpha", "/notes/a.txt").await, atime(&f, "alpha", "/notes/b.txt").await);
+    ok_json(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/b.txt")).await);
+    assert!(atime_after(&f, "alpha", "/notes/a.txt", a0).await, "a.txt atime not bumped");
+    assert!(atime_after(&f, "alpha", "/notes/b.txt", b0).await, "b.txt atime not bumped");
+
+    let a1 = atime(&f, "alpha", "/notes/a.txt").await;
+    err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/missing.txt")).await);
+    // A fire and forget bump would land within this window if it were wrongly issued.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(atime(&f, "alpha", "/notes/a.txt").await, a1, "a refusal must not touch");
+}
+
+/// SPEC-0045/E2E-007: comparing is not reading.
+#[tokio::test]
+async fn spec_0045_e2e_007_comparing_is_not_reading() {
+    let f = world().await;
+    ok_json(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/b.txt")).await);
+    let e = err_text(edit(&f, "/notes/a.txt", "two", "2").await);
+    assert!(
+        e.ends_with("ERR_EDIT_WITHOUT_PRIOR_READ: edit '/notes/a.txt' requires reading it first in this session"),
+        "got: {e}"
+    );
+    read_as_alice(&f, "/notes/a.txt").await;
+    ok_json(edit(&f, "/notes/a.txt", "two", "2").await);
+}
+
+/// SPEC-0045/E2E-213: a cross project comparison, and a refused one, change nothing.
+#[tokio::test]
+async fn spec_0045_e2e_213_cross_project_comparison_changes_nothing() {
+    let f = world().await;
+    put(&f, "alpha", "/cfg/app.txt", "port=80\n").await;
+    put(&f, "beta", "/cfg/app.txt", "port=8080\n").await;
+    let a = snapshot(&f, "alpha", "/cfg/app.txt").await;
+    let b = snapshot(&f, "beta", "/cfg/app.txt").await;
+    ok_json(diff(&f, ALICE, ("alpha", "/cfg/app.txt"), ("beta", "/cfg/app.txt")).await);
+    err_text(diff(&f, ALICE, ("alpha", "/cfg/app.txt"), ("beta", "/cfg/missing.txt")).await);
+    assert_eq!(snapshot(&f, "alpha", "/cfg/app.txt").await, a);
+    assert_eq!(snapshot(&f, "beta", "/cfg/app.txt").await, b);
+}
+
+/// SPEC-0045/E2E-214: the second file is not read either.
+#[tokio::test]
+async fn spec_0045_e2e_214_edit_of_the_second_file_after_a_comparison() {
+    let f = world().await;
+    ok_json(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/b.txt")).await);
+    let e = err_text(edit(&f, "/notes/b.txt", "2", "two").await);
+    assert!(
+        e.ends_with("ERR_EDIT_WITHOUT_PRIOR_READ: edit '/notes/b.txt' requires reading it first in this session"),
+        "got: {e}"
+    );
+}
+
+/// SPEC-0045/E2E-215: last access is bumped in each project.
+#[tokio::test]
+async fn spec_0045_e2e_215_last_access_in_each_project() {
+    let f = world().await;
+    put(&f, "alpha", "/cfg/app.txt", "port=80\n").await;
+    put(&f, "beta", "/cfg/app.txt", "port=8080\n").await;
+    let_time_pass().await;
+    let (a0, b0) =
+        (atime(&f, "alpha", "/cfg/app.txt").await, atime(&f, "beta", "/cfg/app.txt").await);
+    ok_json(diff(&f, ALICE, ("alpha", "/cfg/app.txt"), ("beta", "/cfg/app.txt")).await);
+    assert!(atime_after(&f, "alpha", "/cfg/app.txt", a0).await, "alpha atime not bumped");
+    assert!(atime_after(&f, "beta", "/cfg/app.txt", b0).await, "beta atime not bumped");
+}
+
+/// SPEC-0045/E2E-216: identical files still count as accessed, still not read.
+#[tokio::test]
+async fn spec_0045_e2e_216_identical_files_still_count_as_accessed() {
+    let f = world().await;
+    put(&f, "alpha", "/notes/copy.txt", "one\ntwo\nthree\n").await;
+    let_time_pass().await;
+    let (a0, c0) =
+        (atime(&f, "alpha", "/notes/a.txt").await, atime(&f, "alpha", "/notes/copy.txt").await);
+    let v = ok_json(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/copy.txt")).await);
+    assert_eq!(v["identical"], true);
+    assert!(atime_after(&f, "alpha", "/notes/a.txt", a0).await, "a.txt atime not bumped");
+    assert!(atime_after(&f, "alpha", "/notes/copy.txt", c0).await, "copy.txt atime not bumped");
+    let e = err_text(edit(&f, "/notes/a.txt", "two", "2").await);
+    assert!(
+        e.ends_with("ERR_EDIT_WITHOUT_PRIOR_READ: edit '/notes/a.txt' requires reading it first in this session"),
         "got: {e}"
     );
 }
