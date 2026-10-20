@@ -96,6 +96,9 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     // SPEC-0020 DEC-006: `/api/admin/projects/{project_id}/quota`, the same
     // function as `admin.get_project_quota`.
     ("GET", "quota"),
+    // SPEC-0045 DEC-010: `/api/fs/diff`, outside `{mount_id}`, the same
+    // function as `fs.diff_files`.
+    ("GET", "diff"),
 ];
 
 /// Request body ceiling for the JSON endpoints. Axum defaults to 2 MiB, which is
@@ -115,6 +118,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         // bytes plane
         .route("/api/fs/roots", get(roots))
+        .route("/api/fs/diff", get(diff))
         .route("/api/fs/{mount_id}/list", get(list))
         .route("/api/fs/{mount_id}/mkdir", post(mkdir))
         .route("/api/fs/{mount_id}/delete", post(delete))
@@ -348,6 +352,37 @@ async fn roots(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                 projects.iter().map(|p| json!({"mount_id": p.id, "owner": p.owner})).collect();
             Json(json!({"person": person, "roots": roots})).into_response()
         }
+    }
+}
+
+/// The four values of `GET /api/fs/diff`, in the order a missing one is named.
+const DIFF_PARAMS: [&str; 4] = ["mount_id_a", "path_a", "mount_id_b", "path_b"];
+
+/// `GET /api/fs/diff` (SPEC-0045 DEC-010). Bearer only: it spans two projects,
+/// so `guarded` (one mount) does not fit; `diff_files` authorizes each side.
+/// The missing value text is local (DEC-014) and a value of only spaces counts
+/// as empty; `Q::req_str` is left alone because it serves every other route.
+async fn diff(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let person = match person_of(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return unauthorized(&e),
+    };
+    let q = Q(q);
+    let value = |name: &str| q.opt(name).filter(|v| !v.trim().is_empty());
+    if let Some(name) = DIFF_PARAMS.iter().find(|name| value(name).is_none()) {
+        return error_response(&ToolError::invalid_argument(format!("'{name}' is required")));
+    }
+    let [mount_a, path_a, mount_b, path_b] =
+        DIFF_PARAMS.map(|name| value(name).unwrap_or_default());
+    let a = crate::tools::diff_files::Side { mount_id: mount_a, path: path_a };
+    let b = crate::tools::diff_files::Side { mount_id: mount_b, path: path_b };
+    match crate::tools::diff_files::diff_files(&state, &person, a, b).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error_response(&e),
     }
 }
 
@@ -2549,8 +2584,10 @@ mod tests {
         // the matching test in `super::openapi`.
         // 42 since SPEC-0019 US-0004 added tables and table, 44 since US-0005
         // added images and image, 45 since US-0008 added document-view, 46 since
-        // SPEC-0020 US-0015 added the admin quota read.
-        assert_eq!(REST_ROUTES.len(), 46);
+        // SPEC-0020 US-0015 added the admin quota read, 47 since SPEC-0045
+        // US-0059 added diff.
+        assert_eq!(REST_ROUTES.len(), 47);
+        assert!(REST_ROUTES.contains(&("GET", "diff")));
         assert!(REST_ROUTES.contains(&("GET", "quota")));
         assert!(REST_ROUTES.contains(&("GET", "document-view")));
         assert!(REST_ROUTES.contains(&("GET", "images")));

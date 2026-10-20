@@ -660,3 +660,140 @@ async fn spec_0045_e2e_216_identical_files_still_count_as_accessed() {
         "got: {e}"
     );
 }
+
+// ── US-0059: the same comparison on the REST data plane ─────────────────────
+
+/// The real data plane router over the fixture's state, plus a bearer token
+/// for `person` (a fresh keypair per call, as in the quota REST tests).
+fn rest(f: &Fixture, person: &str) -> (axum::Router, String) {
+    let keys = tempfile::tempdir().unwrap();
+    let (key, public) = crate::keys::write_keypair(keys.path()).unwrap();
+    let mut config = (*f.state.config).clone();
+    config.auth.jwt.public_key_path = public.display().to_string();
+    let s = &f.state;
+    let state = crate::state::AppState {
+        config: std::sync::Arc::new(config.clone()),
+        admin: s.admin.clone(),
+        stores: s.stores.clone(),
+        safety: s.safety.clone(),
+        identity: std::sync::Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+        editors: s.editors.clone(),
+        doc_service: None,
+        search: None,
+    };
+    let token = crate::keys::mint_token_from_file(
+        &key,
+        person,
+        crate::keys::DEFAULT_ISSUER,
+        crate::keys::DEFAULT_CLAIM,
+        3600,
+    )
+    .unwrap();
+    (crate::api::dataplane::router(std::sync::Arc::new(state)), token)
+}
+
+/// `GET /api/fs/diff?<query>` as `person`; the status and the JSON body.
+async fn rest_diff(f: &Fixture, person: &str, query: &str) -> (u16, Value) {
+    use tower::ServiceExt as _;
+    let (app, token) = rest(f, person);
+    let req = axum::http::Request::builder()
+        .uri(format!("/api/fs/diff?{query}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    // A missing route answers 404 with an empty body: keep that observable as a
+    // status assertion failure rather than a parse panic.
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// SPEC-0045/E2E-004: a program gets the tool's answer, field by field.
+#[tokio::test]
+async fn spec_0045_e2e_004_program_client_gets_the_same_answer() {
+    let f = world().await;
+    let tool = ok_json(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/b.txt")).await);
+    let (status, body) = rest_diff(
+        &f,
+        ALICE,
+        "mount_id_a=alpha&path_a=/notes/a.txt&mount_id_b=alpha&path_b=/notes/b.txt",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["diff"], tool["diff"]);
+    assert_eq!(body["identical"], tool["identical"]);
+    assert_eq!(body, tool);
+}
+
+/// SPEC-0045/E2E-112: a program gets the tool's refusal, with its status.
+#[tokio::test]
+async fn spec_0045_e2e_112_program_client_gets_the_same_refusal() {
+    let f = world().await;
+    put(&f, "beta", "/cfg/app.txt", "secret=1\n").await;
+    let tool = err_text(diff(&f, BOB, ("alpha", "/notes/a.txt"), ("beta", "/cfg/app.txt")).await);
+    let (status, body) = rest_diff(
+        &f,
+        BOB,
+        "mount_id_a=alpha&path_a=/notes/a.txt&mount_id_b=beta&path_b=/cfg/app.txt",
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "ERR_FORBIDDEN");
+    let detail = body["detail"].as_str().expect("a detail string");
+    assert_eq!(detail, "ERR_FORBIDDEN: 'bob@example.com' is not a member of 'beta'");
+    assert!(tool.ends_with(detail), "tool: {tool}, rest: {detail}");
+    assert!(!detail.contains("secret"));
+}
+
+/// SPEC-0045/E2E-220: identical files through the web interface.
+#[tokio::test]
+async fn spec_0045_e2e_220_identical_files_through_the_web_interface() {
+    let f = world().await;
+    put(&f, "alpha", "/notes/copy.txt", "one\ntwo\nthree\n").await;
+    let (status, body) = rest_diff(
+        &f,
+        ALICE,
+        "mount_id_a=alpha&path_a=/notes/a.txt&mount_id_b=alpha&path_b=/notes/copy.txt",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"identical": true, "diff": ""}));
+}
+
+/// Asserts a REST refusal is a 400 `ERR_INVALID_ARGUMENT` naming `name`.
+fn assert_required(status: u16, body: &Value, name: &str) {
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "ERR_INVALID_ARGUMENT");
+    assert_eq!(body["detail"], format!("ERR_INVALID_ARGUMENT: '{name}' is required"));
+}
+
+/// SPEC-0045/E2E-223: second project missing.
+#[tokio::test]
+async fn spec_0045_e2e_223_web_interface_second_project_missing() {
+    let f = world().await;
+    let (status, body) =
+        rest_diff(&f, ALICE, "mount_id_a=alpha&path_a=/notes/a.txt&path_b=/notes/b.txt").await;
+    assert_required(status, &body, "mount_id_b");
+}
+
+/// SPEC-0045/E2E-224: several values missing, the first in the fixed order wins.
+#[tokio::test]
+async fn spec_0045_e2e_224_web_interface_several_values_missing() {
+    let f = world().await;
+    let (status, body) = rest_diff(&f, ALICE, "mount_id_a=alpha&path_a=").await;
+    assert_required(status, &body, "path_a");
+}
+
+/// SPEC-0045/E2E-227: a value of spaces counts as empty.
+#[tokio::test]
+async fn spec_0045_e2e_227_value_of_spaces_on_the_web_interface() {
+    let f = world().await;
+    let (status, body) = rest_diff(
+        &f,
+        ALICE,
+        "mount_id_a=alpha&path_a=/notes/a.txt&mount_id_b=alpha&path_b=%20%20%20",
+    )
+    .await;
+    assert_required(status, &body, "path_b");
+}

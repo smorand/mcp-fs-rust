@@ -539,6 +539,44 @@ const OPERATIONS: &[Op] = &[
         params: NO_PARAMS,
         body: "",
     },
+    // SPEC-0045 DEC-010: not scoped to `{mount_id}`, it names both projects.
+    Op {
+        method: "GET",
+        sub: "diff",
+        path: "/api/fs/diff",
+        tool: "fs.diff_files",
+        params: &[
+            Param {
+                name: "mount_id_a",
+                required: true,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+            Param {
+                name: "path_a",
+                required: true,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+            Param {
+                name: "mount_id_b",
+                required: true,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+            Param {
+                name: "path_b",
+                required: true,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+        ],
+        body: "",
+    },
     Op {
         method: "GET",
         sub: "list",
