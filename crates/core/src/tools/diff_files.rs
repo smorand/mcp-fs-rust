@@ -4,9 +4,8 @@
 //! MCP adapter and the REST handler both call `diff_files`, never a copy.
 
 use crate::core::diff::{DEFAULT_CONTEXT, unified_labeled};
-use crate::errors::{Result, ToolError, code};
+use crate::errors::{Result, ToolError};
 use crate::state::AppState;
-use crate::storage::VolumeClient;
 use serde_json::{Value, json};
 
 /// One side of a comparison: the project and the raw (not yet normalized) path.
@@ -39,8 +38,9 @@ pub(crate) async fn diff_files(
 
     let label_a = format!("{}:{path_a}", a.mount_id);
     let label_b = format!("{}:{path_b}", b.mount_id);
-    let old_text = read_side(&client_a, &path_a, &label_a).await?;
-    let new_text = read_side(&client_b, &path_b, &label_b).await?;
+    // A is read completely before B is touched (FR-NEW-015).
+    let old_text = client_a.read_text_checked(&label_a, &path_a, u64::MAX).await?;
+    let new_text = client_b.read_text_checked(&label_b, &path_b, u64::MAX).await?;
 
     // Both are valid UTF-8 here, so string equality is byte equality (DEC-003).
     if old_text == new_text {
@@ -52,18 +52,6 @@ pub(crate) async fn diff_files(
     .await
     .map_err(|e| ToolError::internal(format!("diff task failed: {e}")))?;
     Ok(json!({"identical": false, "diff": diff}))
-}
-
-/// Read one side, naming the file by its project in a not found refusal: with
-/// two projects in play, a bare path would not say which side is missing.
-async fn read_side(client: &VolumeClient, path: &str, label: &str) -> Result<String> {
-    client.read_text(path).await.map_err(|e| {
-        if e.code == code::NOT_FOUND {
-            ToolError::not_found(format!("'{label}' not found"))
-        } else {
-            e
-        }
-    })
 }
 
 /// Test registry glue, the shape `tools/contract_golden.rs` freezes.

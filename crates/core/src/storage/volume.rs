@@ -121,6 +121,36 @@ impl VolumeClient {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Text of a file for a caller that names its files by `label`
+    /// (`project:path`), so a refusal says which of several files is at fault.
+    /// `read_bytes` is not reused: it names the bare path, and changing it
+    /// would alter every read. `max_bytes` is accepted for the size and text
+    /// checks of US-0057 and not applied yet.
+    ///
+    /// Cost: one metadata lookup, then O(size) to fetch and decode.
+    pub async fn read_text_checked(
+        &self,
+        label: &str,
+        path: &str,
+        _max_bytes: u64,
+    ) -> Result<String> {
+        let node = self
+            .meta
+            .get(path)
+            .await?
+            .ok_or_else(|| ToolError::not_found(format!("'{label}' not found")))?;
+        if node.is_dir() {
+            return Err(ToolError::invalid_argument(format!("'{label}' is a directory")));
+        }
+        match node.sha256 {
+            None => Ok(String::new()),
+            Some(sha) => {
+                let bytes = self.blob.get(&sha, 0, None).await?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
+    }
+
     pub async fn list_dir(&self, path: &str) -> Result<Vec<NodeRow>> {
         let n = self.stat(path).await?;
         if !n.is_dir() {

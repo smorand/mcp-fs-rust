@@ -3,6 +3,7 @@
 //! blobs). Nothing is mocked.
 
 use crate::mcp::server::{DiffFilesArgs, McpServer};
+use crate::storage::traits::AdminBackend;
 use crate::tools::admin::test_support::Fixture;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -267,4 +268,145 @@ async fn spec_0045_e2e_225_path_with_doubled_separators() {
     assert!(e.ends_with("ERR_NOT_FOUND: 'alpha:/notes/missing.txt' not found"), "got: {e}");
     let v = ok_json(diff(&f, ALICE, ("alpha", "/notes//a.txt"), ("alpha", "/notes/b.txt")).await);
     assert!(v["diff"].as_str().unwrap().starts_with("--- alpha:/notes/a.txt\n"), "got: {v}");
+}
+
+/// SPEC-0045/E2E-101: first file missing, named with its project.
+#[tokio::test]
+async fn spec_0045_e2e_101_first_file_missing() {
+    let f = world().await;
+    let e =
+        err_text(diff(&f, ALICE, ("alpha", "/notes/missing.txt"), ("alpha", "/notes/b.txt")).await);
+    assert!(e.ends_with("ERR_NOT_FOUND: 'alpha:/notes/missing.txt' not found"), "got: {e}");
+    assert!(!e.contains("identical") && !e.contains("@@"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-102: second file missing, the second one is named.
+#[tokio::test]
+async fn spec_0045_e2e_102_second_file_missing() {
+    let f = world().await;
+    let e =
+        err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/missing.txt")).await);
+    assert!(e.ends_with("ERR_NOT_FOUND: 'alpha:/notes/missing.txt' not found"), "got: {e}");
+    assert!(!e.contains("identical") && !e.contains("@@"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-103: a directory is refused, named with its project.
+#[tokio::test]
+async fn spec_0045_e2e_103_a_directory() {
+    let f = world().await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes"), ("alpha", "/notes/b.txt")).await);
+    assert!(e.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/notes' is a directory"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-109: deleted project (green on arrival, inherited).
+#[tokio::test]
+async fn spec_0045_e2e_109_deleted_project() {
+    let f = world().await;
+    put(&f, "beta", "/cfg/app.txt", "x\n").await;
+    f.admin_store.soft_delete_project("beta").await.unwrap();
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("beta", "/cfg/app.txt")).await);
+    assert!(e.ends_with("ERR_PROJECT_NOT_FOUND: project 'beta' not found"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-110: access outranks the directory problem, which outranks
+/// the missing second file.
+#[tokio::test]
+async fn spec_0045_e2e_110_several_problems_fixed_order() {
+    let f = world().await;
+    let bob = err_text(diff(&f, BOB, ("alpha", "/notes"), ("beta", "/cfg/nothing.txt")).await);
+    assert!(
+        bob.ends_with("ERR_FORBIDDEN: 'bob@example.com' is not a member of 'beta'"),
+        "got: {bob}"
+    );
+    let alice = err_text(diff(&f, ALICE, ("alpha", "/notes"), ("beta", "/cfg/nothing.txt")).await);
+    assert!(alice.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/notes' is a directory"), "got: {alice}");
+}
+
+/// SPEC-0045/E2E-111: climbing above the top stops at the top.
+#[tokio::test]
+async fn spec_0045_e2e_111_climbing_above_the_top() {
+    let f = world().await;
+    let e = err_text(
+        diff(&f, ALICE, ("alpha", "/notes/../../etc/passwd"), ("alpha", "/notes/b.txt")).await,
+    );
+    assert!(e.ends_with("ERR_NOT_FOUND: 'alpha:/etc/passwd' not found"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-212: the second path is a directory.
+#[tokio::test]
+async fn spec_0045_e2e_212_second_path_is_a_directory() {
+    let f = world().await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes")).await);
+    assert!(e.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/notes' is a directory"), "got: {e}");
+    assert!(!e.contains("@@"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-217: first file in a deleted project (green on arrival).
+#[tokio::test]
+async fn spec_0045_e2e_217_first_file_in_a_deleted_project() {
+    let f = world().await;
+    put(&f, "beta", "/cfg/app.txt", "x\n").await;
+    f.admin_store.soft_delete_project("beta").await.unwrap();
+    let e = err_text(diff(&f, ALICE, ("beta", "/cfg/app.txt"), ("alpha", "/notes/a.txt")).await);
+    assert!(e.ends_with("ERR_PROJECT_NOT_FOUND: project 'beta' not found"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-218: a deleted project brought back compares as before
+/// (green on arrival).
+#[tokio::test]
+async fn spec_0045_e2e_218_deleted_project_brought_back() {
+    let f = world().await;
+    put(&f, "alpha", "/cfg/app.txt", "port=80\n").await;
+    put(&f, "beta", "/cfg/app.txt", "port=8080\n").await;
+    f.admin_store.soft_delete_project("beta").await.unwrap();
+    f.state.admin.undelete_project("beta").await.unwrap();
+    let v = ok_json(diff(&f, ALICE, ("alpha", "/cfg/app.txt"), ("beta", "/cfg/app.txt")).await);
+    assert_eq!(
+        v["diff"],
+        "--- alpha:/cfg/app.txt\n+++ beta:/cfg/app.txt\n@@ -1 +1 @@\n-port=80\n+port=8080\n"
+    );
+}
+
+/// SPEC-0045/E2E-219: missing second file in another project.
+#[tokio::test]
+async fn spec_0045_e2e_219_missing_second_file_in_another_project() {
+    let f = world().await;
+    put(&f, "alpha", "/cfg/app.txt", "port=80\n").await;
+    let e =
+        err_text(diff(&f, ALICE, ("alpha", "/cfg/app.txt"), ("beta", "/cfg/missing.txt")).await);
+    assert!(e.ends_with("ERR_NOT_FOUND: 'beta:/cfg/missing.txt' not found"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-222: climbing above the top, second file, other project.
+#[tokio::test]
+async fn spec_0045_e2e_222_climbing_above_the_top_second_file() {
+    let f = world().await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("beta", "/../secret.txt")).await);
+    assert!(e.ends_with("ERR_NOT_FOUND: 'beta:/secret.txt' not found"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-226: path normalization does not outrank access (green on
+/// arrival).
+#[tokio::test]
+async fn spec_0045_e2e_226_normalization_does_not_outrank_access() {
+    let f = world().await;
+    let e = err_text(diff(&f, BOB, ("alpha", "/notes/a.txt"), ("beta", "/../x.txt")).await);
+    assert!(e.ends_with("ERR_FORBIDDEN: 'bob@example.com' is not a member of 'beta'"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-228: a NUL in a path is refused before any lookup (green on
+/// arrival).
+#[tokio::test]
+async fn spec_0045_e2e_228_path_with_a_nul_character() {
+    let f = world().await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/notes/b.txt\0")).await);
+    assert!(e.ends_with("ERR_PATH_OUT_OF_BOUNDS: path contains a NUL byte"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-229: an empty path means the root, which is a directory.
+#[tokio::test]
+async fn spec_0045_e2e_229_empty_path() {
+    let f = world().await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "")).await);
+    assert!(e.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/' is a directory"), "got: {e}");
 }
