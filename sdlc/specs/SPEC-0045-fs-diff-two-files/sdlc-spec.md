@@ -421,7 +421,7 @@ None.
 | E2E-219 | New | edge | SC-002 | FR-NEW-006 | Medium |
 | E2E-220 | New | edge | SC-005 | FR-NEW-013, 003 | Medium |
 
-Coverage: happy 4, failure 22, side effect 5, edge 18 (total 48), state transition 0 (read only), security 0.
+Coverage: happy 4, failure 22, side effect 5, edge 18 (total 49), state transition 0 (read only), security 0.
 Happy to failure ratio 4:22 (beats 1:1).
 
 ### 9.2 New tests
