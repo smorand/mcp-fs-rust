@@ -38,9 +38,16 @@ pub(crate) async fn diff_files(
 
     let label_a = format!("{}:{path_a}", a.mount_id);
     let label_b = format!("{}:{path_b}", b.mount_id);
+    // Boot validation guarantees `Some`; a `None` here is a bug, not a default.
+    let limit = state
+        .safety
+        .config()
+        .max_diff_file_bytes
+        .bytes()
+        .ok_or_else(|| ToolError::internal("max_diff_file_bytes is not set"))?;
     // A is read completely before B is touched (FR-NEW-015).
-    let old_text = client_a.read_text_checked(&label_a, &path_a, u64::MAX).await?;
-    let new_text = client_b.read_text_checked(&label_b, &path_b, u64::MAX).await?;
+    let old_text = client_a.read_text_checked(&label_a, &path_a, limit).await?;
+    let new_text = client_b.read_text_checked(&label_b, &path_b, limit).await?;
 
     // Both are valid UTF-8 here, so string equality is byte equality (DEC-003).
     if old_text == new_text {

@@ -129,6 +129,7 @@ Path style addressing is always forced on S3 because MinIO requires it.
 | `read_guard` | bool | `true` | require a read of a file in this session before editing it |
 | `allow_hard_delete` | bool | `false` | when false, `fs.delete(trash=false)` is `ERR_NOT_SUPPORTED` |
 | `max_read_lines` | int | `2000` | hard ceiling on `fs.read`; `limit_lines` is clamped to it |
+| `max_diff_file_bytes` | int | `5242880` | largest file fs.diff_files accepts, per file; a value that is not a whole number above zero stops the boot |
 
 ## `api`
 

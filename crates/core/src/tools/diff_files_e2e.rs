@@ -410,3 +410,82 @@ async fn spec_0045_e2e_229_empty_path() {
     let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "")).await);
     assert!(e.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/' is a directory"), "got: {e}");
 }
+
+async fn put_bytes(f: &Fixture, project: &str, path: &str, data: &[u8]) {
+    let client = f.state.stores.client(project).await.unwrap();
+    client.write_bytes_atomic(path, data).await.unwrap();
+}
+
+const OVER_LIMIT: &str = "ERR_INVALID_ARGUMENT: 'alpha:/logs/big.log' is 5242881 bytes, over the diff limit of 5242880 bytes";
+
+/// SPEC-0045/E2E-104: a NUL byte makes the file not text.
+#[tokio::test]
+async fn spec_0045_e2e_104_a_file_with_a_nul_byte() {
+    let f = world().await;
+    put_bytes(&f, "alpha", "/img/logo.png", &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x00])
+        .await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/img/logo.png")).await);
+    assert!(
+        e.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/img/logo.png' is not a text file"),
+        "got: {e}"
+    );
+    assert!(!e.contains("@@"), "got: {e}");
+}
+
+/// SPEC-0045/E2E-105: invalid UTF-8 without a NUL.
+#[tokio::test]
+async fn spec_0045_e2e_105_invalid_utf8() {
+    let f = world().await;
+    put_bytes(&f, "alpha", "/data/latin1.txt", &[0x63, 0x61, 0x66, 0xE9]).await;
+    let e =
+        err_text(diff(&f, ALICE, ("alpha", "/data/latin1.txt"), ("alpha", "/notes/a.txt")).await);
+    assert!(
+        e.ends_with("ERR_INVALID_ARGUMENT: 'alpha:/data/latin1.txt' is not a text file"),
+        "got: {e}"
+    );
+}
+
+/// SPEC-0045/E2E-106: over the default limit, then fine after the operator
+/// raises it and restarts (a new fixture models the restart).
+#[tokio::test]
+async fn spec_0045_e2e_106_a_file_over_the_limit() {
+    let f = world().await;
+    let big = vec![b'a'; 5_242_881];
+    put_bytes(&f, "alpha", "/logs/big.log", &big).await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/logs/big.log")).await);
+    assert!(e.ends_with(OVER_LIMIT), "got: {e}");
+
+    let g = Fixture::with_config(|c| {
+        c.safety.max_diff_file_bytes = crate::config::DiffLimit::new(6_291_456)
+    })
+    .await;
+    g.seed_project("alpha", OWNER).await;
+    g.state.admin.add_member("alpha", ALICE, OWNER).await.unwrap();
+    put(&g, "alpha", "/notes/a.txt", "one\ntwo\nthree\n").await;
+    put_bytes(&g, "alpha", "/logs/big.log", &big).await;
+    let v = ok_json(diff(&g, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/logs/big.log")).await);
+    assert_eq!(v["identical"], false);
+}
+
+/// SPEC-0045/E2E-204: exactly at the limit is accepted.
+#[tokio::test]
+async fn spec_0045_e2e_204_exactly_at_the_limit() {
+    let f = world().await;
+    put_bytes(&f, "alpha", "/logs/edge.log", &vec![b'a'; 5_242_880]).await;
+    let v = ok_json(diff(&f, ALICE, ("alpha", "/logs/edge.log"), ("alpha", "/notes/a.txt")).await);
+    assert_eq!(v["identical"], false);
+}
+
+/// SPEC-0045/E2E-205: one byte over the limit is refused.
+#[tokio::test]
+async fn spec_0045_e2e_205_one_byte_over_the_limit() {
+    let f = world().await;
+    put_bytes(&f, "alpha", "/logs/over.log", &vec![b'a'; 5_242_881]).await;
+    let e = err_text(diff(&f, ALICE, ("alpha", "/notes/a.txt"), ("alpha", "/logs/over.log")).await);
+    assert!(
+        e.ends_with(
+            "ERR_INVALID_ARGUMENT: 'alpha:/logs/over.log' is 5242881 bytes, over the diff limit of 5242880 bytes"
+        ),
+        "got: {e}"
+    );
+}

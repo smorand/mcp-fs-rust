@@ -124,15 +124,18 @@ impl VolumeClient {
     /// Text of a file for a caller that names its files by `label`
     /// (`project:path`), so a refusal says which of several files is at fault.
     /// `read_bytes` is not reused: it names the bare path, and changing it
-    /// would alter every read. `max_bytes` is accepted for the size and text
-    /// checks of US-0057 and not applied yet.
+    /// would alter every read.
     ///
-    /// Cost: one metadata lookup, then O(size) to fetch and decode.
+    /// The size limit is judged on the metadata row before any blob read, so
+    /// memory stays bounded by `max_bytes`. The bytes are then refused when
+    /// they hold a NUL or are not valid UTF-8; an empty file is text.
+    ///
+    /// Cost: one metadata lookup, then O(size) to fetch and scan, size <= max_bytes.
     pub async fn read_text_checked(
         &self,
         label: &str,
         path: &str,
-        _max_bytes: u64,
+        max_bytes: u64,
     ) -> Result<String> {
         let node = self
             .meta
@@ -142,13 +145,24 @@ impl VolumeClient {
         if node.is_dir() {
             return Err(ToolError::invalid_argument(format!("'{label}' is a directory")));
         }
-        match node.sha256 {
-            None => Ok(String::new()),
-            Some(sha) => {
-                let bytes = self.blob.get(&sha, 0, None).await?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            }
+        let size = u64::try_from(node.size).unwrap_or(0);
+        if size > max_bytes {
+            return Err(ToolError::invalid_argument(format!(
+                "'{label}' is {size} bytes, over the diff limit of {max_bytes} bytes"
+            )));
         }
+        let Some(sha) = node.sha256 else {
+            return Ok(String::new());
+        };
+        let bytes = self.blob.get(&sha, 0, None).await?;
+        if bytes.contains(&0u8) {
+            return Err(Self::not_text(label));
+        }
+        String::from_utf8(bytes).map_err(|_| Self::not_text(label))
+    }
+
+    fn not_text(label: &str) -> ToolError {
+        ToolError::invalid_argument(format!("'{label}' is not a text file"))
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<NodeRow>> {
