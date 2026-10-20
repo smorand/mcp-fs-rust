@@ -82,7 +82,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   wrapping `mcp::server::McpServer`, `LocalSessionManager` + `legacy_session_mode: true` so
   `initialize` is mandatory; see `.agent_docs/architecture.md` for the exact wire shapes), `/health`.
 - `mcp/` : `server.rs` only — `McpServer`, one `#[tool]` method per entry in `TOOL_CONTRACT.txt`
-  (108 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
+  (109 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
   calls, never reimplementing an operation. The hand-rolled JSON-RPC/SSE framing layer this module
   used to own (`ToolRegistry`/`ToolSchema`/`Args`/`ToolHandler`) is gone (SPEC-0013); what remains
   of that machinery lives at `tools::registry_support`, kept only because `Args`/`ToolCtx` are the
@@ -115,7 +115,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the
   REST plane); `register(&mut ToolRegistry)` survives only as `#[cfg(test)]`-gated glue for the
   shared test harness, except the five optional families (`web`/`context7`/`sqlite`/`db`/`doc`,
-  off by default, not part of the 108-tool contract), whose `register()`/`catalog()` are genuine
+  off by default, not part of the 109-tool contract), whose `register()`/`catalog()` are genuine
   production code backing `/api/swagger.json`. `catalog.rs` holds the transport-agnostic
   `ToolCatalogEntry` shape; `all.rs` has the now-test-only `register_all`. `trash.rs` holds
   `fs.trash_list`/`fs.trash_restore` (SPEC-0011): the backfill of untracked trash nodes into
@@ -128,6 +128,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   password retry via `ERR_PASSWORD_REQUIRED`. `artifacts.rs` holds the five SPEC-0019 tools
   (`fs.list_images`/`get_image`/`list_tables`/`get_table`/`get_document_view`), also served by
   five `GET /api/fs/{mount_id}/...` routes with byte identical payloads.
+  `diff_files.rs` holds `fs.diff_files` (SPEC-0045): unified diff of two text files, possibly in
+  two projects (both must be readable), also served by `GET /api/fs/diff`; the diff runs in
+  `spawn_blocking`, files are capped by `safety.max_diff_file_bytes` (5 MiB).
 - `api/` : `dataplane.rs` (the `/api/fs` routes), `openapi.rs` (spec + Swagger UI).
 - `exports.rs` : `GET /exports/{token}` (SPEC-0012), mounted unconditionally (outside `api.enabled`),
   no auth: the token is the credential. Atomic single use via `meta::delete_export_link_if_live`

@@ -1,7 +1,7 @@
 # mcp-fs (Rust)
 
 A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem**:
-108 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
+109 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
@@ -270,6 +270,18 @@ the response carries `documentation.error`, and `fs.documentize` retries. Conver
 synchronous and slow (tens of seconds for a small PDF, minutes for a video), so set your
 client's read timeout accordingly.
 
+## Comparing two files
+
+`fs.diff_files` (and `GET /api/fs/diff?mount_id_a=&path_a=&mount_id_b=&path_b=`) compares two
+text files, in one project or two, and returns a unified diff with 3 lines of context. The
+caller must be a member of both projects. Each file is capped at `safety.max_diff_file_bytes`
+(5 MiB by default); a binary or non UTF-8 file is refused.
+
+```bash
+{"name": "fs.diff_files", "arguments": {"mount_id_a": "alpha", "path_a": "/a.txt", "mount_id_b": "beta", "path_b": "/b.txt"}}
+# -> {"identical": false, "diff": "--- alpha:/a.txt\n+++ beta:/b.txt\n@@ -1 +1 @@\n-a\n+b\n"}
+```
+
 ## Extracting archives in place
 
 `fs.extract_archive` (and `POST /api/fs/{mount_id}/extract-archive`) unpacks an archive that
@@ -378,7 +390,7 @@ store behaves identically on all three. See
 
 ## Interactive CLI agent
 
-`crates/agent` builds an `agent` binary that drives the 108 tools through an LLM. It is a
+`crates/agent` builds an `agent` binary that drives the 109 tools through an LLM. It is a
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash

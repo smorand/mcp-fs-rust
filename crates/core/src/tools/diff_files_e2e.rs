@@ -556,11 +556,16 @@ async fn read_as_alice(f: &Fixture, path: &str) {
     assert_ne!(r.is_error, Some(true), "read failed: {}", text_of(&r));
 }
 
-/// SPEC-0045/E2E-005: comparing changes nothing. No public accessor exposes the
-/// session write allowance, so this asserts file content and used bytes only.
+/// SPEC-0045/E2E-005: comparing changes nothing. No accessor exposes the session
+/// write allowance, so it is observed through behavior: with a 10 byte allowance,
+/// three comparisons must leave all 10 bytes for a write that needs exactly 10.
 #[tokio::test]
 async fn spec_0045_e2e_005_comparing_changes_nothing() {
-    let f = world().await;
+    let f = Fixture::with_config(|c| c.safety.write_quota_bytes = 10).await;
+    f.seed_project("alpha", OWNER).await;
+    f.state.admin.add_member("alpha", ALICE, OWNER).await.unwrap();
+    put(&f, "alpha", "/notes/a.txt", "one\ntwo\nthree\n").await;
+    put(&f, "alpha", "/notes/b.txt", "one\n2\nthree\n").await;
     let a = snapshot(&f, "alpha", "/notes/a.txt").await;
     let b = snapshot(&f, "alpha", "/notes/b.txt").await;
     for _ in 0..3 {
@@ -568,6 +573,31 @@ async fn spec_0045_e2e_005_comparing_changes_nothing() {
     }
     assert_eq!(snapshot(&f, "alpha", "/notes/a.txt").await, a);
     assert_eq!(snapshot(&f, "alpha", "/notes/b.txt").await, b);
+
+    let server = McpServer::new(f.state.clone(), ALICE.to_string());
+    let w = server
+        .fs_write(Parameters(crate::mcp::server::WriteArgs {
+            mount_id: "alpha".into(),
+            path: "/notes/q.txt".into(),
+            content: "0123456789".into(),
+            overwrite: false,
+            create_parents: true,
+        }))
+        .await
+        .unwrap();
+    assert_ne!(w.is_error, Some(true), "the whole allowance must still be there: {}", text_of(&w));
+    // Proves the 10 byte allowance is really enforced, so the success above means something.
+    let over = server
+        .fs_write(Parameters(crate::mcp::server::WriteArgs {
+            mount_id: "alpha".into(),
+            path: "/notes/q2.txt".into(),
+            content: "x".into(),
+            overwrite: false,
+            create_parents: true,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(over.is_error, Some(true), "the allowance is exhausted after 10 bytes");
 }
 
 /// SPEC-0045/E2E-006: last access updated on success, untouched on a refusal.
@@ -796,4 +826,49 @@ async fn spec_0045_e2e_227_value_of_spaces_on_the_web_interface() {
     )
     .await;
     assert_required(status, &body, "path_b");
+}
+
+// ── US-0060: the 10 second bound ────────────────────────────────────────────
+
+/// 65536 lines of 80 bytes (79 characters and a line feed) is exactly the
+/// 5 MiB default limit; every 65th line (1000 of them) carries `marker`.
+fn big_text(marker: char) -> String {
+    let mut text = String::with_capacity(5_242_880);
+    for i in 0..65_536usize {
+        let c = if i % 65 == 0 && i / 65 < 1000 { marker } else { 'x' };
+        let head = format!("{i:06} ");
+        text.push_str(&head);
+        text.extend(std::iter::repeat_n(c, 79 - head.len()));
+        text.push('\n');
+    }
+    text
+}
+
+/// SPEC-0045/E2E-230: two 5 MiB files differing on 1000 spread lines are
+/// compared within 10 seconds.
+#[tokio::test]
+async fn spec_0045_e2e_230_large_comparison_within_the_time_bound() {
+    let f = world().await;
+    let (old, new) = (big_text('a'), big_text('b'));
+    assert_eq!((old.len(), new.len()), (5_242_880, 5_242_880));
+    put(&f, "alpha", "/p1.txt", &old).await;
+    put(&f, "alpha", "/p2.txt", &new).await;
+
+    let started = std::time::Instant::now();
+    let v = ok_json(diff(&f, ALICE, ("alpha", "/p1.txt"), ("alpha", "/p2.txt")).await);
+    let elapsed = started.elapsed();
+    eprintln!("E2E-230 wall time: {elapsed:?}");
+
+    assert_eq!(v["identical"], false);
+    let body = v["diff"].as_str().unwrap();
+    let (mut removed, mut added) = (0, 0);
+    for line in body.lines().skip(2) {
+        match line.as_bytes().first() {
+            Some(b'-') => removed += 1,
+            Some(b'+') => added += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((removed, added), (1000, 1000));
+    assert!(elapsed < std::time::Duration::from_secs(10), "took {elapsed:?}");
 }

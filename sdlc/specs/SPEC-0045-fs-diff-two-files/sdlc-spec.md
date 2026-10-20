@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: FEAT / depth M: 3 areas touched (file operations, access control, programmatic REST access), 18 requirements, no persisted change. No override.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-19
 > Project: existing
 > From backlog: BL-0010

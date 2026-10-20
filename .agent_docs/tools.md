@@ -93,6 +93,28 @@ grammar is bundled and falls back to a lexical index otherwise.
 `fs.tree` stops at 2000 nodes. Its exclude set does not hide the trash
 directory, matching the reference.
 
+## fs compare (1)
+
+| Tool | Purpose | Parameters | Returns | Annotations | Auth |
+|---|---|---|---|---|---|
+| `fs.diff_files` | unified diff of two text files, possibly in two projects | `mount_id_a`, `path_a`, `mount_id_b`, `path_b` | `identical`, `diff` | RO,I,!OW | member of both projects |
+
+Side A is the old side, B the new one; the diff has 3 lines of context and its
+two header lines are `--- <mount_id_a>:<path_a>` and `+++ <mount_id_b>:<path_b>`.
+Identical texts answer `{"identical": true, "diff": ""}`. Both paths are
+normalized, then both projects authorized (a non member learns nothing about the
+other project's files), then A is read completely before B. Each file must be
+text (valid UTF-8, no NUL byte) and at most `safety.max_diff_file_bytes` (5 MiB
+by default). The tool never writes: it bumps the access time of both files on
+success only and does not count as a read for read before edit. The diff runs in
+`spawn_blocking`; two 5 MiB files differing on 1000 lines answer in well under
+the 10 second bound (E2E-230). Errors, all `ERR_INVALID_ARGUMENT` unless noted:
+`'<mount>:<path>' is a directory`, `'<mount>:<path>' is not a text file`,
+`'<mount>:<path>' is <n> bytes, over the diff limit of <limit> bytes`;
+`ERR_NOT_FOUND` `'<mount>:<path>' not found`; `ERR_FORBIDDEN` for a project the
+caller is not a member of. REST twin: `GET /api/fs/diff`
+(2026-10-20, SPEC-0045).
+
 ## fs metadata (3)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
@@ -385,11 +407,11 @@ before any handler runs.
 
 | Configuration | Served |
 |---|---|
-| default | 59 (44 `fs.*`, 15 `admin.*`) |
-| git flag on | 108 |
-| git and search flags on | 112 |
-| every flag, pandoc on `PATH` | 134 (132 without pandoc: `doc.*` registers nothing) |
-| one optional family alone | 59 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
+| default | 60 (45 `fs.*`, 15 `admin.*`) |
+| git flag on | 109 |
+| git and search flags on | 113 |
+| every flag, pandoc on `PATH` | 135 (133 without pandoc: `doc.*` registers nothing) |
+| one optional family alone | 60 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
 
 The optional families (`web`, `context7`, `sqlite`, `db`, `doc`) are not
 `#[tool]` methods: `add_optional_families` in `mcp/server.rs` runs each enabled
@@ -398,7 +420,7 @@ family's production `register()` into one shared `ToolRegistry`, and adds one
 family's own `ToolSchema::to_list_entry()`, so the served schema equals
 `catalog()` (what `/api/swagger.json` reads); the call goes through
 `ToolRegistry::call` then `to_call_result`. The family handlers authorize
-`mount_id` themselves, unchanged. They are outside the 108 tool golden
+`mount_id` themselves, unchanged. They are outside the 109 tool golden
 contract. Tests: `tools/tool_surface_e2e.rs`.
 
 ## Authorization model
