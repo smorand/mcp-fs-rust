@@ -574,6 +574,15 @@ const OPERATIONS: &[Op] = &[
                 format: "",
                 default: Def::Absent,
             },
+            // The tool schema is untyped (the validator takes number or text);
+            // a query value is always text, so "string" is the honest type.
+            Param {
+                name: "context_lines",
+                required: false,
+                ty: "string",
+                format: "",
+                default: Def::Null,
+            },
         ],
         body: "",
     },

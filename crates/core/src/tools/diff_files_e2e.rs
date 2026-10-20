@@ -1228,3 +1228,113 @@ async fn spec_0046_e2e_046_adjacent_changes_size_0() {
     )
     .await;
 }
+
+// ── SPEC-0046 US-0062: context_lines on the web interface ───────────────────
+
+const AB: &str = "mount_id_a=alpha&path_a=/a.txt&mount_id_b=alpha&path_b=/b.txt";
+const SIZE_DETAIL: &str =
+    "ERR_INVALID_ARGUMENT: 'context_lines' must be a whole number from 0 to 10000000";
+
+/// A web refusal: 400, the stable code and the pinned message, no diff.
+async fn assert_web_refused(f: &Fixture, query: &str) {
+    let (status, body) = rest_diff(f, ALICE, query).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "ERR_INVALID_ARGUMENT");
+    assert_eq!(body["detail"], SIZE_DETAIL);
+    assert!(body.get("diff").is_none(), "no diff may be returned: {body}");
+}
+
+/// The web answer for `size` equals the tool answer for the same size.
+async fn assert_web_matches_tool(size: &str, tool_size: Value, expected: Option<&str>) {
+    let f = world_46().await;
+    let tool = ok_json(
+        diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(tool_size)).await,
+    );
+    let (status, body) = rest_diff(&f, ALICE, &format!("{AB}&context_lines={size}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, tool);
+    if let Some(expected) = expected {
+        assert_eq!(body["diff"], expected);
+    }
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_005_web_size_1() {
+    assert_web_matches_tool("1", json!(1), Some(ONE)).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_015_web_empty_size() {
+    let f = world_46().await;
+    assert_web_refused(&f, &format!("{AB}&context_lines=")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_018_web_invalid_size() {
+    let f = world_46().await;
+    assert_web_refused(&f, &format!("{AB}&context_lines=abc")).await;
+    let tool = err_text(
+        diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(json!("abc"))).await,
+    );
+    assert!(tool.ends_with(SIZE_DETAIL), "{tool}");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_023_web_missing_value_wins_over_invalid_size() {
+    let f = world_46().await;
+    let (status, body) =
+        rest_diff(&f, ALICE, "mount_id_a=alpha&path_a=/a.txt&mount_id_b=alpha&context_lines=abc")
+            .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["detail"], "ERR_INVALID_ARGUMENT: 'path_b' is required");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_038_web_first_occurrence_counts() {
+    let f = world_46().await;
+    assert_web_refused(&f, &format!("{AB}&context_lines=&context_lines=2")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_039_web_one_space_size() {
+    let f = world_46().await;
+    assert_web_refused(&f, &format!("{AB}&context_lines=%20")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_042_negative_zero() {
+    let f = world_46().await;
+    // Alice gives the number -0 unquoted; the client gives the text -0.
+    let raw: Value = serde_json::from_str("-0").unwrap();
+    let e =
+        err_text(diff_with(&f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(raw)).await);
+    assert!(e.ends_with(SIZE_REFUSAL), "got: {e}");
+    assert_web_refused(&f, &format!("{AB}&context_lines=-0")).await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_047_web_size_0() {
+    assert_web_matches_tool(
+        "0",
+        json!(0),
+        Some("--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -6 +6 @@\n-l6\n+L6\n"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_048_web_size_10000000() {
+    assert_web_matches_tool(
+        "10000000",
+        json!(10_000_000),
+        Some(
+            "--- alpha:/a.txt\n+++ alpha:/b.txt\n@@ -1,10 +1,10 @@\n l1\n l2\n l3\n l4\n l5\n-l6\n+L6\n l7\n l8\n l9\n l10\n",
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_049_web_leading_zeros() {
+    assert_web_matches_tool("001", json!("001"), Some(ONE)).await;
+}

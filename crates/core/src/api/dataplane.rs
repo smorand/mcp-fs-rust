@@ -362,6 +362,9 @@ const DIFF_PARAMS: [&str; 4] = ["mount_id_a", "path_a", "mount_id_b", "path_b"];
 /// so `guarded` (one mount) does not fit; `diff_files` authorizes each side.
 /// The missing value text is local (DEC-014) and a value of only spaces counts
 /// as empty; `Q::req_str` is left alone because it serves every other route.
+/// SPEC-0046 DEC-004: the optional `context_lines` is the FIRST such pair taken
+/// raw (so an empty value is refused by the shared validator, not skipped as
+/// `Q::opt` would), and only after the missing value check.
 async fn diff(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -376,11 +379,15 @@ async fn diff(
     if let Some(name) = DIFF_PARAMS.iter().find(|name| value(name).is_none()) {
         return error_response(&ToolError::invalid_argument(format!("'{name}' is required")));
     }
+    let context =
+        q.0.iter()
+            .find(|(k, _)| k == "context_lines")
+            .map(|(_, v)| serde_json::Value::String(v.clone()));
     let [mount_a, path_a, mount_b, path_b] =
         DIFF_PARAMS.map(|name| value(name).unwrap_or_default());
     let a = crate::tools::diff_files::Side { mount_id: mount_a, path: path_a };
     let b = crate::tools::diff_files::Side { mount_id: mount_b, path: path_b };
-    match crate::tools::diff_files::diff_files(&state, &person, a, b, None).await {
+    match crate::tools::diff_files::diff_files(&state, &person, a, b, context.as_ref()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(&e),
     }
