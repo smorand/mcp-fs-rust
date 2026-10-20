@@ -97,11 +97,16 @@ directory, matching the reference.
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
-| `fs.diff_files` | unified diff of two text files, possibly in two projects | `mount_id_a`, `path_a`, `mount_id_b`, `path_b` | `identical`, `diff` | RO,I,!OW | member of both projects |
+| `fs.diff_files` | unified diff of two text files, possibly in two projects | `mount_id_a`, `path_a`, `mount_id_b`, `path_b`, `context_lines` (optional) | `identical`, `diff` | RO,I,!OW | member of both projects |
 
-Side A is the old side, B the new one; the diff has 3 lines of context and its
+Side A is the old side, B the new one; the diff has 3 lines of context by default and its
 two header lines are `--- <mount_id_a>:<path_a>` and `+++ <mount_id_b>:<path_b>`.
-Identical texts answer `{"identical": true, "diff": ""}`. Both paths are
+`context_lines` (2026-10-20, SPEC-0046) is optional, default 3: a whole number from 0 to
+10000000, given as a number or as digit text (leading zeros allowed); absent or null means 3.
+Anything else (negative, fractional, `3.0`, `1e3`, a boolean, a list, empty or padded text) is
+refused with `ERR_INVALID_ARGUMENT: 'context_lines' must be a whole number from 0 to 10000000`, and the value is checked before
+anything else (before paths, access or files). `fs.write`, `fs.edit` and `fs.multi_edit`
+keep 3 lines of context. Identical texts answer `{"identical": true, "diff": ""}`. Both paths are
 normalized, then both projects authorized (a non member learns nothing about the
 other project's files), then A is read completely before B. Each file must be
 text (valid UTF-8, no NUL byte) and at most `safety.max_diff_file_bytes` (5 MiB

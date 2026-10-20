@@ -2,7 +2,7 @@
 //! `McpServer::fs_diff_files` handler over real storage (SQLite metadata, local
 //! blobs). Nothing is mocked.
 
-use crate::mcp::server::{DiffFilesArgs, EditArgs, McpServer, ReadArgs};
+use crate::mcp::server::{DiffFilesArgs, EditArgs, McpServer, MultiEditArgs, ReadArgs, WriteArgs};
 use crate::storage::traits::AdminBackend;
 use crate::tools::admin::test_support::Fixture;
 use rmcp::handler::server::wrapper::Parameters;
@@ -1337,4 +1337,95 @@ async fn spec_0046_e2e_048_web_size_10000000() {
 #[tokio::test]
 async fn spec_0046_e2e_049_web_leading_zeros() {
     assert_web_matches_tool("001", json!("001"), Some(ONE)).await;
+}
+
+// ── SPEC-0046 US-0063: other diffs unchanged, scale ─────────────────────────
+
+/// The comparison with size 0 that precedes each write family check: it must
+/// leave the 3 line default of write, edit and multi edit alone (DEC-007).
+async fn compare_with_size_0(f: &Fixture) {
+    let v = ok_json(
+        diff_with(f, ALICE, ("alpha", "/a.txt"), ("alpha", "/b.txt"), Some(json!(0))).await,
+    );
+    assert!(v["diff"].as_str().unwrap().contains("@@ -6 +6 @@"));
+}
+
+const THREE_AROUND_LINE_6: &str = "@@ -3,7 +3,7 @@";
+
+#[tokio::test]
+async fn spec_0046_e2e_020_write_after_comparison() {
+    let f = world_46().await;
+    compare_with_size_0(&f).await;
+    read_as_alice(&f, "/a.txt").await;
+    let v = ok_json(
+        McpServer::new(f.state.clone(), ALICE.to_string())
+            .fs_write(Parameters(WriteArgs {
+                mount_id: "alpha".into(),
+                path: "/a.txt".into(),
+                content: numbered(10, &[]).replace("l6\n", "X6\n"),
+                overwrite: true,
+                create_parents: true,
+            }))
+            .await,
+    );
+    let d = v["diff"].as_str().unwrap();
+    assert!(d.contains(THREE_AROUND_LINE_6), "got: {d}");
+    assert!(d.contains(" l3\n l4\n l5\n-l6\n+X6\n l7\n l8\n l9\n"), "got: {d}");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_024_edit_after_comparison() {
+    let f = world_46().await;
+    compare_with_size_0(&f).await;
+    read_as_alice(&f, "/a.txt").await;
+    let v = ok_json(edit(&f, "/a.txt", "l6", "X6").await);
+    let d = v["diff"].as_str().unwrap();
+    assert!(d.contains(THREE_AROUND_LINE_6), "got: {d}");
+    assert!(d.contains(" l3\n l4\n l5\n-l6\n+X6\n l7\n l8\n l9\n"), "got: {d}");
+}
+
+#[tokio::test]
+async fn spec_0046_e2e_025_multi_edit_after_comparison() {
+    let f = world_46().await;
+    compare_with_size_0(&f).await;
+    read_as_alice(&f, "/a.txt").await;
+    let v = ok_json(
+        McpServer::new(f.state.clone(), ALICE.to_string())
+            .fs_multi_edit(Parameters(MultiEditArgs {
+                mount_id: "alpha".into(),
+                path: "/a.txt".into(),
+                edits: json!([{"old_string": "l6", "new_string": "X6"}]),
+                dry_run: false,
+            }))
+            .await,
+    );
+    let d = v["diff"].as_str().unwrap();
+    assert!(d.contains(THREE_AROUND_LINE_6), "got: {d}");
+    assert!(d.contains(" l3\n l4\n l5\n-l6\n+X6\n l7\n l8\n l9\n"), "got: {d}");
+}
+
+/// Two files exactly at the 5242880 byte limit, 2621440 lines each, differing
+/// on line 1 only: one block spanning every line.
+#[tokio::test]
+async fn spec_0046_e2e_031_two_files_at_the_size_limit() {
+    let f = world_46().await;
+    let first = "x\n".repeat(2_621_440).into_bytes();
+    let mut second = first.clone();
+    second[0] = b'y';
+    assert_eq!(first.len(), 5_242_880);
+    put_bytes(&f, "alpha", "/big1.txt", &first).await;
+    put_bytes(&f, "alpha", "/big2.txt", &second).await;
+    let v = ok_json(
+        diff_with(
+            &f,
+            ALICE,
+            ("alpha", "/big1.txt"),
+            ("alpha", "/big2.txt"),
+            Some(json!(10_000_000)),
+        )
+        .await,
+    );
+    let d = v["diff"].as_str().unwrap();
+    assert_eq!(d.matches("@@ -1,2621440 +1,2621440 @@").count(), 1);
+    assert_eq!(d.matches("\n@@ ").count(), 1, "one block only");
 }

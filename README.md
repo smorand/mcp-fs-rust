@@ -273,7 +273,10 @@ client's read timeout accordingly.
 ## Comparing two files
 
 `fs.diff_files` (and `GET /api/fs/diff?mount_id_a=&path_a=&mount_id_b=&path_b=`) compares two
-text files, in one project or two, and returns a unified diff with 3 lines of context. The
+text files, in one project or two, and returns a unified diff with 3 lines of context by default; the optional `context_lines`
+(a whole number from 0 to 10000000, as a number or as digit text) chooses another number of
+unchanged lines around each change (2026-10-20, SPEC-0046). Anything else is refused with
+`ERR_INVALID_ARGUMENT: 'context_lines' must be a whole number from 0 to 10000000`. The
 caller must be a member of both projects. Each file is capped at `safety.max_diff_file_bytes`
 (5 MiB by default); a binary or non UTF-8 file is refused.
 

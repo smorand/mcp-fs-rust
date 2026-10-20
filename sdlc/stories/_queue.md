@@ -62,4 +62,4 @@
 | US-0060 | SPEC-0045 | large comparison bound, docs, and spec close | US-0057, US-0058, US-0059 | 2 | landed | story/US-0060-diff-performance-bound-docs-and-spec-close | story/US-0059-rest-route-get-api-fs-diff |
 | US-0061 | SPEC-0046 | choose the context size of a comparison | main | 2 | landed | story/US-0061-choose-context-lines-on-the-tool | main |
 | US-0062 | SPEC-0046 | the same context size on the web interface | US-0061 | 2 | landed | story/US-0062-context-lines-on-the-web-interface | story/US-0061-choose-context-lines-on-the-tool |
-| US-0063 | SPEC-0046 | other diffs unchanged, scale, docs, spec close | US-0061, US-0062 | 2 | todo | | |
+| US-0063 | SPEC-0046 | other diffs unchanged, scale, docs, spec close | US-0061, US-0062 | 2 | landed | story/US-0063-other-diffs-unchanged-scale-docs-and-spec-close | story/US-0062-context-lines-on-the-web-interface |

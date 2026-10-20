@@ -79,7 +79,7 @@ segment; `path` is required unless stated.
 | `tree` | `path=/`, `max_depth=3`, `exclude_patterns` (repeatable), `with_sizes=false` | `fs.tree` |
 | `find-definition` | `name` (required), `root=/`, `kind` | `fs.find_definition` |
 | `find-references` | `name` (required), `root=/` | `fs.find_references` |
-| `diff` (route `GET /api/fs/diff`, no `{mount_id}` segment) | `mount_id_a`, `path_a`, `mount_id_b`, `path_b` (all four required) | `fs.diff_files` |
+| `diff` (route `GET /api/fs/diff`, no `{mount_id}` segment) | `mount_id_a`, `path_a`, `mount_id_b`, `path_b` (all four required), `context_lines` (optional) | `fs.diff_files` |
 | `audit-log` | `since` (number), `limit=20` | `fs.audit_log` |
 | `images` | `path`, `marker` | `fs.list_images` |
 | `image` | `path`, `id` (required) | `fs.get_image` |
@@ -92,6 +92,10 @@ segment; `path` is required unless stated.
 answer is the tool's `{identical, diff}`. A missing or blank value (spaces only)
 is 400 `ERR_INVALID_ARGUMENT` with the message `'<name>' is required`, the first
 missing one in the order `mount_id_a`, `path_a`, `mount_id_b`, `path_b`.
+`context_lines` (2026-10-20, SPEC-0046) is optional, default 3, a whole number from 0 to
+10000000; the first occurrence counts and an empty value is refused, not ignored. A refusal is
+400 `ERR_INVALID_ARGUMENT: 'context_lines' must be a whole number from 0 to 10000000`, checked after the
+missing value check and before anything else.
 
 The five artifact routes (2026-10-10, SPEC-0019 DEC-001) call `tools::artifacts`, the
 functions the tools call, so the body is byte for byte the tool's text (pinned by

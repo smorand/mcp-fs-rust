@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: FEAT / depth M: 2 entry points (tool surface, web interface), additive change to a public contract, 10 requirements, no persisted change. No override.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-19
 > Project: existing
 > From backlog: BL-0069
