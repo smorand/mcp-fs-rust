@@ -259,6 +259,36 @@ impl Dialect {
         }
     }
 
+    /// The engine's substring function: `substr` (SQLite, PostgreSQL) or
+    /// `SUBSTRING` (SQL Server).
+    pub fn substr_fn(self) -> &'static str {
+        match self {
+            Self::Sqlite | Self::Postgres => "substr",
+            Self::SqlServer => "SUBSTRING",
+        }
+    }
+
+    /// The length of `s` in the unit the engine's substring counts: Unicode
+    /// scalar values for SQLite and PostgreSQL, UTF-16 code units for SQL Server
+    /// (an emoji is 2 there). A wrong unit would cut a prefix in the middle of a
+    /// character and make an exact comparison fail on non ASCII names.
+    pub fn char_len(self, s: &str) -> usize {
+        match self {
+            Self::Sqlite | Self::Postgres => s.chars().count(),
+            Self::SqlServer => s.encode_utf16().count(),
+        }
+    }
+
+    /// `lhs = rhs` compared by code, letter case included. Plain `=` is already
+    /// exact on SQLite and PostgreSQL; SQL Server follows the database collation
+    /// (usually case insensitive), so a binary collation is forced there.
+    pub fn exact_equals(self, lhs: &str, rhs: &str) -> String {
+        match self {
+            Self::Sqlite | Self::Postgres => format!("{lhs} = {rhs}"),
+            Self::SqlServer => format!("{lhs} = {rhs} COLLATE Latin1_General_100_BIN2"),
+        }
+    }
+
     /// Render a page clause for a query that already has `ORDER BY`.
     ///
     /// SQL Server has no `LIMIT`/`OFFSET`: `OFFSET ... ROWS FETCH NEXT ... ROWS
@@ -455,6 +485,23 @@ pub fn render_column_migration(dialect: Dialect, m: &ColumnMigration) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_text_helpers_render_per_engine() {
+        assert_eq!(Dialect::Sqlite.substr_fn(), "substr");
+        assert_eq!(Dialect::Postgres.substr_fn(), "substr");
+        assert_eq!(Dialect::SqlServer.substr_fn(), "SUBSTRING");
+        assert_eq!(Dialect::Sqlite.exact_equals("a", "?1"), "a = ?1");
+        assert_eq!(Dialect::Postgres.exact_equals("a", "?1"), "a = ?1");
+        assert_eq!(
+            Dialect::SqlServer.exact_equals("a", "?1"),
+            "a = ?1 COLLATE Latin1_General_100_BIN2"
+        );
+        // An emoji is one character on SQLite and PostgreSQL, two UTF-16 units on SQL Server.
+        assert_eq!(Dialect::Sqlite.char_len("/é📊/"), 4);
+        assert_eq!(Dialect::Postgres.char_len("/é📊/"), 4);
+        assert_eq!(Dialect::SqlServer.char_len("/é📊/"), 5);
+    }
 
     const ALL: [Dialect; 3] = [Dialect::Sqlite, Dialect::Postgres, Dialect::SqlServer];
 

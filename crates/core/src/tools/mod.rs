@@ -30,6 +30,8 @@ pub(crate) mod admin;
 pub mod all;
 pub(crate) mod archive;
 pub(crate) mod artifacts;
+#[cfg(test)]
+mod case_paths_e2e;
 pub mod catalog;
 pub mod context7;
 #[cfg(test)]

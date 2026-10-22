@@ -20,6 +20,35 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// One "path and everything below it" selection, rendered case exact (SPEC-0050).
+///
+/// `LIKE` alone is not enough: SQLite folds ASCII letter case in `LIKE`, so
+/// `/video/%` also selects `/Video/x`. The `LIKE` stays to narrow the rows (and
+/// its wildcard escaping is the one that keeps `a_b` from matching `axb`); the
+/// exact substring equality decides, on every engine (DEC-003, DEC-004).
+struct SubtreeMatch {
+    like: String,
+    prefix: String,
+    prefix_len: usize,
+}
+
+impl SubtreeMatch {
+    fn new(dialect: Dialect, path: &str) -> Self {
+        let trimmed = path.trim_end_matches('/');
+        let prefix = format!("{trimmed}/");
+        let like = format!("{}/%", dialect.escape_like_literal(trimmed));
+        Self { like, prefix_len: dialect.char_len(&prefix), prefix }
+    }
+
+    /// `(col LIKE ?L ESCAPE '\' AND substr(col, 1, n) = ?P)`; the length is an
+    /// integer literal, never user text.
+    fn clause(&self, dialect: Dialect, col: &str, like_ph: usize, prefix_ph: usize) -> String {
+        let head = format!("{}({col}, 1, {})", dialect.substr_fn(), self.prefix_len);
+        let exact = dialect.exact_equals(&head, &format!("?{prefix_ph}"));
+        format!("({col} LIKE ?{like_ph} ESCAPE '\\' AND {exact})")
+    }
+}
+
 /// One file of the disk usage breakdown (SPEC-0047). `original_path` is the
 /// path a trashed file had before its delete, `None` for an active file (and
 /// for a trashed one whose trash row is missing).
@@ -2124,23 +2153,28 @@ impl MetaBackend for RelationalMetaStore {
     }
 
     async fn remove_subtree(&self, path: &str) -> Result<Vec<String>> {
-        let pattern = self.descendant_pattern(path);
+        let dialect = self.db.dialect();
+        let sm = SubtreeMatch::new(dialect, path);
+        let within = sm.clause(dialect, "path", 3, 4);
+        let (select_sql, delete_sql) = (
+            format!(
+                "SELECT sha256, kind, size FROM nodes \
+                 WHERE volume_id=?1 AND (path=?2 OR {within})"
+            ),
+            format!("DELETE FROM nodes WHERE volume_id=?1 AND (path=?2 OR {within})"),
+        );
         let volume = self.volume_id.clone();
         let path = path.to_string();
         run_retrying(&*self.db, move |tx| {
-            let (volume, path, pattern) = (volume.clone(), path.clone(), pattern.clone());
+            let (volume, path) = (volume.clone(), path.clone());
+            let (select_sql, delete_sql) = (select_sql.clone(), delete_sql.clone());
+            let (like, prefix) = (sm.like.clone(), sm.prefix.clone());
             // The accumulator is built inside the body, so a retry starts from an
             // empty list instead of appending to the previous attempt's result.
             Box::pin(async move {
                 let rows = tx
                     .query(
-                        &Query::new(
-                            "SELECT sha256, kind, size FROM nodes \
-                             WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\')",
-                        )
-                        .bind(&volume)
-                        .bind(&path)
-                        .bind(&pattern),
+                        &Query::new(select_sql).bind(&volume).bind(&path).bind(&like).bind(&prefix),
                     )
                     .await?;
                 let shas: Vec<Option<String>> =
@@ -2159,13 +2193,7 @@ impl MetaBackend for RelationalMetaStore {
                     }
                 }
                 tx.execute(
-                    &Query::new(
-                        "DELETE FROM nodes \
-                         WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\')",
-                    )
-                    .bind(&volume)
-                    .bind(&path)
-                    .bind(&pattern),
+                    &Query::new(delete_sql).bind(&volume).bind(&path).bind(&like).bind(&prefix),
                 )
                 .await?;
                 tx_add_usage(tx, &volume, -removed).await?;
@@ -2558,6 +2586,30 @@ mod tests {
         assert_eq!(refs.primary_key, vec!["volume_id", "sha256"]);
         // The parent index must lead with the volume, every lookup filters on it.
         assert_eq!(s.indexes[0].columns, vec!["volume_id", "parent"]);
+    }
+
+    /// SPEC-0050 DEC-004..006: the clause keeps the escaped `LIKE` and adds the
+    /// exact substring equality, rendered per engine.
+    #[test]
+    fn subtree_match_renders_a_case_exact_clause_per_dialect() {
+        let sqlite = SubtreeMatch::new(Dialect::Sqlite, "/video");
+        assert_eq!(sqlite.like, "/video/%");
+        assert_eq!(sqlite.prefix, "/video/");
+        assert_eq!(
+            sqlite.clause(Dialect::Sqlite, "path", 3, 4),
+            "(path LIKE ?3 ESCAPE '\\' AND substr(path, 1, 7) = ?4)"
+        );
+        let mssql = SubtreeMatch::new(Dialect::SqlServer, "/é📊/");
+        assert_eq!(mssql.prefix, "/é📊/", "one trailing slash, not two");
+        assert_eq!(
+            mssql.clause(Dialect::SqlServer, "original_path", 2, 3),
+            "(original_path LIKE ?2 ESCAPE '\\' AND SUBSTRING(original_path, 1, 5) = ?3 \
+             COLLATE Latin1_General_100_BIN2)"
+        );
+        let root = SubtreeMatch::new(Dialect::Postgres, "/");
+        assert_eq!((root.like.as_str(), root.prefix.as_str()), ("/%", "/"));
+        let wild = SubtreeMatch::new(Dialect::Sqlite, "/a_b");
+        assert_eq!(wild.like, "/a\\_b/%");
     }
 
     /// The escape clause and the escaped prefix have to travel together: a
