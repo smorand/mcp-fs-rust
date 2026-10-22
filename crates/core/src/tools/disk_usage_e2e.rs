@@ -504,3 +504,113 @@ async fn spec_0047_us_0065_a_file_in_a_trashed_folder_shows_its_original_path() 
     assert_eq!(out["file_count"], 5);
     assert_eq!(out["used_bytes"], 975_500);
 }
+
+// ── US-0066: the same breakdown on the web interface ────────────────────────
+
+/// The real data plane router over the fixture's state, plus a bearer token for
+/// `person` (a fresh keypair per call, as in the diff and quota REST tests).
+fn rest(f: &Fixture, person: &str) -> (axum::Router, String) {
+    let keys = tempfile::tempdir().unwrap();
+    let (key, public) = crate::keys::write_keypair(keys.path()).unwrap();
+    let mut config = (*f.state.config).clone();
+    config.auth.jwt.public_key_path = public.display().to_string();
+    let s = &f.state;
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        admin: s.admin.clone(),
+        stores: s.stores.clone(),
+        safety: s.safety.clone(),
+        identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+        editors: s.editors.clone(),
+        doc_service: None,
+        search: None,
+    };
+    let token = crate::keys::mint_token_from_file(
+        &key,
+        person,
+        crate::keys::DEFAULT_ISSUER,
+        crate::keys::DEFAULT_CLAIM,
+        3600,
+    )
+    .unwrap();
+    (crate::api::dataplane::router(Arc::new(state)), token)
+}
+
+/// `GET /api/admin/projects/{project}/disk-usage<query>` as `person`.
+async fn rest_usage(f: &Fixture, person: &str, project: &str, query: &str) -> (u16, Value) {
+    use tower::ServiceExt as _;
+    let (app, token) = rest(f, person);
+    let req = axum::http::Request::builder()
+        .uri(format!("/api/admin/projects/{project}/disk-usage{query}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    // A missing route answers 404 with an empty body: keep that observable as a
+    // status assertion failure rather than a parse panic.
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// SPEC-0047/E2E-004: assistants and the web interface agree (FR-NEW-011).
+#[tokio::test]
+async fn spec_0047_e2e_004_assistants_and_the_web_interface_agree() {
+    let w = World::shared().await;
+    let tool = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    let (status, body) = rest_usage(&w.f, OLIVIA, ATLAS, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, tool);
+    assert_eq!(body, standard());
+}
+
+/// SPEC-0047/E2E-015: the web interface refuses like the assistants
+/// (FR-NEW-007, 011).
+#[tokio::test]
+async fn spec_0047_e2e_015_the_web_interface_refuses_like_the_assistants() {
+    let w = World::shared().await;
+    let tool = err_text(w.read(MIA, ATLAS, None).await);
+    let (status, body) = rest_usage(&w.f, MIA, ATLAS, "").await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "ERR_FORBIDDEN");
+    let detail = body["detail"].as_str().expect("a detail string");
+    assert_eq!(detail, "ERR_FORBIDDEN: 'mia@example.com' is not the owner of 'Atlas'");
+    assert!(tool.ends_with(detail), "tool: {tool}, rest: {detail}");
+}
+
+/// SPEC-0047/E2E-034: the cap through the web interface (FR-NEW-004, 011).
+#[tokio::test]
+async fn spec_0047_e2e_034_the_cap_through_the_web_interface() {
+    let w = World::shared().await;
+    let (status, body) = rest_usage(&w.f, OLIVIA, ATLAS, "?limit=2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["entries"],
+        json!([entry("/video/demo.mp4", 600_000), entry("/data/export.csv", 250_000)])
+    );
+    assert_eq!(body["file_count"], 5);
+    assert_eq!(body["truncated"], true);
+    let (status, body) = rest_usage(&w.f, OLIVIA, ATLAS, "?limit=0").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "ERR_INVALID_ARGUMENT");
+    assert!(body["detail"].as_str().unwrap().ends_with(CAP_REFUSAL), "{body}");
+    let (status, body) = rest_usage(&w.f, OLIVIA, ATLAS, "?limit=abc").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["detail"].as_str().unwrap().ends_with(CAP_REFUSAL), "{body}");
+}
+
+/// SPEC-0047/E2E-035: the default cap through the web interface (FR-NEW-004, 005, 011).
+#[tokio::test]
+async fn spec_0047_e2e_035_the_default_cap_through_the_web_interface() {
+    let w = World::empty().await;
+    for i in 0..120 {
+        w.seed(&format!("/f{i:03}.bin"), 1_000, i).await;
+    }
+    let tool = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    let (status, body) = rest_usage(&w.f, OLIVIA, ATLAS, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"].as_array().unwrap().len(), 100);
+    assert_eq!(body["file_count"], 120);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body, tool);
+}

@@ -1183,6 +1183,21 @@ const OPERATIONS: &[Op] = &[
         params: NO_PARAMS,
         body: "",
     },
+    // SPEC-0047 DEC-009: the disk usage read, on the same function as the tool.
+    Op {
+        method: "GET",
+        sub: "disk-usage",
+        path: "/api/admin/projects/{project_id}/disk-usage",
+        tool: "admin.get_project_disk_usage",
+        params: &[Param {
+            name: "limit",
+            required: false,
+            ty: "number",
+            format: "double",
+            default: Def::Int(100),
+        }],
+        body: "",
+    },
     Op {
         method: "GET",
         sub: "find-definition",

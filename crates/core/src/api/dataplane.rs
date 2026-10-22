@@ -96,6 +96,9 @@ pub const REST_ROUTES: &[(&str, &str)] = &[
     // SPEC-0020 DEC-006: `/api/admin/projects/{project_id}/quota`, the same
     // function as `admin.get_project_quota`.
     ("GET", "quota"),
+    // SPEC-0047 DEC-009: `/api/admin/projects/{project_id}/disk-usage`, the same
+    // function as `admin.get_project_disk_usage`.
+    ("GET", "disk-usage"),
     // SPEC-0045 DEC-010: `/api/fs/diff`, outside `{mount_id}`, the same
     // function as `fs.diff_files`.
     ("GET", "diff"),
@@ -169,6 +172,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fs/{mount_id}/export-zip", post(export_zip))
         .route("/api/fs/{mount_id}/extract-archive", post(extract_archive))
         .route("/api/admin/projects/{project_id}/quota", get(project_quota))
+        .route("/api/admin/projects/{project_id}/disk-usage", get(project_disk_usage))
         // Applied outside the routes so the upload keeps its own larger ceiling.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state)
@@ -407,6 +411,29 @@ async fn project_quota(
     };
     let ctx = crate::tools::registry_support::ToolCtx { person, state };
     match crate::tools::admin::get_project_quota(&ctx, &project_id).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// `GET /api/admin/projects/{project_id}/disk-usage?limit=` (SPEC-0047 DEC-009).
+/// Bearer only, like the quota route: the project gate is the tool's own, so
+/// the body and the refusals are byte for byte the MCP tool's. A `limit` that is
+/// not a number goes on as NaN, which the tool refuses with its one message
+/// (DEC-006).
+async fn project_disk_usage(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    let person = match person_of(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return unauthorized(&e),
+    };
+    let limit = Q(q).opt("limit").map(|v| v.parse::<f64>().unwrap_or(f64::NAN));
+    let ctx = crate::tools::registry_support::ToolCtx { person, state };
+    match crate::tools::admin::get_project_disk_usage(&ctx, &project_id, limit).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(&e),
     }
@@ -2592,8 +2619,9 @@ mod tests {
         // 42 since SPEC-0019 US-0004 added tables and table, 44 since US-0005
         // added images and image, 45 since US-0008 added document-view, 46 since
         // SPEC-0020 US-0015 added the admin quota read, 47 since SPEC-0045
-        // US-0059 added diff.
-        assert_eq!(REST_ROUTES.len(), 47);
+        // US-0059 added diff, 48 since SPEC-0047 added disk-usage.
+        assert_eq!(REST_ROUTES.len(), 48);
+        assert!(REST_ROUTES.contains(&("GET", "disk-usage")));
         assert!(REST_ROUTES.contains(&("GET", "diff")));
         assert!(REST_ROUTES.contains(&("GET", "quota")));
         assert!(REST_ROUTES.contains(&("GET", "document-view")));
