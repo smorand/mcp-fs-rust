@@ -8,7 +8,7 @@
 
 use crate::mcp::server::{
     DeleteArgs, GetProjectDiskUsageArgs, GetProjectFolderUsageArgs, GetProjectQuotaArgs, McpServer,
-    TrashRestoreArgs, WriteBytesArgs,
+    SetProjectQuotaArgs, TrashRestoreArgs, WriteBytesArgs,
 };
 use crate::state::AppState;
 use crate::tools::admin::test_support::Fixture;
@@ -699,4 +699,184 @@ async fn spec_0049_e2e_037_a_write_during_the_read_is_seen_entirely_or_not_at_al
     assert_eq!(out["items"][2], folder_item("/docs", 154_000, 3));
     let again = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
     assert_eq!(again["items"][2], folder_item("/docs", 154_000, 3));
+}
+
+// ── US-0073: edge cases, scale, spec close ─────────────────────────────────
+
+fn paths_of(out: &Value) -> Vec<String> {
+    out["items"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap().into()).collect()
+}
+
+/// SPEC-0049/E2E-026: an empty folder (FR-NEW-001, 002, 006).
+#[tokio::test]
+async fn spec_0049_e2e_026_an_empty_folder() {
+    let w = World::shared().await;
+    let client = w.f.state.stores.client(ATLAS).await.unwrap();
+    client.makedirs("/empty", true).await.unwrap();
+    let out = ok_json(w.read(OLIVIA, ATLAS, Some("/empty"), None).await);
+    assert_eq!(out["folder"], json!({"path": "/empty", "size": 0, "file_count": 0}));
+    assert_eq!(out["item_count"], 0);
+    assert_eq!(out["items"], json!([]));
+    assert_eq!(out["truncated"], false);
+    let root = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(root["item_count"], 5);
+    assert_eq!(root["items"][4], folder_item("/empty", 0, 0));
+}
+
+/// SPEC-0049/E2E-028: cap boundaries (FR-NEW-005, 006).
+#[tokio::test]
+async fn spec_0049_e2e_028_cap_boundaries() {
+    let w = World::empty().await;
+    for i in 0..120 {
+        w.seed(&format!("/many/f{i:03}.bin"), 1_000, i).await;
+    }
+    for (cap, shown, cut) in [
+        (None, 100, true),
+        (Some(120.0), 120, false),
+        (Some(119.0), 119, true),
+        (Some(1.0), 1, true),
+    ] {
+        let out = ok_json(w.read(OLIVIA, ATLAS, Some("/many"), cap).await);
+        assert_eq!(out["items"].as_array().unwrap().len(), shown, "cap {cap:?}");
+        assert_eq!(out["item_count"], shown, "cap {cap:?}");
+        assert_eq!(out["truncated"], cut, "cap {cap:?}");
+        assert_eq!(out["folder"], json!({"path": "/many", "size": 120_000, "file_count": 120}));
+    }
+    let one = ok_json(w.read(OLIVIA, ATLAS, Some("/many"), Some(1.0)).await);
+    assert_eq!(one["items"], json!([file_item("/many/f000.bin", 1_000)]));
+}
+
+/// SPEC-0049/E2E-029: equal sizes are ordered by name (FR-NEW-004).
+#[tokio::test]
+async fn spec_0049_e2e_029_equal_sizes_are_ordered_by_name() {
+    let w = World::empty().await;
+    for (i, p) in ["/t/b.txt", "/t/a.txt", "/t/C.txt", "/t/sub/s.txt"].iter().enumerate() {
+        w.seed(p, 10, i as u64).await;
+    }
+    let out = ok_json(w.read(OLIVIA, ATLAS, Some("/t"), None).await);
+    assert_eq!(paths_of(&out), ["/t/C.txt", "/t/a.txt", "/t/b.txt", "/t/sub"]);
+}
+
+/// SPEC-0049/E2E-030: empty items come last (FR-NEW-004).
+#[tokio::test]
+async fn spec_0049_e2e_030_empty_items_come_last() {
+    let w = World::empty().await;
+    w.seed("/z/a.txt", 10, 1).await;
+    w.seed("/z/empty.txt", 0, 2).await;
+    let client = w.f.state.stores.client(ATLAS).await.unwrap();
+    client.makedirs("/z/e", true).await.unwrap();
+    let out = ok_json(w.read(OLIVIA, ATLAS, Some("/z"), None).await);
+    assert_eq!(
+        out["items"],
+        json!([file_item("/z/a.txt", 10), folder_item("/z/e", 0, 0), file_item("/z/empty.txt", 0)])
+    );
+}
+
+/// SPEC-0049/E2E-031: accents and emoji in a folder name (FR-NEW-003).
+#[tokio::test]
+async fn spec_0049_e2e_031_accents_and_emoji_in_a_folder_name() {
+    let w = World::empty().await;
+    w.seed("/rapports été 📊/a.xlsx", 5_000, 4).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["items"], json!([folder_item("/rapports été 📊", 5_000, 1)]));
+}
+
+/// SPEC-0049/E2E-032: five levels deep (FR-NEW-002).
+#[tokio::test]
+async fn spec_0049_e2e_032_five_levels_deep() {
+    let w = World::empty().await;
+    w.seed("/l1/l2/l3/l4/l5/deep.bin", 7_000, 3).await;
+    let root = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(root["items"], json!([folder_item("/l1", 7_000, 1)]));
+    let deep = ok_json(w.read(OLIVIA, ATLAS, Some("/l1/l2/l3"), None).await);
+    assert_eq!(deep["folder"], json!({"path": "/l1/l2/l3", "size": 7_000, "file_count": 1}));
+    assert_eq!(deep["items"], json!([folder_item("/l1/l2/l3/l4", 7_000, 1)]));
+}
+
+/// SPEC-0049/E2E-035: an unlimited project (FR-NEW-011).
+#[tokio::test]
+async fn spec_0049_e2e_035_an_unlimited_project() {
+    let w = World::shared().await;
+    let clear = SetProjectQuotaArgs { project_id: ATLAS.into(), max_mb: None };
+    ok_json(w.as_(ADA).admin_set_project_quota(Parameters(clear)).await);
+    let out = ok_json(w.read(ADA, ATLAS, None, None).await);
+    assert!(out["max_mb"].is_null(), "neither 0 nor text: {out}");
+    let mut expected = root_answer();
+    expected["max_mb"] = Value::Null;
+    assert_eq!(out, expected);
+}
+
+/// SPEC-0049/E2E-036: a project over its limit is readable (FR-NEW-011).
+#[tokio::test]
+async fn spec_0049_e2e_036_a_project_over_its_limit_is_readable() {
+    let w = World::empty().await;
+    for (i, (p, len)) in [("/big/a.bin", 700_000), ("/big/b.bin", 500_000), ("/big/c.bin", 300_000)]
+        .iter()
+        .enumerate()
+    {
+        w.seed(p, *len, i as u64).await;
+    }
+    let lower = SetProjectQuotaArgs { project_id: ATLAS.into(), max_mb: Some(1) };
+    ok_json(w.as_(ADA).admin_set_project_quota(Parameters(lower)).await);
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["max_mb"], 1);
+    assert_eq!(out["used_bytes"], 1_500_000);
+    assert_eq!(out["items"], json!([folder_item("/big", 1_500_000, 3)]));
+    assert_eq!(ok_json(w.read(OLIVIA, ATLAS, Some("/big"), None).await)["folder"]["file_count"], 3);
+}
+
+/// SPEC-0049/E2E-039: the default read of a very large project is fast (NFR 7.1).
+/// The 100 000 rows are written straight through the metadata store with one
+/// shared content blob, so the seed does not write 100 000 blobs.
+#[tokio::test]
+async fn spec_0049_e2e_039_the_default_read_of_a_very_large_project_is_fast() {
+    let w = World::empty().await;
+    w.f.state.admin.set_quota(ATLAS, Some(20 * MB)).await.unwrap();
+    let client = w.f.state.stores.client(ATLAS).await.unwrap();
+    let content = noise(100, 1);
+    let sha = crate::storage::VolumeClient::sha256_hex(&content);
+    client.blob.put(&sha, &content).await.unwrap();
+    for d in 0..1000 {
+        client.makedirs(&format!("/d{d:04}"), true).await.unwrap();
+        for f in 0..100 {
+            client
+                .meta
+                .put_file(
+                    &format!("/d{d:04}/f{f:03}.bin"),
+                    Some(&sha),
+                    100,
+                    crate::storage::traits::MODE_FILE,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let started = std::time::Instant::now();
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    assert_eq!(out["used_bytes"], 10_000_000);
+    assert_eq!(out["folder"], json!({"path": "/", "size": 10_000_000, "file_count": 100_000}));
+    assert_eq!(out["item_count"], 100);
+    assert_eq!(out["truncated"], true);
+    assert_eq!(out["items"][0], folder_item("/d0000", 10_000, 100));
+}
+
+/// Beyond the acceptance set (FR-NEW-007, spec rule "names are case sensitive"):
+/// `/Video` and `/video` are two folders. SQLite's `LIKE` ignores ASCII case, so
+/// the rows read for `/video` must be filtered again by an exact prefix.
+#[tokio::test]
+async fn spec_0049_us_0073_folders_differing_only_by_case_do_not_mix() {
+    let w = World::empty().await;
+    w.seed("/Video/x.bin", 1_000, 1).await;
+    w.seed("/video/y.bin", 2_000, 2).await;
+    let lower = ok_json(w.read(OLIVIA, ATLAS, Some("/video"), None).await);
+    assert_eq!(lower["folder"], json!({"path": "/video", "size": 2_000, "file_count": 1}));
+    assert_eq!(lower["items"], json!([file_item("/video/y.bin", 2_000)]));
+    let root = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(
+        root["items"],
+        json!([folder_item("/video", 2_000, 1), folder_item("/Video", 1_000, 1)])
+    );
+    assert_eq!(root["folder"], json!({"path": "/", "size": 3_000, "file_count": 2}));
 }

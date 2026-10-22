@@ -111,6 +111,16 @@ nothing. Export zips, git objects and artifact blobs are not nodes, so not usage
   text collation differs per engine. A trashed file's original path is its flat trash entry
   `/<trash_dir>/<stamp>__<flat>` row plus the rest of the path. No index: top N scan,
   O(n log k). The default trash directory is `.mcp_trash`.
+* **Folder usage read (2026-10-22, SPEC-0049).** `admin.get_project_folder_usage` and `GET
+  /api/admin/projects/{project_id}/folder-usage` call `tools::admin::get_project_folder_usage`: cap,
+  `reader_project` gate, `parse_folder` (one trailing `/` dropped, `.`/`..`/empty segments refused as typed,
+  no normalization), then `quota::folder_usage`, which holds `VolumeClient::admission` while it checks the
+  folder with `meta.get` and runs `RelationalMetaStore::folder_items`: one query for the file rows below the
+  folder (pattern from `descendant_pattern`), one for the direct `dir` rows by `parent`, bucketed in Rust by
+  the first component after the folder (whole component match, `/doc` never absorbs `/docs`), empty folders
+  listed with 0, ties by path in code point order. The trash folder is an ordinary stored directory that
+  the purge never removes, so it stays listed (0 bytes) after restore and purge. 100 000 files read in
+  well under 5 seconds on SQLite (E2E-039).
 * **Admission (2026-10-12, US-0020).** Every growing operation goes through
   `quota::admit*`: take `VolumeClient::admission`, compute the net change from the current
   sizes, check the project limit, THEN charge the session budget, and hold the lock until

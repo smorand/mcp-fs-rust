@@ -94,7 +94,8 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `quota.rs` : project storage quota (SPEC-0020): `admit`/`admit_file`/`admit_paths`/
   `admit_sibling` take the volume's admission lock, check the `volume_usage` counter against
   the limit, then charge the session; `used_bytes` backs `admin.get_project_quota`; `disk_usage` backs
-  `admin.get_project_disk_usage` (SPEC-0047, largest files first, read under the same lock).
+  `admin.get_project_disk_usage` (SPEC-0047, largest files first, read under the same lock);
+  `folder_usage` backs `admin.get_project_folder_usage` (SPEC-0049, one folder's direct items rolled up).
 - `errors.rs` : the 16 `ERR_*` codes, `ToolError`, HTTP status mapping, plus a `retryable`
   flag for transient database failures (no new code).
 - `migrate.rs` : the `migrate` verb, offline row for row copy between backends.

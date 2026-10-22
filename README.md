@@ -346,6 +346,15 @@ file also shows the path it had before its delete). `limit` is a whole number fr
 are ordered by path in character code order. The figures come from one moment: the read takes
 the project's admission lock, so it never shows half of a write.
 
+`admin.get_project_folder_usage` (also `GET /api/admin/projects/{project_id}/folder-usage?folder=&limit=`)
+reads one folder at a time, to find the heavy folder by drilling down from `/`: the folder's size and
+file count, and its direct items, folders and files mixed, largest first. A folder's size counts every
+file below it (trashed ones included, so the trash folder, `.mcp_trash` by default, shows what the trash
+weighs). Each item is `{path, kind, size}` with `kind` `Folder` or `File`, plus `file_count` for a
+folder. Same two callers, same refusals, same cap (1 to 500, default 100) and cut sign as the file list;
+the folder is refused with `folder '<path>' not found`, `'<path>' is not a folder` or `path must start
+with /` (one trailing `/` is accepted).
+
 ## Security model
 
 - **Authentication**: RS256 JWT, signature, issuer and expiry verified (30s clock skew,

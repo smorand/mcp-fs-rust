@@ -738,9 +738,11 @@ impl RelationalMetaStore {
         let (mut total_size, mut total_files) = (0i64, 0i64);
         for row in &files {
             let (path, size) = (row.text(0)?, row.i64(1)?);
+            // SQLite's LIKE ignores ASCII case, so `/Video/x` comes back for
+            // `/video`; the exact prefix decides, before anything is counted.
+            let Some(rest) = path.strip_prefix(&prefix) else { continue };
             total_size += size;
             total_files += 1;
-            let Some(rest) = path.strip_prefix(&prefix) else { continue };
             let (name, is_folder) = match rest.split_once('/') {
                 Some((first, _)) => (first, true),
                 None => (rest, false),

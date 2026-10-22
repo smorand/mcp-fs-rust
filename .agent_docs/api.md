@@ -38,6 +38,7 @@ token as the password. A 401 body is `{"error": "ERR_UNAUTHENTICATED", "detail":
 | POST | `/api/fs/{mount_id}/extract-archive` | body `{"path", "destination"?, "overwrite"?, "password"?}` | `{destination, files_written, dirs_created, bytes_written}`, same function as `fs.extract_archive` (SPEC-0015) |
 | GET | `/api/admin/projects/{project_id}/quota` | none | `{project_id, max_mb, used_bytes}`, the body of `admin.get_project_quota` byte for byte, same function (SPEC-0020 DEC-006) |
 | GET | `/api/admin/projects/{project_id}/disk-usage` | query `limit` (1 to 500, default 100) | `{project_id, max_mb, used_bytes, file_count, truncated, entries}`, the body of `admin.get_project_disk_usage` byte for byte, same function (SPEC-0047 DEC-009); a non numeric `limit` gets the cap refusal |
+| GET | `/api/admin/projects/{project_id}/folder-usage` | query `folder` (default `/`; `folder=` empty is refused), `limit` (1 to 500, default 100) | `{project_id, max_mb, used_bytes, folder, item_count, truncated, items}`, the body of `admin.get_project_folder_usage` byte for byte, same function (SPEC-0049 DEC-009) |
 
 `trigger_documentation_service` on the upload applies to **every** file of the
 form, and only `"true"` or `"1"` turn it on, because a form field is free text and
