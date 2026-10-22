@@ -1198,6 +1198,30 @@ const OPERATIONS: &[Op] = &[
         }],
         body: "",
     },
+    // SPEC-0049 DEC-009: the folder read, on the same function as the tool.
+    Op {
+        method: "GET",
+        sub: "folder-usage",
+        path: "/api/admin/projects/{project_id}/folder-usage",
+        tool: "admin.get_project_folder_usage",
+        params: &[
+            Param {
+                name: "folder",
+                required: false,
+                ty: "string",
+                format: "",
+                default: Def::Absent,
+            },
+            Param {
+                name: "limit",
+                required: false,
+                ty: "number",
+                format: "double",
+                default: Def::Int(100),
+            },
+        ],
+        body: "",
+    },
     Op {
         method: "GET",
         sub: "find-definition",

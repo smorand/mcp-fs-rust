@@ -7,10 +7,12 @@
 //! admin, Otto belongs to nothing, Bram owns `Borealis`.
 
 use crate::mcp::server::{GetProjectFolderUsageArgs, McpServer};
+use crate::state::AppState;
 use crate::tools::admin::test_support::Fixture;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 const ATLAS: &str = "Atlas";
 const BOREALIS: &str = "Borealis";
@@ -334,4 +336,108 @@ async fn spec_0049_e2e_038_odd_folder_names_are_refused_as_typed() {
     }
     let root = ok_json(w.read(OLIVIA, ATLAS, Some("/"), None).await);
     assert_eq!(root, root_answer());
+}
+
+// ── US-0071: the same folder read on the web interface ─────────────────────
+
+/// The real data plane router over the fixture's state, plus a bearer token for
+/// `person` (a fresh keypair per call, as in the file list REST tests).
+fn rest(f: &Fixture, person: &str) -> (axum::Router, String) {
+    let keys = tempfile::tempdir().unwrap();
+    let (key, public) = crate::keys::write_keypair(keys.path()).unwrap();
+    let mut config = (*f.state.config).clone();
+    config.auth.jwt.public_key_path = public.display().to_string();
+    let s = &f.state;
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        admin: s.admin.clone(),
+        stores: s.stores.clone(),
+        safety: s.safety.clone(),
+        identity: Arc::new(crate::identity::IdentityResolver::new(&config.auth)),
+        editors: s.editors.clone(),
+        doc_service: None,
+        search: None,
+    };
+    let token = crate::keys::mint_token_from_file(
+        &key,
+        person,
+        crate::keys::DEFAULT_ISSUER,
+        crate::keys::DEFAULT_CLAIM,
+        3600,
+    )
+    .unwrap();
+    (crate::api::dataplane::router(Arc::new(state)), token)
+}
+
+/// `GET /api/admin/projects/{project}/folder-usage<query>` as `person`.
+async fn rest_folder(f: &Fixture, person: &str, project: &str, query: &str) -> (u16, Value) {
+    use tower::ServiceExt as _;
+    let (app, token) = rest(f, person);
+    let req = axum::http::Request::builder()
+        .uri(format!("/api/admin/projects/{project}/folder-usage{query}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    // A missing route answers 404 with an empty body: keep that observable as a
+    // status assertion failure rather than a parse panic.
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// SPEC-0049/E2E-006: assistants and the web interface agree (FR-NEW-012).
+#[tokio::test]
+async fn spec_0049_e2e_006_assistants_and_the_web_interface_agree() {
+    let w = World::shared().await;
+    for (folder, query) in [(None, ""), (Some("/video/"), "?folder=/video/")] {
+        let tool = ok_json(w.read(OLIVIA, ATLAS, folder, None).await);
+        let (status, body) = rest_folder(&w.f, OLIVIA, ATLAS, query).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, tool, "folder {folder:?}");
+    }
+}
+
+/// SPEC-0049/E2E-019: the web interface refuses like the assistants (FR-NEW-008, 012).
+#[tokio::test]
+async fn spec_0049_e2e_019_the_web_interface_refuses_like_the_assistants() {
+    let w = World::shared().await;
+    let tool = err_text(w.read(MIA, ATLAS, None, None).await);
+    let (status, body) = rest_folder(&w.f, MIA, ATLAS, "").await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "ERR_FORBIDDEN");
+    let detail = body["detail"].as_str().expect("a detail string");
+    assert_eq!(detail, "ERR_FORBIDDEN: 'mia@example.com' is not the owner of 'Atlas'");
+    assert!(tool.ends_with(detail), "tool: {tool}, rest: {detail}");
+}
+
+/// SPEC-0049/E2E-020: the web interface reports a missing folder like the
+/// assistants (FR-NEW-009, 012).
+#[tokio::test]
+async fn spec_0049_e2e_020_the_web_interface_reports_a_missing_folder_like_the_assistants() {
+    let w = World::shared().await;
+    let tool = err_text(w.read(OLIVIA, ATLAS, Some("/nothing"), None).await);
+    let (status, body) = rest_folder(&w.f, OLIVIA, ATLAS, "?folder=/nothing").await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"], "ERR_NOT_FOUND");
+    let detail = body["detail"].as_str().expect("a detail string");
+    assert_eq!(detail, "ERR_NOT_FOUND: folder '/nothing' not found");
+    assert!(tool.ends_with(detail), "tool: {tool}, rest: {detail}");
+}
+
+/// Beyond the acceptance set (DEC-009): `folder=` present and empty is the empty
+/// folder text, refused; a cap goes through; a non numeric cap gets the cap message.
+#[tokio::test]
+async fn spec_0049_us_0071_an_empty_folder_value_is_refused_and_the_cap_goes_through() {
+    let w = World::shared().await;
+    let (status, body) = rest_folder(&w.f, OLIVIA, ATLAS, "?folder=").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["detail"].as_str().unwrap().ends_with("path must start with /"), "{body}");
+    let (status, body) = rest_folder(&w.f, OLIVIA, ATLAS, "?limit=2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["item_count"], 2);
+    assert_eq!(body["truncated"], true);
+    let (status, body) = rest_folder(&w.f, OLIVIA, ATLAS, "?limit=abc").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["detail"].as_str().unwrap().ends_with(CAP_REFUSAL), "{body}");
 }
