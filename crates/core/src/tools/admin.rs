@@ -725,14 +725,16 @@ pub(crate) async fn get_project_disk_usage(
     let cap = parse_disk_usage_cap(limit)?;
     let project = reader_project(ctx, project_id).await?;
     let client = ctx.state.stores.client(&project.id).await?;
-    let usage =
-        crate::quota::disk_usage(&client, cap, &ctx.state.safety.config().trash_dir).await?;
+    // Legacy trashed nodes have no row yet (DEC-008): track them before reading.
+    let trash_dir = &ctx.state.safety.config().trash_dir;
+    crate::tools::trash::backfill_trash_entries(&client, trash_dir).await?;
+    let usage = crate::quota::disk_usage(&client, cap, trash_dir).await?;
     let truncated = usage.file_count > usage.entries.len() as i64;
     let entries: Vec<Value> = usage
         .entries
         .into_iter()
         .map(|e| {
-            let state = if e.original_path.is_some() { "In trash" } else { "Active" };
+            let state = if e.in_trash { "In trash" } else { "Active" };
             json!({"path": e.path, "size": e.size, "state": state, "original_path": e.original_path})
         })
         .collect();

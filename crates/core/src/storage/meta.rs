@@ -20,12 +20,14 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// One file of the disk usage breakdown (SPEC-0047). `original_path` is set
-/// only for a file in the trash.
+/// One file of the disk usage breakdown (SPEC-0047). `original_path` is the
+/// path a trashed file had before its delete, `None` for an active file (and
+/// for a trashed one whose trash row is missing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileUsageRow {
     pub path: String,
     pub size: i64,
+    pub in_trash: bool,
     pub original_path: Option<String>,
 }
 
@@ -591,12 +593,14 @@ impl RelationalMetaStore {
     /// per engine (PostgreSQL follows the database collation, SQL Server
     /// compares UTF-16 units), but UTF-8 byte order is code point order on all
     /// of them (DEC-003). Time O(n log k) for n files and cap k, space O(k +
-    /// ties at the cutoff). `_trash_dir` is read by the trash states of
-    /// SPEC-0047 US-0065.
+    /// ties at the cutoff). A file under `trash_dir` is `in_trash`; a soft
+    /// delete keeps a trashed folder's files below one flat entry
+    /// (`/<trash_dir>/<stamp>__<flat>`), so the original path is that entry's
+    /// row plus the rest of the path (DEC-008), not a row of the file itself.
     pub(crate) async fn largest_files(
         &self,
         cap: usize,
-        _trash_dir: &str,
+        trash_dir: &str,
     ) -> Result<(Vec<FileUsageRow>, i64)> {
         let mut tx = self.db.begin().await?;
         let volume = &self.volume_id;
@@ -642,13 +646,35 @@ impl RelationalMetaStore {
                 .await?
             }
         };
-        tx.commit().await?;
         let mut files = rows
             .iter()
-            .map(|r| Ok(FileUsageRow { path: r.text(0)?, size: r.i64(1)?, original_path: None }))
+            .map(|r| {
+                Ok(FileUsageRow {
+                    path: r.text(0)?,
+                    size: r.i64(1)?,
+                    in_trash: false,
+                    original_path: None,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         files.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
         files.truncate(cap);
+        // One lookup per distinct trash entry, inside the same transaction.
+        let prefix = format!("/{}/", trash_dir.trim_matches('/'));
+        let mut originals: HashMap<String, Option<String>> = HashMap::new();
+        for file in &mut files {
+            let Some(rest) = file.path.strip_prefix(&prefix) else { continue };
+            let name = rest.split('/').next().unwrap_or(rest);
+            let suffix = rest[name.len()..].to_string();
+            let top = format!("{prefix}{name}");
+            if !originals.contains_key(&top) {
+                let row = get_trash_entry(&mut *tx, volume, &top).await?;
+                originals.insert(top.clone(), row.map(|r| r.original_path));
+            }
+            file.in_trash = true;
+            file.original_path = originals[&top].as_ref().map(|o| format!("{o}{suffix}"));
+        }
+        tx.commit().await?;
         Ok((files, count))
     }
 
