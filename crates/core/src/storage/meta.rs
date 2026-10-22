@@ -742,14 +742,18 @@ impl RelationalMetaStore {
     pub(crate) async fn folder_items(&self, folder: &str, cap: usize) -> Result<FolderItems> {
         let mut tx = self.db.begin().await?;
         let volume = &self.volume_id;
+        let dialect = tx.dialect();
+        let sm = SubtreeMatch::new(dialect, folder);
         let files = tx
             .query(
-                &Query::new(
+                &Query::new(format!(
                     "SELECT path, size FROM nodes \
-                     WHERE volume_id=?1 AND kind='file' AND path LIKE ?2 ESCAPE '\\'",
-                )
+                     WHERE volume_id=?1 AND kind='file' AND {}",
+                    sm.clause(dialect, "path", 2, 3)
+                ))
                 .bind(volume)
-                .bind(self.descendant_pattern(folder)),
+                .bind(&sm.like)
+                .bind(&sm.prefix),
             )
             .await?;
         let dirs = tx
@@ -1959,17 +1963,21 @@ impl MetaBackend for RelationalMetaStore {
     }
 
     async fn subtree(&self, root: &str) -> Result<Vec<NodeRow>> {
+        let dialect = self.db.dialect();
+        let sm = SubtreeMatch::new(dialect, root);
         let rows = self
             .db
             .query(
                 &Query::new(format!(
                     "SELECT {SELECT_COLS} FROM nodes \
-                     WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\') \
-                     ORDER BY path"
+                     WHERE volume_id=?1 AND (path=?2 OR {}) \
+                     ORDER BY path",
+                    sm.clause(dialect, "path", 3, 4)
                 ))
                 .bind(&self.volume_id)
                 .bind(root)
-                .bind(self.descendant_pattern(root)),
+                .bind(&sm.like)
+                .bind(&sm.prefix),
             )
             .await?;
         rows.iter().map(Self::read_row).collect()

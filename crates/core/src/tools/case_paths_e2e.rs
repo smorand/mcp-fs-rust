@@ -6,7 +6,10 @@
 //! Shared setup: project `P` owned by `o@x.com`; `/Video/x.txt` holds `upper` and
 //! `/video/y.txt` holds `lower`.
 
-use crate::mcp::server::{DeleteArgs, GetProjectQuotaArgs, McpServer, MoveArgs, TrashListArgs};
+use crate::mcp::server::{
+    CopyArgs, DeleteArgs, ExcludePatterns, ExportZipArgs, GetProjectQuotaArgs, GlobArgs, GrepArgs,
+    McpServer, MoveArgs, TrashListArgs,
+};
 use crate::tools::admin::test_support::Fixture;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -235,4 +238,64 @@ async fn spec_0050_bt_008_nested_and_accented_differences() {
     assert_eq!(w.text("/ecole/f.txt").await.as_deref(), Some("F"));
     assert!(!w.exists("/ecole/e.txt").await);
     assert!(!w.exists("/école").await);
+}
+
+// ── US-0076: copy and recursive reads ──────────────────────────────────────
+
+/// SPEC-0050/BT-004: a copy takes only the exact folder (BR-004).
+#[tokio::test]
+async fn spec_0050_bt_004_a_copy_takes_only_the_exact_folder() {
+    let w = World::shared().await;
+    let args = CopyArgs {
+        mount_id: P.into(),
+        source: "/video".into(),
+        destination: "/vcopy".into(),
+        overwrite: false,
+        recursive: true,
+    };
+    ok_json(w.server().fs_copy(Parameters(args)).await);
+    assert_eq!(w.text("/vcopy/y.txt").await.as_deref(), Some("lower"));
+    assert!(!w.exists("/vcopy/x.txt").await, "the other case was not copied");
+    assert_eq!(w.text("/Video/x.txt").await.as_deref(), Some("upper"));
+    assert_eq!(w.text("/video/y.txt").await.as_deref(), Some("lower"));
+}
+
+/// SPEC-0050/BT-005: recursive reads stay inside the folder (BR-005).
+#[tokio::test]
+async fn spec_0050_bt_005_recursive_reads_stay_inside_the_folder() {
+    let w = World::shared().await;
+    let glob = GlobArgs {
+        mount_id: P.into(),
+        pattern: "*.txt".into(),
+        root: "/video".into(),
+        exclude_patterns: ExcludePatterns::default(),
+    };
+    let found = ok_json(w.server().fs_glob(Parameters(glob)).await);
+    assert_eq!(found["matches"], serde_json::json!(["/video/y.txt"]));
+
+    let grep = GrepArgs {
+        mount_id: P.into(),
+        pattern: "upper".into(),
+        root: "/video".into(),
+        include_glob: None,
+        exclude_glob: None,
+        regex: true,
+        case_sensitive: true,
+        output_mode: "content".into(),
+        context_lines: 0,
+        max_matches: 100,
+    };
+    let hits = ok_json(w.server().fs_grep(Parameters(grep)).await);
+    assert_eq!(hits["matches"], serde_json::json!([]), "got: {hits}");
+
+    let zip_args = ExportZipArgs { mount_id: P.into(), paths: vec!["/video".into()] };
+    let out = ok_json(w.server().fs_export_zip(Parameters(zip_args)).await);
+    let token = out["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let client = w.f.state.stores.client(P).await.unwrap();
+    let bytes = client.blob.get(&format!("export:{token}"), 0, None).await.unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["video/y.txt"]);
 }
