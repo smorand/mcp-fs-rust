@@ -102,6 +102,15 @@ nothing. Export zips, git objects and artifact blobs are not nodes, so not usage
 * **Read.** `quota::used_bytes` takes the volume's admission lock (`VolumeClient::admission`,
   one tokio mutex per cached client) then reads one row. `admin.get_project_quota` and
   `GET /api/admin/projects/{project_id}/quota` call `tools::admin::get_project_quota`.
+* **Disk usage read (2026-10-22, SPEC-0047).** `admin.get_project_disk_usage` and `GET
+  /api/admin/projects/{project_id}/disk-usage` call `tools::admin::get_project_disk_usage`:
+  cap check, `reader_project` gate (shared with the quota read), trash row backfill, then
+  `quota::disk_usage`, which holds `VolumeClient::admission` while it reads the counter and
+  runs `RelationalMetaStore::largest_files` (count, cutoff size, rows at least that big, all in
+  one transaction). The order of equal sizes is decided in Rust (UTF-8 byte order), because
+  text collation differs per engine. A trashed file's original path is its flat trash entry
+  `/<trash_dir>/<stamp>__<flat>` row plus the rest of the path. No index: top N scan,
+  O(n log k). The default trash directory is `.mcp_trash`.
 * **Admission (2026-10-12, US-0020).** Every growing operation goes through
   `quota::admit*`: take `VolumeClient::admission`, compute the net change from the current
   sizes, check the project limit, THEN charge the session budget, and hold the lock until
@@ -261,7 +270,7 @@ every `git.*` route (`git.auth*` and `git.pr_*` included) when `git.enabled` is
 false and every `search.*` route when `search.enabled` is false, so `tools/list`
 omits them and `tools/call` answers `-32602` `tool not found` before any handler
 runs. Membership never gated git on its own (CWE-284: any member could clone and
-push with git off). Counts: 60 by default, 109 with git, 113 with git and
+push with git off). Counts: 61 by default, 110 with git, 114 with git and
 search. The static `McpServer::tool_router()` is still the full catalog the
 golden contract and `/api/swagger.json` read; do not filter it. A test that
 calls a git or search tool over MCP must enable the flag in its config.

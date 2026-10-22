@@ -9,8 +9,8 @@
 use crate::docs::DocService;
 use crate::docs::service::{Conversion, Manifest, PictureMeta, StubDocService};
 use crate::mcp::server::{
-    DeleteArgs, ExportZipArgs, GetProjectDiskUsageArgs, GitCommitArgs, McpServer, MountOnlyArgs,
-    TrashRestoreArgs, WriteBytesArgs,
+    DeleteArgs, ExportZipArgs, GetProjectDiskUsageArgs, GetProjectQuotaArgs, GitCommitArgs,
+    McpServer, MountOnlyArgs, SetProjectQuotaArgs, TrashRestoreArgs, WriteBytesArgs,
 };
 use crate::state::AppState;
 use crate::tools::admin::test_support::Fixture;
@@ -613,4 +613,189 @@ async fn spec_0047_e2e_035_the_default_cap_through_the_web_interface() {
     assert_eq!(body["file_count"], 120);
     assert_eq!(body["truncated"], true);
     assert_eq!(body, tool);
+}
+
+// ── US-0067: one moment, read only, hardening ──────────────────────────────
+
+fn paths_of(out: &Value) -> Vec<String> {
+    out["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap().into()).collect()
+}
+
+async fn write_bytes(
+    w: &World,
+    person: &str,
+    path: &str,
+    len: usize,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let args = WriteBytesArgs {
+        mount_id: ATLAS.into(),
+        path: path.into(),
+        base64: base64::engine::general_purpose::STANDARD.encode(noise(len, 5)),
+        overwrite: false,
+        create_parents: true,
+        trigger_documentation_service: false,
+    };
+    w.as_(person).fs_write_bytes(Parameters(args)).await
+}
+
+/// SPEC-0047/E2E-017: reading changes nothing (FR-NEW-009).
+#[tokio::test]
+async fn spec_0047_e2e_017_reading_changes_nothing() {
+    let w = World::shared().await;
+    ok_json(write_bytes(&w, OLIVIA, "/session.bin", 100_000).await);
+    let before = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    let used_before = before["used_bytes"].clone();
+    for _ in 0..2 {
+        assert_eq!(ok_json(w.read(OLIVIA, ATLAS, None).await), before);
+    }
+    let quota = ok_json(
+        w.as_(OLIVIA)
+            .admin_get_project_quota(Parameters(GetProjectQuotaArgs { project_id: ATLAS.into() }))
+            .await,
+    );
+    assert_eq!(quota["used_bytes"], used_before);
+    assert_eq!(before["file_count"], 6);
+    // The session budget (262 144) still has 162 144 bytes: one more is refused,
+    // 162 144 are accepted.
+    let refused = err_text(write_bytes(&w, OLIVIA, "/over.bin", 162_145).await);
+    assert!(refused.ends_with("session write quota of 262144 bytes exceeded"), "got: {refused}");
+    ok_json(write_bytes(&w, OLIVIA, "/exact.bin", 162_144).await);
+}
+
+/// SPEC-0047/E2E-018: a project over its limit is readable (FR-NEW-008, 009).
+#[tokio::test]
+async fn spec_0047_e2e_018_a_project_over_its_limit_is_readable() {
+    let w = World::empty().await;
+    for (i, (p, len)) in
+        [("/a.bin", 700_000), ("/b.bin", 500_000), ("/c.bin", 300_000)].iter().enumerate()
+    {
+        w.seed(p, *len, i as u64).await;
+    }
+    let lower = SetProjectQuotaArgs { project_id: ATLAS.into(), max_mb: Some(1) };
+    ok_json(w.as_(ADA).admin_set_project_quota(Parameters(lower)).await);
+    let out = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    assert_eq!(
+        out,
+        json!({"project_id": "Atlas", "max_mb": 1, "used_bytes": 1_500_000, "file_count": 3,
+               "truncated": false,
+               "entries": [entry("/a.bin", 700_000), entry("/b.bin", 500_000), entry("/c.bin", 300_000)]})
+    );
+}
+
+/// SPEC-0047/E2E-021: an unlimited project (FR-NEW-008).
+#[tokio::test]
+async fn spec_0047_e2e_021_an_unlimited_project() {
+    let w = World::shared().await;
+    let clear = SetProjectQuotaArgs { project_id: ATLAS.into(), max_mb: None };
+    ok_json(w.as_(ADA).admin_set_project_quota(Parameters(clear)).await);
+    let out = ok_json(w.read(ADA, ATLAS, None).await);
+    assert!(out["max_mb"].is_null(), "neither 0 nor text: {out}");
+    assert_eq!(out["used_bytes"], 975_500);
+    assert_eq!(out["entries"].as_array().unwrap().len(), 5);
+}
+
+async fn world_with_120_files() -> World {
+    let w = World::empty().await;
+    for i in 0..120 {
+        w.seed(&format!("/f{i:03}.bin"), 1_000, i).await;
+    }
+    w
+}
+
+/// SPEC-0047/E2E-024: a cap equal to the number of files (FR-NEW-004, 005).
+#[tokio::test]
+async fn spec_0047_e2e_024_a_cap_equal_to_the_number_of_files() {
+    let w = world_with_120_files().await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, Some(120.0)).await);
+    assert_eq!(out["entries"].as_array().unwrap().len(), 120);
+    assert_eq!(out["truncated"], false);
+}
+
+/// SPEC-0047/E2E-025: a cap one below the number of files (FR-NEW-004, 005).
+#[tokio::test]
+async fn spec_0047_e2e_025_a_cap_one_below_the_number_of_files() {
+    let w = world_with_120_files().await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, Some(119.0)).await);
+    assert_eq!(out["entries"].as_array().unwrap().len(), 119);
+    assert_eq!(out["file_count"], 120);
+    assert_eq!(out["truncated"], true);
+}
+
+/// SPEC-0047/E2E-026: the smallest and the largest accepted caps (FR-NEW-001, 004, 005).
+#[tokio::test]
+async fn spec_0047_e2e_026_the_smallest_and_the_largest_accepted_caps() {
+    let w = World::shared().await;
+    let one = ok_json(w.read(OLIVIA, ATLAS, Some(1.0)).await);
+    assert_eq!(one["entries"], json!([entry("/video/demo.mp4", 600_000)]));
+    assert_eq!(one["file_count"], 5);
+    assert_eq!(one["truncated"], true);
+    let max = ok_json(w.read(OLIVIA, ATLAS, Some(500.0)).await);
+    assert_eq!(max, standard());
+}
+
+/// SPEC-0047/E2E-028: empty files come last (FR-NEW-002).
+#[tokio::test]
+async fn spec_0047_e2e_028_empty_files_come_last() {
+    let w = World::empty().await;
+    w.seed("/empty.txt", 0, 1).await;
+    w.seed("/a.txt", 10, 2).await;
+    w.seed("/b.txt", 20, 3).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    assert_eq!(
+        out["entries"],
+        json!([entry("/b.txt", 20), entry("/a.txt", 10), entry("/empty.txt", 0)])
+    );
+}
+
+/// SPEC-0047/E2E-030: accents and emoji stay intact (FR-NEW-003).
+#[tokio::test]
+async fn spec_0047_e2e_030_accents_and_emoji_stay_intact() {
+    let w = World::empty().await;
+    w.seed("/rapports/été 📊.xlsx", 5_000, 4).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    assert_eq!(out["entries"], json!([entry("/rapports/été 📊.xlsx", 5_000)]));
+}
+
+/// SPEC-0047/E2E-033: folders are not listed (FR-NEW-003).
+#[tokio::test]
+async fn spec_0047_e2e_033_folders_are_not_listed() {
+    let w = World::shared().await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None).await);
+    let listed = paths_of(&out);
+    for folder in ["/video", "/data", "/docs"] {
+        assert!(!listed.iter().any(|p| p == folder), "{folder} listed: {listed:?}");
+    }
+    assert_eq!(out["file_count"], 5);
+}
+
+/// SPEC-0047/E2E-032: a write during the read is seen entirely or not at all
+/// (FR-NEW-009, 010). Deterministic, no sleep: the test plays the writer by
+/// holding the project's admission lock, as every write does for its whole
+/// duration; the read must wait for it.
+#[tokio::test]
+async fn spec_0047_e2e_032_a_write_during_the_read_is_seen_entirely_or_not_at_all() {
+    let w = World::shared().await;
+    let client = w.f.state.stores.client(ATLAS).await.unwrap();
+    let writer = client.admission.clone().lock_owned().await;
+
+    let server = w.as_(OLIVIA);
+    let read = tokio::spawn(async move {
+        let args = GetProjectDiskUsageArgs { project_id: ATLAS.into(), limit: None };
+        server.admin_get_project_disk_usage(Parameters(args)).await
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!read.is_finished(), "the read must wait for the write in flight");
+
+    client.write_bytes_atomic("/docs/new.txt", &noise(30_000, 11)).await.unwrap();
+    drop(writer);
+
+    let out = ok_json(read.await.unwrap());
+    assert_eq!(out["file_count"], 6, "{out}");
+    assert_eq!(out["used_bytes"], 1_005_500);
+    let sum: i64 =
+        out["entries"].as_array().unwrap().iter().map(|e| e["size"].as_i64().unwrap()).sum();
+    assert_eq!(sum, 1_005_500);
+    assert_eq!(ok_json(w.read(OLIVIA, ATLAS, None).await)["file_count"], 6);
 }

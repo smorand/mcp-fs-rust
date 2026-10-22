@@ -175,7 +175,7 @@ pub(crate) struct DiskUsage {
 }
 
 /// The bytes `client`'s project uses and its `cap` largest files, largest
-/// first (FR-NEW-001, FR-NEW-002).
+/// first (FR-NEW-001, FR-NEW-002), all taken at one moment.
 pub(crate) async fn disk_usage(
     client: &VolumeClient,
     cap: usize,
@@ -185,6 +185,10 @@ pub(crate) async fn disk_usage(
         .trash
         .as_ref()
         .ok_or_else(|| ToolError::internal("volume has no relational store attached"))?;
+    // Every write holds this lock until its last file landed (DEC-002), so a read
+    // under it never sees half of an operation (FR-NEW-010, DEC-005). The counter
+    // is read through `meta`, not `used_bytes`, which would lock a second time.
+    let _admission = client.admission.lock().await;
     let used_bytes = client.meta.used_bytes().await?;
     let (entries, file_count) = store.largest_files(cap, trash_dir).await?;
     Ok(DiskUsage { used_bytes, file_count, entries })

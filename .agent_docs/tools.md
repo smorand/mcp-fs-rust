@@ -267,7 +267,7 @@ mismatch, duplicate part names, overlapping parts) is refused with `could not ex
 date companion exists: the cached branch re reads the source bytes for those extensions
 (one extra blob read per cached OOXML call) and leaves the companion untouched.
 
-## admin (15)
+## admin (16)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -285,6 +285,7 @@ date companion exists: the cached branch re reads the source bytes for those ext
 | `admin.set_purge_config` | configure auto-purge: enable flag, internal/external driver, file and project retention | `project_id`, `autopurge_enabled`, `use_internal_purge`, `file_retention_days`?, `project_retention_days`? | `project_id`, `autopurge_enabled`, `use_internal_purge`, `file_retention_days`, `project_retention_days` | !D,!RO,I,!OW | owner/admin |
 | `admin.undelete_project` | clear a project's soft-delete flag, immediately restoring access | `project_id` | `project_id`, `undeleted` | !D,!RO,!I,!OW | owner/admin |
 | `admin.set_project_quota` | set or clear a project's maximum storage size (SPEC-0010) | `project_id`, `max_mb`? | `project_id`, `max_mb` | !D,!RO,I,!OW | admin |
+| `admin.get_project_disk_usage` | list a project's files from the largest to the smallest, trashed files included (SPEC-0047); also `GET /api/admin/projects/{project_id}/disk-usage?limit=` | `project_id`, `limit`? (whole number 1 to 500, default 100) | `project_id`, `max_mb` (null when unlimited), `used_bytes`, `file_count`, `truncated`, `entries[]` of `path`, `size`, `state` (`Active` or `In trash`), `original_path` (null when active) | RO,I,!OW | admin or owner, same refusals as `admin.get_project_quota`; cap refusal `limit must be between 1 and 500`; ties ordered by path in code point order |
 | `admin.get_project_quota` | read a project's limit and current usage, trashed files included (SPEC-0020); also `GET /api/admin/projects/{project_id}/quota` | `project_id` | `project_id`, `max_mb` (null when unlimited), `used_bytes` | RO,I,!OW | admin or owner; a non admin gets the owner refusal even for a missing project |
 
 2026-10-12 (SPEC-0020): the limit refuses every growing `fs.*`/`git.*` operation on its net change with `ERR_PROJECT_QUOTA_EXCEEDED` (`project storage quota of <N> MB exceeded: <U> bytes used, <W> bytes requested`, HTTP 507), before the session quota. Moves, trash, restore, aborts and pushes are never checked; a limit below usage removes nothing.
@@ -412,11 +413,11 @@ before any handler runs.
 
 | Configuration | Served |
 |---|---|
-| default | 60 (45 `fs.*`, 15 `admin.*`) |
-| git flag on | 109 |
-| git and search flags on | 113 |
-| every flag, pandoc on `PATH` | 135 (133 without pandoc: `doc.*` registers nothing) |
-| one optional family alone | 60 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
+| default | 61 (45 `fs.*`, 16 `admin.*`) |
+| git flag on | 110 |
+| git and search flags on | 114 |
+| every flag, pandoc on `PATH` | 136 (134 without pandoc: `doc.*` registers nothing) |
+| one optional family alone | 61 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
 
 The optional families (`web`, `context7`, `sqlite`, `db`, `doc`) are not
 `#[tool]` methods: `add_optional_families` in `mcp/server.rs` runs each enabled
@@ -425,7 +426,7 @@ family's production `register()` into one shared `ToolRegistry`, and adds one
 family's own `ToolSchema::to_list_entry()`, so the served schema equals
 `catalog()` (what `/api/swagger.json` reads); the call goes through
 `ToolRegistry::call` then `to_call_result`. The family handlers authorize
-`mount_id` themselves, unchanged. They are outside the 109 tool golden
+`mount_id` themselves, unchanged. They are outside the 110 tool golden
 contract. Tests: `tools/tool_surface_e2e.rs`.
 
 ## Authorization model

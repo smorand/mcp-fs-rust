@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: FEAT / depth M: 2 areas touched (project administration, storage), 11 anticipated requirements, no persisted change, no new stored concept.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-21
 > Project: existing
 > From backlog: BL-0041

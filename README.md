@@ -1,7 +1,7 @@
 # mcp-fs (Rust)
 
 A **streamable-HTTP MCP server** exposing a **simulated multi-project filesystem**:
-109 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
+110 `fs.*` / `admin.*` / `git.*` tools, a parallel REST data plane at `/api/fs` with
 OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary with
 **no external service by default**.
 
@@ -336,6 +336,16 @@ one at a time, so they never leave usage above the limit.
 `{project_id, max_mb, used_bytes}`, `max_mb` null when unlimited; it answers a platform
 admin or the project owner only.
 
+`admin.get_project_disk_usage` (also `GET /api/admin/projects/{project_id}/disk-usage?limit=`)
+lists a project's files from the largest to the smallest, so an owner refused by the limit
+can find what to delete. It answers the same two callers with the same refusals as the quota
+read, and returns `{project_id, max_mb, used_bytes, file_count, truncated, entries}`; each
+entry is `{path, size, state, original_path}` with `state` `Active` or `In trash` (a trashed
+file also shows the path it had before its delete). `limit` is a whole number from 1 to 500
+(default 100); anything else is refused with `limit must be between 1 and 500`. Equal sizes
+are ordered by path in character code order. The figures come from one moment: the read takes
+the project's admission lock, so it never shows half of a write.
+
 ## Security model
 
 - **Authentication**: RS256 JWT, signature, issuer and expiry verified (30s clock skew,
@@ -393,7 +403,7 @@ store behaves identically on all three. See
 
 ## Interactive CLI agent
 
-`crates/agent` builds an `agent` binary that drives the 109 tools through an LLM. It is a
+`crates/agent` builds an `agent` binary that drives the 110 tools through an LLM. It is a
 **client**, so it exercises the real MCP wire protocol the way any other client would.
 
 ```bash
