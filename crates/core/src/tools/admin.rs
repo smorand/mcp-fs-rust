@@ -772,6 +772,28 @@ pub(crate) async fn get_project_disk_usage(
     }))
 }
 
+/// SPEC-0049 DEC-007: the folder the reader named, as a stored path. A single
+/// `/` is the root; exactly one trailing `/` is dropped, and only when the text
+/// before it does not itself end with `/`; every remaining segment must be
+/// non empty and not `.` or `..`. The path is NOT normalized, so `..` can never
+/// resolve into another folder. Refusals echo the text as given.
+fn parse_folder(raw: &str) -> Result<String> {
+    if !raw.starts_with('/') {
+        return Err(ToolError::invalid_argument("path must start with /"));
+    }
+    if raw == "/" {
+        return Ok(raw.to_string());
+    }
+    let trimmed = match raw.strip_suffix('/') {
+        Some(rest) if !rest.ends_with('/') => rest,
+        _ => raw,
+    };
+    if trimmed[1..].split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return Err(ToolError::not_found(format!("folder '{raw}' not found")));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// SPEC-0049 FR-NEW-001: one folder of a project, its direct items largest
 /// first. Production code: `admin.get_project_folder_usage` and `GET
 /// /api/admin/projects/{project_id}/folder-usage` both call it. The cap is
@@ -784,13 +806,17 @@ pub(crate) async fn get_project_folder_usage(
 ) -> Result<Value> {
     let cap = parse_disk_usage_cap(limit)?;
     let project = reader_project(ctx, project_id).await?;
+    let raw = folder.unwrap_or("/");
+    let folder = parse_folder(raw)?;
     let client = ctx.state.stores.client(&project.id).await?;
-    let folder = folder.unwrap_or("/");
-    let crate::quota::FolderRead::Found { used_bytes, items } =
-        crate::quota::folder_usage(&client, folder, cap).await?
-    else {
-        // US-0070 maps a missing folder and a file to their refusals.
-        return Err(ToolError::internal("folder check comes with US-0070"));
+    let (used_bytes, items) = match crate::quota::folder_usage(&client, &folder, cap).await? {
+        crate::quota::FolderRead::Found { used_bytes, items } => (used_bytes, items),
+        crate::quota::FolderRead::Missing => {
+            return Err(ToolError::not_found(format!("folder '{raw}' not found")));
+        }
+        crate::quota::FolderRead::IsFile => {
+            return Err(ToolError::invalid_argument(format!("'{raw}' is not a folder")));
+        }
     };
     let truncated = items.item_total > items.items.len() as i64;
     let listed: Vec<Value> = items

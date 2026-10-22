@@ -279,3 +279,59 @@ async fn spec_0049_e2e_018_a_refusal_reveals_nothing_about_the_files() {
         assert!(!e.contains(secret), "the refusal leaks {secret}: {e}");
     }
 }
+
+// ── US-0070: name the folder and refuse bad paths ──────────────────────────
+
+/// SPEC-0049/E2E-015: a folder that does not exist (FR-NEW-009).
+#[tokio::test]
+async fn spec_0049_e2e_015_a_folder_that_does_not_exist() {
+    let w = World::shared().await;
+    let e = err_text(w.read(OLIVIA, ATLAS, Some("/nothing"), None).await);
+    assert!(e.ends_with("folder '/nothing' not found"), "got: {e}");
+}
+
+/// SPEC-0049/E2E-016: a file given as the folder (FR-NEW-009).
+#[tokio::test]
+async fn spec_0049_e2e_016_a_file_given_as_the_folder() {
+    let w = World::shared().await;
+    let e = err_text(w.read(OLIVIA, ATLAS, Some("/readme.md"), None).await);
+    assert!(e.ends_with("'/readme.md' is not a folder"), "got: {e}");
+}
+
+/// SPEC-0049/E2E-017: a folder path without a leading slash (FR-NEW-009).
+#[tokio::test]
+async fn spec_0049_e2e_017_a_folder_path_without_a_leading_slash() {
+    let w = World::shared().await;
+    let e = err_text(w.read(OLIVIA, ATLAS, Some("video"), None).await);
+    assert!(e.ends_with("path must start with /"), "got: {e}");
+}
+
+/// SPEC-0049/E2E-027: a trailing slash means the same folder (FR-NEW-009).
+#[tokio::test]
+async fn spec_0049_e2e_027_a_trailing_slash_means_the_same_folder() {
+    let w = World::shared().await;
+    let with = ok_json(w.read(OLIVIA, ATLAS, Some("/video/"), None).await);
+    let without = ok_json(w.read(OLIVIA, ATLAS, Some("/video"), None).await);
+    assert_eq!(with, without);
+    assert_eq!(with["folder"]["path"], "/video");
+}
+
+/// SPEC-0049/E2E-038: odd folder names are refused as typed (FR-NEW-009).
+#[tokio::test]
+async fn spec_0049_e2e_038_odd_folder_names_are_refused_as_typed() {
+    let w = World::shared().await;
+    let cases = [
+        ("", "path must start with /"),
+        ("/video/../docs", "folder '/video/../docs' not found"),
+        ("//video", "folder '//video' not found"),
+        ("/video//", "folder '/video//' not found"),
+        ("//", "folder '//' not found"),
+        ("/Video", "folder '/Video' not found"),
+    ];
+    for (raw, message) in cases {
+        let e = err_text(w.read(OLIVIA, ATLAS, Some(raw), None).await);
+        assert!(e.ends_with(message), "folder {raw:?}: got {e}");
+    }
+    let root = ok_json(w.read(OLIVIA, ATLAS, Some("/"), None).await);
+    assert_eq!(root, root_answer());
+}
