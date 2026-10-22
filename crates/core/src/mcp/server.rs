@@ -1402,6 +1402,18 @@ pub struct GetProjectDiskUsageArgs {
     pub limit: Option<f64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetProjectFolderUsageArgs {
+    /// Id of the project whose folder is read.
+    pub project_id: String,
+    /// Optional. Absolute path of the folder read, default /.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Optional. Number of items listed, a whole number from 1 to 500. Default 100.
+    #[serde(default)]
+    pub limit: Option<f64>,
+}
+
 // ── search.* parameter structs ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2953,6 +2965,26 @@ impl McpServer {
         to_call_result("admin.get_project_disk_usage", out)
     }
 
+    #[tool(
+        name = "admin.get_project_folder_usage",
+        description = "List one folder of a project (platform admin or project owner): its size \
+             and file count, and its direct folders and files from the largest to the smallest, a \
+             folder counting everything below it. Trashed files are counted."
+    )]
+    pub(crate) async fn admin_get_project_folder_usage(
+        &self,
+        Parameters(a): Parameters<GetProjectFolderUsageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = crate::tools::admin::get_project_folder_usage(
+            &self.git_ctx(),
+            &a.project_id,
+            a.folder.as_deref(),
+            a.limit,
+        )
+        .await;
+        to_call_result("admin.get_project_folder_usage", out)
+    }
+
     // ── search.* family ────────────────────────────────────────────
 
     #[tool(
@@ -3922,11 +3954,12 @@ mod tests {
         // SPEC-0020 adds admin.get_project_quota: admin 15, total 112.
         // SPEC-0045 adds fs.diff_files: fs 45, total 113.
         // SPEC-0047 adds admin.get_project_disk_usage: admin 16, total 114.
+        // SPEC-0049 adds admin.get_project_folder_usage: admin 17, total 115.
         assert_eq!(fs_count, 45, "got: {names:?}");
-        assert_eq!(admin_count, 16, "got: {names:?}");
+        assert_eq!(admin_count, 17, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 114, "got: {names:?}");
+        assert_eq!(names.len(), 115, "got: {names:?}");
     }
 
     #[test]
@@ -4258,7 +4291,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 110, "the frozen contract covers 110 non-search tools");
+        assert_eq!(checked, 111, "the frozen contract covers 111 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4279,8 +4312,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 110, "got: {names:?}");
-        assert_eq!(expected.len(), 110, "the golden contract itself must hold 110 names");
+        assert_eq!(names.len(), 111, "got: {names:?}");
+        assert_eq!(expected.len(), 111, "the golden contract itself must hold 111 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

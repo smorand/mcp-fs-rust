@@ -68,7 +68,7 @@
 | US-0066 | SPEC-0047 | the same breakdown on the web interface | US-0064 | 2 | landed | story/US-0066-the-same-breakdown-on-the-web-interface | story/US-0065-show-trashed-files-and-shared-population |
 | US-0067 | SPEC-0047 | one moment, read only, hardening, docs, spec close | US-0065, US-0066 | 1 | landed | story/US-0067-one-moment-read-only-hardening-and-spec-close | story/US-0066-the-same-breakdown-on-the-web-interface |
 | US-0068 | SPEC-0048 | bump rustls-webpki and webpki-roots for two RustSec advisories | main | 2 | landed | story/US-0068-bump-rustls-webpki-and-webpki-roots | main |
-| US-0069 | SPEC-0049 | read a project's root folder by size | main | 1 | todo | | |
+| US-0069 | SPEC-0049 | read a project's root folder by size | main | 1 | landed | story/US-0069-read-a-projects-root-folder-by-size | main |
 | US-0070 | SPEC-0049 | name the folder and refuse bad paths | US-0069 | 2 | todo | | |
 | US-0071 | SPEC-0049 | the same folder read on the web interface | US-0070 | 2 | todo | | |
 | US-0072 | SPEC-0049 | trash, population, read only and one moment | US-0069 | 2 | todo | | |

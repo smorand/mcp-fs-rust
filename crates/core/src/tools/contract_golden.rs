@@ -142,8 +142,8 @@ fn tool_contract_golden_is_current() {
     // then fs.get_table: 41 fs, so 104, then fs.list_images and fs.get_image: 43 fs, so 106,
     // then fs.get_document_view: 44 fs, so 107. SPEC-0020 adds admin.get_project_quota: 15
     // admin, so 108. SPEC-0045 adds fs.diff_files: 45 fs, so 109. SPEC-0047 adds
-    // admin.get_project_disk_usage: 16 admin, so 110.
-    assert_eq!(reg.len(), 110, "the frozen contract covers 45 fs, 16 admin and 49 git tools");
+    // admin.get_project_disk_usage: 16 admin, so 110. SPEC-0049 adds admin.get_project_folder_usage: 17 admin, so 111.
+    assert_eq!(reg.len(), 111, "the frozen contract covers 45 fs, 17 admin and 49 git tools");
     let rendered = render(&reg);
 
     if std::env::var_os(REWRITE_ENV).is_some() {
@@ -250,7 +250,7 @@ fn e2e_new_960_the_thirty_one_enumerated_names_are_exactly_the_new_tool_set() {
     git_enumeration_verdict(reg.names()).expect("the git family must match the enumeration");
 
     assert_eq!(PRE_SPEC_GIT_TOOLS.len() + NEW_GIT_TOOLS.len(), 49);
-    assert_eq!(reg.len(), 110);
+    assert_eq!(reg.len(), 111);
 
     // Every new tool is frozen, and carries the family's required mount_id.
     let Some(frozen) = frozen_tools() else {
@@ -306,7 +306,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
     let admin_family = reg.names().iter().filter(|n| n.starts_with("admin.")).count();
 
     // contract_golden.rs's own total, and the subtotals all.rs asserts.
-    assert_eq!(reg.len(), 110);
+    assert_eq!(reg.len(), 111);
     assert_eq!(git_family, 49);
     assert_eq!(fs_family + admin_family + git_family, reg.len());
 
@@ -320,7 +320,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
         eprintln!("skipped: {PATH} is absent");
         return;
     };
-    assert_eq!(frozen.len(), 110, "the golden file holds one entry per registered tool");
+    assert_eq!(frozen.len(), 111, "the golden file holds one entry per registered tool");
 
     // The contract text documents the same names, set for set.
     let text =

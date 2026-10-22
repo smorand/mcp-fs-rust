@@ -1,4 +1,4 @@
-# Tool reference (110 tools)
+# Tool reference (111 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -267,7 +267,7 @@ mismatch, duplicate part names, overlapping parts) is refused with `could not ex
 date companion exists: the cached branch re reads the source bytes for those extensions
 (one extra blob read per cached OOXML call) and leaves the companion untouched.
 
-## admin (16)
+## admin (17)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -413,11 +413,11 @@ before any handler runs.
 
 | Configuration | Served |
 |---|---|
-| default | 61 (45 `fs.*`, 16 `admin.*`) |
-| git flag on | 110 |
-| git and search flags on | 114 |
-| every flag, pandoc on `PATH` | 136 (134 without pandoc: `doc.*` registers nothing) |
-| one optional family alone | 61 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
+| default | 62 (45 `fs.*`, 17 `admin.*`) |
+| git flag on | 111 |
+| git and search flags on | 115 |
+| every flag, pandoc on `PATH` | 137 (135 without pandoc: `doc.*` registers nothing) |
+| one optional family alone | 62 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
 
 The optional families (`web`, `context7`, `sqlite`, `db`, `doc`) are not
 `#[tool]` methods: `add_optional_families` in `mcp/server.rs` runs each enabled
@@ -426,7 +426,7 @@ family's production `register()` into one shared `ToolRegistry`, and adds one
 family's own `ToolSchema::to_list_entry()`, so the served schema equals
 `catalog()` (what `/api/swagger.json` reads); the call goes through
 `ToolRegistry::call` then `to_call_result`. The family handlers authorize
-`mount_id` themselves, unchanged. They are outside the 110 tool golden
+`mount_id` themselves, unchanged. They are outside the 111 tool golden
 contract. Tests: `tools/tool_surface_e2e.rs`.
 
 ## Authorization model

@@ -10,7 +10,7 @@
 use crate::errors::{Result, ToolError};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
-use crate::storage::meta::FileUsageRow;
+use crate::storage::meta::{FileUsageRow, FolderItems};
 
 /// Proof that an operation was admitted. It holds the volume's admission lock,
 /// so it must live until the operation's last write landed (DEC-002): another
@@ -192,4 +192,35 @@ pub(crate) async fn disk_usage(
     let used_bytes = client.meta.used_bytes().await?;
     let (entries, file_count) = store.largest_files(cap, trash_dir).await?;
     Ok(DiskUsage { used_bytes, file_count, entries })
+}
+
+/// What a folder read found (SPEC-0049). The tool turns `Missing` and `IsFile`
+/// into their refusals.
+pub(crate) enum FolderRead {
+    Missing,
+    IsFile,
+    Found { used_bytes: i64, items: FolderItems },
+}
+
+/// The bytes the project uses and the direct items of `folder`, largest first.
+/// The root `/` is always a folder; any other path must be a stored directory.
+pub(crate) async fn folder_usage(
+    client: &VolumeClient,
+    folder: &str,
+    cap: usize,
+) -> Result<FolderRead> {
+    let store = client
+        .trash
+        .as_ref()
+        .ok_or_else(|| ToolError::internal("volume has no relational store attached"))?;
+    let used_bytes = client.meta.used_bytes().await?;
+    if folder != "/" {
+        match client.meta.get(folder).await? {
+            None => return Ok(FolderRead::Missing),
+            Some(node) if node.is_file() => return Ok(FolderRead::IsFile),
+            Some(_) => {}
+        }
+    }
+    let items = store.folder_items(folder, cap).await?;
+    Ok(FolderRead::Found { used_bytes, items })
 }

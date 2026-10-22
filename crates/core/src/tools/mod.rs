@@ -47,6 +47,8 @@ pub(crate) mod document;
 pub(crate) mod edit;
 pub mod editor;
 pub(crate) mod export;
+#[cfg(test)]
+mod folder_usage_e2e;
 pub mod git;
 pub mod git_auth;
 pub mod git_pr;

@@ -23,6 +23,11 @@ admin.get_project_disk_usage
   params: project_id:string, limit:number|null=null
   required: ['project_id']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+admin.get_project_folder_usage
+  desc: List one folder of a project (platform admin or project owner): its size and file count, and its direct folders and files from the largest to the smallest, a folder counting everything below it. Trashed files are counted.
+  params: project_id:string, folder:string=null, limit:number|null=null
+  required: ['project_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.get_project_quota
   desc: Show a project's storage quota and current usage (platform admin or project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the sum of every file's size, trashed files included.
   params: project_id:string
@@ -678,3 +683,4 @@ admin.set_index_mode: {"project_id": "parity-probe", "index_mode": "bm25", "prev
 admin.get_index_mode: {"project_id": "parity-probe", "index_mode": "bm25"}
 admin.get_project_quota: {"project_id": "parity-probe", "max_mb": null, "used_bytes": 1234}
 admin.get_project_disk_usage: {"project_id": "parity-probe", "max_mb": null, "used_bytes": 1234, "file_count": 1, "truncated": false, "entries": [{"path": "/a.txt", "size": 1234, "state": "Active", "original_path": null}]}
+admin.get_project_folder_usage: {"project_id": "parity-probe", "max_mb": null, "used_bytes": 1234, "folder": {"path": "/", "size": 1234, "file_count": 1}, "item_count": 1, "truncated": false, "items": [{"path": "/a.txt", "kind": "File", "size": 1234}]}

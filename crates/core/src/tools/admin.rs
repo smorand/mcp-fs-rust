@@ -22,6 +22,7 @@
 //! | set_project_quota        | platform admin only (SPEC-0010)                 |
 //! | get_project_quota        | platform admin, or the owner (SPEC-0020 DEC-007)|
 //! | get_project_disk_usage   | platform admin, or the owner (SPEC-0047 DEC-007)|
+//! | get_project_folder_usage | platform admin, or the owner (SPEC-0049 DEC-007)|
 //!
 //! `create_project` provisions the volume and rolls the ACL row back if that
 //! fails, so a project row never points at a volume that was never created.
@@ -365,6 +366,29 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
         handler(|ctx: ToolCtx, a| async move {
             let project_id = a.str("project_id")?;
             get_project_disk_usage(&ctx, &project_id, a.opt_num("limit")).await
+        }),
+    );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.get_project_folder_usage",
+            "List one folder of a project (platform admin or project owner): its size and \
+             file count, and its direct folders and files from the largest to the smallest, a \
+             folder counting everything below it. Trashed files are counted.",
+        )
+        .req_str("project_id", "Id of the project whose folder is read.")
+        .opt_str_null("folder", "Optional. Absolute path of the folder read, default /.")
+        .opt_nullable_num(
+            "limit",
+            "Optional. Number of items listed, a whole number from 1 to 500. Default 100.",
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            let folder = a.opt_str("folder");
+            get_project_folder_usage(&ctx, &project_id, folder.as_deref(), a.opt_num("limit")).await
         }),
     );
 }
@@ -748,6 +772,49 @@ pub(crate) async fn get_project_disk_usage(
     }))
 }
 
+/// SPEC-0049 FR-NEW-001: one folder of a project, its direct items largest
+/// first. Production code: `admin.get_project_folder_usage` and `GET
+/// /api/admin/projects/{project_id}/folder-usage` both call it. The cap is
+/// checked first, then the gate (SPEC-0047 DEC-006, DEC-007).
+pub(crate) async fn get_project_folder_usage(
+    ctx: &ToolCtx,
+    project_id: &str,
+    folder: Option<&str>,
+    limit: Option<f64>,
+) -> Result<Value> {
+    let cap = parse_disk_usage_cap(limit)?;
+    let project = reader_project(ctx, project_id).await?;
+    let client = ctx.state.stores.client(&project.id).await?;
+    let folder = folder.unwrap_or("/");
+    let crate::quota::FolderRead::Found { used_bytes, items } =
+        crate::quota::folder_usage(&client, folder, cap).await?
+    else {
+        // US-0070 maps a missing folder and a file to their refusals.
+        return Err(ToolError::internal("folder check comes with US-0070"));
+    };
+    let truncated = items.item_total > items.items.len() as i64;
+    let listed: Vec<Value> = items
+        .items
+        .iter()
+        .map(|i| {
+            if i.is_folder {
+                json!({"path": i.path, "kind": "Folder", "size": i.size, "file_count": i.file_count})
+            } else {
+                json!({"path": i.path, "kind": "File", "size": i.size})
+            }
+        })
+        .collect();
+    Ok(json!({
+        "project_id": project.id,
+        "max_mb": project.quota_bytes.map(|b| b / 1_048_576),
+        "used_bytes": used_bytes,
+        "folder": {"path": folder, "size": items.total_size, "file_count": items.total_files},
+        "item_count": listed.len(),
+        "truncated": truncated,
+        "items": listed,
+    }))
+}
+
 // ── shared test fixtures ────────────────────────────────────────────────────
 
 /// Fixtures shared by the `admin.*`, `git.*` and `git.auth*` test modules: a real
@@ -877,7 +944,7 @@ mod tests {
         r
     }
 
-    const ALL_ADMIN_TOOLS: [&str; 16] = [
+    const ALL_ADMIN_TOOLS: [&str; 17] = [
         "admin.create_project",
         "admin.delete_project",
         "admin.list_projects",
@@ -894,12 +961,13 @@ mod tests {
         "admin.set_project_quota",
         "admin.get_project_quota",
         "admin.get_project_disk_usage",
+        "admin.get_project_folder_usage",
     ];
 
     #[test]
     fn every_admin_tool_is_registered() {
         let r = registry();
-        assert_eq!(r.len(), 16);
+        assert_eq!(r.len(), 17);
         for name in ALL_ADMIN_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }

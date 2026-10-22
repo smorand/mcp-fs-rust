@@ -31,6 +31,26 @@ pub(crate) struct FileUsageRow {
     pub original_path: Option<String>,
 }
 
+/// One direct child of a folder in the folder breakdown (SPEC-0049). A folder
+/// carries the total size and file count of everything below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FolderItemRow {
+    pub path: String,
+    pub is_folder: bool,
+    pub size: i64,
+    pub file_count: i64,
+}
+
+/// A folder's own totals and its direct items, largest first, cut to the cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FolderItems {
+    pub total_size: i64,
+    pub total_files: i64,
+    /// Direct items before the cap, so a cut list can be told from a complete one.
+    pub item_total: i64,
+    pub items: Vec<FolderItemRow>,
+}
+
 /// A project id is at most 32 characters (see `admin::validate_project_id`), so
 /// this leaves room to spare while staying inside a SQL Server index key.
 const VOLUME_ID_LEN: u32 = 64;
@@ -676,6 +696,75 @@ impl RelationalMetaStore {
         }
         tx.commit().await?;
         Ok((files, count))
+    }
+
+    /// The direct items of `folder` (`/` or an absolute path without a trailing
+    /// slash), each folder rolled up to everything below it (SPEC-0049
+    /// FR-NEW-002, 004, 007).
+    ///
+    /// One query reads every file row below the folder, a second the direct
+    /// folder rows (so a folder holding no file is listed with 0 bytes). The
+    /// files are bucketed by the first path component after the folder, which
+    /// matches whole components: `/doc` never absorbs `/docs` (DEC-004). Ties
+    /// are ordered by path as Rust strings, engine independent (DEC-005).
+    /// Time O(n + k log k) for n files below and k direct items, space O(n) for
+    /// the rows read plus O(k).
+    pub(crate) async fn folder_items(&self, folder: &str, cap: usize) -> Result<FolderItems> {
+        let mut tx = self.db.begin().await?;
+        let volume = &self.volume_id;
+        let files = tx
+            .query(
+                &Query::new(
+                    "SELECT path, size FROM nodes \
+                     WHERE volume_id=?1 AND kind='file' AND path LIKE ?2 ESCAPE '\\'",
+                )
+                .bind(volume)
+                .bind(self.descendant_pattern(folder)),
+            )
+            .await?;
+        let dirs = tx
+            .query(
+                &Query::new(
+                    "SELECT path FROM nodes WHERE volume_id=?1 AND kind='dir' AND parent=?2",
+                )
+                .bind(volume)
+                .bind(folder),
+            )
+            .await?;
+        tx.commit().await?;
+
+        let prefix = format!("{}/", folder.trim_end_matches('/'));
+        let mut buckets: HashMap<String, FolderItemRow> = HashMap::new();
+        let (mut total_size, mut total_files) = (0i64, 0i64);
+        for row in &files {
+            let (path, size) = (row.text(0)?, row.i64(1)?);
+            total_size += size;
+            total_files += 1;
+            let Some(rest) = path.strip_prefix(&prefix) else { continue };
+            let (name, is_folder) = match rest.split_once('/') {
+                Some((first, _)) => (first, true),
+                None => (rest, false),
+            };
+            let item = buckets.entry(format!("{prefix}{name}")).or_insert_with_key(|key| {
+                FolderItemRow { path: key.clone(), is_folder, size: 0, file_count: 0 }
+            });
+            item.size += size;
+            item.file_count += 1;
+        }
+        for row in &dirs {
+            let path = row.text(0)?;
+            buckets.entry(path.clone()).or_insert(FolderItemRow {
+                path,
+                is_folder: true,
+                size: 0,
+                file_count: 0,
+            });
+        }
+        let mut items: Vec<FolderItemRow> = buckets.into_values().collect();
+        items.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+        let item_total = items.len() as i64;
+        items.truncate(cap);
+        Ok(FolderItems { total_size, total_files, item_total, items })
     }
 
     /// Insert a `trash_entries` row for `trash_path` unless one already exists

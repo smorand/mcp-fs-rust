@@ -149,6 +149,40 @@
       }
     },
     {
+      "name": "admin.get_project_folder_usage",
+      "description": "List one folder of a project (platform admin or project owner): its size and file count, and its direct folders and files from the largest to the smallest, a folder counting everything below it. Trashed files are counted.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Id of the project whose folder is read.",
+            "type": "string"
+          },
+          "folder": {
+            "description": "Optional. Absolute path of the folder read, default /.",
+            "type": "string",
+            "default": null
+          },
+          "limit": {
+            "description": "Optional. Number of items listed, a whole number from 1 to 500. Default 100.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "admin.get_project_quota",
       "description": "Show a project's storage quota and current usage (platform admin or project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the sum of every file's size, trashed files included.",
       "inputSchema": {
