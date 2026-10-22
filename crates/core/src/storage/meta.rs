@@ -26,6 +26,7 @@ use std::sync::Arc;
 /// `/video/%` also selects `/Video/x`. The `LIKE` stays to narrow the rows (and
 /// its wildcard escaping is the one that keeps `a_b` from matching `axb`); the
 /// exact substring equality decides, on every engine (DEC-003, DEC-004).
+#[derive(Clone)]
 struct SubtreeMatch {
     like: String,
     prefix: String,
@@ -1616,14 +1617,14 @@ fn trash_path_prefix_pattern(dialect: Dialect, prefix: &str) -> String {
 
 /// Move `src` (and its subtree) to `dst` inside the caller's transaction. Shared
 /// by `rename` and `rename_into_trash` so the move logic exists once (SPEC-0044
-/// DR-001). `pattern` is the escaped descendant `LIKE` pattern for `src`.
+/// DR-001). `sm` is the case exact selection of `src` and what lies below it (SPEC-0050).
 async fn tx_rename(
     tx: &mut dyn RelationalTx,
     dialect: Dialect,
     volume: &str,
     src: &str,
     dst: &str,
-    pattern: &str,
+    sm: &SubtreeMatch,
 ) -> Result<()> {
     // Shortest path first, so a parent is renamed before its children and no
     // intermediate state collides with a row that has not moved yet.
@@ -1639,13 +1640,14 @@ async fn tx_rename(
     let rows = tx
         .query(
             &Query::new(format!(
-                "SELECT path FROM nodes \
-                     WHERE volume_id=?1 AND (path=?2 OR path LIKE ?3 ESCAPE '\\') \
-                     ORDER BY {order}(path)"
+                "SELECT path FROM nodes WHERE volume_id=?1 AND (path=?2 OR {within}) \
+                 ORDER BY {order}(path)",
+                within = sm.clause(dialect, "path", 3, 4),
             ))
             .bind(volume)
             .bind(src)
-            .bind(pattern),
+            .bind(&sm.like)
+            .bind(&sm.prefix),
         )
         .await?;
     let paths: Vec<String> = rows.iter().map(|r| r.text(0)).collect::<Result<_>>()?;
@@ -2263,29 +2265,28 @@ impl MetaBackend for RelationalMetaStore {
     }
 
     async fn rename(&self, src: &str, dst: &str) -> Result<()> {
-        let pattern = self.descendant_pattern(src);
         let dialect = self.db.dialect();
+        let sm = SubtreeMatch::new(dialect, src);
         let volume = self.volume_id.clone();
         let (src, dst) = (src.to_string(), dst.to_string());
         run_retrying(&*self.db, move |tx| {
-            let (volume, src, dst, pattern) =
-                (volume.clone(), src.clone(), dst.clone(), pattern.clone());
-            Box::pin(async move { tx_rename(tx, dialect, &volume, &src, &dst, &pattern).await })
+            let (volume, src, dst, sm) = (volume.clone(), src.clone(), dst.clone(), sm.clone());
+            Box::pin(async move { tx_rename(tx, dialect, &volume, &src, &dst, &sm).await })
         })
         .await
     }
 
     async fn rename_into_trash(&self, src: &str, dst: &str, entry: &TrashEntry) -> Result<()> {
-        let pattern = self.descendant_pattern(src);
         let dialect = self.db.dialect();
+        let sm = SubtreeMatch::new(dialect, src);
         let volume = self.volume_id.clone();
         let (src, dst, entry) = (src.to_string(), dst.to_string(), entry.clone());
         run_retrying(&*self.db, move |tx| {
-            let (volume, src, dst, pattern, entry) =
-                (volume.clone(), src.clone(), dst.clone(), pattern.clone(), entry.clone());
+            let (volume, src, dst, sm, entry) =
+                (volume.clone(), src.clone(), dst.clone(), sm.clone(), entry.clone());
             Box::pin(async move {
                 // One transaction: the row exists exactly when the move does.
-                tx_rename(tx, dialect, &volume, &src, &dst, &pattern).await?;
+                tx_rename(tx, dialect, &volume, &src, &dst, &sm).await?;
                 insert_trash_entry(
                     tx,
                     &volume,

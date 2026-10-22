@@ -6,7 +6,7 @@
 //! Shared setup: project `P` owned by `o@x.com`; `/Video/x.txt` holds `upper` and
 //! `/video/y.txt` holds `lower`.
 
-use crate::mcp::server::{DeleteArgs, GetProjectQuotaArgs, McpServer, MoveArgs};
+use crate::mcp::server::{DeleteArgs, GetProjectQuotaArgs, McpServer, MoveArgs, TrashListArgs};
 use crate::tools::admin::test_support::Fixture;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -81,6 +81,38 @@ impl World {
     async fn text(&self, path: &str) -> Option<String> {
         let client = self.f.state.stores.client(P).await.unwrap();
         if client.exists(path).await.unwrap() { client.read_text(path).await.ok() } else { None }
+    }
+
+    /// The trash entries whose original path starts with `prefix`, as
+    /// `(original_path, kind)` sorted by path.
+    async fn trash_list(&self, prefix: &str) -> Vec<(String, String)> {
+        let args =
+            TrashListArgs { mount_id: P.into(), path_prefix: prefix.into(), limit: 100, offset: 0 };
+        let out = ok_json(self.server().fs_trash_list(Parameters(args)).await);
+        let mut entries: Vec<(String, String)> = out["entries"]
+            .as_array()
+            .expect("an entries array")
+            .iter()
+            .map(|e| {
+                (e["original_path"].as_str().unwrap().into(), e["kind"].as_str().unwrap().into())
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Every file stored under the trash folder.
+    async fn trashed_files(&self) -> Vec<String> {
+        let client = self.f.state.stores.client(P).await.unwrap();
+        client
+            .meta
+            .subtree("/.mcp_trash")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.is_file())
+            .map(|n| n.path)
+            .collect()
     }
 
     async fn exists(&self, path: &str) -> bool {
@@ -158,4 +190,49 @@ async fn spec_0050_bt_022_wildcard_characters() {
     assert_eq!(w.text("/50x/q.txt").await.as_deref(), Some("q"));
     assert!(!w.exists("/a_b/x.txt").await);
     assert!(!w.exists("/50%/p.txt").await);
+}
+
+// ── US-0075: move, rename and the trash ────────────────────────────────────
+
+/// SPEC-0050/BT-002: a delete to the trash moves only the exact folder (BR-002).
+#[tokio::test]
+async fn spec_0050_bt_002_a_delete_to_the_trash_moves_only_the_exact_folder() {
+    let w = World::shared().await;
+    w.delete("/video", true).await;
+    assert_eq!(w.text("/Video/x.txt").await.as_deref(), Some("upper"));
+    assert_eq!(w.trash_list("").await, [("/video".to_string(), "dir".to_string())]);
+    let stored = w.trashed_files().await;
+    assert_eq!(stored.len(), 1, "got: {stored:?}");
+    assert!(stored[0].ends_with("/y.txt"), "got: {stored:?}");
+}
+
+/// SPEC-0050/BT-003: a move takes only the exact folder (BR-003).
+#[tokio::test]
+async fn spec_0050_bt_003_a_move_takes_only_the_exact_folder() {
+    let w = World::shared().await;
+    w.mv("/video", "/clip").await;
+    assert_eq!(w.text("/clip/y.txt").await.as_deref(), Some("lower"));
+    assert!(!w.exists("/clip/x.txt").await, "the other case did not follow");
+    assert_eq!(w.text("/Video/x.txt").await.as_deref(), Some("upper"));
+    assert!(!w.exists("/video").await);
+}
+
+/// SPEC-0050/BT-008: nested and accented differences (BR-001, BR-003).
+#[tokio::test]
+async fn spec_0050_bt_008_nested_and_accented_differences() {
+    let w = World::with(&[
+        ("/a/Docs/p.txt", "P"),
+        ("/a/docs/q.txt", "Q"),
+        ("/École/e.txt", "E"),
+        ("/école/f.txt", "F"),
+    ])
+    .await;
+    w.delete("/a/docs", false).await;
+    w.mv("/école", "/ecole").await;
+    assert_eq!(w.text("/a/Docs/p.txt").await.as_deref(), Some("P"));
+    assert!(!w.exists("/a/docs").await);
+    assert_eq!(w.text("/École/e.txt").await.as_deref(), Some("E"));
+    assert_eq!(w.text("/ecole/f.txt").await.as_deref(), Some("F"));
+    assert!(!w.exists("/ecole/e.txt").await);
+    assert!(!w.exists("/école").await);
 }
