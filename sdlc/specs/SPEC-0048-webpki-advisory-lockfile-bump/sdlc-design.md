@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 module (the lockfile), 2 occurrences, no contract change, no persisted data
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-22
 > Behavior change: none
 > From backlog: BL-0071

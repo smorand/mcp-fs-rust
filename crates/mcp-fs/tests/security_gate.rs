@@ -296,3 +296,28 @@ fn lock_has_fixed_aws_sdk_s3_and_no_lru_0_12_5() {
     assert!(has("aws-sdk-s3", "1.152.0"), "aws-sdk-s3 is not 1.152.0");
     assert!(!has("lru", "0.12.5"), "lru 0.12.5 is still locked");
 }
+
+/// `major.minor.patch` of a locked version, numerically comparable.
+fn semver_triple(v: &str) -> (u64, u64, u64) {
+    let mut parts = v.split('.').map(|p| p.parse::<u64>().expect("numeric version part"));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+}
+
+/// SPEC-0048/DT-001: the fixes for RUSTSEC-2026-0382 and RUSTSEC-2026-0381 are
+/// read from the lockfile text, so the pin holds even when the advisory
+/// database stops listing them.
+#[test]
+fn lockfile_pins_the_fixed_webpki_releases() {
+    for (name, min, line) in
+        [("rustls-webpki", (0, 103, 16), (0, 103)), ("webpki-roots", (1, 0, 10), (1, 0))]
+    {
+        let found = lock_packages(name);
+        assert_eq!(found.len(), 1, "{name}: exactly one locked version, found {found:?}");
+        let v = semver_triple(&found[0]);
+        assert!(
+            (v.0, v.1) == line && v >= min,
+            "{name} {} is below the fixed release {min:?}",
+            found[0]
+        );
+    }
+}
