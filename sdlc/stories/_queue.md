@@ -76,4 +76,4 @@
 | US-0074 | SPEC-0050 | exact case for the permanent delete | main | 2 | landed | story/US-0074-exact-case-for-the-permanent-delete | main |
 | US-0075 | SPEC-0050 | exact case for move, rename and the trash | US-0074 | 2 | landed | story/US-0075-exact-case-for-move-rename-and-the-trash | story/US-0074-exact-case-for-the-permanent-delete |
 | US-0076 | SPEC-0050 | exact case for copy and recursive reads | US-0074 | 2 | landed | story/US-0076-exact-case-for-copy-and-recursive-reads | story/US-0075-exact-case-for-move-rename-and-the-trash |
-| US-0077 | SPEC-0050 | exact case for the trash listing and the purge, spec close | US-0075, US-0076 | 2 | todo | | |
+| US-0077 | SPEC-0050 | exact case for the trash listing and the purge, spec close | US-0075, US-0076 | 2 | landed | story/US-0077-exact-case-for-the-trash-listing-and-the-purge | story/US-0076-exact-case-for-copy-and-recursive-reads |

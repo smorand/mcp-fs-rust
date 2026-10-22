@@ -186,9 +186,10 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `volume_id` scopes every row of `nodes`, `blob_refs` and `git_*`, because one PostgreSQL
   or SQL Server database holds every volume. It belongs in EVERY `WHERE` clause: omitting
   it leaks or corrupts another volume's rows.
-- A `LIKE` pattern is built with `descendant_pattern` / `Dialect::escape_like_literal`,
-  never by hand. An unescaped prefix made `a_b` match `axb`, so a subtree delete removed
-  unrelated rows.
+- A path and everything below it is selected with `SubtreeMatch` (`storage/meta.rs`): an escaped
+  `LIKE` (`Dialect::escape_like_literal`, never by hand) plus an exact substring equality, so letter case
+  is compared exactly on every engine (SQLite's `LIKE` folds ASCII case, SPEC-0050). An unescaped prefix
+  made `a_b` match `axb`, so a subtree delete removed unrelated rows.
 - Files are content-addressed: write puts the blob then the node, copy is metadata only,
   delete GCs the blob at refcount 0, an empty file stores no blob. The local layout
   `{root}/{sha[..2]}/{sha}` is part of the on-disk contract.

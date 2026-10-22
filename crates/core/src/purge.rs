@@ -693,6 +693,26 @@ mod tests {
         f.meta.set_atime_for_test(path, now - age_seconds).await.unwrap();
     }
 
+    /// SPEC-0050/BT-007: a folder named like the trash folder in another letter
+    /// case is not the trash folder, so its stale file is purged like any other,
+    /// while a stale file inside the real trash folder is left alone (BR-007).
+    #[tokio::test]
+    async fn spec_0050_bt_007_a_folder_named_like_the_trash_folder_in_another_case_is_purged() {
+        let f = fixture().await;
+        seed_stale_file(&f, "/.MCP_TRASH/old.txt", 10.0 * DAY).await;
+        seed_stale_file(&f, "/.mcp_trash/kept.txt", 10.0 * DAY).await;
+        f.admin.seed_purge_config_for_test("proj", true, true, Some(1), None).await.unwrap();
+
+        let purged =
+            sweep_project_files(&f.client, &f.admin, &f.safety, "proj", None).await.unwrap();
+        assert_eq!(purged, 1, "only the file outside the real trash folder is purged");
+        assert!(!f.client.exists("/.MCP_TRASH/old.txt").await.unwrap(), "moved to the trash");
+        assert!(f.client.exists("/.mcp_trash/kept.txt").await.unwrap(), "left where it was");
+        let entries = f.meta.list_trash_entries_page("/.MCP_TRASH", 10, 0).await.unwrap().0;
+        assert_eq!(entries.len(), 1, "the trash entry records the original path");
+        assert_eq!(entries[0].original_path, "/.MCP_TRASH/old.txt");
+    }
+
     #[tokio::test]
     async fn e2e_new_024_happy_path_file_purged() {
         let f = fixture().await;

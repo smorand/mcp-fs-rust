@@ -33,11 +33,19 @@ struct SubtreeMatch {
     prefix_len: usize,
 }
 
+/// A `LIKE` pattern matching every strict descendant of `path`. The prefix is
+/// escaped, so a path holding `%` or `_` matches only itself: without that a file
+/// called `a_b` pulls in its sibling `axb`, which turned a subtree delete into a
+/// delete of unrelated rows.
+fn descendant_like(dialect: Dialect, path: &str) -> String {
+    format!("{}/%", dialect.escape_like_literal(path.trim_end_matches('/')))
+}
+
 impl SubtreeMatch {
     fn new(dialect: Dialect, path: &str) -> Self {
         let trimmed = path.trim_end_matches('/');
         let prefix = format!("{trimmed}/");
-        let like = format!("{}/%", dialect.escape_like_literal(trimmed));
+        let like = descendant_like(dialect, path);
         Self { like, prefix_len: dialect.char_len(&prefix), prefix }
     }
 
@@ -601,9 +609,13 @@ impl RelationalMetaStore {
     /// The prefix is escaped, so a path holding `%` or `_` matches only itself.
     /// Without this a file called `a_b` pulls in its sibling `axb`, which turned a
     /// subtree delete into a delete of unrelated rows.
+    ///
+    /// Production code goes through [`SubtreeMatch`], which keeps this pattern as
+    /// its `LIKE` half and adds the exact prefix; this form stays for the
+    /// escaping tests.
+    #[cfg(test)]
     fn descendant_pattern(&self, path: &str) -> String {
-        let base = self.db.dialect().escape_like_literal(path.trim_end_matches('/'));
-        format!("{base}/%")
+        descendant_like(self.db.dialect(), path)
     }
 
     /// The upsert that writes a file row, rendered for this engine.
@@ -1607,18 +1619,6 @@ fn read_trash_row(r: &RowValues) -> Result<TrashEntryRow> {
     })
 }
 
-/// A `LIKE` pattern matching `prefix` itself and every strict descendant of it,
-/// for [`list_trash_entries`]'s `path_prefix` filter. A free function rather
-/// than a method on [`RelationalMetaStore`] (the trash CRUD functions take
-/// only the caller's open transaction, not the store), but it goes through
-/// the same [`Dialect::escape_like_literal`] as every other `LIKE` in this
-/// codebase, never a hand built prefix.
-#[allow(dead_code)]
-fn trash_path_prefix_pattern(dialect: Dialect, prefix: &str) -> String {
-    let base = dialect.escape_like_literal(prefix.trim_end_matches('/'));
-    format!("{base}/%")
-}
-
 /// Move `src` (and its subtree) to `dst` inside the caller's transaction. Shared
 /// by `rename` and `rename_into_trash` so the move logic exists once (SPEC-0044
 /// DR-001). `sm` is the case exact selection of `src` and what lies below it (SPEC-0050).
@@ -1770,15 +1770,17 @@ async fn count_trash_entries(
         )
         .await?
     } else {
-        let pattern = trash_path_prefix_pattern(dialect, path_prefix);
+        let sm = SubtreeMatch::new(dialect, path_prefix);
         tx.query_opt(
-            &Query::new(
+            &Query::new(format!(
                 "SELECT COUNT(*) FROM trash_entries WHERE volume_id=?1 \
-                 AND (original_path=?2 OR original_path LIKE ?3 ESCAPE '\\')",
-            )
+                 AND (original_path=?2 OR {})",
+                sm.clause(dialect, "original_path", 3, 4)
+            ))
             .bind(volume_id)
             .bind(path_prefix)
-            .bind(pattern),
+            .bind(&sm.like)
+            .bind(&sm.prefix),
         )
         .await?
     };
@@ -1811,16 +1813,18 @@ pub(crate) async fn list_trash_entries(
         )
         .await?
     } else {
-        let pattern = trash_path_prefix_pattern(dialect, path_prefix);
+        let sm = SubtreeMatch::new(dialect, path_prefix);
         tx.query(
             &Query::new(format!(
                 "SELECT {cols} FROM trash_entries WHERE volume_id=?1 \
-                 AND (original_path=?2 OR original_path LIKE ?3 ESCAPE '\\') \
-                 ORDER BY deleted_at DESC {page}"
+                 AND (original_path=?2 OR {}) \
+                 ORDER BY deleted_at DESC {page}",
+                sm.clause(dialect, "original_path", 3, 4)
             ))
             .bind(volume_id)
             .bind(path_prefix)
-            .bind(pattern),
+            .bind(&sm.like)
+            .bind(&sm.prefix),
         )
         .await?
     };
@@ -2026,19 +2030,23 @@ impl MetaBackend for RelationalMetaStore {
     }
 
     async fn stale_files(&self, before: f64, exclude_root: &str) -> Result<Vec<NodeRow>> {
+        let dialect = self.db.dialect();
+        let sm = SubtreeMatch::new(dialect, exclude_root);
         let rows = self
             .db
             .query(
                 &Query::new(format!(
                     "SELECT {SELECT_COLS} FROM nodes \
                      WHERE volume_id=?1 AND kind='file' AND atime<?2 \
-                     AND path<>?3 AND path NOT LIKE ?4 ESCAPE '\\' \
-                     ORDER BY path"
+                     AND path<>?3 AND NOT {} \
+                     ORDER BY path",
+                    sm.clause(dialect, "path", 4, 5)
                 ))
                 .bind(&self.volume_id)
                 .bind(before)
                 .bind(exclude_root)
-                .bind(self.descendant_pattern(exclude_root)),
+                .bind(&sm.like)
+                .bind(&sm.prefix),
             )
             .await?;
         rows.iter().map(Self::read_row).collect()

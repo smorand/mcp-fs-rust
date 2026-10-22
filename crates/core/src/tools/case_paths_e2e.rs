@@ -299,3 +299,16 @@ async fn spec_0050_bt_005_recursive_reads_stay_inside_the_folder() {
         .collect();
     assert_eq!(names, ["video/y.txt"]);
 }
+
+// ── US-0077: trash listing and purge ───────────────────────────────────────
+
+/// SPEC-0050/BT-006: the trash listing prefix is exact (BR-006).
+#[tokio::test]
+async fn spec_0050_bt_006_the_trash_listing_prefix_is_exact() {
+    let w = World::shared().await;
+    w.delete("/Video/x.txt", true).await;
+    w.delete("/video/y.txt", true).await;
+    assert_eq!(w.trash_list("/Video").await, [("/Video/x.txt".to_string(), "file".to_string())]);
+    assert_eq!(w.trash_list("/video").await, [("/video/y.txt".to_string(), "file".to_string())]);
+    assert_eq!(w.trash_list("").await.len(), 2);
+}

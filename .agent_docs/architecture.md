@@ -111,6 +111,13 @@ nothing. Export zips, git objects and artifact blobs are not nodes, so not usage
   text collation differs per engine. A trashed file's original path is its flat trash entry
   `/<trash_dir>/<stamp>__<flat>` row plus the rest of the path. No index: top N scan,
   O(n log k). The default trash directory is `.mcp_trash`.
+* **Case exact subtree selection (2026-10-23, SPEC-0050).** A path and everything below it is
+  selected by `SubtreeMatch` (`storage/meta.rs`), never by a bare `LIKE`: the escaped `LIKE` narrows
+  the rows, a substring equality rendered by `Dialect` (`substr_fn`, `char_len`, `exact_equals`)
+  decides, letter case included. SQLite's `LIKE` folds ASCII case, so `/video/%` alone also selected
+  `/Video/x` and a permanent delete, a move, a copy, a glob or a trash listing of one reached the
+  other (BL-0072). SQL Server forces a binary collation on the equality and counts UTF-16 units; that
+  rendering is unrun on a live server (BL-0073). The git abbreviated hash `LIKE` is untouched.
 * **Folder usage read (2026-10-22, SPEC-0049).** `admin.get_project_folder_usage` and `GET
   /api/admin/projects/{project_id}/folder-usage` call `tools::admin::get_project_folder_usage`: cap,
   `reader_project` gate, `parse_folder` (one trailing `/` dropped, `.`/`..`/empty segments refused as typed,

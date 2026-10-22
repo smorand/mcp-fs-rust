@@ -216,6 +216,22 @@ async fn meta_like_escaping(engine: &Engine, tag: &str) -> Result<()> {
         m.get("/axb/out.txt").await?.is_some(),
         "{who}: a sibling must not be dragged along by a rename"
     );
+
+    // SPEC-0050: two folders that differ only by letter case are two folders. The
+    // engines disagree on `LIKE` case folding, so each has to give the same answer.
+    m.put_file("/Video/x.txt", Some("up1"), 1, MODE_FILE).await?;
+    m.put_file("/video/y.txt", Some("low1"), 1, MODE_FILE).await?;
+    let lower: Vec<String> = m.subtree("/video").await?.into_iter().map(|n| n.path).collect();
+    assert!(
+        lower.contains(&"/video/y.txt".to_string()) && !lower.contains(&"/Video/x.txt".to_string()),
+        "{who}: a subtree read is case exact: {lower:?}"
+    );
+    m.rename("/video", "/clip").await?;
+    assert!(m.get("/Video/x.txt").await?.is_some(), "{who}: a rename is case exact");
+    assert!(m.get("/clip/y.txt").await?.is_some(), "{who}: the exact folder moved");
+    let gc = m.remove_subtree("/clip").await?;
+    assert_eq!(gc, vec!["low1"], "{who}: only the exact folder's blob is released");
+    assert!(m.get("/Video/x.txt").await?.is_some(), "{who}: a removal is case exact");
     Ok(())
 }
 
