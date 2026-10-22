@@ -67,3 +67,4 @@
 | US-0065 | SPEC-0047 | show trashed files and the shared population | US-0064 | 2 | landed | story/US-0065-show-trashed-files-and-shared-population | story/US-0064-list-a-projects-largest-files |
 | US-0066 | SPEC-0047 | the same breakdown on the web interface | US-0064 | 2 | landed | story/US-0066-the-same-breakdown-on-the-web-interface | story/US-0065-show-trashed-files-and-shared-population |
 | US-0067 | SPEC-0047 | one moment, read only, hardening, docs, spec close | US-0065, US-0066 | 1 | landed | story/US-0067-one-moment-read-only-hardening-and-spec-close | story/US-0066-the-same-breakdown-on-the-web-interface |
+| US-0068 | SPEC-0048 | bump rustls-webpki and webpki-roots for two RustSec advisories | main | 2 | todo | | |

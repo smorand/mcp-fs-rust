@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 module (the lockfile), 2 occurrences, no contract change, no persisted data
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-22
 > Behavior change: none
 > From backlog: BL-0071
@@ -147,3 +147,29 @@ None. Empty.
 | 1 (inline checklist; the auditor subagent is unavailable while the provider weekly limit lasts) | 0 | 0 | IMPLEMENTABLE |
 
 **Amendments applied:** none.
+
+## Design additions (2026-10-22)
+
+Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skill loaded: `rust` (`make check` is the gate, tests are real, no unit test stands in for the audit).
+
+### File structure impact
+
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `Cargo.lock` | modify (2 packages) | DR-001, DR-002, DR-003 | US-0068 |
+| `crates/mcp-fs/tests/security_gate.rs` | modify (add DT-001; no existing test changes) | DR-001, DR-002 | US-0068 |
+
+Affected existing tests: keep all 13 of `security_gate.rs`; three of them turn green. Affected documentation: none (`rg -n 'rustls-webpki|webpki-roots' README.md AGENTS.md .agent_docs` finds no mention to update).
+
+### Test strategy
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 | integration | lockfile text parsed by `lock_packages` | `crates/mcp-fs/tests/security_gate.rs` | US-0068 |
+| DT-002 | structural check | shell diff of lockfile package pairs against `main` | story procedure | US-0068 |
+| DT-003 | structural check | `git diff --stat main` | story procedure | US-0068 |
+| DT-020 | integration | `cargo audit --json` and `make security` through the existing tests, unmodified | `crates/mcp-fs/tests/security_gate.rs` | US-0068 |
+
+Test data: none to generate; the lockfile is the fixture.
+
+- **DEC-004:** One story carries the whole debt: DT-001 first (red), then the lockfile update. **Obliged by:** DR-001, DR-002, DR-003. **Rationale:** the implementation order of section 9 has two steps that cannot be separated into landable halves, since a red test alone breaks `make check` on `main` and the lockfile alone leaves the pin unasserted. **Alternatives considered:** two stories (test, then bump), rejected because the first would land a red test. **Source:** design. **Evidence:** section 9 above.
