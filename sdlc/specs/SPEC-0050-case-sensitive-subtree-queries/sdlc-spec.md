@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: M
 > Depth evidence: 4 user operations defective (delete, move, copy, recursive reads) plus 2 secondary (trash listing prefix, automatic purge), one storage module with callers in 3 modules, 8 requirements, no public contract change, no data model change.
-> Status: specified
+> Status: designed
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High
