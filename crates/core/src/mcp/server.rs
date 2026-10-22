@@ -1393,6 +1393,15 @@ pub struct GetProjectQuotaArgs {
     pub project_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetProjectDiskUsageArgs {
+    /// Id of the project whose files are listed by size.
+    pub project_id: String,
+    /// Optional. Number of files listed, a whole number from 1 to 500. Default 100.
+    #[serde(default)]
+    pub limit: Option<f64>,
+}
+
 // ── search.* parameter structs ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2928,6 +2937,22 @@ impl McpServer {
         to_call_result("admin.get_project_quota", out)
     }
 
+    #[tool(
+        name = "admin.get_project_disk_usage",
+        description = "List a project's files from the largest to the smallest (platform admin \
+             or project owner), with the limit in MB (null when unlimited), the bytes used, the \
+             number of files and whether the list was cut. Trashed files are listed too."
+    )]
+    pub(crate) async fn admin_get_project_disk_usage(
+        &self,
+        Parameters(a): Parameters<GetProjectDiskUsageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            crate::tools::admin::get_project_disk_usage(&self.git_ctx(), &a.project_id, a.limit)
+                .await;
+        to_call_result("admin.get_project_disk_usage", out)
+    }
+
     // ── search.* family ────────────────────────────────────────────
 
     #[tool(
@@ -3896,11 +3921,12 @@ mod tests {
         // fs.list_images and fs.get_image: fs 43, total 110; fs.get_document_view: fs 44, total 111.
         // SPEC-0020 adds admin.get_project_quota: admin 15, total 112.
         // SPEC-0045 adds fs.diff_files: fs 45, total 113.
+        // SPEC-0047 adds admin.get_project_disk_usage: admin 16, total 114.
         assert_eq!(fs_count, 45, "got: {names:?}");
-        assert_eq!(admin_count, 15, "got: {names:?}");
+        assert_eq!(admin_count, 16, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
         assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 113, "got: {names:?}");
+        assert_eq!(names.len(), 114, "got: {names:?}");
     }
 
     #[test]
@@ -4232,7 +4258,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 109, "the frozen contract covers 109 non-search tools");
+        assert_eq!(checked, 110, "the frozen contract covers 110 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4253,8 +4279,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 109, "got: {names:?}");
-        assert_eq!(expected.len(), 109, "the golden contract itself must hold 109 names");
+        assert_eq!(names.len(), 110, "got: {names:?}");
+        assert_eq!(expected.len(), 110, "the golden contract itself must hold 110 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

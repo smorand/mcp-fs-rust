@@ -21,6 +21,7 @@
 //! | set_purge_config         | owner or platform admin                         |
 //! | set_project_quota        | platform admin only (SPEC-0010)                 |
 //! | get_project_quota        | platform admin, or the owner (SPEC-0020 DEC-007)|
+//! | get_project_disk_usage   | platform admin, or the owner (SPEC-0047 DEC-007)|
 //!
 //! `create_project` provisions the volume and rolls the ACL row back if that
 //! fails, so a project row never points at a volume that was never created.
@@ -32,6 +33,7 @@ use crate::git::GitRepoStore;
 use crate::storage::admin::validate_project_id;
 #[cfg(test)]
 use crate::storage::traits::IndexMode;
+use crate::storage::traits::Project;
 use crate::tools::registry_support::ToolCtx;
 #[cfg(test)]
 use crate::tools::registry_support::handler;
@@ -344,6 +346,27 @@ pub(crate) fn register_with(reg: &mut ToolRegistry, git: Option<Arc<GitRepoStore
             get_project_quota(&ctx, &project_id).await
         }),
     );
+
+    reg.add(
+        ToolSchema::new(
+            "admin.get_project_disk_usage",
+            "List a project's files from the largest to the smallest (platform admin or \
+             project owner), with the limit in MB (null when unlimited), the bytes used, the \
+             number of files and whether the list was cut. Trashed files are listed too.",
+        )
+        .req_str("project_id", "Id of the project whose files are listed by size.")
+        .opt_nullable_num(
+            "limit",
+            "Optional. Number of files listed, a whole number from 1 to 500. Default 100.",
+        )
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
+        handler(|ctx: ToolCtx, a| async move {
+            let project_id = a.str("project_id")?;
+            get_project_disk_usage(&ctx, &project_id, a.opt_num("limit")).await
+        }),
+    );
 }
 
 // ── implementations ─────────────────────────────────────────────────────────
@@ -641,28 +664,30 @@ async fn set_project_quota(ctx: &ToolCtx, project_id: &str, max_mb: Option<u32>)
     }))
 }
 
+/// SPEC-0020 DEC-007, shared with SPEC-0047 DEC-007: the project a caller may
+/// read the quota or the disk usage of. An admin learns the project is missing;
+/// anyone else gets the same owner refusal whether it is missing or not theirs,
+/// so a project id cannot be probed. Unlike `require_owner_or_admin`, which
+/// reports a missing project before checking the caller.
+async fn reader_project(ctx: &ToolCtx, project_id: &str) -> Result<Project> {
+    let project = ctx.state.admin.get_project(project_id).await?;
+    if ctx.state.is_admin(&ctx.person) {
+        return project.ok_or_else(|| ToolError::project_not_found(project_id));
+    }
+    match project {
+        Some(p) if p.owner == normalize_identity(&ctx.person) => Ok(p),
+        _ => Err(ToolError::forbidden(format!(
+            "'{}' is not the owner of '{project_id}'",
+            ctx.person
+        ))),
+    }
+}
+
 /// SPEC-0020 FR-NEW-009/010: a project's limit and the bytes it uses now.
 /// Production code: `admin.get_project_quota` and `GET
 /// /api/admin/projects/{project_id}/quota` both call it.
 pub(crate) async fn get_project_quota(ctx: &ToolCtx, project_id: &str) -> Result<Value> {
-    let project = ctx.state.admin.get_project(project_id).await?;
-    // DEC-007: an admin learns the project is missing; anyone else gets the
-    // same owner refusal whether it is missing or not theirs, so a project id
-    // cannot be probed. Unlike `require_owner_or_admin`, which reports a
-    // missing project before checking the caller.
-    let project = if ctx.state.is_admin(&ctx.person) {
-        project.ok_or_else(|| ToolError::project_not_found(project_id))?
-    } else {
-        match project {
-            Some(p) if p.owner == normalize_identity(&ctx.person) => p,
-            _ => {
-                return Err(ToolError::forbidden(format!(
-                    "'{}' is not the owner of '{project_id}'",
-                    ctx.person
-                )));
-            }
-        }
-    };
+    let project = reader_project(ctx, project_id).await?;
     let client = ctx.state.stores.client(&project.id).await?;
     let used_bytes = crate::quota::used_bytes(&client).await?;
     Ok(json!({
@@ -670,6 +695,54 @@ pub(crate) async fn get_project_quota(ctx: &ToolCtx, project_id: &str) -> Result
         // Set in whole megabytes by `admin.set_project_quota`, so exact.
         "max_mb": project.quota_bytes.map(|b| b / 1_048_576),
         "used_bytes": used_bytes,
+    }))
+}
+
+/// Files listed when the caller gives no cap (SPEC-0047 FR-NEW-004).
+const DISK_USAGE_DEFAULT_CAP: usize = 100;
+/// The largest cap a caller may ask for.
+const DISK_USAGE_MAX_CAP: usize = 500;
+
+/// SPEC-0047 DEC-006: the cap is a number so a fractional value reaches this
+/// check and gets the one message, not a deserialization error.
+fn parse_disk_usage_cap(limit: Option<f64>) -> Result<usize> {
+    let Some(v) = limit else { return Ok(DISK_USAGE_DEFAULT_CAP) };
+    if v.fract() == 0.0 && (1.0..=DISK_USAGE_MAX_CAP as f64).contains(&v) {
+        return Ok(v as usize);
+    }
+    Err(ToolError::invalid_argument(format!("limit must be between 1 and {DISK_USAGE_MAX_CAP}")))
+}
+
+/// SPEC-0047 FR-NEW-001: a project's files from the largest to the smallest.
+/// Production code: `admin.get_project_disk_usage` and `GET
+/// /api/admin/projects/{project_id}/disk-usage` both call it. The cap is
+/// checked first, then the gate (DEC-006, DEC-007).
+pub(crate) async fn get_project_disk_usage(
+    ctx: &ToolCtx,
+    project_id: &str,
+    limit: Option<f64>,
+) -> Result<Value> {
+    let cap = parse_disk_usage_cap(limit)?;
+    let project = reader_project(ctx, project_id).await?;
+    let client = ctx.state.stores.client(&project.id).await?;
+    let usage =
+        crate::quota::disk_usage(&client, cap, &ctx.state.safety.config().trash_dir).await?;
+    let truncated = usage.file_count > usage.entries.len() as i64;
+    let entries: Vec<Value> = usage
+        .entries
+        .into_iter()
+        .map(|e| {
+            let state = if e.original_path.is_some() { "In trash" } else { "Active" };
+            json!({"path": e.path, "size": e.size, "state": state, "original_path": e.original_path})
+        })
+        .collect();
+    Ok(json!({
+        "project_id": project.id,
+        "max_mb": project.quota_bytes.map(|b| b / 1_048_576),
+        "used_bytes": usage.used_bytes,
+        "file_count": usage.file_count,
+        "truncated": truncated,
+        "entries": entries,
     }))
 }
 
@@ -802,7 +875,7 @@ mod tests {
         r
     }
 
-    const ALL_ADMIN_TOOLS: [&str; 15] = [
+    const ALL_ADMIN_TOOLS: [&str; 16] = [
         "admin.create_project",
         "admin.delete_project",
         "admin.list_projects",
@@ -818,12 +891,13 @@ mod tests {
         "admin.set_purge_config",
         "admin.set_project_quota",
         "admin.get_project_quota",
+        "admin.get_project_disk_usage",
     ];
 
     #[test]
     fn every_admin_tool_is_registered() {
         let r = registry();
-        assert_eq!(r.len(), 15);
+        assert_eq!(r.len(), 16);
         for name in ALL_ADMIN_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }

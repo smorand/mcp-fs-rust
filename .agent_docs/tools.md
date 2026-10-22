@@ -1,4 +1,4 @@
-# Tool reference (109 tools)
+# Tool reference (110 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as

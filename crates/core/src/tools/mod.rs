@@ -38,6 +38,8 @@ pub mod db;
 pub(crate) mod diff_files;
 #[cfg(test)]
 mod diff_files_e2e;
+#[cfg(test)]
+mod disk_usage_e2e;
 pub mod doc;
 #[cfg(test)]
 pub(crate) mod document;

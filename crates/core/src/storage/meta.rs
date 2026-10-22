@@ -20,6 +20,15 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// One file of the disk usage breakdown (SPEC-0047). `original_path` is set
+/// only for a file in the trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileUsageRow {
+    pub path: String,
+    pub size: i64,
+    pub original_path: Option<String>,
+}
+
 /// A project id is at most 32 characters (see `admin::validate_project_id`), so
 /// this leaves room to spare while staying inside a SQL Server index key.
 const VOLUME_ID_LEN: u32 = 64;
@@ -571,6 +580,76 @@ impl RelationalMetaStore {
         let total = count_trash_entries(&mut *tx, &self.volume_id, path_prefix).await?;
         tx.commit().await?;
         Ok((rows, total))
+    }
+
+    /// The largest files of the volume, largest first, ties by path in
+    /// character code order, plus the count of every file (SPEC-0047
+    /// FR-NEW-002, 004, 005).
+    ///
+    /// SQL finds the size of the `cap`th largest file, then every file at least
+    /// that big is fetched and ordered here: the text order of `path` differs
+    /// per engine (PostgreSQL follows the database collation, SQL Server
+    /// compares UTF-16 units), but UTF-8 byte order is code point order on all
+    /// of them (DEC-003). Time O(n log k) for n files and cap k, space O(k +
+    /// ties at the cutoff). `_trash_dir` is read by the trash states of
+    /// SPEC-0047 US-0065.
+    pub(crate) async fn largest_files(
+        &self,
+        cap: usize,
+        _trash_dir: &str,
+    ) -> Result<(Vec<FileUsageRow>, i64)> {
+        let mut tx = self.db.begin().await?;
+        let volume = &self.volume_id;
+        let count = tx
+            .query_opt(
+                &Query::new("SELECT COUNT(*) FROM nodes WHERE volume_id=?1 AND kind='file'")
+                    .bind(volume),
+            )
+            .await?
+            .map_or(Ok(0), |r| r.i64(0))?;
+        let cutoff = if count > cap as i64 {
+            let page = tx.dialect().render_limit_offset(1, cap as i64 - 1);
+            tx.query_opt(
+                &Query::new(format!(
+                    "SELECT size FROM nodes WHERE volume_id=?1 AND kind='file' \
+                     ORDER BY size DESC {page}"
+                ))
+                .bind(volume),
+            )
+            .await?
+            .map(|r| r.i64(0))
+            .transpose()?
+        } else {
+            None
+        };
+        let rows = match cutoff {
+            Some(size) => {
+                tx.query(
+                    &Query::new(
+                        "SELECT path, size FROM nodes \
+                         WHERE volume_id=?1 AND kind='file' AND size>=?2",
+                    )
+                    .bind(volume)
+                    .bind(size),
+                )
+                .await?
+            }
+            None => {
+                tx.query(
+                    &Query::new("SELECT path, size FROM nodes WHERE volume_id=?1 AND kind='file'")
+                        .bind(volume),
+                )
+                .await?
+            }
+        };
+        tx.commit().await?;
+        let mut files = rows
+            .iter()
+            .map(|r| Ok(FileUsageRow { path: r.text(0)?, size: r.i64(1)?, original_path: None }))
+            .collect::<Result<Vec<_>>>()?;
+        files.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+        files.truncate(cap);
+        Ok((files, count))
     }
 
     /// Insert a `trash_entries` row for `trash_path` unless one already exists

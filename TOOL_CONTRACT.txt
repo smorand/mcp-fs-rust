@@ -18,6 +18,11 @@ admin.get_index_mode
   params: project_id:string
   required: ['project_id']
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
+admin.get_project_disk_usage
+  desc: List a project's files from the largest to the smallest (platform admin or project owner), with the limit in MB (null when unlimited), the bytes used, the number of files and whether the list was cut. Trashed files are listed too.
+  params: project_id:string, limit:number|null=null
+  required: ['project_id']
+  annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 admin.get_project_quota
   desc: Show a project's storage quota and current usage (platform admin or project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the sum of every file's size, trashed files included.
   params: project_id:string
@@ -672,3 +677,4 @@ admin.list_members: {"project_id": "parity-probe", "members": [{"person": "admin
 admin.set_index_mode: {"project_id": "parity-probe", "index_mode": "bm25", "previous_mode": "none", "reindex_started": true}
 admin.get_index_mode: {"project_id": "parity-probe", "index_mode": "bm25"}
 admin.get_project_quota: {"project_id": "parity-probe", "max_mb": null, "used_bytes": 1234}
+admin.get_project_disk_usage: {"project_id": "parity-probe", "max_mb": null, "used_bytes": 1234, "file_count": 1, "truncated": false, "entries": [{"path": "/a.txt", "size": 1234, "state": "Active", "original_path": null}]}

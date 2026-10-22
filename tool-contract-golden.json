@@ -120,6 +120,35 @@
       }
     },
     {
+      "name": "admin.get_project_disk_usage",
+      "description": "List a project's files from the largest to the smallest (platform admin or project owner), with the limit in MB (null when unlimited), the bytes used, the number of files and whether the list was cut. Trashed files are listed too.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Id of the project whose files are listed by size.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Optional. Number of files listed, a whole number from 1 to 500. Default 100.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "project_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "admin.get_project_quota",
       "description": "Show a project's storage quota and current usage (platform admin or project owner): max_mb is the limit in megabytes, null when unlimited; used_bytes is the sum of every file's size, trashed files included.",
       "inputSchema": {

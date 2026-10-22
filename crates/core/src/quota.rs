@@ -10,6 +10,7 @@
 use crate::errors::{Result, ToolError};
 use crate::safety::SafetyManager;
 use crate::storage::VolumeClient;
+use crate::storage::meta::FileUsageRow;
 
 /// Proof that an operation was admitted. It holds the volume's admission lock,
 /// so it must live until the operation's last write landed (DEC-002): another
@@ -164,4 +165,27 @@ pub(crate) async fn admit_paths(
 pub(crate) async fn used_bytes(client: &VolumeClient) -> Result<i64> {
     let _admission = client.admission.lock().await;
     client.meta.used_bytes().await
+}
+
+/// A project's usage with its largest files (SPEC-0047).
+pub(crate) struct DiskUsage {
+    pub used_bytes: i64,
+    pub file_count: i64,
+    pub entries: Vec<FileUsageRow>,
+}
+
+/// The bytes `client`'s project uses and its `cap` largest files, largest
+/// first (FR-NEW-001, FR-NEW-002).
+pub(crate) async fn disk_usage(
+    client: &VolumeClient,
+    cap: usize,
+    trash_dir: &str,
+) -> Result<DiskUsage> {
+    let store = client
+        .trash
+        .as_ref()
+        .ok_or_else(|| ToolError::internal("volume has no relational store attached"))?;
+    let used_bytes = client.meta.used_bytes().await?;
+    let (entries, file_count) = store.largest_files(cap, trash_dir).await?;
+    Ok(DiskUsage { used_bytes, file_count, entries })
 }

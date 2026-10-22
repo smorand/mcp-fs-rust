@@ -63,7 +63,7 @@
 | US-0061 | SPEC-0046 | choose the context size of a comparison | main | 2 | landed | story/US-0061-choose-context-lines-on-the-tool | main |
 | US-0062 | SPEC-0046 | the same context size on the web interface | US-0061 | 2 | landed | story/US-0062-context-lines-on-the-web-interface | story/US-0061-choose-context-lines-on-the-tool |
 | US-0063 | SPEC-0046 | other diffs unchanged, scale, docs, spec close | US-0061, US-0062 | 2 | landed | story/US-0063-other-diffs-unchanged-scale-docs-and-spec-close | story/US-0062-context-lines-on-the-web-interface |
-| US-0064 | SPEC-0047 | list a project's largest files | main | 1 | todo | | |
+| US-0064 | SPEC-0047 | list a project's largest files | main | 1 | landed | story/US-0064-list-a-projects-largest-files | main |
 | US-0065 | SPEC-0047 | show trashed files and the shared population | US-0064 | 2 | todo | | |
 | US-0066 | SPEC-0047 | the same breakdown on the web interface | US-0064 | 2 | todo | | |
 | US-0067 | SPEC-0047 | one moment, read only, hardening, docs, spec close | US-0065, US-0066 | 1 | todo | | |
