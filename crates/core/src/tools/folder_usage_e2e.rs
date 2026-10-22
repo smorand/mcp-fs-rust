@@ -6,9 +6,13 @@
 //! (1 225 500 bytes in all); Olivia owns it, Mia is a member, Ada is a platform
 //! admin, Otto belongs to nothing, Bram owns `Borealis`.
 
-use crate::mcp::server::{GetProjectFolderUsageArgs, McpServer};
+use crate::mcp::server::{
+    DeleteArgs, GetProjectDiskUsageArgs, GetProjectFolderUsageArgs, GetProjectQuotaArgs, McpServer,
+    TrashRestoreArgs, WriteBytesArgs,
+};
 use crate::state::AppState;
 use crate::tools::admin::test_support::Fixture;
+use base64::Engine as _;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value, json};
@@ -440,4 +444,259 @@ async fn spec_0049_us_0071_an_empty_folder_value_is_refused_and_the_cap_goes_thr
     let (status, body) = rest_folder(&w.f, OLIVIA, ATLAS, "?limit=abc").await;
     assert_eq!(status, 400, "{body}");
     assert!(body["detail"].as_str().unwrap().ends_with(CAP_REFUSAL), "{body}");
+}
+
+// ── US-0072: trash, population, read only and one moment ───────────────────
+
+impl World {
+    async fn delete(&self, person: &str, path: &str, trash: bool) -> Value {
+        let args =
+            DeleteArgs { mount_id: ATLAS.into(), path: path.into(), recursive: false, trash };
+        ok_json(self.as_(person).fs_delete(Parameters(args)).await)
+    }
+
+    /// The path under which `name` sits in the trash.
+    async fn trashed(&self, name: &str) -> String {
+        let client = self.f.state.stores.client(ATLAS).await.unwrap();
+        let hits: Vec<String> = client
+            .meta
+            .subtree("/")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.is_file() && n.path.starts_with("/.mcp_trash/") && n.path.contains(name))
+            .map(|n| n.path)
+            .collect();
+        assert_eq!(hits.len(), 1, "one trashed {name}: {hits:?}");
+        hits[0].clone()
+    }
+
+    async fn write_bytes(
+        &self,
+        person: &str,
+        path: &str,
+        len: usize,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let args = WriteBytesArgs {
+            mount_id: ATLAS.into(),
+            path: path.into(),
+            base64: base64::engine::general_purpose::STANDARD.encode(noise(len, 5)),
+            overwrite: false,
+            create_parents: true,
+            trigger_documentation_service: false,
+        };
+        self.as_(person).fs_write_bytes(Parameters(args)).await
+    }
+
+    async fn file_list(&self, person: &str) -> Value {
+        let args = GetProjectDiskUsageArgs { project_id: ATLAS.into(), limit: None };
+        ok_json(self.as_(person).admin_get_project_disk_usage(Parameters(args)).await)
+    }
+}
+
+/// SPEC-0049/E2E-005: the trash folder shows what the trash weighs (FR-NEW-003, 007).
+#[tokio::test]
+async fn spec_0049_e2e_005_the_trash_folder_shows_what_the_trash_weighs() {
+    let w = World::shared().await;
+    w.delete(MIA, "/docs/notes.txt", true).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["used_bytes"], 1_225_500);
+    assert_eq!(
+        out["items"],
+        json!([
+            folder_item("/video", 800_000, 2),
+            folder_item("/data", 300_000, 2),
+            folder_item("/docs", 120_000, 1),
+            folder_item("/.mcp_trash", 4_000, 1),
+            file_item("/readme.md", 1_500),
+        ])
+    );
+    assert_eq!(sum_of_items(&out), 1_225_500);
+}
+
+/// SPEC-0049/E2E-021: reading changes nothing (FR-NEW-010).
+#[tokio::test]
+async fn spec_0049_e2e_021_reading_changes_nothing() {
+    let w = World::shared().await;
+    w.write_bytes(OLIVIA, "/session.bin", 100_000).await.unwrap();
+    let first = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    for _ in 0..2 {
+        assert_eq!(ok_json(w.read(OLIVIA, ATLAS, None, None).await), first);
+    }
+    ok_json(w.read(OLIVIA, ATLAS, Some("/video"), None).await);
+    assert_eq!(first["used_bytes"], 1_325_500);
+    assert_eq!(
+        first["items"],
+        json!([
+            folder_item("/video", 800_000, 2),
+            folder_item("/data", 300_000, 2),
+            folder_item("/docs", 124_000, 2),
+            file_item("/session.bin", 100_000),
+            file_item("/readme.md", 1_500),
+        ])
+    );
+    let quota = ok_json(
+        w.as_(OLIVIA)
+            .admin_get_project_quota(Parameters(GetProjectQuotaArgs { project_id: ATLAS.into() }))
+            .await,
+    );
+    assert_eq!(quota["used_bytes"], 1_325_500);
+    // The session budget (262 144) still has 162 144 bytes.
+    let refused = err_text(w.write_bytes(OLIVIA, "/over.bin", 162_145).await);
+    assert!(refused.ends_with("session write quota of 262144 bytes exceeded"), "got: {refused}");
+    w.write_bytes(OLIVIA, "/exact.bin", 162_144).await.unwrap();
+}
+
+/// SPEC-0049/E2E-022: the file list of the previous breakdown is unchanged (FR-NEW-010).
+#[tokio::test]
+async fn spec_0049_e2e_022_the_file_list_of_the_previous_breakdown_is_unchanged() {
+    let w = World::shared().await;
+    let before = w.file_list(OLIVIA).await;
+    ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    ok_json(w.read(OLIVIA, ATLAS, Some("/video"), None).await);
+    let after = w.file_list(OLIVIA).await;
+    assert_eq!(before, after);
+    assert_eq!(after["used_bytes"], 1_225_500);
+    assert_eq!(after["file_count"], 7);
+    let paths: Vec<&str> =
+        after["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/video/demo.mp4",
+            "/data/export.csv",
+            "/video/clips/a.mp4",
+            "/docs/spec.docx",
+            "/data/old/x.csv",
+            "/docs/notes.txt",
+            "/readme.md"
+        ]
+    );
+    assert_eq!(after["truncated"], false);
+}
+
+/// SPEC-0049/E2E-023: deleting moves bytes into the trash folder (FR-NEW-007, 003).
+#[tokio::test]
+async fn spec_0049_e2e_023_deleting_moves_bytes_into_the_trash_folder() {
+    let w = World::shared().await;
+    w.delete(MIA, "/data/export.csv", true).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["used_bytes"], 1_225_500);
+    assert_eq!(
+        out["items"],
+        json!([
+            folder_item("/video", 800_000, 2),
+            folder_item("/.mcp_trash", 250_000, 1),
+            folder_item("/docs", 124_000, 2),
+            folder_item("/data", 50_000, 1),
+            file_item("/readme.md", 1_500),
+        ])
+    );
+}
+
+/// SPEC-0049/E2E-024: restoring brings the bytes back; the emptied trash folder stays (FR-NEW-007).
+#[tokio::test]
+async fn spec_0049_e2e_024_restoring_brings_the_bytes_back() {
+    let w = World::shared().await;
+    w.delete(MIA, "/data/export.csv", true).await;
+    let trashed = w.trashed("export.csv").await;
+    let args = TrashRestoreArgs { mount_id: ATLAS.into(), trash_path: trashed };
+    ok_json(w.as_(MIA).fs_trash_restore(Parameters(args)).await);
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["used_bytes"], 1_225_500);
+    assert_eq!(
+        out["items"],
+        json!([
+            folder_item("/video", 800_000, 2),
+            folder_item("/data", 300_000, 2),
+            folder_item("/docs", 124_000, 2),
+            file_item("/readme.md", 1_500),
+            folder_item("/.mcp_trash", 0, 0),
+        ])
+    );
+    assert_eq!(out["item_count"], 5);
+    assert_eq!(out["truncated"], false);
+    assert_eq!(sum_of_items(&out), 1_225_500);
+}
+
+/// SPEC-0049/E2E-025: a purge removes the bytes (FR-NEW-007).
+#[tokio::test]
+async fn spec_0049_e2e_025_a_purge_removes_the_bytes() {
+    let w = World::shared().await;
+    w.delete(MIA, "/docs/notes.txt", true).await;
+    let trashed = w.trashed("notes.txt").await;
+    w.delete(MIA, &trashed, false).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["used_bytes"], 1_221_500);
+    assert_eq!(
+        out["items"],
+        json!([
+            folder_item("/video", 800_000, 2),
+            folder_item("/data", 300_000, 2),
+            folder_item("/docs", 120_000, 1),
+            file_item("/readme.md", 1_500),
+            folder_item("/.mcp_trash", 0, 0),
+        ])
+    );
+    assert_eq!(sum_of_items(&out), 1_221_500);
+}
+
+/// SPEC-0049/E2E-033: a folder name that starts another folder's name (FR-NEW-002, 007).
+#[tokio::test]
+async fn spec_0049_e2e_033_a_folder_name_that_starts_another_folders_name() {
+    let w = World::empty().await;
+    w.seed("/doc/a.bin", 1_000, 1).await;
+    w.seed("/docs/b.bin", 2_000, 2).await;
+    let root = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(
+        root["items"],
+        json!([folder_item("/docs", 2_000, 1), folder_item("/doc", 1_000, 1)])
+    );
+    let doc = ok_json(w.read(OLIVIA, ATLAS, Some("/doc"), None).await);
+    assert_eq!(doc["folder"], json!({"path": "/doc", "size": 1_000, "file_count": 1}));
+    assert_eq!(doc["items"], json!([file_item("/doc/a.bin", 1_000)]));
+}
+
+/// SPEC-0049/E2E-034: files sharing content count once per path (FR-NEW-007).
+#[tokio::test]
+async fn spec_0049_e2e_034_files_sharing_content_count_once_per_path() {
+    let w = World::empty().await;
+    w.seed("/a/copy1.bin", 100_000, 7).await;
+    w.seed("/a/copy2.bin", 100_000, 7).await;
+    let out = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(out["used_bytes"], 200_000);
+    assert_eq!(out["items"], json!([folder_item("/a", 200_000, 2)]));
+}
+
+/// SPEC-0049/E2E-037: a write during the read is seen entirely or not at all
+/// (FR-NEW-010). Deterministic, no sleep: the test plays the writer by holding the
+/// project's admission lock, as every write does for its whole duration.
+#[tokio::test]
+async fn spec_0049_e2e_037_a_write_during_the_read_is_seen_entirely_or_not_at_all() {
+    let w = World::shared().await;
+    let client = w.f.state.stores.client(ATLAS).await.unwrap();
+    let writer = client.admission.clone().lock_owned().await;
+
+    let server = w.as_(OLIVIA);
+    let read = tokio::spawn(async move {
+        let args =
+            GetProjectFolderUsageArgs { project_id: ATLAS.into(), folder: None, limit: None };
+        server.admin_get_project_folder_usage(Parameters(args)).await
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!read.is_finished(), "the read must wait for the write in flight");
+
+    client.write_bytes_atomic("/docs/new.txt", &noise(30_000, 11)).await.unwrap();
+    drop(writer);
+
+    let out = ok_json(read.await.unwrap());
+    assert_eq!(out["used_bytes"], 1_255_500, "{out}");
+    assert_eq!(out["folder"]["size"], 1_255_500);
+    assert_eq!(out["folder"]["file_count"], 8);
+    assert_eq!(sum_of_items(&out), 1_255_500);
+    assert_eq!(out["items"][2], folder_item("/docs", 154_000, 3));
+    let again = ok_json(w.read(OLIVIA, ATLAS, None, None).await);
+    assert_eq!(again["items"][2], folder_item("/docs", 154_000, 3));
 }

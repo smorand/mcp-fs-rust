@@ -213,6 +213,10 @@ pub(crate) async fn folder_usage(
         .trash
         .as_ref()
         .ok_or_else(|| ToolError::internal("volume has no relational store attached"))?;
+    // Every write holds this lock until its last file landed (DEC-002), so a read
+    // under it never sees half of an operation (FR-NEW-010, DEC-006). The counter
+    // is read through `meta`, not `used_bytes`, which would lock a second time.
+    let _admission = client.admission.lock().await;
     let used_bytes = client.meta.used_bytes().await?;
     if folder != "/" {
         match client.meta.get(folder).await? {
