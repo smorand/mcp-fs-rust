@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: L
 > Depth evidence: FEAT / depth L: 5 areas touched (storage, configuration and startup, the data migration command, build, test environment and documentation), a removal of a supported database, 7 requirements.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-23
 > Project: existing
 > From backlog: BL-0073 (becomes void)
