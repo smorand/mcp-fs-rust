@@ -751,6 +751,9 @@ documented at its call site. Headlines only:
 The authoritative list, with the reasoning and the non git divergences, is in
 [`.agent_docs/parity.md`](parity.md). Do not restate it elsewhere.
 
+Divergences from standard git (no index, dirty tree refusal, HTTPS only, no tags) are a different
+set: see [`git-divergences.md`](git-divergences.md).
+
 ## SPEC-0021 (2026-10-12): a refused branch checkout creates no branch
 
 `git.branch_create` with `checkout: true` now admits and applies the checkout

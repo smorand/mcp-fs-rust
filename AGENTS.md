@@ -242,6 +242,8 @@ The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
 - `.agent_docs/backends.md` : the relational layer, adding a backend, dialect checklist,
   and the dialect checklist.
 - `.agent_docs/testing.md` : test layout, PostgreSQL and MinIO opt-in suites.
+- `.agent_docs/git-divergences.md` : register of where git support differs from standard git, with
+  rationale and ranked gaps (BL-0027).
 - `.agent_docs/lineage.md` : the C# lineage, why it is no longer a reference, design decisions.
 - `.agent_docs/agent.md` : the CLI agent, its config, and the terminal invariants it depends on.
 - `.agent_docs/search.md` : search tools, per-project index modes and auto indexing,
