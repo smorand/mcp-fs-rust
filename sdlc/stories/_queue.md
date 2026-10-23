@@ -77,3 +77,8 @@
 | US-0075 | SPEC-0050 | exact case for move, rename and the trash | US-0074 | 2 | landed | story/US-0075-exact-case-for-move-rename-and-the-trash | story/US-0074-exact-case-for-the-permanent-delete |
 | US-0076 | SPEC-0050 | exact case for copy and recursive reads | US-0074 | 2 | landed | story/US-0076-exact-case-for-copy-and-recursive-reads | story/US-0075-exact-case-for-move-rename-and-the-trash |
 | US-0077 | SPEC-0050 | exact case for the trash listing and the purge, spec close | US-0075, US-0076 | 2 | landed | story/US-0077-exact-case-for-the-trash-listing-and-the-purge | story/US-0076-exact-case-for-copy-and-recursive-reads |
+| US-0078 | SPEC-0051 | refuse SQL Server in the configuration, with baselines | main | 2 | todo | | |
+| US-0079 | SPEC-0051 | remove the driver, the build option and the test service | US-0078 | 2 | todo | | |
+| US-0080 | SPEC-0051 | collapse the dialect and the bounded keys | US-0079 | 2 | todo | | |
+| US-0081 | SPEC-0051 | remove the path length limit | US-0080 | 2 | todo | | |
+| US-0082 | SPEC-0051 | documentation and spec close | US-0081 | 2 | todo | | |
