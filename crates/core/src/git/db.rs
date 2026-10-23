@@ -1,6 +1,6 @@
 //! Per project git index (objects, refs, remotes) on any [`RelationalDb`].
 //!
-//! Rows carry a `volume_id` so one PostgreSQL or SQL Server database can hold the
+//! Rows carry a `volume_id` so one PostgreSQL database can hold the
 //! index of every project. Under SQLite there is still one file per project, at
 //! `state/git/{project_id}.db` (see `ServerConfig::git_db_path`), and the column
 //! is constant within it.
@@ -13,15 +13,6 @@ use crate::storage::rel::dialect::{ColumnType, Upsert};
 use crate::storage::rel::schema::{Column, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb};
 use std::sync::Arc;
-
-/// A project id is at most 32 characters.
-const VOLUME_ID_LEN: u32 = 64;
-/// A hex sha256 is 64 characters; doubled so a longer digest still fits a key.
-const HASH_LEN: u32 = 128;
-/// Ref names are short in practice, but a tag can nest deeply.
-const REF_NAME_LEN: u32 = 400;
-/// An operation type or state is a short keyword from a closed set.
-const OP_ENUM_LEN: u32 = 32;
 
 /// One row of the `git_objects` index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,14 +153,14 @@ const OPERATION_COLUMNS: [&str; 13] = [
 
 /// The tables this store owns.
 pub fn schema() -> SchemaSet {
-    let volume = || Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN));
+    let volume = || Column::required("volume_id", ColumnType::Text);
     SchemaSet::new(
         vec![
             Table::new(
                 "git_objects",
                 vec![
                     volume(),
-                    Column::required("hash", ColumnType::TextKey(HASH_LEN)),
+                    Column::required("hash", ColumnType::Text),
                     Column::required("type", ColumnType::Text),
                     Column::required("size", ColumnType::BigInt),
                 ],
@@ -179,7 +170,7 @@ pub fn schema() -> SchemaSet {
                 "git_refs",
                 vec![
                     volume(),
-                    Column::required("name", ColumnType::TextKey(REF_NAME_LEN)),
+                    Column::required("name", ColumnType::Text),
                     Column::required("target", ColumnType::Text),
                     Column::required("symbolic", ColumnType::BigInt).default("0"),
                 ],
@@ -191,14 +182,14 @@ pub fn schema() -> SchemaSet {
                 "git_operations",
                 vec![
                     volume(),
-                    Column::required("op_type", ColumnType::TextKey(OP_ENUM_LEN)),
-                    Column::required("state", ColumnType::TextKey(OP_ENUM_LEN)),
+                    Column::required("op_type", ColumnType::Text),
+                    Column::required("state", ColumnType::Text),
                     // Declared in the table rather than as a column migration:
                     // `git_operations` is introduced on this same unreleased
                     // branch, so no deployed database carries the narrow shape.
-                    Column::new("source_ref", ColumnType::TextKey(REF_NAME_LEN)),
-                    Column::new("onto_sha", ColumnType::TextKey(HASH_LEN)),
-                    Column::new("original_tip_sha", ColumnType::TextKey(HASH_LEN)),
+                    Column::new("source_ref", ColumnType::Text),
+                    Column::new("onto_sha", ColumnType::Text),
+                    Column::new("original_tip_sha", ColumnType::Text),
                     // Payloads are unbounded: a todo list or a conflict set has no
                     // useful length ceiling and neither is ever indexed.
                     Column::new("todo", ColumnType::Text),
@@ -215,7 +206,7 @@ pub fn schema() -> SchemaSet {
                 "git_remotes",
                 vec![
                     volume(),
-                    Column::required("name", ColumnType::TextKey(REF_NAME_LEN)),
+                    Column::required("name", ColumnType::Text),
                     Column::required("url", ColumnType::Text),
                 ],
                 vec!["volume_id", "name"],

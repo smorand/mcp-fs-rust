@@ -256,7 +256,7 @@ mod tests {
             vec![Table::new(
                 "t",
                 vec![
-                    Column::required("k", ColumnType::TextKey(200)),
+                    Column::required("k", ColumnType::Text),
                     Column::required("n", ColumnType::BigInt).default("0"),
                     Column::new("r", ColumnType::Double),
                     Column::new("b", ColumnType::Blob),

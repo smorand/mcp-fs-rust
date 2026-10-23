@@ -237,7 +237,7 @@ async fn meta_rename_deep_tree(engine: &Engine, tag: &str) -> Result<()> {
 /// 25 writers race on one volume, all referencing one blob.
 ///
 /// The refcount is a read modify write, so a lost update shows up here as a count
-/// below 25 and nowhere else. On PostgreSQL and SQL Server these writers can
+/// below 25 and nowhere else. On PostgreSQL these writers can
 /// genuinely deadlock or lose a serialization race, which is what exercises
 /// [`crate::storage::rel::run_retrying`]; on SQLite the single writer lock
 /// serializes them instead. Either way the observable outcome must be identical,
@@ -715,8 +715,8 @@ async fn oauth_round_trip(engine: &Engine, tag: &str) -> Result<()> {
 /// DRIFT-005: a live deployment still on the legacy `(person, provider)` shape
 /// is rebuilt on the new `(person, host)` key identically on every engine, not
 /// just on SQLite. Starts by dropping whatever a previous case in this same run
-/// left behind, so it is safe to re-run against a shared server (PostgreSQL,
-/// SQL Server) rather than assuming a database it has to itself.
+/// left behind, so it is safe to re-run against a shared server (PostgreSQL)
+/// rather than assuming a database it has to itself.
 async fn oauth_legacy_table_is_rebuilt_identically(engine: &Engine, tag: &str) -> Result<()> {
     let who = engine.name();
     let db = engine.db().await?;
@@ -729,8 +729,8 @@ async fn oauth_legacy_table_is_rebuilt_identically(engine: &Engine, tag: &str) -
     .await?;
 
     // Recreate on the OLD shape, as a live pre-upgrade deployment would have it.
-    let person_ty = d.column_type(crate::storage::rel::ColumnType::TextKey(320));
-    let provider_ty = d.column_type(crate::storage::rel::ColumnType::TextKey(64));
+    let person_ty = d.column_type(crate::storage::rel::ColumnType::Text);
+    let provider_ty = d.column_type(crate::storage::rel::ColumnType::Text);
     let text_ty = d.column_type(crate::storage::rel::ColumnType::Text);
     let blob_ty = d.column_type(crate::storage::rel::ColumnType::Blob);
     let ddl = format!(
@@ -1077,10 +1077,6 @@ async fn catalog_names(db: &dyn RelationalDb, names: &[&str]) -> Result<Vec<Stri
             "SELECT table_name FROM information_schema.tables WHERE table_schema = \
              current_schema() AND table_name IN ({list}) UNION ALL SELECT indexname FROM \
              pg_indexes WHERE schemaname = current_schema() AND indexname IN ({list})"
-        ),
-        Dialect::SqlServer => format!(
-            "SELECT name FROM sys.tables WHERE name IN ({list}) UNION ALL \
-             SELECT name FROM sys.indexes WHERE name IN ({list})"
         ),
     };
     let mut out =

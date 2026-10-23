@@ -2189,9 +2189,8 @@ async fn commit(
 }
 
 /// FR-NEW-116: the ceiling is a count of UTF-8 bytes, not of characters,
-/// because it exists to keep `refs/heads/<name>` inside the `TextKey(400)`
-/// storage ceiling of `git_refs.name` on every backend, and SQL Server renders
-/// that as a bounded `NVARCHAR(400)`.
+/// because it exists to keep `refs/heads/<name>` well inside the storage
+/// ceiling of `git_refs.name` on every backend.
 const MAX_BRANCH_NAME_BYTES: usize = 255;
 
 /// FR-NEW-104 and FR-NEW-116: `git check-ref-format`'s rules, applied before
@@ -15062,7 +15061,7 @@ mod tests {
     /// `storage::purge_git_rows`, the exact function `GitRepoStore::purge_repo`
     /// calls on a shared database, clears the row for one `volume_id` only. What
     /// it cannot prove here: the end to end `admin.delete_project` path on
-    /// PostgreSQL or SQL Server, whose suites are opt in
+    /// PostgreSQL, whose suite is opt in
     /// (`MCPFS_TEST_PG_DSN`, `.agent_docs/testing.md`); on SQLite `purge_repo`
     /// deletes the index file outright and never reads `TABLES`, which is
     /// E2E-NEW-808 below.
@@ -16244,6 +16243,27 @@ mod tests {
         assert!(err.message.contains("256"), "{}", err.message);
         assert!(err.message.contains("255"), "{}", err.message);
         assert_eq!(ref_names(&e).await.len(), 2);
+    }
+
+    /// SPEC-0051/E2E-017: the limit survived the removal of the database it was sized
+    /// for. 255 bytes is accepted, 256 is refused with the same message as before.
+    #[tokio::test]
+    async fn spec_0051_the_branch_name_limit_is_unchanged() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+
+        let at = format!("f/{}", "a".repeat(253));
+        assert_eq!(at.len(), 255);
+        branch_create(&e, json!({"name": at, "start_point": c2})).await.unwrap();
+
+        let over = format!("f/{}", "a".repeat(254));
+        let err = branch_create(&e, json!({"name": over, "start_point": c2})).await.unwrap_err();
+        assert_eq!(
+            err.message,
+            format!(
+                "'{over}' is not a valid branch name: it is 256 bytes of UTF-8, over the 255 byte limit"
+            )
+        );
     }
 
     /// E2E-NEW-410: FR-NEW-103, a repository with no commits at all.

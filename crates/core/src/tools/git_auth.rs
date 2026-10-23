@@ -22,8 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// The bound `git.token_set` enforces on a seeded token (DEC-033): a
-/// denial-of-service bound, matching `TextKey`'s length ceiling on the
-/// persisted column (`crates/mcp-fs/src/git/oauth/persistence.rs:33-34`).
+/// denial-of-service bound, kept at the value the persisted column was sized for.
 const MAX_TOKEN_LEN: usize = 8192;
 
 /// A provider that returns `interval: 0` must not turn the poll loop into a spin.
@@ -2000,6 +1999,33 @@ mod tests {
                 .unwrap();
             let stored = tokens.get_token(PERSON, "github.ibm.com").unwrap().access_token;
             assert_eq!(stored.len(), 8192, "stored intact, not truncated");
+        });
+    }
+
+    /// SPEC-0051/E2E-018: the limit survived the removal of the database it was sized
+    /// for. 8192 characters is accepted, 8193 is refused with the same message.
+    #[test]
+    fn spec_0051_the_token_limit_is_unchanged() {
+        with_git_hosts_lock(async {
+            declare_hosts(REFERENCE_HOSTS);
+            let tokens = Arc::new(OAuthTokenStore::new());
+            let (f, r) = token_set_registry(tokens.clone()).await;
+
+            let at = "a".repeat(8192);
+            f.call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":at}))
+                .await
+                .unwrap();
+            let over = "a".repeat(8193);
+            let err = f
+                .call(&r, PERSON, "git.token_set", json!({"host":"github.ibm.com","token":over}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.message, "token must be at most 8192 characters");
+            assert_eq!(
+                tokens.get_token(PERSON, "github.ibm.com").unwrap().access_token.len(),
+                8192,
+                "the refused token did not replace the stored one"
+            );
         });
     }
 

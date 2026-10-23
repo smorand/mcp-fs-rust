@@ -16,10 +16,6 @@ use async_trait::async_trait;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// A project id is at most 32 characters, an email comfortably under 320.
-const PROJECT_ID_LEN: u32 = 64;
-const PERSON_LEN: u32 = 320;
-
 pub const ROLE_OWNER: &str = "owner";
 pub const ROLE_MEMBER: &str = "member";
 
@@ -30,7 +26,7 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "project",
                 vec![
-                    Column::required("id", ColumnType::TextKey(PROJECT_ID_LEN)),
+                    Column::required("id", ColumnType::Text),
                     Column::required("owner", ColumnType::Text),
                     Column::required("created_at", ColumnType::Text),
                 ],
@@ -39,8 +35,8 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "project_member",
                 vec![
-                    Column::required("project_id", ColumnType::TextKey(PROJECT_ID_LEN)),
-                    Column::required("person", ColumnType::TextKey(PERSON_LEN)),
+                    Column::required("project_id", ColumnType::Text),
+                    Column::required("person", ColumnType::Text),
                     Column::required("role", ColumnType::Text),
                     Column::required("added_by", ColumnType::Text),
                     Column::required("added_at", ColumnType::Text),
@@ -62,7 +58,7 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "project_purge_config",
                 vec![
-                    Column::required("project_id", ColumnType::TextKey(PROJECT_ID_LEN)),
+                    Column::required("project_id", ColumnType::Text),
                     Column::required("autopurge_enabled", ColumnType::BigInt).default("0"),
                     Column::required("use_internal_purge", ColumnType::BigInt).default("0"),
                     Column::new("file_retention_days", ColumnType::BigInt),

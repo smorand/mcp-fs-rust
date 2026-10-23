@@ -43,8 +43,8 @@ use std::collections::BTreeSet;
 
 /// How many rows travel in one INSERT batch.
 ///
-/// SQL Server caps a statement at 2100 parameters, and our widest table binds ten
-/// columns, so 100 rows stays clear of that ceiling on every engine.
+/// Our widest table binds ten columns, so 100 rows is 1000 parameters per statement,
+/// far under the limit of both SQLite and PostgreSQL.
 const BATCH_ROWS: usize = 100;
 
 /// What one table copy did.

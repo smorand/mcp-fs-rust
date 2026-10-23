@@ -1,5 +1,5 @@
 //! mcp-fs: a streamable-HTTP MCP server exposing a simulated multi-project
-//! filesystem, over SQLite, PostgreSQL or SQL Server.
+//! filesystem, over SQLite or PostgreSQL.
 //!
 //! It began as a strict 1:1 port of a C#/.NET 9 implementation, which is why many
 //! comments still explain a shape by pointing at it. That lineage is history, not a

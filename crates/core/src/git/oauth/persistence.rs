@@ -7,8 +7,7 @@
 //! Instantiated only when `MCPFS_TOKEN_KEY` is set; without it the token store is
 //! memory only and tokens are lost on restart.
 //!
-//! The methods are async because the PostgreSQL and SQL Server drivers are async
-//! only. They used to be synchronous, which is why the token store above them had
+//! The methods are async because the PostgreSQL driver is async only. They used to be synchronous, which is why the token store above them had
 //! to become async too.
 
 use crate::errors::Result;
@@ -19,11 +18,6 @@ use crate::storage::rel::schema::{Column, SchemaSet, Table};
 use crate::storage::rel::{Query, RelationalDb};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-
-/// An email comfortably fits, and both columns are part of the primary key.
-const PERSON_LEN: u32 = 320;
-/// The maximum DNS hostname length (RFC 1035), the primary key's other half.
-const HOST_LEN: u32 = 255;
 
 /// The table this store owns.
 ///
@@ -39,8 +33,8 @@ pub fn schema() -> SchemaSet {
         vec![Table::new(
             "oauth_tokens",
             vec![
-                Column::required("person", ColumnType::TextKey(PERSON_LEN)),
-                Column::required("host", ColumnType::TextKey(HOST_LEN)),
+                Column::required("person", ColumnType::Text),
+                Column::required("host", ColumnType::Text),
                 // A non-key attribute (DEC-004): the credential policy the host
                 // resolved to when the token was seeded, not part of identity.
                 Column::required("provider", ColumnType::Text),
@@ -415,8 +409,7 @@ mod tests {
     }
 
     /// E2E-NEW-036: the persisted key is `(person, host)`; `provider` is a
-    /// non-key attribute, and both key columns are `TextKey` bounded (SQL Server
-    /// cannot index `NVARCHAR(MAX)`).
+    /// non-key attribute.
     #[test]
     fn e2e_new_036_the_persisted_key_is_person_and_host() {
         let s = schema();
@@ -424,8 +417,8 @@ mod tests {
         assert_eq!(t.name, "oauth_tokens");
         assert_eq!(t.primary_key, vec!["person", "host"]);
         let col = |name: &str| t.columns.iter().find(|c| c.name == name).unwrap();
-        assert!(matches!(col("person").ty, ColumnType::TextKey(_)));
-        assert!(matches!(col("host").ty, ColumnType::TextKey(_)));
+        assert!(matches!(col("person").ty, ColumnType::Text));
+        assert!(matches!(col("host").ty, ColumnType::Text));
         assert!(!t.primary_key.contains(&"provider"), "provider is not part of the key");
         assert!(
             matches!(col("provider").ty, ColumnType::Text),

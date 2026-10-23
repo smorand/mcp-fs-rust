@@ -209,8 +209,8 @@ impl SchemaSet {
     ///
     /// Kept out of [`Self::render`] because they are not self guarding on every
     /// engine: SQLite has no `ADD COLUMN IF NOT EXISTS`, so its `migrate` probes
-    /// `pragma_table_info` first. PostgreSQL and SQL Server render their own
-    /// guard and can run the statement blind.
+    /// `pragma_table_info` first. PostgreSQL renders its own guard and can
+    /// run the statement blind.
     pub fn render_column_migrations(&self, dialect: Dialect) -> Vec<String> {
         self.column_migrations
             .iter()
@@ -283,39 +283,14 @@ fn render_table(dialect: Dialect, table: &Table) -> String {
 
     let name = dialect.quote_ident(table.name);
     let body = parts.join(", ");
-    match dialect {
-        Dialect::Sqlite | Dialect::Postgres => {
-            format!("CREATE TABLE IF NOT EXISTS {name} ({body})")
-        }
-        // SQL Server has no IF NOT EXISTS on CREATE TABLE, so existence is a guard.
-        Dialect::SqlServer => format!(
-            "IF OBJECT_ID(N'{}', N'U') IS NULL CREATE TABLE {name} ({body});",
-            escape_sql_string(table.name)
-        ),
-    }
+    format!("CREATE TABLE IF NOT EXISTS {name} ({body})")
 }
 
 fn render_index(dialect: Dialect, index: &Index) -> String {
     let cols = index.columns.iter().map(|c| dialect.quote_ident(c)).collect::<Vec<_>>().join(", ");
     let name = dialect.quote_ident(index.name);
     let table = dialect.quote_ident(index.table);
-    match dialect {
-        Dialect::Sqlite | Dialect::Postgres => {
-            format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})")
-        }
-        Dialect::SqlServer => format!(
-            "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{}' \
-             AND object_id = OBJECT_ID(N'{}')) CREATE INDEX {name} ON {table} ({cols});",
-            escape_sql_string(index.name),
-            escape_sql_string(index.table)
-        ),
-    }
-}
-
-/// Escape a single quoted SQL string literal. Only reached with our own static
-/// table names, but a guard beats trusting that they stay quote free.
-pub(super) fn escape_sql_string(s: &str) -> String {
-    s.replace("'", "''")
+    format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})")
 }
 
 fn render_typed_index(dialect: Dialect, tidx: &TypedIndex) -> Option<String> {
@@ -324,24 +299,18 @@ fn render_typed_index(dialect: Dialect, tidx: &TypedIndex) -> Option<String> {
     let table = dialect.quote_ident(tidx.table);
 
     match (&tidx.kind, dialect) {
-        // IvfFlat is a PostgreSQL-only index type: skip it on other engines.
-        (IndexKind::IvfFlat, Dialect::Sqlite | Dialect::SqlServer) => None,
+        // IvfFlat is a PostgreSQL-only index type: skip it on SQLite.
+        (IndexKind::IvfFlat, Dialect::Sqlite) => None,
         (IndexKind::IvfFlat, Dialect::Postgres) => Some(format!(
             "CREATE INDEX IF NOT EXISTS {name} ON {table} USING ivfflat ({cols} vector_cosine_ops)"
         )),
-        // GIN is PostgreSQL-specific; on other engines fall back to a standard index.
+        // GIN is PostgreSQL-specific; on SQLite fall back to a standard index.
         (IndexKind::Gin, Dialect::Postgres) => {
             Some(format!("CREATE INDEX IF NOT EXISTS {name} ON {table} USING GIN ({cols})"))
         }
         (IndexKind::Standard | IndexKind::Gin, Dialect::Sqlite | Dialect::Postgres) => {
             Some(format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"))
         }
-        (IndexKind::Standard | IndexKind::Gin, Dialect::SqlServer) => Some(format!(
-            "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{}' \
-             AND object_id = OBJECT_ID(N'{}')) CREATE INDEX {name} ON {table} ({cols});",
-            escape_sql_string(tidx.name),
-            escape_sql_string(tidx.table)
-        )),
     }
 }
 
@@ -367,8 +336,8 @@ mod tests {
         Table::new(
             "nodes",
             vec![
-                Column::required("volume_id", ColumnType::TextKey(200)),
-                Column::required("path", ColumnType::TextKey(700)),
+                Column::required("volume_id", ColumnType::Text),
+                Column::required("path", ColumnType::Text),
                 Column::new("parent", ColumnType::Text),
                 Column::required("size", ColumnType::BigInt).default("0"),
                 Column::required("mtime", ColumnType::Double),
@@ -396,26 +365,13 @@ mod tests {
         assert!(sql.contains("\"mtime\" DOUBLE PRECISION NOT NULL"), "{sql}");
     }
 
-    /// The keyed columns must be sized, otherwise SQL Server rejects the PK.
-    #[test]
-    fn sqlserver_ddl_guards_existence_and_sizes_key_columns() {
-        let sql = render_table(Dialect::SqlServer, &nodes());
-        assert!(sql.starts_with("IF OBJECT_ID(N'nodes', N'U') IS NULL CREATE TABLE [nodes] ("));
-        assert!(sql.contains("[volume_id] NVARCHAR(200) NOT NULL"), "{sql}");
-        assert!(sql.contains("[path] NVARCHAR(700) NOT NULL"), "{sql}");
-        // An unkeyed text column stays unbounded.
-        assert!(sql.contains("[parent] NVARCHAR(MAX)"), "{sql}");
-        assert!(sql.contains("[mtime] FLOAT NOT NULL"), "{sql}");
-        assert!(sql.ends_with("PRIMARY KEY ([volume_id], [path]));"), "{sql}");
-    }
-
     #[test]
     fn foreign_key_cascade_renders_on_every_engine() {
         let t = Table::new(
             "project_member",
             vec![
-                Column::required("project_id", ColumnType::TextKey(200)),
-                Column::required("person", ColumnType::TextKey(320)),
+                Column::required("project_id", ColumnType::Text),
+                Column::required("person", ColumnType::Text),
             ],
             vec!["project_id", "person"],
         )
@@ -434,13 +390,6 @@ mod tests {
                 "{sql}"
             );
         }
-        let sql = render_table(Dialect::SqlServer, &t);
-        assert!(
-            sql.contains(
-                "FOREIGN KEY ([project_id]) REFERENCES [project] ([id]) ON DELETE CASCADE"
-            ),
-            "{sql}"
-        );
     }
 
     #[test]
@@ -453,12 +402,6 @@ mod tests {
         assert_eq!(
             render_index(Dialect::Postgres, &idx),
             "CREATE INDEX IF NOT EXISTS \"idx_nodes_parent\" ON \"nodes\" (\"parent\")"
-        );
-        let mssql = render_index(Dialect::SqlServer, &idx);
-        assert!(mssql.starts_with("IF NOT EXISTS (SELECT 1 FROM sys.indexes"), "{mssql}");
-        assert!(
-            mssql.contains("CREATE INDEX [idx_nodes_parent] ON [nodes] ([parent]);"),
-            "{mssql}"
         );
     }
 
@@ -493,58 +436,6 @@ mod tests {
         ]
     }
 
-    /// `table.column` pairs a primary key or an index declares on unbounded
-    /// text. SQL Server renders `Text` as `NVARCHAR(MAX)` and refuses it as a key
-    /// column (error 1919), so the store fails to open there (SPEC-0023 DEC-002).
-    fn unbounded_keys(set: &SchemaSet) -> Vec<String> {
-        let column_type = |table: &str, column: &str| {
-            set.tables
-                .iter()
-                .find(|t| t.name == table)
-                .and_then(|t| t.columns.iter().find(|c| c.name == column))
-                .map(|c| c.ty)
-        };
-        let keys = set.tables.iter().flat_map(|t| t.primary_key.iter().map(move |c| (t.name, *c)));
-        let indexed = set.indexes.iter().flat_map(|i| i.columns.iter().map(move |c| (i.table, *c)));
-        let typed =
-            set.typed_indexes.iter().flat_map(|i| i.columns.iter().map(move |c| (i.table, *c)));
-        let mut out: Vec<String> = keys
-            .chain(indexed)
-            .chain(typed)
-            .filter(|(t, c)| column_type(t, c) == Some(ColumnType::Text))
-            .map(|(t, c)| format!("{t}.{c}"))
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// SPEC-0023 DEC-002: no primary key or index column of a production schema
-    /// is unbounded text, so a store never fails to open on SQL Server.
-    #[test]
-    fn no_production_schema_keys_unbounded_text() {
-        let offenders: Vec<String> = production_schemas()
-            .iter()
-            .flat_map(|(name, set)| {
-                unbounded_keys(set).into_iter().map(move |k| format!("{name}: {k}"))
-            })
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "unbounded text used as a key column, declare it ColumnType::TextKey(n): {offenders:?}"
-        );
-    }
-
-    /// The guard itself: an indexed `Text` column is reported by table and column.
-    #[test]
-    fn unbounded_key_guard_names_table_and_column() {
-        let set = SchemaSet::new(
-            vec![nodes()],
-            vec![Index { name: "idx_nodes_parent", table: "nodes", columns: vec!["parent"] }],
-        );
-        assert_eq!(unbounded_keys(&set), vec!["nodes.parent".to_string()]);
-    }
-
     /// Every statement a schema renders for one dialect, column migrations last,
     /// fingerprinted so a byte change anywhere in the DDL shows up.
     fn ddl_fingerprint(set: &SchemaSet, dialect: Dialect) -> String {
@@ -556,7 +447,7 @@ mod tests {
 
     /// SPEC-0026/BT-020: the DDL of every production schema, on every engine, is
     /// byte identical to the one rendered before US-0029 (captured on 2026-10-14,
-    /// before the PostgreSQL migrate change), so SQLite and SQL Server deployments
+    /// before the PostgreSQL migrate change), so SQLite and PostgreSQL deployments
     /// see no difference (BR-005).
     #[test]
     fn production_ddl_is_unchanged_on_every_engine() {
@@ -572,11 +463,6 @@ mod tests {
                 "6891bd41b0390995dc29ba63e43b869f47c2cb109141ae5fa1e0a8216f185d4a",
             ),
             (
-                "storage::meta",
-                Dialect::SqlServer,
-                "fd4826b849f765d404f70859782c7e702a2a973a7b9d8935ead634b4b00e92ea",
-            ),
-            (
                 "storage::admin",
                 Dialect::Sqlite,
                 "deeda260cae9c31eede46a62e6f353ddff5cb1384f070061831175217e3f3048",
@@ -585,11 +471,6 @@ mod tests {
                 "storage::admin",
                 Dialect::Postgres,
                 "973ea4d49ab1c602220a39606b8dedd1f5018a8593ed2f68915903dafdc338d2",
-            ),
-            (
-                "storage::admin",
-                Dialect::SqlServer,
-                "35bfd583e3d8eab9c06c71270e5804a9d695661922f9b50afedd3010860ee294",
             ),
             (
                 "git::db",
@@ -602,11 +483,6 @@ mod tests {
                 "681558d60d439a5e20efdf8d031ebf7b453cf1569f2def7eba3c7b23f55cd355",
             ),
             (
-                "git::db",
-                Dialect::SqlServer,
-                "07b9d371c4fbff99a9b73b479a122c2ebd425e3939c62121601cd1fd6094db1c",
-            ),
-            (
                 "git::oauth::persistence",
                 Dialect::Sqlite,
                 "1eabe2ae2ee3253a3b05b04f5648093b146b9217c3c7ed2a4d65ba12a5bf4d30",
@@ -615,11 +491,6 @@ mod tests {
                 "git::oauth::persistence",
                 Dialect::Postgres,
                 "aa10ebe986bc8ca2c326ea82eed065ac6cae8602595eba7de0383fb6497ea9ab",
-            ),
-            (
-                "git::oauth::persistence",
-                Dialect::SqlServer,
-                "be5ad946b61d1d426cc1f06516a18c111cbd3629a8caf5a10acee11f5c93fb54",
             ),
         ];
         let schemas = production_schemas();

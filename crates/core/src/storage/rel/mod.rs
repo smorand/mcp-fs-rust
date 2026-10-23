@@ -1,4 +1,4 @@
-//! The relational seam: one async surface over SQLite, PostgreSQL and SQL Server.
+//! The relational seam: one async surface over SQLite and PostgreSQL.
 //!
 //! Every store speaks [`Query`] plus [`RowValues`] instead of a driver's own row
 //! type, so a statement is written once and the engine is a configuration choice.

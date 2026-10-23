@@ -2,6 +2,16 @@ config::tests::sqlserver_without_a_dsn_is_rejected_and_names_the_key
 config::tests::sqlserver_without_the_cargo_feature_names_the_feature
 storage::conformance::sqlserver_passes_the_conformance_suite
 storage::meta::tests::a_rename_that_would_overflow_a_descendant_is_refused_live
+storage::meta::tests::rename_orders_by_the_dialect_length_function
+storage::meta::tests::subtree_match_renders_a_case_exact_clause_per_dialect
+storage::meta::tests::the_store_refuses_a_computed_path_past_the_column_width
+storage::rel::dialect::tests::exact_text_helpers_render_per_engine
+storage::rel::dialect::tests::length_function_differs_on_sqlserver
+storage::rel::dialect::tests::like_escaping_of_bracket_is_sqlserver_only
+storage::rel::dialect::tests::upsert_ignore_renders_do_nothing_and_a_bare_merge
+storage::rel::schema::tests::no_production_schema_keys_unbounded_text
+storage::rel::schema::tests::sqlserver_ddl_guards_existence_and_sizes_key_columns
+storage::rel::schema::tests::unbounded_key_guard_names_table_and_column
 tools::mssql_trash_e2e::spec_0023_bt_001_deleted_files_are_listed_in_the_trash
 tools::teardown_e2e::spec_0024_bt_005_trash_rows_of_a_deleted_project_mssql
 tools::teardown_e2e::spec_0024_bt_010_no_metadata_row_of_a_deleted_volume_remains_mssql

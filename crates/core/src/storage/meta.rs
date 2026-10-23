@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// `LIKE` alone is not enough: SQLite folds ASCII letter case in `LIKE`, so
 /// `/video/%` also selects `/Video/x`. The `LIKE` stays to narrow the rows (and
 /// its wildcard escaping is the one that keeps `a_b` from matching `axb`); the
-/// exact substring equality decides, on every engine (DEC-003, DEC-004).
+/// exact substring equality decides, on both engines (DEC-003, DEC-004).
 #[derive(Clone)]
 struct SubtreeMatch {
     like: String,
@@ -46,15 +46,14 @@ impl SubtreeMatch {
         let trimmed = path.trim_end_matches('/');
         let prefix = format!("{trimmed}/");
         let like = descendant_like(dialect, path);
-        Self { like, prefix_len: dialect.char_len(&prefix), prefix }
+        Self { like, prefix_len: prefix.chars().count(), prefix }
     }
 
     /// `(col LIKE ?L ESCAPE '\' AND substr(col, 1, n) = ?P)`; the length is an
     /// integer literal, never user text.
-    fn clause(&self, dialect: Dialect, col: &str, like_ph: usize, prefix_ph: usize) -> String {
-        let head = format!("{}({col}, 1, {})", dialect.substr_fn(), self.prefix_len);
-        let exact = dialect.exact_equals(&head, &format!("?{prefix_ph}"));
-        format!("({col} LIKE ?{like_ph} ESCAPE '\\' AND {exact})")
+    fn clause(&self, col: &str, like_ph: usize, prefix_ph: usize) -> String {
+        let n = self.prefix_len;
+        format!("({col} LIKE ?{like_ph} ESCAPE '\\' AND substr({col}, 1, {n}) = ?{prefix_ph})")
     }
 }
 
@@ -89,13 +88,6 @@ pub(crate) struct FolderItems {
     pub items: Vec<FolderItemRow>,
 }
 
-/// A project id is at most 32 characters (see `admin::validate_project_id`), so
-/// this leaves room to spare while staying inside a SQL Server index key.
-const VOLUME_ID_LEN: u32 = 64;
-/// Keyed because the primary key and the parent index both use a path. SQL Server
-/// cannot index unbounded text, so a length is required rather than optional.
-const PATH_LEN: u32 = 450;
-
 /// SQL Server caps a CLUSTERED index key at 900 bytes, and `NVARCHAR` costs 2 bytes
 /// per character, so the primary key `(volume_id, path)` has 450 characters to share.
 ///
@@ -112,8 +104,7 @@ const MAX_VOLUME_ID_CHARS: usize = 32;
 
 /// The longest path that fits the primary key whatever the project id is called.
 ///
-/// Deliberately below [`PATH_LEN`]: the column can hold more characters than a key
-/// entry can carry, and it is the key that fails. Public because
+/// Public because
 /// [`max_path_len`] turns it into the caller facing limit, and the guard that rejects
 /// an over long path MUST derive from the same arithmetic as the schema.
 pub const MAX_PATH_CHARS: usize = SQLSERVER_KEY_CHARS - MAX_VOLUME_ID_CHARS;
@@ -122,18 +113,6 @@ pub const MAX_PATH_CHARS: usize = SQLSERVER_KEY_CHARS - MAX_VOLUME_ID_CHARS;
 // tempting mistake is to raise the budget as though a character cost one byte, and
 // that failure would otherwise appear only against a real SQL Server.
 const _: () = assert!(SQLSERVER_KEY_CHARS * 2 <= 900);
-/// A hex sha256 is 64 characters. Doubled, so a longer digest stays storable.
-const SHA_LEN: u32 = 128;
-/// A UUIDv4 string is exactly 36 characters (SPEC-0012 US-0001, FR-NEW-015).
-const EXPORT_TOKEN_LEN: u32 = 36;
-
-/// A node revision and an artifact set id are UUIDv4 strings (SPEC-0019 DEC-003).
-const UUID_LEN: u32 = 36;
-/// `exact` or `approximate` (SPEC-0019 FR-NEW-002).
-const QUALITY_LEN: u32 = 16;
-/// An RFC 3339 timestamp as `util::now_iso` writes it is 32 characters. Doubled,
-/// so another offset or precision stays storable (SPEC-0023 DEC-001).
-const TIMESTAMP_LEN: u32 = 64;
 /// Refusal when the document changed between reading it and committing its
 /// artifacts (SPEC-0019 FR-NEW-035).
 const CHANGED_DURING_CONVERSION: &str = "Document changed during conversion";
@@ -205,35 +184,6 @@ pub fn max_path_len(backend: &str) -> Option<usize> {
     }
 }
 
-/// [`max_path_len`] for a store that already holds a dialect rather than the
-/// configured backend name. Same constant, so the two cannot disagree.
-fn max_path_len_for(dialect: Dialect) -> Option<usize> {
-    match dialect {
-        Dialect::SqlServer => Some(MAX_PATH_CHARS),
-        Dialect::Sqlite | Dialect::Postgres => None,
-    }
-}
-
-/// Refuse a path the `nodes` columns cannot hold.
-///
-/// `SafetyManager::ensure_path_fits` already rejects an over long path the caller
-/// supplied, but a move or a copy re-roots each descendant under a new prefix, so a
-/// destination that fits can still produce children that do not. This is the
-/// backstop on the computed form, at the one place every write funnels through.
-fn ensure_storable_path(dialect: Dialect, path: &str) -> Result<()> {
-    let Some(limit) = max_path_len_for(dialect) else {
-        return Ok(());
-    };
-    let len = path.chars().count();
-    if len <= limit {
-        return Ok(());
-    }
-    Err(ToolError::invalid_argument(format!(
-        "path is {len} characters but this backend allows at most {limit}: '{path}' would be \
-         created by re-rooting under a longer prefix, so choose a shorter destination"
-    )))
-}
-
 /// Every table of [`schema`] holding rows of one volume, in schema order.
 ///
 /// Derived rather than listed by hand: a shared database teardown that names
@@ -256,10 +206,9 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "nodes",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    Column::required("path", ColumnType::TextKey(PATH_LEN)),
-                    // Indexed, so it is keyed rather than unbounded text.
-                    Column::new("parent", ColumnType::TextKey(PATH_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("path", ColumnType::Text),
+                    Column::new("parent", ColumnType::Text),
                     Column::required("name", ColumnType::Text),
                     Column::required("kind", ColumnType::Text),
                     Column::required("size", ColumnType::BigInt).default("0"),
@@ -274,8 +223,8 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "blob_refs",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    Column::required("sha256", ColumnType::TextKey(SHA_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("sha256", ColumnType::Text),
                     Column::required("refcount", ColumnType::BigInt),
                     Column::required("size", ColumnType::BigInt),
                 ],
@@ -284,17 +233,12 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "trash_entries",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    // Indexed as part of the primary key, so it is keyed rather
-                    // than unbounded text, same budget as `nodes.path`.
-                    Column::required("trash_path", ColumnType::TextKey(PATH_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("trash_path", ColumnType::Text),
                     Column::required("original_path", ColumnType::Text),
                     Column::required("size", ColumnType::BigInt).default("0"),
                     Column::required("kind", ColumnType::Text),
-                    // Indexed by `idx_trash_entries_deleted_at`, so it is keyed:
-                    // SQL Server refuses an unbounded column in an index (1919).
-                    // SQLite and PostgreSQL still render TEXT (SPEC-0023 DEC-001).
-                    Column::required("deleted_at", ColumnType::TextKey(TIMESTAMP_LEN)),
+                    Column::required("deleted_at", ColumnType::Text),
                     Column::new("deleted_by", ColumnType::Text),
                 ],
                 vec!["volume_id", "trash_path"],
@@ -305,7 +249,7 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "volume_usage",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
                     Column::required("used_bytes", ColumnType::BigInt).default("0"),
                 ],
                 vec!["volume_id"],
@@ -313,8 +257,8 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "export_links",
                 vec![
-                    Column::required("token", ColumnType::TextKey(EXPORT_TOKEN_LEN)),
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
+                    Column::required("token", ColumnType::Text),
+                    Column::required("volume_id", ColumnType::Text),
                     Column::required("created_at", ColumnType::Text),
                     Column::required("expires_at", ColumnType::Text),
                 ],
@@ -325,10 +269,10 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "doc_artifact_current",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    Column::required("path", ColumnType::TextKey(PATH_LEN)),
-                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
-                    Column::required("node_rev", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("path", ColumnType::Text),
+                    Column::required("set_id", ColumnType::Text),
+                    Column::required("node_rev", ColumnType::Text),
                     Column::required("updated_at", ColumnType::BigInt),
                 ],
                 vec!["volume_id", "path"],
@@ -336,11 +280,11 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "doc_artifact_sets",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
-                    Column::required("path", ColumnType::TextKey(PATH_LEN)),
-                    Column::required("node_rev", ColumnType::TextKey(UUID_LEN)),
-                    Column::new("text_sha", ColumnType::TextKey(SHA_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("set_id", ColumnType::Text),
+                    Column::required("path", ColumnType::Text),
+                    Column::required("node_rev", ColumnType::Text),
+                    Column::new("text_sha", ColumnType::Text),
                     Column::required("text_len", ColumnType::BigInt).default("0"),
                     Column::required("report", ColumnType::Text),
                     Column::new("superseded_at", ColumnType::BigInt),
@@ -351,13 +295,13 @@ pub fn schema() -> SchemaSet {
             Table::new(
                 "doc_images",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("set_id", ColumnType::Text),
                     Column::required("seq", ColumnType::BigInt),
                     Column::required("caption", ColumnType::Text),
                     Column::new("page", ColumnType::BigInt),
-                    Column::required("format", ColumnType::TextKey(8)),
-                    Column::required("sha256", ColumnType::TextKey(SHA_LEN)),
+                    Column::required("format", ColumnType::Text),
+                    Column::required("sha256", ColumnType::Text),
                     Column::required("size", ColumnType::BigInt),
                     Column::required("line_start", ColumnType::BigInt),
                     Column::required("line_count", ColumnType::BigInt),
@@ -365,18 +309,18 @@ pub fn schema() -> SchemaSet {
                 ],
                 vec!["volume_id", "set_id", "seq"],
             ),
-            // `row_count`/`col_count` rather than the design's `rows`/`cols`:
-            // `ROWS` is reserved in SQL Server's `OFFSET ... ROWS` grammar.
+            // `row_count`/`col_count` rather than the design's `rows`/`cols`,
+            // which would collide with SQL keywords.
             Table::new(
                 "doc_tables",
                 vec![
-                    Column::required("volume_id", ColumnType::TextKey(VOLUME_ID_LEN)),
-                    Column::required("set_id", ColumnType::TextKey(UUID_LEN)),
+                    Column::required("volume_id", ColumnType::Text),
+                    Column::required("set_id", ColumnType::Text),
                     Column::required("seq", ColumnType::BigInt),
                     Column::required("caption", ColumnType::Text),
                     Column::required("row_count", ColumnType::BigInt),
                     Column::required("col_count", ColumnType::BigInt),
-                    Column::required("quality", ColumnType::TextKey(QUALITY_LEN)),
+                    Column::required("quality", ColumnType::Text),
                     Column::required("cells", ColumnType::Text),
                     Column::required("line_start", ColumnType::BigInt),
                     Column::required("line_count", ColumnType::BigInt),
@@ -409,7 +353,7 @@ pub fn schema() -> SchemaSet {
     .column_migration(ColumnMigration {
         table: "nodes",
         column: "rev",
-        ty: ColumnType::TextKey(UUID_LEN),
+        ty: ColumnType::Text,
         not_null: false,
         default: "NULL",
     })
@@ -652,9 +596,8 @@ impl RelationalMetaStore {
     ///
     /// SQL finds the size of the `cap`th largest file, then every file at least
     /// that big is fetched and ordered here: the text order of `path` differs
-    /// per engine (PostgreSQL follows the database collation, SQL Server
-    /// compares UTF-16 units), but UTF-8 byte order is code point order on all
-    /// of them (DEC-003). Time O(n log k) for n files and cap k, space O(k +
+    /// per engine (PostgreSQL follows the database collation), but UTF-8 byte
+    /// order is code point order on both (DEC-003). Time O(n log k) for n files and cap k, space O(k +
     /// ties at the cutoff). A file under `trash_dir` is `in_trash`; a soft
     /// delete keeps a trashed folder's files below one flat entry
     /// (`/<trash_dir>/<stamp>__<flat>`), so the original path is that entry's
@@ -761,7 +704,7 @@ impl RelationalMetaStore {
                 &Query::new(format!(
                     "SELECT path, size FROM nodes \
                      WHERE volume_id=?1 AND kind='file' AND {}",
-                    sm.clause(dialect, "path", 2, 3)
+                    sm.clause("path", 2, 3)
                 ))
                 .bind(volume)
                 .bind(&sm.like)
@@ -1512,7 +1455,7 @@ async fn tx_decref(tx: &mut dyn RelationalTx, volume: &str, sha: Option<&str>) -
 ///
 /// Returns false when the row was already there. A plain INSERT here was a real
 /// race: SQLite serializes every writer behind one mutex, so a check then insert
-/// could not interleave, but PostgreSQL and SQL Server run writers at the same
+/// could not interleave, but PostgreSQL runs writers at the same
 /// time and two of them creating the same parent directory raised a duplicate key.
 /// Both callers need the outcome, so the conflict is reported rather than hidden:
 /// [`tx_mkdirs_chain`] revalidates that the winner stored a directory, and `mkdir`
@@ -1632,7 +1575,7 @@ async fn tx_rename(
 ) -> Result<()> {
     // Shortest path first, so a parent is renamed before its children and no
     // intermediate state collides with a row that has not moved yet.
-    let order = dialect.length_fn();
+    let order = "length";
     if !tx_exists(tx, volume, src).await? {
         return Err(ToolError::not_found(format!("'{src}' not found")));
     }
@@ -1646,7 +1589,7 @@ async fn tx_rename(
             &Query::new(format!(
                 "SELECT path FROM nodes WHERE volume_id=?1 AND (path=?2 OR {within}) \
                  ORDER BY {order}(path)",
-                within = sm.clause(dialect, "path", 3, 4),
+                within = sm.clause("path", 3, 4),
             ))
             .bind(volume)
             .bind(src)
@@ -1659,11 +1602,6 @@ async fn tx_rename(
     for old in paths {
         let new =
             if old == src { dst.to_string() } else { format!("{}{}", dst, &old[src.len()..]) };
-        // A descendant grows by however much `dst` is longer than `src`, so
-        // it can overflow the column even though `dst` itself fitted. The
-        // whole rename is one transaction, so refusing here leaves the tree
-        // untouched rather than half moved.
-        ensure_storable_path(dialect, &new)?;
         tx.execute(
             &Query::new(
                 "UPDATE nodes SET path=?1, parent=?2, name=?3, rev=?4 \
@@ -1775,7 +1713,7 @@ async fn count_trash_entries(
             &Query::new(format!(
                 "SELECT COUNT(*) FROM trash_entries WHERE volume_id=?1 \
                  AND (original_path=?2 OR {})",
-                sm.clause(dialect, "original_path", 3, 4)
+                sm.clause("original_path", 3, 4)
             ))
             .bind(volume_id)
             .bind(path_prefix)
@@ -1819,7 +1757,7 @@ pub(crate) async fn list_trash_entries(
                 "SELECT {cols} FROM trash_entries WHERE volume_id=?1 \
                  AND (original_path=?2 OR {}) \
                  ORDER BY deleted_at DESC {page}",
-                sm.clause(dialect, "original_path", 3, 4)
+                sm.clause("original_path", 3, 4)
             ))
             .bind(volume_id)
             .bind(path_prefix)
@@ -1976,7 +1914,7 @@ impl MetaBackend for RelationalMetaStore {
                     "SELECT {SELECT_COLS} FROM nodes \
                      WHERE volume_id=?1 AND (path=?2 OR {}) \
                      ORDER BY path",
-                    sm.clause(dialect, "path", 3, 4)
+                    sm.clause("path", 3, 4)
                 ))
                 .bind(&self.volume_id)
                 .bind(root)
@@ -2040,7 +1978,7 @@ impl MetaBackend for RelationalMetaStore {
                      WHERE volume_id=?1 AND kind='file' AND atime<?2 \
                      AND path<>?3 AND NOT {} \
                      ORDER BY path",
-                    sm.clause(dialect, "path", 4, 5)
+                    sm.clause("path", 4, 5)
                 ))
                 .bind(&self.volume_id)
                 .bind(before)
@@ -2060,7 +1998,6 @@ impl MetaBackend for RelationalMetaStore {
         mode: i64,
     ) -> Result<PutFileResult> {
         let dialect = self.db.dialect();
-        ensure_storable_path(dialect, path)?;
         let put_sql = self.put_node_sql();
         let volume = self.volume_id.clone();
         let path = path.to_string();
@@ -2173,7 +2110,7 @@ impl MetaBackend for RelationalMetaStore {
     async fn remove_subtree(&self, path: &str) -> Result<Vec<String>> {
         let dialect = self.db.dialect();
         let sm = SubtreeMatch::new(dialect, path);
-        let within = sm.clause(dialect, "path", 3, 4);
+        let within = sm.clause("path", 3, 4);
         let (select_sql, delete_sql) = (
             format!(
                 "SELECT sha256, kind, size FROM nodes \
@@ -2224,7 +2161,6 @@ impl MetaBackend for RelationalMetaStore {
     async fn mkdirs(&self, path: &str, exist_ok: bool) -> Result<()> {
         let volume = self.volume_id.clone();
         let dialect = self.db.dialect();
-        ensure_storable_path(dialect, path)?;
         let path = path.to_string();
         run_retrying(&*self.db, move |tx| {
             let (volume, path) = (volume.clone(), path.clone());
@@ -2244,7 +2180,6 @@ impl MetaBackend for RelationalMetaStore {
     async fn mkdir(&self, path: &str) -> Result<()> {
         let volume = self.volume_id.clone();
         let dialect = self.db.dialect();
-        ensure_storable_path(dialect, path)?;
         let path = path.to_string();
         run_retrying(&*self.db, move |tx| {
             let (volume, path) = (volume.clone(), path.clone());
@@ -2512,29 +2447,6 @@ mod tests {
         );
         assert_eq!(max_path_len(backend::SQLITE), None);
         assert_eq!(max_path_len(backend::POSTGRES), None);
-
-        assert_eq!(max_path_len_for(Dialect::SqlServer), max_path_len(backend::SQLSERVER));
-        assert_eq!(max_path_len_for(Dialect::Sqlite), max_path_len(backend::SQLITE));
-        assert_eq!(max_path_len_for(Dialect::Postgres), max_path_len(backend::POSTGRES));
-    }
-
-    /// The backstop for a computed path. A move or a copy re-roots descendants, so a
-    /// destination that fits can still produce children that do not.
-    #[test]
-    fn the_store_refuses_a_computed_path_past_the_column_width() {
-        let limit = MAX_PATH_CHARS;
-        let at_limit = format!("/{}", "a".repeat(limit - 1));
-        let over = format!("/{}", "a".repeat(limit));
-
-        assert!(ensure_storable_path(Dialect::SqlServer, &at_limit).is_ok());
-        let e = ensure_storable_path(Dialect::SqlServer, &over).unwrap_err();
-        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
-        assert!(e.message.contains(&format!("{}", limit + 1)));
-        assert!(e.message.contains("re-rooting"), "explains the cause: {}", e.message);
-
-        // An unbounded engine takes it, so the restriction stays where it belongs.
-        assert!(ensure_storable_path(Dialect::Sqlite, &over).is_ok());
-        assert!(ensure_storable_path(Dialect::Postgres, &over).is_ok());
     }
 
     #[tokio::test]
@@ -2549,22 +2461,22 @@ mod tests {
     }
 
     /// SPEC-0050 DEC-004..006: the clause keeps the escaped `LIKE` and adds the
-    /// exact substring equality, rendered per engine.
+    /// exact substring equality.
     #[test]
-    fn subtree_match_renders_a_case_exact_clause_per_dialect() {
+    fn spec_0051_subtree_match_renders_a_case_exact_clause() {
         let sqlite = SubtreeMatch::new(Dialect::Sqlite, "/video");
         assert_eq!(sqlite.like, "/video/%");
         assert_eq!(sqlite.prefix, "/video/");
         assert_eq!(
-            sqlite.clause(Dialect::Sqlite, "path", 3, 4),
+            sqlite.clause("path", 3, 4),
             "(path LIKE ?3 ESCAPE '\\' AND substr(path, 1, 7) = ?4)"
         );
-        let mssql = SubtreeMatch::new(Dialect::SqlServer, "/é📊/");
-        assert_eq!(mssql.prefix, "/é📊/", "one trailing slash, not two");
+        // The length counts characters, as `substr` does: an emoji is one.
+        let emoji = SubtreeMatch::new(Dialect::Postgres, "/é📊/");
+        assert_eq!(emoji.prefix, "/é📊/", "one trailing slash, not two");
         assert_eq!(
-            mssql.clause(Dialect::SqlServer, "original_path", 2, 3),
-            "(original_path LIKE ?2 ESCAPE '\\' AND SUBSTRING(original_path, 1, 5) = ?3 \
-             COLLATE Latin1_General_100_BIN2)"
+            emoji.clause("original_path", 2, 3),
+            "(original_path LIKE ?2 ESCAPE '\\' AND substr(original_path, 1, 4) = ?3)"
         );
         let root = SubtreeMatch::new(Dialect::Postgres, "/");
         assert_eq!((root.like.as_str(), root.prefix.as_str()), ("/%", "/"));
@@ -2962,15 +2874,6 @@ mod tests {
         assert!(a.get("/dst/f.txt").await.unwrap().is_some());
         assert!(b.get("/src/f.txt").await.unwrap().is_some(), "volume b did not move");
         assert!(b.get("/dst/f.txt").await.unwrap().is_none());
-    }
-
-    /// `rename` orders by path length so a parent moves before its children. On
-    /// SQL Server that function is spelled differently, so the store asks the
-    /// dialect rather than hardcoding it.
-    #[test]
-    fn rename_orders_by_the_dialect_length_function() {
-        assert_eq!(Dialect::Sqlite.length_fn(), "length");
-        assert_eq!(Dialect::SqlServer.length_fn(), "LEN");
     }
 
     /// A deep tree exercises the ordering: every child must land under its moved

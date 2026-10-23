@@ -217,7 +217,7 @@ pub struct MetaConfig {
     pub backend: String,
     /// SQLite only: one database file per volume under this directory.
     pub dir: String,
-    /// PostgreSQL and SQL Server only. Secret, so inject it with `${VAR}`.
+    /// PostgreSQL only. Secret, so inject it with `${VAR}`.
     pub dsn: Dsn,
     /// PostgreSQL only: the schema holding our tables.
     pub schema: String,

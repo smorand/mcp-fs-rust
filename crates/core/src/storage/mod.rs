@@ -305,7 +305,7 @@ pub async fn build_git_db(
 ///
 /// Only reached on a shared database. Under SQLite the index is a file and
 /// deleting it removes the rows with it, which is what `purge_repo` does. Without
-/// this, deleting a project on PostgreSQL or SQL Server would leave its refs and
+/// this, deleting a project on PostgreSQL would leave its refs and
 /// object index behind, and a project later recreated under the same id would
 /// inherit them.
 pub async fn purge_git_rows(
