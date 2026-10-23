@@ -239,10 +239,7 @@ pub(crate) mod testkit {
                 crate::storage::test_registry(),
             )),
             safety: {
-                let safety = crate::safety::SafetyManager::new(
-                    config.safety.clone(),
-                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
-                );
+                let safety = crate::safety::SafetyManager::new(config.safety.clone());
                 safety.attach_limits(admin);
                 Arc::new(safety)
             },
@@ -282,10 +279,7 @@ pub(crate) mod testkit {
                 crate::storage::test_registry(),
             )),
             safety: {
-                let safety = crate::safety::SafetyManager::new(
-                    config.safety.clone(),
-                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
-                );
+                let safety = crate::safety::SafetyManager::new(config.safety.clone());
                 safety.attach_limits(admin);
                 Arc::new(safety)
             },
@@ -343,10 +337,7 @@ pub(crate) mod testkit {
                 crate::storage::test_registry(),
             )),
             safety: {
-                let safety = crate::safety::SafetyManager::new(
-                    config.safety.clone(),
-                    crate::storage::meta::max_path_len(&config.infra.meta.backend),
-                );
+                let safety = crate::safety::SafetyManager::new(config.safety.clone());
                 safety.attach_limits(admin);
                 Arc::new(safety)
             },

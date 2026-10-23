@@ -1,9 +1,16 @@
 config::tests::sqlserver_without_a_dsn_is_rejected_and_names_the_key
 config::tests::sqlserver_without_the_cargo_feature_names_the_feature
+safety::tests::a_path_at_the_backend_limit_is_accepted
+safety::tests::every_caller_hits_the_guard_through_normalize_path
+safety::tests::one_character_past_the_limit_is_rejected_with_an_actionable_message
+safety::tests::the_limit_applies_after_normalization
+safety::tests::the_limit_counts_characters_not_bytes
+safety::tests::the_limit_does_not_apply_to_sqlite_or_postgres
 storage::conformance::sqlserver_passes_the_conformance_suite
 storage::meta::tests::a_rename_that_would_overflow_a_descendant_is_refused_live
 storage::meta::tests::rename_orders_by_the_dialect_length_function
 storage::meta::tests::subtree_match_renders_a_case_exact_clause_per_dialect
+storage::meta::tests::the_path_ceiling_is_sqlserver_only_and_agrees_across_accessors
 storage::meta::tests::the_store_refuses_a_computed_path_past_the_column_width
 storage::rel::dialect::tests::exact_text_helpers_render_per_engine
 storage::rel::dialect::tests::length_function_differs_on_sqlserver

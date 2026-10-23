@@ -88,31 +88,6 @@ pub(crate) struct FolderItems {
     pub items: Vec<FolderItemRow>,
 }
 
-/// SQL Server caps a CLUSTERED index key at 900 bytes, and `NVARCHAR` costs 2 bytes
-/// per character, so the primary key `(volume_id, path)` has 450 characters to share.
-///
-/// The limit bites on the actual row, not on the declared widths: a 449 character
-/// path under a 9 character volume id built a 916 byte key and the server refused it
-/// with error 1946. So the column may be wider than any path this store will accept.
-const SQLSERVER_KEY_CHARS: usize = 900 / 2;
-
-/// `admin::validate_project_id` caps a project id at 32 characters, and the volume id
-/// IS the project id, so this is the worst case share of the key budget. Budgeting the
-/// worst case keeps the ceiling identical in every project: a path that fits in one
-/// volume must not be refused in another just because its name is longer.
-const MAX_VOLUME_ID_CHARS: usize = 32;
-
-/// The longest path that fits the primary key whatever the project id is called.
-///
-/// Public because
-/// [`max_path_len`] turns it into the caller facing limit, and the guard that rejects
-/// an over long path MUST derive from the same arithmetic as the schema.
-pub const MAX_PATH_CHARS: usize = SQLSERVER_KEY_CHARS - MAX_VOLUME_ID_CHARS;
-
-// The character budget must really fit 900 bytes. Checked at compile time because the
-// tempting mistake is to raise the budget as though a character cost one byte, and
-// that failure would otherwise appear only against a real SQL Server.
-const _: () = assert!(SQLSERVER_KEY_CHARS * 2 <= 900);
 /// Refusal when the document changed between reading it and committing its
 /// artifacts (SPEC-0019 FR-NEW-035).
 const CHANGED_DURING_CONVERSION: &str = "Document changed during conversion";
@@ -168,20 +143,6 @@ const DOC_IMAGE_COLS: [&str; 11] = [
 /// A fresh node revision: a node insert, path change or byte write calls this.
 fn new_rev() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-/// The longest path the metadata backend can store, when it has a limit at all.
-///
-/// Only SQL Server does: `path` is part of the primary key and of the `parent`
-/// index, and SQL Server cannot index unbounded text, so the column is
-/// `NVARCHAR(PATH_LEN)` there while SQLite and PostgreSQL take unbounded `TEXT`.
-/// Returning `None` for those two is deliberate: a PostgreSQL deployment must not
-/// inherit a restriction that only exists because of another engine.
-pub fn max_path_len(backend: &str) -> Option<usize> {
-    match backend {
-        crate::config::backend::SQLSERVER => Some(MAX_PATH_CHARS),
-        _ => None,
-    }
 }
 
 /// Every table of [`schema`] holding rows of one volume, in schema order.
@@ -2425,28 +2386,6 @@ mod tests {
 
     async fn store() -> RelationalMetaStore {
         RelationalMetaStore::in_memory("proj").await.unwrap()
-    }
-
-    /// Only SQL Server bounds a path, and both accessors must agree, since one
-    /// serves the safety guard and the other the store itself.
-    #[test]
-    fn the_path_ceiling_is_sqlserver_only_and_agrees_across_accessors() {
-        use crate::config::backend;
-        assert_eq!(max_path_len(backend::SQLSERVER), Some(MAX_PATH_CHARS));
-        // The ceiling must leave room for the longest project id inside the 900 byte
-        // clustered key, which is what SQL Server actually enforces.
-        assert_eq!(MAX_PATH_CHARS, 418);
-        // The volume budget must match the real project id cap, since the volume id IS
-        // the project id: if validation ever allowed a longer one, the key would grow.
-        let longest_ok = "p".repeat(MAX_VOLUME_ID_CHARS);
-        assert!(crate::storage::admin::validate_project_id(&longest_ok).is_ok());
-        let one_over = "p".repeat(MAX_VOLUME_ID_CHARS + 1);
-        assert!(
-            crate::storage::admin::validate_project_id(&one_over).is_err(),
-            "a project id longer than the budgeted worst case must be impossible"
-        );
-        assert_eq!(max_path_len(backend::SQLITE), None);
-        assert_eq!(max_path_len(backend::POSTGRES), None);
     }
 
     #[tokio::test]

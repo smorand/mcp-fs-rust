@@ -146,10 +146,7 @@ impl Fixture {
         let inner = crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap();
         inner.connect().await.unwrap();
         let admin = Arc::new(FailOnceAdmin { inner, armed: AtomicBool::new(false) });
-        let safety = Arc::new(SafetyManager::new(
-            config.safety.clone(),
-            crate::storage::meta::max_path_len(&config.infra.meta.backend),
-        ));
+        let safety = Arc::new(SafetyManager::new(config.safety.clone()));
         safety.attach_limits(admin.clone());
         let state = Arc::new(AppState {
             config: config.clone(),

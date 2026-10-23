@@ -675,7 +675,7 @@ mod tests {
         let client = VolumeClient::new("proj", meta.clone(), blob).with_trash_store(meta.clone());
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         admin.create_project("proj", "owner@t.c").await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
         Fix { _dir: dir, meta, client, admin, safety }
     }
@@ -1103,7 +1103,7 @@ mod tests {
         let client = client.with_trash_store(meta.clone());
         let admin = RelationalAdminStore::in_memory().await.unwrap();
         admin.create_project("proj", "owner@t.c").await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
 
         client.write_text_atomic("/stale2.txt", "data").await.unwrap();
@@ -1396,7 +1396,7 @@ mod tests {
         let config = std::sync::Arc::new(raw_config);
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
 
         admin.create_project("p1", "owner@t.c").await.unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
         let config = std::sync::Arc::new(crate::config::ServerConfig::default());
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
 
         let summary = run_cycle(&stores, &admin, &safety, None).await.unwrap();
@@ -1445,7 +1445,7 @@ mod tests {
         let config = std::sync::Arc::new(raw_config);
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
 
         const N: usize = 50;
@@ -1829,7 +1829,7 @@ mod tests {
         let config = Arc::new(raw_config);
         let stores = StoreManager::new(config, relational);
         let admin = RelationalAdminStore::in_memory().await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
         admin.create_project("proj", "owner@t.c").await.unwrap();
         ExportFix { _dir: dir, stores, admin, safety }
@@ -2121,7 +2121,7 @@ mod tests {
             Arc::new(crate::storage::RelationalRegistry::new()),
         );
         let admin = RelationalAdminStore::in_memory().await.unwrap();
-        let safety = SafetyManager::new(SafetyConfig::default(), None);
+        let safety = SafetyManager::new(SafetyConfig::default());
         safety.attach_no_limits();
         OrphanFix { dir, stores, admin, safety, now: now_unix().floor() }
     }

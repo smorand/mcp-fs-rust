@@ -95,10 +95,7 @@ impl Fixture {
         let admin =
             Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
-        let safety = Arc::new(SafetyManager::new(
-            config.safety.clone(),
-            crate::storage::meta::max_path_len(&config.infra.meta.backend),
-        ));
+        let safety = Arc::new(SafetyManager::new(config.safety.clone()));
         safety.attach_limits(admin.clone());
         let doc_service = doc.map(|c| Arc::new(StubDocService::bundle(c)) as _);
         let state = Arc::new(AppState {

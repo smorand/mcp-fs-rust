@@ -70,10 +70,7 @@ impl PgFixture {
         let registry = crate::storage::test_registry();
         let admin = crate::storage::build_admin_store(&config, &registry).await.unwrap();
         admin.connect().await.unwrap();
-        let safety = Arc::new(SafetyManager::new(
-            config.safety.clone(),
-            crate::storage::meta::max_path_len(&config.infra.meta.backend),
-        ));
+        let safety = Arc::new(SafetyManager::new(config.safety.clone()));
         safety.attach_limits(admin.clone());
         let state = Arc::new(AppState {
             config: config.clone(),

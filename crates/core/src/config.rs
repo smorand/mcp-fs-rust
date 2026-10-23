@@ -13,9 +13,8 @@ use std::path::{Path, PathBuf};
 pub mod backend {
     pub const SQLITE: &str = "sqlite";
     pub const POSTGRES: &str = "postgres";
-    /// Removed (SPEC-0051): still named here only so the refusal can recognize it and
-    /// the code that has not been deleted yet keeps compiling.
-    pub const SQLSERVER: &str = "sqlserver";
+    /// Removed (SPEC-0051): named only so the refusal can recognize it. Not accepted.
+    pub const REMOVED: &str = "sqlserver";
 
     /// Every accepted value, for error messages.
     pub const ALL: [&str; 2] = [SQLITE, POSTGRES];
@@ -997,7 +996,7 @@ impl ServerConfig {
             ("git", &self.infra.git.backend),
             ("oauth", &self.infra.oauth.backend),
         ];
-        match stores.into_iter().find(|(_, b)| *b == backend::SQLSERVER) {
+        match stores.into_iter().find(|(_, b)| *b == backend::REMOVED) {
             Some((section, _)) => Err(ToolError::invalid_argument(format!(
                 "infra.{section}.backend 'sqlserver' is no longer supported: \
                  use 'postgres' or 'sqlite'"

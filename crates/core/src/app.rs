@@ -82,10 +82,7 @@ pub(crate) async fn build_with_state(
     admin.connect().await?;
 
     let stores = Arc::new(StoreManager::new(config.clone(), relational.clone()));
-    let safety = Arc::new(SafetyManager::new(
-        config.safety.clone(),
-        crate::storage::meta::max_path_len(&config.infra.meta.backend),
-    ));
+    let safety = Arc::new(SafetyManager::new(config.safety.clone()));
     // Every write admission reads the project's storage limit here (SPEC-0020).
     safety.attach_limits(admin.clone());
     let identity = Arc::new(IdentityResolver::new(&config.auth));

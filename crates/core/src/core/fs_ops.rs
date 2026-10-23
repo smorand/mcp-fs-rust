@@ -2127,7 +2127,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta);
-        let s = SafetyManager::new(cfg, None);
+        let s = SafetyManager::new(cfg);
         s.attach_no_limits();
         Fix { _dir: d, v, s }
     }
@@ -3515,7 +3515,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let blob = Arc::new(crate::storage::blob::local::LocalBlobStore::new(d.path(), "b"));
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta);
-        let s = SafetyManager::new(SafetyConfig::default(), None);
+        let s = SafetyManager::new(SafetyConfig::default());
         s.attach_no_limits();
         v.write_text_atomic("/a.txt", "x").await.unwrap();
         log.lock().unwrap().clear();
@@ -4185,7 +4185,7 @@ mod tests {
             release: tokio::sync::Mutex::new(Some(release_rx)),
         });
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta.clone());
-        let s = SafetyManager::new(SafetyConfig::default(), None);
+        let s = SafetyManager::new(SafetyConfig::default());
         s.attach_no_limits();
         v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
         let (alice, bob) = (StubDocService::ok(ALICE_MD), StubDocService::ok(BOB_MD));
@@ -4240,7 +4240,7 @@ mod tests {
             release: tokio::sync::Mutex::new(Some(release_rx)),
         });
         let v = VolumeClient::new("p", meta.clone(), blob).with_trash_store(meta.clone());
-        let s = SafetyManager::new(SafetyConfig::default(), None);
+        let s = SafetyManager::new(SafetyConfig::default());
         s.attach_no_limits();
         v.write_bytes_atomic("/report.pdf", b"%PDF").await.unwrap();
         if let Some(bytes) = former_sibling {
@@ -4391,7 +4391,7 @@ mod tests {
             deletes: StdMutex::new(Vec::new()),
         });
         let v = VolumeClient::new("p", meta.clone(), blob.clone()).with_trash_store(meta.clone());
-        let s = SafetyManager::new(SafetyConfig::default(), None);
+        let s = SafetyManager::new(SafetyConfig::default());
         s.attach_no_limits();
         v.write_bytes_atomic("/deck.pptx", b"PK deck").await.unwrap();
         if let Some(bytes) = copy {

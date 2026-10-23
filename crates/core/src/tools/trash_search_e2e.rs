@@ -62,10 +62,7 @@ impl Fixture {
             Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(ATLAS, ADA).await.unwrap();
-        let safety = Arc::new(SafetyManager::new(
-            config.safety.clone(),
-            crate::storage::meta::max_path_len(&config.infra.meta.backend),
-        ));
+        let safety = Arc::new(SafetyManager::new(config.safety.clone()));
         safety.attach_limits(admin.clone());
         let state = Arc::new(AppState {
             config: config.clone(),
@@ -500,10 +497,7 @@ impl PgFixture {
             Arc::new(crate::storage::admin::RelationalAdminStore::in_memory().await.unwrap());
         admin.connect().await.unwrap();
         admin.create_project(ATLAS, ADA).await.unwrap();
-        let safety = Arc::new(SafetyManager::new(
-            config.safety.clone(),
-            crate::storage::meta::max_path_len(&config.infra.meta.backend),
-        ));
+        let safety = Arc::new(SafetyManager::new(config.safety.clone()));
         safety.attach_limits(admin.clone());
         let state = Arc::new(AppState {
             config: config.clone(),

@@ -277,6 +277,30 @@ mod tests {
         );
     }
 
+    /// SPEC-0051/E2E-019: a path of 2 000 characters is written and read back on
+    /// SQLite, whatever limit another engine once had.
+    #[tokio::test]
+    async fn spec_0051_a_2000_character_path_is_written_and_read_back() {
+        let h = harness().await;
+        let mut path = String::new();
+        while path.len() + 100 <= 1990 {
+            path.push('/');
+            path.push_str(&"d".repeat(99));
+        }
+        path.push('/');
+        path.push_str(&"f".repeat(2000 - path.len()));
+        assert_eq!(path.chars().count(), 2000);
+
+        h.call("fs.write", json!({"mount_id": MOUNT, "path": path, "content": "deep\n"}))
+            .await
+            .unwrap();
+        let read = h
+            .call("fs.read", json!({"mount_id": MOUNT, "path": path, "line_numbered": false}))
+            .await
+            .unwrap();
+        assert!(read.to_string().contains("deep"), "{read}");
+    }
+
     #[tokio::test]
     async fn mkdir_creates_nested_directories() {
         let h = harness().await;

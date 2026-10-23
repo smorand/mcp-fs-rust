@@ -80,5 +80,5 @@
 | US-0078 | SPEC-0051 | refuse SQL Server in the configuration, with baselines | main | 2 | landed | story/US-0078-refuse-sql-server-in-the-configuration | main |
 | US-0079 | SPEC-0051 | remove the driver, the build option and the test service | US-0078 | 2 | landed | story/US-0079-remove-the-driver-and-build-option | story/US-0078-refuse-sql-server-in-the-configuration |
 | US-0080 | SPEC-0051 | collapse the dialect and the bounded keys | US-0079 | 2 | landed | story/US-0080-collapse-the-dialect-and-bounded-keys | story/US-0079-remove-the-driver-and-build-option |
-| US-0081 | SPEC-0051 | remove the path length limit | US-0080 | 2 | todo | | |
+| US-0081 | SPEC-0051 | remove the path length limit | US-0080 | 2 | landed | story/US-0081-remove-the-path-length-limit | story/US-0080-collapse-the-dialect-and-bounded-keys |
 | US-0082 | SPEC-0051 | documentation and spec close | US-0081 | 2 | todo | | |
