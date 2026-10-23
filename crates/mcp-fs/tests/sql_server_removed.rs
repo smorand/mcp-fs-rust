@@ -468,3 +468,131 @@ fn spec_0051_a_migration_to_sql_server_is_refused() {
     assert_migration_refused(&out, "meta");
     assert_eq!(snapshot(&d.cwd.path().join("state")), before, "the source changed");
 }
+
+// ── E2E-012, E2E-015: the build option, the lock and the test environment ────
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+}
+
+fn cargo() -> Command {
+    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    c.current_dir(repo_root());
+    c
+}
+
+#[test]
+fn spec_0051_the_removed_build_option_is_refused() {
+    // A scratch target dir: the refusal happens while resolving features, before any
+    // build, and this keeps the check clear of the outer cargo's lock.
+    let scratch = tempfile::tempdir().unwrap();
+    let out = cargo()
+        .args(["check", "-p", "mcp-fs", "--features", "sqlserver", "--offline"])
+        .env("CARGO_TARGET_DIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("does not contain this feature: sqlserver"),
+        "cargo said: {}",
+        stderr(&out)
+    );
+
+    // `all-backends` stays, and now means PostgreSQL plus vector search.
+    let meta = cargo()
+        .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
+        .output()
+        .unwrap();
+    let meta: Value = serde_json::from_slice(&meta.stdout).unwrap();
+    for name in ["mcp-fs-core", "mcp-fs"] {
+        let pkg = meta["packages"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap();
+        let features = pkg["features"].as_object().unwrap();
+        assert!(!features.contains_key("sqlserver"), "{name} still has the feature");
+        assert!(features.contains_key("all-backends"), "{name} lost all-backends");
+    }
+    let core = meta["packages"].as_array().unwrap().iter().find(|p| p["name"] == "mcp-fs-core");
+    assert_eq!(core.unwrap()["features"]["all-backends"], json!(["postgres", "rag"]));
+}
+
+#[test]
+fn spec_0051_the_test_environment_no_longer_offers_sql_server() {
+    let lock = fs::read_to_string(repo_root().join("Cargo.lock")).unwrap();
+    let packages: Vec<&str> =
+        lock.lines().filter_map(|l| l.strip_prefix("name = \"")?.strip_suffix('"')).collect();
+    for name in &packages {
+        assert!(!name.starts_with("tiberius") && *name != "bb8", "the lock still has {name}");
+    }
+    assert!(packages.len() > 100, "the lock was not parsed: {} packages", packages.len());
+
+    let compose = fs::read_to_string(repo_root().join("docker-compose.test.yml")).unwrap();
+    assert!(compose.lines().any(|l| l == "  postgres:"), "the PostgreSQL service must stay");
+    assert!(!compose.to_ascii_lowercase().contains("mssql"), "the compose file still names mssql");
+}
+
+// ── E2E-002, E2E-003: PostgreSQL is unchanged (opt in: needs the test service) ──
+
+fn pg_dsn() -> Option<String> {
+    std::env::var("MCPFS_TEST_PG_DSN").ok().filter(|v| !v.trim().is_empty())
+}
+
+#[test]
+fn spec_0051_the_postgres_suite_passes_unchanged() {
+    let Some(dsn) = pg_dsn() else {
+        eprintln!(
+            "skipping: MCPFS_TEST_PG_DSN is unset (docker compose -f docker-compose.test.yml up -d)"
+        );
+        return;
+    };
+    let out = cargo()
+        .args(["test", "-p", "mcp-fs-core", "--features", "postgres", "--lib", "--"])
+        .args(["conformance", "spec_0024", "pg_open", "pg_null", "--test-threads=4"])
+        .env("MCPFS_TEST_PG_DSN", dsn)
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(out.status.success(), "the PostgreSQL suite failed:\n{text}");
+    assert!(text.contains("test result: ok."), "{text}");
+    // Filters that match nothing also end in `ok`: the suite must really have run.
+    assert!(!text.contains("running 0 tests"), "no test matched: {text}");
+    assert!(text.contains("postgres_passes_the_conformance_suite ... ok"), "{text}");
+}
+
+/// A destination whose four stores live in the PostgreSQL schema `schema`.
+fn postgres_yaml(port: u16, key: &Path, dsn: &str, schema: &str) -> String {
+    let mut y = config_yaml(port, key, [SQLITE; 4], "");
+    y.truncate(y.find("infra:\n").unwrap());
+    y.push_str("infra:\n");
+    for name in ["meta", "admin", "git", "oauth"] {
+        y.push_str(&format!(
+            "  {name}:\n    backend: postgres\n    dsn: \"{dsn}\"\n    schema: {schema}\n"
+        ));
+    }
+    y
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn spec_0051_the_migration_from_sqlite_to_postgres_still_copies_the_state() {
+    let Some(dsn) = pg_dsn() else {
+        eprintln!("skipping: MCPFS_TEST_PG_DSN is unset");
+        return;
+    };
+    let d = deployment_with_atlas();
+    let schema = format!("spec0051_{}", std::process::id());
+    let from = d.write_config("from.yaml", ALL_SQLITE, "");
+    let to = d.conf.path().join("to.yaml");
+    fs::write(&to, postgres_yaml(free_port(), &d.public_key, &dsn, &schema)).unwrap();
+
+    let out = d.run(&["migrate", "--from", from.to_str().unwrap(), "--to", to.to_str().unwrap()]);
+    let psql = |sql: &str| {
+        Command::new("psql").args([&dsn, "-tA", "-c", sql]).output().expect("psql on PATH")
+    };
+    let rows = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>();
+    let nodes = psql(&format!("SELECT count(*) FROM \"{schema}\".nodes"));
+    psql(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"));
+    assert!(out.status.success(), "migrate failed: {}", stderr(&out));
+    assert!(rows.is_ok_and(|n| n > 0), "no row total on stdout");
+    assert!(stderr(&out).contains("migrating"), "{}", stderr(&out));
+    let nodes: u64 = String::from_utf8_lossy(&nodes.stdout).trim().parse().unwrap();
+    assert!(nodes >= 3, "the three files of atlas must reach PostgreSQL, found {nodes}");
+}

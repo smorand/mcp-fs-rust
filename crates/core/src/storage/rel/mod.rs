@@ -25,8 +25,6 @@ pub mod dialect;
 pub mod postgres;
 pub mod schema;
 pub mod sqlite;
-#[cfg(feature = "sqlserver")]
-pub mod sqlserver;
 
 pub use dialect::{Assign, AssignValue, ColumnType, Dialect, Upsert, UpsertAction};
 pub use schema::{Column, ColumnMigration, ForeignKey, Index, SchemaSet, Table};
@@ -34,9 +32,6 @@ pub use sqlite::SqliteRelationalDb;
 
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresRelationalDb;
-
-#[cfg(feature = "sqlserver")]
-pub use sqlserver::SqlServerRelationalDb;
 
 use crate::errors::{Result, ToolError};
 use async_trait::async_trait;
@@ -48,7 +43,7 @@ use std::time::Duration;
 /// Pool sizing, mirrored from `infra.<store>.pool` in the config.
 ///
 /// Engine neutral on purpose: it lives here rather than beside one driver so a
-/// build with only the `sqlserver` feature still has it.
+/// build without the PostgreSQL feature still has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolSettings {
     pub max_connections: u32,

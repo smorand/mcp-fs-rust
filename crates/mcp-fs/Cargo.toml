@@ -15,7 +15,6 @@ path = "src/main.rs"
 [features]
 default = []
 postgres = ["mcp-fs-core/postgres"]
-sqlserver = ["mcp-fs-core/sqlserver"]
 rag = ["mcp-fs-core/rag"]
 all-backends = ["mcp-fs-core/all-backends"]
 

@@ -43,7 +43,6 @@ const IMG_A: &[u8] = b"IMG-A";
 #[derive(Clone, Copy)]
 enum Engine {
     Postgres,
-    SqlServer,
 }
 
 /// A server whose metadata lives in a private scope of a shared database, with
@@ -64,7 +63,6 @@ impl Fixture {
     async fn new(engine: Engine, test: &str, doc: Option<Conversion>) -> Option<Self> {
         let (var, feature, enabled) = match engine {
             Engine::Postgres => ("MCPFS_TEST_PG_DSN", "postgres", cfg!(feature = "postgres")),
-            Engine::SqlServer => ("MCPFS_TEST_MSSQL_DSN", "sqlserver", cfg!(feature = "sqlserver")),
         };
         let Some(dsn) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) else {
             eprintln!("skipping {test}: {var} is unset");
@@ -83,13 +81,11 @@ impl Fixture {
         let mut config = ServerConfig::default();
         config.infra.meta.backend = match engine {
             Engine::Postgres => backend::POSTGRES,
-            Engine::SqlServer => backend::SQLSERVER,
         }
         .into();
         config.infra.meta.dsn = Dsn::new(scoped_dsn);
         config.infra.meta.schema = match engine {
             Engine::Postgres => scope.clone(),
-            Engine::SqlServer => String::new(),
         };
         config.infra.blob.dir = dir.path().join("blobs").display().to_string();
         config.auth.admins = vec![ADA.to_string()];
@@ -204,7 +200,7 @@ impl Fixture {
 
     async fn cleanup(self) {
         let Self { state, db, engine, dsn, scope, .. } = self;
-        // SQL Server refuses to drop a database a pooled connection still holds.
+        // Drop the pool first: the scope cannot be dropped while a connection holds it.
         drop(state);
         drop(db);
         drop_scope(engine, &dsn, &scope).await;
@@ -270,46 +266,22 @@ async fn counts(f: &Fixture, volume: &str) -> Vec<(&'static str, i64)> {
 }
 
 #[cfg(feature = "postgres")]
-async fn drop_scope(engine: Engine, dsn: &str, scope: &str) {
-    if let Engine::Postgres = engine {
-        use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
-        let db =
-            PostgresRelationalDb::connect(dsn, "public", PoolSettings::default()).await.unwrap();
-        let sql = format!("DROP SCHEMA IF EXISTS \"{scope}\" CASCADE");
-        db.execute(&Query::new(sql)).await.unwrap();
-        return;
-    }
-    drop_database(dsn, scope).await;
-}
-
-#[cfg(not(feature = "postgres"))]
 async fn drop_scope(_engine: Engine, dsn: &str, scope: &str) {
-    drop_database(dsn, scope).await;
-}
-
-#[cfg(feature = "sqlserver")]
-async fn drop_database(dsn: &str, name: &str) {
-    use crate::storage::rel::{PoolSettings, SqlServerRelationalDb};
-    let db = SqlServerRelationalDb::connect(dsn, PoolSettings::default()).await.unwrap();
-    // SINGLE_USER rolls back and closes any connection a dropped pool left open.
-    let sql = format!(
-        "IF DB_ID(N'{name}') IS NOT NULL BEGIN \
-         ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; \
-         DROP DATABASE [{name}]; END"
-    );
+    use crate::storage::rel::{PoolSettings, PostgresRelationalDb};
+    let db = PostgresRelationalDb::connect(dsn, "public", PoolSettings::default()).await.unwrap();
+    let sql = format!("DROP SCHEMA IF EXISTS \"{scope}\" CASCADE");
     db.execute(&Query::new(sql)).await.unwrap();
 }
 
-#[cfg(not(feature = "sqlserver"))]
-async fn drop_database(_dsn: &str, _name: &str) {
-    // Unreachable: the fixture skips before any database exists without the feature.
+#[cfg(not(feature = "postgres"))]
+async fn drop_scope(_engine: Engine, _dsn: &str, _scope: &str) {
+    // Unreachable: the fixture skips before any scope exists without the feature.
 }
 
 /// Creates the scope and returns a handle on it plus the DSN the server uses.
 async fn open_scope(engine: Engine, dsn: &str, scope: &str) -> (Arc<dyn RelationalDb>, String) {
     match engine {
         Engine::Postgres => open_pg(dsn, scope).await,
-        Engine::SqlServer => open_mssql(dsn, scope).await,
     }
 }
 
@@ -325,37 +297,6 @@ async fn open_pg(dsn: &str, schema: &str) -> (Arc<dyn RelationalDb>, String) {
 #[cfg(not(feature = "postgres"))]
 async fn open_pg(_dsn: &str, _schema: &str) -> (Arc<dyn RelationalDb>, String) {
     unreachable!("the fixture skips without the postgres feature")
-}
-
-#[cfg(feature = "sqlserver")]
-async fn open_mssql(dsn: &str, name: &str) -> (Arc<dyn RelationalDb>, String) {
-    use crate::storage::rel::{PoolSettings, SqlServerRelationalDb};
-    let master = SqlServerRelationalDb::connect(dsn, PoolSettings::default()).await.unwrap();
-    master.execute(&Query::new(format!("CREATE DATABASE [{name}]"))).await.unwrap();
-    drop(master);
-    let scoped = with_database(dsn, name);
-    let db = SqlServerRelationalDb::connect(&scoped, PoolSettings::default()).await.unwrap();
-    db.migrate(&crate::storage::meta::schema()).await.unwrap();
-    (Arc::new(db), scoped)
-}
-
-#[cfg(not(feature = "sqlserver"))]
-async fn open_mssql(_dsn: &str, _name: &str) -> (Arc<dyn RelationalDb>, String) {
-    unreachable!("the fixture skips without the sqlserver feature")
-}
-
-/// The ADO.NET `dsn` pointed at database `name` instead of the one it names.
-fn with_database(dsn: &str, name: &str) -> String {
-    let mut parts: Vec<String> = dsn
-        .split(';')
-        .filter(|p| {
-            let key = p.split('=').next().unwrap_or_default().trim().to_ascii_lowercase();
-            !p.trim().is_empty() && key != "database" && key != "initial catalog"
-        })
-        .map(str::to_string)
-        .collect();
-    parts.push(format!("Database={name}"));
-    parts.join(";")
 }
 
 // ── BT-005: trash rows of a deleted project ─────────────────────────────────
@@ -378,12 +319,6 @@ async fn bt_005(engine: Engine, test: &str) {
 #[tokio::test]
 async fn spec_0024_bt_005_trash_rows_of_a_deleted_project_pg() {
     bt_005(Engine::Postgres, "bt005pg").await;
-}
-
-/// SPEC-0024/BT-005 on SQL Server (BR-001, trash part).
-#[tokio::test]
-async fn spec_0024_bt_005_trash_rows_of_a_deleted_project_mssql() {
-    bt_005(Engine::SqlServer, "bt005ms").await;
 }
 
 // ── BT-008: the artifact sweep spares the new project's blobs ───────────────
@@ -465,12 +400,6 @@ async fn bt_010(engine: Engine, test: &str) {
 #[tokio::test]
 async fn spec_0024_bt_010_no_metadata_row_of_a_deleted_volume_remains_pg() {
     bt_010(Engine::Postgres, "bt010pg").await;
-}
-
-/// SPEC-0024/BT-010 on SQL Server (BR-004, BR-007).
-#[tokio::test]
-async fn spec_0024_bt_010_no_metadata_row_of_a_deleted_volume_remains_mssql() {
-    bt_010(Engine::SqlServer, "bt010ms").await;
 }
 
 // ── BT-012: an old export link answers 404 ──────────────────────────────────

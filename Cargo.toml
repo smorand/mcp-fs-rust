@@ -40,20 +40,6 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls",
     "postgres",
 ] }
-# SQL Server, optional and off by default. `tiberius-ng` is the maintained fork of
-# `tiberius`, which had no release since 2024 and ships unpatched advisories; sqlx
-# has no MSSQL driver at all (removed in 0.7, never rewritten), so a separate
-# driver is the only option. Pinned exactly because the fork is young.
-# `rustls` instead of the default `native-tls` keeps OpenSSL out of the build.
-tiberius-ng = { version = "=0.13.1", default-features = false, features = [
-    "rustls",
-    "tds73",
-    "chrono",
-] }
-# Connection pooling for tiberius, which ships none of its own. bb8 is async and
-# already the pool behind several tokio ecosystem drivers.
-bb8 = "0.9"
-tokio-util = { version = "0.7", features = ["compat"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
 aws-config = "1"
 aws-credential-types = "1"

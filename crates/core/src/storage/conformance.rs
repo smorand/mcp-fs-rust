@@ -4,14 +4,12 @@
 //! exists for a different question: does a store behave the SAME on another
 //! engine? So every case here takes an [`Engine`] and is run once per backend.
 //!
-//! SQLite always runs. PostgreSQL runs only when `MCPFS_TEST_PG_DSN` is set and
-//! SQL Server only when `MCPFS_TEST_MSSQL_DSN` is set, so `cargo test` stays green
-//! with no database and no Docker:
+//! SQLite always runs. PostgreSQL runs only when `MCPFS_TEST_PG_DSN` is set, so
+//! `cargo test` stays green with no database and no Docker:
 //!
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
-//! MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
 //!   cargo test --all-features conformance
 //! ```
 //!
@@ -40,7 +38,6 @@ use std::sync::Arc;
 enum Engine {
     Sqlite,
     Postgres(String),
-    SqlServer(String),
 }
 
 impl Engine {
@@ -48,7 +45,6 @@ impl Engine {
         match self {
             Self::Sqlite => "sqlite",
             Self::Postgres(_) => "postgres",
-            Self::SqlServer(_) => "sqlserver",
         }
     }
 
@@ -77,23 +73,6 @@ impl Engine {
             // The length, never the value: a DSN carries a password.
             Self::Postgres(dsn) => Err(crate::errors::ToolError::not_supported(format!(
                 "the postgres feature is not compiled in, so the {} character dsn is unusable",
-                dsn.len()
-            ))),
-            #[cfg(feature = "sqlserver")]
-            Self::SqlServer(dsn) => {
-                let db = crate::storage::rel::SqlServerRelationalDb::connect(
-                    dsn,
-                    crate::storage::rel::PoolSettings {
-                        max_connections: 4,
-                        acquire_timeout: std::time::Duration::from_secs(10),
-                    },
-                )
-                .await?;
-                Ok(Arc::new(db))
-            }
-            #[cfg(not(feature = "sqlserver"))]
-            Self::SqlServer(dsn) => Err(crate::errors::ToolError::not_supported(format!(
-                "the sqlserver feature is not compiled in, so the {} character dsn is unusable",
                 dsn.len()
             ))),
         }
@@ -1214,21 +1193,4 @@ async fn postgres_passes_the_conformance_suite() {
     run_suite(&Engine::Postgres(dsn))
         .await
         .expect("postgres must satisfy exactly the same cases as sqlite");
-}
-
-/// Skipped, not failed, when `MCPFS_TEST_MSSQL_DSN` is unset: the default
-/// `cargo test` run must not need a database.
-#[tokio::test]
-async fn sqlserver_passes_the_conformance_suite() {
-    let Ok(dsn) = std::env::var("MCPFS_TEST_MSSQL_DSN") else {
-        eprintln!("skipping the sqlserver conformance suite: MCPFS_TEST_MSSQL_DSN is unset");
-        return;
-    };
-    if !cfg!(feature = "sqlserver") {
-        eprintln!("skipping the sqlserver conformance suite: built without --features sqlserver");
-        return;
-    }
-    run_suite(&Engine::SqlServer(dsn))
-        .await
-        .expect("sqlserver must satisfy exactly the same cases as sqlite");
 }

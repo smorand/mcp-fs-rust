@@ -2537,63 +2537,6 @@ mod tests {
         assert!(ensure_storable_path(Dialect::Postgres, &over).is_ok());
     }
 
-    /// A rename whose destination fits but whose descendants would not must fail as a
-    /// whole: the transaction is one unit, so the tree stays where it was.
-    #[tokio::test]
-    async fn a_rename_that_would_overflow_a_descendant_is_refused_live() {
-        let Ok(dsn) = std::env::var("MCPFS_TEST_MSSQL_DSN") else {
-            eprintln!("skipping the live path ceiling check: MCPFS_TEST_MSSQL_DSN is unset");
-            return;
-        };
-        if !cfg!(feature = "sqlserver") {
-            eprintln!("skipping the live path ceiling check: built without --features sqlserver");
-            return;
-        }
-        #[cfg(feature = "sqlserver")]
-        {
-            let db = crate::storage::rel::SqlServerRelationalDb::connect(
-                &dsn,
-                crate::storage::rel::PoolSettings {
-                    max_connections: 2,
-                    acquire_timeout: std::time::Duration::from_secs(10),
-                },
-            )
-            .await
-            .expect("connect to the test SQL Server");
-            let db: Arc<dyn RelationalDb> = Arc::new(db);
-            let s = RelationalMetaStore::open(db, &"p".repeat(MAX_VOLUME_ID_CHARS)).await.unwrap();
-            s.remove_subtree("/src").await.ok();
-            s.remove_subtree("/dst").await.ok();
-
-            // A path at the ceiling must round trip under the LONGEST project id, which
-            // is the case the arithmetic budgets for. This is what caught the original
-            // 450 character ceiling: it built a 916 byte key and SQL Server refused it.
-            let deep = format!("/{}", "a".repeat(MAX_PATH_CHARS - 1));
-            assert_eq!(deep.chars().count(), MAX_PATH_CHARS);
-            s.put_file(&deep, Some("shalimit"), 3, crate::storage::traits::MODE_FILE)
-                .await
-                .expect("a path at the ceiling must be storable");
-            assert!(s.get(&deep).await.unwrap().is_some(), "and readable back");
-            s.remove_subtree(&deep).await.unwrap();
-
-            // Now a short tree, moved under a prefix long enough to overflow a child.
-            let child = "/src/".to_string() + &"b".repeat(40);
-            s.put_file(&child, Some("shamove"), 3, crate::storage::traits::MODE_FILE)
-                .await
-                .unwrap();
-            let long_dst = format!("/{}", "d".repeat(MAX_PATH_CHARS - 20));
-            assert!(long_dst.chars().count() <= MAX_PATH_CHARS, "the destination fits");
-
-            let e = s.rename("/src", &long_dst).await.unwrap_err();
-            assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
-            assert!(
-                s.get(&child).await.unwrap().is_some(),
-                "the refused rename must leave the tree untouched"
-            );
-            s.remove_subtree("/src").await.unwrap();
-        }
-    }
-
     #[tokio::test]
     async fn schema_declares_both_tables_keyed_by_volume() {
         let s = schema();

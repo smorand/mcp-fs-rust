@@ -1,2 +1,7 @@
 config::tests::sqlserver_without_a_dsn_is_rejected_and_names_the_key
 config::tests::sqlserver_without_the_cargo_feature_names_the_feature
+storage::conformance::sqlserver_passes_the_conformance_suite
+storage::meta::tests::a_rename_that_would_overflow_a_descendant_is_refused_live
+tools::mssql_trash_e2e::spec_0023_bt_001_deleted_files_are_listed_in_the_trash
+tools::teardown_e2e::spec_0024_bt_005_trash_rows_of_a_deleted_project_mssql
+tools::teardown_e2e::spec_0024_bt_010_no_metadata_row_of_a_deleted_volume_remains_mssql

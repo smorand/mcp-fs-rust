@@ -39,10 +39,9 @@ use tokio::sync::Mutex;
 /// file open, so each volume keeps getting its own fresh handle exactly as before.
 #[derive(Default)]
 pub struct RelationalRegistry {
-    /// Gated on having ANY SQL driver, not on one of them: only a SQL engine is
-    /// ever cached, and with no driver at all there is nothing to share, so the
-    /// map would be permanently empty.
-    #[cfg(any(feature = "postgres", feature = "sqlserver"))]
+    /// Gated on the PostgreSQL driver: only a networked engine is ever cached, and
+    /// SQLite stores a file, so without it the map would be permanently empty.
+    #[cfg(feature = "postgres")]
     shared: Mutex<HashMap<String, Arc<dyn RelationalDb>>>,
 }
 
@@ -57,14 +56,14 @@ impl RelationalRegistry {
     /// counting is the only externally visible difference between one shared
     /// registry and several private ones, since each private one would cache the
     /// same target separately.
-    #[cfg(any(feature = "postgres", feature = "sqlserver"))]
+    #[cfg(feature = "postgres")]
     pub async fn pool_count(&self) -> usize {
         self.shared.lock().await.len()
     }
 
-    /// Always 0 without a SQL driver: nothing is ever cached, so there is no pool
+    /// Always 0 without the PostgreSQL driver: nothing is ever cached, so there is no pool
     /// to count and callers do not need to be feature gated themselves.
-    #[cfg(not(any(feature = "postgres", feature = "sqlserver")))]
+    #[cfg(not(feature = "postgres"))]
     pub async fn pool_count(&self) -> usize {
         0
     }
@@ -73,7 +72,7 @@ impl RelationalRegistry {
     ///
     /// The DSN is hashed rather than stored: a map key is easy to print by
     /// accident and a DSN carries a password.
-    #[cfg(any(feature = "postgres", feature = "sqlserver"))]
+    #[cfg(feature = "postgres")]
     fn key(backend: &str, dsn: &Dsn, schema: &str) -> String {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -107,7 +106,6 @@ async fn build_relational_db(
     match store.backend {
         backend::SQLITE => Ok(Arc::new(rel::SqliteRelationalDb::open(sqlite_path())?)),
         backend::POSTGRES => build_postgres(registry, section, store).await,
-        backend::SQLSERVER => build_sqlserver(registry, section, store).await,
         other => Err(unknown_backend(section, other)),
     }
 }
@@ -144,46 +142,6 @@ async fn build_postgres(
     let db: Arc<dyn RelationalDb> = Arc::new(db);
     guard.insert(key, db.clone());
     Ok(db)
-}
-
-#[cfg(feature = "sqlserver")]
-async fn build_sqlserver(
-    registry: &RelationalRegistry,
-    _section: &str,
-    store: RelationalTarget<'_>,
-) -> Result<Arc<dyn RelationalDb>> {
-    // SQL Server has no schema selector of its own here: an ADO.NET DSN names the
-    // database directly, so the key uses the section's schema only for uniqueness.
-    let key = RelationalRegistry::key(backend::SQLSERVER, store.dsn, store.schema);
-    let mut guard = registry.shared.lock().await;
-    if let Some(existing) = guard.get(&key) {
-        return Ok(existing.clone());
-    }
-    let db = rel::SqlServerRelationalDb::connect(
-        store.dsn.expose(),
-        rel::PoolSettings {
-            max_connections: store.pool.max_connections,
-            acquire_timeout: std::time::Duration::from_secs(store.pool.acquire_timeout_secs),
-        },
-    )
-    .await?;
-    let db: Arc<dyn RelationalDb> = Arc::new(db);
-    guard.insert(key, db.clone());
-    Ok(db)
-}
-
-#[cfg(not(feature = "sqlserver"))]
-async fn build_sqlserver(
-    _registry: &RelationalRegistry,
-    section: &str,
-    store: RelationalTarget<'_>,
-) -> Result<Arc<dyn RelationalDb>> {
-    Err(ToolError::invalid_argument(format!(
-        "infra.{section}.backend is 'sqlserver' (pool max {}, dsn {}) but this binary was \
-         built without the 'sqlserver' cargo feature: rebuild with --features sqlserver",
-        store.pool.max_connections,
-        if store.dsn.is_empty() { "missing" } else { "configured" }
-    )))
 }
 
 #[cfg(not(feature = "postgres"))]
