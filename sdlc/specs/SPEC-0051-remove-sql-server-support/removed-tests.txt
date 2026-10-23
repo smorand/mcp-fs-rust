@@ -1,0 +1,2 @@
+config::tests::sqlserver_without_a_dsn_is_rejected_and_names_the_key
+config::tests::sqlserver_without_the_cargo_feature_names_the_feature

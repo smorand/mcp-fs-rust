@@ -25,3 +25,6 @@ mcp-fs-core = { path = "../core" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

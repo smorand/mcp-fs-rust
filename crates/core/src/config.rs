@@ -13,10 +13,12 @@ use std::path::{Path, PathBuf};
 pub mod backend {
     pub const SQLITE: &str = "sqlite";
     pub const POSTGRES: &str = "postgres";
+    /// Removed (SPEC-0051): still named here only so the refusal can recognize it and
+    /// the code that has not been deleted yet keeps compiling.
     pub const SQLSERVER: &str = "sqlserver";
 
     /// Every accepted value, for error messages.
-    pub const ALL: [&str; 3] = [SQLITE, POSTGRES, SQLSERVER];
+    pub const ALL: [&str; 2] = [SQLITE, POSTGRES];
 }
 
 /// A database connection string.
@@ -968,6 +970,9 @@ impl ServerConfig {
 
     /// Reject a configuration that cannot work, naming the offending key.
     pub fn validate(&self) -> Result<()> {
+        // First of all, so a removed database is always reported as removed, whatever else
+        // is wrong with the file (SPEC-0051).
+        self.reject_removed_backends()?;
         if self.safety.max_diff_file_bytes.bytes().is_none() {
             return Err(ToolError::invalid_argument(
                 "invalid safety.max_diff_file_bytes: must be a whole number of bytes above zero",
@@ -981,6 +986,24 @@ impl ServerConfig {
         validate_search(&self.search)?;
         crate::git::remote::validate_hosts(&self.git)?;
         Ok(())
+    }
+
+    /// Refuse a store naming SQL Server, scanning meta, admin, git then oauth so the first
+    /// one in that order is the one named. The dsn is never read, so it cannot be echoed.
+    fn reject_removed_backends(&self) -> Result<()> {
+        let stores = [
+            ("meta", &self.infra.meta.backend),
+            ("admin", &self.infra.admin.backend),
+            ("git", &self.infra.git.backend),
+            ("oauth", &self.infra.oauth.backend),
+        ];
+        match stores.into_iter().find(|(_, b)| *b == backend::SQLSERVER) {
+            Some((section, _)) => Err(ToolError::invalid_argument(format!(
+                "infra.{section}.backend 'sqlserver' is no longer supported: \
+                 use 'postgres' or 'sqlite'"
+            ))),
+            None => Ok(()),
+        }
     }
 
     // ── path helpers (mirror the C# ConfigLoader helpers) ────────────────────
@@ -1055,20 +1078,6 @@ fn validate_store(section: &str, backend: &str, dsn: &Dsn) -> Result<()> {
                 return Err(ToolError::invalid_argument(format!(
                     "infra.{section}.backend is 'postgres' but this binary was built without \
                      the 'postgres' cargo feature: rebuild with --features postgres"
-                )));
-            }
-            Ok(())
-        }
-        backend::SQLSERVER => {
-            if dsn.is_empty() {
-                return Err(ToolError::invalid_argument(format!(
-                    "infra.{section}.dsn is required when infra.{section}.backend is 'sqlserver'"
-                )));
-            }
-            if !cfg!(feature = "sqlserver") {
-                return Err(ToolError::invalid_argument(format!(
-                    "infra.{section}.backend is 'sqlserver' but this binary was built without \
-                     the 'sqlserver' cargo feature: rebuild with --features sqlserver"
                 )));
             }
             Ok(())
@@ -1522,37 +1531,19 @@ infra:
         }
     }
 
-    /// A backend that needs a server cannot fall back to a file, so a missing DSN
-    /// has to stop the boot rather than silently write somewhere else.
+    /// SPEC-0051: SQL Server is refused whatever the rest of the block says, and the
+    /// message does not depend on a dsn being present.
     #[test]
-    fn sqlserver_without_a_dsn_is_rejected_and_names_the_key() {
-        let e = ServerConfig::from_yaml("infra:\n  oauth:\n    backend: sqlserver\n")
-            .expect_err("sqlserver cannot be reached without a dsn");
-        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
-        assert!(e.message.contains("infra.oauth.dsn"), "{}", e.message);
-    }
-
-    /// Only meaningful in a build that lacks the feature, which is the default.
-    #[cfg(not(feature = "sqlserver"))]
-    #[test]
-    fn sqlserver_without_the_cargo_feature_names_the_feature() {
-        let e = ServerConfig::from_yaml(
-            "infra:\n  oauth:\n    backend: sqlserver\n    dsn: \"server=h;database=d\"\n",
-        )
-        .expect_err("the driver is not compiled in");
-        assert!(e.message.contains("--features sqlserver"), "{}", e.message);
-    }
-
-    /// With the driver compiled in, a complete block is accepted at load time. The
-    /// connection itself is only attempted when a store opens.
-    #[cfg(feature = "sqlserver")]
-    #[test]
-    fn sqlserver_with_a_dsn_is_accepted_when_the_feature_is_on() {
-        let c = ServerConfig::from_yaml(
-            "infra:\n  oauth:\n    backend: sqlserver\n    dsn: \"server=h;database=d\"\n",
-        )
-        .expect("a complete sqlserver block is valid");
-        assert_eq!(c.infra.oauth.backend, backend::SQLSERVER);
+    fn spec_0051_sqlserver_is_refused_with_or_without_a_dsn() {
+        for dsn in ["", "    dsn: \"server=h;database=d\"\n"] {
+            let yaml = format!("infra:\n  oauth:\n    backend: sqlserver\n{dsn}");
+            let e = ServerConfig::from_yaml(&yaml).expect_err("sqlserver was removed");
+            assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+            assert_eq!(
+                e.message,
+                "infra.oauth.backend 'sqlserver' is no longer supported: use 'postgres' or 'sqlite'"
+            );
+        }
     }
 
     /// Only meaningful in a build that lacks the feature, which is the default.
