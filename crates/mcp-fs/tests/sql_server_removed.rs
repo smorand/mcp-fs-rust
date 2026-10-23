@@ -596,3 +596,58 @@ fn spec_0051_the_migration_from_sqlite_to_postgres_still_copies_the_state() {
     let nodes: u64 = String::from_utf8_lossy(&nodes.stdout).trim().parse().unwrap();
     assert!(nodes >= 3, "the three files of atlas must reach PostgreSQL, found {nodes}");
 }
+
+// ── E2E-004: the documentation lists two databases ───────────────────────────
+
+const REMOVAL_SENTENCE: &str = "SQL Server support was removed on 2026-10-23 (SPEC-0051).";
+const REMOVED_TERMS: [&str; 5] = ["sqlserver", "sql server", "mssql", "tiberius", "bb8"];
+
+fn documentation_files() -> Vec<PathBuf> {
+    let root = repo_root();
+    let mut files =
+        vec![root.join("README.md"), root.join("AGENTS.md"), root.join("docker-compose.test.yml")];
+    for entry in fs::read_dir(root.join(".agent_docs")).unwrap() {
+        files.push(entry.unwrap().path());
+    }
+    files
+}
+
+/// A date such as 2026-09-15, which marks a line of the history document.
+fn carries_a_date(line: &str) -> bool {
+    line.as_bytes().windows(10).any(|w| {
+        w.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+    })
+}
+
+#[test]
+fn spec_0051_the_documentation_lists_two_databases() {
+    let mut offenders = Vec::new();
+    for file in documentation_files() {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&file).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            if !REMOVED_TERMS.iter().any(|t| lower.contains(t)) {
+                continue;
+            }
+            let removal_note = line.contains(REMOVAL_SENTENCE)
+                && matches!(name.as_str(), "README.md" | "lineage.md");
+            let history = name == "lineage.md" && carries_a_date(line);
+            if !(removal_note || history) {
+                offenders.push(format!("{name}:{}: {line}", n + 1));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "SQL Server is still documented:\n{}", offenders.join("\n"));
+
+    let readme = fs::read_to_string(repo_root().join("README.md")).unwrap();
+    assert_eq!(
+        readme.matches(REMOVAL_SENTENCE).count(),
+        1,
+        "the README carries the removal note once"
+    );
+    assert!(readme.contains("sqlite | postgres"), "the configuration example lists two databases");
+}

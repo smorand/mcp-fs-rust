@@ -34,7 +34,7 @@ plane can never disagree.
                     |
         +-----------v------------------------------------------------------+
         | storage::rel: RelationalDb / RelationalTx + Dialect              |
-        | SqliteRelationalDb | PgRelationalDb | MssqlRelationalDb          |
+        | SqliteRelationalDb | PgRelationalDb                              |
         +------------------------------------------------------------------+
 ```
 
@@ -113,11 +113,10 @@ nothing. Export zips, git objects and artifact blobs are not nodes, so not usage
   O(n log k). The default trash directory is `.mcp_trash`.
 * **Case exact subtree selection (2026-10-23, SPEC-0050).** A path and everything below it is
   selected by `SubtreeMatch` (`storage/meta.rs`), never by a bare `LIKE`: the escaped `LIKE` narrows
-  the rows, a substring equality rendered by `Dialect` (`substr_fn`, `char_len`, `exact_equals`)
+  the rows, a substring equality (`substr(col, 1, n) = prefix`, `n` counted in characters)
   decides, letter case included. SQLite's `LIKE` folds ASCII case, so `/video/%` alone also selected
   `/Video/x` and a permanent delete, a move, a copy, a glob or a trash listing of one reached the
-  other (BL-0072). SQL Server forces a binary collation on the equality and counts UTF-16 units; that
-  rendering is unrun on a live server (BL-0073). The git abbreviated hash `LIKE` is untouched.
+  other (BL-0072). The git abbreviated hash `LIKE` is untouched.
 * **Folder usage read (2026-10-22, SPEC-0049).** `admin.get_project_folder_usage` and `GET
   /api/admin/projects/{project_id}/folder-usage` call `tools::admin::get_project_folder_usage`: cap,
   `reader_project` gate, `parse_folder` (one trailing `/` dropped, `.`/`..`/empty segments refused as typed,
@@ -138,7 +137,7 @@ nothing. Export zips, git objects and artifact blobs are not nodes, so not usage
   no project bytes. A limit lowered below usage removes nothing; every positive delta is
   then refused. Fail closed: an error reading the limit or the counter refuses the
   operation rather than letting it through unchecked.
-* **Gap.** Two processes sharing one PostgreSQL or SQL Server database can lose an update
+* **Gap.** Two processes sharing one PostgreSQL database can lose an update
   only during the very first backfill of a volume, if the other process writes between the
   SUM and the insert; the in process lock does not cross processes.
 
@@ -172,8 +171,8 @@ The images and tables a conversion keeps live in four meta tables, every row key
 ## The relational layer
 
 Every store speaks `storage::rel::RelationalDb` rather than a driver, so the metadata
-tree, the ACL registry, the git index and the OAuth store each run on SQLite (default),
-PostgreSQL or SQL Server, chosen per store in the config. Full reference in
+tree, the ACL registry, the git index and the OAuth store each run on SQLite (default)
+or PostgreSQL, chosen per store in the config. Full reference in
 [`backends.md`](backends.md).
 
 ```text
@@ -183,8 +182,8 @@ RelationalMetaStore  RelationalAdminStore  RelationalGitDb  RelationalOAuthPersi
                    |  RelationalDb (dyn) + Dialect
      +-------------+--------------+----------------+
      |                            |                |
-SqliteRelationalDb        PgRelationalDb    MssqlRelationalDb
-(serialized, actor)       (sqlx pool)       (bb8 + tiberius-ng)
+SqliteRelationalDb        PgRelationalDb
+(serialized, actor)       (sqlx pool)
 ```
 
 Three properties matter above the layer:
@@ -195,7 +194,7 @@ Three properties matter above the layer:
 * **`run_retrying` is opt in and asserts idempotence.** It re runs the whole closure on a
   transient failure (up to `MAX_TX_ATTEMPTS`, 3). Work that touches state outside the
   transaction must use `begin()` instead. See `backends.md`.
-* **`volume_id` scopes every row.** One shared PostgreSQL or SQL Server database holds
+* **`volume_id` scopes every row.** One shared PostgreSQL database holds
   every volume, so `volume_id` is the first key column of `nodes`, `blob_refs` and the
   `git_*` tables and belongs in every `WHERE` clause. Under SQLite it is constant per
   file, so that deployment keeps one file per volume.
@@ -334,7 +333,7 @@ and never leaks across callers.
   by a short lived actor holding the lock for its whole life, because a
   `rusqlite::Transaction` borrows its `Connection` and a `MutexGuard` is not `Send`, so
   it cannot be held across an `.await`.
-* **PostgreSQL and SQL Server: a real connection pool** (`pool.max_connections`,
+* **PostgreSQL: a real connection pool** (`pool.max_connections`,
   `pool.acquire_timeout_secs`), so writes run concurrently instead of serialized. That
   makes two failures newly possible which SQLite could not produce: a serialization
   conflict and a deadlock victim. Both are marked `retryable` and are re run by

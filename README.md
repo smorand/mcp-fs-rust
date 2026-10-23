@@ -6,7 +6,7 @@ OpenAPI docs, and an optional Git HTTP smart server. Runs from a single binary w
 **no external service by default**.
 
 Server state (metadata tree, ACL, git index, OAuth tokens) = **SQLite** by default, or
-**PostgreSQL** or **SQL Server** chosen per store in the config. File bytes = **local
+**PostgreSQL** chosen per store in the config. File bytes = **local
 filesystem** (default) or **MinIO/S3**, content-addressed by sha256. Auth = verified
 **RS256 bearer JWT**.
 
@@ -25,22 +25,17 @@ A default build is SQLite only and carries no database driver beyond bundled `ru
 |---|---|---|
 | (default) | SQLite | `rusqlite`, bundled |
 | `postgres` | PostgreSQL | `sqlx` |
-| `sqlserver` | SQL Server | `tiberius-ng` + `bb8` |
-| `all-backends` | both | |
+| `all-backends` | PostgreSQL and vector search | `sqlx` |
 
-`tiberius-ng` is a young, low traffic fork, chosen because `sqlx` has no MSSQL driver and
-the alternative (`odbc-api`) would require a system driver manager on every host. It is
-pinned, optional, and confined to one file. The full comparison and the exit plan are in
-[`.agent_docs/backends.md`](.agent_docs/backends.md#decision-which-sql-server-driver-2026-09-15).
+SQL Server support was removed on 2026-10-23 (SPEC-0051).
 
 ```bash
 cargo build --release --features postgres
 cargo build --release --features all-backends
 ```
 
-SQL Server needs a second driver because **sqlx removed its MSSQL support in 0.7** and the
-rewrite has never shipped. Both are optional so a default build carries neither the
-dependency nor its TLS stack.
+The PostgreSQL driver is optional, so a default build carries neither the dependency nor
+its TLS stack.
 
 ## Quickstart
 
@@ -92,7 +87,7 @@ tried.
 
 ### Switching backend with data in place
 
-`migrate` is how you move an existing deployment onto PostgreSQL or SQL Server. It copies
+`migrate` is how you move an existing deployment onto PostgreSQL. It copies
 every row the server owns, from the engines one config names to the engines the other
 names.
 
@@ -127,7 +122,7 @@ move them one at a time:
 ```yaml
 infra:
   meta:                          # the per volume file tree
-    backend: postgres            # sqlite | postgres | sqlserver
+    backend: postgres            # sqlite | postgres
     dsn: "${MCPFS_META_DSN}"     # secret, required for a server engine
     schema: mcpfs                # postgres only
     pool: { max_connections: 20, acquire_timeout_secs: 10 }
@@ -173,7 +168,7 @@ Full schema in [`.agent_docs/config.md`](.agent_docs/config.md).
 the bytes live in the bucket while the metadata stays in `state/`: a project needs **both
 halves**.
 
-On PostgreSQL or SQL Server one database holds every volume, discriminated by a
+On PostgreSQL one database holds every volume, discriminated by a
 `volume_id` column, since creating a database per project on the fly is not viable. Blob
 bytes never move into the relational database, and `state/git-repos/` stays on disk
 because libgit2 needs a real working directory.
@@ -389,25 +384,24 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 The suite is the quality gate and must be green before any commit. Use `--all-features` on
-clippy, otherwise the two optional drivers are never compiled and their warnings never
+clippy, otherwise the optional driver is never compiled and their warnings never
 surface.
 
-The default run needs no database and no Docker. To exercise PostgreSQL and SQL Server,
-bring the services up and pass their dsn; the cases skip themselves when the variables are
+The default run needs no database and no Docker. To exercise PostgreSQL,
+bring the service up and pass its dsn; the cases skip themselves when the variable is
 absent:
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
 
 MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
-MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
   cargo test --workspace --all-features
 
 docker compose -f docker-compose.test.yml down -v
 ```
 
 One conformance suite runs the same assertions against every engine, which is what proves a
-store behaves identically on all three. See
+store behaves identically on both. See
 [`.agent_docs/testing.md`](.agent_docs/testing.md).
 
 ## Interactive CLI agent

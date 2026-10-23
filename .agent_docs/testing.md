@@ -38,7 +38,7 @@ means something went wrong.
 ./test.sh                                    # cargo test --workspace
 cargo test -p mcp-fs-core --lib              # the library, where every test lives
 cargo test -p mcp-fs-core --lib storage::     # one area
-cargo test --workspace --all-features        # includes the postgres and sqlserver drivers
+cargo test --workspace --all-features        # includes the postgres driver
 cargo clippy --all-targets --all-features -- -D warnings   # second half of the quality gate
 ```
 
@@ -124,43 +124,56 @@ other test's spans fire on their own OS thread, where the flag was never set, an
 before adding a third capturing test: the isolation only holds if that test also runs on
 a dedicated single threaded runtime, the same way the first two do.
 
-## Relational conformance: PostgreSQL and SQL Server
+## Relational conformance: PostgreSQL
 
 The per store test modules cover their own logic against SQLite. `storage/conformance.rs`
 answers a different question: does a store behave **the same** on another engine? Every
 case takes an `Engine` and runs once per backend.
 
-SQLite always runs. The server engines run only when their dsn is in the environment, so
+SQLite always runs. The PostgreSQL cases run only when their dsn is in the environment, so
 `cargo test --workspace` stays green with no Docker and nothing installed.
 
 | Variable | Enables |
 |---|---|
 | `MCPFS_TEST_PG_DSN` | the PostgreSQL cases |
-| `MCPFS_TEST_MSSQL_DSN` | the SQL Server cases |
 
 ```bash
-docker compose -f docker-compose.test.yml up -d      # pgvector/pgvector:pg16 on 55432, mssql 2022 on 51433
+docker compose -f docker-compose.test.yml up -d      # pgvector/pgvector:pg16 on 55432
 
 MCPFS_TEST_PG_DSN=postgres://mcpfs:mcpfs@127.0.0.1:55432/mcpfs \
-MCPFS_TEST_MSSQL_DSN='Server=tcp:127.0.0.1,51433;Database=master;User Id=sa;Password=mcpfs_Passw0rd;TrustServerCertificate=true' \
   cargo test --workspace --all-features
 
 docker compose -f docker-compose.test.yml down -v
 ```
 
-The ports are deliberately unusual so this never collides with a real PostgreSQL on 5432
-or SQL Server on 1433. Both services declare a healthcheck because the tests connect
-immediately, and SQL Server needs tens of seconds before it accepts a login. PostgreSQL
+The port is deliberately unusual so this never collides with a real PostgreSQL on 5432.
+The service declares a healthcheck because the tests connect immediately. PostgreSQL
 data is on `tmpfs`: throwaway, and faster.
 
-`--all-features` is required, since the drivers are behind the `postgres` and `sqlserver`
-cargo features. Without them the dsn variables are ignored.
+`--all-features` is required, since the driver is behind the `postgres`
+cargo feature. Without them the dsn variables are ignored.
 
 **Isolation differs per engine, and that is the point.** SQLite hands out a private in
 memory database per call, while the server engines share one instance, so every case
-derives unique ids from a per run tag. A case that passes on all three has been proven not
+derives unique ids from a per run tag. A case that passes on both has been proven not
 to depend on having the database to itself, which is what catches a statement missing its
 `volume_id` predicate.
+
+## Layout guards and process level tests (2026-10-23, SPEC-0051)
+
+* `crates/core/tests/schema_golden.rs` compares the table definitions of the four relational
+  stores, on SQLite and PostgreSQL, byte for byte with `crates/core/tests/fixtures/schema_*.sql`.
+  A diff there is a stored layout change: review it as one. Regenerate only on purpose with
+  `MCPFS_REWRITE_SCHEMA_GOLDEN=1`.
+* `crates/mcp-fs/tests/sql_server_removed.rs` drives the real `mcp-fs` binary (stdout, stderr,
+  exit status, what lands on disk) and reopens `crates/mcp-fs/tests/fixtures/state_v1/`, a SQLite
+  state written by the previous version (project `atlas`, 3 files). Never regenerate that fixture to
+  make a test pass: it proves an older database still opens. The ignored
+  `spec_0051_regenerate_state_fixture` exists for a deliberate new baseline only.
+* The PostgreSQL half of that file (`postgres_suite_passes_unchanged`, the SQLite to PostgreSQL
+  migration) needs `MCPFS_TEST_PG_DSN`, the `postgres` feature and `psql`; otherwise it skips.
+* A removal is proven with an inventory: `cargo test --workspace -- --list` names before and
+  after must differ by exactly the removal list (`sdlc/specs/SPEC-0051-*/removed-tests.txt`).
 
 ## Opt in tests
 

@@ -37,21 +37,20 @@ reference clock skew.
 ## Relational stores: `infra.meta`, `infra.admin`, `infra.git`, `infra.oauth`
 
 Four stores hold the server's relational state, each configured independently and each
-accepting the same three backends. Details of the layer are in
+accepting the same two backends. Details of the layer are in
 [`backends.md`](backends.md).
 
 | Backend | Compiled | Needs |
 |---|---|---|
 | `sqlite` | always | a path, no dsn |
 | `postgres` | `--features postgres` | a dsn |
-| `sqlserver` | `--features sqlserver` | a dsn |
 
 Keys shared by all four sections:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `backend` | string | `sqlite` | `sqlite`, `postgres` or `sqlserver`. Anything else is `ERR_INVALID_ARGUMENT` naming the accepted values |
-| `dsn` | string | `""` | PostgreSQL and SQL Server only. **Secret**: inject it with `${VAR}` |
+| `backend` | string | `sqlite` | `sqlite` or `postgres`. Anything else is `ERR_INVALID_ARGUMENT` naming the accepted values; a database that was removed is refused first, before any other check (`config.rs::reject_removed_backends`) |
+| `dsn` | string | `""` | PostgreSQL only. **Secret**: inject it with `${VAR}` |
 | `schema` | string | `public` | PostgreSQL only: the schema holding our tables |
 | `pool.max_connections` | int | `10` | server engines only; SQLite keeps one serialized connection by design |
 | `pool.acquire_timeout_secs` | int | `30` | server engines only: how long a request waits for a pooled connection |
@@ -74,8 +73,8 @@ changes behaviour.
 All four are checked when the config loads, because a silent misconfiguration here is the
 real risk. Each failure is `ERR_INVALID_ARGUMENT` naming the offending key:
 
-* `backend` is not one of the three accepted values;
-* `backend` is `postgres` or `sqlserver` and `dsn` is empty;
+* `backend` is not one of the two accepted values;
+* `backend` is `postgres` and `dsn` is empty;
 * `dsn` is set while `backend` is `sqlite`, which never reads a dsn. Rejected rather than
   ignored, so a dsn that does nothing cannot look like it is in use;
 * `backend` names an engine this binary was not built with. The message names the cargo
@@ -287,7 +286,7 @@ Details in [`.agent_docs/git.md`](git.md).
 
 Under the SQLite backend, only `infra.meta.dir`, `infra.blob.dir` and
 `infra.admin.path` are configurable; everything else is derived, so moving
-`infra.meta.dir` moves the whole state tree. A store on PostgreSQL or SQL Server uses
+`infra.meta.dir` moves the whole state tree. A store on PostgreSQL uses
 its dsn instead and ignores these paths, except `git_repo_dir`, which stays on disk
 because libgit2 needs a real working directory.
 

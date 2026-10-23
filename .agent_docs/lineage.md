@@ -57,8 +57,8 @@ means something went wrong.
 These three are load bearing when reading a database or planning an upgrade.
 
 **1. `volume_id` on `nodes`, `blob_refs` and the three `git_*` tables.**
-SQLite gets one file per volume, so a tenant column was unnecessary. PostgreSQL and SQL
-Server cannot create a database per project on the fly, so one database holds every volume
+SQLite gets one file per volume, so a tenant column was unnecessary. PostgreSQL cannot create
+a database per project on the fly, so one database holds every volume
 and the tenant is the first column of the primary key (`PRIMARY KEY (volume_id, path)`).
 Under SQLite the column is written but constant per file, so that deployment is unchanged
 in layout and behaviour.
@@ -67,14 +67,11 @@ in layout and behaviour.
 between engines, one direction only.
 
 **2. Dialect binary typing for the OAuth token.**
-`token_enc` renders as `BLOB`, `BYTEA` or `VARBINARY(MAX)` per engine. The encryption is
+`token_enc` renders as `BLOB` or `BYTEA` per engine. The encryption is
 untouched (AES-256-GCM keyed by `MCPFS_TOKEN_KEY`); only the column type varies.
 
-**3. `ColumnType::TextKey(n)` is a bounded key.**
-It renders as `NVARCHAR(n)` on SQL Server, because SQL Server cannot index
-`NVARCHAR(MAX)`. Keyed text therefore has a length ceiling there that it does not have on
-SQLite or PostgreSQL, which is why a path length limit exists at all. See
-[`backends.md`](backends.md).
+**3. One database fewer.**
+SQL Server support was removed on 2026-10-23 (SPEC-0051).
 
 ## Design decisions worth remembering
 
@@ -169,8 +166,7 @@ one document.
   identical.
 * An unescaped `LIKE` prefix in subtree read, subtree delete and rename made `a_b` match
   its sibling `axb`, so a subtree delete could remove unrelated rows. All three route
-  through one `descendant_pattern` helper that escapes `\`, `%`, `_` and, on SQL Server,
-  `[`.
+  through one `descendant_pattern` helper that escapes `\`, `%` and `_`.
 * A conflict is a SUCCESS, not an error. The pull's only conflict path used to be
   `ToolError::internal("the merge left unresolved conflicts that 'ours'/'theirs' cannot
   represent")`, so there was no conflict response to copy anywhere in the tree (DRIFT-001).

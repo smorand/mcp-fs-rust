@@ -46,7 +46,7 @@ The index exists because the blob store cannot be enumerated cheaply: it answers
 live there too, which is why `git.status` needs no libgit2 call.
 
 The two `.db` paths above are the SQLite default. The index is configured by `infra.git`
-and the token store by `infra.oauth`, so either can run on PostgreSQL or SQL Server
+and the token store by `infra.oauth`, so either can run on PostgreSQL
 instead, in which case one database holds every project and `volume_id` separates them
 (see [`backends.md`](backends.md)). **`state/git-repos/` always stays on disk**, whatever
 the index backend, because libgit2 needs a real working directory.

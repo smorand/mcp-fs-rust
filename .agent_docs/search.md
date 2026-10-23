@@ -182,12 +182,6 @@ so no system library is needed (same posture as `rusqlite` with `bundled`).
 Vectors are stored in a `vec0` virtual table alongside a `search_vec_meta` companion
 table. The DDL uses the `SchemaSet::virtual_tables` field in the schema renderer.
 
-## SQL Server
-
-All search modes return `ERR_NOT_SUPPORTED` on SQL Server. The dialect types
-(`Tsvector`, `Vector(N)`) degrade to `NVARCHAR(MAX)` so the schema applies cleanly,
-but the tools reject the call at runtime.
-
 ## Chunking
 
 Fixed character window, configurable per call:

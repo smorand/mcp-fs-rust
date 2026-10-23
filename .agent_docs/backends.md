@@ -1,9 +1,9 @@
 # Relational backends
 
 Server state lives in a relational database: the per volume metadata tree, the ACL
-registry, the git index and the OAuth token store. Three engines are supported,
-selected per store from the YAML config: **SQLite** (default, always compiled),
-**PostgreSQL** and **SQL Server** (each behind a cargo feature).
+registry, the git index and the OAuth token store. Two engines are supported,
+selected per store from the YAML config: **SQLite** (default, always compiled) and
+**PostgreSQL** (behind the `postgres` cargo feature).
 
 Blob bytes are NOT here. They stay in `infra.blob` (local filesystem or S3) and are
 unaffected by a relational backend change.
@@ -15,11 +15,10 @@ unaffected by a relational backend change.
 | File | Holds |
 |---|---|
 | `mod.rs` | `RelationalDb` and `RelationalTx` traits, `Query`, `SqlValue`, `RowValues`, `run_retrying`, `MAX_TX_ATTEMPTS` |
-| `dialect.rs` | `Dialect` enum plus every place the three engines differ |
+| `dialect.rs` | `Dialect` enum plus every place the two engines differ |
 | `schema.rs` | `SchemaSet`, `Table`, `Column`, `ColumnType`: each schema declared once, rendered per engine |
 | `sqlite.rs` | `SqliteRelationalDb`, wrapping the existing serialized `SqliteDb` |
 | `postgres.rs` | `PgRelationalDb` on an `sqlx::PgPool`, `#[cfg(feature = "postgres")]` |
-| `sqlserver.rs` | `MssqlRelationalDb` on a `bb8` pool over `tiberius-ng`, `#[cfg(feature = "sqlserver")]` |
 
 ### The trait is an owned handle, not a closure
 
@@ -67,37 +66,23 @@ itself), so retry only ever engages on a server engine.
 
 ### Dialect checklist
 
-Every item is a real difference between the three engines, each with tests in
+Every item is a real difference between the two engines, each with tests in
 `dialect.rs`.
 
-| Concern | SQLite | PostgreSQL | SQL Server |
-|---|---|---|---|
-| Placeholder | `?1` | `$1` | `@P1` |
-| Identifier quoting | `"x"` | `"x"` | `[x]` |
-| Text | `TEXT` | `TEXT` | `NVARCHAR(MAX)` |
-| Indexed text (`TextKey(n)`) | `TEXT` | `TEXT` | `NVARCHAR(n)` |
-| 64 bit integer | `INTEGER` | `BIGINT` | `BIGINT` |
-| Float | `REAL` | `DOUBLE PRECISION` | `FLOAT` |
-| Bytes | `BLOB` | `BYTEA` | `VARBINARY(MAX)` |
-| Upsert | `ON CONFLICT ... DO UPDATE / DO NOTHING` | same | `MERGE ... WITH (HOLDLOCK)` |
-| String length | `length()` | `length()` | `LEN()` |
-| `LIKE` escaping | `\`, `%`, `_` | same | plus `[` |
-| Null parameter | untyped | untyped (OID 0, `UntypedNull`) | per driver |
+| Concern | SQLite | PostgreSQL |
+|---|---|---|
+| Placeholder | `?1` | `$1` |
+| Identifier quoting | `"x"` | `"x"` |
+| Text | `TEXT` | `TEXT` |
+| 64 bit integer | `INTEGER` | `BIGINT` |
+| Float | `REAL` | `DOUBLE PRECISION` |
+| Bytes | `BLOB` | `BYTEA` |
+| Upsert | `ON CONFLICT ... DO UPDATE / DO NOTHING` | same |
+| `LIKE` escaping | `\`, `%`, `_` | same |
+| Null parameter | untyped | untyped (OID 0, `UntypedNull`) |
 
-Five of those deserve the reason, because getting them wrong is silent:
+Two of those deserve the reason, because getting them wrong is silent:
 
-* **`TextKey` exists because SQL Server cannot index `NVARCHAR(MAX)`.** A column in a
-  primary key or an index needs a bounded length there, while the same column is plain
-  `TEXT` elsewhere. Use `ColumnType::TextKey(n)` for any keyed text.
-  (2026-10-12, SPEC-0023) Secondary indexes count too: `trash_entries.deleted_at` was
-  `Text` inside `idx_trash_entries_deleted_at`, so a SQL Server metadata store failed to
-  open with error 1919. It is now `TextKey(TIMESTAMP_LEN)`, and the unit test
-  `no_production_schema_keys_unbounded_text` in `rel/schema.rs` fails `make check` on any
-  primary key or index column declared `Text` in the four production schemas.
-* **`MERGE` needs `WITH (HOLDLOCK)`.** Without it, `MERGE` races a concurrent insert and
-  raises a duplicate key error instead of updating.
-* **`[` matters only on SQL Server**, where it opens a character class in `LIKE`.
-  Escaping it on the other engines would be wrong, because there it is a literal.
 * **Placeholder rendering skips quoted literals.** A `?` inside a string literal is not a
   parameter. The renderer tracks single quoted literals, doubled quote escapes included.
 * **A null parameter must be untyped (2026-10-12, SPEC-0022).** `SqlValue::Null` carries no
@@ -133,7 +118,7 @@ or a missing object is never created. The rendered DDL of every engine is pinned
 ## Multi tenancy: `volume_id`
 
 SQLite gets one database file per volume, so a tenant column is unnecessary there. A
-PostgreSQL or SQL Server deployment cannot create a database per project on the fly, so
+PostgreSQL deployment cannot create a database per project on the fly, so
 one database holds every volume and the tenant is a column.
 
 `nodes`, `blob_refs` and the three `git_*` tables carry `volume_id` as the first element
@@ -144,79 +129,12 @@ as it always did.
 **Consequence to respect:** `volume_id` belongs in the `WHERE` clause of every statement
 touching those tables. Omitting it in a read leaks another volume's rows; omitting it in
 a delete or a refcount update corrupts another volume. The conformance suite runs the
-server engines against one shared instance precisely so a missing predicate shows up.
-
-## Decision: which SQL Server driver, 2026-09-15
-
-This is the least comfortable dependency choice in the project, so the reasoning is
-recorded in full rather than left implicit. Revisit it deliberately, not by accident.
-
-### The constraint that removes the obvious answer
-
-`sqlx` drives PostgreSQL here, so the appealing design is one toolkit for all three
-engines. That design does not exist: **sqlx removed its MSSQL driver in 0.7 and the
-rewrite has never shipped** (checked again at 0.9.0). Any SQL Server support therefore
-means a second, unrelated driver next to `sqlx`. There is no way to avoid that.
-
-### The options, as they actually stood
-
-| | `tiberius-ng` (chosen) | `tiberius` | `odbc-api` |
-|---|---|---|---|
-| Version, date | 0.13.1, 2026-08-30 | 0.12.3, **2024-07-19** | 29.0.0, 2026-07-19 |
-| Downloads | ~3.5k total | ~5.2M total, but stale | ~1.6M, ~253k recent |
-| Maintenance | active, single maintainer, young fork | **unmaintained, open unpatched advisories** | healthy, widely used |
-| Deploy cost | **none**, pure Rust, `cargo build` | none | **needs a system ODBC driver manager plus a C toolchain on every host** |
-| Async | native | native | blocking, needs `spawn_blocking` |
-
-### Why `tiberius-ng` won
-
-The deciding factor is deployment posture, not driver quality. Everything else in this
-server builds and runs with no external system dependency: `rusqlite` is `bundled`, `sqlx`
-and `reqwest` use `rustls` rather than system OpenSSL. `odbc-api` would be the first
-component to require an `apt install` or `brew install` before the server can start, and
-it would have to be present inside any container image too. That is a permanent, visible
-tax on every operator, including those who never enable SQL Server.
-
-`tiberius` was excluded outright: an unmaintained driver shipping known unpatched
-advisories is not a candidate regardless of its download count.
-
-### What we are accepting, stated plainly
-
-`tiberius-ng` is a young fork with one maintainer and very low traffic. **It could stop
-being maintained.** That risk is accepted knowingly, on three conditions, all of which
-hold today:
-
-1. **It is optional.** The `sqlserver` cargo feature is off by default, so a default build
-   contains neither the crate nor its risk. Verify with `cargo tree --depth 1`.
-2. **It is pinned exactly** (`=0.13.1`), so a surprise release cannot arrive silently.
-3. **The blast radius is one file.** The driver only ever appears behind `RelationalDb`.
-   `rel/sqlserver.rs` is the sole place it is named; no store, tool or route knows it
-   exists.
-
-### The migration path, if it does die
-
-Switch to `odbc-api` and accept the system dependency. Concretely: rewrite
-`rel/sqlserver.rs` against `odbc-api`, wrap its blocking calls in `spawn_blocking` the way
-`rel/sqlite.rs` already does for `rusqlite`, and document the driver manager as an install
-prerequisite for the `sqlserver` feature. Nothing outside that file changes, and the
-backend conformance suite in `storage/conformance.rs` is what proves the replacement
-behaves identically: run it against a real server before and after. The abstraction is
-the mitigation, and this is the scenario it was built for.
+server engine against one shared instance precisely so a missing predicate shows up.
 
 ## Gotchas from the original port, 2026-09-15
 
 Recorded because each one cost real time and none is guessable from the code alone.
 
-* **sqlx cannot reach SQL Server.** The MSSQL driver was removed in sqlx 0.7 and the
-  rewrite has never shipped, so the appealing "one toolkit, three engines" design is not
-  available. SQL Server needs a second driver, which is why `tiberius-ng` plus `bb8` sits
-  beside `sqlx`.
-* **`tiberius` itself is unmaintained**, which is why the fork is used. The full driver
-  comparison and the exit plan are in the decision record above; read it before changing
-  or upgrading anything under `rel/sqlserver.rs`.
-* **`tiberius` has no transaction object.** `BEGIN`, `COMMIT` and `ROLLBACK` are ordinary
-  statements, so `MssqlTx` owns a pooled connection for the transaction's whole life to
-  keep the statements on one session.
 * **The unescaped `LIKE` bug was real and pre existing.** Subtree read, subtree delete
   and rename built `path LIKE '{prefix}/%'` with a raw prefix, so a file named `a_b`
   pulled in its sibling `axb`: a subtree delete could remove unrelated rows. All three
@@ -236,4 +154,4 @@ Recorded because each one cost real time and none is guessable from the code alo
 
 * [`config.md`](config.md) for the YAML keys, the DSN, and validation at boot.
 * [`architecture.md`](architecture.md) for where the layer sits in a request.
-* [`testing.md`](testing.md) for running the suite against PostgreSQL and SQL Server.
+* [`testing.md`](testing.md) for running the suite against PostgreSQL.

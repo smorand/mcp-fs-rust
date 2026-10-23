@@ -12,7 +12,7 @@ token store, a browser token screen at `/app/tokens`, and a browser screen at
 interactive CLI agent that drives the tools through an LLM (`./agent.sh`).
 
 Server state (metadata tree, ACL, git index, OAuth tokens) lives in a relational store:
-**SQLite** by default, **PostgreSQL** or **SQL Server** per store via config. Blob bytes
+**SQLite** by default, or **PostgreSQL** per store via config. Blob bytes
 stay in `infra.blob` (local or S3).
 
 An optional `doc_service` section plugs an external document to Markdown converter in,
@@ -30,11 +30,11 @@ run. Lineage and design decisions: `.agent_docs/lineage.md`.
 
 Stack: Rust 2024, axum + tokio, rmcp 3.5.0 (`server` + `transport-streamable-http-server`
 features only, the one production MCP transport, SPEC-0013), rusqlite (bundled), sqlx (optional,
-PostgreSQL), tiberius-ng + bb8 (optional, SQL Server), aws-sdk-s3, jsonwebtoken + rsa, git2
+PostgreSQL), aws-sdk-s3, jsonwebtoken + rsa, git2
 (libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap, tracing.
 
-Cargo features, none in `default`: `postgres`, `sqlserver`, `rag`, `all-backends`. A default build
-is SQLite only and carries neither relational driver. The `rag` feature enables pgvector (PostgreSQL)
+Cargo features, none in `default`: `postgres`, `rag`, `all-backends` (PostgreSQL plus `rag`). A default
+build is SQLite only and carries no network database driver. The `rag` feature enables pgvector (PostgreSQL)
 and sqlite-vec (SQLite) for vector search; it implies `postgres`.
 
 ## Key commands
@@ -51,7 +51,7 @@ mcp-fs serve | keys | token | migrate | purge | version
 mcp-fs migrate --from a.yaml --to b.yaml  offline copy of relational state between backends
 mcp-fs purge [--project <id> [--on-demand]]  run the auto-purge sweep once; no --project runs
                                       every configured project plus the grace-period removal
-docker compose -f docker-compose.test.yml up -d  postgres + mssql for the opt-in suites
+docker compose -f docker-compose.test.yml up -d  postgres for the opt-in suites
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
@@ -64,7 +64,7 @@ All logic lives in the library crate `crates/core` (package `mcp-fs-core`, crate
 `mcp_fs_core`; the directory is `crates/core`, not `crates/mcp-fs-core`, to match the skill's
 mandated layout while keeping the Cargo package/crate name off the language's own `core`
 sysroot crate). `crates/mcp-fs` keeps only `src/main.rs` (9 lines) and a path dependency on
-`mcp-fs-core`; its `postgres`/`sqlserver`/`rag`/`all-backends` features forward to the same
+`mcp-fs-core`; its `postgres`/`rag`/`all-backends` features forward to the same
 features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unless noted.
 - `cli.rs` : clap verbs (serve/keys/token/migrate/purge/version), config path resolution.
 - `purge.rs` : the auto-purge engine — `sweep_project_files`/`sweep_project`/`sweep_grace_period`,
@@ -102,7 +102,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `identity.rs` : RS256 verification, 30s clock skew, forwarded header then `Authorization`.
 - `safety.rs` : path normalization, read-before-write, write quota, capped audit, trash.
 - `storage/` : `rel/` (the relational layer: `RelationalDb`/`RelationalTx` owned handle,
-  `dialect.rs`, `schema.rs`, `sqlite.rs`, `postgres.rs`, `sqlserver.rs`, `run_retrying`),
+  `dialect.rs`, `schema.rs`, `sqlite.rs`, `postgres.rs`, `run_retrying`),
   `sqlite.rs` (serialized, WAL, offloaded), `meta.rs` (nodes + blob_refs,
   content-addressing, refcount GC), `admin.rs` (project/project_member, caseless ACL,
   project id validation), `blob/local.rs` + `blob/s3.rs`, `volume.rs` (VolumeClient),
@@ -184,7 +184,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   calling it asserts the work is idempotent; use `begin()` for anything touching state
   outside the transaction. Never block a request thread on the database.
 - `volume_id` scopes every row of `nodes`, `blob_refs` and `git_*`, because one PostgreSQL
-  or SQL Server database holds every volume. It belongs in EVERY `WHERE` clause: omitting
+  database holds every volume. It belongs in EVERY `WHERE` clause: omitting
   it leaks or corrupts another volume's rows.
 - A path and everything below it is selected with `SubtreeMatch` (`storage/meta.rs`): an escaped
   `LIKE` (`Dialect::escape_like_literal`, never by hand) plus an exact substring equality, so letter case
@@ -223,8 +223,8 @@ bytes identical), `ERR_NOT_SUPPORTED` for an unsupported extraction format, numb
 markers kept in generated docx, `volume_id` multi tenancy, dialect binary typing for the
 OAuth token, a merge conflict being an `Ok` response carrying `status: "conflict"` rather
 than an error (with every combine response serialized through the types in
-`git/merge.rs`, never a hand built `json!`), and `TextKey(n)` bounded keys (SQL Server cannot index `NVARCHAR(MAX)`, so
-keyed text has a length ceiling there).
+`git/merge.rs`, never a hand built `json!`), and a configuration naming a database that was removed being refused before any other check
+(`config.rs::reject_removed_backends`, SPEC-0051).
 
 ## Backlog
 The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
@@ -240,8 +240,8 @@ The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
   the `git.pr_*` surface and the normalized pull request model.
 - `.agent_docs/config.md` : full YAML schema, backends and dsn, resolution order, secrets.
 - `.agent_docs/backends.md` : the relational layer, adding a backend, dialect checklist,
-  and the SQL Server driver decision record (read before touching `rel/sqlserver.rs`).
-- `.agent_docs/testing.md` : test layout, PostgreSQL/SQL Server and MinIO opt-in suites.
+  and the dialect checklist.
+- `.agent_docs/testing.md` : test layout, PostgreSQL and MinIO opt-in suites.
 - `.agent_docs/lineage.md` : the C# lineage, why it is no longer a reference, design decisions.
 - `.agent_docs/agent.md` : the CLI agent, its config, and the terminal invariants it depends on.
 - `.agent_docs/search.md` : search tools, per-project index modes and auto indexing,
