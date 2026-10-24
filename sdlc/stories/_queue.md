@@ -84,7 +84,7 @@
 | US-0082 | SPEC-0051 | documentation and spec close | US-0081 | 2 | landed | story/US-0082-documentation-and-spec-close | story/US-0081-remove-the-path-length-limit |
 | US-0083 | SPEC-0052 | create a plain tag and list tags with kind and order | main | 1 | landed | story/US-0083-create-a-plain-tag-and-list-tags | main |
 | US-0084 | SPEC-0052 | annotated tags with message, tagger and creation time | US-0083 | 2 | landed | story/US-0084-annotated-tags-and-listing-details | story/US-0083-create-a-plain-tag-and-list-tags |
-| US-0085 | SPEC-0052 | delete a local tag | US-0083 | 1 | todo | | |
+| US-0085 | SPEC-0052 | delete a local tag | US-0083 | 1 | landed | story/US-0085-delete-a-local-tag | story/US-0084-annotated-tags-and-listing-details |
 | US-0086 | SPEC-0052 | receive remote tags on fetch | US-0084 | 1 | todo | | |
 | US-0087 | SPEC-0052 | receive remote tags on pull, also when the merge pauses | US-0086 | 2 | todo | | |
 | US-0088 | SPEC-0052 | receive remote tags on clone | US-0086 | 2 | todo | | |

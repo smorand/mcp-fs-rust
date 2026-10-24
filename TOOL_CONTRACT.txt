@@ -606,6 +606,13 @@ git.tag_create
   param message: Message of an annotated tag; empty creates a plain tag.
   returns: {"mount_id": "proj", "name": "v1.0", "kind": "lightweight or annotated", "sha": "<commit sha>", "object": "<commit sha, or the tag object sha when annotated>", "overwritten": false, "previous_sha": "<commit sha, only when overwritten>"}
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
+git.tag_delete
+  desc: Delete a local tag. Removes the tag ref only: its commit, every branch, every other tag and the remote are left untouched, so a mistaken delete is undone by recreating the tag at the reported sha with git.tag_create.
+  params: mount_id:string, name:string
+  required: ['mount_id', 'name']
+  param name: Name of the local tag to delete, without the refs/tags/ prefix.
+  returns: {"mount_id": "proj", "name": "v1.0", "sha": "<commit the tag pointed at>"}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=false
 git.tags
   desc: List all tags with their kind, commit and, for annotated tags, message, tagger and creation time.
   params: mount_id:string

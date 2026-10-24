@@ -48,7 +48,7 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the forty `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// Register the forty one `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
 ///
 /// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
@@ -332,6 +332,31 @@ pub(crate) fn register_with(
                     serde_json::from_value(a.0.clone())
                         .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
                 super::git_tags::tool_tag_create(ctx, a, g).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.tag_delete",
+            "Delete a local tag. Removes the tag ref only: its commit, every branch, every other \
+             tag and the remote are left untouched, so a mistaken delete is undone by recreating \
+             the tag at the reported sha with git.tag_create.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the local tag to delete, without the refs/tags/ prefix.")
+        .destructive(true)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(false),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let a: crate::mcp::server::GitTagDeleteArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                super::git_tags::tool_tag_delete(ctx, a, g).await
             }
         }),
     );
@@ -7534,7 +7559,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 40] = [
+    const ALL_GIT_TOOLS: [&str; 41] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -7545,6 +7570,7 @@ mod tests {
         "git.reset",
         "git.tags",
         "git.tag_create",
+        "git.tag_delete",
         "git.log",
         "git.show",
         "git.diff",
@@ -7581,7 +7607,7 @@ mod tests {
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 40);
+        assert_eq!(r.len(), 41);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -7821,6 +7847,7 @@ mod tests {
             ("git.reset", json!({"mount_id": MOUNT, "target_ref": "abc", "mode": "hard"})),
             ("git.tags", m.clone()),
             ("git.tag_create", json!({"mount_id": MOUNT, "name": "v1"})),
+            ("git.tag_delete", json!({"mount_id": MOUNT, "name": "v1"})),
             ("git.log", m.clone()),
             ("git.show", json!({"mount_id": MOUNT, "commit_sha": "abc"})),
             ("git.diff", json!({"mount_id": MOUNT, "from_ref": "main"})),
@@ -7902,7 +7929,7 @@ mod tests {
             mount_scoped_git_tools().iter().map(|(n, _)| *n).collect();
 
         assert_eq!(listed, registered, "the blanket authorization list drifted from the registry");
-        assert_eq!(listed.len(), 46, "40 git.* plus the 6 git.pr_* tools take a mount_id");
+        assert_eq!(listed.len(), 47, "41 git.* plus the 6 git.pr_* tools take a mount_id");
     }
 
     /// E2E-MOD-406: the separation of duties that matters, over the whole
@@ -24591,5 +24618,247 @@ mod tests {
         assert_eq!(t["sha"], json!(c));
         assert_eq!(t["kind"], "annotated");
         assert_eq!(t["message"], "Release 2.0");
+    }
+
+    // ── SPEC-0052 US-0085: git.tag_delete ──────────────────────────────────
+
+    fn unknown_tag_msg(name: &str) -> String {
+        format!("Tag '{name}' does not exist.")
+    }
+
+    async fn untag_as(e: &Env, person: &str, name: &str) -> Result<Value> {
+        e.as_person(person, "git.tag_delete", json!({"mount_id": MOUNT, "name": name})).await
+    }
+
+    async fn untag(e: &Env, name: &str) -> Result<Value> {
+        untag_as(e, OWNER, name).await
+    }
+
+    /// Every `git.tag_delete` audit line, of Alice and Bob, as (person, detail).
+    fn deletion_audit(e: &Env) -> Vec<(String, String)> {
+        [OWNER, BOB]
+            .iter()
+            .flat_map(|p| {
+                tag_audit(e, p)
+                    .into_iter()
+                    .filter(|(op, _)| op == "git.tag_delete")
+                    .map(|(_, d)| (p.to_string(), d))
+            })
+            .collect()
+    }
+
+    /// The one deletion of a concurrent pair that won, checking the loser got
+    /// the unknown tag refusal; returns the winner.
+    fn the_one_winner(ra: &Result<Value>, rb: &Result<Value>, name: &str) -> &'static str {
+        match (ra, rb) {
+            (Ok(_), Err(err)) | (Err(err), Ok(_)) => {
+                assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+                assert_eq!(err.message, unknown_tag_msg(name));
+                if ra.is_ok() { OWNER } else { BOB }
+            }
+            other => panic!("exactly one deletion must win: {other:?}"),
+        }
+    }
+
+    /// SPEC-0052/E2E-026: deleting one tag keeps the others, the commit and main.
+    #[tokio::test]
+    async fn e2e_tag_026_delete_a_local_tag() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_main(&e).await;
+        tag(&e, json!({"name": "v2.0"})).await.unwrap();
+        tag(&e, json!({"name": "v3.0", "message": "three"})).await.unwrap();
+        let main_before = e.ref_sha("refs/heads/main").await;
+
+        let out = untag(&e, "v1.0").await.unwrap();
+
+        assert_eq!(out, json!({"mount_id": MOUNT, "name": "v1.0", "sha": a}));
+        assert_eq!(tag_names(&e).await, vec!["v2.0".to_string(), "v3.0".to_string()]);
+        assert_eq!(tag_target(&e, "v2.0").await.as_deref(), Some(c.as_str()));
+        let shown = e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": a})).await.unwrap();
+        assert_eq!(shown["commit"]["sha"], json!(a), "{shown}");
+        let log = e.call("git.log", json!({"mount_id": MOUNT})).await.unwrap();
+        assert!(log["commits"].as_array().unwrap().iter().any(|x| x["sha"] == json!(a)), "{log}");
+        assert_eq!(e.ref_sha("refs/heads/main").await, main_before, "main is unchanged");
+        assert_eq!(head_sha(&e).await, c);
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        assert!(repo.find_reference("refs/tags/v1.0").is_err(), "the on disk ref is gone too");
+    }
+
+    /// SPEC-0052/E2E-027: an unknown tag is refused and nothing changes.
+    #[tokio::test]
+    async fn e2e_tag_027_delete_an_unknown_tag() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let before = tag_list(&e).await;
+        let audit_before = e.audit().len();
+
+        let err = untag(&e, "v9.9").await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, unknown_tag_msg("v9.9"));
+        assert_eq!(tag_list(&e).await, before);
+        assert_eq!(e.audit().len(), audit_before, "a refusal writes no audit entry");
+    }
+
+    /// SPEC-0052/E2E-028: the last tag, deleted twice.
+    #[tokio::test]
+    async fn e2e_tag_028_delete_the_last_tag_twice() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        untag(&e, "v1.0").await.unwrap();
+        assert!(tag_list(&e).await.is_empty());
+        let err = untag(&e, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, unknown_tag_msg("v1.0"));
+        assert_eq!(deletion_audit(&e).len(), 1, "only the first deletion is audited");
+    }
+
+    /// SPEC-0052/E2E-029: a paused cherry pick refuses the deletion with the
+    /// branch change refusal, and the tag stays.
+    #[tokio::test]
+    async fn e2e_tag_029_deletion_refused_during_a_paused_operation() {
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        let (_c2, f1) = seed_fork_conflict_at(&e, MOUNT, "main").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let v10 = tag_target(&e, "v1.0").await;
+        assert_eq!(cherry_pick(&e, &f1).await.unwrap()["status"], "conflict");
+        let branch_err =
+            e.call("git.branch_create", json!({"mount_id": MOUNT, "name": "x"})).await.unwrap_err();
+
+        let err = untag_as(&e, BOB, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.code, branch_err.code);
+        assert_eq!(err.message, branch_err.message.replace("git.branch_create", "git.tag_delete"));
+        assert_eq!(
+            err.message,
+            format!(
+                "git.tag_delete: a cherry_pick is in progress on '{MOUNT}'; finish it with \
+                 git.cherry_pick_continue or abandon it with git.cherry_pick_abort"
+            )
+        );
+        assert_eq!(tag_target(&e, "v1.0").await, v10, "v1.0 still exists");
+        assert!(deletion_audit(&e).is_empty());
+    }
+
+    /// SPEC-0052/E2E-030: a non member gets the usual refusal, nothing changes.
+    #[tokio::test]
+    async fn e2e_tag_030_non_member_cannot_delete() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let usual = e.as_person(CAROL, "git.status", json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        let err = untag_as(&e, CAROL, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN, "{err:?}");
+        assert_eq!(err.message, usual.message);
+        assert!(!format!("{err:?}").contains("v1.0"), "{err:?}");
+        assert_eq!(tag_names(&e).await, vec!["v1.0".to_string()]);
+        assert!(e.f.state.safety.audit(CAROL, MOUNT).is_empty());
+        assert!(deletion_audit(&e).is_empty());
+    }
+
+    /// SPEC-0052/E2E-031: the deletion is local (a real bare remote declared as
+    /// `origin`, holding `v1.0`, keeps it) and audited with the full id.
+    #[tokio::test]
+    async fn e2e_tag_031_deletion_is_local_and_audited() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        let remote_dir = e.f.dir.path().join("remote-tag-031");
+        let url = declare_empty_remote(&e, &remote_dir, "origin").await;
+        call_push_branch(&e, &url, "main", "anonymous").await.unwrap();
+        {
+            let bare = git2::Repository::open_bare(&remote_dir).unwrap();
+            bare.reference("refs/tags/v1.0", Oid::from_str(&a).unwrap(), false, "test").unwrap();
+        }
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let remote_refs = bare_ref_names(&remote_dir);
+
+        untag(&e, "v1.0").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&remote_dir, "refs/tags/v1.0"), Some(a.clone()));
+        assert_eq!(bare_ref_names(&remote_dir), remote_refs, "the remote is untouched");
+        assert_eq!(a.len(), 40);
+        assert_eq!(
+            deletion_audit(&e),
+            vec![(OWNER.to_string(), format!("deleted tag 'v1.0' (was at {a})"))]
+        );
+        let paths: Vec<String> =
+            e.audit().into_iter().filter(|x| x.op == "git.tag_delete").map(|x| x.path).collect();
+        assert_eq!(paths, ["/"]);
+    }
+
+    /// SPEC-0052/E2E-032: two deletions of one tag at once, exactly one wins.
+    #[tokio::test]
+    async fn e2e_tag_032_concurrent_deletion() {
+        let e = Env::new().await;
+        let (_a, b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        tag(&e, json!({"name": "v2.0", "target": b})).await.unwrap();
+
+        let (ra, rb) = tokio::join!(untag_as(&e, OWNER, "v1.0"), untag_as(&e, BOB, "v1.0"));
+
+        the_one_winner(&ra, &rb, "v1.0");
+        assert_eq!(tag_names(&e).await, vec!["v2.0".to_string()]);
+        assert_eq!(tag_target(&e, "v2.0").await.as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0052/E2E-053: a project with no commit and no tag (the harness
+    /// mount after `git.init` only plays `proj-empty`).
+    #[tokio::test]
+    async fn e2e_tag_053_delete_in_a_project_with_no_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        let refs_before = e.entry().await.db.list_refs().await.unwrap().len();
+
+        let err = untag(&e, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, unknown_tag_msg("v1.0"));
+        assert!(tag_list(&e).await.is_empty());
+        assert_eq!(e.entry().await.db.list_refs().await.unwrap().len(), refs_before);
+        assert!(deletion_audit(&e).is_empty());
+    }
+
+    /// SPEC-0052/E2E-065: two different tags deleted at once both go.
+    #[tokio::test]
+    async fn e2e_tag_065_concurrent_deletion_of_different_tags() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        tag(&e, json!({"name": "v2.0"})).await.unwrap();
+
+        let (ra, rb) = tokio::join!(untag_as(&e, OWNER, "v1.0"), untag_as(&e, BOB, "v2.0"));
+
+        ra.unwrap();
+        rb.unwrap();
+        assert!(tag_list(&e).await.is_empty());
+        assert_eq!(deletion_audit(&e).len(), 2);
+    }
+
+    /// SPEC-0052/E2E-066: one audit entry for a concurrent deletion, naming
+    /// the member whose deletion succeeded.
+    #[tokio::test]
+    async fn e2e_tag_066_one_audit_entry_for_a_concurrent_deletion() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        let (ra, rb) = tokio::join!(untag_as(&e, OWNER, "v1.0"), untag_as(&e, BOB, "v1.0"));
+        let winner = the_one_winner(&ra, &rb, "v1.0");
+
+        assert_eq!(
+            deletion_audit(&e),
+            vec![(winner.to_string(), format!("deleted tag 'v1.0' (was at {a})"))]
+        );
     }
 }

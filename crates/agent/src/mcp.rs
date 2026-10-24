@@ -314,9 +314,9 @@ mod tests {
         // adds `fs.export_zip` (100 to 101), SPEC-0015 adds `fs.extract_archive` (101 to 102),
         // SPEC-0019 adds `fs.list_tables` (102 to 103), then `fs.get_table` (104), then
         // `fs.list_images` and `fs.get_image` (106), then `fs.get_document_view` (107),
-        // then `admin.get_project_quota` (108), then SPEC-0045 `fs.diff_files` (109), then SPEC-0047 `admin.get_project_disk_usage` (110), then SPEC-0049 `admin.get_project_folder_usage` (111), then SPEC-0052 `git.tag_create` (112).
+        // then `admin.get_project_quota` (108), then SPEC-0045 `fs.diff_files` (109), then SPEC-0047 `admin.get_project_disk_usage` (110), then SPEC-0049 `admin.get_project_folder_usage` (111), then SPEC-0052 `git.tag_create` (112), then `git.tag_delete` (113).
         let non_search = tools.keys().filter(|n| !n.starts_with("search.")).count();
-        assert_eq!(non_search, 112, "expected the full 112-tool catalogue, got {:?}", tools.keys());
+        assert_eq!(non_search, 113, "expected the full 113-tool catalogue, got {:?}", tools.keys());
         assert!(
             tools.contains_key("fs.read_bytes"),
             "fs.read_bytes must be present: {:?}",

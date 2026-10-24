@@ -3610,6 +3610,33 @@
       }
     },
     {
+      "name": "git.tag_delete",
+      "description": "Delete a local tag. Removes the tag ref only: its commit, every branch, every other tag and the remote are left untouched, so a mistaken delete is undone by recreating the tag at the reported sha with git.tag_create.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the local tag to delete, without the refs/tags/ prefix.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mount_id",
+          "name"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "git.tags",
       "description": "List all tags with their kind, commit and, for annotated tags, message, tagger and creation time.",
       "inputSchema": {

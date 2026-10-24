@@ -1,4 +1,5 @@
-//! Tag engines (SPEC-0052): `git.tag_create` and the `git.tags` listing.
+//! Tag engines (SPEC-0052): `git.tag_create`, `git.tag_delete` and the
+//! `git.tags` listing.
 //!
 //! A tag is one `git_refs` row named `refs/tags/<name>` whose target is the
 //! commit (a plain tag) or a tag object (an annotated tag), exactly like a
@@ -52,6 +53,25 @@ pub(crate) async fn tool_tag_create(
         };
         tag_create(&entry, &safety, &person, &mount_id, request).await
     })
+    .await
+}
+
+/// `git.tag_delete`: membership, then the paused operation, then inside
+/// [`tag_delete`] the unknown tag (FR-NEW-020). The name is not validated: a
+/// name no rule accepts can never exist, so it gets the unknown tag refusal.
+pub(crate) async fn tool_tag_delete(
+    ctx: ToolCtx,
+    a: crate::mcp::server::GitTagDeleteArgs,
+    g: Option<Arc<GitRepoStore>>,
+) -> Result<Value> {
+    let mount_id = a.mount_id.clone();
+    let entry = open(&ctx, &mount_id, g).await?;
+    reject_if_operation_in_progress(&entry, &mount_id, "git.tag_delete").await?;
+    let safety = ctx.state.safety.clone();
+    let person = ctx.person.clone();
+    on_git_thread(
+        move || async move { tag_delete(&entry, &safety, &person, &mount_id, &a.name).await },
+    )
     .await
 }
 
@@ -155,6 +175,52 @@ async fn tag_create(
         map.insert("previous_sha".to_string(), Value::String(old));
     }
     Ok(out)
+}
+
+/// DEC-009, FR-NEW-016: the existence check and the removal share the write
+/// lock, so of two concurrent deletions of one tag the second finds no row and
+/// gets the FR-NEW-005 refusal. Only the tag ref goes: commits, other refs and
+/// the remote are never touched, and the tag object stays in the store like
+/// any unreferenced object.
+///
+/// Cost: O(1) ref lookups and one row delete; the repository is hydrated (O(n)
+/// in stored objects, the same as every other tag tool) only for an existing
+/// tag, since peeling an annotated tag needs its object.
+async fn tag_delete(
+    entry: &GitRepoEntry,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    name: &str,
+) -> Result<Value> {
+    let tag_ref = format!("{TAGS_PREFIX}{name}");
+    let _write = entry.write_lock.lock().await;
+
+    let Some(row) = entry.db.get_ref(&tag_ref).await? else {
+        return Err(ToolError::not_found(format!("Tag '{name}' does not exist.")));
+    };
+
+    let repo = entry.repo.lock().await;
+    hydrate(entry, &repo).await?;
+    // The audit and the answer name a commit, so an annotated tag is peeled;
+    // an unpeelable target is still deleted and reported under its own id.
+    let sha = peel_to_commit(&repo, &row.target).unwrap_or(row.target);
+
+    entry.db.delete_ref(&tag_ref).await?;
+    // Keep the on disk refs in step, the same way git.branch_delete does; an
+    // absent on disk ref (DEC-019 names libgit2 refuses) is already in step.
+    if let Ok(mut on_disk) = repo.find_reference(&tag_ref) {
+        let _ = on_disk.delete();
+    }
+
+    safety.record_audit(
+        person,
+        &entry.project_id,
+        "git.tag_delete",
+        "/",
+        &format!("deleted tag '{name}' (was at {sha})"),
+    );
+    Ok(json!({"mount_id": mount_id, "name": name, "sha": sha}))
 }
 
 /// DEC-005, DEC-006: the tag object is assembled by hand and written through

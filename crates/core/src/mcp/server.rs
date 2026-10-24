@@ -914,6 +914,14 @@ pub struct GitTagCreateArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitTagDeleteArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the local tag to delete, without the refs/tags/ prefix.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GitBranchDeleteArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -3328,6 +3336,18 @@ impl McpServer {
         to_call_result("git.tag_create", out)
     }
 
+    #[tool(
+        name = "git.tag_delete",
+        description = "Delete a local tag. Removes the tag ref only: its commit, every branch, every other tag and the remote are left untouched, so a mistaken delete is undone by recreating the tag at the reported sha with git.tag_create."
+    )]
+    async fn git_tag_delete(
+        &self,
+        Parameters(a): Parameters<GitTagDeleteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = crate::tools::git_tags::tool_tag_delete(self.git_ctx(), a, None).await;
+        to_call_result("git.tag_delete", out)
+    }
+
     #[tool(name = "git.log", description = "List commits. ref_name defaults to HEAD.")]
     async fn git_log(
         &self,
@@ -3925,6 +3945,10 @@ mod tests {
             "Create a tag at a branch, tag or commit, by default the currently checked out commit. Refuses a name that already exists unless overwrite is true.",
         ),
         (
+            "git.tag_delete",
+            "Delete a local tag. Removes the tag ref only: its commit, every branch, every other tag and the remote are left untouched, so a mistaken delete is undone by recreating the tag at the reported sha with git.tag_create.",
+        ),
+        (
             "git.auth",
             "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
         ),
@@ -3994,12 +4018,12 @@ mod tests {
         // SPEC-0045 adds fs.diff_files: fs 45, total 113.
         // SPEC-0047 adds admin.get_project_disk_usage: admin 16, total 114.
         // SPEC-0049 adds admin.get_project_folder_usage: admin 17, total 115.
-        // SPEC-0052 adds git.tag_create: git 50, total 116.
+        // SPEC-0052 adds git.tag_create: git 50, total 116; git.tag_delete: git 51, total 117.
         assert_eq!(fs_count, 45, "got: {names:?}");
         assert_eq!(admin_count, 17, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
-        assert_eq!(git_count, 50, "got: {names:?}");
-        assert_eq!(names.len(), 116, "got: {names:?}");
+        assert_eq!(git_count, 51, "got: {names:?}");
+        assert_eq!(names.len(), 117, "got: {names:?}");
     }
 
     #[test]
@@ -4026,7 +4050,7 @@ mod tests {
 
     #[test]
     fn every_core_git_tool_is_registered() {
-        const ALL_GIT_TOOLS: [&str; 40] = [
+        const ALL_GIT_TOOLS: [&str; 41] = [
             "git.init",
             "git.status",
             "git.branches",
@@ -4037,6 +4061,7 @@ mod tests {
             "git.reset",
             "git.tags",
             "git.tag_create",
+            "git.tag_delete",
             "git.log",
             "git.show",
             "git.diff",
@@ -4332,7 +4357,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 112, "the frozen contract covers 112 non-search tools");
+        assert_eq!(checked, 113, "the frozen contract covers 113 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4353,8 +4378,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 112, "got: {names:?}");
-        assert_eq!(expected.len(), 112, "the golden contract itself must hold 112 names");
+        assert_eq!(names.len(), 113, "got: {names:?}");
+        assert_eq!(expected.len(), 113, "the golden contract itself must hold 113 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

@@ -1,4 +1,4 @@
-# Tool reference (112 tools)
+# Tool reference (113 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -297,7 +297,7 @@ rolls the ACL row back if provisioning fails. Deletion also purges
 `state/git/{id}.db` and the bare repo directory when git is enabled, so a
 recreated id never inherits stale refs.
 
-## git (40, registered only when `git.enabled`)
+## git (41, registered only when `git.enabled`)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -311,6 +311,7 @@ recreated id never inherits stale refs.
 | `git.reset` | move the CURRENT branch's pointer; `soft` moves the ref alone and never touches the volume (`hard` rewrites the volume, US-018) | `target_ref`, `mode` (`soft`\|`hard`, required, no `mixed`) | `mode`, `old_sha`, `new_sha`, `files_changed` (0 for soft) | D,!RO,I,!OW | member |
 | `git.tags` | tags, ascending by name bytes; `sha` is the peeled commit, `object` the ref target | (`mount_id`) | `mount_id`, `tags[{name, full_ref, sha, object, kind}]` | RO,I,!OW | member |
 | `git.tag_create` | create `refs/tags/{name}` at a branch, tag or commit (default HEAD); refuses during a paused operation and an existing name without `overwrite` | `name`, `target=""`, `overwrite:bool=false` | `mount_id`, `name`, `kind`, `sha`, `object`, `overwritten`, `previous_sha?` | !D,!RO,!I,!OW | member |
+| `git.tag_delete` | remove the local `refs/tags/{name}` only (never the commit, other refs or the remote); refuses during a paused operation and an unknown tag | `name` | `mount_id`, `name`, `sha` (peeled commit) | D,!RO,I,!OW | member |
 | `git.log` | commits from a ref | `ref_name=null`, `limit:int=20`, `path=null` | `mount_id`, `commits[]` | RO,I,!OW | member |
 | `git.show` | one commit plus its diff | `commit_sha` | `commit{}`, `diff` | RO,I,!OW | member |
 | `git.diff` | diff two refs, or a ref and the volume | `from_ref`, `to_ref=null`, `path=null` | `mount_id`, `from`, `to`, `diff` | RO,I,!OW | member |
@@ -416,9 +417,9 @@ before any handler runs.
 | Configuration | Served |
 |---|---|
 | default | 62 (45 `fs.*`, 17 `admin.*`) |
-| git flag on | 112 |
-| git and search flags on | 116 |
-| every flag, pandoc on `PATH` | 138 (136 without pandoc: `doc.*` registers nothing) |
+| git flag on | 113 |
+| git and search flags on | 117 |
+| every flag, pandoc on `PATH` | 139 (137 without pandoc: `doc.*` registers nothing) |
 | one optional family alone | 62 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
 
 The optional families (`web`, `context7`, `sqlite`, `db`, `doc`) are not
@@ -428,7 +429,7 @@ family's production `register()` into one shared `ToolRegistry`, and adds one
 family's own `ToolSchema::to_list_entry()`, so the served schema equals
 `catalog()` (what `/api/swagger.json` reads); the call goes through
 `ToolRegistry::call` then `to_call_result`. The family handlers authorize
-`mount_id` themselves, unchanged. They are outside the 112 tool golden
+`mount_id` themselves, unchanged. They are outside the 113 tool golden
 contract. Tests: `tools/tool_surface_e2e.rs`.
 
 ## Authorization model
