@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: L
 > Depth evidence: started M (3 areas, about 12 requirements); escalated to L at audit round 1 when the count reached 18 (more than about 15); no new persisted concept (tags are already stored references)
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-24
 > Project: existing
 > From backlog: BL-0074

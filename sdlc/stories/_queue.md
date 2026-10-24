@@ -82,3 +82,12 @@
 | US-0080 | SPEC-0051 | collapse the dialect and the bounded keys | US-0079 | 2 | landed | story/US-0080-collapse-the-dialect-and-bounded-keys | story/US-0079-remove-the-driver-and-build-option |
 | US-0081 | SPEC-0051 | remove the path length limit | US-0080 | 2 | landed | story/US-0081-remove-the-path-length-limit | story/US-0080-collapse-the-dialect-and-bounded-keys |
 | US-0082 | SPEC-0051 | documentation and spec close | US-0081 | 2 | landed | story/US-0082-documentation-and-spec-close | story/US-0081-remove-the-path-length-limit |
+| US-0083 | SPEC-0052 | create a plain tag and list tags with kind and order | main | 1 | todo | | |
+| US-0084 | SPEC-0052 | annotated tags with message, tagger and creation time | US-0083 | 2 | todo | | |
+| US-0085 | SPEC-0052 | delete a local tag | US-0083 | 1 | todo | | |
+| US-0086 | SPEC-0052 | receive remote tags on fetch | US-0084 | 1 | todo | | |
+| US-0087 | SPEC-0052 | receive remote tags on pull, also when the merge pauses | US-0086 | 2 | todo | | |
+| US-0088 | SPEC-0052 | receive remote tags on clone | US-0086 | 2 | todo | | |
+| US-0089 | SPEC-0052 | publish one tag to the remote | US-0083 | 1 | todo | | |
+| US-0090 | SPEC-0052 | overwrite a remote tag only on explicit confirmation | US-0089, US-0084 | 1 | todo | | |
+| US-0091 | SPEC-0052 | documentation, round trip test and spec close | US-0090, US-0085, US-0087, US-0088 | 1 | todo | | |
