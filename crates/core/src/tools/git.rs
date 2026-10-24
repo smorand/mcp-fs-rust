@@ -2304,7 +2304,11 @@ pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()> {
     if let Some(c) = name.chars().find(|c| {
         c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
     }) {
-        return reject(&format!("it contains the forbidden character {c:?}"));
+        // Tags spell a backslash as itself (SPEC-0052 FR-NEW-004); `{c:?}` would
+        // double it. Branches keep their historical Debug spelling unchanged.
+        let spelled =
+            if c == '\\' && noun == "tag" { "'\\'".to_string() } else { format!("{c:?}") };
+        return reject(&format!("it contains the forbidden character {spelled}"));
     }
     if name.contains("..") {
         return reject("it contains '..'");
@@ -24095,6 +24099,26 @@ mod tests {
         assert!(tag_list(&e).await.is_empty());
     }
 
+    /// SPEC-0052/FR-NEW-004 (converge repair): a backslash is written between
+    /// single quotes as itself, `'\'`, not as the Debug escape `'\\'`; the
+    /// delete character and a line break keep their escapes.
+    #[tokio::test]
+    async fn e2e_tag_extra_forbidden_character_spelling() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        for (name, reason) in [
+            ("a\\b", "it contains the forbidden character '\\'"),
+            ("a\nb", "it contains the forbidden character '\\n'"),
+            ("a\u{7f}b", "it contains the forbidden character '\\u{7f}'"),
+        ] {
+            let err = tag(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert_eq!(err.message, format!("'{name}' is not a valid tag name: {reason}"));
+        }
+        assert!(tag_list(&e).await.is_empty());
+    }
+
     /// SPEC-0052/E2E-010: the other name rules, each with its own reason.
     #[tokio::test]
     async fn e2e_tag_010_other_invalid_names() {
@@ -25245,6 +25269,24 @@ mod tests {
         assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(c.as_str()));
     }
 
+    /// SPEC-0052/FR-NEW-009 (converge repair): a pull that merges cleanly (here a
+    /// fast forward) delivers the remote tag and lists it as added; the
+    /// conflict case is E2E-054.
+    #[tokio::test]
+    async fn e2e_tag_extra_clean_pull_receives_tags() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-extra-ff").await;
+        let c = advance_bare_remote(&dir, "refs/heads/main", "ahead\n");
+        plain_tag_bare_remote(&dir, "v2.0", &c);
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_ne!(out["status"], "conflict", "{out}");
+        assert_eq!(out["tags_added"], json!(["v2.0"]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert_eq!(tag_target(&e, "v2.0").await.as_deref(), Some(c.as_str()));
+    }
+
     /// SPEC-0052 E2E-063: a failed pull brings no tag: remote down, then an
     /// expired credential through the registered tool.
     #[test]
@@ -25719,6 +25761,43 @@ mod tests {
             assert!(publish_audit(&e, CAROL).is_empty());
             assert_eq!(publish_audit(&e, OWNER), vec![format!("published tag 'v1.0' at {a}")]);
         });
+    }
+
+    /// SPEC-0052/E2E-051: Alice creates and publishes an annotated tag, Bob
+    /// receives it on fetch. Each has a clone of the same bare remote in a
+    /// separate server, so the tag can only reach Bob through the remote.
+    #[tokio::test]
+    async fn e2e_tag_051_create_publish_receive_round_trip() {
+        let alice = Env::new().await;
+        let (dir, url, a) = cloned_remote(&alice, "remote-t051").await;
+        let bob = Env::new().await;
+        call_clone_and_import(&bob, &url, "anonymous").await.unwrap();
+        assert!(tag_names(&bob).await.is_empty());
+
+        tag(&alice, json!({"name": "release-2026", "message": "RC"})).await.unwrap();
+        call_publish_tag(&alice, &url, "release-2026").await.unwrap();
+        let fetched = call_fetch_branch(&bob, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&fetched["tags_added"]), ["release-2026"]);
+        let listed = tag_list(&bob).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "release-2026");
+        assert_eq!(listed[0]["kind"], "annotated");
+        assert_eq!(listed[0]["message"], "RC");
+        assert_eq!(listed[0]["sha"], a);
+        assert_eq!(tag_list(&alice).await[0]["sha"], a);
+        assert_eq!(
+            bare_ref_sha(&dir, "refs/tags/release-2026"),
+            tag_target(&bob, "release-2026").await,
+            "Bob holds the very tag object Alice published"
+        );
+        assert_eq!(
+            tag_audit(&alice, OWNER),
+            vec![
+                ("git.tag_create".to_string(), format!("created tag 'release-2026' at {a}")),
+                ("git.tag_publish".to_string(), format!("published tag 'release-2026' at {a}")),
+            ]
+        );
     }
 
     /// SPEC-0052/E2E-055: a project tracking no remote refuses the publish.

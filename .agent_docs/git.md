@@ -1,10 +1,10 @@
 # Git subsystem
 
-Opt in (`git.enabled`). When on, the server registers the 39 `git.*` tools (including `git.merge`, whose engine is
+Opt in (`git.enabled`). When on, the server registers the 42 `git.*` tools (including `git.merge`, whose engine is
 `git/merge.rs`) plus
 the 4 `git.auth*` tools (`git.auth`, `git.auth_status`, `git.auth_revoke`,
 `git.token_set`) and the 6 `git.pr_*` tools (`git.pr_create`, `git.pr_list`,
-`git.pr_get`, `git.pr_diff`, `git.pr_merge`, `git.pr_review`), 49 in all, and mounts the git smart HTTP routes, so a volume can be
+`git.pr_get`, `git.pr_diff`, `git.pr_merge`, `git.pr_review`), 52 in all, and mounts the git smart HTTP routes, so a volume can be
 cloned, fetched and pushed with a plain `git` CLI, including against a
 GitHub Enterprise Server host declared in `git.hosts`.
 
@@ -761,3 +761,61 @@ set: see [`git-divergences.md`](git-divergences.md).
 (`ERR_PROJECT_QUOTA_EXCEEDED`, `ERR_WRITE_QUOTA_EXCEEDED`) or an apply failure
 leaves no row in the git index, no on disk ref and HEAD unmoved, so a retry
 after the cause is gone succeeds instead of failing with `ERR_NO_CLOBBER`.
+
+## Tags (SPEC-0052, 2026-10-24)
+
+Engines in `tools/git_tags.rs`; tools `git.tags`, `git.tag_create`, `git.tag_delete`,
+`git.remote_push_tag`; tests `e2e_tag_*` in the tests module of `tools/git.rs`.
+
+**Storage.** A tag is one `git_refs` row `refs/tags/<name>` (scoped by `volume_id`, no schema
+change). A plain tag targets the commit; an annotated tag targets a tag object written through
+the odb (`repo.odb().write`, never `Repository::tag`), so the message is kept byte for byte
+(no prettify). The tagger is built like a commit author: name is the person id before `@`,
+email is the person id.
+
+**Listing.** `git.tags` sorts ascending by full ref bytes (`v10.0` before `v2.0`, `été` last).
+`sha` is the peeled commit, `object` the ref target, `kind` is `lightweight` or `annotated`;
+an annotated entry adds `message`, `tagger`, `tagger_email`, `tagged_at` (UTC). An unpeelable
+target is still listed under its own id.
+
+**Create, overwrite, delete.** Refusal order: membership, paused operation, name (the branch
+name rules), no commit yet, unknown target (branch, then tag, then full id, then a unique
+prefix of 7+ characters), existing name without `overwrite`. The existence check and the
+write run under `entry.write_lock`, so concurrent same name calls serialise and one wins.
+Delete removes the ref only (never the commit, other refs or the remote) and refuses an
+unknown tag with `Tag '<name>' does not exist.`
+
+**Audit lines** (`safety.record_audit`, path `/`, full 40 character ids, the commit even for
+an annotated tag): `git.tag_create` `created tag '<n>' at <sha>`; `git.tag_overwrite`
+`overwrote tag '<n>' at <sha> (was <old>)`; `git.tag_delete` `deleted tag '<n>' (was at
+<sha>)`; `git.tag_publish` `published tag '<n>' at <sha>`. A refusal writes nothing; publish
+is audited only after a real push, not through `run_remote_operation` (DEC-016).
+
+**Publish** (`git.remote_push_tag`). Pushes `refs/tags/<n>` alone, never a branch, another
+tag or a commit. Order: unknown tag, no remote of that name, credential, one listing of the
+advertised refs, then: the tag's commit must be an advertised ref target or an ancestor of
+one the project holds (`Cannot publish tag '<n>': commit <7> is not on the remote. Publish
+its branch first.`; the publish never fetches). A remote tag with the same object, or two
+annotated tags on the same commit with the same message, is `up_to_date` (no push, no
+audit). The message of a remote annotated tag with another object id is read by a full
+single tag fetch under `refs/mcpfs/probe/`, removed at once (the local transport refuses a
+shallow fetch). A differing remote tag needs `overwrite` plus `expected_remote_commit` (full
+id or 7+ character prefix of its current commit); a mismatch answers `has moved to <7>`, a
+match forces the push leased on the advertised object. A name libgit2 refuses as a ref is
+answered `Remote refused tag '<n>': ...` (DEC-019).
+
+**Receive** (fetch, pull, clone). Tag following stays off. Fetch and pull take candidates
+from the advertised refs: a tag whose peeled commit is the fetched branch tip or one of its
+ancestors. Lightweight candidates need no download; annotated ones are fetched by explicit
+refspecs into `refs/mcpfs/incoming/` (batches of 500), then removed. Clone takes the
+`refs/tags/*` of its temporary clone in the cloned branch history. `reconcile_incoming_tags`
+runs after the object import: an absent tag is added, an identical one skipped, a differing
+local tag kept. Results gain `tags_added` and `tags_kept_local` (sorted names); a pull
+reconciles before the merge decision, so a paused conflict result carries them too.
+
+**Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
+scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
+"on the remote" tip set is every advertised ref, the real rejection mapping is untested,
+`a//b` normalised on disk). Out of scope: BL-0075 delete a remote tag, BL-0076 publish all.
+Round trip proof: `e2e_tag_051_create_publish_receive_round_trip` (two servers, one bare
+remote).

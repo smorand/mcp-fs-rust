@@ -60,7 +60,7 @@ From `cargo test --workspace` on the current tree:
 | Target | Result |
 |---|---|
 | `mcp-fs` lib | 1033 passed, 2 ignored |
-| `agent` bin | 111 passed |
+| `agent` bin | 113 passed (2026-10-24) |
 | `mcp-fs` bin | 0 (the binary is a thin `main`) |
 | doctests | 0 passed, 3 ignored (wiring examples marked `ignore`) |
 

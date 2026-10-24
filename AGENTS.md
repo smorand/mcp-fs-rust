@@ -8,7 +8,9 @@ a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger U
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/` with push,
 fetch and pull against any declared host (including GitHub Enterprise), a per-host
 token store, a browser token screen at `/app/tokens`, and a browser screen at
-`/app/deleted-projects` listing soft-deleted projects with an undelete action. Ships with `agent`, an
+`/app/deleted-projects` listing soft-deleted projects with an undelete action. Git tags are
+supported: create (plain or annotated), delete, publish one tag, receive on fetch, pull and clone,
+each change audited in one line (SPEC-0052). Ships with `agent`, an
 interactive CLI agent that drives the tools through an LLM (`./agent.sh`).
 
 Server state (metadata tree, ACL, git index, OAuth tokens) lives in a relational store:
@@ -130,6 +132,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   password retry via `ERR_PASSWORD_REQUIRED`. `artifacts.rs` holds the five SPEC-0019 tools
   (`fs.list_images`/`get_image`/`list_tables`/`get_table`/`get_document_view`), also served by
   five `GET /api/fs/{mount_id}/...` routes with byte identical payloads.
+  `git_tags.rs` holds the tag engines (SPEC-0052): `git.tags`, `git.tag_create`, `git.tag_delete`,
+  `git.remote_push_tag` (one tag, never a commit, overwrite only with `expected_remote_commit`)
+  and `reconcile_incoming_tags`, which fetch, pull and clone call to add `tags_added`/`tags_kept_local`.
   `diff_files.rs` holds `fs.diff_files` (SPEC-0045): unified diff of two text files, possibly in
   two projects (both must be readable), also served by `GET /api/fs/diff`; the diff runs in
   `spawn_blocking`, files are capped by `safety.max_diff_file_bytes` (5 MiB).

@@ -1,6 +1,6 @@
 # Git divergences from standard git
 
-Created 2026-10-24 (BL-0027). Register of the ways `git.*` differs from ordinary git, so the set
+Created 2026-10-24 (BL-0027). Last updated 2026-10-24: D15 closed by SPEC-0052. Register of the ways `git.*` differs from ordinary git, so the set
 can be judged as a whole. Not to be confused with `parity.md`, which lists divergences from the C#
 lineage. Citations are `file:LINE` at the date above; line numbers drift, the symbol is the anchor.
 Paths are under `crates/core/src/` unless stated.
@@ -38,7 +38,7 @@ Paths are under `crates/core/src/` unless stated.
 
 | # | Standard git | This server | Why | Cost | Anchor |
 |---|---|---|---|---|---|
-| D15 | Tags are created, deleted and fetched | `git.tags` lists only. No tool creates or deletes a tag. Fetch never follows or imports tags (`AutotagOption::None`) | FR-NEW-062 keeps fetch from touching refs outside the asked branch | Cannot release or mark a version, and remote tags never appear | `mcp/server.rs:3290`, `git/remote.rs:745` |
+| D15 | Tags are created, deleted, pushed and fetched | **Closed by SPEC-0052 (2026-10-24)** except: no tool deletes a remote tag (BL-0075) and publish sends one named tag, never all (BL-0076). Fetch and pull receive only the tags in the fetched branch history, clone those of the cloned branch; a differing local tag is kept, never replaced | Auto tag following stays off (`AutotagOption::None`); candidates come from the advertised refs, so fetch still touches no ref outside the asked branch and its history tags | Remote tag deletion and bulk publish need standard git | `tools/git_tags.rs`, `git/remote.rs` `history_tags` |
 | D16 | Fetch with any refspec | Fetch works on one branch, tag following off, pruning forced off | Bounded, predictable ref updates | Cannot mirror a remote | `git/remote.rs:686` |
 | D17 | `stash` can include untracked files | Stash saves "uncommitted changes" of the volume and refuses when there are none | Follows D1 | No untracked versus tracked distinction | `tools/git.rs:605` |
 
@@ -46,8 +46,9 @@ Paths are under `crates/core/src/` unless stated.
 
 Per file conflict resolution, rebase, cherry pick, revert, stash, `git.reset` (hard covers discard),
 force push with lease, `remote_branch` on push, remote add, list and remove, remotes beyond
-`origin`, and pull requests. The 49 tools registered in `mcp/server.rs` under `git.*` were listed and none adds a divergence
-beyond the rows above.
+`origin`, and pull requests. The tools registered in `mcp/server.rs` under `git.*` were listed and none adds a divergence
+beyond the rows above. Since SPEC-0052 there are 52 (42 `git.*`, 4 `git.auth*`, 6 `git.pr_*`);
+the tag tools close D15 rather than add a row.
 
 ## Coherence
 
@@ -56,18 +57,20 @@ Three themes.
    D4 and D5 are independent losses.
 2. **Safety and atomicity (D6 to D9).** D6 and D7 disagree in spirit: integration is strict and
    atomic, bootstrap is lenient. Coherent only if clone is treated as "fill an empty volume".
-3. **Transport and credentials (D10 to D16).** Consistent: HTTPS plus one token. D15 is the
-   outlier: a missing capability, not a safety choice.
+3. **Transport and credentials (D10 to D16).** Consistent: HTTPS plus one token. D15 was the
+   outlier (a missing capability), closed by SPEC-0052.
 
 ## Gaps ranked (recommendation, default if not answered)
 
 | Rank | Gap | Recommendation | Default |
 |---|---|---|---|
-| 1 | D15 tags (create, delete, follow on fetch) | Close: release workflows need tags | Close, one FEAT |
-| 2 | D14 no token refresh | Close only if a supported host issues expiring tokens; confirm first | Keep |
+| 1 | D14 no token refresh | Close only if a supported host issues expiring tokens; confirm first | Keep |
+| 2 | D15 remainder: remote tag delete (BL-0075), publish all tags (BL-0076) | Close on demand: release workflows rarely need either | Keep |
 | 3 | D6 dirty tree refusal | Keep: the atomic apply depends on it | Keep |
 | 4 | D4 file modes | Keep until a user reports an executable bit loss | Keep |
 | 5 | D10 SSH | Keep: key storage is a security surface | Keep |
 | 6 | D1, D2 no index | Keep: it is the model | Keep |
 | 7 | D7 clone versus pull asymmetry | Keep, but document `skipped` in the clone contract text | Keep |
 | 8 | D5, D9 hooks, submodules | Keep | Keep |
+
+D15 tags (create, delete, follow on fetch), formerly rank 1, closed by SPEC-0052 (2026-10-24).
