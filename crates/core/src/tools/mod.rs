@@ -54,6 +54,7 @@ mod folder_usage_e2e;
 pub mod git;
 pub mod git_auth;
 pub mod git_pr;
+pub mod git_tags;
 #[cfg(test)]
 pub(crate) mod lifecycle;
 #[cfg(test)]

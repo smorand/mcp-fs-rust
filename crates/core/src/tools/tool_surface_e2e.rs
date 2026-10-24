@@ -253,7 +253,7 @@ async fn bt_020_enabled_git_and_search_are_served_unchanged() {
 
     let names = list_names(&app, &token).await;
     let served = names.iter().filter(|n| !n.starts_with("t.")).count();
-    assert_eq!(served, 115, "git and search on serve 115 tools, got {names:?}");
+    assert_eq!(served, 116, "git and search on serve 116 tools, got {names:?}");
 
     for name in ["git.init", "git.status"] {
         let v = send(
@@ -478,7 +478,7 @@ async fn bt_011_every_flag_on_serves_the_whole_surface() {
     let (app, _state) = app_with_atlas(c).await;
 
     let tools = list_tools(&app, &token).await;
-    let expected = if pandoc_on_path() { 137 } else { 135 };
+    let expected = if pandoc_on_path() { 138 } else { 136 };
     assert_eq!(served_count(&tools), expected, "every flag on (pandoc: {})", pandoc_on_path());
 }
 

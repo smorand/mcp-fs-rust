@@ -3568,8 +3568,45 @@
       }
     },
     {
+      "name": "git.tag_create",
+      "description": "Create a tag at a branch, tag or commit, by default the currently checked out commit. Refuses a name that already exists unless overwrite is true.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name of the tag to create, without the refs/tags/ prefix.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Branch, tag or commit id the tag points at; defaults to the currently checked out commit.",
+            "type": "string",
+            "default": ""
+          },
+          "overwrite": {
+            "description": "Replace a tag of the same name; false refuses when it exists.",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "mount_id",
+          "name"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "git.tags",
-      "description": "List all tags.",
+      "description": "List all tags with their kind, commit and, for annotated tags, message, tagger and creation time.",
       "inputSchema": {
         "type": "object",
         "properties": {

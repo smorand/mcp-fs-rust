@@ -897,6 +897,20 @@ pub struct GitBranchCreateArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitTagCreateArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the tag to create, without the refs/tags/ prefix.
+    pub name: String,
+    /// Branch, tag or commit id the tag points at; defaults to the currently checked out commit.
+    #[serde(default)]
+    pub target: String,
+    /// Replace a tag of the same name; false refuses when it exists.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GitBranchDeleteArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -3287,13 +3301,28 @@ impl McpServer {
         to_call_result("git.reset", out)
     }
 
-    #[tool(name = "git.tags", description = "List all tags.")]
+    #[tool(
+        name = "git.tags",
+        description = "List all tags with their kind, commit and, for annotated tags, message, tagger and creation time."
+    )]
     async fn git_tags(
         &self,
         Parameters(a): Parameters<MountOnlyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let out = crate::tools::git::tool_tags(self.git_ctx(), a, None).await;
         to_call_result("git.tags", out)
+    }
+
+    #[tool(
+        name = "git.tag_create",
+        description = "Create a tag at a branch, tag or commit, by default the currently checked out commit. Refuses a name that already exists unless overwrite is true."
+    )]
+    async fn git_tag_create(
+        &self,
+        Parameters(a): Parameters<GitTagCreateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = crate::tools::git_tags::tool_tag_create(self.git_ctx(), a, None).await;
+        to_call_result("git.tag_create", out)
     }
 
     #[tool(name = "git.log", description = "List commits. ref_name defaults to HEAD.")]
@@ -3884,7 +3913,14 @@ mod tests {
         ("git.status", "Show HEAD, current branch, and all refs."),
         ("git.log", "List commits. ref_name defaults to HEAD."),
         ("git.show", "Show details and diff of a commit."),
-        ("git.tags", "List all tags."),
+        (
+            "git.tags",
+            "List all tags with their kind, commit and, for annotated tags, message, tagger and creation time.",
+        ),
+        (
+            "git.tag_create",
+            "Create a tag at a branch, tag or commit, by default the currently checked out commit. Refuses a name that already exists unless overwrite is true.",
+        ),
         (
             "git.auth",
             "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
@@ -3955,11 +3991,12 @@ mod tests {
         // SPEC-0045 adds fs.diff_files: fs 45, total 113.
         // SPEC-0047 adds admin.get_project_disk_usage: admin 16, total 114.
         // SPEC-0049 adds admin.get_project_folder_usage: admin 17, total 115.
+        // SPEC-0052 adds git.tag_create: git 50, total 116.
         assert_eq!(fs_count, 45, "got: {names:?}");
         assert_eq!(admin_count, 17, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
-        assert_eq!(git_count, 49, "got: {names:?}");
-        assert_eq!(names.len(), 115, "got: {names:?}");
+        assert_eq!(git_count, 50, "got: {names:?}");
+        assert_eq!(names.len(), 116, "got: {names:?}");
     }
 
     #[test]
@@ -3986,7 +4023,7 @@ mod tests {
 
     #[test]
     fn every_core_git_tool_is_registered() {
-        const ALL_GIT_TOOLS: [&str; 39] = [
+        const ALL_GIT_TOOLS: [&str; 40] = [
             "git.init",
             "git.status",
             "git.branches",
@@ -3996,6 +4033,7 @@ mod tests {
             "git.branch_reset",
             "git.reset",
             "git.tags",
+            "git.tag_create",
             "git.log",
             "git.show",
             "git.diff",
@@ -4291,7 +4329,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 111, "the frozen contract covers 111 non-search tools");
+        assert_eq!(checked, 112, "the frozen contract covers 112 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4312,8 +4350,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 111, "got: {names:?}");
-        assert_eq!(expected.len(), 111, "the golden contract itself must hold 111 names");
+        assert_eq!(names.len(), 112, "got: {names:?}");
+        assert_eq!(expected.len(), 112, "the golden contract itself must hold 112 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

@@ -48,7 +48,7 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the thirty-two `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// Register the forty `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
 ///
 /// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
@@ -281,17 +281,56 @@ pub(crate) fn register_with(
 
     let g = git.clone();
     reg.add(
-        ToolSchema::new("git.tags", "List all tags.")
-            .req_str("mount_id", "Project/volume id the operation targets.")
-            .read_only(true)
-            .idempotent(true)
-            .open_world(false),
+        ToolSchema::new(
+            "git.tags",
+            "List all tags with their kind, commit and, for annotated tags, message, tagger and \
+             creation time.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .read_only(true)
+        .idempotent(true)
+        .open_world(false),
         handler(move |ctx: ToolCtx, a| {
             let g = g.clone();
             async move {
                 let a: crate::mcp::server::MountOnlyArgs = serde_json::from_value(a.0.clone())
                     .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
                 tool_tags(ctx, a, g).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.tag_create",
+            "Create a tag at a branch, tag or commit, by default the currently checked out \
+             commit. Refuses a name that already exists unless overwrite is true.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("name", "Name of the tag to create, without the refs/tags/ prefix.")
+        .opt_str(
+            "target",
+            "",
+            "Branch, tag or commit id the tag points at; defaults to the currently checked out \
+             commit.",
+        )
+        .opt_bool(
+            "overwrite",
+            false,
+            "Replace a tag of the same name; false refuses when it exists.",
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(false)
+        .open_world(false),
+        handler(move |ctx: ToolCtx, a| {
+            let g = g.clone();
+            async move {
+                let a: crate::mcp::server::GitTagCreateArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                super::git_tags::tool_tag_create(ctx, a, g).await
             }
         }),
     );
@@ -1314,10 +1353,7 @@ pub(crate) async fn tool_tags(
     a: crate::mcp::server::MountOnlyArgs,
     g: Option<Arc<GitRepoStore>>,
 ) -> Result<Value> {
-    let mount_id = a.mount_id.clone();
-    let entry = open(&ctx, &mount_id, g).await?;
-    let tags = refs_under(&entry, "refs/tags/").await?;
-    Ok(json!({"mount_id": mount_id, "tags": tags}))
+    super::git_tags::tool_tags(ctx, a, g).await
 }
 
 pub(crate) async fn tool_log(
@@ -1778,7 +1814,7 @@ async fn authorize(
 }
 
 /// Authorize, require `git.init` to have run, and open the repository.
-async fn open(
+pub(crate) async fn open(
     ctx: &ToolCtx,
     mount_id: &str,
     injected: Option<Arc<GitRepoStore>>,
@@ -1807,7 +1843,7 @@ async fn open_on(store: &GitRepoStore, mount_id: &str) -> Result<Arc<GitRepoEntr
 /// one is not `Send`; the MCP dispatcher needs `Send` futures. Moving the work to
 /// the blocking pool also keeps CPU bound diff and pack work off the async
 /// workers. Same helper as the git HTTP layer (private there).
-async fn on_git_thread<T, F, Fut>(f: F) -> Result<T>
+pub(crate) async fn on_git_thread<T, F, Fut>(f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Fut + Send + 'static,
@@ -1867,7 +1903,7 @@ fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
-fn parse_oid(sha: &str) -> Result<Oid> {
+pub(crate) fn parse_oid(sha: &str) -> Result<Oid> {
     Oid::from_str(sha).map_err(|_| ToolError::not_found(format!("commit '{sha}' not found")))
 }
 
@@ -1895,7 +1931,7 @@ async fn resolve_ref(db: &RelationalGitDb, ref_or_sha: &str) -> Result<Option<St
 }
 
 /// Make libgit2 able to see the objects held in the blob store.
-async fn hydrate(entry: &GitRepoEntry, repo: &Repository) -> Result<()> {
+pub(crate) async fn hydrate(entry: &GitRepoEntry, repo: &Repository) -> Result<()> {
     entry.objects.export_to_repo(repo).await?;
     Ok(())
 }
@@ -2003,24 +2039,6 @@ async fn branches(mount_id: &str, entry: &GitRepoEntry) -> Result<Value> {
         }));
     }
     Ok(json!({"mount_id": mount_id, "branches": listed}))
-}
-
-/// `refs/heads/` for branches, `refs/tags/` for tags: same shape, same order.
-async fn refs_under(entry: &GitRepoEntry, prefix: &'static str) -> Result<Vec<Value>> {
-    Ok(entry
-        .db
-        .list_refs()
-        .await?
-        .into_iter()
-        .filter(|r| !r.symbolic && r.name.starts_with(prefix))
-        .map(|r| {
-            json!({
-                "name": r.name.strip_prefix(prefix).unwrap_or(&r.name),
-                "full_ref": r.name,
-                "sha": r.target,
-            })
-        })
-        .collect())
 }
 
 async fn log(
@@ -2198,8 +2216,16 @@ const MAX_BRANCH_NAME_BYTES: usize = 255;
 /// Valid UTF-8 beyond ASCII is accepted and never normalized: the bytes the
 /// caller sent are the bytes stored.
 fn validate_branch_name(name: &str) -> Result<()> {
+    validate_ref_name(name, "branch")
+}
+
+/// The rules of [`validate_branch_name`] for any ref family. `noun` only
+/// changes the wording (`branch name`, `tag name`): tags and branches share
+/// one rule set, so a name refused for one is refused for the other with the
+/// very same reason.
+pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()> {
     let reject = |why: &str| {
-        Err(ToolError::invalid_argument(format!("'{name}' is not a valid branch name: {why}")))
+        Err(ToolError::invalid_argument(format!("'{name}' is not a valid {noun} name: {why}")))
     };
     if name.is_empty() {
         return reject("it is empty");
@@ -4192,7 +4218,7 @@ async fn remote_remove(
 /// `volume_id` alone, and nothing else. There is no in-memory cache because a
 /// cache would have to be invalidated across processes, which is exactly the
 /// restart hazard DEC-901 rejected.
-async fn reject_if_operation_in_progress(
+pub(crate) async fn reject_if_operation_in_progress(
     entry: &GitRepoEntry,
     mount_id: &str,
     tool: &str,
@@ -7507,7 +7533,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 39] = [
+    const ALL_GIT_TOOLS: [&str; 40] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -7517,6 +7543,7 @@ mod tests {
         "git.branch_reset",
         "git.reset",
         "git.tags",
+        "git.tag_create",
         "git.log",
         "git.show",
         "git.diff",
@@ -7553,7 +7580,7 @@ mod tests {
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 39);
+        assert_eq!(r.len(), 40);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -7727,7 +7754,10 @@ mod tests {
             ("git.init", "Initialize the volume as a git repository."),
             ("git.status", "Show HEAD, current branch, and all refs."),
             ("git.branches", "List all branches with their SHA."),
-            ("git.tags", "List all tags."),
+            (
+                "git.tags",
+                "List all tags with their kind, commit and, for annotated tags, message, tagger and creation time.",
+            ),
         ] {
             let s = &r.resolve(name).unwrap().schema;
             assert_eq!(s.description, desc);
@@ -7789,6 +7819,7 @@ mod tests {
             ),
             ("git.reset", json!({"mount_id": MOUNT, "target_ref": "abc", "mode": "hard"})),
             ("git.tags", m.clone()),
+            ("git.tag_create", json!({"mount_id": MOUNT, "name": "v1"})),
             ("git.log", m.clone()),
             ("git.show", json!({"mount_id": MOUNT, "commit_sha": "abc"})),
             ("git.diff", json!({"mount_id": MOUNT, "from_ref": "main"})),
@@ -7870,7 +7901,7 @@ mod tests {
             mount_scoped_git_tools().iter().map(|(n, _)| *n).collect();
 
         assert_eq!(listed, registered, "the blanket authorization list drifted from the registry");
-        assert_eq!(listed.len(), 45, "39 git.* plus the 6 git.pr_* tools take a mount_id");
+        assert_eq!(listed.len(), 46, "40 git.* plus the 6 git.pr_* tools take a mount_id");
     }
 
     /// E2E-MOD-406: the separation of duties that matters, over the whole
@@ -23716,5 +23747,651 @@ mod tests {
             })
         );
         assert_eq!(push_keys(&out), PUSH_BASE_KEYS);
+    }
+
+    // ── SPEC-0052 US-0083: git.tag_create and the git.tags listing ─────────
+
+    const BOB: &str = "bob@test.com";
+    const CAROL: &str = "carol@test.com";
+
+    fn exists_msg(name: &str) -> String {
+        format!("Tag '{name}' already exists. Choose another name or confirm overwriting it.")
+    }
+
+    fn unknown_target_msg(target: &str) -> String {
+        format!("Cannot tag '{target}': no such branch, tag or commit.")
+    }
+
+    async fn tag_as(e: &Env, person: &str, args: Value) -> Result<Value> {
+        let mut args = args;
+        args["mount_id"] = json!(MOUNT);
+        e.as_person(person, "git.tag_create", args).await
+    }
+
+    async fn tag(e: &Env, args: Value) -> Result<Value> {
+        tag_as(e, OWNER, args).await
+    }
+
+    async fn tag_list(e: &Env) -> Vec<Value> {
+        e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn tag_names(e: &Env) -> Vec<String> {
+        tag_list(e).await.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    }
+
+    async fn tag_target(e: &Env, name: &str) -> Option<String> {
+        e.ref_sha(&format!("refs/tags/{name}")).await
+    }
+
+    /// Every `git.tag_*` audit line of `person`, as (action, detail).
+    fn tag_audit(e: &Env, person: &str) -> Vec<(String, String)> {
+        e.f.state
+            .safety
+            .audit(person, MOUNT)
+            .into_iter()
+            .filter(|a| a.op.starts_with("git.tag_"))
+            .map(|a| (a.op, a.detail))
+            .collect()
+    }
+
+    /// `main` checked out at A (the spec's a1b2c3d), `dev` at B (b2c3d4e),
+    /// which forks from A. Bob is a second member.
+    async fn seed_tags(e: &Env) -> (String, String) {
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a\n").await;
+        let a = e.commit("A").await;
+        e.set_branch("dev", &a).await;
+        e.checkout("dev").await;
+        e.write("/b.txt", "b\n").await;
+        let b = e.commit("B").await;
+        e.checkout("main").await;
+        (a, b)
+    }
+
+    /// Move `main` one commit forward to C (the spec's c3d4e5f).
+    async fn advance_main(e: &Env) -> String {
+        e.write("/c.txt", "c\n").await;
+        e.commit("C").await
+    }
+
+    async fn head_sha(e: &Env) -> String {
+        e.call("git.status", json!({"mount_id": MOUNT})).await.unwrap()["head"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// SPEC-0052/E2E-001: a plain tag at the checked out commit.
+    #[tokio::test]
+    async fn e2e_tag_001_create_a_plain_tag_at_the_checked_out_commit() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        assert!(tag_list(&e).await.is_empty());
+
+        let out = tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        assert_eq!(out["sha"], json!(a), "{out}");
+        assert_eq!(out["kind"], "lightweight", "{out}");
+        assert_eq!(out["overwritten"], false, "{out}");
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+        let listed = tag_list(&e).await;
+        assert_eq!(
+            listed,
+            vec![json!({
+                "name": "v1.0",
+                "full_ref": "refs/tags/v1.0",
+                "sha": a,
+                "object": a,
+                "kind": "lightweight",
+            })]
+        );
+        assert!(listed[0].get("message").is_none(), "a plain tag carries no message");
+    }
+
+    /// SPEC-0052/E2E-002: a tag at a named branch leaves the checkout alone.
+    #[tokio::test]
+    async fn e2e_tag_002_create_a_tag_at_a_named_branch() {
+        let e = Env::new().await;
+        let (a, b) = seed_tags(&e).await;
+
+        tag(&e, json!({"name": "release-2026", "target": "dev"})).await.unwrap();
+
+        assert_eq!(tag_target(&e, "release-2026").await.as_deref(), Some(b.as_str()));
+        assert_eq!(head_sha(&e).await, a, "the checked out commit is unchanged");
+    }
+
+    /// SPEC-0052/E2E-003: a tag at a tag, and a tag at a commit id.
+    #[tokio::test]
+    async fn e2e_tag_003_create_a_tag_at_a_tag_or_a_commit() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_main(&e).await;
+
+        tag(&e, json!({"name": "v1.0-copy", "target": "v1.0"})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": c})).await.unwrap();
+
+        assert_eq!(tag_target(&e, "v1.0-copy").await.as_deref(), Some(a.as_str()));
+        assert_eq!(tag_target(&e, "v1.1").await.as_deref(), Some(c.as_str()));
+        for t in tag_list(&e).await {
+            assert_eq!(t["kind"], "lightweight", "{t}");
+        }
+    }
+
+    /// SPEC-0052/E2E-006: an existing name is refused without confirmation.
+    #[tokio::test]
+    async fn e2e_tag_006_existing_name_refused_without_confirmation() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        advance_main(&e).await;
+        let audit_before = e.audit().len();
+
+        let err = tag(&e, json!({"name": "v1.0"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER, "{err:?}");
+        assert_eq!(err.message, exists_msg("v1.0"));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+        assert_eq!(e.audit().len(), audit_before, "a refusal writes no audit entry");
+    }
+
+    /// SPEC-0052/E2E-007: a confirmed overwrite moves the tag.
+    #[tokio::test]
+    async fn e2e_tag_007_overwrite_confirmed_moves_the_tag() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_main(&e).await;
+
+        let out = tag(&e, json!({"name": "v1.0", "overwrite": true})).await.unwrap();
+
+        assert_eq!(out["overwritten"], true, "{out}");
+        assert_eq!(out["previous_sha"], json!(a), "{out}");
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(c.as_str()));
+        assert_eq!(tag_list(&e).await.len(), 1, "the number of tags is unchanged");
+    }
+
+    /// SPEC-0052/E2E-009: a space or a control character in the name.
+    #[tokio::test]
+    async fn e2e_tag_009_name_with_a_space() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        for (name, reason) in [
+            ("my tag", "it contains the forbidden character ' '"),
+            ("a b~", "it contains the forbidden character ' '"),
+            ("a\tb", "it contains the forbidden character '\\t'"),
+        ] {
+            let err = tag(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert_eq!(err.message, format!("'{name}' is not a valid tag name: {reason}"));
+        }
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0052/E2E-010: the other name rules, each with its own reason.
+    #[tokio::test]
+    async fn e2e_tag_010_other_invalid_names() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        for (name, reason) in [
+            ("", "it is empty"),
+            ("a..b", "it contains '..'"),
+            ("/v1", "it begins or ends with '/'"),
+            ("v1/", "it begins or ends with '/'"),
+            ("rel/.hidden", "one of its '/' separated components begins with '.'"),
+            ("v1.lock", "it ends with '.lock'"),
+        ] {
+            let err = tag(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert_eq!(err.message, format!("'{name}' is not a valid tag name: {reason}"));
+            assert!(tag_list(&e).await.is_empty(), "the list is unchanged after {name:?}");
+        }
+    }
+
+    /// SPEC-0052/E2E-011: 255 bytes pass, 256 and 301 bytes do not.
+    #[tokio::test]
+    async fn e2e_tag_011_name_length_boundary() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let ok = format!("v{}", "a".repeat(254));
+        let long = format!("v{}", "a".repeat(255));
+        let accented = format!("{}{}", "a".repeat(101), "é".repeat(100));
+        assert_eq!((ok.len(), long.len(), accented.len()), (255, 256, 301));
+
+        tag(&e, json!({"name": ok})).await.unwrap();
+        for (name, n) in [(&long, 256), (&accented, 301)] {
+            let err = tag(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+            assert_eq!(
+                err.message,
+                format!(
+                    "'{name}' is not a valid tag name: it is {n} bytes of UTF-8, over the 255 \
+                     byte limit"
+                )
+            );
+        }
+        assert_eq!(tag_names(&e).await, vec![ok]);
+    }
+
+    /// SPEC-0052/E2E-012: an unknown target.
+    #[tokio::test]
+    async fn e2e_tag_012_unknown_target() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        let err = tag(&e, json!({"name": "v3.0", "target": "nosuchref"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, unknown_target_msg("nosuchref"));
+        assert_eq!(tag_target(&e, "v3.0").await, None);
+    }
+
+    /// SPEC-0052/E2E-013: accented and emoji names are kept byte for byte.
+    #[tokio::test]
+    async fn e2e_tag_013_unicode_names_accepted() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        tag(&e, json!({"name": "été-2026"})).await.unwrap();
+        tag(&e, json!({"name": "rel/2026-🚀"})).await.unwrap();
+
+        assert_eq!(tag_names(&e).await, vec!["rel/2026-🚀".to_string(), "été-2026".to_string()]);
+    }
+
+    /// SPEC-0052/E2E-014: a project with no commit (the harness mount, after
+    /// `git.init` only, plays `proj-empty`).
+    #[tokio::test]
+    async fn e2e_tag_014_project_with_no_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+
+        let err = tag(&e, json!({"name": "v1.0"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, "Cannot tag: this project has no commit yet.");
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0052/E2E-015: a non member gets the usual refusal.
+    #[tokio::test]
+    async fn e2e_tag_015_non_member_cannot_create() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let usual = e.as_person(CAROL, "git.status", json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        let err = tag_as(&e, CAROL, json!({"name": "v1.0"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN, "{err:?}");
+        assert_eq!(err.code, usual.code);
+        assert_eq!(err.message, usual.message);
+        assert!(tag_list(&e).await.is_empty());
+        assert!(e.f.state.safety.audit(CAROL, MOUNT).is_empty());
+        assert!(tag_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-016: two creations of one name at once, exactly one wins.
+    #[tokio::test]
+    async fn e2e_tag_016_concurrent_creation() {
+        let e = Env::new().await;
+        let (a, b) = seed_tags(&e).await;
+
+        let (ra, rb) = tokio::join!(
+            tag_as(&e, OWNER, json!({"name": "v5.0", "target": a})),
+            tag_as(&e, BOB, json!({"name": "v5.0", "target": b})),
+        );
+
+        let winner = match (&ra, &rb) {
+            (Ok(_), Err(err)) | (Err(err), Ok(_)) => {
+                assert_eq!(err.code, code::NO_CLOBBER, "{err:?}");
+                assert_eq!(err.message, exists_msg("v5.0"));
+                if ra.is_ok() { a.clone() } else { b.clone() }
+            }
+            other => panic!("exactly one creation must win: {other:?}"),
+        };
+        assert_eq!(tag_target(&e, "v5.0").await, Some(winner));
+        let created = [OWNER, BOB]
+            .iter()
+            .flat_map(|p| tag_audit(&e, p))
+            .filter(|(op, _)| op == "git.tag_create")
+            .count();
+        assert_eq!(created, 1, "exactly one creation entry");
+    }
+
+    /// SPEC-0052/E2E-017: creation is refused while a merge is paused, with
+    /// the very refusal a branch change gets.
+    #[tokio::test]
+    async fn e2e_tag_017_creation_refused_during_a_paused_merge() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+        let branch_err =
+            e.call("git.branch_create", json!({"mount_id": MOUNT, "name": "x"})).await.unwrap_err();
+
+        let err = tag(&e, json!({"name": "v1.0"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.code, branch_err.code);
+        assert_eq!(err.message, branch_err.message.replace("git.branch_create", "git.tag_create"));
+        assert_eq!(
+            err.message,
+            format!(
+                "git.tag_create: a merge is in progress on '{MOUNT}'; finish it with \
+                 git.merge_resolve or abandon it with git.merge_abort"
+            )
+        );
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0052/E2E-018: a paused rebase, cherry pick and revert each refuse
+    /// with their own name, and the creation works once abandoned.
+    #[tokio::test]
+    async fn e2e_tag_018_creation_refused_during_other_paused_operations() {
+        for kind in ["rebase", "cherry_pick", "revert"] {
+            let e = Env::new().await;
+            e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+            let paused = match kind {
+                "rebase" => {
+                    let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+                    rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap()
+                }
+                "cherry_pick" => {
+                    let (_c2, f1) = seed_fork_conflict_at(&e, MOUNT, "main").await;
+                    cherry_pick(&e, &f1).await.unwrap()
+                }
+                _ => {
+                    let c = seed_fx_line_rewritten(&e).await;
+                    revert(&e, &c[2]).await.unwrap()
+                }
+            };
+            assert_eq!(paused["status"], "conflict", "{kind}: {paused}");
+
+            let err = tag_as(&e, BOB, json!({"name": "v1.0"})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{kind}: {err:?}");
+            assert_eq!(
+                err.message,
+                format!(
+                    "git.tag_create: a {kind} is in progress on '{MOUNT}'; finish it with \
+                     git.{kind}_continue or abandon it with git.{kind}_abort"
+                )
+            );
+            assert!(tag_list(&e).await.is_empty(), "{kind}");
+
+            e.call(&format!("git.{kind}_abort"), json!({"mount_id": MOUNT})).await.unwrap();
+            tag_as(&e, BOB, json!({"name": "v1.0"})).await.unwrap();
+            assert_eq!(tag_names(&e).await, vec!["v1.0".to_string()], "{kind}");
+        }
+    }
+
+    /// SPEC-0052/E2E-019: creation and overwrite each write one audit line.
+    #[tokio::test]
+    async fn e2e_tag_019_audit_entry_on_creation_and_overwrite() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_main(&e).await;
+        tag(&e, json!({"name": "v1.0", "overwrite": true})).await.unwrap();
+
+        assert_eq!(
+            tag_audit(&e, OWNER),
+            vec![
+                ("git.tag_create".to_string(), format!("created tag 'v1.0' at {a}")),
+                ("git.tag_overwrite".to_string(), format!("overwrote tag 'v1.0' at {c} (was {a})")),
+            ]
+        );
+        let paths: Vec<String> = e
+            .audit()
+            .into_iter()
+            .filter(|x| x.op.starts_with("git.tag_"))
+            .map(|x| x.path)
+            .collect();
+        assert_eq!(paths, ["/", "/"]);
+    }
+
+    /// SPEC-0052/E2E-021: zero then one tag.
+    #[tokio::test]
+    async fn e2e_tag_021_zero_and_one_tag() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        let first = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        assert_eq!(first, json!({"mount_id": MOUNT, "tags": []}));
+        assert_eq!(tag_names(&e).await, vec!["v1.0".to_string()]);
+    }
+
+    /// SPEC-0052/E2E-023: a non member cannot list, and learns no tag name.
+    #[tokio::test]
+    async fn e2e_tag_023_non_member_cannot_list() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let usual = e.as_person(CAROL, "git.status", json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        let err = e.as_person(CAROL, "git.tags", json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN, "{err:?}");
+        assert_eq!(err.message, usual.message);
+        assert!(!format!("{err:?}").contains("v1.0"), "{err:?}");
+    }
+
+    /// SPEC-0052/E2E-024: listing works while a merge is paused.
+    #[tokio::test]
+    async fn e2e_tag_024_listing_works_during_a_paused_operation() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+
+        let listed = tag_list(&e).await;
+
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0]["name"], "v1.0");
+        assert_eq!(listed[0]["kind"], "lightweight");
+    }
+
+    /// SPEC-0052/E2E-025: ascending order, compared byte by byte.
+    #[tokio::test]
+    async fn e2e_tag_025_listing_order() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        for name in ["v2.0", "v10.0", "Alpha", "été", "v1.0"] {
+            tag(&e, json!({"name": name})).await.unwrap();
+        }
+
+        let out = e.as_person(BOB, "git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        let names: Vec<&str> =
+            out["tags"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+
+        assert_eq!(names, ["Alpha", "v1.0", "v10.0", "v2.0", "été"]);
+    }
+
+    /// SPEC-0052/E2E-052: tagging works right after the first commit.
+    #[tokio::test]
+    async fn e2e_tag_052_tagging_works_after_the_first_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/first.txt", "1\n").await;
+        let f = e.commit("first").await;
+
+        tag(&e, json!({"name": "v0.1"})).await.unwrap();
+
+        assert_eq!(tag_target(&e, "v0.1").await.as_deref(), Some(f.as_str()));
+    }
+
+    /// SPEC-0052/E2E-061: two different names at once both succeed.
+    #[tokio::test]
+    async fn e2e_tag_061_concurrent_creation_of_different_names() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        let (ra, rb) = tokio::join!(
+            tag_as(&e, OWNER, json!({"name": "v6.0"})),
+            tag_as(&e, BOB, json!({"name": "v6.1"})),
+        );
+
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(tag_names(&e).await, vec!["v6.0".to_string(), "v6.1".to_string()]);
+        let created = [OWNER, BOB]
+            .iter()
+            .flat_map(|p| tag_audit(&e, p))
+            .filter(|(op, _)| op == "git.tag_create")
+            .count();
+        assert_eq!(created, 2);
+    }
+
+    /// SPEC-0052/E2E-068: the loser of a race retries under another name. The
+    /// race decides who loses, so the loser plays Bob's part.
+    #[tokio::test]
+    async fn e2e_tag_068_the_loser_of_a_concurrent_creation_can_retry_under_another_name() {
+        let e = Env::new().await;
+        let (a, b) = seed_tags(&e).await;
+        let (ra, rb) = tokio::join!(
+            tag_as(&e, OWNER, json!({"name": "v5.0", "target": a})),
+            tag_as(&e, BOB, json!({"name": "v5.0", "target": b})),
+        );
+        let loser = match (&ra, &rb) {
+            (Ok(_), Err(err)) => {
+                assert_eq!(err.message, exists_msg("v5.0"));
+                BOB
+            }
+            (Err(err), Ok(_)) => {
+                assert_eq!(err.message, exists_msg("v5.0"));
+                OWNER
+            }
+            other => panic!("exactly one creation must win: {other:?}"),
+        };
+        let v50 = tag_target(&e, "v5.0").await;
+
+        tag_as(&e, loser, json!({"name": "v5.1", "target": b})).await.unwrap();
+
+        assert_eq!(tag_target(&e, "v5.1").await.as_deref(), Some(b.as_str()));
+        assert_eq!(tag_target(&e, "v5.0").await, v50, "v5.0 is unchanged");
+    }
+
+    /// SPEC-0052/E2E-070: the paused operation refusal outranks an invalid
+    /// name and an unknown target.
+    #[tokio::test]
+    async fn e2e_tag_070_paused_operation_outranks_an_invalid_name_and_unknown_target() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        assert_eq!(e.merge("feature").await.unwrap()["status"], "conflict");
+
+        let err = tag(&e, json!({"name": "my tag", "target": "nosuchref"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(
+            err.message,
+            format!(
+                "git.tag_create: a merge is in progress on '{MOUNT}'; finish it with \
+                 git.merge_resolve or abandon it with git.merge_abort"
+            )
+        );
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0052/E2E-079: a confirmed overwrite to the same commit is audited,
+    /// and a confirmed overwrite of an unknown name is a creation.
+    #[tokio::test]
+    async fn e2e_tag_079_overwrite_to_the_same_commit_is_audited() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        tag(&e, json!({"name": "v1.0", "target": a, "overwrite": true})).await.unwrap();
+        let v8 = tag(&e, json!({"name": "v8.0", "target": a, "overwrite": true})).await.unwrap();
+
+        assert_eq!(v8["overwritten"], false, "{v8}");
+        assert!(v8.get("previous_sha").is_none(), "{v8}");
+        assert_eq!(
+            tag_audit(&e, OWNER)[1..],
+            [
+                ("git.tag_overwrite".to_string(), format!("overwrote tag 'v1.0' at {a} (was {a})")),
+                ("git.tag_create".to_string(), format!("created tag 'v8.0' at {a}")),
+            ]
+        );
+    }
+
+    /// SPEC-0052/E2E-080: a name that is both a branch and a tag is the branch.
+    #[tokio::test]
+    async fn e2e_tag_080_branch_and_tag_share_a_name() {
+        let e = Env::new().await;
+        let (a, b) = seed_tags(&e).await;
+        e.set_branch("rel", &b).await;
+        tag(&e, json!({"name": "rel", "target": a})).await.unwrap();
+
+        tag(&e, json!({"name": "v1", "target": "rel"})).await.unwrap();
+
+        assert_eq!(tag_target(&e, "v1").await.as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0052/E2E-081: a commit prefix under 7 characters is unknown.
+    #[tokio::test]
+    async fn e2e_tag_081_short_commit_prefix() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        let short5 = &a[..5];
+
+        let err = tag(&e, json!({"name": "v1", "target": short5})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, unknown_target_msg(short5));
+        assert!(tag_list(&e).await.is_empty());
+        // The same commit through a 7 character prefix is accepted, so the
+        // refusal above is the length rule and not a missing commit.
+        tag(&e, json!({"name": "v1", "target": &a[..7]})).await.unwrap();
+        assert_eq!(tag_target(&e, "v1").await.as_deref(), Some(a.as_str()));
+    }
+
+    /// SPEC-0052/E2E-082: a 7 character prefix two commits share is unknown.
+    /// The pair is found by hashing candidate commits until two ids agree on
+    /// their first 7 characters (about twenty thousand hashes, by the birthday
+    /// bound), then both are written to the store.
+    #[tokio::test]
+    async fn e2e_tag_082_ambiguous_commit_prefix() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        let entry = e.entry().await;
+        let prefix = {
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let tree = repo.find_commit(Oid::from_str(&a).unwrap()).unwrap().tree_id();
+            let mut seen: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            let mut i = 0u64;
+            let prefix = loop {
+                let body = format!(
+                    "tree {tree}\nparent {a}\nauthor p <p@test.com> 1700000000 +0000\n\
+                     committer p <p@test.com> 1700000000 +0000\n\nprobe {i}\n"
+                )
+                .into_bytes();
+                let oid = Oid::hash_object(git2::ObjectType::Commit, &body).unwrap().to_string();
+                let key = oid[..7].to_string();
+                if let Some(other) = seen.get(&key) {
+                    let odb = repo.odb().unwrap();
+                    odb.write(git2::ObjectType::Commit, other).unwrap();
+                    odb.write(git2::ObjectType::Commit, &body).unwrap();
+                    break key;
+                }
+                seen.insert(key, body);
+                i += 1;
+            };
+            entry.objects.import_from_repo(&repo).await.unwrap();
+            prefix
+        };
+
+        let err = tag(&e, json!({"name": "v1", "target": prefix})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, unknown_target_msg(&prefix));
+        assert!(tag_list(&e).await.is_empty());
     }
 }
