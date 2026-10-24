@@ -3165,6 +3165,8 @@ async fn clone_and_import_inner(
                         "files_imported": 0,
                         "bytes_imported": 0,
                         "message": "Repository is empty",
+                        "tags_added": [],
+                        "tags_kept_local": [],
                     }));
                 }
             };
@@ -3213,6 +3215,18 @@ async fn clone_and_import_inner(
             entry.db.set_ref("HEAD", &format!("refs/heads/{target_branch}"), true).await?;
             entry.db.set_ref(&format!("refs/heads/{target_branch}"), &tip_sha, false).await?;
 
+            // DEC-014: the tags come from the clone itself, reconciled only now,
+            // after the import and the quota admission, so a refused clone leaves
+            // no tag and no row names an object the blob store lacks. The project
+            // repository is hydrated first: a clash is compared against local tag
+            // objects the temporary clone has never seen.
+            let incoming = crate::git::remote::clone_history_tags(&cloned, tip.id())?;
+            let (tags_added, tags_kept_local) = {
+                let repo = entry.repo.lock().await;
+                hydrate(&entry, &repo).await?;
+                crate::tools::git_tags::reconcile_incoming_tags(&entry, &repo, &incoming).await?
+            };
+
             let mut imported = 0usize;
             let mut skipped: Vec<String> = Vec::new();
             for (rel, oid) in files {
@@ -3256,6 +3270,8 @@ async fn clone_and_import_inner(
             out.insert("commits_imported".into(), json!(commits_imported));
             out.insert("depth".into(), if depth > 0 { json!(depth) } else { json!("full") });
             out.insert("auth".into(), json!(auth));
+            out.insert("tags_added".into(), json!(tags_added));
+            out.insert("tags_kept_local".into(), json!(tags_kept_local));
             if !skipped.is_empty() {
                 out.insert("skipped".into(), json!(skipped));
             }
@@ -25317,5 +25333,112 @@ mod tests {
         assert_eq!(out["tags_added"], json!([]));
         assert_eq!(tag_target(&e, "v1.0").await, local);
         assert_eq!(tag_list(&e).await[0]["message"], "A");
+    }
+
+    // ── SPEC-0052 US-0088: receiving remote tags on clone ─────────────────
+
+    /// SPEC-0052 E2E-046: the clone brings in the tags of the cloned branch's
+    /// history, plain and annotated, and leaves out a tag only another branch
+    /// holds, though the clone downloaded that branch too.
+    #[tokio::test]
+    async fn e2e_tag_046_clone_brings_in_history_tags() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-t046");
+        let url = seed_bare_remote(&dir, "hi\n");
+        let a = bare_ref_sha(&dir, "refs/heads/main").unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        let v2 = annotated_tag_bare_remote(&dir, "v2.0", &c, "Release 2.0");
+        create_branch_on_bare_remote(&dir, "refs/heads/experimental", "refs/heads/main");
+        let ex = advance_bare_remote(&dir, "refs/heads/experimental", "x\n");
+        plain_tag_bare_remote(&dir, "v9.0", &ex);
+
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0", "v2.0"]);
+        assert_eq!(out["tags_kept_local"], json!([]));
+        let listed = tag_list(&e).await;
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(listed[0]["name"], "v1.0");
+        assert_eq!(listed[0]["kind"], "lightweight");
+        assert_eq!(listed[0]["sha"], a);
+        assert_eq!(listed[1]["name"], "v2.0");
+        assert_eq!(listed[1]["kind"], "annotated");
+        assert_eq!(listed[1]["message"], "Release 2.0");
+        assert_eq!(listed[1]["object"], v2);
+        assert_eq!(listed[1]["sha"], c);
+        assert!(tag_target(&e, "v9.0").await.is_none());
+    }
+
+    /// SPEC-0052 E2E-047: a remote without tag gives empty arrays and an empty
+    /// listing. "Goes down during the clone" is a remote that accepts every
+    /// connection and drops it (`closing_remote`), the closest the harness
+    /// offers to a server dying mid exchange; the clone is refused and no tag
+    /// appears.
+    #[tokio::test]
+    async fn e2e_tag_047_clone_with_no_tag_and_a_failed_clone() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-t047");
+        let url = seed_bare_remote(&dir, "hi\n");
+
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert!(tag_names(&e).await.is_empty());
+
+        let (down, handle) = closing_remote().await;
+        let err = call_clone_and_import(&e, &down, "anonymous").await.unwrap_err();
+        handle.abort();
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert!(err.message.contains("clone failed"), "{}", err.message);
+        assert!(tag_names(&e).await.is_empty());
+    }
+
+    /// SPEC-0052 E2E-059: 500 tags in the history, 100 of them annotated.
+    #[tokio::test]
+    async fn e2e_tag_059_clone_with_many_tags() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-t059");
+        let url = seed_bare_remote(&dir, "hi\n");
+        let a = bare_ref_sha(&dir, "refs/heads/main").unwrap();
+        for i in 0..500 {
+            if i % 5 == 0 {
+                annotated_tag_bare_remote(&dir, &format!("t{i:03}"), &a, &format!("note {i}"));
+            } else {
+                plain_tag_bare_remote(&dir, &format!("t{i:03}"), &a);
+            }
+        }
+
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_added"].as_array().unwrap().len(), 500);
+        assert_eq!(out["tags_kept_local"], json!([]));
+        let listed = tag_list(&e).await;
+        assert_eq!(listed.len(), 500);
+        let annotated: Vec<&Value> = listed.iter().filter(|t| t["kind"] == "annotated").collect();
+        assert_eq!(annotated.len(), 100);
+        for t in annotated {
+            let n: usize = t["name"].as_str().unwrap()[1..].parse().unwrap();
+            assert_eq!(t["message"], format!("note {n}"));
+            assert_eq!(t["tagger"], "Origin");
+            assert_eq!(t["sha"], a);
+        }
+    }
+
+    /// SPEC-0052 E2E-060: a re-clone keeps the local tag that sits at another
+    /// commit than the remote's and reports it.
+    #[tokio::test]
+    async fn e2e_tag_060_clone_meets_a_conflicting_local_tag() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t060").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+
+        let out = call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_kept_local"], json!(["v1.0"]));
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
     }
 }

@@ -87,7 +87,7 @@
 | US-0085 | SPEC-0052 | delete a local tag | US-0083 | 1 | landed | story/US-0085-delete-a-local-tag | story/US-0084-annotated-tags-and-listing-details |
 | US-0086 | SPEC-0052 | receive remote tags on fetch | US-0084 | 1 | landed | story/US-0086-receive-tags-on-fetch | story/US-0085-delete-a-local-tag |
 | US-0087 | SPEC-0052 | receive remote tags on pull, also when the merge pauses | US-0086 | 2 | landed | story/US-0087-receive-tags-on-pull | story/US-0086-receive-tags-on-fetch |
-| US-0088 | SPEC-0052 | receive remote tags on clone | US-0086 | 2 | todo | | |
+| US-0088 | SPEC-0052 | receive remote tags on clone | US-0086 | 2 | landed | story/US-0088-receive-tags-on-clone | story/US-0087-receive-tags-on-pull |
 | US-0089 | SPEC-0052 | publish one tag to the remote | US-0083 | 1 | todo | | |
 | US-0090 | SPEC-0052 | overwrite a remote tag only on explicit confirmation | US-0089, US-0084 | 1 | todo | | |
 | US-0091 | SPEC-0052 | documentation, round trip test and spec close | US-0090, US-0085, US-0087, US-0088 | 1 | todo | | |

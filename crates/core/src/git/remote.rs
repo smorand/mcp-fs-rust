@@ -918,6 +918,38 @@ fn history_tags(
     Ok((tags, received))
 }
 
+/// DEC-014: the tags a fresh clone carries that belong to the cloned branch,
+/// sorted by name: every `refs/tags/*` of `repo` whose final target is a
+/// commit equal to or an ancestor of `tip`. The clone already holds the data
+/// (libgit2 follows tags on clone), so nothing is downloaded here; a tag on
+/// another branch's commit, a tree or a blob is skipped without a word.
+///
+/// Cost: n tags give O(n) ref and object lookups plus one
+/// `graph_descendant_of` per distinct commit, each O(d) in the history depth
+/// d, so O(n + c d) time for c distinct commits, and O(n) space.
+pub fn clone_history_tags(repo: &git2::Repository, tip: git2::Oid) -> Result<Vec<IncomingTag>> {
+    let refs = repo
+        .references_glob("refs/tags/*")
+        .map_err(|e| ToolError::internal(format!("list cloned tag refs: {e}")))?;
+    let mut in_history: HashMap<git2::Oid, bool> = HashMap::new();
+    let mut tags = Vec::new();
+    for r in refs.flatten() {
+        let (Ok(full), Some(oid)) = (r.name(), r.target()) else { continue };
+        let Some(name) = full.strip_prefix("refs/tags/") else { continue };
+        let Ok(object) = repo.find_object(oid, None) else { continue };
+        let annotated = object.kind() == Some(git2::ObjectType::Tag);
+        let Some(commit) = object.peel_to_commit().ok().map(|c| c.id()) else { continue };
+        let reachable = *in_history.entry(commit).or_insert_with(|| {
+            commit == tip || repo.graph_descendant_of(tip, commit).unwrap_or(false)
+        });
+        if reachable {
+            tags.push(IncomingTag { name: name.to_string(), oid, annotated });
+        }
+    }
+    tags.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok(tags)
+}
+
 /// The commit a held tag object finally names, through any chain of tags.
 fn peel_held(repo: &git2::Repository, oid: git2::Oid) -> Option<git2::Oid> {
     repo.find_object(oid, None).ok()?.peel_to_commit().ok().map(|c| c.id())
