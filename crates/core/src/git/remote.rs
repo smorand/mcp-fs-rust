@@ -679,6 +679,31 @@ pub struct FetchOutcome {
     pub refs_updated: Vec<FetchRefUpdate>,
     pub advertised_branches: Vec<String>,
     pub objects_fetched: i64,
+    /// The remote tags in the scoped branch's history (DEC-011), sorted by
+    /// name, each with its object already in `repo`; empty under
+    /// [`TagScope::Off`]. Nothing is written for them here: the caller
+    /// reconciles them against its own tags (DEC-012).
+    pub incoming_tags: Vec<IncomingTag>,
+}
+
+/// One remote tag a fetch may bring in (DEC-011). `oid` is the ref's own
+/// target: the commit for a plain tag, the tag object for an annotated one,
+/// which is what a `refs/tags/<name>` row stores (DEC-004).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingTag {
+    pub name: String,
+    pub oid: git2::Oid,
+    pub annotated: bool,
+}
+
+/// Which history a fetch takes tags from (DEC-011): `Branch` names a branch
+/// of the remote, `RemoteDefault` the branch the remote's HEAD names, and
+/// `Off` takes none, so a caller not yet receiving tags pays nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagScope<'a> {
+    Off,
+    Branch(&'a str),
+    RemoteDefault,
 }
 
 /// Fetch objects and update `refs/remotes/origin/*` from `origin_url`
@@ -706,6 +731,7 @@ pub fn fetch_from_remote(
     origin_url: &str,
     token: Option<String>,
     deadline: Option<Instant>,
+    tag_scope: TagScope<'_>,
 ) -> Result<FetchOutcome> {
     let token_for_redaction = token.clone();
     let mut git_remote = repo
@@ -715,22 +741,37 @@ pub fn fetch_from_remote(
     // The remote's own advertisement, read before the fetch itself runs
     // (DEC-037): the caller diffs this against its prior
     // `refs/remotes/origin/*` view to find what went stale.
-    let advertised_branches: Vec<String> = {
+    let (advertised_branches, advertised_tags, default_branch) = {
         let list_callbacks = credential_callbacks(token.clone(), deadline);
         let conn = git_remote
             .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
             .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
-        conn.list()
-            .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?
+        let heads = conn
+            .list()
+            .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+        let branches: Vec<String> = heads
             .iter()
             .filter_map(|h| h.name().strip_prefix("refs/heads/").map(str::to_string))
-            .collect()
+            .collect();
+        let tags: Vec<(String, git2::Oid)> = heads
+            .iter()
+            .filter_map(|h| h.name().strip_prefix("refs/tags/").map(|n| (n.to_string(), h.oid())))
+            .collect();
+        // Only asked for when needed: an empty or detached remote HEAD just
+        // means no history to take tags from.
+        let default_branch = match tag_scope {
+            TagScope::RemoteDefault => conn.default_branch().ok().and_then(|b| {
+                b.as_str().ok().and_then(|s| s.strip_prefix("refs/heads/")).map(str::to_string)
+            }),
+            _ => None,
+        };
+        (branches, tags, default_branch)
         // `conn` drops here, disconnecting before the real fetch reconnects.
     };
 
     let updates: Rc<RefCell<Vec<FetchRefUpdate>>> = Rc::new(RefCell::new(Vec::new()));
     let updates_cell = updates.clone();
-    let mut callbacks = credential_callbacks(token, deadline);
+    let mut callbacks = credential_callbacks(token.clone(), deadline);
     callbacks.update_tips(move |refname, old, new| {
         updates_cell.borrow_mut().push(FetchRefUpdate {
             ref_name: refname.to_string(),
@@ -742,8 +783,10 @@ pub fn fetch_from_remote(
 
     let mut opts = git2::FetchOptions::new();
     opts.remote_callbacks(callbacks);
-    // FR-NEW-062: no tag ever follows this fetch, and pruning stays off so a
-    // ref absent from `advertised_branches` is reported, never deleted here.
+    // SPEC-0052 FR-MOD-002 (formerly FR-NEW-062's "no tag"): libgit2 never
+    // follows tags here (DEC-011); the history tags are chosen explicitly
+    // below. Pruning stays off so a ref absent from `advertised_branches` is
+    // reported, never deleted here.
     opts.download_tags(git2::AutotagOption::None);
     opts.prune(git2::FetchPrune::Off);
 
@@ -751,10 +794,161 @@ pub fn fetch_from_remote(
         .fetch(&[fetch_refspec(remote).as_str()], Some(&mut opts), None)
         .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
 
-    let objects_fetched = git_remote.stats().received_objects() as i64;
+    let mut objects_fetched = git_remote.stats().received_objects() as i64;
     let refs_updated = updates.borrow().clone();
 
-    Ok(FetchOutcome { refs_updated, advertised_branches, objects_fetched })
+    let branch = match tag_scope {
+        TagScope::Off => None,
+        TagScope::Branch(b) => Some(b.to_string()),
+        TagScope::RemoteDefault => default_branch,
+    };
+    let incoming_tags = match branch {
+        None => Vec::new(),
+        Some(b) => {
+            let tip = repo.refname_to_id(&format!("refs/remotes/{remote}/{b}")).ok();
+            let fetch_tags = |refspecs: &[String]| -> Result<i64> {
+                let mut opts = git2::FetchOptions::new();
+                opts.remote_callbacks(credential_callbacks(token.clone(), deadline));
+                opts.download_tags(git2::AutotagOption::None);
+                opts.prune(git2::FetchPrune::Off);
+                git_remote.fetch(refspecs, Some(&mut opts), None).map_err(|e| {
+                    connection_error(origin_url, &e, token_for_redaction.as_deref())
+                })?;
+                Ok(git_remote.stats().received_objects() as i64)
+            };
+            let (tags, received) = match tip {
+                Some(tip) => history_tags(repo, tip, &advertised_tags, fetch_tags)?,
+                None => (Vec::new(), 0),
+            };
+            objects_fetched += received;
+            tags
+        }
+    };
+
+    Ok(FetchOutcome { refs_updated, advertised_branches, objects_fetched, incoming_tags })
+}
+
+/// Where annotated candidates are fetched to, on disk only, then removed: the
+/// tag objects stay, no ref of the project ever names this namespace.
+const INCOMING_TAGS_PREFIX: &str = "refs/mcpfs/incoming/";
+
+/// How many explicit tag refspecs go into one fetch, so thousands of tags
+/// (E2E-048) never build one unbounded negotiation.
+const TAG_REFSPEC_BATCH: usize = 500;
+
+/// DEC-011: the advertised tags whose final commit is `tip` or one of its
+/// ancestors, sorted by name, with every annotated one's tag object fetched
+/// into `repo`. `advertised` holds the raw advertisement, `^{}` peeled
+/// entries included. A tag naming a tree or a blob, or a commit outside that
+/// history, is skipped without a word.
+///
+/// A tag object already in `repo` needs no download. One the advertisement
+/// gives no peeled entry for, and whose object `repo` does not hold, cannot be
+/// judged before it is downloaded: it is fetched with the annotated ones and
+/// peeled locally (the design's fallback), so the result never depends on
+/// whether a transport advertises peeled entries.
+///
+/// Cost: n advertised tags give O(n) map work plus one `graph_descendant_of`
+/// per distinct commit, each O(d) in the history depth d, so O(n + c d) time
+/// for c distinct commits, and O(n) space; downloads are ceil(k / 500) fetches
+/// for k annotated tags not yet held.
+fn history_tags(
+    repo: &git2::Repository,
+    tip: git2::Oid,
+    advertised: &[(String, git2::Oid)],
+    mut fetch: impl FnMut(&[String]) -> Result<i64>,
+) -> Result<(Vec<IncomingTag>, i64)> {
+    let peeled: HashMap<&str, git2::Oid> =
+        advertised.iter().filter_map(|(n, oid)| n.strip_suffix("^{}").map(|n| (n, *oid))).collect();
+    let mut in_history: HashMap<git2::Oid, bool> = HashMap::new();
+    let mut is_in_history = |commit: git2::Oid| -> bool {
+        *in_history.entry(commit).or_insert_with(|| {
+            repo.find_commit(commit).is_ok()
+                && (commit == tip || repo.graph_descendant_of(tip, commit).unwrap_or(false))
+        })
+    };
+
+    let mut tags = Vec::new();
+    let mut to_download: Vec<(&str, git2::Oid)> = Vec::new();
+    for (name, oid) in advertised.iter().filter(|(n, _)| !n.ends_with("^{}")) {
+        let final_commit = peeled.get(name.as_str()).copied();
+        let held_kind = repo.find_object(*oid, None).ok().and_then(|o| o.kind());
+        match (final_commit, held_kind) {
+            // A plain tag on a commit, or a held annotated tag: decide now.
+            (None, Some(git2::ObjectType::Commit)) => {
+                if is_in_history(*oid) {
+                    tags.push(IncomingTag { name: name.clone(), oid: *oid, annotated: false });
+                }
+            }
+            (_, Some(git2::ObjectType::Tag)) => {
+                let commit = peel_held(repo, *oid);
+                if commit.is_some_and(&mut is_in_history) {
+                    tags.push(IncomingTag { name: name.clone(), oid: *oid, annotated: true });
+                }
+            }
+            // A plain tag on a tree or a blob.
+            (None, Some(_)) => {}
+            (Some(commit), None) => {
+                if is_in_history(commit) {
+                    to_download.push((name, *oid));
+                }
+            }
+            (Some(_), Some(_)) => {}
+            // No peeled entry and nothing held: only a download can tell.
+            (None, None) => to_download.push((name, *oid)),
+        }
+    }
+
+    let mut received = 0;
+    if !to_download.is_empty() {
+        let fetched = fetch_into_incoming(&to_download, &mut fetch);
+        let cleanup = remove_incoming_refs(repo);
+        received = fetched?;
+        cleanup?;
+        for (name, oid) in to_download {
+            let Ok(object) = repo.find_object(oid, None) else { continue };
+            let annotated = object.kind() == Some(git2::ObjectType::Tag);
+            let commit = object.peel_to_commit().ok().map(|c| c.id());
+            if commit.is_some_and(&mut is_in_history) {
+                tags.push(IncomingTag { name: name.to_string(), oid, annotated });
+            }
+        }
+    }
+    tags.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok((tags, received))
+}
+
+/// The commit a held tag object finally names, through any chain of tags.
+fn peel_held(repo: &git2::Repository, oid: git2::Oid) -> Option<git2::Oid> {
+    repo.find_object(oid, None).ok()?.peel_to_commit().ok().map(|c| c.id())
+}
+
+/// The batched explicit fetch of DEC-011; returns the objects received.
+fn fetch_into_incoming(
+    tags: &[(&str, git2::Oid)],
+    fetch: &mut impl FnMut(&[String]) -> Result<i64>,
+) -> Result<i64> {
+    let mut received = 0;
+    for batch in tags.chunks(TAG_REFSPEC_BATCH) {
+        let refspecs: Vec<String> = batch
+            .iter()
+            .map(|(name, _)| format!("+refs/tags/{name}:{INCOMING_TAGS_PREFIX}{name}"))
+            .collect();
+        received += fetch(&refspecs)?;
+    }
+    Ok(received)
+}
+
+/// Drop every temporary incoming ref, whatever the fetch did, so a failed or
+/// partial download leaves no ref outside the project's own namespaces.
+fn remove_incoming_refs(repo: &git2::Repository) -> Result<()> {
+    let refs = repo
+        .references_glob(&format!("{INCOMING_TAGS_PREFIX}*"))
+        .map_err(|e| ToolError::internal(format!("list incoming tag refs: {e}")))?;
+    for mut r in refs.flatten() {
+        r.delete().map_err(|e| ToolError::internal(format!("remove incoming tag ref: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Wrap a git2 failure reaching the network with the host named explicitly

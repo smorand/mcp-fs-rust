@@ -74,3 +74,6 @@ Test harness: `e.call("git.tags", json!({"mount_id": MOUNT}))` goes through the 
 - [ ] Docs updated: none in this story unless Paths lists them; the closing story updates the documentation.
 - [ ] Self review: full (performance, idiomatic Rust per the rust skill, no `unwrap` on fallible paths, no dash punctuation).
 - [ ] One commit `US-0087: receive remote tags on pull, also when the merge pauses`, body `Spec: SPEC-0052` and the requirement ids.
+
+## Note from US-0086 (carried over, added 2026-10-24)
+`SPEC-0052/E2E-043` ("Pull keeps a conflicting local tag") is owned by US-0086 but could only be asserted on the fetch half there, because pull was not wired yet (`e2e_tag_043_*` checks that the pull succeeds and the local `v1.0` is unchanged, and the `kept local` report on a fetch). When this story wires pull, extend `e2e_tag_043_*` so that the pull result itself carries `tags_kept_local == ["v1.0"]` and `tags_added == []`, and keep the local tag at its commit. Without this the spec's Then of E2E-043 is only partly proven.

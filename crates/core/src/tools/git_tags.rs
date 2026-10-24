@@ -386,3 +386,73 @@ fn annotation_details(repo: &Repository, target: &str, map: &mut serde_json::Map
         );
     }
 }
+
+/// DEC-017: two tag targets are the same tag when both are plain on one
+/// commit, or both annotated on one final commit with the same message;
+/// tagger and time do not count, and a plain tag never equals an annotated
+/// one. Both objects must be in `repo`; a missing one is an error, not a
+/// difference, because reconcile runs only after the fetch brought it in.
+pub(crate) fn tags_identical(repo: &Repository, a: Oid, b: Oid) -> Result<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    let find = |oid: Oid| {
+        repo.find_object(oid, None)
+            .map_err(|e| ToolError::internal(format!("tag target {oid} unreadable: {e}")))
+    };
+    let (a, b) = (find(a)?, find(b)?);
+    match (a.as_tag(), b.as_tag()) {
+        (Some(ta), Some(tb)) => {
+            let peel = |o: &git2::Object<'_>| o.peel_to_commit().ok().map(|c| c.id());
+            Ok(peel(&a).is_some()
+                && peel(&a) == peel(&b)
+                && ta.message_bytes() == tb.message_bytes())
+        }
+        // Two plain tags are equal only on the same object, checked above.
+        _ => Ok(false),
+    }
+}
+
+/// DEC-012: record each incoming tag the project does not have, keep every
+/// local tag of the same name untouched, and report both lists sorted. A tag
+/// identical to the local one (DEC-017) is in neither list. Must run after the
+/// fetched objects are imported into the blob store, so no row ever names an
+/// object the store lacks.
+///
+/// Cost: one ref listing, then for n incoming tags O(n) map lookups, one
+/// comparison per name clash and one row write per added tag; O(n) space.
+pub(crate) async fn reconcile_incoming_tags(
+    entry: &GitRepoEntry,
+    repo: &Repository,
+    incoming: &[crate::git::remote::IncomingTag],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let local: std::collections::HashMap<String, String> = entry
+        .db
+        .list_refs()
+        .await?
+        .into_iter()
+        .filter(|r| !r.symbolic && r.name.starts_with(TAGS_PREFIX))
+        .map(|r| (r.name, r.target))
+        .collect();
+    let (mut added, mut kept_local) = (Vec::new(), Vec::new());
+    for tag in incoming {
+        let tag_ref = format!("{TAGS_PREFIX}{}", tag.name);
+        match local.get(&tag_ref) {
+            None => {
+                entry.db.set_ref(&tag_ref, &tag.oid.to_string(), false).await?;
+                // Keep the on disk refs in step, as git.tag_create does; a
+                // name libgit2 refuses (DEC-019) must not undo the row.
+                let _ = repo.reference(&tag_ref, tag.oid, true, "mcp-fs git.remote_fetch");
+                added.push(tag.name.clone());
+            }
+            Some(target) => {
+                if !tags_identical(repo, parse_oid(target)?, tag.oid)? {
+                    kept_local.push(tag.name.clone());
+                }
+            }
+        }
+    }
+    added.sort_unstable();
+    kept_local.sort_unstable();
+    Ok((added, kept_local))
+}

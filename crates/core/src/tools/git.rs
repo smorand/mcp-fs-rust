@@ -3717,6 +3717,12 @@ async fn fetch_branch_inner(
         .map(|r| (r.name, r.target))
         .collect();
 
+    // Tags come from the checked out branch's history, or from the remote's
+    // default branch when nothing is checked out (DEC-011).
+    let head_branch = match entry.db.get_ref("HEAD").await? {
+        Some(h) if h.symbolic => h.target.strip_prefix("refs/heads/").map(str::to_string),
+        _ => None,
+    };
     let (remote_owned, origin_owned) = (remote.to_string(), origin_url.to_string());
     let entry_for_thread = entry.clone();
     // Held for the whole hydrate-plus-fetch, the same lock `push_branch` and
@@ -3735,18 +3741,32 @@ async fn fetch_branch_inner(
         on_git_thread(move || async move {
             let repo = entry_for_thread.repo.lock().await;
             hydrate(&entry_for_thread, &repo).await?;
+            let scope = match &head_branch {
+                Some(b) => crate::git::remote::TagScope::Branch(b),
+                None => crate::git::remote::TagScope::RemoteDefault,
+            };
             let outcome = crate::git::remote::fetch_from_remote(
                 &repo,
                 &remote_owned,
                 &origin_owned,
                 token,
                 Some(deadline),
+                scope,
             )?;
             entry_for_thread.objects.import_from_repo(&repo).await?;
-            Ok(outcome)
+            // After the import, never before: a ref row must not name a tag
+            // object the blob store does not hold yet (DEC-012).
+            let tags = crate::tools::git_tags::reconcile_incoming_tags(
+                &entry_for_thread,
+                &repo,
+                &outcome.incoming_tags,
+            )
+            .await?;
+            Ok((outcome, tags))
         }),
     )
     .await?;
+    let (outcome, (tags_added, tags_kept_local)) = outcome;
 
     let mut refs_updated = Vec::with_capacity(outcome.refs_updated.len());
     for u in &outcome.refs_updated {
@@ -3769,6 +3789,8 @@ async fn fetch_branch_inner(
         "objects_fetched": outcome.objects_fetched,
         "up_to_date": refs_updated.is_empty(),
         "auth": auth,
+        "tags_added": tags_added,
+        "tags_kept_local": tags_kept_local,
     }))
 }
 
@@ -6608,6 +6630,8 @@ async fn pull_branch_inner(
                 &origin_owned,
                 token,
                 Some(deadline),
+                // Pull receives tags in US-0087; until then it fetches as before.
+                crate::git::remote::TagScope::Off,
             )?;
             entry_for_thread.objects.import_from_repo(&repo).await?;
             for u in &outcome.refs_updated {
@@ -10648,8 +10672,8 @@ mod tests {
         repo.find_reference(ref_name).unwrap().delete().unwrap();
     }
 
-    /// An annotated tag on the bare "remote", pointing at `target_ref`, to prove
-    /// a fetch takes no tags (FR-NEW-062).
+    /// An annotated tag on the bare "remote", pointing at `target_ref`: a fetch
+    /// brings it in when it is in the fetched history (SPEC-0052 FR-MOD-002).
     fn tag_bare_remote(dir: &std::path::Path, tag: &str, target_ref: &str) {
         let repo = git2::Repository::open_bare(dir).unwrap();
         let target = repo.find_reference(target_ref).unwrap().peel_to_commit().unwrap();
@@ -10747,6 +10771,7 @@ mod tests {
             "https://mcp-fs-fetch-unreachable-test.invalid/o/r.git",
             None,
             None,
+            crate::git::remote::TagScope::Off,
         )
         .unwrap_err();
         assert_eq!(err.code, code::INTERNAL_ERROR);
@@ -10856,22 +10881,28 @@ mod tests {
         assert_eq!(out["up_to_date"], false);
         assert_eq!(out["auth"], "anonymous");
         assert!(out["objects_fetched"].as_i64().unwrap() > 0);
+        // SPEC-0052 FR-MOD-002 added the two tag arrays, always present.
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(out["tags_kept_local"], json!([]));
         let obj = out.as_object().unwrap();
-        assert_eq!(obj.len(), 5, "exactly the five declared fields: {obj:?}");
+        assert_eq!(obj.len(), 7, "exactly the seven declared fields: {obj:?}");
     }
 
-    /// E2E-NEW-215 / E2E-NEW-216: a fetch against a remote holding a branch and
-    /// a tag updates and reports only the branch's remote-tracking ref; the
-    /// tag is never imported, and `git.tags` is unchanged.
+    /// E2E-NEW-215 / E2E-NEW-216, modified by SPEC-0052 E2E-MOD-002 (DEC-022):
+    /// a fetch against a remote holding a branch and a tag on that branch
+    /// updates and reports the branch's remote-tracking ref as before, never
+    /// reports a tag ref among `refs_updated`, and now also brings the tag in,
+    /// listed in `tags_added` (FR-MOD-002 replaced FR-NEW-062's "no tag").
     #[tokio::test]
-    async fn e2e_new_215_216_fetch_brings_branches_and_takes_no_tags() {
+    async fn e2e_new_215_216_tag_mod_002_fetch_brings_branches_and_history_tags() {
         let e = Env::new().await;
         let remote_dir = e.f.dir.path().join("remote-215");
         let url = seed_bare_remote(&remote_dir, "hi\n");
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
         let tip = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
         tag_bare_remote(&remote_dir, "v1", "refs/heads/main");
-        let before_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        assert!(entry.db.get_ref("refs/tags/v1").await.unwrap().is_none());
 
         let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
         let updates = out["refs_updated"].as_array().unwrap();
@@ -10884,44 +10915,65 @@ mod tests {
             "no tag ref may appear in refs_updated: {updates:?}"
         );
 
-        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
-        assert!(entry.db.get_ref("refs/tags/v1").await.unwrap().is_none(), "no tag imported");
-        let after_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
-        assert_eq!(after_tags, before_tags, "git.tags must be unchanged by a fetch");
+        assert_eq!(out["tags_added"], json!(["v1"]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        let row = entry.db.get_ref("refs/tags/v1").await.unwrap().expect("tag imported");
+        assert_eq!(row.target, bare_ref_sha(&remote_dir, "refs/tags/v1").unwrap());
+        let tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(tags["tags"][0]["name"], "v1");
+        assert_eq!(tags["tags"][0]["sha"], tip);
+        assert_eq!(tags["tags"][0]["kind"], "annotated");
     }
 
-    /// E2E-NEW-217: `git.remote_pull` (US-011) does not exist yet, and this
-    /// story's scope boundary forbids building it here. But FR-NEW-062 states
-    /// pull inherits the fetch refspec because its first step IS this fetch,
-    /// so the way to prove that now, without building pull, is to call the
-    /// exact shared primitive pull will call, `fetch_from_remote`, directly,
-    /// exactly as US-011 will: any future caller of this function gets
-    /// no-tags-taken behaviour for free, by construction, not by a second
-    /// implementation.
+    /// E2E-NEW-217, modified by SPEC-0052 E2E-MOD-002 (DEC-022): pull's first
+    /// step IS this fetch, so the shared primitive `fetch_from_remote` is
+    /// called directly. It still updates only `refs/remotes/origin/*` refs
+    /// itself, and now returns the history tag among `incoming_tags` with its
+    /// tag object present, which is what pull and clone will reconcile from.
     #[tokio::test]
-    async fn e2e_new_217_pull_will_inherit_the_fetch_refspec() {
+    async fn e2e_new_217_pull_will_inherit_the_fetch_refspec_and_its_tags() {
         let e = Env::new().await;
         let remote_dir = e.f.dir.path().join("remote-217");
         let url = seed_bare_remote(&remote_dir, "hi\n");
         call_clone_and_import(&e, &url, "anonymous").await.unwrap();
         tag_bare_remote(&remote_dir, "v1", "refs/heads/main");
-        let before_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        let tag_oid =
+            git2::Oid::from_str(&bare_ref_sha(&remote_dir, "refs/tags/v1").unwrap()).unwrap();
 
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         {
             let repo = entry.repo.lock().await;
             hydrate(&entry, &repo).await.unwrap();
-            let outcome =
-                crate::git::remote::fetch_from_remote(&repo, "origin", &url, None, None).unwrap();
+            let outcome = crate::git::remote::fetch_from_remote(
+                &repo,
+                "origin",
+                &url,
+                None,
+                None,
+                crate::git::remote::TagScope::Branch("main"),
+            )
+            .unwrap();
             assert!(
                 outcome.refs_updated.iter().all(|u| !u.ref_name.contains("tags")),
                 "got {:?}",
                 outcome.refs_updated
             );
+            assert_eq!(
+                outcome.incoming_tags,
+                vec![crate::git::remote::IncomingTag {
+                    name: "v1".to_string(),
+                    oid: tag_oid,
+                    annotated: true,
+                }]
+            );
+            assert!(repo.find_tag(tag_oid).is_ok(), "the tag object must be downloaded");
+            assert!(
+                repo.references_glob("refs/mcpfs/*").unwrap().next().is_none(),
+                "the temporary incoming refs must be gone"
+            );
         }
+        // The primitive itself writes no tag row: reconcile does (DEC-012).
         assert!(entry.db.get_ref("refs/tags/v1").await.unwrap().is_none());
-        let after_tags = e.call("git.tags", json!({"mount_id": MOUNT})).await.unwrap();
-        assert_eq!(after_tags, before_tags);
     }
 
     /// Not one of this story's 14 owned tests, but a required implementation
@@ -24860,5 +24912,308 @@ mod tests {
             deletion_audit(&e),
             vec![(winner.to_string(), format!("deleted tag 'v1.0' (was at {a})"))]
         );
+    }
+
+    // ── SPEC-0052 US-0086: receiving remote tags on fetch ─────────────────
+
+    /// A plain tag on the bare "remote" at `target` (a commit, or any object
+    /// for the non commit cases of E2E-062), forced so a test can move it.
+    fn plain_tag_bare_remote(dir: &std::path::Path, tag: &str, target: &str) {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let oid = git2::Oid::from_str(target).unwrap();
+        repo.reference(&format!("refs/tags/{tag}"), oid, true, "test tag").unwrap();
+    }
+
+    /// An annotated tag on the bare "remote" at object `target`, carrying
+    /// `message` verbatim; returns the tag object id.
+    fn annotated_tag_bare_remote(
+        dir: &std::path::Path,
+        tag: &str,
+        target: &str,
+        message: &str,
+    ) -> String {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        let object = repo.find_object(git2::Oid::from_str(target).unwrap(), None).unwrap();
+        let sig =
+            git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_300, 0)).unwrap();
+        repo.tag(tag, &object, &sig, message, true).unwrap().to_string()
+    }
+
+    /// A clone of a fresh bare remote: returns the remote directory, its URL
+    /// and the commit `main` is at (the spec's a1b2c3d).
+    async fn cloned_remote(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
+        let dir = e.f.dir.path().join(label);
+        let url = seed_bare_remote(&dir, "hi\n");
+        call_clone_and_import(e, &url, "anonymous").await.unwrap();
+        let a = bare_ref_sha(&dir, "refs/heads/main").unwrap();
+        (dir, url, a)
+    }
+
+    fn names(v: &Value) -> Vec<String> {
+        v.as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_string()).collect()
+    }
+
+    /// SPEC-0052 E2E-041: both history tags, one plain and one annotated,
+    /// arrive and are listed as added.
+    #[tokio::test]
+    async fn e2e_tag_041_fetch_brings_in_history_tags() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t041").await;
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        let v11 = annotated_tag_bare_remote(&dir, "v1.1", &c, "release 1.1\n");
+        assert!(tag_names(&e).await.is_empty());
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0", "v1.1"]);
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+        assert_eq!(tag_target(&e, "v1.1").await.as_deref(), Some(v11.as_str()));
+        let listed = tag_list(&e).await;
+        assert_eq!(listed[1]["sha"], c);
+        assert_eq!(listed[1]["kind"], "annotated");
+    }
+
+    /// SPEC-0052 E2E-042: a tag reachable only from another branch is ignored.
+    #[tokio::test]
+    async fn e2e_tag_042_tags_outside_the_history_are_ignored() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-t042").await;
+        create_branch_on_bare_remote(&dir, "refs/heads/experimental", "refs/heads/main");
+        let ex = advance_bare_remote(&dir, "refs/heads/experimental", "x\n");
+        plain_tag_bare_remote(&dir, "v9.0", &ex);
+        annotated_tag_bare_remote(&dir, "v9.1", &ex, "outside\n");
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert!(tag_target(&e, "v9.0").await.is_none());
+        assert!(tag_target(&e, "v9.1").await.is_none());
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert!(!out.to_string().contains("v9."), "the result must not mention it: {out}");
+    }
+
+    /// SPEC-0052 E2E-043: a pull keeps a conflicting local tag. Pull does not
+    /// receive tags before US-0087, so the pull half asserts it succeeds and
+    /// leaves the local tag alone, and the "kept local" report is asserted on
+    /// the fetch, the same reconcile pull will call.
+    #[tokio::test]
+    async fn e2e_tag_043_pull_keeps_a_conflicting_local_tag() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t043").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(out["tags_kept_local"], json!(["v1.0"]));
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+    }
+
+    /// SPEC-0052 E2E-044: the same tag on both sides is neither added nor kept.
+    #[tokio::test]
+    async fn e2e_tag_044_same_name_at_the_same_commit() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t044").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        let before = tag_list(&e).await;
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert_eq!(tag_list(&e).await, before);
+    }
+
+    /// SPEC-0052 E2E-045: a failed exchange brings no tag. Down is a missing
+    /// remote path; "rate limited" is simulated by a remote that drops every
+    /// connection (no file remote can answer 429); the expired credential goes
+    /// through the registered tool, refused before any network call.
+    #[test]
+    fn e2e_tag_045_failed_fetch_brings_no_tag() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let (dir, _, _) = cloned_remote(&e, "remote-t045").await;
+            let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+            plain_tag_bare_remote(&dir, "v3.0", &c);
+
+            let down = format!("file://{}", e.f.dir.path().join("no-such-remote").display());
+            let err = call_fetch_branch(&e, &down, "anonymous").await.unwrap_err();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert!(tag_target(&e, "v3.0").await.is_none());
+
+            let (refusing, handle) = closing_remote().await;
+            let err = call_fetch_branch(&e, &refusing, "anonymous").await.unwrap_err();
+            handle.abort();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert!(tag_target(&e, "v3.0").await.is_none());
+
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            entry.db.add_remote("origin", "https://github.ibm.com/org/repo.git").await.unwrap();
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = e.call("git.remote_fetch", json!({"mount_id": MOUNT})).await.unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert!(tag_target(&e, "v3.0").await.is_none());
+            assert!(tag_names(&e).await.is_empty());
+        });
+    }
+
+    /// SPEC-0052 E2E-048: 2000 history tags, every fourth annotated, all
+    /// arrive with kind, message and tagger, and all are listed as added.
+    #[tokio::test]
+    async fn e2e_tag_048_two_thousand_tags() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t048").await;
+        let mut commits = vec![a];
+        for i in 0..4 {
+            commits.push(advance_bare_remote(&dir, "refs/heads/main", &format!("c{i}\n")));
+        }
+        {
+            let repo = git2::Repository::open_bare(&dir).unwrap();
+            let sig = git2::Signature::new("Origin", "o@t.com", &git2::Time::new(1_700_000_300, 0))
+                .unwrap();
+            for i in 0..2000 {
+                let commit = repo
+                    .find_object(git2::Oid::from_str(&commits[i % commits.len()]).unwrap(), None)
+                    .unwrap();
+                let name = format!("t{i:04}");
+                if i % 4 == 0 {
+                    repo.tag(&name, &commit, &sig, &format!("message {i}\n"), false).unwrap();
+                } else {
+                    repo.tag_lightweight(&name, &commit, false).unwrap();
+                }
+            }
+        }
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        let added = names(&out["tags_added"]);
+        assert_eq!(added.len(), 2000);
+        assert_eq!(added[0], "t0000");
+        assert_eq!(added[1999], "t1999");
+        let listed = tag_list(&e).await;
+        assert_eq!(listed.len(), 2000);
+        assert_eq!(listed[0]["kind"], "annotated");
+        assert_eq!(listed[0]["message"], "message 0\n");
+        assert_eq!(listed[0]["tagger"], "Origin");
+        assert_eq!(listed[0]["tagger_email"], "o@t.com");
+        assert_eq!(listed[1]["kind"], "lightweight");
+        assert_eq!(listed[1996]["message"], "message 1996\n");
+    }
+
+    /// SPEC-0052 E2E-049: a non member gets the usual refusal on fetch and on
+    /// pull, and no tag arrives.
+    #[test]
+    fn e2e_tag_049_non_member_cannot_receive() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let (dir, _, a) = cloned_remote(&e, "remote-t049").await;
+            plain_tag_bare_remote(&dir, "v1.0", &a);
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            entry.db.add_remote("origin", "https://github.com/o/r.git").await.unwrap();
+
+            let err = e
+                .as_person(CAROL, "git.remote_fetch", json!({"mount_id": MOUNT}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN);
+            assert!(!err.message.contains("v1.0"));
+            let err = e
+                .as_person(CAROL, "git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN);
+            assert!(!err.message.contains("v1.0"));
+            assert!(tag_names(&e).await.is_empty());
+        });
+    }
+
+    /// SPEC-0052 E2E-050: a remote tag moved between two fetches keeps the
+    /// local position, reported as kept local, and no other tag changes.
+    #[tokio::test]
+    async fn e2e_tag_050_remote_tag_moved_between_two_fetches() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t050").await;
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        plain_tag_bare_remote(&dir, "v0.9", &a);
+        let first = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(names(&first["tags_added"]), ["v0.9", "v1.0"]);
+        let before = tag_list(&e).await;
+
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_kept_local"], json!(["v1.0"]));
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+        assert_eq!(tag_list(&e).await, before);
+    }
+
+    /// SPEC-0052 E2E-062: a tag on a tree is skipped silently; an annotated
+    /// tag of an annotated tag of a history commit arrives.
+    #[tokio::test]
+    async fn e2e_tag_062_tags_that_do_not_point_at_a_commit() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t062").await;
+        let tree = {
+            let repo = git2::Repository::open_bare(&dir).unwrap();
+            let commit = repo.find_commit(git2::Oid::from_str(&a).unwrap()).unwrap();
+            commit.tree_id().to_string()
+        };
+        plain_tag_bare_remote(&dir, "t-tree", &tree);
+        annotated_tag_bare_remote(&dir, "t-tree-annotated", &tree, "a folder\n");
+        let inner = annotated_tag_bare_remote(&dir, "v8.0-inner", &a, "inner\n");
+        let v8 = annotated_tag_bare_remote(&dir, "v8.0", &inner, "outer\n");
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v8.0", "v8.0-inner"]);
+        assert_eq!(tag_target(&e, "v8.0").await.as_deref(), Some(v8.as_str()));
+        assert!(tag_target(&e, "t-tree").await.is_none());
+        assert!(tag_target(&e, "t-tree-annotated").await.is_none());
+        assert!(!out.to_string().contains("t-tree"), "{out}");
+        let listed = tag_list(&e).await;
+        assert_eq!(listed[0]["name"], "v8.0");
+        assert_eq!(listed[0]["sha"], a);
+        assert_eq!(listed[0]["message"], "outer\n");
+    }
+
+    /// SPEC-0052 E2E-076: same commit, different message: the local annotated
+    /// tag keeps its message and is reported as kept local. The same message
+    /// from another tagger at another time is identical (DEC-017).
+    #[tokio::test]
+    async fn e2e_tag_076_same_commit_different_message() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t076").await;
+        tag(&e, json!({"name": "v1.0", "message": "A"})).await.unwrap();
+        tag(&e, json!({"name": "v2.0", "message": "same"})).await.unwrap();
+        let local = tag_target(&e, "v1.0").await;
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "B");
+        annotated_tag_bare_remote(&dir, "v2.0", &a, "same");
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_kept_local"], json!(["v1.0"]));
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await, local);
+        assert_eq!(tag_list(&e).await[0]["message"], "A");
     }
 }
