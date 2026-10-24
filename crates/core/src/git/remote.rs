@@ -680,10 +680,15 @@ fn push_refs(
 }
 
 /// SPEC-0052 DEC-015: push `refs/tags/{tag}` to the same name on
-/// `origin_url`, never forced, through the same core as a branch push. The
-/// caller has already checked, against [`list_advertised_refs`], that the
-/// tag's commit is on the remote and that the remote has no tag of that
-/// name, so the pack carries at most the tag object itself.
+/// `origin_url`, through the same core as a branch push. The caller has
+/// already checked, against [`list_advertised_refs`], that the tag's commit
+/// is on the remote, so the pack carries at most the tag object itself.
+///
+/// `lease` is the remote tag object the caller's listing saw (DEC-018): with
+/// it the push is forced (`+`), and aborted before anything is sent when the
+/// remote no longer holds exactly that object, reported as
+/// [`TagPush::LeaseLost`] so the caller words the refusal. Without it the
+/// push is a plain creation the remote refuses to turn into an update.
 ///
 /// A per ref refusal by the remote is `Remote refused tag '<n>': <reason>`
 /// (DEC-019); any other failure is the connection refusal a fetch or a
@@ -694,13 +699,67 @@ pub fn push_tag_to_remote(
     tag: &str,
     token: Option<String>,
     deadline: Option<Instant>,
-) -> Result<()> {
+    lease: Option<git2::Oid>,
+) -> Result<TagPush> {
     let token_for_redaction = token.clone();
     let tag_ref = format!("refs/tags/{tag}");
-    let refs = PushRefs { src: &tag_ref, dst: &tag_ref, force: false, lease: None };
-    push_refs(repo, origin_url, refs, token, deadline)
-        .map(|_| ())
-        .map_err(|f| tag_push_error(f, tag, origin_url, token_for_redaction.as_deref()))
+    let lease = lease.map(|oid| oid.to_string());
+    let refs =
+        PushRefs { src: &tag_ref, dst: &tag_ref, force: lease.is_some(), lease: lease.as_deref() };
+    match push_refs(repo, origin_url, refs, token, deadline) {
+        Ok(_) => Ok(TagPush::Pushed),
+        Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
+        Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
+    }
+}
+
+/// What a tag push did (SPEC-0052 DEC-018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagPush {
+    /// The remote took the tag.
+    Pushed,
+    /// The remote tag was no longer the leased object; nothing was sent.
+    LeaseLost,
+}
+
+/// SPEC-0052 DEC-017: bring the remote's `refs/tags/{tag}` object into `repo`
+/// under a probe ref, so its message can be compared, then always remove the
+/// probe ref, also when the fetch failed. Returns the object the probe ref
+/// pointed at, which is what the remote holds now and may differ from the
+/// advertised one; `None` when the remote no longer has the tag.
+///
+/// Not shallow: the probe runs only when the remote tag peels to a commit
+/// the project already holds, so negotiation leaves the tag object alone to
+/// send, which is what `depth 1` was for. A depth is also refused outright by
+/// libgit2's local transport ("shallow fetch is not supported by the local
+/// transport"), and elsewhere would write a `shallow` file into the project's
+/// repository, cutting the history every later walk of it relies on.
+pub fn probe_remote_tag(
+    repo: &git2::Repository,
+    origin_url: &str,
+    tag: &str,
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> Result<Option<git2::Oid>> {
+    let token_for_redaction = token.clone();
+    let probe_ref = format!("{PROBE_TAGS_PREFIX}{tag}");
+    let fetched = (|| {
+        let mut git_remote = repo.remote_anonymous(origin_url)?;
+        let mut opts = git2::FetchOptions::new();
+        opts.remote_callbacks(credential_callbacks(token, deadline));
+        opts.download_tags(git2::AutotagOption::None);
+        opts.prune(git2::FetchPrune::Off);
+        let refspec = format!("+refs/tags/{tag}:{probe_ref}");
+        git_remote.fetch(&[refspec.as_str()], Some(&mut opts), None)
+    })();
+    let (fetched_object, removed) = match repo.find_reference(&probe_ref) {
+        Ok(mut r) => (r.target(), r.delete()),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => (None, Ok(())),
+        Err(e) => (None, Err(e)),
+    };
+    fetched.map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+    removed.map_err(|e| ToolError::internal(format!("remove probe tag ref: {e}")))?;
+    Ok(fetched_object)
 }
 
 /// The wording of a failed tag push (DEC-019). A lease never applies to a
@@ -1004,6 +1063,9 @@ pub fn fetch_from_remote(
 /// Where annotated candidates are fetched to, on disk only, then removed: the
 /// tag objects stay, no ref of the project ever names this namespace.
 const INCOMING_TAGS_PREFIX: &str = "refs/mcpfs/incoming/";
+
+/// Where [`probe_remote_tag`] fetches one remote tag to, removed at once.
+const PROBE_TAGS_PREFIX: &str = "refs/mcpfs/probe/";
 
 /// How many explicit tag refspecs go into one fetch, so thousands of tags
 /// (E2E-048) never build one unbounded negotiation.

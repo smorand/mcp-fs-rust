@@ -492,6 +492,8 @@ pub(crate) async fn tool_remote_push_tag(
         token,
         auth: &auth,
         timeout_secs,
+        overwrite: a.overwrite,
+        expected_remote_commit: &a.expected_remote_commit,
     };
     publish_tag(entry, ctx.state.safety.clone(), target).await
 }
@@ -507,6 +509,10 @@ pub(crate) struct PublishTarget<'a> {
     pub token: Option<String>,
     pub auth: &'a str,
     pub timeout_secs: u64,
+    /// FR-NEW-008: replacing a differing remote tag was confirmed.
+    pub overwrite: bool,
+    /// DEC-018: the commit the requester believes the remote tag is at.
+    pub expected_remote_commit: &'a str,
 }
 
 /// DEC-015, DEC-016, DEC-020: publish one tag once the remote and the
@@ -521,7 +527,10 @@ pub(crate) struct PublishTarget<'a> {
 /// Cost: hydration, O(o) in stored objects as for every tag tool; then for
 /// n advertised refs O(n) work plus one `graph_descendant_of` per distinct
 /// advertised commit held locally, each O(d) in the history depth d, so
-/// O(n + u d) time for u distinct tips and O(n) space. Nothing is fetched.
+/// O(n + u d) time for u distinct tips and O(n) space. Nothing is fetched,
+/// except one tag object when both tags are annotated on the same commit
+/// (DEC-017), and a lease lost between listing and push costs one more
+/// listing, O(n).
 pub(crate) async fn publish_tag(
     entry: Arc<GitRepoEntry>,
     safety: Arc<SafetyManager>,
@@ -545,7 +554,18 @@ async fn publish_inner(
     target: PublishTarget<'_>,
     host: &str,
 ) -> Result<Value> {
-    let PublishTarget { mount_id, person, remote, tag, url, token, auth, timeout_secs } = target;
+    let PublishTarget {
+        mount_id,
+        person,
+        remote,
+        tag,
+        url,
+        token,
+        auth,
+        timeout_secs,
+        overwrite,
+        expected_remote_commit,
+    } = target;
     let tag_ref = format!("{TAGS_PREFIX}{tag}");
     // Acquired here, in the async caller, never inside the blocking closure,
     // so a deadline firing releases it (DRIFT-009), as for a branch push.
@@ -556,17 +576,20 @@ async fn publish_inner(
     let object = parse_oid(&row.target)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let (thread_entry, tag_owned, url_owned) = (entry.clone(), tag.to_string(), url.to_string());
-    let (commit, pushed) = crate::git::remote::with_remote_deadline(
+    let confirmed = overwrite.then(|| expected_remote_commit.to_string());
+    let (commit, outcome) = crate::git::remote::with_remote_deadline(
         timeout_secs,
         host,
         on_git_thread(move || async move {
             let repo = thread_entry.repo.lock().await;
             hydrate(&thread_entry, &repo).await?;
-            publish_on_repo(&repo, &tag_owned, object, &url_owned, token, deadline)
+            let publish = Publish { tag: &tag_owned, object, url: &url_owned, token, deadline };
+            publish_on_repo(&repo, &publish, confirmed.as_deref())
         }),
     )
     .await?;
 
+    let pushed = outcome != Published::UpToDate;
     if pushed {
         safety.record_audit(
             person,
@@ -580,23 +603,39 @@ async fn publish_inner(
         "mount_id": mount_id,
         "tag": tag,
         "remote": remote,
-        "created": pushed,
+        "created": outcome == Published::Created,
         "up_to_date": !pushed,
         "remote_sha": commit,
         "auth": auth,
     }))
 }
 
-/// The blocking half of a publication: list, check, then push only a tag
-/// the remote lacks. Returns the tag's commit and whether a push happened.
-fn publish_on_repo(
-    repo: &Repository,
-    tag: &str,
+/// What a publication did to the remote tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    Created,
+    Replaced,
+    UpToDate,
+}
+
+/// The local tag and the remote connection of one blocking publication.
+struct Publish<'a> {
+    tag: &'a str,
     object: Oid,
-    url: &str,
+    url: &'a str,
     token: Option<String>,
     deadline: Instant,
-) -> Result<(String, bool)> {
+}
+
+/// The blocking half of a publication: list, check, then push. `confirmed`
+/// is the stated remote commit when an overwrite was confirmed (DEC-018).
+/// Returns the tag's commit and what happened.
+fn publish_on_repo(
+    repo: &Repository,
+    publish: &Publish<'_>,
+    confirmed: Option<&str>,
+) -> Result<(String, Published)> {
+    let Publish { tag, object, url, ref token, deadline } = *publish;
     let tag_ref = format!("{TAGS_PREFIX}{tag}");
     let commit = peel_to_commit(repo, &object.to_string()).ok_or_else(|| {
         ToolError::internal(format!("tag '{tag}' does not name a commit held by the project"))
@@ -604,6 +643,8 @@ fn publish_on_repo(
     let commit_oid = parse_oid(&commit)?;
     let advertised =
         crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+    #[cfg(test)]
+    after_listing::fire(url);
 
     if !commit_on_remote(repo, commit_oid, &advertised) {
         return Err(ToolError::invalid_argument(format!(
@@ -612,22 +653,42 @@ fn publish_on_repo(
         )));
     }
 
+    // DEC-018: the lease is the remote tag object seen in this one listing;
+    // `None` means the remote has no such tag and the push is a creation.
+    let mut lease = None;
     if let Some(remote_object) = advertised_oid(&advertised, &tag_ref) {
-        // The same object is the same tag, whatever its kind. A different
-        // object is refused for now: telling an identical annotated tag
-        // written twice apart from a real difference needs the message
-        // probe of DEC-017, and overwriting needs the confirmation of
-        // FR-NEW-008, both outside this tool's first version.
-        if remote_object == object {
-            return Ok((commit, false));
+        let peeled_entry = advertised_oid(&advertised, &format!("{tag_ref}^{{}}"));
+        let remote_commit = peeled_entry.unwrap_or(remote_object);
+        let remote_annotated = peeled_entry.is_some();
+        let local_annotated = object != commit_oid;
+        // Identical without a transfer when the object is the same. Two
+        // annotated tags on one commit may still carry one message under
+        // another tagger or time, which only the remote's tag object can
+        // tell; every other combination differs by kind or by commit.
+        let identical = remote_object == object
+            || (remote_annotated
+                && local_annotated
+                && remote_commit == commit_oid
+                && probe_identical(repo, publish)?);
+        if identical {
+            return Ok((commit, Published::UpToDate));
         }
-        let peeled =
-            advertised_oid(&advertised, &format!("{tag_ref}^{{}}")).unwrap_or(remote_object);
-        return Err(ToolError::no_clobber(format!(
-            "Remote tag '{tag}' already exists at a different commit ({}). Confirm overwriting \
-             to replace it.",
-            short7(&peeled.to_string())
-        )));
+        let remote_commit = remote_commit.to_string();
+        match confirmed {
+            Some(stated) if !stated.trim().is_empty() => {
+                if !stated_commit_matches(stated, &remote_commit) {
+                    return Err(moved(tag, &remote_commit));
+                }
+            }
+            _ => {
+                return Err(ToolError::no_clobber(format!(
+                    "Remote tag '{tag}' already exists at a different commit ({}). Confirm \
+                     overwriting to replace it.",
+                    short7(&remote_commit)
+                )));
+            }
+        }
+        lease = Some(remote_object);
     }
 
     // The push names the tag by ref, so the index row (the source of truth)
@@ -641,8 +702,80 @@ fn publish_on_repo(
     }
     repo.reference(&tag_ref, object, true, "mcp-fs git.remote_push_tag")
         .map_err(|e| crate::git::remote::remote_refused_tag(tag, e.message()))?;
-    crate::git::remote::push_tag_to_remote(repo, url, tag, token, Some(deadline))?;
-    Ok((commit, true))
+    let pushed = crate::git::remote::push_tag_to_remote(
+        repo,
+        url,
+        tag,
+        token.clone(),
+        Some(deadline),
+        lease,
+    )?;
+    if pushed == crate::git::remote::TagPush::LeaseLost {
+        // The remote tag moved between the listing and the push, and the
+        // push was aborted before anything was sent. One more listing names
+        // where it went, so the refusal reads like case 5 of DEC-018.
+        let now =
+            crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+        let peeled = advertised_oid(&now, &format!("{tag_ref}^{{}}"))
+            .or_else(|| advertised_oid(&now, &tag_ref))
+            .unwrap_or(Oid::ZERO_SHA1);
+        return Err(moved(tag, &peeled.to_string()));
+    }
+    let outcome = if lease.is_some() { Published::Replaced } else { Published::Created };
+    Ok((commit, outcome))
+}
+
+/// DEC-017: whether the remote annotated tag carries the local tag's
+/// message. Its object is fetched alone under a probe ref, then the object
+/// the probe ref named is compared through [`tags_identical`], never the
+/// advertised one: the remote may have moved since the listing, and an
+/// advertised object it no longer holds was never fetched. The probe ref is
+/// removed whatever happened, so no ref outside the project's namespaces
+/// survives. A tag gone from the remote is not identical; the push lease
+/// then reports where it went.
+fn probe_identical(repo: &Repository, publish: &Publish<'_>) -> Result<bool> {
+    let fetched = crate::git::remote::probe_remote_tag(
+        repo,
+        publish.url,
+        publish.tag,
+        publish.token.clone(),
+        Some(publish.deadline),
+    )?;
+    match fetched {
+        Some(remote_object) => tags_identical(repo, publish.object, remote_object),
+        None => Ok(false),
+    }
+}
+
+/// Test seam: the remote moving between the listing and the probe or the
+/// push is a race no test can win from outside, so a test registers a hook,
+/// keyed by remote URL so parallel tests never see each other's, that runs
+/// once right after the listing. Compiled out of production builds.
+#[cfg(test)]
+pub(crate) mod after_listing {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<Option<HashMap<String, Hook>>> = Mutex::new(None);
+
+    pub(crate) fn set(url: &str, hook: impl FnOnce() + Send + 'static) {
+        HOOKS.lock().unwrap().get_or_insert_with(HashMap::new).insert(url.into(), Box::new(hook));
+    }
+
+    pub(super) fn fire(url: &str) {
+        let hook = HOOKS.lock().unwrap().as_mut().and_then(|m| m.remove(url));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+fn moved(tag: &str, remote_commit: &str) -> ToolError {
+    ToolError::no_clobber(format!(
+        "Remote tag '{tag}' has moved to {} since you last saw it. Fetch, then confirm again.",
+        short7(remote_commit)
+    ))
 }
 
 /// DEC-020: the commit is on the remote when an advertised ref names it, or
@@ -659,6 +792,15 @@ fn commit_on_remote(repo: &Repository, commit: Oid, advertised: &[(String, Oid)]
 
 fn advertised_oid(advertised: &[(String, Oid)], name: &str) -> Option<Oid> {
     advertised.iter().find(|(n, _)| n == name).map(|(_, oid)| *oid)
+}
+
+/// DEC-018: a stated commit names `commit` as its full id or as a prefix of
+/// at least 7 hex characters; anything shorter is too ambiguous to lease on.
+pub(crate) fn stated_commit_matches(stated: &str, commit: &str) -> bool {
+    let stated = stated.trim().to_ascii_lowercase();
+    stated.len() >= 7
+        && stated.chars().all(|c| c.is_ascii_hexdigit())
+        && commit.starts_with(&stated)
 }
 
 fn unknown_tag(name: &str) -> ToolError {

@@ -3236,7 +3236,7 @@
     },
     {
       "name": "git.remote_push_tag",
-      "description": "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit.",
+      "description": "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag. A remote tag of that name that differs is refused unless overwrite is true and expected_remote_commit states the commit it points at now.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3252,6 +3252,16 @@
             "description": "Declared remote to publish to.",
             "type": "string",
             "default": "origin"
+          },
+          "overwrite": {
+            "description": "Replace a remote tag that differs from the local one; needs expected_remote_commit.",
+            "type": "boolean",
+            "default": false
+          },
+          "expected_remote_commit": {
+            "description": "Commit the remote tag points at now; at least 7 characters.",
+            "type": "string",
+            "default": ""
           }
         },
         "required": [
@@ -3260,7 +3270,7 @@
         ]
       },
       "annotations": {
-        "destructiveHint": false,
+        "destructiveHint": true,
         "readOnlyHint": false,
         "idempotentHint": true,
         "openWorldHint": true

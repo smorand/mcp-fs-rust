@@ -524,13 +524,16 @@ git.remote_push
   returns: {"branch": "main", "remote": "origin", "created": true, "up_to_date": false, "remote_sha": "<sha>", "auth": "github", "forced": false, "remote_branch": "sandbox" (only when remote_branch was supplied), "overwritten_sha": "<sha>" (only when forced; 40 zeros when the branch was created)}
   annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 git.remote_push_tag
-  desc: Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit.
-  params: mount_id:string, tag:string, remote:string=origin
+  desc: Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag. A remote tag of that name that differs is refused unless overwrite is true and expected_remote_commit states the commit it points at now.
+  params: mount_id:string, tag:string, remote:string=origin, overwrite:boolean=false, expected_remote_commit:string=""
   required: ['mount_id', 'tag']
   param tag: Name of the local tag to publish, without the refs/tags/ prefix.
   param remote: Declared remote to publish to.
+  param overwrite: Replace a remote tag that differs from the local one; needs expected_remote_commit.
+  param expected_remote_commit: Commit the remote tag points at now; at least 7 characters.
   returns: {"mount_id": "proj", "tag": "v1.0", "remote": "origin", "created": true, "up_to_date": false, "remote_sha": "<commit the tag points at>", "auth": "github"}
-  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=true
+  returns (a differing remote tag replaced after a confirmed overwrite): the same keys with "created": false, "up_to_date": false
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 git.remote_remove
   desc: Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op.
   params: mount_id:string, name:string

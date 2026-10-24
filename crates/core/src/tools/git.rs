@@ -641,13 +641,24 @@ async move {
             "git.remote_push_tag",
             "Publish one local tag to a declared remote under the same name. Sends that tag \
              only: no branch, no other tag and no commit, so the tag's commit must already be \
-             on the remote. Reports up_to_date when the remote already holds the same tag, and \
-             refuses a remote tag of that name at another commit.",
+             on the remote. Reports up_to_date when the remote already holds the same tag. A remote \
+             tag of that name that differs is refused unless overwrite is true and \
+             expected_remote_commit states the commit it points at now.",
         )
         .req_str("mount_id", "Project/volume id the operation targets.")
         .req_str("tag", "Name of the local tag to publish, without the refs/tags/ prefix.")
         .opt_str("remote", "origin", "Declared remote to publish to.")
-        .destructive(false)
+        .opt_bool(
+            "overwrite",
+            false,
+            "Replace a remote tag that differs from the local one; needs expected_remote_commit.",
+        )
+        .opt_str(
+            "expected_remote_commit",
+            "",
+            "Commit the remote tag points at now; at least 7 characters.",
+        )
+        .destructive(true)
         .read_only(false)
         .idempotent(true)
         .open_world(true),
@@ -25479,6 +25490,17 @@ mod tests {
     /// so the direct remote tests call the engine itself, like
     /// `call_push_branch` does for a branch.
     async fn call_publish_tag(e: &Env, url: &str, tag: &str) -> Result<Value> {
+        call_publish_tag_with(e, url, tag, false, "").await
+    }
+
+    /// [`call_publish_tag`] with the overwrite confirmation of US-0090.
+    async fn call_publish_tag_with(
+        e: &Env,
+        url: &str,
+        tag: &str,
+        overwrite: bool,
+        expected_remote_commit: &str,
+    ) -> Result<Value> {
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         super::super::git_tags::publish_tag(
             entry,
@@ -25492,6 +25514,8 @@ mod tests {
                 token: None,
                 auth: "anonymous",
                 timeout_secs: e.f.state.config.git.remote_timeout_secs,
+                overwrite,
+                expected_remote_commit,
             },
         )
         .await
@@ -25877,5 +25901,383 @@ mod tests {
         assert_eq!(bare_refs(&dir), before);
         assert_eq!(tag_target(&e, "a//b").await.as_deref(), Some(a.as_str()));
         assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    // ── SPEC-0052 US-0090: overwriting a remote tag ─────────────────────────
+
+    /// The spec's "remote `v1.0` at f6a7b8c, local `v1.0` at a1b2c3d": the
+    /// remote tag sits on `release` (one commit past a), pushed so the
+    /// commit is on the remote; local `v1.0` is a plain tag at a. Returns the
+    /// remote directory, its URL, a and f.
+    async fn diverged_remote_tag(
+        e: &Env,
+        label: &str,
+    ) -> (std::path::PathBuf, String, String, String) {
+        let (dir, url, a) = cloned_remote(e, label).await;
+        let f = local_commit_on(e, "release", &a, "/f.txt").await;
+        call_push_branch(e, &url, "release", "anonymous").await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+        tag(e, json!({"name": "v1.0"})).await.unwrap();
+        (dir, url, a, f)
+    }
+
+    /// Another published commit (the spec's 0a1b2c3), for a moved remote tag.
+    async fn another_published_commit(e: &Env, url: &str, a: &str) -> String {
+        let g = local_commit_on(e, "hotfix", a, "/g.txt").await;
+        call_push_branch(e, url, "hotfix", "anonymous").await.unwrap();
+        g
+    }
+
+    fn already_exists(sha: &str) -> String {
+        format!(
+            "Remote tag 'v1.0' already exists at a different commit ({}). Confirm overwriting \
+             to replace it.",
+            short7(sha)
+        )
+    }
+
+    /// No probe ref survives a publish (DEC-017).
+    async fn probe_refs(e: &Env) -> usize {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        repo.references_glob("refs/mcpfs/probe/*").unwrap().count()
+    }
+
+    /// SPEC-0052/E2E-036: a differing remote tag is refused without
+    /// confirmation and stays where it was.
+    #[tokio::test]
+    async fn e2e_tag_036_remote_tag_at_another_commit_no_confirmation() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = diverged_remote_tag(&e, "remote-t036").await;
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.message, already_exists(&f));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-037: a confirmed overwrite stating the remote commit
+    /// replaces the tag; once the remote tag has moved, the same request is
+    /// refused and the remote stays where it moved to. The move is made on
+    /// the bare remote before the request (case 5 of DEC-018); the move
+    /// between the listing and the push is proved on the lease itself, by
+    /// pushing with the lease the listing would have taken after the remote
+    /// moved on.
+    #[tokio::test]
+    async fn e2e_tag_037_confirmed_overwrite_and_a_moved_remote_tag() {
+        let e = Env::new().await;
+        let (dir, url, a, f) = diverged_remote_tag(&e, "remote-t037").await;
+
+        let out = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap();
+
+        assert_eq!(out["created"], false, "{out}");
+        assert_eq!(out["up_to_date"], false, "{out}");
+        assert_eq!(out["remote_sha"], a, "{out}");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![format!("published tag 'v1.0' at {a}")]);
+
+        // The remote tag moves to g before Alice confirms again with f.
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+        let g = another_published_commit(&e, &url, &a).await;
+        plain_tag_bare_remote(&dir, "v1.0", &g);
+        let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(
+            err.message,
+            format!(
+                "Remote tag 'v1.0' has moved to {} since you last saw it. Fetch, then confirm \
+                 again.",
+                short7(&g)
+            )
+        );
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(g.as_str()));
+
+        // The remote moves between the listing (which saw f) and the push.
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let repo = entry.repo.lock().await;
+        let seen = git2::Oid::from_str(&f).unwrap();
+        let pushed =
+            crate::git::remote::push_tag_to_remote(&repo, &url, "v1.0", None, None, Some(seen))
+                .unwrap();
+        assert_eq!(pushed, crate::git::remote::TagPush::LeaseLost);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(g.as_str()));
+        assert_eq!(publish_audit(&e, OWNER).len(), 1, "refusals leave no audit entry");
+    }
+
+    /// SPEC-0052/E2E-056: a confirmed overwrite of an absent remote tag is a
+    /// plain creation, and repeating it is up to date; one audit entry.
+    #[tokio::test]
+    async fn e2e_tag_056_confirmed_overwrite_absent_then_identical() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t056").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        let first = call_publish_tag_with(&e, &url, "v1.0", true, "f6a7b8c").await.unwrap();
+        assert_eq!(first["created"], true, "{first}");
+        assert_eq!(first["up_to_date"], false, "{first}");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+
+        let second = call_publish_tag_with(&e, &url, "v1.0", true, "f6a7b8c").await.unwrap();
+        assert_eq!(second["created"], false, "{second}");
+        assert_eq!(second["up_to_date"], true, "{second}");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![format!("published tag 'v1.0' at {a}")]);
+    }
+
+    /// SPEC-0052/E2E-057: a stated commit other than the remote tag's is
+    /// refused with the moved text naming the remote tag's commit.
+    #[tokio::test]
+    async fn e2e_tag_057_stated_commit_differs_from_the_remote_tag() {
+        let e = Env::new().await;
+        let (dir, url, a, f) = diverged_remote_tag(&e, "remote-t057").await;
+        let g = another_published_commit(&e, &url, &a).await;
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&g)).await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(
+            err.message,
+            format!(
+                "Remote tag 'v1.0' has moved to {} since you last saw it. Fetch, then confirm \
+                 again.",
+                short7(&f)
+            )
+        );
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-058: a non member confirming an overwrite through the
+    /// registered tool gets the usual refusal and the remote is untouched.
+    #[tokio::test]
+    async fn e2e_tag_058_non_member_cannot_overwrite_a_remote_tag() {
+        let e = Env::new().await;
+        let (dir, _, _, f) = diverged_remote_tag(&e, "remote-t058").await;
+        let before = bare_refs(&dir);
+
+        let err = e
+            .as_person(
+                CAROL,
+                "git.remote_push_tag",
+                json!({
+                    "mount_id": MOUNT, "tag": "v1.0", "overwrite": true,
+                    "expected_remote_commit": short7(&f),
+                }),
+            )
+            .await
+            .unwrap_err();
+        let usual = e.as_person(CAROL, "git.tags", json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert_eq!(err.message, usual.message);
+        assert!(!err.message.contains("v1.0"));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, CAROL).is_empty());
+    }
+
+    /// SPEC-0052/E2E-069: an annotated local tag and a plain remote tag on
+    /// the same commit differ by kind alone and are refused.
+    #[tokio::test]
+    async fn e2e_tag_069_remote_tag_differs_only_by_kind() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t069").await;
+        tag(&e, json!({"name": "v1.0", "message": "A"})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.message, already_exists(&a));
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-083: confirming without stating a commit is refused
+    /// with the same text as no confirmation at all.
+    #[tokio::test]
+    async fn e2e_tag_083_confirmed_overwrite_without_a_stated_commit() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = diverged_remote_tag(&e, "remote-t083").await;
+        let before = bare_refs(&dir);
+
+        for blank in ["", "   "] {
+            let err = call_publish_tag_with(&e, &url, "v1.0", true, blank).await.unwrap_err();
+            assert_eq!(err.code, code::NO_CLOBBER);
+            assert_eq!(err.message, already_exists(&f), "stated {blank:?}");
+        }
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// FR-NEW-007 for annotated tags (DEC-017): the same commit and message
+    /// with another tagger and time is the same tag, even with a confirmed
+    /// overwrite; the message is read through the probe, whose ref is gone
+    /// afterwards.
+    #[tokio::test]
+    async fn e2e_tag_extra_annotated_same_message_other_tagger_is_up_to_date() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-tx1").await;
+        tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
+        let remote_tag = annotated_tag_bare_remote(&dir, "v1.0", &a, "release 1.0\n");
+        assert_ne!(tag_target(&e, "v1.0").await.as_deref(), Some(remote_tag.as_str()));
+        let before = bare_refs(&dir);
+
+        for overwrite in [false, true] {
+            let out = call_publish_tag_with(&e, &url, "v1.0", overwrite, short7(&a)).await.unwrap();
+            assert_eq!(out["up_to_date"], true, "{out}");
+            assert_eq!(out["created"], false, "{out}");
+        }
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, OWNER).is_empty());
+        assert_eq!(probe_refs(&e).await, 0);
+    }
+
+    /// FR-NEW-007 for annotated tags (DEC-017): another message on the same
+    /// commit differs, is refused without confirmation, and is replaced by
+    /// the local tag object with it.
+    #[tokio::test]
+    async fn e2e_tag_extra_annotated_other_message_differs() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-tx2").await;
+        tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "something else\n");
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.message, already_exists(&a));
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(probe_refs(&e).await, 0);
+
+        let out = call_publish_tag_with(&e, &url, "v1.0", true, &a).await.unwrap();
+        assert_eq!(out["created"], false, "{out}");
+        assert_eq!(out["up_to_date"], false, "{out}");
+        let local = tag_target(&e, "v1.0").await.unwrap();
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), Some(local));
+        assert_eq!(publish_audit(&e, OWNER), vec![format!("published tag 'v1.0' at {a}")]);
+        assert_eq!(probe_refs(&e).await, 0);
+    }
+
+    fn moved_text(sha: &str) -> String {
+        format!(
+            "Remote tag 'v1.0' has moved to {} since you last saw it. Fetch, then confirm again.",
+            short7(sha)
+        )
+    }
+
+    /// DEC-018 through the real publication: the remote tag moves between
+    /// the listing (which saw f) and the push, so the lease is lost, the push
+    /// sends nothing, and the refusal names where the tag went.
+    #[tokio::test]
+    async fn e2e_tag_extra_lease_lost_moved_between_listing_and_push() {
+        let e = Env::new().await;
+        let (dir, url, a, f) = diverged_remote_tag(&e, "remote-tx3").await;
+        let g = another_published_commit(&e, &url, &a).await;
+        let (hook_dir, hook_g) = (dir.clone(), g.clone());
+        super::super::git_tags::after_listing::set(&url, move || {
+            plain_tag_bare_remote(&hook_dir, "v1.0", &hook_g);
+        });
+
+        let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.message, moved_text(&g));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(g.as_str()));
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// DEC-018 through the real publication: the remote tag is deleted
+    /// between the listing and the push. The lease on f sees the zero id, the
+    /// push sends nothing, and the second listing finds no tag, so the
+    /// refusal names the zero id: that is what the code does today.
+    #[tokio::test]
+    async fn e2e_tag_extra_lease_lost_deleted_between_listing_and_push() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = diverged_remote_tag(&e, "remote-tx4").await;
+        let hook_dir = dir.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            let repo = git2::Repository::open_bare(&hook_dir).unwrap();
+            repo.find_reference("refs/tags/v1.0").unwrap().delete().unwrap();
+        });
+
+        let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER);
+        assert_eq!(err.message, moved_text(&"0".repeat(40)));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// DEC-017: the probe compares the object it actually fetched, not the
+    /// advertised one. The remote annotated tag carries the local message at
+    /// listing time, then is rewritten with another message before the
+    /// probe; the advertised object is never in the project, and the fetched
+    /// one differs, so the tag is refused as different.
+    #[tokio::test]
+    async fn e2e_tag_extra_probe_compares_the_fetched_object() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-tx5").await;
+        tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "release 1.0\n");
+        let (hook_dir, hook_a) = (dir.clone(), a.clone());
+        super::super::git_tags::after_listing::set(&url, move || {
+            annotated_tag_bare_remote(&hook_dir, "v1.0", &hook_a, "rewritten\n");
+        });
+        let after = || bare_ref_sha(&dir, "refs/tags/v1.0");
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::NO_CLOBBER, "{}", err.message);
+        assert_eq!(err.message, already_exists(&a));
+        let rewritten = after().unwrap();
+        assert_ne!(Some(rewritten), tag_target(&e, "v1.0").await);
+        assert!(publish_audit(&e, OWNER).is_empty());
+        assert_eq!(probe_refs(&e).await, 0);
+    }
+
+    /// DEC-017: a probe that fails (the remote vanished after the listing)
+    /// is reported as an error and still leaves no probe ref behind.
+    #[tokio::test]
+    async fn e2e_tag_extra_probe_failure_leaves_no_probe_ref() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-tx6").await;
+        tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "release 1.0\n");
+        let (hook_dir, gone) = (dir.clone(), dir.with_extension("gone"));
+        let hook_gone = gone.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            std::fs::rename(&hook_dir, &hook_gone).unwrap();
+        });
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_ne!(err.code, code::NO_CLOBBER, "{}", err.message);
+        assert!(!err.message.is_empty());
+        assert_eq!(probe_refs(&e).await, 0);
+        assert!(publish_audit(&e, OWNER).is_empty());
+        std::fs::rename(&gone, &dir).unwrap();
+        assert_eq!(probe_refs(&e).await, 0);
+    }
+
+    /// DEC-018: a stated commit matches as the full id or as a prefix of at
+    /// least 7 characters, never shorter.
+    #[test]
+    fn e2e_tag_extra_stated_commit_matching() {
+        use super::super::git_tags::stated_commit_matches;
+        let full = "f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5";
+        assert!(stated_commit_matches(full, full));
+        assert!(stated_commit_matches("f6a7b8c", full));
+        assert!(stated_commit_matches("F6A7B8C9", full));
+        assert!(!stated_commit_matches("f6a7b8", full));
+        assert!(!stated_commit_matches("0a1b2c3", full));
+        assert!(!stated_commit_matches("", full));
     }
 }

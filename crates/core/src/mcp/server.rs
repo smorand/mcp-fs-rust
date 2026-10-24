@@ -1127,6 +1127,12 @@ pub struct GitRemotePushTagArgs {
     /// Declared remote to publish to.
     #[serde(default = "def_origin")]
     pub remote: String,
+    /// Replace a remote tag that differs from the local one; needs expected_remote_commit.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Commit the remote tag points at now; at least 7 characters.
+    #[serde(default)]
+    pub expected_remote_commit: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -3508,7 +3514,7 @@ impl McpServer {
 
     #[tool(
         name = "git.remote_push_tag",
-        description = "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit."
+        description = "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag. A remote tag of that name that differs is refused unless overwrite is true and expected_remote_commit states the commit it points at now."
     )]
     async fn git_remote_push_tag(
         &self,
@@ -3973,7 +3979,7 @@ mod tests {
         ),
         (
             "git.remote_push_tag",
-            "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit.",
+            "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag. A remote tag of that name that differs is refused unless overwrite is true and expected_remote_commit states the commit it points at now.",
         ),
         (
             "git.auth",

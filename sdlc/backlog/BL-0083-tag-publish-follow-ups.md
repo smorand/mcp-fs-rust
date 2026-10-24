@@ -13,6 +13,8 @@ Created: 2026-10-24
 - `git.tag_create` and `reconcile_incoming_tags` call `repo.reference` on names such as `a//b`, which libgit2 silently normalises to `a/b` on disk (the database row keeps `a//b`). Guard those calls with `is_valid_name` as the publish path now does.
 - E2E-039 and E2E-077 are simulations (the failure is at the listing step, not after the push).
 
+- (US-0090) A remote tag deleted between the listing and the push is refused with `has moved to 0000000`; there is no separate wording for a deleted tag. The annotated message probe is a full single tag fetch, not the shallow fetch of DEC-017 (the local transport refuses depth).
+
 ## Why
 Each one is a small gap between the design text and the code, or a regression the current tests would not catch.
 
