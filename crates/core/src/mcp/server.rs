@@ -1119,6 +1119,17 @@ pub struct GitRemotePushArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemotePushTagArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the local tag to publish, without the refs/tags/ prefix.
+    pub tag: String,
+    /// Declared remote to publish to.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GitRemoteRemoveArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -3496,6 +3507,18 @@ impl McpServer {
     }
 
     #[tool(
+        name = "git.remote_push_tag",
+        description = "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit."
+    )]
+    async fn git_remote_push_tag(
+        &self,
+        Parameters(a): Parameters<GitRemotePushTagArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = crate::tools::git_tags::tool_remote_push_tag(self.git_ctx(), a, None, None).await;
+        to_call_result("git.remote_push_tag", out)
+    }
+
+    #[tool(
         name = "git.merge",
         description = "Merge a branch, tag or commit into the checked-out branch. An already merged source is reported as already_up_to_date and changes nothing. A source the current branch is an ancestor of fast-forwards. Anything else is a three-way merge: a clean one creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or stash first)."
     )]
@@ -3949,6 +3972,10 @@ mod tests {
             "Delete a local tag. Removes the tag ref only: its commit, every branch, every other tag and the remote are left untouched, so a mistaken delete is undone by recreating the tag at the reported sha with git.tag_create.",
         ),
         (
+            "git.remote_push_tag",
+            "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit.",
+        ),
+        (
             "git.auth",
             "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
         ),
@@ -4018,12 +4045,13 @@ mod tests {
         // SPEC-0045 adds fs.diff_files: fs 45, total 113.
         // SPEC-0047 adds admin.get_project_disk_usage: admin 16, total 114.
         // SPEC-0049 adds admin.get_project_folder_usage: admin 17, total 115.
-        // SPEC-0052 adds git.tag_create: git 50, total 116; git.tag_delete: git 51, total 117.
+        // SPEC-0052 adds git.tag_create: git 50, total 116; git.tag_delete: git 51, total 117;
+        // git.remote_push_tag: git 52, total 118.
         assert_eq!(fs_count, 45, "got: {names:?}");
         assert_eq!(admin_count, 17, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
-        assert_eq!(git_count, 51, "got: {names:?}");
-        assert_eq!(names.len(), 117, "got: {names:?}");
+        assert_eq!(git_count, 52, "got: {names:?}");
+        assert_eq!(names.len(), 118, "got: {names:?}");
     }
 
     #[test]
@@ -4050,7 +4078,7 @@ mod tests {
 
     #[test]
     fn every_core_git_tool_is_registered() {
-        const ALL_GIT_TOOLS: [&str; 41] = [
+        const ALL_GIT_TOOLS: [&str; 42] = [
             "git.init",
             "git.status",
             "git.branches",
@@ -4090,6 +4118,7 @@ mod tests {
             "git.remote_list",
             "git.remote_clone",
             "git.remote_push",
+            "git.remote_push_tag",
             "git.remote_fetch",
             "git.remote_pull",
         ];
@@ -4357,7 +4386,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 113, "the frozen contract covers 113 non-search tools");
+        assert_eq!(checked, 114, "the frozen contract covers 114 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4378,8 +4407,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 113, "got: {names:?}");
-        assert_eq!(expected.len(), 113, "the golden contract itself must hold 113 names");
+        assert_eq!(names.len(), 114, "got: {names:?}");
+        assert_eq!(expected.len(), 114, "the golden contract itself must hold 114 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

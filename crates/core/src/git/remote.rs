@@ -525,21 +525,97 @@ pub fn push_to_remote(
     expected_remote_sha: Option<&str>,
 ) -> Result<PushOutcome> {
     let token_for_redaction = token.clone();
-    let mut remote = repo.remote_anonymous(origin_url).map_err(|e| {
-        ToolError::internal(redact(
-            format!("push failed to open remote: {e}"),
-            token_for_redaction.as_deref(),
-        ))
-    })?;
-
     // FR-MOD-102: the two sides of the refspec are named independently, so a
     // local branch can land under another name on the remote. Everything the
     // outcome is read from (the negotiation's pre-push view, the per-ref
     // rejection status) keys off the REMOTE side, which is the ref the remote
     // actually reports on.
-    let src_refname = format!("refs/heads/{branch}");
-    let dst_refname = format!("refs/heads/{remote_branch}");
-    let dst_for_negotiation = dst_refname.clone();
+    let refs = PushRefs {
+        src: &format!("refs/heads/{branch}"),
+        dst: &format!("refs/heads/{remote_branch}"),
+        force,
+        lease: expected_remote_sha,
+    };
+    let before = match push_refs(repo, origin_url, refs, token, deadline) {
+        Ok(before) => before,
+        Err(PushFailure::Open(e)) => {
+            return Err(ToolError::internal(redact(
+                format!("push failed to open remote: {e}"),
+                token_for_redaction.as_deref(),
+            )));
+        }
+        // A lease mismatch surfaces as the failure of the push the callback
+        // aborted, so it is classified before anything else: the remote never
+        // rejected this push, the lease did.
+        Err(PushFailure::Lease { expected, actual }) => {
+            return Err(lease_mismatch_error(branch, remote_branch, &expected, &actual));
+        }
+        // The local transport (used by every test, and by a same-host push in
+        // production) raises a non-fast-forward as a hard error from `push`
+        // itself, before `push_update_reference` ever runs; a remote smart-HTTP
+        // server instead reports it per-ref through that callback. Both paths
+        // are classified the same way (FR-NEW-024): the remote's own signal is
+        // authoritative regardless of which shape it arrives in.
+        Err(PushFailure::Push(e)) if e.code() == git2::ErrorCode::NotFastForward => {
+            return Err(non_fast_forward_error(branch));
+        }
+        Err(PushFailure::Push(e)) => {
+            return Err(ToolError::internal(redact(
+                format!("push of branch '{branch}' failed: {e}"),
+                token_for_redaction.as_deref(),
+            )));
+        }
+        Err(PushFailure::Rejected(msg)) => return Err(classify_push_rejection(&msg, branch)),
+    };
+
+    let existed = before.is_some_and(|oid| !oid.is_zero());
+    let previous_remote_sha = if existed { before.map(|o| o.to_string()) } else { None };
+    Ok(PushOutcome {
+        remote_sha: local_sha.to_string(),
+        created: !existed,
+        up_to_date: previous_remote_sha.as_deref() == Some(local_sha),
+        overwritten_sha: previous_remote_sha,
+    })
+}
+
+/// One push's ref names and update rule, the part the branch and the tag
+/// entry points differ in (SPEC-0052 DEC-015): full ref names on both sides,
+/// `refs/heads/<b>` or `refs/tags/<t>`.
+struct PushRefs<'a> {
+    src: &'a str,
+    dst: &'a str,
+    force: bool,
+    lease: Option<&'a str>,
+}
+
+/// How a push failed, before any entry point names it: each entry point turns
+/// it into its own message (a branch, or a tag), so the core never decides
+/// the wording.
+enum PushFailure {
+    /// The remote could not even be opened.
+    Open(git2::Error),
+    /// The pre-push advertisement did not match the lease (FR-NEW-157).
+    Lease { expected: String, actual: String },
+    /// `push` itself failed: a transport error, or the local transport's hard
+    /// non-fast-forward.
+    Push(git2::Error),
+    /// The remote refused the ref through the per ref status callback.
+    Rejected(String),
+}
+
+/// The push core shared by [`push_to_remote`] and [`push_tag_to_remote`]:
+/// one push of `refs.src` to `refs.dst`, returning the destination's value in
+/// the pre-push advertisement (`None` when the remote did not report it).
+fn push_refs(
+    repo: &git2::Repository,
+    origin_url: &str,
+    refs: PushRefs<'_>,
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> std::result::Result<Option<git2::Oid>, PushFailure> {
+    let PushRefs { src: src_refname, dst: dst_refname, force, lease: expected_remote_sha } = refs;
+    let mut remote = repo.remote_anonymous(origin_url).map_err(PushFailure::Open)?;
+    let dst_for_negotiation = dst_refname.to_string();
     let remote_before: Rc<RefCell<Option<git2::Oid>>> = Rc::new(RefCell::new(None));
     let before_cell = remote_before.clone();
     let rejected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -590,40 +666,146 @@ pub fn push_to_remote(
     // convention at the call site.
     let refspec = format!("{}{src_refname}:{dst_refname}", if force { "+" } else { "" });
     if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut opts)) {
-        // A lease mismatch surfaces as the failure of the push the callback
-        // aborted, so it is classified before anything else: the remote never
-        // rejected this push, the lease did.
-        if let (Some(actual), Some(expected)) = (lease_actual.borrow().clone(), lease.as_deref()) {
-            return Err(lease_mismatch_error(branch, remote_branch, expected, &actual));
+        if let (Some(actual), Some(expected)) = (lease_actual.borrow().clone(), lease) {
+            return Err(PushFailure::Lease { expected, actual });
         }
-        // The local transport (used by every test, and by a same-host push in
-        // production) raises a non-fast-forward as a hard error from `push`
-        // itself, before `push_update_reference` ever runs; a remote smart-HTTP
-        // server instead reports it per-ref through that callback. Both paths
-        // are classified the same way (FR-NEW-024): the remote's own signal is
-        // authoritative regardless of which shape it arrives in.
-        if e.code() == git2::ErrorCode::NotFastForward {
-            return Err(non_fast_forward_error(branch));
-        }
-        return Err(ToolError::internal(redact(
-            format!("push of branch '{branch}' failed: {e}"),
-            token_for_redaction.as_deref(),
-        )));
+        return Err(PushFailure::Push(e));
     }
 
     if let Some(msg) = rejected.borrow().clone() {
-        return Err(classify_push_rejection(&msg, branch));
+        return Err(PushFailure::Rejected(msg));
     }
 
-    let before = *remote_before.borrow();
-    let existed = before.is_some_and(|oid| !oid.is_zero());
-    let previous_remote_sha = if existed { before.map(|o| o.to_string()) } else { None };
-    Ok(PushOutcome {
-        remote_sha: local_sha.to_string(),
-        created: !existed,
-        up_to_date: previous_remote_sha.as_deref() == Some(local_sha),
-        overwritten_sha: previous_remote_sha,
-    })
+    Ok(*remote_before.borrow())
+}
+
+/// SPEC-0052 DEC-015: push `refs/tags/{tag}` to the same name on
+/// `origin_url`, never forced, through the same core as a branch push. The
+/// caller has already checked, against [`list_advertised_refs`], that the
+/// tag's commit is on the remote and that the remote has no tag of that
+/// name, so the pack carries at most the tag object itself.
+///
+/// A per ref refusal by the remote is `Remote refused tag '<n>': <reason>`
+/// (DEC-019); any other failure is the connection refusal a fetch or a
+/// branch push gives for the same cause.
+pub fn push_tag_to_remote(
+    repo: &git2::Repository,
+    origin_url: &str,
+    tag: &str,
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let token_for_redaction = token.clone();
+    let tag_ref = format!("refs/tags/{tag}");
+    let refs = PushRefs { src: &tag_ref, dst: &tag_ref, force: false, lease: None };
+    push_refs(repo, origin_url, refs, token, deadline)
+        .map(|_| ())
+        .map_err(|f| tag_push_error(f, tag, origin_url, token_for_redaction.as_deref()))
+}
+
+/// The wording of a failed tag push (DEC-019). A lease never applies to a
+/// tag push, so that arm only exists for exhaustiveness.
+fn tag_push_error(
+    failure: PushFailure,
+    tag: &str,
+    origin_url: &str,
+    token: Option<&str>,
+) -> ToolError {
+    match failure {
+        PushFailure::Rejected(reason) => remote_refused_tag(tag, &reason),
+        PushFailure::Open(e) | PushFailure::Push(e) => connection_error(origin_url, &e, token),
+        PushFailure::Lease { .. } => {
+            ToolError::internal(format!("push of tag '{tag}' failed: unexpected lease"))
+        }
+    }
+}
+
+/// DEC-019: the one refusal for a tag name the remote, or git itself, will
+/// not take as a reference.
+pub fn remote_refused_tag(tag: &str, reason: &str) -> ToolError {
+    ToolError::internal(format!("Remote refused tag '{tag}': {reason}"))
+}
+
+/// Every ref the remote at `origin_url` advertises, `^{}` peeled entries
+/// included, in advertisement order, over one connection that downloads
+/// nothing (SPEC-0052 DEC-015). Shares [`credential_callbacks`] and the
+/// connection refusal of [`fetch_from_remote`], which lists through the same
+/// [`advertise`].
+pub fn list_advertised_refs(
+    repo: &git2::Repository,
+    origin_url: &str,
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> Result<AdvertisedRefs> {
+    let token_for_redaction = token.clone();
+    let mut git_remote = repo
+        .remote_anonymous(origin_url)
+        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+    advertise(&mut git_remote, origin_url, token, deadline, false).map(|(refs, _)| refs)
+}
+
+/// Every `(name, oid)` a remote advertises, in advertisement order.
+pub type AdvertisedRefs = Vec<(String, git2::Oid)>;
+
+/// One listing connection: every advertised `(name, oid)`, plus the branch
+/// the remote's HEAD names when `want_default` asks for it (an empty or
+/// detached HEAD gives `None`). The connection drops on return, before any
+/// later fetch or push reconnects.
+fn advertise(
+    git_remote: &mut git2::Remote<'_>,
+    origin_url: &str,
+    token: Option<String>,
+    deadline: Option<Instant>,
+    want_default: bool,
+) -> Result<(AdvertisedRefs, Option<String>)> {
+    let token_for_redaction = token.clone();
+    let list_callbacks = credential_callbacks(token, deadline);
+    let conn = git_remote
+        .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
+        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+    let heads = conn
+        .list()
+        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+    let refs = heads.iter().map(|h| (h.name().to_string(), h.oid())).collect();
+    let default_branch = if want_default {
+        conn.default_branch().ok().and_then(|b| {
+            b.as_str().ok().and_then(|s| s.strip_prefix("refs/heads/")).map(str::to_string)
+        })
+    } else {
+        None
+    };
+    Ok((refs, default_branch))
+}
+
+/// SPEC-0052 DEC-016: the same `git.remote` span as [`run_remote_operation`]
+/// and no audit entry, for a tool whose audit depends on what really happened
+/// rather than on the outcome alone (a tag publication audits only a real
+/// push, FR-NEW-012).
+pub async fn trace_remote_operation<T, F>(
+    operation: &'static str,
+    remote: &str,
+    host: &str,
+    provider: &str,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let span = tracing::info_span!(
+        "git.remote",
+        operation,
+        remote,
+        host,
+        provider,
+        branch = "",
+        outcome = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
+    );
+    let start = Instant::now();
+    let result = future.instrument(span.clone()).await;
+    span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+    span.record("duration_ms", start.elapsed().as_millis() as u64);
+    result
 }
 
 /// Classify a rejection reported by the remote through `push_update_reference`
@@ -742,31 +924,22 @@ pub fn fetch_from_remote(
     // (DEC-037): the caller diffs this against its prior
     // `refs/remotes/origin/*` view to find what went stale.
     let (advertised_branches, advertised_tags, default_branch) = {
-        let list_callbacks = credential_callbacks(token.clone(), deadline);
-        let conn = git_remote
-            .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
-            .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
-        let heads = conn
-            .list()
-            .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+        // Only asked for when needed: an empty or detached remote HEAD just
+        // means no history to take tags from.
+        let want_default = matches!(tag_scope, TagScope::RemoteDefault);
+        let (heads, default_branch) =
+            advertise(&mut git_remote, origin_url, token.clone(), deadline, want_default)?;
         let branches: Vec<String> = heads
             .iter()
-            .filter_map(|h| h.name().strip_prefix("refs/heads/").map(str::to_string))
+            .filter_map(|(name, _)| name.strip_prefix("refs/heads/").map(str::to_string))
             .collect();
         let tags: Vec<(String, git2::Oid)> = heads
             .iter()
-            .filter_map(|h| h.name().strip_prefix("refs/tags/").map(|n| (n.to_string(), h.oid())))
+            .filter_map(|(name, oid)| {
+                name.strip_prefix("refs/tags/").map(|n| (n.to_string(), *oid))
+            })
             .collect();
-        // Only asked for when needed: an empty or detached remote HEAD just
-        // means no history to take tags from.
-        let default_branch = match tag_scope {
-            TagScope::RemoteDefault => conn.default_branch().ok().and_then(|b| {
-                b.as_str().ok().and_then(|s| s.strip_prefix("refs/heads/")).map(str::to_string)
-            }),
-            _ => None,
-        };
         (branches, tags, default_branch)
-        // `conn` drops here, disconnecting before the real fetch reconnects.
     };
 
     let updates: Rc<RefCell<Vec<FetchRefUpdate>>> = Rc::new(RefCell::new(Vec::new()));

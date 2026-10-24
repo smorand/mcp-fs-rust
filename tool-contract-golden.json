@@ -3235,6 +3235,38 @@
       }
     },
     {
+      "name": "git.remote_push_tag",
+      "description": "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag, and refuses a remote tag of that name at another commit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "tag": {
+            "description": "Name of the local tag to publish, without the refs/tags/ prefix.",
+            "type": "string"
+          },
+          "remote": {
+            "description": "Declared remote to publish to.",
+            "type": "string",
+            "default": "origin"
+          }
+        },
+        "required": [
+          "mount_id",
+          "tag"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
       "name": "git.remote_remove",
       "description": "Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op.",
       "inputSchema": {

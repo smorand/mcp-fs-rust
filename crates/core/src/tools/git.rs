@@ -48,7 +48,7 @@ const MODE_DIR: i32 = 0o040_000;
 /// Diff context lines, matching the C# `CompareOptions { ContextLines = 3 }`.
 const DIFF_CONTEXT_LINES: u32 = 3;
 
-/// Register the forty one `git.*` tools (the four `git.auth*`/`git.token_set` ones
+/// Register the forty two `git.*` tools (the four `git.auth*`/`git.token_set` ones
 /// live in [`super::git_auth`]).
 ///
 /// Test-only: the live MCP surface dispatches through `mcp::server::McpServer`'s
@@ -630,6 +630,34 @@ async move {
                 let a: crate::mcp::server::GitRemotePushArgs = serde_json::from_value(a.0.clone())
                     .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
                 tool_remote_push(ctx, a, g, t).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    let t = tokens.clone();
+    reg.add(
+        ToolSchema::new(
+            "git.remote_push_tag",
+            "Publish one local tag to a declared remote under the same name. Sends that tag \
+             only: no branch, no other tag and no commit, so the tag's commit must already be \
+             on the remote. Reports up_to_date when the remote already holds the same tag, and \
+             refuses a remote tag of that name at another commit.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .req_str("tag", "Name of the local tag to publish, without the refs/tags/ prefix.")
+        .opt_str("remote", "origin", "Declared remote to publish to.")
+        .destructive(false)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(true),
+        handler(move |ctx: ToolCtx, a| {
+            let (g, t) = (g.clone(), t.clone());
+            async move {
+                let a: crate::mcp::server::GitRemotePushTagArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                super::git_tags::tool_remote_push_tag(ctx, a, g, t).await
             }
         }),
     );
@@ -2970,7 +2998,7 @@ fn head_branch(head: Option<&git2::Reference<'_>>) -> Option<String> {
 /// fail loud through [`crate::git::OAuthTokenStore::require_valid_credential`]
 /// (FR-NEW-018, FR-NEW-019, FR-NEW-070, DEC-019, DEC-020) rather than silently
 /// degrading to anonymous (DEC-010, the defect US-002 removed).
-async fn resolve_clone_credential(
+pub(crate) async fn resolve_clone_credential(
     ctx: &ToolCtx,
     tokens: &Option<Arc<crate::git::OAuthTokenStore>>,
     url: &str,
@@ -7623,7 +7651,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 41] = [
+    const ALL_GIT_TOOLS: [&str; 42] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -7663,6 +7691,7 @@ mod tests {
         "git.remote_list",
         "git.remote_clone",
         "git.remote_push",
+        "git.remote_push_tag",
         "git.remote_fetch",
         "git.remote_pull",
     ];
@@ -7671,7 +7700,7 @@ mod tests {
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 41);
+        assert_eq!(r.len(), 42);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -7943,6 +7972,7 @@ mod tests {
             ("git.remote_list", m.clone()),
             ("git.remote_clone", json!({"mount_id": MOUNT, "url": "https://example.test/r.git"})),
             ("git.remote_push", json!({"mount_id": MOUNT, "branch": "main"})),
+            ("git.remote_push_tag", json!({"mount_id": MOUNT, "tag": "v1"})),
             ("git.remote_fetch", m.clone()),
             ("git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"})),
             (
@@ -7993,7 +8023,7 @@ mod tests {
             mount_scoped_git_tools().iter().map(|(n, _)| *n).collect();
 
         assert_eq!(listed, registered, "the blanket authorization list drifted from the registry");
-        assert_eq!(listed.len(), 47, "41 git.* plus the 6 git.pr_* tools take a mount_id");
+        assert_eq!(listed.len(), 48, "42 git.* plus the 6 git.pr_* tools take a mount_id");
     }
 
     /// E2E-MOD-406: the separation of duties that matters, over the whole
@@ -25440,5 +25470,412 @@ mod tests {
         assert_eq!(out["tags_kept_local"], json!(["v1.0"]));
         assert_eq!(out["tags_added"], json!([]));
         assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+    }
+
+    // ── SPEC-0052 US-0089: git.remote_push_tag ─────────────────────────────
+
+    /// `file://` cannot reach the publish engine through the registered
+    /// `git.remote_push_tag` tool (`resolve_clone_credential` rejects it first),
+    /// so the direct remote tests call the engine itself, like
+    /// `call_push_branch` does for a branch.
+    async fn call_publish_tag(e: &Env, url: &str, tag: &str) -> Result<Value> {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        super::super::git_tags::publish_tag(
+            entry,
+            e.f.state.safety.clone(),
+            super::super::git_tags::PublishTarget {
+                mount_id: MOUNT,
+                person: OWNER,
+                remote: "origin",
+                tag,
+                url,
+                token: None,
+                auth: "anonymous",
+                timeout_secs: e.f.state.config.git.remote_timeout_secs,
+            },
+        )
+        .await
+    }
+
+    async fn publish_as(e: &Env, person: &str, tag: &str) -> Result<Value> {
+        e.as_person(person, "git.remote_push_tag", json!({"mount_id": MOUNT, "tag": tag})).await
+    }
+
+    /// Every ref of the bare "remote" with its target, read off disk.
+    fn bare_refs(dir: &std::path::Path) -> BTreeMap<String, String> {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        repo.references()
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter_map(|r| Some((r.name().ok()?.to_string(), r.target()?.to_string())))
+            .collect()
+    }
+
+    /// Every `git.tag_publish` audit detail of `person`.
+    fn publish_audit(e: &Env, person: &str) -> Vec<String> {
+        tag_audit(e, person)
+            .into_iter()
+            .filter(|(op, _)| op == "git.tag_publish")
+            .map(|(_, d)| d)
+            .collect()
+    }
+
+    fn short7(sha: &str) -> &str {
+        &sha[..7]
+    }
+
+    /// A local branch `name` forked from `from`, one commit ahead, checked
+    /// back out to `main`; returns the new commit.
+    async fn local_commit_on(e: &Env, name: &str, from: &str, file: &str) -> String {
+        e.set_branch(name, from).await;
+        e.checkout(name).await;
+        e.write(file, "x\n").await;
+        let sha = e.commit(name).await;
+        e.checkout("main").await;
+        sha
+    }
+
+    /// SPEC-0052/E2E-033: only the named tag reaches the remote.
+    #[tokio::test]
+    async fn e2e_tag_033_publish_one_tag_only() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t033").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = local_commit_on(&e, "dev", &a, "/c.txt").await;
+        tag(&e, json!({"name": "v2.0", "target": c})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        let out = call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(
+            out,
+            json!({
+                "mount_id": MOUNT, "tag": "v1.0", "remote": "origin", "created": true,
+                "up_to_date": false, "remote_sha": a, "auth": "anonymous",
+            })
+        );
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0"), None);
+        let mut expected = before;
+        expected.insert("refs/tags/v1.0".to_string(), a.clone());
+        assert_eq!(bare_refs(&dir), expected, "the remote gained no other reference");
+    }
+
+    /// SPEC-0052/E2E-034: an unknown tag is refused and the remote untouched.
+    #[tokio::test]
+    async fn e2e_tag_034_publish_an_unknown_tag() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-t034").await;
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "v9.9").await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert_eq!(err.message, "Tag 'v9.9' does not exist.");
+        assert_eq!(bare_refs(&dir), before);
+    }
+
+    /// SPEC-0052/E2E-035: an identical remote tag is up to date, nothing is
+    /// pushed and nothing audited.
+    #[tokio::test]
+    async fn e2e_tag_035_publish_an_identical_tag() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t035").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        let before = bare_refs(&dir);
+
+        let out = call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(out["up_to_date"], true, "{out}");
+        assert_eq!(out["created"], false, "{out}");
+        assert_eq!(out["remote_sha"], a, "{out}");
+        assert_eq!(bare_refs(&dir), before);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-038: down, rate limited and expired credential give the
+    /// refusals a branch push gives. Down is a missing remote path; "rate
+    /// limited" is a remote dropping every connection (no file remote can
+    /// answer 429); the expired credential goes through the registered tool.
+    #[test]
+    fn e2e_tag_038_remote_unavailable_rate_limited_or_credential_expired() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let (dir, _, a) = cloned_remote(&e, "remote-t038").await;
+            tag(&e, json!({"name": "v1.0"})).await.unwrap();
+            let before = bare_refs(&dir);
+
+            let down = format!("file://{}", e.f.dir.path().join("no-such-remote").display());
+            let err = call_publish_tag(&e, &down, "v1.0").await.unwrap_err();
+            let branch_err = call_push_branch(&e, &down, "main", "anonymous").await.unwrap_err();
+            assert_eq!(err.code, branch_err.code);
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+
+            let (refusing, handle) = closing_remote().await;
+            let err = call_publish_tag(&e, &refusing, "v1.0").await.unwrap_err();
+            let branch_err =
+                call_push_branch(&e, &refusing, "main", "anonymous").await.unwrap_err();
+            handle.abort();
+            assert_eq!(err.code, branch_err.code);
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            entry.db.add_remote("origin", "https://github.ibm.com/org/repo.git").await.unwrap();
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = publish_as(&e, OWNER, "v1.0").await.unwrap_err();
+            let branch_err = e
+                .call("git.remote_push", json!({"mount_id": MOUNT, "branch": "main"}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert_eq!(err.message, branch_err.message);
+            assert!(!err.message.contains("ghp_expired"));
+
+            assert_eq!(bare_refs(&dir), before, "no partial tag on the remote");
+            assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+            assert!(publish_audit(&e, OWNER).is_empty());
+        });
+    }
+
+    /// SPEC-0052/E2E-039: a connection dropped before the tag reached the
+    /// remote gives the usual connection refusal; the retry succeeds. The
+    /// drop is a remote that accepts then closes every connection, the
+    /// retry the real bare remote.
+    #[tokio::test]
+    async fn e2e_tag_039_connection_lost_while_publishing() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t039").await;
+        tag(&e, json!({"name": "v2.0"})).await.unwrap();
+
+        let (dropping, handle) = closing_remote().await;
+        let err = call_publish_tag(&e, &dropping, "v2.0").await.unwrap_err();
+        handle.abort();
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0"), None);
+
+        let out = call_publish_tag(&e, &url, "v2.0").await.unwrap();
+        assert_eq!(out["created"], true, "{out}");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0").as_deref(), Some(a.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![format!("published tag 'v2.0' at {a}")]);
+    }
+
+    /// SPEC-0052/E2E-040: a non member gets the usual refusal, the remote is
+    /// untouched, and the one audit entry names the member who published.
+    #[test]
+    fn e2e_tag_040_non_member_cannot_publish_and_the_audit_names_the_publisher() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let (dir, url, a) = cloned_remote(&e, "remote-t040").await;
+            tag(&e, json!({"name": "v1.0"})).await.unwrap();
+            let before = bare_refs(&dir);
+
+            let err = publish_as(&e, CAROL, "v1.0").await.unwrap_err();
+            let usual = e
+                .as_person(CAROL, "git.remote_push", json!({"mount_id": MOUNT, "branch": "main"}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN);
+            assert_eq!(err.message, usual.message);
+            assert!(!err.message.contains("v1.0"));
+            assert_eq!(bare_refs(&dir), before);
+
+            call_publish_tag(&e, &url, "v1.0").await.unwrap();
+            assert!(publish_audit(&e, CAROL).is_empty());
+            assert_eq!(publish_audit(&e, OWNER), vec![format!("published tag 'v1.0' at {a}")]);
+        });
+    }
+
+    /// SPEC-0052/E2E-055: a project tracking no remote refuses the publish.
+    #[tokio::test]
+    async fn e2e_tag_055_publish_with_no_remote() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        let err = publish_as(&e, OWNER, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert_eq!(err.message, "Cannot publish tag 'v1.0': this project tracks no remote.");
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-071: a tag on a never published commit is refused, and
+    /// neither the tag nor the commit reaches the remote.
+    #[tokio::test]
+    async fn e2e_tag_071_tag_on_a_commit_the_remote_lacks() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t071").await;
+        let b = local_commit_on(&e, "dev", &a, "/b.txt").await;
+        tag(&e, json!({"name": "v1.0", "target": "dev"})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            err.message,
+            format!(
+                "Cannot publish tag 'v1.0': commit {} is not on the remote. Publish its branch \
+                 first.",
+                short7(&b)
+            )
+        );
+        assert_eq!(bare_refs(&dir), before);
+        let remote = git2::Repository::open_bare(&dir).unwrap();
+        assert!(remote.find_commit(git2::Oid::from_str(&b).unwrap()).is_err(), "no new commit");
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-072: a tag on the tip of a published branch goes out and
+    /// the remote gains that one reference only.
+    #[tokio::test]
+    async fn e2e_tag_072_tag_on_a_published_commit() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t072").await;
+        let b = local_commit_on(&e, "dev", &a, "/b.txt").await;
+        call_push_branch(&e, &url, "dev", "anonymous").await.unwrap();
+        tag(&e, json!({"name": "v1.0", "target": "dev"})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(b.as_str()));
+        let mut expected = before;
+        expected.insert("refs/tags/v1.0".to_string(), b);
+        assert_eq!(bare_refs(&dir), expected);
+    }
+
+    /// SPEC-0052/E2E-073: a commit inside the history of another remote
+    /// branch counts as on the remote.
+    #[tokio::test]
+    async fn e2e_tag_073_commit_reachable_from_another_remote_branch() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t073").await;
+        e.set_branch("release", &a).await;
+        e.checkout("release").await;
+        e.write("/c.txt", "c\n").await;
+        let c = e.commit("C").await;
+        e.write("/d.txt", "d\n").await;
+        e.commit("D").await;
+        e.checkout("main").await;
+        call_push_branch(&e, &url, "release", "anonymous").await.unwrap();
+        tag(&e, json!({"name": "v1.0", "target": c})).await.unwrap();
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(c.as_str()));
+    }
+
+    /// SPEC-0052/E2E-074: membership is checked before anything else, so a
+    /// non member learns nothing about tags or remotes.
+    #[tokio::test]
+    async fn e2e_tag_074_non_member_outranks_every_other_publish_refusal() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        let err = publish_as(&e, CAROL, "v9.9").await.unwrap_err();
+        let usual = e.as_person(CAROL, "git.tags", json!({"mount_id": MOUNT})).await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert_eq!(err.message, usual.message);
+        assert_ne!(err.message, "Tag 'v9.9' does not exist.");
+        assert!(!err.message.contains("v9.9") && !err.message.contains("remote"));
+    }
+
+    /// SPEC-0052/E2E-075: the unknown tag refusal comes before the no remote
+    /// one.
+    #[tokio::test]
+    async fn e2e_tag_075_unknown_tag_outranks_no_remote() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        let err = publish_as(&e, OWNER, "v9.9").await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert_eq!(err.message, "Tag 'v9.9' does not exist.");
+        assert!(!err.message.contains("remote"));
+    }
+
+    /// SPEC-0052/E2E-077: the connection dropped after the remote accepted the
+    /// tag. No transport here can accept a pack and then drop the answer, so
+    /// the accepted push is the tag written on the bare remote at the same
+    /// object, and the dropped answer the closing remote's refusal; the retry
+    /// then sees an identical remote tag.
+    #[tokio::test]
+    async fn e2e_tag_077_connection_lost_after_the_remote_accepted_the_tag() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t077").await;
+        tag(&e, json!({"name": "v2.0"})).await.unwrap();
+
+        let (dropping, handle) = closing_remote().await;
+        plain_tag_bare_remote(&dir, "v2.0", &a);
+        let err = call_publish_tag(&e, &dropping, "v2.0").await.unwrap_err();
+        handle.abort();
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+
+        let out = call_publish_tag(&e, &url, "v2.0").await.unwrap();
+        assert_eq!(out["up_to_date"], true, "{out}");
+        assert_eq!(out["created"], false, "{out}");
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0052/E2E-084: a commit held only under a remote tip the project
+    /// never fetched is not on the remote as far as the publish can prove,
+    /// and the publish never fetches to find out. Alice fetched E, the
+    /// remote then moved `main` to D (a child of E) without her fetching.
+    #[tokio::test]
+    async fn e2e_tag_084_commit_only_on_an_unfetched_remote_tip() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-t084").await;
+        let commit_e = advance_bare_remote(&dir, "refs/heads/main", "e\n");
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        advance_bare_remote(&dir, "refs/heads/main", "d\n");
+        tag(&e, json!({"name": "v1.0", "target": commit_e})).await.unwrap();
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            err.message,
+            format!(
+                "Cannot publish tag 'v1.0': commit {} is not on the remote. Publish its branch \
+                 first.",
+                short7(&commit_e)
+            )
+        );
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+    }
+
+    /// SPEC-0052/E2E-085 (DEC-019): a name the branch rules accept but git
+    /// refuses as a reference. The local file transport runs no hooks, so the
+    /// refusal is the one git itself gives for that name when the tag ref is
+    /// written for the push; the per ref status path of a real remote maps to
+    /// the same text (unit test in `git_tags`).
+    #[tokio::test]
+    async fn e2e_tag_085_remote_refuses_the_tag_name() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t085").await;
+        tag(&e, json!({"name": "a//b"})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "a//b").await.unwrap_err();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert_eq!(err.message, "Remote refused tag 'a//b': invalid ref name");
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(tag_target(&e, "a//b").await.as_deref(), Some(a.as_str()));
+        assert!(publish_audit(&e, OWNER).is_empty());
     }
 }

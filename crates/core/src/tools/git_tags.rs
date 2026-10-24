@@ -1,5 +1,5 @@
-//! Tag engines (SPEC-0052): `git.tag_create`, `git.tag_delete` and the
-//! `git.tags` listing.
+//! Tag engines (SPEC-0052): `git.tag_create`, `git.tag_delete`, the
+//! `git.tags` listing and `git.remote_push_tag`.
 //!
 //! A tag is one `git_refs` row named `refs/tags/<name>` whose target is the
 //! commit (a plain tag) or a tag object (an annotated tag), exactly like a
@@ -12,13 +12,15 @@ use crate::errors::{Result, ToolError};
 use crate::git::{GitRepoEntry, GitRepoStore};
 use crate::safety::SafetyManager;
 use crate::tools::git::{
-    hydrate, on_git_thread, open, parse_oid, reject_if_operation_in_progress, validate_ref_name,
+    hydrate, on_git_thread, open, parse_oid, reject_if_operation_in_progress,
+    resolve_clone_credential, validate_ref_name,
 };
 use crate::tools::registry_support::ToolCtx;
 use chrono::{DateTime, Utc};
 use git2::{ObjectType, Oid, Repository};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const TAGS_PREFIX: &str = "refs/tags/";
 
@@ -455,4 +457,236 @@ pub(crate) async fn reconcile_incoming_tags(
     added.sort_unstable();
     kept_local.sort_unstable();
     Ok((added, kept_local))
+}
+
+/// `git.remote_push_tag`: refusals come in the order of FR-NEW-020 because
+/// that is the order of the calls: membership (`open`), unknown tag, no
+/// remote, credential, then inside [`publish_tag`] the connection and the
+/// remote checks. None of them writes an audit entry (DEC-016).
+pub(crate) async fn tool_remote_push_tag(
+    ctx: ToolCtx,
+    a: crate::mcp::server::GitRemotePushTagArgs,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let entry = open(&ctx, &a.mount_id, g).await?;
+    if entry.db.get_ref(&format!("{TAGS_PREFIX}{}", a.tag)).await?.is_none() {
+        return Err(unknown_tag(&a.tag));
+    }
+    let Some(url) =
+        entry.db.list_remotes().await?.into_iter().find(|(n, _)| *n == a.remote).map(|(_, u)| u)
+    else {
+        return Err(ToolError::not_found(format!(
+            "Cannot publish tag '{}': this project tracks no remote.",
+            a.tag
+        )));
+    };
+    let (token, auth) = resolve_clone_credential(&ctx, &t, &url).await?;
+    let timeout_secs = ctx.state.config.git.remote_timeout_secs;
+    let target = PublishTarget {
+        mount_id: &a.mount_id,
+        person: &ctx.person,
+        remote: &a.remote,
+        tag: &a.tag,
+        url: &url,
+        token,
+        auth: &auth,
+        timeout_secs,
+    };
+    publish_tag(entry, ctx.state.safety.clone(), target).await
+}
+
+/// Where and how one tag is published: everything [`publish_tag`] needs
+/// once the remote URL and the credential are known.
+pub(crate) struct PublishTarget<'a> {
+    pub mount_id: &'a str,
+    pub person: &'a str,
+    pub remote: &'a str,
+    pub tag: &'a str,
+    pub url: &'a str,
+    pub token: Option<String>,
+    pub auth: &'a str,
+    pub timeout_secs: u64,
+}
+
+/// DEC-015, DEC-016, DEC-020: publish one tag once the remote and the
+/// credential are known. Split from [`tool_remote_push_tag`] so a test can
+/// reach it with a `file://` remote, which the registered tool refuses.
+///
+/// Under the write lock (DEC-009), one listing connection, then the checks,
+/// then at most one push connection. The audit entry is written only when
+/// the push really happened: an identical remote tag, a refusal and a
+/// connection failure all leave the trail untouched (FR-NEW-012).
+///
+/// Cost: hydration, O(o) in stored objects as for every tag tool; then for
+/// n advertised refs O(n) work plus one `graph_descendant_of` per distinct
+/// advertised commit held locally, each O(d) in the history depth d, so
+/// O(n + u d) time for u distinct tips and O(n) space. Nothing is fetched.
+pub(crate) async fn publish_tag(
+    entry: Arc<GitRepoEntry>,
+    safety: Arc<SafetyManager>,
+    target: PublishTarget<'_>,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(target.url);
+    let (remote, auth) = (target.remote, target.auth);
+    crate::git::remote::trace_remote_operation(
+        "git.remote_push_tag",
+        remote,
+        &host,
+        auth,
+        publish_inner(entry, safety, target, &host),
+    )
+    .await
+}
+
+async fn publish_inner(
+    entry: Arc<GitRepoEntry>,
+    safety: Arc<SafetyManager>,
+    target: PublishTarget<'_>,
+    host: &str,
+) -> Result<Value> {
+    let PublishTarget { mount_id, person, remote, tag, url, token, auth, timeout_secs } = target;
+    let tag_ref = format!("{TAGS_PREFIX}{tag}");
+    // Acquired here, in the async caller, never inside the blocking closure,
+    // so a deadline firing releases it (DRIFT-009), as for a branch push.
+    let _write = entry.write_lock.lock().await;
+    let Some(row) = entry.db.get_ref(&tag_ref).await? else {
+        return Err(unknown_tag(tag));
+    };
+    let object = parse_oid(&row.target)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let (thread_entry, tag_owned, url_owned) = (entry.clone(), tag.to_string(), url.to_string());
+    let (commit, pushed) = crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        host,
+        on_git_thread(move || async move {
+            let repo = thread_entry.repo.lock().await;
+            hydrate(&thread_entry, &repo).await?;
+            publish_on_repo(&repo, &tag_owned, object, &url_owned, token, deadline)
+        }),
+    )
+    .await?;
+
+    if pushed {
+        safety.record_audit(
+            person,
+            &entry.project_id,
+            "git.tag_publish",
+            "/",
+            &format!("published tag '{tag}' at {commit}"),
+        );
+    }
+    Ok(json!({
+        "mount_id": mount_id,
+        "tag": tag,
+        "remote": remote,
+        "created": pushed,
+        "up_to_date": !pushed,
+        "remote_sha": commit,
+        "auth": auth,
+    }))
+}
+
+/// The blocking half of a publication: list, check, then push only a tag
+/// the remote lacks. Returns the tag's commit and whether a push happened.
+fn publish_on_repo(
+    repo: &Repository,
+    tag: &str,
+    object: Oid,
+    url: &str,
+    token: Option<String>,
+    deadline: Instant,
+) -> Result<(String, bool)> {
+    let tag_ref = format!("{TAGS_PREFIX}{tag}");
+    let commit = peel_to_commit(repo, &object.to_string()).ok_or_else(|| {
+        ToolError::internal(format!("tag '{tag}' does not name a commit held by the project"))
+    })?;
+    let commit_oid = parse_oid(&commit)?;
+    let advertised =
+        crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+
+    if !commit_on_remote(repo, commit_oid, &advertised) {
+        return Err(ToolError::invalid_argument(format!(
+            "Cannot publish tag '{tag}': commit {} is not on the remote. Publish its branch first.",
+            short7(&commit)
+        )));
+    }
+
+    if let Some(remote_object) = advertised_oid(&advertised, &tag_ref) {
+        // The same object is the same tag, whatever its kind. A different
+        // object is refused for now: telling an identical annotated tag
+        // written twice apart from a real difference needs the message
+        // probe of DEC-017, and overwriting needs the confirmation of
+        // FR-NEW-008, both outside this tool's first version.
+        if remote_object == object {
+            return Ok((commit, false));
+        }
+        let peeled =
+            advertised_oid(&advertised, &format!("{tag_ref}^{{}}")).unwrap_or(remote_object);
+        return Err(ToolError::no_clobber(format!(
+            "Remote tag '{tag}' already exists at a different commit ({}). Confirm overwriting \
+             to replace it.",
+            short7(&peeled.to_string())
+        )));
+    }
+
+    // The push names the tag by ref, so the index row (the source of truth)
+    // is written to the on disk ref first, as a branch push does. A name the
+    // branch rules accept but git refuses as a reference (DEC-019) is
+    // refused here, before the push connection, with the refusal a remote
+    // would give. Checked rather than left to `reference`, which quietly
+    // normalises `a//b` to `a/b` and would write a ref of another name.
+    if !git2::Reference::is_valid_name(&tag_ref) {
+        return Err(crate::git::remote::remote_refused_tag(tag, "invalid ref name"));
+    }
+    repo.reference(&tag_ref, object, true, "mcp-fs git.remote_push_tag")
+        .map_err(|e| crate::git::remote::remote_refused_tag(tag, e.message()))?;
+    crate::git::remote::push_tag_to_remote(repo, url, tag, token, Some(deadline))?;
+    Ok((commit, true))
+}
+
+/// DEC-020: the commit is on the remote when an advertised ref names it, or
+/// when it is an ancestor of an advertised commit the project already holds.
+/// A tip the project lacks is skipped rather than fetched, so such a commit
+/// counts as absent even when the remote has it (E2E-084).
+fn commit_on_remote(repo: &Repository, commit: Oid, advertised: &[(String, Oid)]) -> bool {
+    let tips: std::collections::HashSet<Oid> = advertised.iter().map(|(_, oid)| *oid).collect();
+    tips.contains(&commit)
+        || tips.into_iter().any(|tip| {
+            repo.find_commit(tip).is_ok() && repo.graph_descendant_of(tip, commit).unwrap_or(false)
+        })
+}
+
+fn advertised_oid(advertised: &[(String, Oid)], name: &str) -> Option<Oid> {
+    advertised.iter().find(|(n, _)| n == name).map(|(_, oid)| *oid)
+}
+
+fn unknown_tag(name: &str) -> ToolError {
+    ToolError::not_found(format!("Tag '{name}' does not exist."))
+}
+
+/// DEC-018: tag refusals show 7 characters, distinct from the 8 character
+/// `short` the other git tools print.
+pub(crate) fn short7(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short7_keeps_seven_characters() {
+        assert_eq!(short7("a1b2c3d4e5f6"), "a1b2c3d");
+        assert_eq!(short7("abc"), "abc");
+    }
+
+    /// DEC-019: a per ref refusal from a real remote, the path the local
+    /// file transport never takes, reads the same as git's own name refusal.
+    #[test]
+    fn a_remote_name_refusal_names_the_tag_and_the_reason() {
+        let err = crate::git::remote::remote_refused_tag("a//b", "invalid ref name");
+        assert_eq!(err.code, crate::errors::code::INTERNAL_ERROR);
+        assert_eq!(err.message, "Remote refused tag 'a//b': invalid ref name");
+    }
 }
