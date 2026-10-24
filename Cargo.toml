@@ -40,7 +40,7 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls",
     "postgres",
 ] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = "1"
 aws-credential-types = "1"
 sha2 = "0.10"
