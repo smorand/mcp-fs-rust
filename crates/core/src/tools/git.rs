@@ -6605,6 +6605,12 @@ async fn pull_branch_inner(
         person.to_string(),
     );
     let entry_for_thread = entry.clone();
+    // The reconciled tags, written by the closure right after the fetch import
+    // and read here once it returns. A slot rather than a field on every
+    // `PullOutcome` arm, so the merge decision and its early returns stay
+    // untouched. Empty if the exchange failed: the closure never got there.
+    let tags_slot: Arc<std::sync::Mutex<(Vec<String>, Vec<String>)>> = Arc::default();
+    let tags_slot_for_thread = tags_slot.clone();
     // Acquired here, in the async caller, never inside the blocking closure
     // below (DRIFT-009): see `push_branch` for why this is what makes a
     // deadline actually release the lock. One `write_lock` plus one `repo`
@@ -6630,10 +6636,19 @@ async fn pull_branch_inner(
                 &origin_owned,
                 token,
                 Some(deadline),
-                // Pull receives tags in US-0087; until then it fetches as before.
-                crate::git::remote::TagScope::Off,
+                crate::git::remote::TagScope::Branch(&branch_owned),
             )?;
             entry_for_thread.objects.import_from_repo(&repo).await?;
+            // After the import (a ref row must not name an object the blob
+            // store lacks) and before the merge decision, so a pull that
+            // pauses on a conflict has already delivered its tags (DEC-013).
+            let tags = crate::tools::git_tags::reconcile_incoming_tags(
+                &entry_for_thread,
+                &repo,
+                &outcome.incoming_tags,
+            )
+            .await?;
+            *tags_slot_for_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = tags;
             for u in &outcome.refs_updated {
                 entry_for_thread.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
             }
@@ -6807,7 +6822,10 @@ async fn pull_branch_inner(
     )
     .await?;
 
-    Ok(match outcome {
+    let (tags_added, tags_kept_local) =
+        std::mem::take(&mut *tags_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+
+    let mut result = match outcome {
         PullOutcome::FastForward { old_sha, new_sha, files_changed } => json!({
             "old_sha": old_sha,
             "new_sha": new_sha,
@@ -6825,7 +6843,13 @@ async fn pull_branch_inner(
         // The shared conflict response, verbatim: no pull specific key is
         // added to it, so one caller side handler covers every operation.
         PullOutcome::Conflict(response) => response.to_value(),
-    })
+    };
+    // Additive keys on every result, the conflict one included (FR-NEW-017).
+    if let Some(map) = result.as_object_mut() {
+        map.insert("tags_added".to_string(), json!(tags_added));
+        map.insert("tags_kept_local".to_string(), json!(tags_kept_local));
+    }
+    Ok(result)
 }
 
 // ── git.stash_save, git.stash_list, git.stash_drop ──────────────────────────
@@ -24994,10 +25018,8 @@ mod tests {
         assert!(!out.to_string().contains("v9."), "the result must not mention it: {out}");
     }
 
-    /// SPEC-0052 E2E-043: a pull keeps a conflicting local tag. Pull does not
-    /// receive tags before US-0087, so the pull half asserts it succeeds and
-    /// leaves the local tag alone, and the "kept local" report is asserted on
-    /// the fetch, the same reconcile pull will call.
+    /// SPEC-0052 E2E-043: a pull keeps a conflicting local tag and reports it
+    /// itself; a fetch afterwards reports it the same way.
     #[tokio::test]
     async fn e2e_tag_043_pull_keeps_a_conflicting_local_tag() {
         let e = Env::new().await;
@@ -25006,7 +25028,9 @@ mod tests {
         let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
         plain_tag_bare_remote(&dir, "v1.0", &c);
 
-        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        let pulled = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(pulled["tags_kept_local"], json!(["v1.0"]));
+        assert_eq!(pulled["tags_added"], json!([]));
         assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
 
         let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
@@ -25143,6 +25167,84 @@ mod tests {
             assert!(!err.message.contains("v1.0"));
             assert!(tag_names(&e).await.is_empty());
         });
+    }
+
+    /// SPEC-0052 E2E-054: a pull paused on a conflict still delivers the
+    /// remote tag, listed as added in the paused result.
+    #[tokio::test]
+    async fn e2e_tag_054_paused_pull_still_receives_tags() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-t054").await;
+        e.write("/shared.txt", "local content\n").await;
+        e.commit("local change").await;
+        let c = advance_bare_remote_write(&dir, "refs/heads/main", "shared.txt", "remote\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["tags_added"], json!(["v1.0"]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(c.as_str()));
+    }
+
+    /// SPEC-0052 E2E-063: a failed pull brings no tag: remote down, then an
+    /// expired credential through the registered tool.
+    #[test]
+    fn e2e_tag_063_failed_pull_brings_no_tag() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(REFERENCE_HOSTS).await;
+            let (dir, _, _) = cloned_remote(&e, "remote-t063").await;
+            let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+            plain_tag_bare_remote(&dir, "v3.0", &c);
+
+            let down = format!("file://{}", e.f.dir.path().join("no-such-remote").display());
+            let err = call_pull_branch(&e, &down, "main", "anonymous").await.unwrap_err();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert!(tag_target(&e, "v3.0").await.is_none());
+
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            entry.db.add_remote("origin", "https://github.ibm.com/org/repo.git").await.unwrap();
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = e
+                .call("git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert!(tag_target(&e, "v3.0").await.is_none());
+            assert!(tag_names(&e).await.is_empty());
+        });
+    }
+
+    /// SPEC-0052 E2E-064: a paused pull keeps a conflicting local tag and
+    /// reports it as kept local.
+    #[tokio::test]
+    async fn e2e_tag_064_paused_pull_keeps_a_conflicting_local_tag() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t064").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        e.write("/shared.txt", "local content\n").await;
+        e.commit("local change").await;
+        let c = advance_bare_remote_write(&dir, "refs/heads/main", "shared.txt", "remote\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(out["tags_kept_local"], json!(["v1.0"]));
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
     }
 
     /// SPEC-0052 E2E-050: a remote tag moved between two fetches keeps the
