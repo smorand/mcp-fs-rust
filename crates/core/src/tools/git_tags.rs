@@ -14,6 +14,7 @@ use crate::tools::git::{
     hydrate, on_git_thread, open, parse_oid, reject_if_operation_in_progress, validate_ref_name,
 };
 use crate::tools::registry_support::ToolCtx;
+use chrono::{DateTime, Utc};
 use git2::{ObjectType, Oid, Repository};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -43,8 +44,13 @@ pub(crate) async fn tool_tag_create(
     let person = ctx.person.clone();
     let target = Some(a.target).filter(|t| !t.is_empty());
     on_git_thread(move || async move {
-        tag_create(&entry, &safety, &person, &mount_id, &a.name, target.as_deref(), a.overwrite)
-            .await
+        let request = TagRequest {
+            name: &a.name,
+            target: target.as_deref(),
+            message: &a.message,
+            overwrite: a.overwrite,
+        };
+        tag_create(&entry, &safety, &person, &mount_id, request).await
     })
     .await
 }
@@ -65,6 +71,14 @@ pub(crate) async fn tool_tags(
     .await
 }
 
+/// The caller's choices for one creation; an empty `message` means a plain tag.
+struct TagRequest<'a> {
+    name: &'a str,
+    target: Option<&'a str>,
+    message: &'a str,
+    overwrite: bool,
+}
+
 /// DEC-009: the write lock covers the existence check and the ref write
 /// together, so of two concurrent creations of one name exactly one passes the
 /// check; the other then sees the winner's row and gets the FR-NEW-003 refusal.
@@ -75,10 +89,9 @@ async fn tag_create(
     safety: &SafetyManager,
     person: &str,
     mount_id: &str,
-    name: &str,
-    target: Option<&str>,
-    overwrite: bool,
+    request: TagRequest<'_>,
 ) -> Result<Value> {
+    let TagRequest { name, target, message, overwrite } = request;
     let tag_ref = format!("{TAGS_PREFIX}{name}");
     let _write = entry.write_lock.lock().await;
 
@@ -104,11 +117,21 @@ async fn tag_create(
     }
 
     let sha = commit.to_string();
-    entry.db.set_ref(&tag_ref, &sha, false).await?;
+    let (kind, object) = if message.is_empty() {
+        ("lightweight", commit)
+    } else {
+        let tag_oid = write_tag_object(&repo, person, name, commit, message)?;
+        // The tag object must be in the authoritative blob store before the
+        // ref row names it, or a reader could find a ref to nothing.
+        entry.objects.import_from_repo(&repo).await?;
+        ("annotated", tag_oid)
+    };
+    let object_sha = object.to_string();
+    entry.db.set_ref(&tag_ref, &object_sha, false).await?;
     // Keep the on disk refs in step, the same way git.branch_create does. The
     // index row is the source of truth; libgit2 refuses a few names the branch
     // rules accept (DEC-019), and that refusal must not undo a valid tag.
-    let _ = repo.reference(&tag_ref, commit, true, "mcp-fs git.tag_create");
+    let _ = repo.reference(&tag_ref, object, true, "mcp-fs git.tag_create");
 
     // The previous target of a plain tag is its commit; peeling also covers a
     // tag that was annotated before, so the line always names a commit.
@@ -123,15 +146,41 @@ async fn tag_create(
     let mut out = json!({
         "mount_id": mount_id,
         "name": name,
-        "kind": "lightweight",
+        "kind": kind,
         "sha": sha,
-        "object": sha,
+        "object": object_sha,
         "overwritten": previous_commit.is_some(),
     });
     if let (Some(old), Some(map)) = (previous_commit, out.as_object_mut()) {
         map.insert("previous_sha".to_string(), Value::String(old));
     }
     Ok(out)
+}
+
+/// DEC-005, DEC-006: the tag object is assembled by hand and written through
+/// the object database, because `Repository::tag` validates names more
+/// strictly than the branch rules and would also normalise the message, which
+/// FR-NEW-002 forbids (the message is kept byte for byte, so no prettify).
+/// The tagger is built like a commit author: name before `@`, email the id.
+fn write_tag_object(
+    repo: &Repository,
+    person: &str,
+    name: &str,
+    commit: Oid,
+    message: &str,
+) -> Result<Oid> {
+    // A header line ends at a newline and brackets delimit the email, so a
+    // person id carrying any of them could forge or break the header.
+    let clean = |s: &str| s.chars().filter(|c| !matches!(c, '\n' | '<' | '>')).collect::<String>();
+    let tagger_name = clean(person.split('@').next().unwrap_or(person));
+    let tagger_email = clean(person);
+    let body = format!(
+        "object {commit}\ntype commit\ntag {name}\ntagger {tagger_name} <{tagger_email}> {} +0000\n\n{message}",
+        Utc::now().timestamp()
+    );
+    let odb = repo.odb().map_err(|e| ToolError::internal(format!("tag object store: {e}")))?;
+    odb.write(ObjectType::Tag, body.as_bytes())
+        .map_err(|e| ToolError::internal(format!("write tag object: {e}")))
 }
 
 /// The commit HEAD stands on, or `None` when the project has no commit: a
@@ -229,11 +278,45 @@ fn tag_entry(repo: &Repository, full_ref: String, target: String) -> Value {
     // listed, under its own id, rather than hiding the tag or failing the list.
     let sha = peel_to_commit(repo, &target).unwrap_or_else(|| target.clone());
     let kind = if annotated { "annotated" } else { "lightweight" };
-    json!({
+    let mut entry = json!({
         "name": name,
         "full_ref": full_ref,
         "sha": sha,
         "object": target,
         "kind": kind,
-    })
+    });
+    if let (true, Some(map)) = (annotated, entry.as_object_mut()) {
+        annotation_details(repo, &target, map);
+    }
+    entry
+}
+
+/// FR-MOD-001: message exactly as stored, tagger name and email, creation
+/// time in UTC. A tag object that cannot be parsed adds nothing rather than
+/// failing the listing, the same leniency as an unpeelable target.
+fn annotation_details(repo: &Repository, target: &str, map: &mut serde_json::Map<String, Value>) {
+    let Some(tag) = Oid::from_str(target).ok().and_then(|oid| repo.find_tag(oid).ok()) else {
+        return;
+    };
+    map.insert(
+        "message".to_string(),
+        Value::String(
+            String::from_utf8_lossy(tag.message_bytes().unwrap_or_default()).into_owned(),
+        ),
+    );
+    let Some(tagger) = tag.tagger() else { return };
+    map.insert(
+        "tagger".to_string(),
+        Value::String(String::from_utf8_lossy(tagger.name_bytes()).into_owned()),
+    );
+    map.insert(
+        "tagger_email".to_string(),
+        Value::String(String::from_utf8_lossy(tagger.email_bytes()).into_owned()),
+    );
+    if let Some(at) = DateTime::<Utc>::from_timestamp(tagger.when().seconds(), 0) {
+        map.insert(
+            "tagged_at".to_string(),
+            Value::String(at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+    }
 }

@@ -3590,6 +3590,11 @@
             "description": "Replace a tag of the same name; false refuses when it exists.",
             "type": "boolean",
             "default": false
+          },
+          "message": {
+            "description": "Message of an annotated tag; empty creates a plain tag.",
+            "type": "string",
+            "default": ""
           }
         },
         "required": [

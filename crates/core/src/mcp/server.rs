@@ -908,6 +908,9 @@ pub struct GitTagCreateArgs {
     /// Replace a tag of the same name; false refuses when it exists.
     #[serde(default)]
     pub overwrite: bool,
+    /// Message of an annotated tag; empty creates a plain tag.
+    #[serde(default)]
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

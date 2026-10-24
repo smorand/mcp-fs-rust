@@ -598,18 +598,19 @@ git.status
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.tag_create
   desc: Create a tag at a branch, tag or commit, by default the currently checked out commit. Refuses a name that already exists unless overwrite is true.
-  params: mount_id:string, name:string, target:string="", overwrite:boolean=false
+  params: mount_id:string, name:string, target:string="", overwrite:boolean=false, message:string=""
   required: ['mount_id', 'name']
   param name: Name of the tag to create, without the refs/tags/ prefix.
   param target: Branch, tag or commit id the tag points at; defaults to the currently checked out commit.
   param overwrite: Replace a tag of the same name; false refuses when it exists.
-  returns: {"mount_id": "proj", "name": "v1.0", "kind": "lightweight", "sha": "<commit sha>", "object": "<commit sha>", "overwritten": false, "previous_sha": "<commit sha, only when overwritten>"}
+  param message: Message of an annotated tag; empty creates a plain tag.
+  returns: {"mount_id": "proj", "name": "v1.0", "kind": "lightweight or annotated", "sha": "<commit sha>", "object": "<commit sha, or the tag object sha when annotated>", "overwritten": false, "previous_sha": "<commit sha, only when overwritten>"}
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=false
 git.tags
   desc: List all tags with their kind, commit and, for annotated tags, message, tagger and creation time.
   params: mount_id:string
   required: ['mount_id']
-  returns: {"mount_id": "proj", "tags": [{"name": "v1.0", "full_ref": "refs/tags/v1.0", "sha": "<peeled commit sha>", "object": "<ref target sha>", "kind": "lightweight"}]}
+  returns: {"mount_id": "proj", "tags": [{"name": "v1.0", "full_ref": "refs/tags/v1.0", "sha": "<peeled commit sha>", "object": "<ref target sha>", "kind": "lightweight"}, {"name": "v2.0", "full_ref": "refs/tags/v2.0", "sha": "<peeled commit sha>", "object": "<tag object sha>", "kind": "annotated", "message": "<exactly as stored>", "tagger": "<name>", "tagger_email": "<email>", "tagged_at": "YYYY-MM-DDTHH:MM:SSZ"}]}
            sorted ascending by name, compared byte by byte
   annotations: readOnlyHint=true, idempotentHint=true, openWorldHint=false
 git.token_set

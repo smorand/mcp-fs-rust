@@ -320,6 +320,7 @@ pub(crate) fn register_with(
             false,
             "Replace a tag of the same name; false refuses when it exists.",
         )
+        .opt_str("message", "", "Message of an annotated tag; empty creates a plain tag.")
         .destructive(false)
         .read_only(false)
         .idempotent(false)
@@ -24393,5 +24394,202 @@ mod tests {
         assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
         assert_eq!(err.message, unknown_target_msg(&prefix));
         assert!(tag_list(&e).await.is_empty());
+    }
+
+    // ── SPEC-0052 US-0084: annotated tags and the listing details ──────────
+
+    fn assert_utc_stamp(stamp: &str) {
+        let parsed = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%SZ")
+            .unwrap_or_else(|e| panic!("bad stamp {stamp}: {e}"));
+        let age = Utc::now().timestamp() - parsed.and_utc().timestamp();
+        assert!((-5..=5).contains(&age), "{stamp} is {age}s from now");
+    }
+
+    async fn tag_entry_of(e: &Env, name: &str) -> Value {
+        tag_list(e).await.into_iter().find(|t| t["name"] == name).unwrap()
+    }
+
+    /// SPEC-0052/E2E-004: an annotated tag with message, tagger and time.
+    #[tokio::test]
+    async fn e2e_tag_004_create_an_annotated_tag() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+
+        let out = tag(&e, json!({"name": "v2.0", "message": "Release 2.0"})).await.unwrap();
+
+        assert_eq!(out["kind"], "annotated", "{out}");
+        assert_eq!(out["sha"], json!(a), "{out}");
+        let object = out["object"].as_str().unwrap().to_string();
+        assert_ne!(object, a, "object is the tag object, not the commit");
+        assert_eq!(tag_target(&e, "v2.0").await.as_deref(), Some(object.as_str()));
+        let t = tag_entry_of(&e, "v2.0").await;
+        assert_eq!(t["kind"], "annotated");
+        assert_eq!(t["message"], "Release 2.0");
+        assert_eq!(t["sha"], json!(a));
+        assert_eq!(t["object"], json!(object));
+        assert_eq!(t["tagger"], OWNER.split('@').next().unwrap());
+        assert_eq!(t["tagger_email"], OWNER);
+        assert_utc_stamp(t["tagged_at"].as_str().unwrap());
+        assert_eq!(
+            tag_audit(&e, OWNER),
+            vec![("git.tag_create".to_string(), format!("created tag 'v2.0' at {a}"))]
+        );
+    }
+
+    /// SPEC-0052/E2E-005: the message comes back byte for byte.
+    #[tokio::test]
+    async fn e2e_tag_005_message_kept_verbatim() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let message = "Été 🚀 <b>gras</b> & \"quotes\"\n  second line, indented\n";
+
+        tag(&e, json!({"name": "v2.1", "message": message})).await.unwrap();
+
+        assert_eq!(tag_entry_of(&e, "v2.1").await["message"], json!(message));
+    }
+
+    /// SPEC-0052/E2E-008: overwriting changes the kind, in both directions.
+    #[tokio::test]
+    async fn e2e_tag_008_overwrite_changes_the_kind() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        let out = tag_as(&e, BOB, json!({"name": "v1.0", "message": "Re-cut", "overwrite": true}))
+            .await
+            .unwrap();
+
+        assert_eq!(out["kind"], "annotated", "{out}");
+        assert_eq!(out["overwritten"], true, "{out}");
+        assert_eq!(out["previous_sha"], json!(a), "{out}");
+        let t = tag_entry_of(&e, "v1.0").await;
+        assert_eq!(t["kind"], "annotated");
+        assert_eq!(t["message"], "Re-cut");
+        assert_eq!(t["tagger"], "bob");
+        assert_eq!(t["tagger_email"], BOB);
+
+        let back = tag(&e, json!({"name": "v1.0", "overwrite": true})).await.unwrap();
+        assert_eq!(back["kind"], "lightweight", "{back}");
+        let t = tag_entry_of(&e, "v1.0").await;
+        assert_eq!(t["kind"], "lightweight");
+        for key in ["message", "tagger", "tagger_email", "tagged_at"] {
+            assert!(t.get(key).is_none(), "plain tag must not carry {key}: {t}");
+        }
+        assert_eq!(tag_audit(&e, BOB)[0].0, "git.tag_overwrite");
+    }
+
+    /// SPEC-0052/E2E-020: the listing mixes both kinds, in name order.
+    #[tokio::test]
+    async fn e2e_tag_020_list_shows_kind_and_message() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let c = advance_main(&e).await;
+        tag(&e, json!({"name": "v2.0", "message": "Release 2.0"})).await.unwrap();
+
+        let out = e.as_person(BOB, "git.tags", json!({"mount_id": MOUNT})).await.unwrap();
+        let tags = out["tags"].as_array().unwrap();
+
+        assert_eq!(tags.len(), 2, "{out}");
+        assert_eq!(tags[0]["name"], "v1.0");
+        assert_eq!(tags[0]["kind"], "lightweight");
+        assert_eq!(tags[0]["sha"], json!(a));
+        assert!(tags[0].get("message").is_none());
+        assert_eq!(tags[1]["name"], "v2.0");
+        assert_eq!(tags[1]["kind"], "annotated");
+        assert_eq!(tags[1]["message"], "Release 2.0");
+        assert_eq!(tags[1]["sha"], json!(c));
+    }
+
+    /// SPEC-0052/E2E-022: 5000 tags, plain and annotated, seeded straight into
+    /// the store (one object import, 5000 rows) to keep the test quick.
+    #[tokio::test]
+    async fn e2e_tag_022_five_thousand_tags() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        let entry = e.entry().await;
+        {
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            let odb = repo.odb().unwrap();
+            for i in 0..5000 {
+                let target = if i % 2 == 0 {
+                    let body = format!(
+                        "object {a}\ntype commit\ntag t{i:04}\n\
+                         tagger p <p@test.com> 1700000000 +0000\n\nmsg {i}"
+                    );
+                    odb.write(git2::ObjectType::Tag, body.as_bytes()).unwrap().to_string()
+                } else {
+                    a.clone()
+                };
+                entry.db.set_ref(&format!("refs/tags/t{i:04}"), &target, false).await.unwrap();
+            }
+            entry.objects.import_from_repo(&repo).await.unwrap();
+        }
+
+        let tags = tag_list(&e).await;
+
+        assert_eq!(tags.len(), 5000);
+        for (i, t) in tags.iter().enumerate() {
+            assert_eq!(t["name"], json!(format!("t{i:04}")));
+            assert_eq!(t["sha"], json!(a));
+            if i % 2 == 0 {
+                assert_eq!(t["kind"], "annotated", "{t}");
+                assert_eq!(t["message"], json!(format!("msg {i}")));
+            } else {
+                assert_eq!(t["kind"], "lightweight", "{t}");
+                assert!(t.get("message").is_none());
+            }
+        }
+    }
+
+    /// SPEC-0052/E2E-067: a message does not lift the no commit refusal.
+    #[tokio::test]
+    async fn e2e_tag_067_annotated_tag_in_a_project_with_no_commit() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+
+        let err = tag(&e, json!({"name": "v1.0", "message": "First"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND, "{err:?}");
+        assert_eq!(err.message, "Cannot tag: this project has no commit yet.");
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0052/E2E-078: empty message is plain, whitespace is annotated.
+    #[tokio::test]
+    async fn e2e_tag_078_empty_message_gives_a_plain_tag() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+
+        let v0 = tag(&e, json!({"name": "v7.0", "message": ""})).await.unwrap();
+        let v1 = tag(&e, json!({"name": "v7.1", "message": "   "})).await.unwrap();
+
+        assert_eq!(v0["kind"], "lightweight", "{v0}");
+        assert_eq!(v1["kind"], "annotated", "{v1}");
+        let t0 = tag_entry_of(&e, "v7.0").await;
+        assert_eq!(t0["kind"], "lightweight");
+        assert!(t0.get("message").is_none());
+        let t1 = tag_entry_of(&e, "v7.1").await;
+        assert_eq!(t1["kind"], "annotated");
+        assert_eq!(t1["message"], "   ");
+    }
+
+    /// SPEC-0052/E2E-MOD-001: name and commit are what they were; kind and
+    /// message are added.
+    #[tokio::test]
+    async fn e2e_tag_mod_001_listing_now_shows_kind_and_message() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let c = advance_main(&e).await;
+        tag(&e, json!({"name": "v2.0", "message": "Release 2.0"})).await.unwrap();
+
+        let t = tag_entry_of(&e, "v2.0").await;
+
+        assert_eq!(t["name"], "v2.0");
+        assert_eq!(t["full_ref"], "refs/tags/v2.0");
+        assert_eq!(t["sha"], json!(c));
+        assert_eq!(t["kind"], "annotated");
+        assert_eq!(t["message"], "Release 2.0");
     }
 }
