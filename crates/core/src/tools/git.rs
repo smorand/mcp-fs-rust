@@ -27352,4 +27352,188 @@ mod tests {
         )
         .await;
     }
+
+    // ── SPEC-0053 US-0094: paused operations and concurrent deletions ─────
+
+    /// A bare remote whose `main` is at F with the remote tag `v1.0` on F and
+    /// no link to the project: the deletion engine takes the URL directly, so
+    /// a project holding a paused operation never needs a clone. Returns
+    /// (dir, url, F).
+    fn standalone_remote(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
+        let dir = e.f.dir.path().join(label);
+        let url = seed_bare_remote(&dir, "hi\n");
+        let f = advance_bare_remote(&dir, "refs/heads/main", "f\n");
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+        (dir, url, f)
+    }
+
+    /// Pause a merge, rebase, cherry pick or revert in `proj-a`, as E2E-017
+    /// and E2E-018 of SPEC-0052 do.
+    async fn pause_operation(e: &Env, kind: &str) {
+        let paused = match kind {
+            "merge" => {
+                seed_conflict(e).await;
+                e.merge("feature").await.unwrap()
+            }
+            "rebase" => {
+                let (_c1, _c2, f1, f2) = seed_fork_conflict(e).await;
+                rebase(e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap()
+            }
+            "cherry_pick" => {
+                let (_c2, f1) = seed_fork_conflict_at(e, MOUNT, "main").await;
+                cherry_pick(e, &f1).await.unwrap()
+            }
+            _ => {
+                let c = seed_fx_line_rewritten(e).await;
+                revert(e, &c[2]).await.unwrap()
+            }
+        };
+        assert_eq!(paused["status"], "conflict", "{kind}: {paused}");
+    }
+
+    /// SPEC-0053/E2E-029: a paused merge, rebase, cherry pick or revert does
+    /// not block the deletion, and the paused operation is left as it was.
+    #[tokio::test]
+    async fn e2e_tag_029_remote_delete_during_a_paused_operation() {
+        for kind in ["merge", "rebase", "cherry_pick", "revert"] {
+            let e = Env::new().await;
+            pause_operation(&e, kind).await;
+            let (dir, url, f) = standalone_remote(&e, "remote-d029");
+            let (op_before, before) = (e.op_row().await, bare_refs(&dir));
+            assert!(op_before.is_some(), "{kind}: an operation is paused");
+
+            let out = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await;
+
+            assert_eq!(out.unwrap()["deleted_commit"], json!(f), "{kind}");
+            assert_eq!(bare_refs(&dir), without(&before, "v1.0"), "{kind}");
+            assert_eq!(e.op_row().await, op_before, "{kind}: the operation is untouched");
+            assert_eq!(delete_audit(&e, OWNER), vec![deleted_line("v1.0", &f)], "{kind}");
+        }
+    }
+
+    /// SPEC-0053/E2E-030: Alice and Bob delete one remote tag at once. The
+    /// test holds the repository write lock so both calls are provably
+    /// queued behind it before either can act, then repeats on fresh state:
+    /// the outcome never depends on timing.
+    #[tokio::test]
+    async fn e2e_tag_030_remote_delete_two_members_at_once() {
+        for round in 0..3 {
+            let e = Env::new().await;
+            e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+            let (dir, url, f) = standalone_remote(&e, &format!("remote-d030-{round}"));
+            let before = bare_refs(&dir);
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            let guard = entry.write_lock.lock().await;
+
+            let alice = call_delete_remote_tag_as(&e, OWNER, &url, "v1.0", short7(&f));
+            let bob = call_delete_remote_tag_as(&e, BOB, &url, "v1.0", short7(&f));
+            tokio::pin!(alice, bob);
+            tokio::select! {
+                _ = &mut alice => panic!("round {round}: Alice ran under the held lock"),
+                _ = &mut bob => panic!("round {round}: Bob ran under the held lock"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
+            }
+            assert_eq!(bare_refs(&dir), before, "round {round}: both are still waiting");
+            drop(guard);
+            let (ra, rb) = tokio::join!(alice, bob);
+
+            let (winner, loser) = match (&ra, &rb) {
+                (Ok(_), Err(err)) => (OWNER, err),
+                (Err(err), Ok(_)) => (BOB, err),
+                other => panic!("round {round}: exactly one deletion must win: {other:?}"),
+            };
+            assert_eq!(loser.code, code::NOT_FOUND, "round {round}: {loser:?}");
+            assert_eq!(loser.message, absent_text("v1.0"));
+            assert_eq!(bare_refs(&dir), without(&before, "v1.0"));
+            assert_eq!(delete_audit(&e, winner), vec![deleted_line("v1.0", &f)]);
+            let total = delete_audit(&e, OWNER).len() + delete_audit(&e, BOB).len();
+            assert_eq!(total, 1, "round {round}: exactly one audit entry");
+        }
+    }
+
+    /// SPEC-0053/E2E-031: Alice's confirmation is stale because Bob moved the
+    /// tag to G (Bob's move is written straight on the remote, which is what
+    /// a confirmed publication leaves there). Both orders are forced. Bob
+    /// first, between the listing and the push: the lease is lost and Alice
+    /// is refused. Alice first: her deletion goes through, Bob then places
+    /// the tag at G, and Alice's stale confirmation cannot touch it.
+    #[tokio::test]
+    async fn e2e_tag_031_remote_delete_stale_view_while_the_tag_is_moved() {
+        // Bob moves it after Alice's listing, before her push.
+        let e = Env::new().await;
+        let (dir, url, f) = standalone_remote(&e, "remote-d031a");
+        let g = advance_bare_remote(&dir, "refs/heads/main", "g\n");
+        let (hook_dir, hook_g) = (dir.clone(), g.clone());
+        super::super::git_tags::after_listing::set(&url, move || {
+            plain_tag_bare_remote(&hook_dir, "v1.0", &hook_g);
+        });
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!((err.code, err.message), (code::NO_CLOBBER, moved_tag_text("v1.0", &g)));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(g.as_str()));
+        assert!(delete_audit(&e, OWNER).is_empty(), "no entry when she was refused");
+
+        // Alice's deletion comes first; Bob then places the tag at G.
+        let e = Env::new().await;
+        let (dir, url, f) = standalone_remote(&e, "remote-d031b");
+        let g = advance_bare_remote(&dir, "refs/heads/main", "g\n");
+        call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &g);
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!((err.code, err.message), (code::NO_CLOBBER, moved_tag_text("v1.0", &g)));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(g.as_str()));
+        assert_eq!(delete_audit(&e, OWNER), vec![deleted_line("v1.0", &f)], "one entry");
+    }
+
+    /// SPEC-0053/E2E-038: a paused merge and an unknown remote tag.
+    #[tokio::test]
+    async fn e2e_tag_038_remote_delete_paused_merge_and_an_unknown_tag() {
+        let e = Env::new().await;
+        pause_operation(&e, "merge").await;
+        let (dir, url, f) = standalone_remote(&e, "remote-d038");
+        let (op_before, before) = (e.op_row().await, bare_refs(&dir));
+
+        let err = call_delete_remote_tag(&e, &url, "v9.9", short7(&f)).await.unwrap_err();
+
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, absent_text("v9.9")));
+        assert_eq!(e.op_row().await, op_before, "the merge is still paused");
+        assert_eq!(bare_refs(&dir), before);
+        assert!(delete_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0053/E2E-039: a paused merge and a wrong commit.
+    #[tokio::test]
+    async fn e2e_tag_039_remote_delete_paused_merge_and_a_wrong_commit() {
+        let e = Env::new().await;
+        pause_operation(&e, "merge").await;
+        let (dir, url, f) = standalone_remote(&e, "remote-d039");
+        let (op_before, before) = (e.op_row().await, bare_refs(&dir));
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", "c3d4e5f").await.unwrap_err();
+
+        assert_eq!((err.code, err.message), (code::NO_CLOBBER, moved_tag_text("v1.0", &f)));
+        assert_eq!(e.op_row().await, op_before, "the merge is still paused");
+        assert_eq!(bare_refs(&dir), before, "the remote tag is unchanged");
+        assert!(delete_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0053/E2E-040: Bob retries after Alice's successful deletion.
+    #[tokio::test]
+    async fn e2e_tag_040_remote_delete_retry_after_a_successful_deletion() {
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        let (dir, url, f) = standalone_remote(&e, "remote-d040");
+        call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap();
+        let after = bare_refs(&dir);
+
+        let err = call_delete_remote_tag_as(&e, BOB, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, absent_text("v1.0")));
+        assert_eq!(bare_refs(&dir), after);
+        assert_eq!(delete_audit(&e, OWNER), vec![deleted_line("v1.0", &f)]);
+        assert!(delete_audit(&e, BOB).is_empty());
+    }
 }
