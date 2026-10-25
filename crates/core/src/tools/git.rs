@@ -27536,4 +27536,86 @@ mod tests {
         assert_eq!(delete_audit(&e, OWNER), vec![deleted_line("v1.0", &f)]);
         assert!(delete_audit(&e, BOB).is_empty());
     }
+
+    /// SPEC-0053/E2E-035: publish, delete on the remote, delete locally,
+    /// publish again from another member, delete again. Each step leaves its
+    /// own audit entry and no step touches the other side.
+    #[tokio::test]
+    async fn e2e_tag_035_remote_delete_round_trip() {
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        let (dir, url, a) = cloned_remote(&e, "remote-d035").await;
+        let tag_ref = "refs/tags/v1.0";
+
+        // Alice tags and publishes v1.0 at A.
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+        assert_eq!(bare_ref_sha(&dir, tag_ref).as_deref(), Some(a.as_str()));
+
+        // Remote deletion: the local tag stays, the remote loses it.
+        let out = call_delete_remote_tag(&e, &url, "v1.0", &a).await.unwrap();
+        assert_eq!(out["deleted_commit"], a, "{out}");
+        assert_eq!(bare_ref_sha(&dir, tag_ref), None);
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+
+        // A repeated deletion is refused as absent and audits nothing.
+        let audit = audit_size(&e);
+        let err = call_delete_remote_tag(&e, &url, "v1.0", &a).await.unwrap_err();
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, absent_text("v1.0")));
+        assert_eq!(audit_size(&e), audit);
+
+        // Local deletion: the remote stays without the tag.
+        untag(&e, "v1.0").await.unwrap();
+        assert_eq!(tag_target(&e, "v1.0").await, None);
+        assert_eq!(bare_ref_sha(&dir, tag_ref), None);
+
+        // Bob tags another commit B under the same name and publishes it.
+        let b = local_commit_on(&e, "dev", &a, "/b.txt").await;
+        call_push_branch(&e, &url, "dev", "anonymous").await.unwrap();
+        tag_as(&e, BOB, json!({"name": "v1.0", "target": "dev"})).await.unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let published = super::super::git_tags::publish_tag(
+            entry,
+            e.f.state.safety.clone(),
+            super::super::git_tags::PublishTarget {
+                mount_id: MOUNT,
+                person: BOB,
+                remote: "origin",
+                tag: "v1.0",
+                url: &url,
+                token: None,
+                auth: "anonymous",
+                timeout_secs: e.f.state.config.git.remote_timeout_secs,
+                overwrite: false,
+                expected_remote_commit: "",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(published["created"], true, "{published}");
+        assert_eq!(bare_ref_sha(&dir, tag_ref).as_deref(), Some(b.as_str()));
+
+        // Alice deletes that one on the remote stating B.
+        call_delete_remote_tag(&e, &url, "v1.0", &b).await.unwrap();
+        assert_eq!(bare_ref_sha(&dir, tag_ref), None);
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(b.as_str()));
+
+        let created =
+            |sha: &str| ("git.tag_create".to_string(), format!("created tag 'v1.0' at {sha}"));
+        let op = |op: &str, detail: String| (op.to_string(), detail);
+        assert_eq!(
+            tag_audit(&e, OWNER),
+            vec![
+                created(&a),
+                op("git.tag_publish", format!("published tag 'v1.0' at {a}")),
+                op("git.tag_remote_delete", deleted_line("v1.0", &a)),
+                op("git.tag_delete", format!("deleted tag 'v1.0' (was at {a})")),
+                op("git.tag_remote_delete", deleted_line("v1.0", &b)),
+            ]
+        );
+        assert_eq!(
+            tag_audit(&e, BOB),
+            vec![created(&b), op("git.tag_publish", format!("published tag 'v1.0' at {b}"))]
+        );
+    }
 }

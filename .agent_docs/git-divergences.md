@@ -38,7 +38,7 @@ Paths are under `crates/core/src/` unless stated.
 
 | # | Standard git | This server | Why | Cost | Anchor |
 |---|---|---|---|---|---|
-| D15 | Tags are created, deleted, pushed and fetched | **Closed by SPEC-0052 (2026-10-24)** except: no tool deletes a remote tag (BL-0075) and publish sends one named tag, never all (BL-0076). Fetch and pull receive only the tags in the fetched branch history, clone those of the cloned branch; a differing local tag is kept, never replaced | Auto tag following stays off (`AutotagOption::None`); candidates come from the advertised refs, so fetch still touches no ref outside the asked branch and its history tags | Remote tag deletion and bulk publish need standard git | `tools/git_tags.rs`, `git/remote.rs` `history_tags` |
+| D15 | Tags are created, deleted, pushed and fetched | **Closed by SPEC-0052 (2026-10-24)** except: remote tag deletion was delivered by SPEC-0053 (`git.remote_delete_tag`, BL-0075, 2026-10-25) and publish sends one named tag, never all (BL-0076). Fetch and pull receive only the tags in the fetched branch history, clone those of the cloned branch; a differing local tag is kept, never replaced | Auto tag following stays off (`AutotagOption::None`); candidates come from the advertised refs, so fetch still touches no ref outside the asked branch and its history tags | Bulk publish needs standard git | `tools/git_tags.rs`, `git/remote.rs` `history_tags` |
 | D16 | Fetch with any refspec | Fetch works on one branch, tag following off, pruning forced off | Bounded, predictable ref updates | Cannot mirror a remote | `git/remote.rs:686` |
 | D17 | `stash` can include untracked files | Stash saves "uncommitted changes" of the volume and refuses when there are none | Follows D1 | No untracked versus tracked distinction | `tools/git.rs:605` |
 
@@ -65,7 +65,7 @@ Three themes.
 | Rank | Gap | Recommendation | Default |
 |---|---|---|---|
 | 1 | D14 no token refresh | Close only if a supported host issues expiring tokens; confirm first | Keep |
-| 2 | D15 remainder: remote tag delete (BL-0075), publish all tags (BL-0076) | Close on demand: release workflows rarely need either | Keep |
+| 2 | D15 remainder: publish all tags (BL-0076); remote tag delete closed by SPEC-0053 | Close on demand: release workflows rarely need it | Keep |
 | 3 | D6 dirty tree refusal | Keep: the atomic apply depends on it | Keep |
 | 4 | D4 file modes | Keep until a user reports an executable bit loss | Keep |
 | 5 | D10 SSH | Keep: key storage is a security surface | Keep |

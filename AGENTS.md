@@ -133,7 +133,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (`fs.list_images`/`get_image`/`list_tables`/`get_table`/`get_document_view`), also served by
   five `GET /api/fs/{mount_id}/...` routes with byte identical payloads.
   `git_tags.rs` holds the tag engines (SPEC-0052): `git.tags`, `git.tag_create`, `git.tag_delete`,
-  `git.remote_push_tag` (one tag, never a commit, overwrite only with `expected_remote_commit`)
+  `git.remote_push_tag` (one tag, never a commit, overwrite only with `expected_remote_commit`),
+  `git.remote_delete_tag` (SPEC-0053: delete one remote tag, only after the member states its commit
+  in `expected_remote_commit`; local tags untouched; audit `git.tag_remote_delete`)
   and `reconcile_incoming_tags`, which fetch, pull and clone call to add `tags_added`/`tags_kept_local`.
   `diff_files.rs` holds `fs.diff_files` (SPEC-0045): unified diff of two text files, possibly in
   two projects (both must be readable), also served by `GET /api/fs/diff`; the diff runs in

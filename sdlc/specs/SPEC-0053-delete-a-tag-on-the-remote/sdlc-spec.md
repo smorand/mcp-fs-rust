@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 2 areas (remote exchange, audit), 15 requirements, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-24
 > Project: existing
 > From backlog: BL-0075

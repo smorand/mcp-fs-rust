@@ -765,7 +765,7 @@ after the cause is gone succeeds instead of failing with `ERR_NO_CLOBBER`.
 ## Tags (SPEC-0052, 2026-10-24)
 
 Engines in `tools/git_tags.rs`; tools `git.tags`, `git.tag_create`, `git.tag_delete`,
-`git.remote_push_tag`; tests `e2e_tag_*` in the tests module of `tools/git.rs`.
+`git.remote_push_tag`, `git.remote_delete_tag`; tests `e2e_tag_*` in the tests module of `tools/git.rs`.
 
 **Storage.** A tag is one `git_refs` row `refs/tags/<name>` (scoped by `volume_id`, no schema
 change). A plain tag targets the commit; an annotated tag targets a tag object written through
@@ -804,6 +804,24 @@ id or 7+ character prefix of its current commit); a mismatch answers `has moved 
 match forces the push leased on the advertised object. A name libgit2 refuses as a ref is
 answered `Remote refused tag '<n>': ...` (DEC-019).
 
+**Remote deletion** (`git.remote_delete_tag`, SPEC-0053, 2026-10-25). Deletes `refs/tags/<n>`
+on the remote through the refspec `:refs/tags/<n>`, nothing else (no branch, other tag, commit
+or local tag; a local tag of that name stays and a local delete never reaches the remote).
+Refusal order: not a member, no remote of that name (`Cannot delete tag '<n>': this project
+tracks no remote.` or `... does not track a remote named '<r>'.`), credential, then one listing
+decides: remote tag absent (`Remote tag '<n>' does not exist.`, also for an empty or invalid
+name and any name ending in `^{}`), no commit stated (`Remote tag '<n>' points at <7>. State
+that commit to confirm its deletion.`), stated commit differs (`Remote tag '<n>' has moved to
+<7> since you last saw it. Fetch, then confirm again.`). `expected_remote_commit` is the full
+id or 7+ hex characters, any case, trimmed; shorter never matches. An annotated tag is deleted
+too and is confirmed by its peeled commit. The push is leased on the advertised tag object;
+a lost lease (tag moved or removed between listing and push) re lists once and answers
+`moved` or absent, never retries. Audit `git.tag_remote_delete` `deleted tag '<n>' on remote
+'<r>' (was at <sha>)` is written only after the push succeeded. No paused operation check:
+the call touches no local file, ref or index row. Round trip proof:
+`e2e_tag_035_remote_delete_round_trip` (publish, delete remotely, delete locally, publish
+again from another member, delete again; one audit entry per step).
+
 **Receive** (fetch, pull, clone). Tag following stays off. Fetch and pull take candidates
 from the advertised refs: a tag whose peeled commit is the fetched branch tip or one of its
 ancestors. Lightweight candidates need no download; annotated ones are fetched by explicit
@@ -816,6 +834,6 @@ reconciles before the merge decision, so a paused conflict result carries them t
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
 scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
 "on the remote" tip set is every advertised ref, the real rejection mapping is untested,
-`a//b` normalised on disk). Out of scope: BL-0075 delete a remote tag, BL-0076 publish all.
+`a//b` normalised on disk). Out of scope: BL-0076 publish all. Remote tag deletion (BL-0075) is delivered by SPEC-0053.
 Round trip proof: `e2e_tag_051_create_publish_receive_round_trip` (two servers, one bare
 remote).
