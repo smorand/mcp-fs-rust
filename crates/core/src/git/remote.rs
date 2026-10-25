@@ -735,13 +735,69 @@ pub fn delete_tag_on_remote(
     let tag_ref = format!("refs/tags/{tag}");
     let lease = lease.to_string();
     let refs = PushRefs { src: "", dst: &tag_ref, force: false, lease: Some(&lease) };
-    match push_refs(repo, origin_url, refs, token, deadline) {
-        Ok(_) => Ok(TagPush::Pushed),
-        Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
-        Err(PushFailure::Rejected(reason)) => {
-            Err(ToolError::internal(format!("deletion of tag '{tag}' failed: {reason}")))
+    #[cfg(test)]
+    let forced = delete_seams::take_rejection(origin_url).map(PushFailure::Rejected);
+    #[cfg(not(test))]
+    let forced = None;
+    let pushed = match forced {
+        Some(failure) => Err(failure),
+        None => push_refs(repo, origin_url, refs, token, deadline),
+    };
+    match pushed {
+        Ok(_) => {
+            // The remote applied the deletion; only its answer is lost.
+            #[cfg(test)]
+            if delete_seams::take_fault(origin_url) {
+                let lost = git2::Error::from_str("connection reset before the answer arrived");
+                return Err(connection_error(origin_url, &lost, token_for_redaction.as_deref()));
+            }
+            Ok(TagPush::Pushed)
         }
+        Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
+        Err(PushFailure::Rejected(reason)) => Err(remote_refused_delete(tag, &reason)),
         Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
+    }
+}
+
+/// SPEC-0053 DEC-012: the remote declined the deletion of a tag it holds.
+/// Not [`remote_refused_tag`], which words a refusal of the tag's name.
+pub fn remote_refused_delete(tag: &str, reason: &str) -> ToolError {
+    ToolError::internal(format!("Remote refused to delete tag '{tag}': {reason}"))
+}
+
+/// Test seams of the delete push (SPEC-0053 DEC-015), keyed by remote URL so
+/// parallel tests never see each other's. The local file transport runs no
+/// hooks (so it never declines a deletion) and cannot lose an answer after
+/// applying a push; each seam stands for one of those. Compiled out of
+/// production builds.
+#[cfg(test)]
+pub(crate) mod delete_seams {
+    use std::sync::Mutex;
+
+    static REJECTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    static FAULTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// The next delete push to `url` reports a per ref rejection with `reason`
+    /// instead of being sent.
+    pub(crate) fn force_rejection(url: &str, reason: &str) {
+        REJECTIONS.lock().unwrap().push((url.into(), reason.into()));
+    }
+
+    /// The next delete push to `url` is really applied, then reported as a
+    /// connection error, as when the answer is lost on the way back.
+    pub(crate) fn fault_after_push(url: &str) {
+        FAULTS.lock().unwrap().push(url.into());
+    }
+
+    pub(super) fn take_rejection(url: &str) -> Option<String> {
+        let mut all = REJECTIONS.lock().unwrap();
+        let at = all.iter().position(|(u, _)| u == url)?;
+        Some(all.remove(at).1)
+    }
+
+    pub(super) fn take_fault(url: &str) -> bool {
+        let mut all = FAULTS.lock().unwrap();
+        all.iter().position(|u| u == url).map(|at| all.remove(at)).is_some()
     }
 }
 

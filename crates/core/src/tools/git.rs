@@ -26419,6 +26419,18 @@ mod tests {
         tag: &str,
         expected_remote_commit: &str,
     ) -> Result<Value> {
+        call_delete_remote_named(e, person, "origin", url, tag, expected_remote_commit).await
+    }
+
+    /// [`call_delete_remote_tag_as`] on the remote called `remote`.
+    async fn call_delete_remote_named(
+        e: &Env,
+        person: &str,
+        remote: &str,
+        url: &str,
+        tag: &str,
+        expected_remote_commit: &str,
+    ) -> Result<Value> {
         let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
         super::super::git_tags::delete_remote_tag(
             entry,
@@ -26426,7 +26438,7 @@ mod tests {
             super::super::git_tags::DeleteTarget {
                 mount_id: MOUNT,
                 person,
-                remote: "origin",
+                remote,
                 tag,
                 url,
                 token: None,
@@ -26792,8 +26804,8 @@ mod tests {
         assert_eq!(f.len(), 40);
     }
 
-    /// SPEC-0053/E2E-026: no refusal writes an audit entry. The protected
-    /// tag attempt needs the declined seam of US-0093 and joins it there.
+    /// SPEC-0053/E2E-026: no refusal writes an audit entry, the remote
+    /// declining a protected tag included (US-0093 `forced_rejection`).
     #[tokio::test]
     async fn e2e_tag_026_remote_delete_no_audit_entry_for_any_refusal() {
         let e = Env::new().await;
@@ -26804,6 +26816,8 @@ mod tests {
         call_delete_remote_tag(&e, &url, "v1.0", short7(&a)).await.unwrap_err();
         call_delete_remote_tag(&e, &url, "v9.9", short7(&f)).await.unwrap_err();
         delete_remote_tag_as(&e, CAROL, "v1.0", short7(&f)).await.unwrap_err();
+        crate::git::remote::delete_seams::force_rejection(&url, "protected tag");
+        call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
 
         assert_eq!(bare_refs(&dir), before);
         assert_eq!(audit_size(&e), audit);
@@ -26934,5 +26948,408 @@ mod tests {
         let (dir, url, _, f) = deletion_remote(&e, "remote-d051").await;
         let refusal = (code::NO_CLOBBER, moved_tag_text("v1.0", &f));
         assert_delete_refused(&e, &dir, &url, "v1.0", "zzzzzzz", refusal).await;
+    }
+
+    // ── SPEC-0053 US-0093: remote lookup, connection failures, declined ───
+
+    /// Alice through the registered tool (lookup refusals come before any
+    /// credential or connection, so a project with no usable remote reaches
+    /// them), naming `remote` or leaving it out for the default.
+    async fn delete_by_tool(
+        e: &Env,
+        tag: &str,
+        stated: &str,
+        remote: Option<&str>,
+    ) -> Result<Value> {
+        let mut args = json!({"mount_id": MOUNT, "tag": tag, "expected_remote_commit": stated});
+        if let Some(remote) = remote {
+            args["remote"] = json!(remote);
+        }
+        e.as_person(OWNER, "git.remote_delete_tag", args).await
+    }
+
+    /// Make the project track `url` under `name`.
+    async fn track_remote(e: &Env, name: &str, url: &str) {
+        e.git.get_or_open_repo(MOUNT).await.unwrap().db.add_remote(name, url).await.unwrap();
+    }
+
+    /// Make the project track no remote at all: the clone that seeds the
+    /// state recorded `origin`.
+    async fn untrack_every_remote(e: &Env) {
+        let db = e.git.get_or_open_repo(MOUNT).await.unwrap().db.clone();
+        for (name, _) in db.list_remotes().await.unwrap() {
+            db.remove_remote(&name).await.unwrap();
+        }
+    }
+
+    fn no_remote_text(tag: &str) -> String {
+        format!("Cannot delete tag '{tag}': this project tracks no remote.")
+    }
+
+    fn untracked_text(tag: &str, remote: &str) -> String {
+        format!("Cannot delete tag '{tag}': this project does not track a remote named '{remote}'.")
+    }
+
+    fn refused_text(tag: &str, reason: &str) -> String {
+        format!("Remote refused to delete tag '{tag}': {reason}")
+    }
+
+    /// A lookup refusal through the tool that leaves the remote and the audit
+    /// trail untouched.
+    async fn assert_lookup_refused(
+        e: &Env,
+        dir: &std::path::Path,
+        (tag, stated, remote): (&str, &str, Option<&str>),
+        expected: String,
+    ) {
+        let (before, audit) = (bare_refs(dir), audit_size(e));
+        let err = delete_by_tool(e, tag, stated, remote).await.unwrap_err();
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, expected));
+        assert_eq!(bare_refs(dir), before, "the remote is untouched");
+        assert_eq!(audit_size(e), audit, "no audit entry was added");
+    }
+
+    /// The first part of a connection refusal naming the host of `url`.
+    fn connection_prefix(url: &str) -> String {
+        format!("fetch from host '{}' failed: ", crate::git::remote::extract_host(url))
+    }
+
+    /// SPEC-0053/E2E-017: no remote at all.
+    #[tokio::test]
+    async fn e2e_tag_017_remote_delete_project_tracks_no_remote() {
+        let e = Env::new().await;
+        let (dir, _, _, f) = deletion_remote(&e, "remote-d017").await;
+        untrack_every_remote(&e).await;
+        assert_lookup_refused(&e, &dir, ("v1.0", short7(&f), None), no_remote_text("v1.0")).await;
+    }
+
+    /// SPEC-0053/E2E-018: no remote outranks an absent tag and no commit.
+    #[tokio::test]
+    async fn e2e_tag_018_remote_delete_no_remote_outranks_absent_tag_and_no_commit() {
+        let e = Env::new().await;
+        let (dir, _, _, _) = deletion_remote(&e, "remote-d018").await;
+        untrack_every_remote(&e).await;
+        assert_lookup_refused(&e, &dir, ("v9.9", "", None), no_remote_text("v9.9")).await;
+    }
+
+    /// SPEC-0053/E2E-019: the remote declines a protected tag. The local
+    /// transport runs no hooks, so `force_rejection` stands for the remote's
+    /// per ref answer; the remote tag stays because nothing was pushed.
+    #[tokio::test]
+    async fn e2e_tag_019_remote_delete_declined_by_a_protected_tag() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-d019").await;
+        crate::git::remote::delete_seams::force_rejection(&url, "protected tag");
+        let (before, audit) = (bare_refs(&dir), audit_size(&e));
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!(
+            (err.code, err.message),
+            (code::INTERNAL_ERROR, refused_text("v1.0", "protected tag"))
+        );
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_size(&e), audit);
+    }
+
+    /// SPEC-0053/E2E-020: the remote's reason is relayed as given.
+    #[tokio::test]
+    async fn e2e_tag_020_remote_delete_relays_the_reason_as_given() {
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        let (dir, url, a, _) = deletion_remote(&e, "remote-d020").await;
+        let reason = "deletion of release tags is forbidden by policy";
+        crate::git::remote::delete_seams::force_rejection(&url, reason);
+        let before = bare_refs(&dir);
+
+        let err =
+            call_delete_remote_tag_as(&e, BOB, &url, "release-2026", short7(&a)).await.unwrap_err();
+
+        assert_eq!(
+            (err.code, err.message),
+            (code::INTERNAL_ERROR, refused_text("release-2026", reason))
+        );
+        assert_eq!(bare_refs(&dir), before);
+        assert!(delete_audit(&e, BOB).is_empty());
+    }
+
+    /// SPEC-0053/E2E-021: a wrong commit outranks the remote's protection.
+    #[tokio::test]
+    async fn e2e_tag_021_remote_delete_wrong_commit_outranks_the_protection() {
+        let e = Env::new().await;
+        let (dir, url, a, f) = deletion_remote(&e, "remote-d021").await;
+        crate::git::remote::delete_seams::force_rejection(&url, "protected tag");
+        let refusal = (code::NO_CLOBBER, moved_tag_text("v1.0", &f));
+        assert_delete_refused(&e, &dir, &url, "v1.0", short7(&a), refusal).await;
+    }
+
+    /// SPEC-0053/E2E-024: a non member outranks no remote, through the
+    /// registered tool.
+    #[tokio::test]
+    async fn e2e_tag_024_remote_delete_non_member_outranks_no_remote() {
+        let e = Env::new().await;
+        let (dir, _, _, f) = deletion_remote(&e, "remote-d024").await;
+        untrack_every_remote(&e).await;
+        let (before, audit) = (bare_refs(&dir), audit_size(&e));
+
+        let err = delete_remote_tag_as(&e, CAROL, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert_eq!(err.message, format!("'{CAROL}' is not a member of '{MOUNT}'"));
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_size(&e), audit);
+    }
+
+    /// SPEC-0053/E2E-032: down, rate limited, expired credential, no stored
+    /// credential, no answer in time. Down is a missing remote path; rate
+    /// limited is a remote dropping every connection (no file remote can
+    /// answer 429, as in SPEC-0052/E2E-038); the two credential cases go
+    /// through the registered tool with an https origin; no answer is a
+    /// remote that accepts then stays silent, against a 1 second deadline.
+    /// The host is the one of the URL used, not `github.ibm.com`, except for
+    /// the credential legs.
+    #[test]
+    fn e2e_tag_032_remote_delete_down_rate_limited_credential_or_no_answer() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts_and_timeout(REFERENCE_HOSTS, 1).await;
+            e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+            let (dir, _, _, f) = deletion_remote(&e, "remote-d032").await;
+            let (before, audit) = (bare_refs(&dir), audit_size(&e));
+
+            let down = format!("file://{}", e.f.dir.path().join("no-such-remote").display());
+            let err = call_delete_remote_tag(&e, &down, "v1.0", short7(&f)).await.unwrap_err();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert!(err.message.starts_with(&connection_prefix(&down)), "{}", err.message);
+
+            let (refusing, handle) = closing_remote().await;
+            let err = call_delete_remote_tag(&e, &refusing, "v1.0", short7(&f)).await.unwrap_err();
+            handle.abort();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert!(err.message.starts_with(&connection_prefix(&refusing)), "{}", err.message);
+
+            track_remote(&e, "origin", "https://github.ibm.com/org/repo.git").await;
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = delete_remote_tag_as(&e, OWNER, "v1.0", short7(&f)).await.unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert_eq!(
+                err.message,
+                "token expired for host github.ibm.com; authenticate with git.auth or \
+                 git.token_set for host github.ibm.com"
+            );
+            assert!(!err.message.contains("ghp_expired"));
+
+            let err = delete_remote_tag_as(&e, BOB, "v1.0", short7(&f)).await.unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert_eq!(
+                err.message,
+                "no token for host github.ibm.com; authenticate with git.auth or git.token_set \
+                 for host github.ibm.com"
+            );
+
+            let (silent, srv) = silent_remote().await;
+            let err = call_delete_remote_tag(&e, &silent, "v1.0", short7(&f)).await.unwrap_err();
+            srv.abort();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert_eq!(
+                err.message,
+                format!(
+                    "remote timeout: host '{}' did not respond within 1s",
+                    crate::git::remote::extract_host(&silent)
+                )
+            );
+
+            assert_eq!(bare_refs(&dir), before, "the remote tag stays");
+            assert_eq!(audit_size(&e), audit, "no audit entry was added");
+        });
+    }
+
+    /// SPEC-0053/E2E-033: the connection drops before the request applied;
+    /// the retry on the real remote succeeds and leaves exactly one entry.
+    #[tokio::test]
+    async fn e2e_tag_033_remote_delete_connection_lost_before_the_deletion() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-d033").await;
+        let before = bare_refs(&dir);
+
+        let (dropping, handle) = closing_remote().await;
+        let err = call_delete_remote_tag(&e, &dropping, "v1.0", short7(&f)).await.unwrap_err();
+        handle.abort();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert!(err.message.starts_with(&connection_prefix(&dropping)), "{}", err.message);
+        assert_eq!(bare_refs(&dir), before, "the remote tag is still there");
+        assert!(delete_audit(&e, OWNER).is_empty());
+
+        call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap();
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+        assert_eq!(delete_audit(&e, OWNER), vec![deleted_line("v1.0", &f)]);
+    }
+
+    /// SPEC-0053/E2E-034: a connection failure outranks an absent tag and a
+    /// missing commit.
+    #[tokio::test]
+    async fn e2e_tag_034_remote_delete_connection_failure_outranks_tag_checks() {
+        let e = Env::new().await;
+        let (_, _, _, _) = deletion_remote(&e, "remote-d034").await;
+        let audit = audit_size(&e);
+
+        let (dropping, handle) = closing_remote().await;
+        let err = call_delete_remote_tag(&e, &dropping, "v9.9", "").await.unwrap_err();
+        handle.abort();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert!(err.message.starts_with(&connection_prefix(&dropping)), "{}", err.message);
+        assert_eq!(audit_size(&e), audit);
+    }
+
+    /// SPEC-0053/E2E-041: no remote while a local tag exists; it stays.
+    #[tokio::test]
+    async fn e2e_tag_041_remote_delete_no_remote_keeps_the_local_tag() {
+        let e = Env::new().await;
+        let (dir, _, a, _) = deletion_remote(&e, "remote-d041").await;
+        untrack_every_remote(&e).await;
+
+        assert_lookup_refused(&e, &dir, ("v1.0", short7(&a), None), no_remote_text("v1.0")).await;
+
+        assert_eq!(tag_target(&e, "v1.0").await.as_deref(), Some(a.as_str()));
+    }
+
+    /// SPEC-0053/E2E-042: the remote applied the deletion, then the answer
+    /// was lost (`fault_after_push`): a connection refusal, no audit entry,
+    /// and the retry finds the tag gone.
+    #[tokio::test]
+    async fn e2e_tag_042_remote_delete_connection_lost_after_the_deletion() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-d042").await;
+        crate::git::remote::delete_seams::fault_after_push(&url);
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR);
+        assert!(err.message.starts_with(&connection_prefix(&url)), "{}", err.message);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None, "the remote did delete it");
+        assert!(delete_audit(&e, OWNER).is_empty());
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, absent_text("v1.0")));
+        assert!(delete_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0053/E2E-043: Bob finds the deletion Alice could not confirm.
+    #[tokio::test]
+    async fn e2e_tag_043_remote_delete_another_member_finds_it_deleted() {
+        let e = Env::new().await;
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        let (_, url, _, f) = deletion_remote(&e, "remote-d043").await;
+        crate::git::remote::delete_seams::fault_after_push(&url);
+        call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        let err = call_delete_remote_tag_as(&e, BOB, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, absent_text("v1.0")));
+        for person in [OWNER, BOB] {
+            assert!(delete_audit(&e, person).is_empty());
+        }
+    }
+
+    /// SPEC-0053/E2E-044: the named remote is not tracked.
+    #[tokio::test]
+    async fn e2e_tag_044_remote_delete_named_remote_not_tracked() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-d044").await;
+        track_remote(&e, "origin", &url).await;
+        let tracked = e.git.get_or_open_repo(MOUNT).await.unwrap().db.list_remotes().await.unwrap();
+
+        let case = ("v1.0", short7(&f), Some("upstream"));
+        assert_lookup_refused(&e, &dir, case, untracked_text("v1.0", "upstream")).await;
+
+        let now = e.git.get_or_open_repo(MOUNT).await.unwrap().db.list_remotes().await.unwrap();
+        assert_eq!(now, tracked);
+    }
+
+    /// SPEC-0053/E2E-045: remote names are case sensitive.
+    #[tokio::test]
+    async fn e2e_tag_045_remote_delete_remote_names_are_case_sensitive() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-d045").await;
+        track_remote(&e, "origin", &url).await;
+
+        let case = ("v1.0", short7(&f), Some("Origin"));
+        assert_lookup_refused(&e, &dir, case, untracked_text("v1.0", "Origin")).await;
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+    }
+
+    /// SPEC-0053/E2E-046: an untracked named remote outranks an absent tag
+    /// and a missing commit.
+    #[tokio::test]
+    async fn e2e_tag_046_remote_delete_untracked_remote_outranks_tag_checks() {
+        let e = Env::new().await;
+        let (dir, url, _, _) = deletion_remote(&e, "remote-d046").await;
+        track_remote(&e, "origin", &url).await;
+
+        let case = ("v9.9", "", Some("upstream"));
+        assert_lookup_refused(&e, &dir, case, untracked_text("v9.9", "upstream")).await;
+    }
+
+    /// SPEC-0053/E2E-048: with two tracked remotes, the one named is the one
+    /// reported, audited and changed.
+    #[tokio::test]
+    async fn e2e_tag_048_remote_delete_reports_the_remote_named() {
+        let e = Env::new().await;
+        let (origin_dir, origin_url, _, origin_f) = deletion_remote(&e, "remote-d048").await;
+        let up_dir = e.f.dir.path().join("upstream-d048");
+        let up_url = seed_bare_remote(&up_dir, "hi\n");
+        let up_f = advance_bare_remote(&up_dir, "refs/heads/main", "f\n");
+        plain_tag_bare_remote(&up_dir, "v1.0", &up_f);
+        track_remote(&e, "origin", &origin_url).await;
+        track_remote(&e, "upstream", &up_url).await;
+        let origin_before = bare_refs(&origin_dir);
+
+        let out =
+            call_delete_remote_named(&e, OWNER, "upstream", &up_url, "v1.0", short7(&up_f)).await;
+
+        assert_eq!(
+            out.unwrap(),
+            json!({
+                "mount_id": MOUNT, "tag": "v1.0", "remote": "upstream",
+                "deleted_commit": up_f, "auth": "anonymous",
+            })
+        );
+        assert_eq!(
+            delete_audit(&e, OWNER),
+            vec![format!("deleted tag 'v1.0' on remote 'upstream' (was at {up_f})")]
+        );
+        assert_eq!(bare_ref_sha(&up_dir, "refs/tags/v1.0"), None);
+        assert_eq!(bare_refs(&origin_dir), origin_before);
+        assert_eq!(bare_ref_sha(&origin_dir, "refs/tags/v1.0").as_deref(), Some(origin_f.as_str()));
+    }
+
+    /// SPEC-0053/E2E-052: no remote named and `origin` is not tracked.
+    #[tokio::test]
+    async fn e2e_tag_052_remote_delete_default_origin_not_tracked() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-d052").await;
+        untrack_every_remote(&e).await;
+        track_remote(&e, "upstream", &url).await;
+
+        assert_lookup_refused(
+            &e,
+            &dir,
+            ("v1.0", short7(&f), None),
+            untracked_text("v1.0", "origin"),
+        )
+        .await;
     }
 }

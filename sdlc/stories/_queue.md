@@ -92,6 +92,6 @@
 | US-0090 | SPEC-0052 | overwrite a remote tag only on explicit confirmation | US-0089, US-0084 | 1 | landed | story/US-0090-overwrite-a-remote-tag | story/US-0089-publish-one-tag |
 | US-0091 | SPEC-0052 | documentation, round trip test and spec close | US-0090, US-0085, US-0087, US-0088 | 1 | landed | story/US-0091-documentation-and-spec-close | story/US-0090-overwrite-a-remote-tag |
 | US-0092 | SPEC-0053 | delete a confirmed remote tag | main | 1 | landed | story/US-0092-delete-a-confirmed-remote-tag | main |
-| US-0093 | SPEC-0053 | remote lookup, connection failures and declined deletions | US-0092 | 2 | todo | | |
+| US-0093 | SPEC-0053 | remote lookup, connection failures and declined deletions | US-0092 | 2 | landed | story/US-0093-remote-lookup-and-failure-refusals | main |
 | US-0094 | SPEC-0053 | paused operations and concurrent deletions | US-0092 | 2 | todo | | |
 | US-0095 | SPEC-0053 | documentation, round trip test and spec close | US-0093, US-0094 | 2 | todo | | |
