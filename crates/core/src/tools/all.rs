@@ -80,14 +80,15 @@ mod tests {
     }
 
     #[test]
-    fn the_git_families_add_fifty_two_tools() {
+    fn the_git_families_add_fifty_three_tools() {
         let mut reg = ToolRegistry::new();
         super::super::admin::register(&mut reg);
         super::super::git::register(&mut reg);
         super::super::git_auth::register(&mut reg);
         super::super::git_pr::register(&mut reg);
         // SPEC-0052 adds git.tag_create, git.tag_delete and git.remote_push_tag: 42 git.*.
-        assert_eq!(reg.len(), 17 + 42 + 4 + 6);
+        // SPEC-0053 adds git.remote_delete_tag: 43 git.*.
+        assert_eq!(reg.len(), 17 + 43 + 4 + 6);
         assert!(reg.resolve("git.remote_clone").is_some());
         assert!(reg.resolve("git.auth_revoke").is_some());
         assert!(reg.resolve("git.token_set").is_some());
@@ -134,12 +135,12 @@ mod tests {
         };
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
-        // 45 fs (SPEC-0019, SPEC-0045) + 17 admin (SPEC-0020, SPEC-0047, SPEC-0049) + 52 git (42 git.* + 4 git.auth* + 6 git.pr_*)
-        // + 5 web + 2 context7 + 8 sqlite + 5 db = 134
+        // 45 fs (SPEC-0019, SPEC-0045) + 17 admin (SPEC-0020, SPEC-0047, SPEC-0049) + 53 git (43 git.* + 4 git.auth* + 6 git.pr_*)
+        // + 5 web + 2 context7 + 8 sqlite + 5 db = 135
         // + 2 doc.to_docx / doc.to_pptx if pandoc is in PATH, 0 otherwise
         // + 3 doc.open_editor / doc.close_editor / doc.list_editors always
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        assert_eq!(reg.len(), 134 + doc_count + 3);
+        assert_eq!(reg.len(), 135 + doc_count + 3);
     }
 
     #[test]
@@ -157,8 +158,8 @@ mod tests {
         let config = crate::config::ServerConfig::default();
         super::register_all(&mut reg, &features, &config);
         let doc_count = if which::which("pandoc").is_ok() { 2 } else { 0 };
-        // Base 134 + doc + 3 editor + 4 search.*
-        assert_eq!(reg.len(), 134 + doc_count + 3 + 4);
+        // Base 135 + doc + 3 editor + 4 search.*
+        assert_eq!(reg.len(), 135 + doc_count + 3 + 4);
         assert!(reg.resolve("search.index").is_some());
         assert!(reg.resolve("search.query").is_some());
         assert!(reg.resolve("search.delete").is_some());
@@ -234,7 +235,7 @@ mod tests {
         super::super::contract_golden::assert_family(
             &reg,
             |name| name.starts_with("admin.") || name.starts_with("git."),
-            69,
+            70,
             "admin.* and git.* tools",
         );
     }

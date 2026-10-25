@@ -580,7 +580,8 @@ pub fn push_to_remote(
 
 /// One push's ref names and update rule, the part the branch and the tag
 /// entry points differ in (SPEC-0052 DEC-015): full ref names on both sides,
-/// `refs/heads/<b>` or `refs/tags/<t>`.
+/// `refs/heads/<b>` or `refs/tags/<t>`. An empty `src` is a deletion of `dst`
+/// (SPEC-0053 DEC-004), the refspec `:<dst>`, which git never forces.
 struct PushRefs<'a> {
     src: &'a str,
     dst: &'a str,
@@ -709,6 +710,37 @@ pub fn push_tag_to_remote(
     match push_refs(repo, origin_url, refs, token, deadline) {
         Ok(_) => Ok(TagPush::Pushed),
         Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
+        Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
+    }
+}
+
+/// SPEC-0053 DEC-004: delete `refs/tags/{tag}` on `origin_url` through the
+/// same core as a publication. The caller has already found the tag in its
+/// listing, so an invalid or unknown name never reaches a refspec.
+///
+/// `lease` is the remote tag object that listing saw: the push is aborted
+/// before anything is sent when the remote no longer holds exactly that
+/// object, reported as [`TagPush::LeaseLost`] (DEC-008). A per ref refusal is
+/// an internal error carrying the remote's reason; any other failure is the
+/// connection refusal a publication gives for the same cause.
+pub fn delete_tag_on_remote(
+    repo: &git2::Repository,
+    origin_url: &str,
+    tag: &str,
+    token: Option<String>,
+    deadline: Option<Instant>,
+    lease: git2::Oid,
+) -> Result<TagPush> {
+    let token_for_redaction = token.clone();
+    let tag_ref = format!("refs/tags/{tag}");
+    let lease = lease.to_string();
+    let refs = PushRefs { src: "", dst: &tag_ref, force: false, lease: Some(&lease) };
+    match push_refs(repo, origin_url, refs, token, deadline) {
+        Ok(_) => Ok(TagPush::Pushed),
+        Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
+        Err(PushFailure::Rejected(reason)) => {
+            Err(ToolError::internal(format!("deletion of tag '{tag}' failed: {reason}")))
+        }
         Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
     }
 }

@@ -1,5 +1,6 @@
 //! Tag engines (SPEC-0052): `git.tag_create`, `git.tag_delete`, the
-//! `git.tags` listing and `git.remote_push_tag`.
+//! `git.tags` listing, `git.remote_push_tag` and `git.remote_delete_tag`
+//! (SPEC-0053).
 //!
 //! A tag is one `git_refs` row named `refs/tags/<name>` whose target is the
 //! commit (a plain tag) or a tag object (an annotated tag), exactly like a
@@ -769,6 +770,206 @@ pub(crate) mod after_listing {
             hook();
         }
     }
+}
+
+/// `git.remote_delete_tag`: refusals come in the order of DEC-005 because
+/// that is the order of the calls: membership (`open`), remote lookup,
+/// credential, then inside [`delete_remote_tag`] the connection and the tag
+/// checks. A paused operation does not block it (FR-NEW-010): the deletion
+/// touches no local file, ref or index row.
+pub(crate) async fn tool_remote_delete_tag(
+    ctx: ToolCtx,
+    a: crate::mcp::server::GitRemoteDeleteTagArgs,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let entry = open(&ctx, &a.mount_id, g).await?;
+    let remotes = entry.db.list_remotes().await?;
+    let Some(url) = remotes.iter().find(|(n, _)| *n == a.remote).map(|(_, u)| u.clone()) else {
+        return Err(ToolError::not_found(if remotes.is_empty() {
+            format!("Cannot delete tag '{}': this project tracks no remote.", a.tag)
+        } else {
+            format!(
+                "Cannot delete tag '{}': this project does not track a remote named '{}'.",
+                a.tag, a.remote
+            )
+        }));
+    };
+    let (token, auth) = resolve_clone_credential(&ctx, &t, &url).await?;
+    let target = DeleteTarget {
+        mount_id: &a.mount_id,
+        person: &ctx.person,
+        remote: &a.remote,
+        tag: &a.tag,
+        url: &url,
+        token,
+        auth: &auth,
+        timeout_secs: ctx.state.config.git.remote_timeout_secs,
+        expected_remote_commit: &a.expected_remote_commit,
+    };
+    delete_remote_tag(entry, ctx.state.safety.clone(), target).await
+}
+
+/// Where and how one remote tag is deleted (SPEC-0053): everything
+/// [`delete_remote_tag`] needs once the remote URL and the credential are
+/// known.
+pub(crate) struct DeleteTarget<'a> {
+    pub mount_id: &'a str,
+    pub person: &'a str,
+    pub remote: &'a str,
+    pub tag: &'a str,
+    pub url: &'a str,
+    pub token: Option<String>,
+    pub auth: &'a str,
+    pub timeout_secs: u64,
+    /// The commit the requester states the remote tag points at now.
+    pub expected_remote_commit: &'a str,
+}
+
+/// SPEC-0053 DEC-005, DEC-010: delete one remote tag once the remote and
+/// the credential are known. Split from [`tool_remote_delete_tag`] so a test
+/// can reach it with a `file://` remote, which the registered tool refuses.
+///
+/// Under the write lock, one listing connection decides every refusal, then
+/// at most one delete push. The audit entry is written only once the push
+/// returned Ok, so no refusal and no failure leaves a line (FR-NEW-008).
+///
+/// Cost: hydration, O(o) in stored objects as for every tag tool; then for n
+/// advertised refs O(n) time and space for the listing and the lookups. The
+/// delete push sends no object; a lease lost between listing and push costs
+/// one more listing, O(n).
+pub(crate) async fn delete_remote_tag(
+    entry: Arc<GitRepoEntry>,
+    safety: Arc<SafetyManager>,
+    target: DeleteTarget<'_>,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(target.url);
+    let (remote, auth) = (target.remote, target.auth);
+    crate::git::remote::trace_remote_operation(
+        "git.remote_delete_tag",
+        remote,
+        &host,
+        auth,
+        delete_inner(entry, safety, target, &host),
+    )
+    .await
+}
+
+async fn delete_inner(
+    entry: Arc<GitRepoEntry>,
+    safety: Arc<SafetyManager>,
+    target: DeleteTarget<'_>,
+    host: &str,
+) -> Result<Value> {
+    let DeleteTarget {
+        mount_id,
+        person,
+        remote,
+        tag,
+        url,
+        token,
+        auth,
+        timeout_secs,
+        expected_remote_commit,
+    } = target;
+    // Held in the async caller, never inside the blocking closure, so a
+    // deadline firing releases it, as for a publication.
+    let _write = entry.write_lock.lock().await;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let (thread_entry, tag_owned, url_owned, stated) =
+        (entry.clone(), tag.to_string(), url.to_string(), expected_remote_commit.to_string());
+    let commit = crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        host,
+        on_git_thread(move || async move {
+            let repo = thread_entry.repo.lock().await;
+            hydrate(&thread_entry, &repo).await?;
+            delete_on_repo(&repo, &tag_owned, &url_owned, token, deadline, &stated)
+        }),
+    )
+    .await?;
+
+    safety.record_audit(
+        person,
+        &entry.project_id,
+        "git.tag_remote_delete",
+        "/",
+        &format!("deleted tag '{tag}' on remote '{remote}' (was at {commit})"),
+    );
+    Ok(json!({
+        "mount_id": mount_id,
+        "tag": tag,
+        "remote": remote,
+        "deleted_commit": commit,
+        "auth": auth,
+    }))
+}
+
+/// The blocking half of a deletion: list, check in the order of DEC-005,
+/// then push the deletion. Returns the full commit the remote tag had.
+fn delete_on_repo(
+    repo: &Repository,
+    tag: &str,
+    url: &str,
+    token: Option<String>,
+    deadline: Instant,
+    stated: &str,
+) -> Result<String> {
+    let tag_ref = format!("{TAGS_PREFIX}{tag}");
+    let advertised =
+        crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+    #[cfg(test)]
+    after_listing::fire(url);
+
+    // DEC-007: only an advertised tag is ever named in a refspec. A name
+    // ending in `^{}` would otherwise match the peeled entry of another tag.
+    let Some((object, commit)) =
+        remote_tag_state(&advertised, &tag_ref).filter(|_| !tag.ends_with("^{}"))
+    else {
+        return Err(remote_tag_absent(tag));
+    };
+    if stated.trim().is_empty() {
+        return Err(ToolError::invalid_argument(format!(
+            "Remote tag '{tag}' points at {}. State that commit to confirm its deletion.",
+            short7(&commit)
+        )));
+    }
+    if !stated_commit_matches(stated, &commit) {
+        return Err(moved(tag, &commit));
+    }
+
+    let pushed = crate::git::remote::delete_tag_on_remote(
+        repo,
+        url,
+        tag,
+        token.clone(),
+        Some(deadline),
+        object,
+    )?;
+    if pushed == crate::git::remote::TagPush::LeaseLost {
+        // DEC-008: the tag moved or vanished between the listing and the
+        // push, and nothing was sent. One more listing says which; the push
+        // is never retried, since the member confirmed only the old commit.
+        let now =
+            crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+        return Err(match remote_tag_state(&now, &tag_ref) {
+            Some((_, now_commit)) => moved(tag, &now_commit),
+            None => remote_tag_absent(tag),
+        });
+    }
+    Ok(commit)
+}
+
+/// The remote tag's own object and the commit it stands for (its peeled
+/// `^{}` entry for an annotated tag), from one listing; `None` when absent.
+fn remote_tag_state(advertised: &[(String, Oid)], tag_ref: &str) -> Option<(Oid, String)> {
+    let object = advertised_oid(advertised, tag_ref)?;
+    let commit = advertised_oid(advertised, &format!("{tag_ref}^{{}}")).unwrap_or(object);
+    Some((object, commit.to_string()))
+}
+
+fn remote_tag_absent(tag: &str) -> ToolError {
+    ToolError::not_found(format!("Remote tag '{tag}' does not exist."))
 }
 
 fn moved(tag: &str, remote_commit: &str) -> ToolError {

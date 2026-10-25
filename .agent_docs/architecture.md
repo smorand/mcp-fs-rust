@@ -286,7 +286,7 @@ every `git.*` route (`git.auth*` and `git.pr_*` included) when `git.enabled` is
 false and every `search.*` route when `search.enabled` is false, so `tools/list`
 omits them and `tools/call` answers `-32602` `tool not found` before any handler
 runs. Membership never gated git on its own (CWE-284: any member could clone and
-push with git off). Counts: 62 by default, 114 with git, 118 with git and
+push with git off). Counts: 62 by default, 115 with git, 119 with git and
 search. The static `McpServer::tool_router()` is still the full catalog the
 golden contract and `/api/swagger.json` read; do not filter it. A test that
 calls a git or search tool over MCP must enable the flag in its config.

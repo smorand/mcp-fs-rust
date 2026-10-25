@@ -3108,6 +3108,43 @@
       }
     },
     {
+      "name": "git.remote_delete_tag",
+      "description": "Delete one tag on a declared remote. Only that tag is removed: no branch, no other tag, no commit and no local tag. The member must state the commit the remote tag points at now (expected_remote_commit, at least 7 hexadecimal characters); a missing or different commit is refused with the commit the remote tag really has.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "tag": {
+            "description": "Name of the tag to delete on the remote, without the refs/tags/ prefix.",
+            "type": "string"
+          },
+          "remote": {
+            "description": "Declared remote to delete the tag on.",
+            "type": "string",
+            "default": "origin"
+          },
+          "expected_remote_commit": {
+            "description": "Commit the remote tag points at now; at least 7 hexadecimal characters.",
+            "type": "string",
+            "default": ""
+          }
+        },
+        "required": [
+          "mount_id",
+          "tag"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "readOnlyHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
       "name": "git.remote_fetch",
       "description": "Fetch objects and update refs/remotes/{remote}/* from a declared remote. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.",
       "inputSchema": {

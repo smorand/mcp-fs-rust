@@ -144,8 +144,8 @@ fn tool_contract_golden_is_current() {
     // admin, so 108. SPEC-0045 adds fs.diff_files: 45 fs, so 109. SPEC-0047 adds
     // admin.get_project_disk_usage: 16 admin, so 110. SPEC-0049 adds admin.get_project_folder_usage: 17 admin, so 111.
     // SPEC-0052 adds git.tag_create: 50 git, so 112; git.tag_delete: 51 git, so 113;
-    // git.remote_push_tag: 52 git, so 114.
-    assert_eq!(reg.len(), 114, "the frozen contract covers 45 fs, 17 admin and 52 git tools");
+    // git.remote_push_tag: 52 git, so 114. SPEC-0053 adds git.remote_delete_tag: 53 git, so 115.
+    assert_eq!(reg.len(), 115, "the frozen contract covers 45 fs, 17 admin and 53 git tools");
     let rendered = render(&reg);
 
     if std::env::var_os(REWRITE_ENV).is_some() {
@@ -227,7 +227,8 @@ const NEW_GIT_TOOLS: [&str; 31] = [
 
 /// The tag tools SPEC-0052 adds after FR-NEW-349 froze its enumeration, kept
 /// apart so that enumeration stays verbatim.
-const TAG_GIT_TOOLS: [&str; 3] = ["git.tag_create", "git.tag_delete", "git.remote_push_tag"];
+const TAG_GIT_TOOLS: [&str; 4] =
+    ["git.tag_create", "git.tag_delete", "git.remote_push_tag", "git.remote_delete_tag"];
 
 /// Compare a registered git family against
 /// `PRE_SPEC_GIT_TOOLS + NEW_GIT_TOOLS + TAG_GIT_TOOLS`.
@@ -260,8 +261,8 @@ fn e2e_new_960_the_thirty_one_enumerated_names_are_exactly_the_new_tool_set() {
     let reg = contract_registry();
     git_enumeration_verdict(reg.names()).expect("the git family must match the enumeration");
 
-    assert_eq!(PRE_SPEC_GIT_TOOLS.len() + NEW_GIT_TOOLS.len() + TAG_GIT_TOOLS.len(), 52);
-    assert_eq!(reg.len(), 114);
+    assert_eq!(PRE_SPEC_GIT_TOOLS.len() + NEW_GIT_TOOLS.len() + TAG_GIT_TOOLS.len(), 53);
+    assert_eq!(reg.len(), 115);
 
     // Every new tool is frozen, and carries the family's required mount_id.
     let Some(frozen) = frozen_tools() else {
@@ -317,8 +318,8 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
     let admin_family = reg.names().iter().filter(|n| n.starts_with("admin.")).count();
 
     // contract_golden.rs's own total, and the subtotals all.rs asserts.
-    assert_eq!(reg.len(), 114);
-    assert_eq!(git_family, 52);
+    assert_eq!(reg.len(), 115);
+    assert_eq!(git_family, 53);
     assert_eq!(fs_family + admin_family + git_family, reg.len());
 
     // git.rs's ALL_GIT_TOOLS covers the family minus the four auth tools and the
@@ -331,7 +332,7 @@ fn e2e_new_931_every_hardcoded_tool_count_site_reports_the_new_numbers() {
         eprintln!("skipped: {PATH} is absent");
         return;
     };
-    assert_eq!(frozen.len(), 114, "the golden file holds one entry per registered tool");
+    assert_eq!(frozen.len(), 115, "the golden file holds one entry per registered tool");
 
     // The contract text documents the same names, set for set.
     let text =

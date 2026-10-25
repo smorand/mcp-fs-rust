@@ -1136,6 +1136,20 @@ pub struct GitRemotePushTagArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GitRemoteDeleteTagArgs {
+    /// Project/volume id the operation targets.
+    pub mount_id: String,
+    /// Name of the tag to delete on the remote, without the refs/tags/ prefix.
+    pub tag: String,
+    /// Declared remote to delete the tag on.
+    #[serde(default = "def_origin")]
+    pub remote: String,
+    /// Commit the remote tag points at now; at least 7 hexadecimal characters.
+    #[serde(default)]
+    pub expected_remote_commit: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GitRemoteRemoveArgs {
     /// Project/volume id the operation targets.
     pub mount_id: String,
@@ -3525,6 +3539,19 @@ impl McpServer {
     }
 
     #[tool(
+        name = "git.remote_delete_tag",
+        description = "Delete one tag on a declared remote. Only that tag is removed: no branch, no other tag, no commit and no local tag. The member must state the commit the remote tag points at now (expected_remote_commit, at least 7 hexadecimal characters); a missing or different commit is refused with the commit the remote tag really has."
+    )]
+    async fn git_remote_delete_tag(
+        &self,
+        Parameters(a): Parameters<GitRemoteDeleteTagArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out =
+            crate::tools::git_tags::tool_remote_delete_tag(self.git_ctx(), a, None, None).await;
+        to_call_result("git.remote_delete_tag", out)
+    }
+
+    #[tool(
         name = "git.merge",
         description = "Merge a branch, tag or commit into the checked-out branch. An already merged source is reported as already_up_to_date and changes nothing. A source the current branch is an ancestor of fast-forwards. Anything else is a three-way merge: a clean one creates a merge commit and updates the volume, a conflicting one applies nothing and returns status conflict with both sides' content of every conflicting file, to be finished with git.merge_resolve or abandoned with git.merge_abort. Refuses a dirty volume (commit or stash first)."
     )]
@@ -3982,6 +4009,10 @@ mod tests {
             "Publish one local tag to a declared remote under the same name. Sends that tag only: no branch, no other tag and no commit, so the tag's commit must already be on the remote. Reports up_to_date when the remote already holds the same tag. A remote tag of that name that differs is refused unless overwrite is true and expected_remote_commit states the commit it points at now.",
         ),
         (
+            "git.remote_delete_tag",
+            "Delete one tag on a declared remote. Only that tag is removed: no branch, no other tag, no commit and no local tag. The member must state the commit the remote tag points at now (expected_remote_commit, at least 7 hexadecimal characters); a missing or different commit is refused with the commit the remote tag really has.",
+        ),
+        (
             "git.auth",
             "Start OAuth device flow for GitHub or GitLab. Returns user_code and verification_uri.",
         ),
@@ -4052,12 +4083,12 @@ mod tests {
         // SPEC-0047 adds admin.get_project_disk_usage: admin 16, total 114.
         // SPEC-0049 adds admin.get_project_folder_usage: admin 17, total 115.
         // SPEC-0052 adds git.tag_create: git 50, total 116; git.tag_delete: git 51, total 117;
-        // git.remote_push_tag: git 52, total 118.
+        // git.remote_push_tag: git 52, total 118. SPEC-0053 adds git.remote_delete_tag: git 53, total 119.
         assert_eq!(fs_count, 45, "got: {names:?}");
         assert_eq!(admin_count, 17, "got: {names:?}");
         assert_eq!(search_count, 4, "got: {names:?}");
-        assert_eq!(git_count, 52, "got: {names:?}");
-        assert_eq!(names.len(), 118, "got: {names:?}");
+        assert_eq!(git_count, 53, "got: {names:?}");
+        assert_eq!(names.len(), 119, "got: {names:?}");
     }
 
     #[test]
@@ -4084,7 +4115,7 @@ mod tests {
 
     #[test]
     fn every_core_git_tool_is_registered() {
-        const ALL_GIT_TOOLS: [&str; 42] = [
+        const ALL_GIT_TOOLS: [&str; 43] = [
             "git.init",
             "git.status",
             "git.branches",
@@ -4125,6 +4156,7 @@ mod tests {
             "git.remote_clone",
             "git.remote_push",
             "git.remote_push_tag",
+            "git.remote_delete_tag",
             "git.remote_fetch",
             "git.remote_pull",
         ];
@@ -4392,7 +4424,7 @@ mod tests {
             let gold = normalize_schema(&entry["inputSchema"], &empty);
             assert_eq!(mine, gold, "schema structurally drifted on {}", tool.name);
         }
-        assert_eq!(checked, 114, "the frozen contract covers 114 non-search tools");
+        assert_eq!(checked, 115, "the frozen contract covers 115 non-search tools");
     }
 
     /// US-0007/DT-007: `tools/list` (the router's own `list_all`) returns exactly
@@ -4413,8 +4445,8 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             frozen.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
 
-        assert_eq!(names.len(), 114, "got: {names:?}");
-        assert_eq!(expected.len(), 114, "the golden contract itself must hold 114 names");
+        assert_eq!(names.len(), 115, "got: {names:?}");
+        assert_eq!(expected.len(), 115, "the golden contract itself must hold 115 names");
         let missing: Vec<&String> = expected.difference(&names).collect();
         let extra: Vec<&String> = names.difference(&expected).collect();
         assert!(

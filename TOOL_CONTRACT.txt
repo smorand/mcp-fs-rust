@@ -501,6 +501,15 @@ git.remote_clone
   params: mount_id:string, url:string, branch:string=null, depth:integer=0
   required: ['mount_id', 'url']
   annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=false, openWorldHint=true
+git.remote_delete_tag
+  desc: Delete one tag on a declared remote. Only that tag is removed: no branch, no other tag, no commit and no local tag. The member must state the commit the remote tag points at now (expected_remote_commit, at least 7 hexadecimal characters); a missing or different commit is refused with the commit the remote tag really has.
+  params: mount_id:string, tag:string, remote:string=origin, expected_remote_commit:string=""
+  required: ['mount_id', 'tag']
+  param tag: Name of the tag to delete on the remote, without the refs/tags/ prefix.
+  param remote: Declared remote to delete the tag on.
+  param expected_remote_commit: Commit the remote tag points at now; at least 7 hexadecimal characters.
+  returns: {"mount_id": "proj", "tag": "v1.0", "remote": "origin", "deleted_commit": "<full 40 character commit the remote tag had>", "auth": "github"}
+  annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=false, openWorldHint=true
 git.remote_fetch
   desc: Fetch objects and update refs/remotes/{remote}/* from a declared remote. Never advances a local branch and never touches a working tree file. A branch removed on the remote is reported in refs_stale, not pruned locally.
   params: mount_id:string, remote:string=origin
