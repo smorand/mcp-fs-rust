@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 context (remote exchange), 16 anticipated requirements, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-25
 > Project: existing
 > From backlog: BL-0076
