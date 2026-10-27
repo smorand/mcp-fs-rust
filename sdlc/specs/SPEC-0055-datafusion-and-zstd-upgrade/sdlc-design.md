@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 11 files (4 manifest lines, 1 code line, 2 gate configs, 1 test file modified, 3 new test locations, 1 new doc), 12 requirements, no public contract change
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-27
 > Behavior change: none
 > From backlog: n/a (free text input; the deferred follow up is BL-0089)
@@ -250,3 +250,38 @@ The literal expected values of DT-001 to DT-011 are written into the test source
 | 1 | 0 | 8 minor | IMPLEMENTABLE |
 
 **Amendments applied:** A-1 test count 14; A-2 prose mentions of datafusion; A-3 lockfile lines are for main at 7a142ec; A-4 DT-011 asserts the real payload keys; A-5 literal expected values live in the test source; A-6 fixture construction of DT-040 and DT-041; A-7 DT-030 copies the fixture to a tempdir; A-8 DT-023 concrete commands. Auditor: claude-sonnet-5-5 (not the model that wrote the document), one round.
+
+## Design additions (2026-10-27)
+
+### Test strategy and stories
+All tests are functional or structural tests through the real functions of the crate or the real repository files; none is a mock of its own output. Target tier 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`).
+
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-002 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-003 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-004 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-005 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-006 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-007 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-008 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-009 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-010 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-011 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-020 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0103 |
+| DT-021 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0103 |
+| DT-022 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0103 |
+| DT-023 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0104 |
+| DT-024 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0103 |
+| DT-025 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0104 |
+| DT-030 | integration | direct call to the search backend | `crates/core/src/search/bm25_sqlite.rs` tests module and search e2e | US-0101 |
+| DT-031 | integration | direct call to the search backend | `crates/core/src/search/bm25_sqlite.rs` tests module and search e2e | US-0102 |
+| DT-040 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-041 | functional e2e | direct call through the registered tools | `crates/core/src/tools/db.rs` tests module | US-0101 |
+| DT-042 | structural | file and command assertion | `crates/mcp-fs/tests/security_gate.rs` | US-0103 |
+
+Test data: generated (CSV, Parquet and NDJSON files built by the tests), plus one committed fixture directory for the tantivy 0.26 index (DT-030), generated once by tantivy 0.26 in the first story.
+
+- **DEC-010:** Four stories along the implementation order of Section 9: characterization first, tantivy, datafusion with the zstd removal, then cleanup and documentation. Each leaves main green except the security step, which is red on main today and turns green in US-0103 (DR-012). **Obliged by:** SPEC-0055/DR-009, DR-012. **Alternatives considered:** one story for everything (rejected: 11 files and a lockfile regeneration in one unverifiable unit); datafusion before tantivy (rejected: the order in Section 9 puts the smaller, independently testable bump first). **Source:** design. **Evidence:** Section 9.
+- **DEC-011:** Test locations: db characterization and zstd guards in the tests module of `crates/core/src/tools/db.rs`; the tantivy fixture test in the tests module of `crates/core/src/search/bm25_sqlite.rs` with the fixture under `crates/core/src/search/fixtures/tantivy_0_26/`; structural gate tests in `crates/mcp-fs/tests/security_gate.rs` next to the SPEC-0035 and SPEC-0036 tests. **Obliged by:** SPEC-0055/DR-009, DR-010, DR-004. **Alternatives considered:** a new integration test crate (rejected: the helpers are private to those modules). **Source:** existing code. **Evidence:** `crates/core/src/tools/db.rs:585`, `crates/mcp-fs/tests/security_gate.rs:41`.
