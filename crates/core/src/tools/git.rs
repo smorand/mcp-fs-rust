@@ -28041,4 +28041,251 @@ mod tests {
         let text = "Cannot publish tags: this project does not track a remote named 'origin'.";
         assert_eq!((err.code, err.message), (code::NOT_FOUND, text.to_string()));
     }
+
+    // ── SPEC-0054 US-0097: the confirmation number guard ──────────────────
+
+    const NOT_A_COUNT: &str = "The number to confirm must be a whole number, zero or more.";
+
+    /// Two tags due, `v1.0` at A and `v1.1` at B: (dir, A, B).
+    async fn two_due(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
+        let (dir, _, a, b, _) = three_commit_remote(e, label).await;
+        tag(e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        (dir, a, b)
+    }
+
+    /// The wrong number refusal: code, first line, then the list lines.
+    fn assert_wrong_number(err: ToolError, first: &str, list: &[&str]) {
+        assert_eq!(err.code, code::NO_CLOBBER, "{}", err.message);
+        let mut want = vec![first];
+        want.extend_from_slice(list);
+        assert_eq!(err.message, want.join("\n"));
+    }
+
+    /// A confirmation that must be refused with `message`, the remote and the
+    /// audit trail left as they were.
+    async fn assert_refused_untouched(
+        e: &Env,
+        dir: &std::path::Path,
+        confirm: Value,
+        message: &str,
+    ) {
+        let (before, audit) = (bare_refs(dir), audit_count(e));
+        let err = call_publish_all_tags(e, "origin", Some(confirm)).await.unwrap_err();
+        assert_eq!(err.message, message);
+        assert_eq!(bare_refs(dir), before, "remote untouched");
+        assert_eq!(audit_count(e), audit, "no audit entry");
+    }
+
+    /// SPEC-0054/E2E-009: a number too low.
+    #[tokio::test]
+    async fn e2e_tag_009_publish_all_number_too_low() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p009").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(1))).await.unwrap_err();
+
+        let first = "Tags to publish: 2, not 1. Review the list, then confirm again.";
+        assert_wrong_number(err, first, &["v1.0 to publish", "v1.1 to publish"]);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.1"), None);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-010: a number too high.
+    #[tokio::test]
+    async fn e2e_tag_010_publish_all_number_too_high() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p010").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(5))).await.unwrap_err();
+
+        let first = "Tags to publish: 2, not 5. Review the list, then confirm again.";
+        assert_wrong_number(err, first, &["v1.0 to publish", "v1.1 to publish"]);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-011: zero is a number, so it is a wrong one here.
+    #[tokio::test]
+    async fn e2e_tag_011_publish_all_zero_is_a_number() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p011").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(0))).await.unwrap_err();
+
+        let first = "Tags to publish: 2, not 0. Review the list, then confirm again.";
+        assert_wrong_number(err, first, &["v1.0 to publish", "v1.1 to publish"]);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-012: Bob publishes one tag between the preview and the
+    /// confirmation, so the count Alice saw is stale.
+    #[tokio::test]
+    async fn e2e_tag_012_publish_all_the_count_changed_after_the_preview() {
+        let e = Env::new().await;
+        let (dir, _, b) = two_due(&e, "remote-p012").await;
+        let url = format!("file://{}", dir.display());
+        assert_eq!(preview_all(&e).await["message"], count_line(2));
+        call_publish_tag(&e, &url, "v1.1").await.unwrap();
+        let audit = audit_count(&e);
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
+
+        let first = "Tags to publish: 1, not 2. Review the list, then confirm again.";
+        assert_wrong_number(err, first, &["v1.0 to publish", "v1.1 up to date"]);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.1").as_deref(), Some(b.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-024: a project with no tag.
+    #[tokio::test]
+    async fn e2e_tag_024_publish_all_a_project_with_no_tag() {
+        let e = Env::new().await;
+        let (dir, _, _) = cloned_remote(&e, "remote-p024").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let out = preview_all(&e).await;
+
+        assert_eq!(names(&out["lines"]), Vec::<String>::new());
+        assert_eq!(out["message"], "No tag to publish.");
+        assert_eq!((out["to_publish"].clone(), out["sent"].clone()), (json!(0), json!(false)));
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-025: everything is up to date, preview and confirmed 0.
+    #[tokio::test]
+    async fn e2e_tag_025_publish_all_everything_is_up_to_date() {
+        let e = Env::new().await;
+        let (dir, _, a, b, _) = three_commit_remote(&e, "remote-p025").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        plain_tag_bare_remote(&dir, "v1.1", &b);
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        for out in [preview_all(&e).await, confirm_all(&e, json!(0)).await] {
+            assert_eq!(names(&out["lines"]), ["v1.0 up to date", "v1.1 up to date"]);
+            assert_eq!(out["message"], "No tag to publish.");
+            assert_eq!(out["sent"], false);
+        }
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-028: no remote beats a wrong number.
+    #[tokio::test]
+    async fn e2e_tag_028_publish_all_no_remote_beats_a_wrong_number() {
+        let e = Env::new().await;
+        let (_, _, a, b, _) = three_commit_remote(&e, "remote-p028").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        untrack_every_remote(&e).await;
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(7))).await.unwrap_err();
+
+        assert_eq!(
+            (err.code, err.message),
+            (code::NOT_FOUND, "Cannot publish tags: this project tracks no remote.".into())
+        );
+    }
+
+    /// SPEC-0054/E2E-038: a negative number.
+    #[tokio::test]
+    async fn e2e_tag_038_publish_all_a_negative_number() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p038").await;
+        for confirm in [json!("-1"), json!(-1)] {
+            assert_refused_untouched(&e, &dir, confirm, NOT_A_COUNT).await;
+        }
+    }
+
+    /// SPEC-0054/E2E-039: a non member outranks the missing remote.
+    #[tokio::test]
+    async fn e2e_tag_039_publish_all_non_member_beats_no_remote() {
+        let e = Env::new().await;
+        untrack_every_remote(&e).await;
+
+        let err = publish_all_by_tool(&e, MALLORY, json!({"confirm_count": 7})).await.unwrap_err();
+
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert_eq!(err.message, format!("'{MALLORY}' is not a member of '{MOUNT}'"));
+    }
+
+    /// SPEC-0054/E2E-042: Bob creates a tag after the preview.
+    #[tokio::test]
+    async fn e2e_tag_042_publish_all_a_new_tag_appears_after_the_preview() {
+        let e = Env::new().await;
+        let (dir, _, a, b, c) = three_commit_remote(&e, "remote-p042").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(2));
+        e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+        tag_as(&e, BOB, json!({"name": "v1.2", "target": c})).await.unwrap();
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
+
+        let first = "Tags to publish: 3, not 2. Review the list, then confirm again.";
+        let list = ["v1.0 to publish", "v1.1 to publish", "v1.2 to publish"];
+        assert_wrong_number(err, first, &list);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-049: a decimal number.
+    #[tokio::test]
+    async fn e2e_tag_049_publish_all_a_decimal_number() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p049").await;
+        for confirm in [json!("2.5"), json!(2.5)] {
+            assert_refused_untouched(&e, &dir, confirm, NOT_A_COUNT).await;
+        }
+    }
+
+    /// SPEC-0054/E2E-052: leading zeros are a number, up to nine characters.
+    #[tokio::test]
+    async fn e2e_tag_052_publish_all_leading_zeros_are_a_number() {
+        let e = Env::new().await;
+        let (dir, a, b) = two_due(&e, "remote-p052").await;
+        let before = bare_refs(&dir);
+        assert_refused_untouched(&e, &dir, json!("0000000002"), NOT_A_COUNT).await;
+
+        let out = confirm_all(&e, json!("02")).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 published", "v1.1 published"]);
+        assert_eq!(out["published"], 2);
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a), ("v1.1", &b)]));
+    }
+
+    /// SPEC-0054/E2E-053: signs and spaces are not a number.
+    #[tokio::test]
+    async fn e2e_tag_053_publish_all_signs_and_spaces_are_not_a_number() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p053").await;
+        for confirm in [json!("+2"), json!(" 2"), json!("2 ")] {
+            assert_refused_untouched(&e, &dir, confirm, NOT_A_COUNT).await;
+        }
+    }
+
+    /// SPEC-0054/E2E-059: an empty text is refused; no number is a preview.
+    #[tokio::test]
+    async fn e2e_tag_059_publish_all_an_empty_number_is_not_a_number() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p059").await;
+        assert_refused_untouched(&e, &dir, json!(""), NOT_A_COUNT).await;
+
+        let out = preview_all(&e).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 to publish", "v1.1 to publish"]);
+        assert_eq!(out["message"], count_line(2));
+        assert_eq!(out["sent"], false);
+    }
 }

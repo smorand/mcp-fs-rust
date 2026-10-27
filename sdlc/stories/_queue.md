@@ -96,7 +96,7 @@
 | US-0094 | SPEC-0053 | paused operations and concurrent deletions | US-0092 | 2 | landed | story/US-0094-paused-operations-and-concurrency | main |
 | US-0095 | SPEC-0053 | documentation, round trip test and spec close | US-0093, US-0094 | 2 | landed | story/US-0095-documentation-round-trip-and-spec-close | main |
 | US-0096 | SPEC-0054 | preview and send the due tags | main | 1 | landed | story/US-0096-preview-and-send-the-due-tags | main |
-| US-0097 | SPEC-0054 | the confirmation number guard | US-0096 | 2 | todo | | |
+| US-0097 | SPEC-0054 | the confirmation number guard | US-0096 | 2 | landed | story/US-0097-the-confirmation-number-guard | main |
 | US-0098 | SPEC-0054 | tags that are skipped, refused or changed on the remote | US-0097 | 1 | todo | | |
 | US-0099 | SPEC-0054 | connection failures, concurrency, paused operations and cost | US-0098 | 2 | todo | | |
 | US-0100 | SPEC-0054 | single publish unchanged, documentation and spec close | US-0098, US-0099 | 2 | todo | | |
