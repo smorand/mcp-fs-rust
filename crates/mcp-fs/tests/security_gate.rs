@@ -155,10 +155,7 @@ fn accepted_advisories_are_recorded_once_with_a_reason() {
     ids.sort_unstable();
     let mut expected = [
         "RUSTSEC-2023-0071",
-        "RUSTSEC-2024-0384",
-        "RUSTSEC-2024-0436",
         "RUSTSEC-2026-0192",
-        "RUSTSEC-2026-0253",
         "RUSTSEC-2026-0367",
         "RUSTSEC-2026-0368",
         "RUSTSEC-2026-0369",
@@ -370,4 +367,70 @@ fn no_source_names_the_old_ndjson_option_type() {
         let text = fs::read_to_string(f).expect("read file");
         assert!(!text.contains(old), "{} still names {old}", f.display());
     }
+}
+
+/// SPEC-0055/DT-023: no stale audit ignore. The acceptance file lists neither
+/// advisory that left the graph with datafusion 43, and every id it still
+/// lists is reported when the audit runs WITHOUT any ignore, so an id that no
+/// longer matches a package cannot hide behind the list.
+#[test]
+fn audit_ignores_name_only_advisories_still_in_the_graph() {
+    let raw = fs::read_to_string(repo_root().join(".cargo/audit.toml")).expect(".cargo/audit.toml");
+    for gone in ["RUSTSEC-2024-0384", "RUSTSEC-2024-0436", "RUSTSEC-2026-0253"] {
+        assert!(!raw.contains(gone), ".cargo/audit.toml still ignores {gone}");
+    }
+    if !tools_installed() {
+        eprintln!("cargo-audit not installed locally; skipping the graph half");
+        return;
+    }
+    // A scratch project holding only the lockfile and an empty ignore list:
+    // cargo-audit reads `.cargo/audit.toml` relative to its working directory.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    fs::copy(repo_root().join("Cargo.lock"), scratch.path().join("Cargo.lock")).expect("lock");
+    fs::create_dir(scratch.path().join(".cargo")).expect("mkdir");
+    fs::write(scratch.path().join(".cargo/audit.toml"), "[advisories]\nignore = []\n")
+        .expect("audit.toml");
+    let out = Command::new("cargo")
+        .args(["audit", "--json"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run cargo audit");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("cargo audit json");
+    let mut present: Vec<String> = report["vulnerabilities"]["list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v["advisory"]["id"].as_str().map(str::to_owned))
+        .collect();
+    for list in report["warnings"].as_object().into_iter().flat_map(|m| m.values()) {
+        present.extend(
+            list.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w["advisory"]["id"].as_str().map(str::to_owned)),
+        );
+    }
+    let ids = raw.lines().filter_map(|l| l.trim().strip_prefix('"')?.split('"').next());
+    for id in ids {
+        assert!(present.iter().any(|p| p == id), "{id} is ignored but no package matches it");
+    }
+}
+
+/// SPEC-0055/DT-025: the git pin is documented with its reason and exit, the
+/// documentation index links it, and the follow up entry exists.
+#[test]
+fn the_datafusion_pin_is_documented_and_indexed() {
+    let doc = fs::read_to_string(repo_root().join(".agent_docs/dependencies.md"))
+        .expect(".agent_docs/dependencies.md");
+    assert!(doc.contains("6f1436fe1407495019d8afec8a9f55663f418d9a"), "pinned revision missing");
+    assert!(doc.contains("BL-0089"), "exit condition missing");
+    let agents = fs::read_to_string(repo_root().join("AGENTS.md")).expect("AGENTS.md");
+    assert!(agents.contains(".agent_docs/dependencies.md"), "AGENTS.md does not index it");
+    assert!(
+        fs::read_dir(repo_root().join("sdlc/backlog"))
+            .expect("sdlc/backlog")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("BL-0089-")),
+        "BL-0089 is missing"
+    );
 }

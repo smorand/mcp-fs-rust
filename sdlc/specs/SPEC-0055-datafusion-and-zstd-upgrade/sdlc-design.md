@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 11 files (4 manifest lines, 1 code line, 2 gate configs, 1 test file modified, 3 new test locations, 1 new doc), 12 requirements, no public contract change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-27
 > Behavior change: none
 > From backlog: n/a (free text input; the deferred follow up is BL-0089)

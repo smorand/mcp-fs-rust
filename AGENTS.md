@@ -256,5 +256,6 @@ The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
   rationale and ranked gaps (BL-0027).
 - `.agent_docs/lineage.md` : the C# lineage, why it is no longer a reference, design decisions.
 - `.agent_docs/agent.md` : the CLI agent, its config, and the terminal invariants it depends on.
+- `.agent_docs/dependencies.md` : dependencies pinned off crates.io (datafusion git revision), why, and the exit condition (BL-0089).
 - `.agent_docs/search.md` : search tools, per-project index modes and auto indexing,
   BM25/RAG/reranking config, per-backend caveats.
