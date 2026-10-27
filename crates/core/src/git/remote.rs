@@ -536,7 +536,7 @@ pub fn push_to_remote(
         force,
         lease: expected_remote_sha,
     };
-    let before = match push_refs(repo, origin_url, refs, token, deadline) {
+    let before = match push_ref(repo, origin_url, refs, token, deadline) {
         Ok(before) => before,
         Err(PushFailure::Open(e)) => {
             return Err(ToolError::internal(redact(
@@ -547,8 +547,13 @@ pub fn push_to_remote(
         // A lease mismatch surfaces as the failure of the push the callback
         // aborted, so it is classified before anything else: the remote never
         // rejected this push, the lease did.
-        Err(PushFailure::Lease { expected, actual }) => {
-            return Err(lease_mismatch_error(branch, remote_branch, &expected, &actual));
+        Err(PushFailure::Lease(misses)) => {
+            let Some(miss) = misses.into_iter().next() else {
+                return Err(ToolError::internal(format!(
+                    "push of branch '{branch}' failed: lease"
+                )));
+            };
+            return Err(lease_mismatch_error(branch, remote_branch, &miss.expected, &miss.actual));
         }
         // The local transport (used by every test, and by a same-host push in
         // production) raises a non-fast-forward as a hard error from `push`
@@ -589,14 +594,30 @@ struct PushRefs<'a> {
     lease: Option<&'a str>,
 }
 
+/// One destination whose pre-push advertisement did not match its lease.
+struct LeaseMiss {
+    dst: String,
+    expected: String,
+    actual: String,
+}
+
+/// What one push did, per ref, in the order of the refs given: the value
+/// each destination had in the pre-push advertisement (`None` when the
+/// remote did not report it), and every per ref refusal the remote sent.
+struct PushReport {
+    before: Vec<Option<git2::Oid>>,
+    rejected: Vec<(String, String)>,
+}
+
 /// How a push failed, before any entry point names it: each entry point turns
 /// it into its own message (a branch, or a tag), so the core never decides
 /// the wording.
 enum PushFailure {
     /// The remote could not even be opened.
     Open(git2::Error),
-    /// The pre-push advertisement did not match the lease (FR-NEW-157).
-    Lease { expected: String, actual: String },
+    /// The pre-push advertisement did not match the lease of every listed
+    /// destination (FR-NEW-157); nothing was sent.
+    Lease(Vec<LeaseMiss>),
     /// `push` itself failed: a transport error, or the local transport's hard
     /// non-fast-forward.
     Push(git2::Error),
@@ -604,57 +625,88 @@ enum PushFailure {
     Rejected(String),
 }
 
-/// The push core shared by [`push_to_remote`] and [`push_tag_to_remote`]:
-/// one push of `refs.src` to `refs.dst`, returning the destination's value in
-/// the pre-push advertisement (`None` when the remote did not report it).
-fn push_refs(
+/// [`push_refs`] for the entry points that push exactly one ref: a per ref
+/// refusal is a failure of the whole call, as it always was for them.
+fn push_ref(
     repo: &git2::Repository,
     origin_url: &str,
     refs: PushRefs<'_>,
     token: Option<String>,
     deadline: Option<Instant>,
 ) -> std::result::Result<Option<git2::Oid>, PushFailure> {
-    let PushRefs { src: src_refname, dst: dst_refname, force, lease: expected_remote_sha } = refs;
+    let report = push_refs(repo, origin_url, &[refs], token, deadline)?;
+    if let Some((_, msg)) = report.rejected.into_iter().next() {
+        return Err(PushFailure::Rejected(msg));
+    }
+    Ok(report.before.into_iter().next().flatten())
+}
+
+/// The push core shared by every push entry point (SPEC-0054 DEC-004): one
+/// connection carrying one refspec per element of `refs`. Each lease is
+/// checked against the transport's own pre-push advertisement, and every
+/// mismatch is recorded before the push is aborted, so a caller pushing many
+/// refs learns all the stale ones at once while nothing was sent.
+///
+/// Cost: O(r) for r refs, one map lookup per advertised update.
+fn push_refs(
+    repo: &git2::Repository,
+    origin_url: &str,
+    refs: &[PushRefs<'_>],
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> std::result::Result<PushReport, PushFailure> {
     let mut remote = repo.remote_anonymous(origin_url).map_err(PushFailure::Open)?;
-    let dst_for_negotiation = dst_refname.to_string();
-    let remote_before: Rc<RefCell<Option<git2::Oid>>> = Rc::new(RefCell::new(None));
-    let before_cell = remote_before.clone();
-    let rejected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Destination to (position, lease), so the negotiation callback finds the
+    // ref an advertised update belongs to in O(1).
+    let wanted: HashMap<String, (usize, Option<String>)> = refs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.dst.to_string(), (i, r.lease.map(str::to_string))))
+        .collect();
+    let before: Rc<RefCell<Vec<Option<git2::Oid>>>> = Rc::new(RefCell::new(vec![None; refs.len()]));
+    let before_cell = before.clone();
+    let rejected: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
     let rejected_cell = rejected.clone();
     // FR-NEW-157: the sha the remote actually holds, captured only when it
     // fails to match the lease, so the caller can be told both values.
-    let lease_actual: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let lease_actual_cell = lease_actual.clone();
-    let lease = expected_remote_sha.map(str::to_string);
-    let lease_for_callback = lease.clone();
+    let misses: Rc<RefCell<Vec<LeaseMiss>>> = Rc::new(RefCell::new(Vec::new()));
+    let misses_cell = misses.clone();
 
     let mut callbacks = credential_callbacks(token, deadline);
     callbacks.push_negotiation(move |updates| {
         for u in updates {
             // git2 0.21 returns a Result: a non UTF-8 destination never matches.
-            if u.dst_refname().ok() == Some(dst_for_negotiation.as_str()) {
-                *before_cell.borrow_mut() = Some(u.src());
-                // The lease is checked HERE, against the transport's own
-                // pre-push advertisement of the ref, which costs no second
-                // connection and no second round trip: it is the same view
-                // `created` and `up_to_date` are already read from. Returning
-                // an error aborts the push before a single object or ref
-                // update is sent, which is what leaves a stale-leased remote
-                // byte-identical (FR-NEW-157).
-                if let Some(expected) = lease_for_callback.as_deref() {
-                    let actual = u.src().to_string();
-                    if actual != expected {
-                        *lease_actual_cell.borrow_mut() = Some(actual);
-                        return Err(git2::Error::from_str("expected_remote_sha does not match"));
-                    }
+            let Some((at, lease)) = u.dst_refname().ok().and_then(|d| wanted.get(d)) else {
+                continue;
+            };
+            before_cell.borrow_mut()[*at] = Some(u.src());
+            // The lease is checked HERE, against the transport's own
+            // pre-push advertisement of the ref, which costs no second
+            // connection and no second round trip: it is the same view
+            // `created` and `up_to_date` are already read from. Returning an
+            // error aborts the push before a single object or ref update is
+            // sent, which is what leaves a stale-leased remote byte-identical
+            // (FR-NEW-157).
+            if let Some(expected) = lease.as_deref() {
+                let actual = u.src().to_string();
+                if actual != expected {
+                    misses_cell.borrow_mut().push(LeaseMiss {
+                        dst: u.dst_refname().unwrap_or_default().to_string(),
+                        expected: expected.to_string(),
+                        actual,
+                    });
                 }
             }
         }
-        Ok(())
+        if misses_cell.borrow().is_empty() {
+            Ok(())
+        } else {
+            Err(git2::Error::from_str("expected_remote_sha does not match"))
+        }
     });
-    callbacks.push_update_reference(move |_refname, status| {
+    callbacks.push_update_reference(move |refname, status| {
         if let Some(msg) = status {
-            *rejected_cell.borrow_mut() = Some(msg.to_string());
+            rejected_cell.borrow_mut().push((refname.to_string(), msg.to_string()));
         }
         Ok(())
     });
@@ -665,19 +717,21 @@ fn push_refs(
     // and it is only ever built from a `force` that already carries a
     // validated lease: the two are inseparable by construction here, not by
     // convention at the call site.
-    let refspec = format!("{}{src_refname}:{dst_refname}", if force { "+" } else { "" });
-    if let Err(e) = remote.push(&[refspec.as_str()], Some(&mut opts)) {
-        if let (Some(actual), Some(expected)) = (lease_actual.borrow().clone(), lease) {
-            return Err(PushFailure::Lease { expected, actual });
+    let refspecs: Vec<String> = refs
+        .iter()
+        .map(|r| format!("{}{}:{}", if r.force { "+" } else { "" }, r.src, r.dst))
+        .collect();
+    if let Err(e) = remote.push(&refspecs, Some(&mut opts)) {
+        let lost = std::mem::take(&mut *misses.borrow_mut());
+        if !lost.is_empty() {
+            return Err(PushFailure::Lease(lost));
         }
         return Err(PushFailure::Push(e));
     }
 
-    if let Some(msg) = rejected.borrow().clone() {
-        return Err(PushFailure::Rejected(msg));
-    }
-
-    Ok(*remote_before.borrow())
+    let before = std::mem::take(&mut *before.borrow_mut());
+    let rejected = std::mem::take(&mut *rejected.borrow_mut());
+    Ok(PushReport { before, rejected })
 }
 
 /// SPEC-0052 DEC-015: push `refs/tags/{tag}` to the same name on
@@ -707,9 +761,9 @@ pub fn push_tag_to_remote(
     let lease = lease.map(|oid| oid.to_string());
     let refs =
         PushRefs { src: &tag_ref, dst: &tag_ref, force: lease.is_some(), lease: lease.as_deref() };
-    match push_refs(repo, origin_url, refs, token, deadline) {
+    match push_ref(repo, origin_url, refs, token, deadline) {
         Ok(_) => Ok(TagPush::Pushed),
-        Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
+        Err(PushFailure::Lease(_)) => Ok(TagPush::LeaseLost),
         Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
     }
 }
@@ -741,7 +795,7 @@ pub fn delete_tag_on_remote(
     let forced = None;
     let pushed = match forced {
         Some(failure) => Err(failure),
-        None => push_refs(repo, origin_url, refs, token, deadline),
+        None => push_ref(repo, origin_url, refs, token, deadline),
     };
     match pushed {
         Ok(_) => {
@@ -753,9 +807,66 @@ pub fn delete_tag_on_remote(
             }
             Ok(TagPush::Pushed)
         }
-        Err(PushFailure::Lease { .. }) => Ok(TagPush::LeaseLost),
+        Err(PushFailure::Lease(_)) => Ok(TagPush::LeaseLost),
         Err(PushFailure::Rejected(reason)) => Err(remote_refused_delete(tag, &reason)),
         Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
+    }
+}
+
+/// What one push of many tags did (SPEC-0054 DEC-004, DEC-011): the tags
+/// the remote refused one by one with its reason, and the tags whose remote
+/// state no longer matched the listing. When `lease_lost` is not empty the
+/// push was aborted and nothing at all was sent.
+#[derive(Debug, Default)]
+pub struct TagsPush {
+    pub rejected: Vec<(String, String)>,
+    pub lease_lost: Vec<String>,
+}
+
+/// SPEC-0054 DEC-004: push every `refs/tags/<t>` of `tags` to the same name
+/// on `origin_url` in one connection, through the push core every other push
+/// uses. Each refspec is a creation leased on "absent" (the zero id), so a
+/// remote that gained one of those tags after the caller's listing aborts the
+/// whole push before anything is sent, and the tag is named in
+/// [`TagsPush::lease_lost`]. The caller has checked that every tag's commit
+/// is on the remote, so the pack carries at most the tag objects.
+///
+/// Any failure other than a lease or a per ref refusal is the connection
+/// refusal a fetch or a single publication gives for the same cause.
+pub fn push_tags_to_remote(
+    repo: &git2::Repository,
+    origin_url: &str,
+    tags: &[&str],
+    token: Option<String>,
+    deadline: Option<Instant>,
+) -> Result<TagsPush> {
+    let token_for_redaction = token.clone();
+    let absent = git2::Oid::ZERO_SHA1.to_string();
+    let names: Vec<String> = tags.iter().map(|t| format!("refs/tags/{t}")).collect();
+    let refs: Vec<PushRefs<'_>> = names
+        .iter()
+        .map(|n| PushRefs { src: n, dst: n, force: false, lease: Some(&absent) })
+        .collect();
+    let tag_of = |refname: String| match refname.strip_prefix("refs/tags/") {
+        Some(tag) => tag.to_string(),
+        None => refname,
+    };
+    match push_refs(repo, origin_url, &refs, token, deadline) {
+        Ok(report) => Ok(TagsPush {
+            rejected: report.rejected.into_iter().map(|(r, why)| (tag_of(r), why)).collect(),
+            lease_lost: Vec::new(),
+        }),
+        Err(PushFailure::Lease(misses)) => Ok(TagsPush {
+            rejected: Vec::new(),
+            lease_lost: misses.into_iter().map(|m| tag_of(m.dst)).collect(),
+        }),
+        Err(PushFailure::Open(e) | PushFailure::Push(e)) => {
+            Err(connection_error(origin_url, &e, token_for_redaction.as_deref()))
+        }
+        // push_refs reports per ref refusals in its report, never as a failure.
+        Err(PushFailure::Rejected(reason)) => {
+            Err(ToolError::internal(format!("push of tags failed: {reason}")))
+        }
     }
 }
 
@@ -861,7 +972,7 @@ fn tag_push_error(
     match failure {
         PushFailure::Rejected(reason) => remote_refused_tag(tag, &reason),
         PushFailure::Open(e) | PushFailure::Push(e) => connection_error(origin_url, &e, token),
-        PushFailure::Lease { .. } => {
+        PushFailure::Lease(_) => {
             ToolError::internal(format!("push of tag '{tag}' failed: unexpected lease"))
         }
     }

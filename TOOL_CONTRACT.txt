@@ -543,6 +543,16 @@ git.remote_push_tag
   returns: {"mount_id": "proj", "tag": "v1.0", "remote": "origin", "created": true, "up_to_date": false, "remote_sha": "<commit the tag points at>", "auth": "github"}
   returns (a differing remote tag replaced after a confirmed overwrite): the same keys with "created": false, "up_to_date": false
   annotations: destructiveHint=true, readOnlyHint=false, idempotentHint=true, openWorldHint=true
+git.remote_push_tags
+  desc: Publish every local tag that is due to a declared remote, in one push. Without confirm_count it only lists each local tag with its outcome (to publish, up to date, differs, commit not on remote) and sends nothing. With confirm_count equal to the number of tags to publish it sends exactly those tags: no branch, no commit, and never a replacement of a differing remote tag.
+  params: mount_id:string, remote:string=origin, confirm_count:<untyped>=null
+  required: ['mount_id']
+  param remote: Declared remote to publish to; an empty name means origin.
+  param confirm_count: Optional. Number of tags to publish, as the preview counted them; leave it out to preview without sending.
+  returns (preview): {"mount_id": "proj", "remote": "origin", "to_publish": 2, "published": 0, "sent": false, "tags": [{"name": "v0.9", "outcome": "up to date", "commit": "<full commit>"}, {"name": "v1.0", "outcome": "to publish", "commit": "<full commit>"}, {"name": "v1.1", "outcome": "to publish", "commit": "<full commit>"}], "lines": ["v0.9 up to date", "v1.0 to publish", "v1.1 to publish"], "message": "Tags to publish: 2. Confirm by stating 2 to send them.", "auth": "github"}
+  returns (confirmed send): the same keys with "published": 2, "sent": true, outcome "published" in place of "to publish", lines "v1.0 published", and "message": ""
+  returns (outcome values): to publish, published, up to date, differs (with remote_commit), commit not on remote, refused by remote (with reason)
+  annotations: destructiveHint=false, readOnlyHint=false, idempotentHint=true, openWorldHint=true
 git.remote_remove
   desc: Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op.
   params: mount_id:string, name:string

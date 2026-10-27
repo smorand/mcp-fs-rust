@@ -3314,6 +3314,37 @@
       }
     },
     {
+      "name": "git.remote_push_tags",
+      "description": "Publish every local tag that is due to a declared remote, in one push. Without confirm_count it only lists each local tag with its outcome (to publish, up to date, differs, commit not on remote) and sends nothing. With confirm_count equal to the number of tags to publish it sends exactly those tags: no branch, no commit, and never a replacement of a differing remote tag.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mount_id": {
+            "description": "Project/volume id the operation targets.",
+            "type": "string"
+          },
+          "remote": {
+            "description": "Declared remote to publish to; an empty name means origin.",
+            "type": "string",
+            "default": "origin"
+          },
+          "confirm_count": {
+            "description": "Optional. Number of tags to publish, as the preview counted them; leave it out to preview without sending.",
+            "default": null
+          }
+        },
+        "required": [
+          "mount_id"
+        ]
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "readOnlyHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
       "name": "git.remote_remove",
       "description": "Delete a named remote and every remote-tracking ref under refs/remotes/{name}/. Branches, commits and files are untouched, and the objects fetched from that remote are kept. A name matching no remote is an error, never a silent no-op.",
       "inputSchema": {

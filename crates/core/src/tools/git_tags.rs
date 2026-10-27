@@ -772,6 +772,432 @@ pub(crate) mod after_listing {
     }
 }
 
+/// `git.remote_push_tags` (SPEC-0054): refusals come in the order of DEC-005
+/// because that is the order of the calls: membership (`open`), remote
+/// lookup, credential, then inside [`publish_all_tags`] the connection, the
+/// number and the push. A paused operation does not block it (FR-NEW-014):
+/// publishing touches no working file and no index row.
+pub(crate) async fn tool_remote_push_tags(
+    ctx: ToolCtx,
+    a: crate::mcp::server::GitRemotePushTagsArgs,
+    g: Option<Arc<GitRepoStore>>,
+    t: Option<Arc<crate::git::OAuthTokenStore>>,
+) -> Result<Value> {
+    let entry = open(&ctx, &a.mount_id, g).await?;
+    let (remote, url) = tracked_remote(&entry, &a.remote).await?;
+    let (token, auth) = resolve_clone_credential(&ctx, &t, &url).await?;
+    let target = PublishAllTarget {
+        mount_id: &a.mount_id,
+        person: &ctx.person,
+        remote: &remote,
+        url: &url,
+        token,
+        auth: &auth,
+        timeout_secs: ctx.state.config.git.remote_timeout_secs,
+        confirm_count: a.confirm_count.as_ref(),
+    };
+    publish_all_tags(entry, ctx.state.safety.clone(), target).await
+}
+
+/// FR-NEW-010, DEC-017: the remote name to use (an empty text means
+/// `origin`, since the serde default only covers an absent field) and its
+/// URL. Names are compared exactly, so `Origin` is not `origin`.
+pub(crate) async fn tracked_remote(entry: &GitRepoEntry, remote: &str) -> Result<(String, String)> {
+    let remote = if remote.is_empty() { "origin" } else { remote };
+    let remotes = entry.db.list_remotes().await?;
+    match remotes.iter().find(|(n, _)| n == remote) {
+        Some((_, url)) => Ok((remote.to_string(), url.clone())),
+        None if remotes.is_empty() => {
+            Err(ToolError::not_found("Cannot publish tags: this project tracks no remote."))
+        }
+        None => Err(ToolError::not_found(format!(
+            "Cannot publish tags: this project does not track a remote named '{remote}'."
+        ))),
+    }
+}
+
+/// Where and how every due tag is published (SPEC-0054): everything
+/// [`publish_all_tags`] needs once the remote URL and the credential are
+/// known. `confirm_count` absent or null is a preview.
+pub(crate) struct PublishAllTarget<'a> {
+    pub mount_id: &'a str,
+    pub person: &'a str,
+    pub remote: &'a str,
+    pub url: &'a str,
+    pub token: Option<String>,
+    pub auth: &'a str,
+    pub timeout_secs: u64,
+    pub confirm_count: Option<&'a Value>,
+}
+
+/// SPEC-0054 DEC-005 to DEC-012: preview or publish every local tag once the
+/// remote and the credential are known. Split from [`tool_remote_push_tags`]
+/// so a test can reach it with a `file://` remote, which the tool refuses.
+///
+/// The whole action holds the write lock (DEC-007), preview included, so the
+/// count shown and the count checked come from one consistent view. One
+/// listing connection decides every outcome, then at most one push sends
+/// every due tag. One audit line per tag the push really published.
+///
+/// Cost: hydration, O(o) in stored objects as for every tag tool; then for t
+/// local tags and n advertised refs, O(n) to index the listing, O(t log t)
+/// to sort, and one history walk per distinct local commit not advertised
+/// itself, O(u d) for u such commits and depth d, memoized so tags sharing a
+/// commit cost one walk; one probe connection per annotated lookalike. O(n +
+/// t) space.
+pub(crate) async fn publish_all_tags(
+    entry: Arc<GitRepoEntry>,
+    safety: Arc<SafetyManager>,
+    target: PublishAllTarget<'_>,
+) -> Result<Value> {
+    let host = crate::git::remote::extract_host(target.url);
+    let (remote, auth) = (target.remote, target.auth);
+    crate::git::remote::trace_remote_operation(
+        "git.remote_push_tags",
+        remote,
+        &host,
+        auth,
+        publish_all_inner(entry, safety, target, &host),
+    )
+    .await
+}
+
+async fn publish_all_inner(
+    entry: Arc<GitRepoEntry>,
+    safety: Arc<SafetyManager>,
+    target: PublishAllTarget<'_>,
+    host: &str,
+) -> Result<Value> {
+    let PublishAllTarget {
+        mount_id,
+        person,
+        remote,
+        url,
+        token,
+        auth,
+        timeout_secs,
+        confirm_count,
+    } = target;
+    // Held in the async caller, never inside the blocking closure, so a
+    // deadline firing releases it, as for a single publication.
+    let _write = entry.write_lock.lock().await;
+    // `String` ordering is byte ordering (DEC-006), never the database
+    // collation; the full refs share one prefix, so this sorts the names.
+    let mut local: Vec<(String, String)> = entry
+        .db
+        .list_refs()
+        .await?
+        .into_iter()
+        .filter(|r| !r.symbolic && r.name.starts_with(TAGS_PREFIX))
+        .map(|r| (r.name, r.target))
+        .collect();
+    local.sort_unstable();
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let (thread_entry, url_owned, confirm) =
+        (entry.clone(), url.to_string(), confirm_count.cloned());
+    let report = crate::git::remote::with_remote_deadline(
+        timeout_secs,
+        host,
+        on_git_thread(move || async move {
+            let repo = thread_entry.repo.lock().await;
+            hydrate(&thread_entry, &repo).await?;
+            let conn = Connection { url: &url_owned, token, deadline };
+            publish_all_on_repo(&repo, &local, &conn, confirm.as_ref())
+        }),
+    )
+    .await?;
+
+    for tag in report.tags.iter().filter(|t| t.outcome == Outcome::Published) {
+        safety.record_audit(
+            person,
+            &entry.project_id,
+            "git.tag_publish",
+            "/",
+            &format!("published tag '{}' at {}", tag.name, tag.commit),
+        );
+    }
+    let published = report.tags.iter().filter(|t| t.outcome == Outcome::Published).count();
+    let message = match (report.sent, report.to_publish) {
+        (true, _) => String::new(),
+        (false, 0) => "No tag to publish.".to_string(),
+        (false, n) => format!("Tags to publish: {n}. Confirm by stating {n} to send them."),
+    };
+    Ok(json!({
+        "mount_id": mount_id,
+        "remote": remote,
+        "to_publish": report.to_publish,
+        "published": published,
+        "sent": report.sent,
+        "tags": report.tags.iter().map(TagOutcome::to_json).collect::<Vec<_>>(),
+        "lines": render(&report.tags),
+        "message": message,
+        "auth": auth,
+    }))
+}
+
+/// The remote connection of one blocking bulk publication.
+struct Connection<'a> {
+    url: &'a str,
+    token: Option<String>,
+    deadline: Instant,
+}
+
+/// The outcome of one local tag (DEC-006, DEC-011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    ToPublish,
+    Published,
+    UpToDate,
+    /// The remote tag's commit, full id.
+    Differs(String),
+    CommitNotOnRemote,
+    /// The reason the remote, or git itself, gave.
+    Refused(String),
+}
+
+/// One local tag and what happened to it.
+struct TagOutcome {
+    name: String,
+    object: Oid,
+    /// The commit the tag stands for, full id.
+    commit: String,
+    outcome: Outcome,
+}
+
+impl TagOutcome {
+    /// `<name> <outcome>`, the one line per tag every answer shares (DEC-009).
+    fn line(&self) -> String {
+        match &self.outcome {
+            Outcome::ToPublish => format!("{} to publish", self.name),
+            Outcome::Published => format!("{} published", self.name),
+            Outcome::UpToDate => format!("{} up to date", self.name),
+            Outcome::Differs(at) => format!("{} differs (remote at {})", self.name, short7(at)),
+            Outcome::CommitNotOnRemote => format!("{} commit not on remote", self.name),
+            Outcome::Refused(why) => format!("{} refused by remote: {why}", self.name),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let outcome = match &self.outcome {
+            Outcome::ToPublish => "to publish",
+            Outcome::Published => "published",
+            Outcome::UpToDate => "up to date",
+            Outcome::Differs(_) => "differs",
+            Outcome::CommitNotOnRemote => "commit not on remote",
+            Outcome::Refused(_) => "refused by remote",
+        };
+        let mut out = json!({"name": self.name, "outcome": outcome, "commit": self.commit});
+        if let Some(map) = out.as_object_mut() {
+            match &self.outcome {
+                Outcome::Differs(at) => {
+                    map.insert("remote_commit".to_string(), Value::String(at.clone()));
+                }
+                Outcome::Refused(why) => {
+                    map.insert("reason".to_string(), Value::String(why.clone()));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// What the blocking half decided: every tag's outcome, the count of tags
+/// to publish at the listing, and whether a push happened.
+struct BulkReport {
+    tags: Vec<TagOutcome>,
+    to_publish: usize,
+    sent: bool,
+}
+
+/// DEC-009: the per tag lines, in the order of `tags`, shared by the
+/// preview, the report and the wrong number refusal so they cannot drift.
+fn render(tags: &[TagOutcome]) -> Vec<String> {
+    tags.iter().map(TagOutcome::line).collect()
+}
+
+/// The blocking half of a bulk publication, in the order of DEC-005: list,
+/// classify, check the number, then push the due tags in one connection.
+fn publish_all_on_repo(
+    repo: &Repository,
+    local: &[(String, String)],
+    conn: &Connection<'_>,
+    confirm: Option<&Value>,
+) -> Result<BulkReport> {
+    let advertised = crate::git::remote::list_advertised_refs(
+        repo,
+        conn.url,
+        conn.token.clone(),
+        Some(conn.deadline),
+    )?;
+    #[cfg(test)]
+    after_listing::fire(conn.url);
+
+    let mut tags = classify_tags(repo, local, &advertised, conn)?;
+    let to_publish = tags.iter().filter(|t| t.outcome == Outcome::ToPublish).count();
+    let Some(stated) = parse_confirm(confirm)? else {
+        return Ok(BulkReport { tags, to_publish, sent: false });
+    };
+    if stated != to_publish as u64 {
+        let mut message = format!(
+            "Tags to publish: {to_publish}, not {stated}. Review the list, then confirm again."
+        );
+        for line in render(&tags) {
+            message.push('\n');
+            message.push_str(&line);
+        }
+        return Err(ToolError::no_clobber(message));
+    }
+    if to_publish == 0 {
+        return Ok(BulkReport { tags, to_publish, sent: false });
+    }
+    send_due_tags(repo, &mut tags, conn)?;
+    Ok(BulkReport { tags, to_publish, sent: true })
+}
+
+/// DEC-006: the outcome of every local tag against the one listing, in the
+/// order of `local`. Checks, in order: commit not on remote, identical,
+/// differs, to publish.
+fn classify_tags(
+    repo: &Repository,
+    local: &[(String, String)],
+    advertised: &[(String, Oid)],
+    conn: &Connection<'_>,
+) -> Result<Vec<TagOutcome>> {
+    let by_name: std::collections::HashMap<&str, Oid> =
+        advertised.iter().map(|(n, oid)| (n.as_str(), *oid)).collect();
+    let tips: std::collections::HashSet<Oid> = advertised.iter().map(|(_, oid)| *oid).collect();
+    let mut on_remote: std::collections::HashMap<Oid, bool> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(local.len());
+    for (full_ref, target) in local {
+        let name = full_ref.strip_prefix(TAGS_PREFIX).unwrap_or(full_ref).to_string();
+        let object = parse_oid(target)?;
+        // A target that names no commit the project holds cannot be on the
+        // remote either; it is reported, not allowed to fail the whole list.
+        let Some(commit) = peel_to_commit(repo, target) else {
+            let commit = target.clone();
+            out.push(TagOutcome { name, object, commit, outcome: Outcome::CommitNotOnRemote });
+            continue;
+        };
+        let commit_oid = parse_oid(&commit)?;
+        let reachable = *on_remote
+            .entry(commit_oid)
+            .or_insert_with(|| commit_reachable(repo, commit_oid, &tips));
+        let outcome = if reachable {
+            remote_outcome(repo, full_ref, &name, object, commit_oid, &by_name, conn)?
+        } else {
+            Outcome::CommitNotOnRemote
+        };
+        out.push(TagOutcome { name, object, commit, outcome });
+    }
+    Ok(out)
+}
+
+/// Identical, differs or to publish, for a tag whose commit is on the
+/// remote, with the rules of the single publication (SPEC-0052 DEC-017).
+fn remote_outcome(
+    repo: &Repository,
+    full_ref: &str,
+    name: &str,
+    object: Oid,
+    commit: Oid,
+    by_name: &std::collections::HashMap<&str, Oid>,
+    conn: &Connection<'_>,
+) -> Result<Outcome> {
+    let Some(&remote_object) = by_name.get(full_ref) else {
+        return Ok(Outcome::ToPublish);
+    };
+    let peeled = by_name.get(format!("{full_ref}^{{}}").as_str()).copied();
+    let remote_commit = peeled.unwrap_or(remote_object);
+    // Two annotated tags on one commit may carry one message under another
+    // tagger or time, which only the remote's tag object can tell.
+    let identical = remote_object == object
+        || (peeled.is_some() && object != commit && remote_commit == commit && {
+            let publish = Publish {
+                tag: name,
+                object,
+                url: conn.url,
+                token: conn.token.clone(),
+                deadline: conn.deadline,
+            };
+            probe_identical(repo, &publish)?
+        });
+    Ok(if identical { Outcome::UpToDate } else { Outcome::Differs(remote_commit.to_string()) })
+}
+
+/// DEC-008: absent or null is a preview; a string of 1 to 9 ASCII digits or
+/// a JSON integer from 0 to 999999999 is a number; anything else is refused
+/// with one text, so a typo never reads as a transport error.
+fn parse_confirm(confirm: Option<&Value>) -> Result<Option<u64>> {
+    const MAX_DIGITS: usize = 9;
+    const MAX: u64 = 999_999_999;
+    let refused = || {
+        ToolError::invalid_argument("The number to confirm must be a whole number, zero or more.")
+    };
+    match confirm {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s))
+            if (1..=MAX_DIGITS).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            s.parse().map(Some).map_err(|_| refused())
+        }
+        Some(Value::Number(n)) => n.as_u64().filter(|v| *v <= MAX).map(Some).ok_or_else(refused),
+        Some(_) => Err(refused()),
+    }
+}
+
+/// DEC-010, DEC-011, DEC-012: write each due tag's ref on disk, as the single
+/// publication does since a push names refs, then push them all in one
+/// connection and mark each `published` or `refused by remote`.
+fn send_due_tags(repo: &Repository, tags: &mut [TagOutcome], conn: &Connection<'_>) -> Result<()> {
+    let mut due = Vec::new();
+    for (at, tag) in tags.iter_mut().enumerate() {
+        if tag.outcome != Outcome::ToPublish {
+            continue;
+        }
+        let tag_ref = format!("{TAGS_PREFIX}{}", tag.name);
+        // Checked rather than left to `reference`, which quietly normalises
+        // `a//b` to `a/b` and would push a ref of another name (DEC-019).
+        if !git2::Reference::is_valid_name(&tag_ref) {
+            tag.outcome = Outcome::Refused("invalid ref name".to_string());
+            continue;
+        }
+        match repo.reference(&tag_ref, tag.object, true, "mcp-fs git.remote_push_tags") {
+            Ok(_) => due.push(at),
+            Err(e) => tag.outcome = Outcome::Refused(e.message().to_string()),
+        }
+    }
+    if due.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = due.iter().map(|&at| tags[at].name.as_str()).collect();
+    let pushed = crate::git::remote::push_tags_to_remote(
+        repo,
+        conn.url,
+        &names,
+        conn.token.clone(),
+        Some(conn.deadline),
+    )?;
+    if !pushed.lease_lost.is_empty() {
+        // Nothing was sent: a remote tag appeared between the listing and
+        // the push. The member reviews the list again rather than getting a
+        // report built on a listing the remote no longer matches.
+        return Err(ToolError::no_clobber(format!(
+            "Remote tags changed since the listing: {}. Review the list, then confirm again.",
+            pushed.lease_lost.join(", ")
+        )));
+    }
+    let rejected: std::collections::HashMap<String, String> = pushed.rejected.into_iter().collect();
+    for at in due {
+        let tag = &mut tags[at];
+        tag.outcome = match rejected.get(&tag.name) {
+            Some(why) => Outcome::Refused(why.clone()),
+            None => Outcome::Published,
+        };
+    }
+    Ok(())
+}
+
 /// `git.remote_delete_tag`: refusals come in the order of DEC-005 because
 /// that is the order of the calls: membership (`open`), remote lookup,
 /// credential, then inside [`delete_remote_tag`] the connection and the tag
@@ -985,8 +1411,14 @@ fn moved(tag: &str, remote_commit: &str) -> ToolError {
 /// counts as absent even when the remote has it (E2E-084).
 fn commit_on_remote(repo: &Repository, commit: Oid, advertised: &[(String, Oid)]) -> bool {
     let tips: std::collections::HashSet<Oid> = advertised.iter().map(|(_, oid)| *oid).collect();
+    commit_reachable(repo, commit, &tips)
+}
+
+/// [`commit_on_remote`] against a set of tips built once, so a caller
+/// checking many commits against one listing does not rebuild it.
+fn commit_reachable(repo: &Repository, commit: Oid, tips: &std::collections::HashSet<Oid>) -> bool {
     tips.contains(&commit)
-        || tips.into_iter().any(|tip| {
+        || tips.iter().any(|&tip| {
             repo.find_commit(tip).is_ok() && repo.graph_descendant_of(tip, commit).unwrap_or(false)
         })
 }

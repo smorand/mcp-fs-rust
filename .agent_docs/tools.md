@@ -1,4 +1,4 @@
-# Tool reference (115 tools)
+# Tool reference (116 tools)
 
 Facts below come from `TOOL_CONTRACT.txt` (captured from the running reference
 server) and the `tools/` modules. Parameters are listed as
@@ -297,7 +297,7 @@ rolls the ACL row back if provisioning fails. Deletion also purges
 `state/git/{id}.db` and the bare repo directory when git is enabled, so a
 recreated id never inherits stale refs.
 
-## git (43, registered only when `git.enabled`)
+## git (44, registered only when `git.enabled`)
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
@@ -341,6 +341,7 @@ recreated id never inherits stale refs.
 | `git.remote_clone` | clone a remote into the volume | `url`, `branch=null`, `depth:int=0` | `mount_id`, `url`, `branch`, `commit`, `commit_message`, `files_imported`, `commits_imported`, `depth`, `auth`, `skipped?`, `tags_added[]`, `tags_kept_local[]` | !D,!RO,!I,OW | member |
 | `git.remote_push` | push a local branch to a named remote, fast-forward unless a lease is supplied | `branch`, `remote` (default `origin`), `remote_branch`, `force`, `expected_remote_sha` | `branch`, `remote`, `created`, `up_to_date`, `remote_sha`, `auth` (credential class, never a value), `forced`; plus `overwritten_sha` when forced and `remote_branch` when it differs from the local name | D,!RO,I,OW | member |
 | `git.remote_push_tag` | publish one local tag under the same name, never forced; refuses an unknown tag, no remote, a commit not on the remote and a differing remote tag unless `overwrite` and `expected_remote_commit` (full id or 7+ character prefix of the remote tag's current commit; a mismatch answers `has moved`), the push then leased on the advertised object; `up_to_date` for an identical remote tag (same commit, and for two annotated tags the same message); audited (`git.tag_publish`) only on a real push | `tag`, `remote` (default `origin`), `overwrite:bool=false`, `expected_remote_commit=""` | `mount_id`, `tag`, `remote`, `created`, `up_to_date`, `remote_sha` (the tag's commit), `auth` | !D,!RO,I,OW | member |
+| `git.remote_push_tags` | publish every due local tag in one push (SPEC-0054): one listing classifies each tag, sorted by name bytes, as `to publish`, `up to date` (same object, or two annotated tags on one commit with one message), `differs (remote at <7>)` or `commit not on remote`; without `confirm_count` a preview (`Tags to publish: <N>. Confirm by stating <N> to send them.`, or `No tag to publish.`); with it equal to N one push of creation refspecs leased on "absent", never a branch, a commit or a replacement; refusals in order: not a member, no remote (`Cannot publish tags: this project tracks no remote.`), remote not tracked (`... does not track a remote named '<r>'.`, an empty name means `origin`), connection, number not a count, wrong number (`Tags to publish: <M>, not <N>. ...` then the list); holds the write lock, preview included; audited (`git.tag_publish`) once per tag published | `remote` (default `origin`), `confirm_count` (absent/null, a string of 1 to 9 digits, or an integer) | `mount_id`, `remote`, `to_publish`, `published`, `sent`, `tags[]` (`name`, `outcome`, `commit`, `remote_commit?`, `reason?`), `lines[]`, `message`, `auth` | !D,!RO,I,OW | member |
 | `git.remote_delete_tag` | delete one tag on the remote (SPEC-0053), refspec `:refs/tags/<n>` leased on the advertised tag object; refusals in order: not a member, no such remote (`Cannot delete tag '<n>': this project tracks no remote.`), remote tag absent (`Remote tag '<n>' does not exist.`, also an empty, blank or invalid name), no commit stated (`points at <7>. State that commit to confirm its deletion.`), stated commit differs (`has moved to <7>`, an annotated tag confirmed by its peeled commit); a lease lost between listing and push re lists once, never retried; local tags untouched; audited (`git.tag_remote_delete`) only after the push | `tag`, `remote` (default `origin`), `expected_remote_commit=""` | `mount_id`, `tag`, `remote`, `deleted_commit` (full id), `auth` | D,!RO,!I,OW | member |
 | `git.remote_fetch` | fetch objects, update `refs/remotes/origin/*` only, never a working file | (`mount_id`) | updated refs, `refs_stale[]`, objects downloaded, `tags_added[]`, `tags_kept_local[]` | !D,!RO,I,OW | member |
 | `git.remote_pull` | fetch, then fast-forward or three-way merge the checked-out branch; a conflict pauses as a `merge` | `branch` | fast-forward, merge outcome, or the shared conflict response; every outcome adds `tags_added[]`, `tags_kept_local[]` | D,!RO,I,OW | member |
@@ -419,9 +420,9 @@ before any handler runs.
 | Configuration | Served |
 |---|---|
 | default | 62 (45 `fs.*`, 17 `admin.*`) |
-| git flag on | 115 |
-| git and search flags on | 119 |
-| every flag, pandoc on `PATH` | 141 (139 without pandoc: `doc.*` registers nothing) |
+| git flag on | 116 |
+| git and search flags on | 120 |
+| every flag, pandoc on `PATH` | 142 (140 without pandoc: `doc.*` registers nothing) |
 | one optional family alone | 62 + `web` 5, `context7` 2, `sqlite` 8, `db` 5, `doc` 2 |
 
 The optional families (`web`, `context7`, `sqlite`, `db`, `doc`) are not
@@ -431,7 +432,7 @@ family's production `register()` into one shared `ToolRegistry`, and adds one
 family's own `ToolSchema::to_list_entry()`, so the served schema equals
 `catalog()` (what `/api/swagger.json` reads); the call goes through
 `ToolRegistry::call` then `to_call_result`. The family handlers authorize
-`mount_id` themselves, unchanged. They are outside the 115 tool golden
+`mount_id` themselves, unchanged. They are outside the 116 tool golden
 contract. Tests: `tools/tool_surface_e2e.rs`.
 
 ## Authorization model

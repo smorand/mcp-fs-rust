@@ -677,6 +677,39 @@ async move {
     let t = tokens.clone();
     reg.add(
         ToolSchema::new(
+            "git.remote_push_tags",
+            "Publish every local tag that is due to a declared remote, in one push. Without \
+             confirm_count it only lists each local tag with its outcome (to publish, up to date, \
+             differs, commit not on remote) and sends nothing. With confirm_count equal to the \
+             number of tags to publish it sends exactly those tags: no branch, no commit, and \
+             never a replacement of a differing remote tag.",
+        )
+        .req_str("mount_id", "Project/volume id the operation targets.")
+        .opt_str("remote", "origin", "Declared remote to publish to; an empty name means origin.")
+        .opt_any(
+            "confirm_count",
+            "Optional. Number of tags to publish, as the preview counted them; leave it out to \
+             preview without sending.",
+        )
+        .destructive(false)
+        .read_only(false)
+        .idempotent(true)
+        .open_world(true),
+        handler(move |ctx: ToolCtx, a| {
+            let (g, t) = (g.clone(), t.clone());
+            async move {
+                let a: crate::mcp::server::GitRemotePushTagsArgs =
+                    serde_json::from_value(a.0.clone())
+                        .map_err(|e| crate::errors::ToolError::invalid_argument(e.to_string()))?;
+                super::git_tags::tool_remote_push_tags(ctx, a, g, t).await
+            }
+        }),
+    );
+
+    let g = git.clone();
+    let t = tokens.clone();
+    reg.add(
+        ToolSchema::new(
             "git.remote_delete_tag",
             "Delete one tag on a declared remote. Only that tag is removed: no branch, no other \
              tag, no commit and no local tag. The member must state the commit the remote tag \
@@ -7699,7 +7732,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_TOOLS: [&str; 43] = [
+    const ALL_GIT_TOOLS: [&str; 44] = [
         "git.init",
         "git.status",
         "git.branches",
@@ -7740,6 +7773,7 @@ mod tests {
         "git.remote_clone",
         "git.remote_push",
         "git.remote_push_tag",
+        "git.remote_push_tags",
         "git.remote_delete_tag",
         "git.remote_fetch",
         "git.remote_pull",
@@ -7749,7 +7783,7 @@ mod tests {
     fn every_git_tool_is_registered() {
         let mut r = ToolRegistry::new();
         register(&mut r);
-        assert_eq!(r.len(), 43);
+        assert_eq!(r.len(), 44);
         for name in ALL_GIT_TOOLS {
             assert!(r.resolve(name).is_some(), "{name} is missing");
         }
@@ -8022,6 +8056,7 @@ mod tests {
             ("git.remote_clone", json!({"mount_id": MOUNT, "url": "https://example.test/r.git"})),
             ("git.remote_push", json!({"mount_id": MOUNT, "branch": "main"})),
             ("git.remote_push_tag", json!({"mount_id": MOUNT, "tag": "v1"})),
+            ("git.remote_push_tags", json!({"mount_id": MOUNT})),
             ("git.remote_delete_tag", json!({"mount_id": MOUNT, "tag": "v1"})),
             ("git.remote_fetch", m.clone()),
             ("git.remote_pull", json!({"mount_id": MOUNT, "branch": "main"})),
@@ -8073,7 +8108,7 @@ mod tests {
             mount_scoped_git_tools().iter().map(|(n, _)| *n).collect();
 
         assert_eq!(listed, registered, "the blanket authorization list drifted from the registry");
-        assert_eq!(listed.len(), 49, "43 git.* plus the 6 git.pr_* tools take a mount_id");
+        assert_eq!(listed.len(), 50, "44 git.* plus the 6 git.pr_* tools take a mount_id");
     }
 
     /// E2E-MOD-406: the separation of duties that matters, over the whole
@@ -27617,5 +27652,393 @@ mod tests {
             tag_audit(&e, BOB),
             vec![created(&b), op("git.tag_publish", format!("published tag 'v1.0' at {b}"))]
         );
+    }
+
+    // ── SPEC-0054 US-0096: git.remote_push_tags ───────────────────────────
+    //
+    // The numbers follow SPEC-0054's E2E ids; the `publish_all` slug keeps
+    // them apart from the earlier tag specs' tests of the same numbers.
+
+    const MALLORY: &str = "mallory@example.com";
+
+    /// `file://` cannot reach the engine through the registered
+    /// `git.remote_push_tags` tool (`resolve_clone_credential` rejects it), so
+    /// the direct tests run the tool's own remote lookup, then the engine.
+    async fn call_publish_all_tags(e: &Env, remote: &str, confirm: Option<Value>) -> Result<Value> {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let (remote, url) = super::super::git_tags::tracked_remote(&entry, remote).await?;
+        super::super::git_tags::publish_all_tags(
+            entry,
+            e.f.state.safety.clone(),
+            super::super::git_tags::PublishAllTarget {
+                mount_id: MOUNT,
+                person: OWNER,
+                remote: &remote,
+                url: &url,
+                token: None,
+                auth: "anonymous",
+                timeout_secs: e.f.state.config.git.remote_timeout_secs,
+                confirm_count: confirm.as_ref(),
+            },
+        )
+        .await
+    }
+
+    async fn preview_all(e: &Env) -> Value {
+        call_publish_all_tags(e, "origin", None).await.unwrap()
+    }
+
+    async fn confirm_all(e: &Env, count: Value) -> Value {
+        call_publish_all_tags(e, "origin", Some(count)).await.unwrap()
+    }
+
+    /// `person` through the registered tool, with `extra` merged in.
+    async fn publish_all_by_tool(e: &Env, person: &str, extra: Value) -> Result<Value> {
+        let mut args = json!({"mount_id": MOUNT});
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        e.as_person(person, "git.remote_push_tags", args).await
+    }
+
+    fn count_line(n: usize) -> String {
+        format!("Tags to publish: {n}. Confirm by stating {n} to send them.")
+    }
+
+    fn published_line(tag: &str, sha: &str) -> String {
+        format!("published tag '{tag}' at {sha}")
+    }
+
+    /// Every audit entry of every person these tests use, whatever the action.
+    fn audit_count(e: &Env) -> usize {
+        [OWNER, BOB, MALLORY].iter().map(|p| e.f.state.safety.audit(p, MOUNT).len()).sum()
+    }
+
+    /// `before` plus `refs/tags/<tag>` at each given commit.
+    fn with_tags(
+        before: &BTreeMap<String, String>,
+        tags: &[(&str, &str)],
+    ) -> BTreeMap<String, String> {
+        let mut expected = before.clone();
+        for (tag, sha) in tags {
+            expected.insert(format!("refs/tags/{tag}"), sha.to_string());
+        }
+        expected
+    }
+
+    /// A remote whose `main` holds A, B and C (the spec's a1b2c3d, b2c3d4e,
+    /// c3d4e5f), all fetched into the project. Returns (dir, url, A, B, C).
+    async fn three_commit_remote(
+        e: &Env,
+        label: &str,
+    ) -> (std::path::PathBuf, String, String, String, String) {
+        let (dir, url, a) = cloned_remote(e, label).await;
+        let b = advance_bare_remote(&dir, "refs/heads/main", "b\n");
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        call_fetch_branch(e, &url, "anonymous").await.unwrap();
+        (dir, url, a, b, c)
+    }
+
+    /// The state of SPEC-0054/E2E-001: local `v1.0` at A, `v1.1` at B, `v0.9`
+    /// at C, the remote holding `v0.9` identically.
+    async fn first_journey(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
+        let (dir, _, a, b, c) = three_commit_remote(e, label).await;
+        tag(e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        tag(e, json!({"name": "v0.9", "target": c})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v0.9", &c);
+        (dir, a, b)
+    }
+
+    /// SPEC-0054/E2E-001: the preview lists every tag and sends nothing.
+    #[tokio::test]
+    async fn e2e_tag_001_publish_all_preview_lists_every_tag_and_sends_nothing() {
+        let e = Env::new().await;
+        let (dir, _, _) = first_journey(&e, "remote-p001").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let out = preview_all(&e).await;
+
+        assert_eq!(names(&out["lines"]), ["v0.9 up to date", "v1.0 to publish", "v1.1 to publish"]);
+        assert_eq!(out["message"], count_line(2));
+        assert_eq!((out["to_publish"].clone(), out["sent"].clone()), (json!(2), json!(false)));
+        assert_eq!(out["published"], 0);
+        assert_eq!(bare_refs(&dir), before, "nothing was sent");
+        assert_eq!(audit_count(&e), audit, "no audit entry");
+    }
+
+    /// SPEC-0054/E2E-002: the confirmed send publishes the due tags only.
+    #[tokio::test]
+    async fn e2e_tag_002_publish_all_confirmed_send_publishes_the_due_tags() {
+        let e = Env::new().await;
+        let (dir, a, b) = first_journey(&e, "remote-p002").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        let local = tag_list(&e).await;
+
+        let out = confirm_all(&e, json!(2)).await;
+
+        assert_eq!(names(&out["lines"]), ["v0.9 up to date", "v1.0 published", "v1.1 published"]);
+        assert_eq!(out["message"], "");
+        assert_eq!((out["published"].clone(), out["sent"].clone()), (json!(2), json!(true)));
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a), ("v1.1", &b)]));
+        assert_eq!(tag_list(&e).await, local, "the local tags are unchanged");
+        assert_eq!(publish_audit(&e, OWNER).len(), 2);
+        assert_eq!(audit_count(&e), audit + 2, "exactly two new entries, both by Alice");
+    }
+
+    /// SPEC-0054/E2E-003: annotated tags keep their kind and message.
+    #[tokio::test]
+    async fn e2e_tag_003_publish_all_annotated_tags_keep_kind_and_message() {
+        let e = Env::new().await;
+        let (dir, _, a, b, _) = three_commit_remote(&e, "remote-p003").await;
+        tag(&e, json!({"name": "v2.0", "target": a, "message": "Release 2.0"})).await.unwrap();
+        tag(&e, json!({"name": "v2.1", "target": b})).await.unwrap();
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), ["v2.0 to publish", "v2.1 to publish"]);
+        let out = confirm_all(&e, json!("2")).await;
+
+        assert_eq!(names(&out["lines"]), ["v2.0 published", "v2.1 published"]);
+        let remote = git2::Repository::open_bare(&dir).unwrap();
+        let v20 =
+            remote.find_reference("refs/tags/v2.0").unwrap().peel(git2::ObjectType::Tag).unwrap();
+        let v20 = v20.as_tag().unwrap();
+        assert_eq!(v20.message_bytes(), Some(b"Release 2.0".as_slice()));
+        assert_eq!(v20.target_id().to_string(), a);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.1").as_deref(), Some(b.as_str()));
+        let v21 = remote.find_reference("refs/tags/v2.1").unwrap().target().unwrap();
+        assert!(remote.find_commit(v21).is_ok(), "v2.1 stays lightweight");
+    }
+
+    /// SPEC-0054/E2E-004: a single tag due.
+    #[tokio::test]
+    async fn e2e_tag_004_publish_all_a_single_tag_due() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p004").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), ["v1.0 to publish"]);
+        assert_eq!(preview["message"], count_line(1));
+
+        let out = confirm_all(&e, json!(1)).await;
+        assert_eq!(names(&out["lines"]), ["v1.0 published"]);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+    }
+
+    /// SPEC-0054/E2E-005: a named remote; the other remote is untouched.
+    #[tokio::test]
+    async fn e2e_tag_005_publish_all_a_named_remote() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-p005").await;
+        let backup = e.f.dir.path().join("remote-p005-backup");
+        git2::build::RepoBuilder::new().bare(true).clone(&url, &backup).unwrap();
+        track_remote(&e, "backup", &format!("file://{}", backup.display())).await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+
+        let preview = call_publish_all_tags(&e, "backup", None).await.unwrap();
+        assert_eq!(preview["message"], count_line(1));
+        let out = call_publish_all_tags(&e, "backup", Some(json!(1))).await.unwrap();
+
+        assert_eq!(names(&out["lines"]), ["v1.0 published"]);
+        assert_eq!(out["remote"], "backup");
+        assert_eq!(bare_ref_sha(&backup, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None, "origin has no v1.0");
+    }
+
+    /// SPEC-0054/E2E-006: the order is by name, byte by byte.
+    #[tokio::test]
+    async fn e2e_tag_006_publish_all_order_is_by_name_byte_by_byte() {
+        let e = Env::new().await;
+        let (_, _, a) = cloned_remote(&e, "remote-p006").await;
+        for name in ["v1", "été", "alpha", "Zeta"] {
+            tag(&e, json!({"name": name, "target": a})).await.unwrap();
+        }
+
+        let out = preview_all(&e).await;
+
+        let order = ["Zeta to publish", "alpha to publish", "v1 to publish", "été to publish"];
+        assert_eq!(names(&out["lines"]), order);
+    }
+
+    /// SPEC-0054/E2E-007: a private mark is seen, removed, and not published.
+    #[tokio::test]
+    async fn e2e_tag_007_publish_all_a_private_mark_is_removed_and_not_published() {
+        let e = Env::new().await;
+        let (dir, _, a, b, _) = three_commit_remote(&e, "remote-p007").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "wip-alice", "target": b})).await.unwrap();
+
+        let first = preview_all(&e).await;
+        assert!(names(&first["lines"]).contains(&"wip-alice to publish".to_string()), "{first}");
+        untag_as(&e, OWNER, "wip-alice").await.unwrap();
+        let second = preview_all(&e).await;
+        assert_eq!(second["message"], count_line(1));
+        confirm_all(&e, json!(1)).await;
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/wip-alice"), None);
+    }
+
+    /// SPEC-0054/E2E-017: the project tracks no remote.
+    #[tokio::test]
+    async fn e2e_tag_017_publish_all_project_tracks_no_remote() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p017").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        untrack_every_remote(&e).await;
+        let before = bare_refs(&dir);
+
+        for confirm in [None, Some(json!(1))] {
+            let err = call_publish_all_tags(&e, "origin", confirm).await.unwrap_err();
+            assert_eq!(
+                (err.code, err.message),
+                (code::NOT_FOUND, "Cannot publish tags: this project tracks no remote.".into())
+            );
+        }
+        assert_eq!(bare_refs(&dir), before);
+    }
+
+    /// SPEC-0054/E2E-018: a named remote the project does not track, names
+    /// compared exactly.
+    #[tokio::test]
+    async fn e2e_tag_018_publish_all_named_remote_not_tracked() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p018").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        for remote in ["staging", "Origin"] {
+            let err = call_publish_all_tags(&e, remote, None).await.unwrap_err();
+            let text = format!(
+                "Cannot publish tags: this project does not track a remote named '{remote}'."
+            );
+            assert_eq!((err.code, err.message), (code::NOT_FOUND, text));
+        }
+        assert_eq!(bare_refs(&dir), before, "origin is untouched");
+    }
+
+    /// SPEC-0054/E2E-019: a non member can neither probe nor publish, and
+    /// learns no tag name.
+    #[tokio::test]
+    async fn e2e_tag_019_publish_all_non_member_cannot_probe_or_publish() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p019").await;
+        tag(&e, json!({"name": "secret-release", "target": a})).await.unwrap();
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        for extra in [json!({}), json!({"confirm_count": 1})] {
+            let err = publish_all_by_tool(&e, MALLORY, extra).await.unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN);
+            assert_eq!(err.message, format!("'{MALLORY}' is not a member of '{MOUNT}'"));
+            assert!(!err.message.contains("secret-release"));
+        }
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-027: a name with a slash.
+    #[tokio::test]
+    async fn e2e_tag_027_publish_all_a_name_with_a_slash() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p027").await;
+        tag(&e, json!({"name": "release/1.0", "target": a})).await.unwrap();
+
+        assert_eq!(preview_all(&e).await["message"], count_line(1));
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), ["release/1.0 published"]);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/release/1.0").as_deref(), Some(a.as_str()));
+    }
+
+    /// SPEC-0054/E2E-030: one audit line per tag sent, with the full id.
+    #[tokio::test]
+    async fn e2e_tag_030_publish_all_audit_lines() {
+        let e = Env::new().await;
+        let (_, _, a, b, _) = three_commit_remote(&e, "remote-p030").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        let audit = audit_count(&e);
+
+        confirm_all(&e, json!(2)).await;
+
+        assert_eq!(
+            publish_audit(&e, OWNER),
+            vec![published_line("v1.0", &a), published_line("v1.1", &b)]
+        );
+        assert_eq!(audit_count(&e), audit + 2, "no other entry");
+    }
+
+    /// SPEC-0054/E2E-031: no audit for an up to date tag.
+    #[tokio::test]
+    async fn e2e_tag_031_publish_all_no_audit_for_an_up_to_date_tag() {
+        let e = Env::new().await;
+        let (dir, _, a, _, c) = three_commit_remote(&e, "remote-p031").await;
+        tag(&e, json!({"name": "v0.9", "target": c})).await.unwrap();
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v0.9", &c);
+        let audit = audit_count(&e);
+
+        confirm_all(&e, json!(1)).await;
+
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v1.0", &a)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0054/E2E-032: no audit for a preview, a wrong number or a non
+    /// member.
+    #[tokio::test]
+    async fn e2e_tag_032_publish_all_no_audit_for_any_refusal_or_preview() {
+        let e = Env::new().await;
+        let (dir, _, a, b, _) = three_commit_remote(&e, "remote-p032").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        preview_all(&e).await;
+        assert_eq!(audit_count(&e), audit);
+        let wrong = call_publish_all_tags(&e, "origin", Some(json!(3))).await.unwrap_err();
+        assert!(wrong.message.starts_with("Tags to publish: 2, not 3."), "{}", wrong.message);
+        assert_eq!(audit_count(&e), audit);
+        let outsider = publish_all_by_tool(&e, MALLORY, json!({})).await.unwrap_err();
+        assert!(outsider.message.contains("is not a member of"), "{}", outsider.message);
+        assert_eq!(audit_count(&e), audit);
+        assert_eq!(bare_refs(&dir), before);
+    }
+
+    /// SPEC-0054/E2E-034: only tags are sent, never the branch ahead.
+    #[tokio::test]
+    async fn e2e_tag_034_publish_all_only_tags_are_sent() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p034").await;
+        e.write("/b.txt", "b\n").await;
+        let b = e.commit("B").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        confirm_all(&e, json!(1)).await;
+
+        assert_eq!(bare_ref_sha(&dir, "refs/heads/main").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a)]));
+        let remote = git2::Repository::open_bare(&dir).unwrap();
+        assert!(remote.find_commit(git2::Oid::from_str(&b).unwrap()).is_err(), "B never sent");
+    }
+
+    /// SPEC-0054/E2E-058: an empty remote name means origin.
+    #[tokio::test]
+    async fn e2e_tag_058_publish_all_an_empty_remote_name_means_origin() {
+        let e = Env::new().await;
+        let (_, url, a) = cloned_remote(&e, "remote-p058").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+
+        let out = call_publish_all_tags(&e, "", None).await.unwrap();
+        assert_eq!(names(&out["lines"]), ["v1.0 to publish"]);
+        assert_eq!(out["message"], count_line(1));
+
+        untrack_every_remote(&e).await;
+        track_remote(&e, "backup", &url).await;
+        let err = call_publish_all_tags(&e, "", None).await.unwrap_err();
+        let text = "Cannot publish tags: this project does not track a remote named 'origin'.";
+        assert_eq!((err.code, err.message), (code::NOT_FOUND, text.to_string()));
     }
 }

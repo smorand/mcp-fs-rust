@@ -2,7 +2,7 @@
 
 ## Overview
 A **streamable-HTTP MCP server** exposing a **simulated
-multi-project filesystem** (115 tools: 45 `fs.*`, 17 `admin.*`, 43 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
+multi-project filesystem** (116 tools: 45 `fs.*`, 17 `admin.*`, 44 `git.*`, 4 `git.auth*`, 6 `git.pr_*`;
 + 4 `search.*` when search enabled),
 a REST data plane at `/api/fs` with OpenAPI at `/api/swagger.json` and Swagger UI at
 `/api/docs`, and an optional Git HTTP smart server at `/git/{mount_id}/` with push,
@@ -10,7 +10,8 @@ fetch and pull against any declared host (including GitHub Enterprise), a per-ho
 token store, a browser token screen at `/app/tokens`, and a browser screen at
 `/app/deleted-projects` listing soft-deleted projects with an undelete action. Git tags are
 supported: create (plain or annotated), delete, publish one tag, receive on fetch, pull and clone,
-each change audited in one line (SPEC-0052). Ships with `agent`, an
+each change audited in one line (SPEC-0052); every due tag can be previewed then
+published in one guarded push (`git.remote_push_tags`, SPEC-0054). Ships with `agent`, an
 interactive CLI agent that drives the tools through an LLM (`./agent.sh`).
 
 Server state (metadata tree, ACL, git index, OAuth tokens) lives in a relational store:
@@ -84,7 +85,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   wrapping `mcp::server::McpServer`, `LocalSessionManager` + `legacy_session_mode: true` so
   `initialize` is mandatory; see `.agent_docs/architecture.md` for the exact wire shapes), `/health`.
 - `mcp/` : `server.rs` only — `McpServer`, one `#[tool]` method per entry in `TOOL_CONTRACT.txt`
-  (115 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
+  (116 tools, `#[tool_router]`), each calling the same `core::fs_ops`/engine function the REST plane
   calls, never reimplementing an operation. The hand-rolled JSON-RPC/SSE framing layer this module
   used to own (`ToolRegistry`/`ToolSchema`/`Args`/`ToolHandler`) is gone (SPEC-0013); what remains
   of that machinery lives at `tools::registry_support`, kept only because `Args`/`ToolCtx` are the
@@ -119,7 +120,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the
   REST plane); `register(&mut ToolRegistry)` survives only as `#[cfg(test)]`-gated glue for the
   shared test harness, except the five optional families (`web`/`context7`/`sqlite`/`db`/`doc`,
-  off by default, not part of the 115-tool contract), whose `register()`/`catalog()` are genuine
+  off by default, not part of the 116-tool contract), whose `register()`/`catalog()` are genuine
   production code backing `/api/swagger.json`. `catalog.rs` holds the transport-agnostic
   `ToolCatalogEntry` shape; `all.rs` has the now-test-only `register_all`. `trash.rs` holds
   `fs.trash_list`/`fs.trash_restore` (SPEC-0011): the backfill of untracked trash nodes into
@@ -135,7 +136,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `git_tags.rs` holds the tag engines (SPEC-0052): `git.tags`, `git.tag_create`, `git.tag_delete`,
   `git.remote_push_tag` (one tag, never a commit, overwrite only with `expected_remote_commit`),
   `git.remote_delete_tag` (SPEC-0053: delete one remote tag, only after the member states its commit
-  in `expected_remote_commit`; local tags untouched; audit `git.tag_remote_delete`)
+  in `expected_remote_commit`; local tags untouched; audit `git.tag_remote_delete`),
+  `git.remote_push_tags` (SPEC-0054: preview every local tag's outcome, then send the due ones in
+  one push of creation refspecs leased on "absent" once `confirm_count` equals their count)
   and `reconcile_incoming_tags`, which fetch, pull and clone call to add `tags_added`/`tags_kept_local`.
   `diff_files.rs` holds `fs.diff_files` (SPEC-0045): unified diff of two text files, possibly in
   two projects (both must be readable), also served by `GET /api/fs/diff`; the diff runs in
@@ -165,7 +168,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `mcp.rs` (stateless JSON-RPC, fuzzy tool name resolution), `llm.rs` (OpenAI compatible
   streaming with tool calling), `input.rs` (wrap aware line editor), `ui.rs` (markdown to
   ANSI), `spinner.rs`, `session.rs`. Config: `config/agent_test.yaml`.
-- `TOOL_CONTRACT.txt` : the 115 tool schemas and return shapes, human readable. **This is
+- `TOOL_CONTRACT.txt` : the 116 tool schemas and return shapes, human readable. **This is
   the authoritative contract.**
 - `tool-contract-golden.json` : the same contract, machine checked. Three tests compare
   every name, description and `inputSchema` against it, serialized, so a reordered schema
@@ -239,7 +242,7 @@ The backlog is the `backlog/` directory: one `BL-NNNN_slug.md` file per item.
 ## Documentation index
 - `.agent_docs/architecture.md` : storage model, project usage and quota admission, document
   artifact store, request lifecycle, safety, error logging.
-- `.agent_docs/tools.md` : the 115 tool reference (families, parameters, authorization).
+- `.agent_docs/tools.md` : the 116 tool reference (families, parameters, authorization).
 - `.agent_docs/api.md` : the `/api/fs` REST plane and the OpenAPI single source of truth.
 - `.agent_docs/git.md` : git objects in the blob store, HTTP smart protocol, the
   `git.hosts` host map, OAuth/PAT tokens (per person+host), the remote pipeline
