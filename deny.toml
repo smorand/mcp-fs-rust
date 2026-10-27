@@ -40,3 +40,6 @@ deny = []
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# The one git source: datafusion is pinned to a main revision until a release
+# carries arrow 60 and zstd 0.14 (SPEC-0055, BL-0089).
+allow-git = ["https://github.com/apache/datafusion"]

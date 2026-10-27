@@ -321,3 +321,53 @@ fn lockfile_pins_the_fixed_webpki_releases() {
         );
     }
 }
+
+/// SPEC-0055/DT-020: the vulnerable zstd family is read from the lockfile
+/// text, so the floor holds even when the advisory database stops listing it.
+#[test]
+fn lockfile_holds_no_zstd_below_the_fixed_releases() {
+    for (name, min) in [("zstd", (0, 14, 3)), ("zstd-safe", (8, 2, 0)), ("zstd-sys", (2, 1, 2))] {
+        let found = lock_packages(name);
+        assert!(!found.is_empty(), "{name} absent from Cargo.lock");
+        for v in &found {
+            // `zstd-sys` carries build metadata (`2.1.2+zstd.1.5.7`), dropped here.
+            let core = v.split('+').next().unwrap_or(v);
+            assert!(semver_triple(core) >= min, "{name} {v} is below the fixed release {min:?}");
+        }
+    }
+}
+
+/// SPEC-0055/DT-022: exactly one git source is allowed, the datafusion
+/// repository, so the pinned revision is the only exception to `unknown-git`.
+#[test]
+fn deny_toml_allows_only_the_datafusion_git_source() {
+    let raw = fs::read_to_string(repo_root().join("deny.toml")).expect("deny.toml");
+    let lines: Vec<&str> =
+        raw.lines().filter(|l| l.trim_start().starts_with("allow-git")).collect();
+    assert_eq!(lines.len(), 1, "exactly one allow-git line: {lines:?}");
+    let entries: Vec<&str> = lines[0]
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inside, _)| inside)
+        .expect("allow-git array on one line")
+        .split(',')
+        .map(|e| e.trim().trim_matches('"'))
+        .filter(|e| !e.is_empty())
+        .collect();
+    assert_eq!(entries, vec!["https://github.com/apache/datafusion"]);
+    assert!(raw.contains("unknown-git = \"deny\""), "unknown-git must stay deny");
+}
+
+/// SPEC-0055/DT-024: the datafusion option type was renamed upstream; no
+/// source still names the old one.
+#[test]
+fn no_source_names_the_old_ndjson_option_type() {
+    // Built by concat so this file does not itself contain the name it forbids.
+    let old = concat!("NdJson", "ReadOptions");
+    let mut files = Vec::new();
+    rust_and_doc_files(&repo_root().join("crates"), &mut files);
+    for f in files.iter().filter(|p| p.extension().is_some_and(|e| e == "rs")) {
+        let text = fs::read_to_string(f).expect("read file");
+        assert!(!text.contains(old), "{} still names {old}", f.display());
+    }
+}

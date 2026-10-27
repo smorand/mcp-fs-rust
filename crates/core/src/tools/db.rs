@@ -90,12 +90,34 @@ async fn register_from_bytes(
                 .map_err(|e| ToolError::internal(format!("register parquet: {e}")))?;
         }
         FileFormat::Json | FileFormat::Ndjson => {
-            ctx.register_json(tname, &path_str, NdJsonReadOptions::default())
+            ctx.register_json(tname, &path_str, JsonReadOptions::default())
                 .await
                 .map_err(|e| ToolError::internal(format!("register json: {e}")))?;
         }
     }
     Ok(tmp)
+}
+
+/// Session with the SQL string mapping of datafusion 43: `CAST(.. AS VARCHAR)`
+/// yields `Utf8`, so `db.profile` min and max stay rendered text (SPEC-0055 DR-009).
+/// Since datafusion 49 the default maps VARCHAR to `Utf8View`, which
+/// `arrow_value_to_json` renders as the placeholder `<Utf8View>`.
+fn session() -> SessionContext {
+    let mut config = SessionConfig::new();
+    config.options_mut().sql_parser.map_string_types_to_utf8view = false;
+    SessionContext::new_with_config(config)
+}
+
+/// The `SQL error` text of datafusion 43. Newer sqlparser releases append the
+/// token position (` at Line: 1, Column: 1`) to parser errors; it is dropped so
+/// the message a caller sees is unchanged (SPEC-0055 DR-009).
+fn sql_error(e: datafusion::error::DataFusionError) -> ToolError {
+    static POSITION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // A literal pattern known to compile: the expect cannot fire.
+        regex::Regex::new(r" at Line: \d+, Column: \d+").expect("valid position pattern")
+    });
+    let text = e.to_string();
+    ToolError::invalid_argument(format!("SQL error: {}", POSITION.replace_all(&text, "")))
 }
 
 fn cap_rows(requested: i64, config_max: usize) -> usize {
@@ -279,13 +301,13 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             let fmt = detect_format(&path)?;
             let tname = table_name(&path);
 
-            let df_ctx = SessionContext::new();
+            let df_ctx = session();
             let _tmp = register_from_bytes(&df_ctx, &tname, fmt, &bytes).await?;
 
             let batches = df_ctx
                 .sql(&sql)
                 .await
-                .map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?
+                .map_err(sql_error)?
                 .collect()
                 .await
                 .map_err(|e| ToolError::internal(format!("collect: {e}")))?;
@@ -319,14 +341,14 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             let fmt = detect_format(&path)?;
             let tname = table_name(&path);
 
-            let df_ctx = SessionContext::new();
+            let df_ctx = session();
             let _tmp = register_from_bytes(&df_ctx, &tname, fmt, &bytes).await?;
 
             let sql = format!("SELECT * FROM \"{tname}\" LIMIT 0");
             let df_schema = df_ctx
                 .sql(&sql)
                 .await
-                .map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?;
+                .map_err(sql_error)?;
             let schema = df_schema.schema().inner().clone();
 
             let cols: Vec<Value> = schema
@@ -372,7 +394,7 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             let fmt = detect_format(&path)?;
             let tname = table_name(&path);
 
-            let df_ctx = SessionContext::new();
+            let df_ctx = session();
             let _tmp = register_from_bytes(&df_ctx, &tname, fmt, &bytes).await?;
 
             // Get schema
@@ -480,14 +502,14 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             let fmt = detect_format(&path)?;
             let tname = table_name(&path);
 
-            let df_ctx = SessionContext::new();
+            let df_ctx = session();
             let _tmp = register_from_bytes(&df_ctx, &tname, fmt, &bytes).await?;
 
             let sql = format!("SELECT * FROM \"{tname}\" LIMIT {n}");
             let batches = df_ctx
                 .sql(&sql)
                 .await
-                .map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?
+                .map_err(sql_error)?
                 .collect()
                 .await
                 .map_err(|e| ToolError::internal(format!("collect: {e}")))?;
@@ -532,14 +554,14 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
             let dst_fmt = detect_format(&dst_path)?;
             let tname = table_name(&src_path);
 
-            let df_ctx = SessionContext::new();
+            let df_ctx = session();
             let _tmp = register_from_bytes(&df_ctx, &tname, src_fmt, &bytes).await?;
 
             let sql = format!("SELECT * FROM \"{tname}\"");
             let batches = df_ctx
                 .sql(&sql)
                 .await
-                .map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?
+                .map_err(sql_error)?
                 .collect()
                 .await
                 .map_err(|e| ToolError::internal(format!("collect: {e}")))?;
