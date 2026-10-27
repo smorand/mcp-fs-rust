@@ -3,16 +3,20 @@
 > Spec: SPEC-0055 (sdlc/specs/SPEC-0055-datafusion-and-zstd-upgrade/)
 > Nature: DEBT
 > Priority: P1
-> Depends on: US-0102
+> Depends on: US-0101
 > min_tier: 1
 > Files touched: 5
 > Closes spec: no
 
 ## Objective
+AMENDED 2026-10-27 (design amendment after US-0102 was blocked): this story also carries the tantivy bump of the former US-0102 (DR-002, DR-011, DT-031). Reason: `parquet 53` pins `zstd-sys <2.0.14` while tantivy 0.27 needs `zstd 0.14`, so tantivy 0.27 cannot resolve until parquet is at 60. Order inside the story: datafusion, arrow and parquet first (the probe resolved with `tantivy 0.26`), then tantivy.
+
 Move datafusion to the pinned git revision with arrow 60 and parquet 60, rename the option type, allow the single git source in `deny.toml`, and prove the old zstd is gone. DT-001 to DT-011 recorded in the first story are the oracle: where a datafusion difference changes an output, restore the old output in code and never edit an expectation (DEC-006). The security step of `make check` becomes green here. Decision density is high (lockfile regeneration, output restoration), hence tier 1.
 
 ## Requirements covered
 - SPEC-0055/DR-001: The workspace SHALL depend on datafusion from the git repository `https://github.com/apache/datafusion` at revision `6f1436fe1407495019d8afec8a9f55663f418d9a`, on arrow `60` and on parquet `60`.
+- SPEC-0055/DR-002: The workspace SHALL depend on tantivy `0.27`.
+- SPEC-0055/DR-011: IF DT-030 shows that a tantivy 0.26 index does not open under 0.27, THEN the change SHALL NOT land and the incompatibility SHALL be handled as a declared break decided by the user (Section 7).
 - SPEC-0055/DR-003: The `db` tool family SHALL register NDJSON files with `JsonReadOptions`.
 - SPEC-0055/DR-004: The lockfile SHALL NOT contain a `zstd` package below 0.14.3, a `zstd-safe` package below 8.2.0 or a `zstd-sys` package below 2.1.2.
 - SPEC-0055/DR-005: The dependency policy file SHALL allow the git source `https://github.com/apache/datafusion` and no other git source.
@@ -26,6 +30,7 @@ Move datafusion to the pinned git revision with arrow 60 and parquet 60, rename 
 ### Decisions
 - DEC-001 (SPEC-0055): Depend on datafusion by git revision `6f1436fe1407495019d8afec8a9f55663f418d9a` (apache/datafusion main, committed 2026-10-27, workspace version 55.1.0) with arrow 60 and parquet 60. **Alternatives considered:** (a) datafusion 55.2.0 from crates.io plus advisory ignores (rejected: it keeps zstd 0.13 because arrow 59 requires `zstd ^0.13`; nothing is removed); (b) vendored `[patch]` copies of `arrow-ipc` and `parquet` with zstd 0.14 (rejected: large copies in the repository); (c) waiting for a release (rejected: the audit gate is red on main now). **Rationale:** the only way to remove the vulnerable code today, chosen by the user. **Implemented by:** DR-001. **Evidence:** `Cargo.toml:123`; crates.io `datafusion` max version 55.2.0; apache/datafusion `Cargo.toml` (`arrow = 60.0.0`, `zstd = 0.14`).
 - DEC-002 (SPEC-0055): arrow and parquet are direct dependencies at 60 so they unify with the versions datafusion main uses. **Alternatives considered:** letting datafusion bring them in (rejected: `crates/core/Cargo.toml:89-90` depends on both directly). **Implemented by:** DR-001. **Evidence:** `Cargo.toml:124-125`.
+- DEC-003 (SPEC-0055): Upgrade tantivy to 0.27. **Alternatives considered:** `default-features = false` without `zstd-compression` (rejected: it would change which stored field compressors can be read; the upgrade keeps all); staying on 0.26 with an ignore (rejected: the user asked to remove zstd 0.13). **Implemented by:** DR-002. **Evidence:** `Cargo.toml:88`; tantivy 0.27.0 CHANGELOG (breaking changes concern APIs this code does not use: it compiled unchanged).
 - DEC-004 (SPEC-0055): Allow exactly one git source in `deny.toml`, the repository URL without a wildcard; the revision stays pinned by `Cargo.toml` and `Cargo.lock`. **Alternatives considered:** `unknown-git = "warn"` (rejected: weakens the gate for every future dependency). **Implemented by:** DR-005. **Evidence:** `deny.toml:40-42`.
 - DEC-006 (SPEC-0055): The characterization tests are written first, recorded on datafusion 43, and become the oracle: where datafusion 55 differs, the code restores the old output; a test expectation is never edited. A difference that cannot be restored is an F finding for the user (a declared break). **Alternatives considered:** accepting new outputs (rejected: smuggles behaviour change into a DEBT). **Implemented by:** DR-009. **Evidence:** `crates/core/src/tools/db.rs:585-703` (8 tests, thin).
 - DEC-007 (SPEC-0055): `cargo update` is limited to the four packages (`cargo update -p datafusion -p arrow -p parquet -p tantivy`) so unrelated crates keep their locked versions. **Alternatives considered:** a full `cargo update` (rejected: the probe changed about 1900 lockfile lines and mixes unrelated upgrades into a security move). **Implemented by:** DR-001, DR-002. **Evidence:** probe diff on a scratch branch.
@@ -40,7 +45,7 @@ All internal; the `db.*` and `search.*` tool contracts are invariant (DR-009, DR
 ### Paths
 | Path | Action |
 |---|---|
-| `Cargo.toml` | modify (lines 123-125) |
+| `Cargo.toml` | modify (lines 88, 123-125) |
 | `Cargo.lock` | regenerate for datafusion, arrow, parquet only |
 | `crates/core/src/tools/db.rs` | modify (line 93 rename; restore old outputs if a characterized one changed) |
 | `deny.toml` | modify ([sources] allow-git) |
@@ -72,9 +77,14 @@ All internal; the `db.*` and `search.*` tool contracts are invariant (DR-009, DR
 - Level / Driver / Location: structural / file and command assertion / `crates/mcp-fs/tests/security_gate.rs`
 - **Covers:** DR-012, all occurrences. **Driver:** the existing `make_security_passes` (`security_gate.rs:21`) goes green on the new set; no edit.
 
+### SPEC-0055/DT-031: search e2e unmodified
+- Level / Driver / Location: integration / direct call to the search backend / `crates/core/src/search/bm25_sqlite.rs` tests module and search e2e
+- **Validates:** DR-009 on the search family
+- Given the 161 tests of `crates/core/src/search/e2e.rs`, When they run on the new dependency set, Then all pass with no edit.
+
 ## Constraints
 - Files not to touch: `.cargo/audit.toml` (the ignore cleanup is US-0104), the characterization tests of US-0101 (never edit an expectation).
-- Dependencies not to add: none besides the git source for datafusion (DEC-001); `cargo update` limited to `-p datafusion -p arrow -p parquet` (DEC-007).
+- Dependencies not to add: none besides the git source for datafusion (DEC-001); `cargo update` limited to `-p datafusion -p arrow -p parquet -p tantivy` (DEC-007).
 - Patterns to avoid: a wildcard git allowance; `unknown-git = "warn"`.
 - Scope boundary: documentation and ignore cleanup belong to US-0104. If an output cannot be restored, stop and ask (declared break).
 

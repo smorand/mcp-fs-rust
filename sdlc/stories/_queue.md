@@ -100,7 +100,7 @@
 | US-0098 | SPEC-0054 | tags that are skipped, refused or changed on the remote | US-0097 | 1 | todo | | |
 | US-0099 | SPEC-0054 | connection failures, concurrency, paused operations and cost | US-0098 | 2 | todo | | |
 | US-0100 | SPEC-0054 | single publish unchanged, documentation and spec close | US-0098, US-0099 | 2 | todo | | |
-| US-0101 | SPEC-0055 | characterize the db family and the tantivy index before any upgrade | main | 2 | todo | | |
-| US-0102 | SPEC-0055 | upgrade tantivy to 0.27 | US-0101 | 2 | todo | | |
-| US-0103 | SPEC-0055 | upgrade datafusion, arrow and parquet and remove the old zstd | US-0102 | 1 | todo | | |
+| US-0101 | SPEC-0055 | characterize the db family and the tantivy index before any upgrade | main | 2 | landed | story/US-0101-characterize-the-db-family-and-the-tantivy-index | main |
+| US-0102 | SPEC-0055 | upgrade tantivy to 0.27 | US-0101 | 2 | skipped | | |
+| US-0103 | SPEC-0055 | upgrade datafusion, arrow and parquet and remove the old zstd | US-0101 | 1 | todo | | |
 | US-0104 | SPEC-0055 | stale ignores, pin documentation and spec close | US-0103 | 2 | todo | | |

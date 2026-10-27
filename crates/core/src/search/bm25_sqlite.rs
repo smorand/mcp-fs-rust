@@ -448,4 +448,36 @@ mod tests {
         assert!(s1.bm25_warm);
         assert!(s1.bm25_docs > 0);
     }
+
+    /// Copy a directory tree, so a test never opens the committed fixture in
+    /// place (opening for write would modify it).
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    /// SPEC-0055/DT-030: an index written by tantivy 0.26 (alpha.md "hello world",
+    /// beta.md "goodbye moon", the backend's own schema) still opens and answers.
+    #[tokio::test]
+    async fn spec_0055_dt_030_tantivy_0_26_index_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/search/fixtures/tantivy_0_26");
+        copy_dir(&fixture, &dir.path().join("vol"));
+        let b = TantivyBm25Backend::new(dir.path().to_str().unwrap());
+
+        let hello = b.query_bm25("vol", "hello", 10).await.unwrap();
+        assert_eq!(hello.len(), 1);
+        assert_eq!(hello[0].path, "alpha.md");
+        assert_eq!(hello[0].chunk, "hello world");
+        assert_eq!(hello[0].rank, 1);
+
+        let moon = b.query_bm25("vol", "moon", 10).await.unwrap();
+        assert_eq!(moon.len(), 1);
+        assert_eq!(moon[0].path, "beta.md");
+        assert_eq!(moon[0].chunk, "goodbye moon");
+    }
 }

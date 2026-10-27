@@ -693,6 +693,340 @@ mod tests {
         assert_eq!(result["row_count"], 5);
     }
 
+    const CSV: &str = "id,name,score\n1,Alice,1.5\n2,Bob,2.5\n3,Carol,4.0\n";
+    const NDJSON: &str = "{\"id\":1,\"name\":\"Alice\",\"score\":1.5}\n{\"id\":2,\"name\":\"Bob\",\"score\":2.5}\n{\"id\":3,\"name\":\"Carol\",\"score\":4.0}\n";
+
+    async fn db_harness() -> crate::tools::testkit::Harness {
+        crate::tools::testkit::harness_with_extra(|reg, cfg| {
+            register(reg, &cfg.db);
+        })
+        .await
+    }
+
+    /// Harness holding `/t.csv`, `/t.parquet` (via db.convert) and `/t.ndjson`
+    /// (seeded), all with the same three rows.
+    async fn three_row_harness() -> crate::tools::testkit::Harness {
+        let h = db_harness().await;
+        h.seed("/t.csv", CSV).await;
+        h.seed("/t.ndjson", NDJSON).await;
+        h.call(
+            "db.convert",
+            json!({"mount_id": crate::tools::testkit::MOUNT, "src_path": "/t.csv", "dst_path": "/t.parquet"}),
+        )
+        .await
+        .unwrap();
+        h
+    }
+
+    async fn call_on(
+        h: &crate::tools::testkit::Harness,
+        tool: &str,
+        path: &str,
+        extra: Value,
+    ) -> Result<Value> {
+        let mut args = json!({"mount_id": crate::tools::testkit::MOUNT, "path": path});
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        h.call(tool, args).await
+    }
+
+    fn three_rows() -> Value {
+        json!({
+            "columns": ["id", "name", "score"],
+            "rows": [
+                {"id": 1, "name": "Alice", "score": 1.5},
+                {"id": 2, "name": "Bob", "score": 2.5},
+                {"id": 3, "name": "Carol", "score": 4.0}
+            ],
+            "row_count": 3
+        })
+    }
+
+    const SELECT_ALL: &str = "SELECT id, name, score FROM t ORDER BY id";
+
+    /// SPEC-0055/DT-001
+    #[tokio::test]
+    async fn spec_0055_dt_001_query_aggregate_on_csv() {
+        let h = three_row_harness().await;
+        let r = call_on(
+            &h,
+            "db.query",
+            "/t.csv",
+            json!({"sql": "SELECT count(*) AS n, sum(score) AS total FROM t"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r,
+            json!({"columns": ["n", "total"], "rows": [{"n": 3, "total": 8.0}], "row_count": 1})
+        );
+    }
+
+    /// SPEC-0055/DT-002. Recorded on datafusion 43: a Parquet written by
+    /// db.convert reads its string column back as `Utf8View`, which the row
+    /// serializer renders as the placeholder `<Utf8View>`. DR-009 keeps that.
+    #[tokio::test]
+    async fn spec_0055_dt_002_query_parquet() {
+        let h = three_row_harness().await;
+        let r = call_on(&h, "db.query", "/t.parquet", json!({"sql": SELECT_ALL})).await.unwrap();
+        assert_eq!(
+            r,
+            json!({
+                "columns": ["id", "name", "score"],
+                "rows": [
+                    {"id": 1, "name": "<Utf8View>", "score": 1.5},
+                    {"id": 2, "name": "<Utf8View>", "score": 2.5},
+                    {"id": 3, "name": "<Utf8View>", "score": 4.0}
+                ],
+                "row_count": 3
+            })
+        );
+    }
+
+    /// SPEC-0055/DT-003
+    #[tokio::test]
+    async fn spec_0055_dt_003_query_ndjson() {
+        let h = three_row_harness().await;
+        let r = call_on(&h, "db.query", "/t.ndjson", json!({"sql": SELECT_ALL})).await.unwrap();
+        assert_eq!(r, three_rows());
+    }
+
+    fn schema_of(types: [&str; 3]) -> Value {
+        json!([
+            {"name": "id", "data_type": types[0], "nullable": true},
+            {"name": "name", "data_type": types[1], "nullable": true},
+            {"name": "score", "data_type": types[2], "nullable": true}
+        ])
+    }
+
+    /// SPEC-0055/DT-004. The Parquet string column is `Utf8View` on 43.
+    #[tokio::test]
+    async fn spec_0055_dt_004_schema_type_names() {
+        let h = three_row_harness().await;
+        let csv = call_on(&h, "db.schema", "/t.csv", json!({})).await.unwrap();
+        assert_eq!(csv, schema_of(["Int64", "Utf8", "Float64"]));
+        let parquet = call_on(&h, "db.schema", "/t.parquet", json!({})).await.unwrap();
+        assert_eq!(parquet, schema_of(["Int64", "Utf8View", "Float64"]));
+        let ndjson = call_on(&h, "db.schema", "/t.ndjson", json!({})).await.unwrap();
+        assert_eq!(ndjson, schema_of(["Int64", "Utf8", "Float64"]));
+    }
+
+    fn profile_of(name_type: &str) -> Value {
+        json!({
+            "total_rows": 3,
+            "columns": [
+                {"name": "id", "type": "Int64", "non_null": 3, "distinct": 3, "min": "1", "max": "3"},
+                {"name": "name", "type": name_type, "non_null": 3, "distinct": 3, "min": "Alice", "max": "Carol"},
+                {"name": "score", "type": "Float64", "non_null": 3, "distinct": 3, "min": "1.5", "max": "4.0"}
+            ]
+        })
+    }
+
+    /// SPEC-0055/DT-005
+    #[tokio::test]
+    async fn spec_0055_dt_005_profile_csv() {
+        let h = three_row_harness().await;
+        let r = call_on(&h, "db.profile", "/t.csv", json!({})).await.unwrap();
+        assert_eq!(r, profile_of("Utf8"));
+    }
+
+    /// SPEC-0055/DT-006. Same profile as the CSV except the recorded type name
+    /// of the string column, `Utf8View`.
+    #[tokio::test]
+    async fn spec_0055_dt_006_profile_parquet() {
+        let h = three_row_harness().await;
+        let r = call_on(&h, "db.profile", "/t.parquet", json!({})).await.unwrap();
+        assert_eq!(r, profile_of("Utf8View"));
+    }
+
+    /// SPEC-0055/DT-007: the first two rows, in file order, on 43.
+    #[tokio::test]
+    async fn spec_0055_dt_007_sample_two_rows_of_ndjson() {
+        let h = three_row_harness().await;
+        let r = call_on(&h, "db.sample", "/t.ndjson", json!({"n": 2})).await.unwrap();
+        assert_eq!(
+            r,
+            json!({
+                "columns": ["id", "name", "score"],
+                "rows": [
+                    {"id": 1, "name": "Alice", "score": 1.5},
+                    {"id": 2, "name": "Bob", "score": 2.5}
+                ],
+                "row_count": 2
+            })
+        );
+    }
+
+    async fn convert(h: &crate::tools::testkit::Harness, src: &str, dst: &str) -> Value {
+        h.call(
+            "db.convert",
+            json!({"mount_id": crate::tools::testkit::MOUNT, "src_path": src, "dst_path": dst}),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// SPEC-0055/DT-008
+    #[tokio::test]
+    async fn spec_0055_dt_008_convert_csv_to_parquet_to_csv() {
+        let h = three_row_harness().await;
+        let r = convert(&h, "/t.parquet", "/back.csv").await;
+        assert_eq!(
+            r,
+            json!({"src_path": "/t.parquet", "dst_path": "/back.csv", "rows_converted": 3, "format": "csv"})
+        );
+        let text = h.client().await.read_text("/back.csv").await.unwrap();
+        assert_eq!(text, "id,name,score\n1,Alice,1.5\n2,Bob,2.5\n3,Carol,4.0\n");
+    }
+
+    /// SPEC-0055/DT-009
+    #[tokio::test]
+    async fn spec_0055_dt_009_convert_csv_to_ndjson() {
+        let h = three_row_harness().await;
+        let r = convert(&h, "/t.csv", "/out.ndjson").await;
+        assert_eq!(
+            r,
+            json!({"src_path": "/t.csv", "dst_path": "/out.ndjson", "rows_converted": 3, "format": "ndjson"})
+        );
+        let text = h.client().await.read_text("/out.ndjson").await.unwrap();
+        assert_eq!(
+            text,
+            "{\"id\":1,\"name\":\"Alice\",\"score\":1.5}\n{\"id\":2,\"name\":\"Bob\",\"score\":2.5}\n{\"id\":3,\"name\":\"Carol\",\"score\":4.0}\n"
+        );
+    }
+
+    /// SPEC-0055/DT-010. The recorded text carries no path or version noise, so
+    /// it is asserted whole.
+    #[tokio::test]
+    async fn spec_0055_dt_010_query_syntax_error_text() {
+        let h = three_row_harness().await;
+        let e = call_on(&h, "db.query", "/t.csv", json!({"sql": "SELEKT 1"})).await.unwrap_err();
+        assert_eq!(e.code, "ERR_INVALID_ARGUMENT");
+        assert_eq!(
+            e.message,
+            "SQL error: SQL error: ParserError(\"Expected: an SQL statement, found: SELEKT\")"
+        );
+    }
+
+    /// SPEC-0055/DT-011
+    #[tokio::test]
+    async fn spec_0055_dt_011_query_max_rows_caps_the_payload() {
+        let h = three_row_harness().await;
+        let r = call_on(
+            &h,
+            "db.query",
+            "/t.csv",
+            json!({"sql": "SELECT id FROM t ORDER BY id", "max_rows": 2}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(r["row_count"], 2);
+        let mut keys: Vec<&String> = r.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["columns", "row_count", "rows"]);
+        assert_eq!(r, json!({"columns": ["id"], "rows": [{"id": 1}, {"id": 2}], "row_count": 2}));
+    }
+
+    /// A Parquet file with zstd compressed pages, rows (1, Alice) and (2, Bob),
+    /// written without a dictionary so each column chunk starts with its data
+    /// page. Returns the bytes and the (start, end) of column 0's chunk.
+    fn zstd_parquet() -> (Vec<u8>, (usize, usize)) {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::{Compression, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1, 2])),
+                std::sync::Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let reader = SerializedFileReader::new(bytes::Bytes::from(out.clone())).unwrap();
+        let col = reader.metadata().row_group(0).column(0);
+        assert!(matches!(col.compression(), Compression::ZSTD(_)));
+        let (start, len) = col.byte_range();
+        (out, (start as usize, (start + len) as usize))
+    }
+
+    fn id_name_rows() -> Value {
+        json!({
+            "columns": ["id", "name"],
+            "rows": [{"id": 1, "name": "<Utf8View>"}, {"id": 2, "name": "<Utf8View>"}],
+            "row_count": 2
+        })
+    }
+
+    /// SPEC-0055/DT-040. Effect not observable by assertion (memory class); this
+    /// proves the zstd read path works. The string column renders as the
+    /// recorded `<Utf8View>` placeholder, as in DT-002.
+    #[tokio::test]
+    async fn spec_0055_dt_040_zstd_parquet_is_read() {
+        let h = db_harness().await;
+        let (bytes, _) = zstd_parquet();
+        h.client().await.write_bytes_atomic("/t.parquet", &bytes).await.unwrap();
+        let sql = json!({"sql": "SELECT id, name FROM t ORDER BY id"});
+        let first = call_on(&h, "db.query", "/t.parquet", sql.clone()).await.unwrap();
+        assert_eq!(first, id_name_rows());
+        let second = call_on(&h, "db.query", "/t.parquet", sql).await.unwrap();
+        assert_eq!(second, first);
+    }
+
+    /// SPEC-0055/DT-041. The first data page of `id` becomes the literal bytes
+    /// 22 B5 2F FD 00 00 then zeros, page header and file length untouched.
+    /// A rejection guard: the error comes from the page decode, not from the
+    /// footer, which is intact.
+    #[tokio::test]
+    async fn spec_0055_dt_041_corrupt_zstd_page_is_rejected() {
+        let h = db_harness().await;
+        let (valid, (start, end)) = zstd_parquet();
+        let client = h.client().await;
+        client.write_bytes_atomic("/t.parquet", &valid).await.unwrap();
+
+        // The page body begins at the zstd frame magic that follows the page header.
+        let body = start
+            + valid[start..end].windows(4).position(|w| w == [0x28, 0xB5, 0x2F, 0xFD]).unwrap();
+        let mut corrupt = valid.clone();
+        corrupt[body..end].fill(0);
+        corrupt[body..body + 6].copy_from_slice(&[0x22, 0xB5, 0x2F, 0xFD, 0x00, 0x00]);
+        assert_eq!(corrupt.len(), valid.len());
+        client.write_bytes_atomic("/bad.parquet", &corrupt).await.unwrap();
+
+        let err = call_on(&h, "db.query", "/bad.parquet", json!({"sql": "SELECT * FROM bad"}))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+
+        let ok = call_on(
+            &h,
+            "db.query",
+            "/t.parquet",
+            json!({"sql": "SELECT id, name FROM t ORDER BY id"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok, id_name_rows());
+    }
+
     #[test]
     fn max_file_bytes_logic() {
         // Verify the logic: a 6-byte file would be rejected with max_file_bytes=1.
