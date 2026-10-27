@@ -97,7 +97,7 @@
 | US-0095 | SPEC-0053 | documentation, round trip test and spec close | US-0093, US-0094 | 2 | landed | story/US-0095-documentation-round-trip-and-spec-close | main |
 | US-0096 | SPEC-0054 | preview and send the due tags | main | 1 | landed | story/US-0096-preview-and-send-the-due-tags | main |
 | US-0097 | SPEC-0054 | the confirmation number guard | US-0096 | 2 | landed | story/US-0097-the-confirmation-number-guard | main |
-| US-0098 | SPEC-0054 | tags that are skipped, refused or changed on the remote | US-0097 | 1 | todo | | |
+| US-0098 | SPEC-0054 | tags that are skipped, refused or changed on the remote | US-0097 | 1 | landed | story/US-0098-tags-skipped-refused-or-changed-on-the-remote | main |
 | US-0099 | SPEC-0054 | connection failures, concurrency, paused operations and cost | US-0098 | 2 | todo | | |
 | US-0100 | SPEC-0054 | single publish unchanged, documentation and spec close | US-0098, US-0099 | 2 | todo | | |
 | US-0101 | SPEC-0055 | characterize the db family and the tantivy index before any upgrade | main | 2 | landed | story/US-0101-characterize-the-db-family-and-the-tantivy-index | main |

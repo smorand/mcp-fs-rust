@@ -28288,4 +28288,326 @@ mod tests {
         assert_eq!(out["message"], count_line(2));
         assert_eq!(out["sent"], false);
     }
+
+    // ── SPEC-0054 US-0098: skipped, refused or changed on the remote ──────
+
+    const PROTECTED: &str = "protected tag name";
+
+    /// One local commit the remote never received (the spec's d4e5f6a).
+    async fn unpublished_commit(e: &Env) -> String {
+        e.write("/d.txt", "d\n").await;
+        e.commit("D").await
+    }
+
+    fn remote_has_commit(dir: &std::path::Path, sha: &str) -> bool {
+        let remote = git2::Repository::open_bare(dir).unwrap();
+        remote.find_commit(git2::Oid::from_str(sha).unwrap()).is_ok()
+    }
+
+    fn differs(tag: &str, sha: &str) -> String {
+        format!("{tag} differs (remote at {})", short7(sha))
+    }
+
+    /// SPEC-0054/E2E-013: a differing remote tag is skipped, the others sent.
+    #[tokio::test]
+    async fn e2e_tag_013_publish_all_a_differing_remote_tag_is_skipped() {
+        let e = Env::new().await;
+        let (dir, _, a, b, f) = three_commit_remote(&e, "remote-p013").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v2.0", "target": b})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+        let audit = audit_count(&e);
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), [differs("v1.0", &f), "v2.0 to publish".into()]);
+        assert_eq!(preview["message"], count_line(1));
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), [differs("v1.0", &f), "v2.0 published".into()]);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0").as_deref(), Some(b.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v2.0", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0054/E2E-014: a differing kind is skipped.
+    #[tokio::test]
+    async fn e2e_tag_014_publish_all_a_differing_kind_is_skipped() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p014").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "remote release\n");
+        let before = bare_refs(&dir);
+
+        let out = preview_all(&e).await;
+
+        assert_eq!(names(&out["lines"]), [differs("v1.0", &a)]);
+        assert_eq!(out["message"], "No tag to publish.");
+        assert_eq!(bare_refs(&dir), before);
+    }
+
+    /// SPEC-0054/E2E-015: a tag whose commit the remote lacks is skipped.
+    #[tokio::test]
+    async fn e2e_tag_015_publish_all_a_commit_not_on_remote_is_skipped() {
+        let e = Env::new().await;
+        let (dir, _, _, b, _) = three_commit_remote(&e, "remote-p015").await;
+        let d = unpublished_commit(&e).await;
+        tag(&e, json!({"name": "wip-alice", "target": d})).await.unwrap();
+        tag(&e, json!({"name": "v2.0", "target": b})).await.unwrap();
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), ["v2.0 to publish", "wip-alice commit not on remote"]);
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), ["v2.0 published", "wip-alice commit not on remote"]);
+        assert!(!remote_has_commit(&dir, &d), "the commit was never sent");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/wip-alice"), None);
+    }
+
+    /// The state of SPEC-0054/E2E-016: `refused-tag`, `v1.0` and `v2.0` due,
+    /// the remote refusing `refused-tag`. Returns (dir, A, C).
+    async fn one_tag_refused(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
+        let (dir, url, a, b, c) = three_commit_remote(e, label).await;
+        tag(e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(e, json!({"name": "refused-tag", "target": b})).await.unwrap();
+        tag(e, json!({"name": "v2.0", "target": c})).await.unwrap();
+        crate::git::remote::bulk_seams::reject(&url, &[("refused-tag", PROTECTED)]);
+        (dir, a, c)
+    }
+
+    /// SPEC-0054/E2E-016: the remote refuses one tag, the others are sent.
+    #[tokio::test]
+    async fn e2e_tag_016_publish_all_the_remote_refuses_one_tag() {
+        let e = Env::new().await;
+        let (dir, a, c) = one_tag_refused(&e, "remote-p016").await;
+        let (local, audit) = (tag_list(&e).await, audit_count(&e));
+
+        let out = confirm_all(&e, json!(3)).await;
+
+        assert_eq!(
+            names(&out["lines"]),
+            [
+                "refused-tag refused by remote: protected tag name",
+                "v1.0 published",
+                "v2.0 published"
+            ]
+        );
+        assert_eq!(out["published"], 2);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/refused-tag"), None);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0").as_deref(), Some(c.as_str()));
+        assert_eq!(tag_list(&e).await, local, "the local tags are unchanged");
+        assert_eq!(
+            publish_audit(&e, OWNER),
+            vec![published_line("v1.0", &a), published_line("v2.0", &c)]
+        );
+        assert_eq!(audit_count(&e), audit + 2);
+    }
+
+    /// SPEC-0054/E2E-023: nothing is sendable.
+    #[tokio::test]
+    async fn e2e_tag_023_publish_all_nothing_is_sendable() {
+        let e = Env::new().await;
+        let (dir, _, a, _, f) = three_commit_remote(&e, "remote-p023").await;
+        let d = unpublished_commit(&e).await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "wip-alice", "target": d})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        for out in [preview_all(&e).await, confirm_all(&e, json!(0)).await] {
+            let lines = [differs("v1.0", &f), "wip-alice commit not on remote".into()];
+            assert_eq!(names(&out["lines"]), lines);
+            assert_eq!(out["message"], "No tag to publish.");
+        }
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-033: no audit for a tag the remote refused.
+    #[tokio::test]
+    async fn e2e_tag_033_publish_all_no_audit_for_a_refused_tag() {
+        let e = Env::new().await;
+        one_tag_refused(&e, "remote-p033").await;
+
+        confirm_all(&e, json!(3)).await;
+
+        let audit = publish_audit(&e, OWNER);
+        assert_eq!(audit.len(), 2);
+        assert!(audit.iter().all(|d| !d.contains("refused-tag")), "{audit:?}");
+    }
+
+    /// SPEC-0054/E2E-037: a missing commit wins over a differing remote tag.
+    #[tokio::test]
+    async fn e2e_tag_037_publish_all_a_missing_commit_wins_over_differs() {
+        let e = Env::new().await;
+        let (dir, _, _, _, f) = three_commit_remote(&e, "remote-p037").await;
+        let d = unpublished_commit(&e).await;
+        tag(&e, json!({"name": "v1.0", "target": d})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+
+        let out = preview_all(&e).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 commit not on remote"]);
+        assert_eq!(out["message"], "No tag to publish.");
+    }
+
+    /// SPEC-0054/E2E-040: two tags whose commit the remote lacks.
+    #[tokio::test]
+    async fn e2e_tag_040_publish_all_two_tags_on_a_missing_commit() {
+        let e = Env::new().await;
+        let (dir, _, _) = cloned_remote(&e, "remote-p040").await;
+        let d = unpublished_commit(&e).await;
+        tag(&e, json!({"name": "wip-alice", "target": d})).await.unwrap();
+        tag(&e, json!({"name": "wip-bob", "target": d})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        let out = preview_all(&e).await;
+
+        let lines = ["wip-alice commit not on remote", "wip-bob commit not on remote"];
+        assert_eq!(names(&out["lines"]), lines);
+        assert_eq!(out["message"], "No tag to publish.");
+        assert_eq!(bare_refs(&dir), before);
+        assert!(!remote_has_commit(&dir, &d));
+    }
+
+    /// SPEC-0054/E2E-041: the remote refuses every tag.
+    #[tokio::test]
+    async fn e2e_tag_041_publish_all_the_remote_refuses_every_tag() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-p041").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        crate::git::remote::bulk_seams::reject(&url, &[("v1.0", PROTECTED), ("v1.1", PROTECTED)]);
+        let (before, local, audit) = (bare_refs(&dir), tag_list(&e).await, audit_count(&e));
+
+        let out = confirm_all(&e, json!(2)).await;
+
+        assert_eq!(
+            names(&out["lines"]),
+            [
+                "v1.0 refused by remote: protected tag name",
+                "v1.1 refused by remote: protected tag name"
+            ]
+        );
+        assert_eq!(out["published"], 0);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(tag_list(&e).await, local);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-051: a differing message makes an annotated tag differ.
+    #[tokio::test]
+    async fn e2e_tag_051_publish_all_a_differing_message_differs() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p051").await;
+        tag(&e, json!({"name": "v2.0", "target": a, "message": "Release 2.0"})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v2.0", &a, "Other");
+
+        let out = preview_all(&e).await;
+
+        assert_eq!(names(&out["lines"]), [differs("v2.0", &a)]);
+        assert_eq!(out["message"], "No tag to publish.");
+    }
+
+    /// `v1.0` at A and `v2.0` at B, both due, previewed: (dir, url, A, B, C).
+    async fn two_due_previewed(
+        e: &Env,
+        label: &str,
+    ) -> (std::path::PathBuf, String, String, String, String) {
+        let (dir, url, a, b, c) = three_commit_remote(e, label).await;
+        tag(e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(e, json!({"name": "v2.0", "target": b})).await.unwrap();
+        assert_eq!(preview_all(e).await["message"], count_line(2));
+        (dir, url, a, b, c)
+    }
+
+    /// After the listing of the next call to `url`, the remote `tag` is set
+    /// to `target` by another source.
+    fn remote_tag_after_listing(dir: &std::path::Path, url: &str, tag: &'static str, target: &str) {
+        let (dir, target) = (dir.to_path_buf(), target.to_string());
+        super::super::git_tags::after_listing::set(url, move || {
+            plain_tag_bare_remote(&dir, tag, &target);
+        });
+    }
+
+    /// SPEC-0054/E2E-054: a remote tag appears between the listing and the
+    /// send; the lease detects it, it is reported differing, the rest sent.
+    #[tokio::test]
+    async fn e2e_tag_054_publish_all_a_remote_tag_appears_before_the_send() {
+        let e = Env::new().await;
+        let (dir, url, _, b, f) = two_due_previewed(&e, "remote-p054").await;
+        remote_tag_after_listing(&dir, &url, "v1.0", &f);
+        let audit = audit_count(&e);
+
+        let out = confirm_all(&e, json!(2)).await;
+
+        assert_eq!(names(&out["lines"]), [differs("v1.0", &f), "v2.0 published".into()]);
+        assert_eq!(out["published"], 1);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0").as_deref(), Some(b.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v2.0", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0054/E2E-055: a tag up to date at the listing keeps that outcome
+    /// when the remote moves it before the send.
+    #[tokio::test]
+    async fn e2e_tag_055_publish_all_a_remote_tag_moves_before_the_send() {
+        let e = Env::new().await;
+        let (dir, url, a, b, f) = three_commit_remote(&e, "remote-p055").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v2.0", "target": b})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        assert_eq!(preview_all(&e).await["message"], count_line(1));
+        remote_tag_after_listing(&dir, &url, "v1.0", &f);
+        let audit = audit_count(&e);
+
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 up to date", "v2.0 published"]);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v2.0", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0054/E2E-056: another member creates the same tag on the remote
+    /// before the send; it is up to date, with no audit entry.
+    #[tokio::test]
+    async fn e2e_tag_056_publish_all_the_same_tag_appears_before_the_send() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = two_due_previewed(&e, "remote-p056").await;
+        remote_tag_after_listing(&dir, &url, "v1.0", &a);
+        let audit = audit_count(&e);
+
+        let out = confirm_all(&e, json!(2)).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 up to date", "v2.0 published"]);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v2.0", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0054/E2E-057: a name git refuses as a reference is reported
+    /// without a refspec, the other tag sent.
+    #[tokio::test]
+    async fn e2e_tag_057_publish_all_an_invalid_ref_name() {
+        let e = Env::new().await;
+        let (dir, _, a, b, _) = three_commit_remote(&e, "remote-p057").await;
+        tag(&e, json!({"name": "a//b", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.0", "target": b})).await.unwrap();
+        let audit = audit_count(&e);
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), ["a//b to publish", "v1.0 to publish"]);
+        assert_eq!(preview["message"], count_line(2));
+        let out = confirm_all(&e, json!(2)).await;
+
+        let lines = ["a//b refused by remote: invalid ref name", "v1.0 published"];
+        assert_eq!(names(&out["lines"]), lines);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/a/b"), None);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(b.as_str()));
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v1.0", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
 }

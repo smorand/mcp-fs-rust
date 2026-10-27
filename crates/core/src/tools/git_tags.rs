@@ -1149,6 +1149,13 @@ fn parse_confirm(confirm: Option<&Value>) -> Result<Option<u64>> {
 /// DEC-010, DEC-011, DEC-012: write each due tag's ref on disk, as the single
 /// publication does since a push names refs, then push them all in one
 /// connection and mark each `published` or `refused by remote`.
+///
+/// FR-NEW-020: a lost lease means the remote gained some of those tags after
+/// the listing and nothing was sent. The remote is listed again, each lost
+/// tag reclassified from that fresh listing and, unless it is still due,
+/// dropped before the rest is pushed again. Every round that loses a lease
+/// removes at least one tag, so the loop is bounded by the number of due
+/// tags: O(t) rounds of one listing and one push, in practice one.
 fn send_due_tags(repo: &Repository, tags: &mut [TagOutcome], conn: &Connection<'_>) -> Result<()> {
     let mut due = Vec::new();
     for (at, tag) in tags.iter_mut().enumerate() {
@@ -1167,34 +1174,88 @@ fn send_due_tags(repo: &Repository, tags: &mut [TagOutcome], conn: &Connection<'
             Err(e) => tag.outcome = Outcome::Refused(e.message().to_string()),
         }
     }
+    for _ in 0..due.len() {
+        if due.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = due.iter().map(|&at| tags[at].name.as_str()).collect();
+        let pushed = crate::git::remote::push_tags_to_remote(
+            repo,
+            conn.url,
+            &names,
+            conn.token.clone(),
+            Some(conn.deadline),
+        )?;
+        let rejected: std::collections::HashMap<String, String> =
+            pushed.rejected.into_iter().collect();
+        due.retain(|&at| match rejected.get(&tags[at].name) {
+            Some(why) => {
+                tags[at].outcome = Outcome::Refused(why.clone());
+                false
+            }
+            None => true,
+        });
+        if pushed.lease_lost.is_empty() {
+            for &at in &due {
+                tags[at].outcome = Outcome::Published;
+            }
+            return Ok(());
+        }
+        let before = due.len();
+        reclassify_lost(repo, tags, &mut due, &pushed.lease_lost, conn)?;
+        if due.len() == before {
+            break;
+        }
+    }
     if due.is_empty() {
         return Ok(());
     }
+    // Only reachable when a fresh listing shows the lost tags due again: the
+    // remote keeps changing them faster than a push can follow. Nothing of
+    // the remaining tags was sent.
     let names: Vec<&str> = due.iter().map(|&at| tags[at].name.as_str()).collect();
-    let pushed = crate::git::remote::push_tags_to_remote(
+    Err(ToolError::no_clobber(format!(
+        "Remote tags kept changing while publishing: {}. Review the list, then confirm again.",
+        names.join(", ")
+    )))
+}
+
+/// FR-NEW-020, DEC-011: list the remote again and give each tag whose lease
+/// was lost its outcome against that listing; a tag the remote now holds is
+/// `up to date` or `differs` and leaves `due`, one it no longer holds stays.
+fn reclassify_lost(
+    repo: &Repository,
+    tags: &mut [TagOutcome],
+    due: &mut Vec<usize>,
+    lost: &[String],
+    conn: &Connection<'_>,
+) -> Result<()> {
+    let advertised = crate::git::remote::list_advertised_refs(
         repo,
         conn.url,
-        &names,
         conn.token.clone(),
         Some(conn.deadline),
     )?;
-    if !pushed.lease_lost.is_empty() {
-        // Nothing was sent: a remote tag appeared between the listing and
-        // the push. The member reviews the list again rather than getting a
-        // report built on a listing the remote no longer matches.
-        return Err(ToolError::no_clobber(format!(
-            "Remote tags changed since the listing: {}. Review the list, then confirm again.",
-            pushed.lease_lost.join(", ")
-        )));
+    let by_name: std::collections::HashMap<&str, Oid> =
+        advertised.iter().map(|(n, oid)| (n.as_str(), *oid)).collect();
+    let mut kept = Vec::with_capacity(due.len());
+    for &at in due.iter() {
+        let tag = &tags[at];
+        if !lost.contains(&tag.name) {
+            kept.push(at);
+            continue;
+        }
+        let full_ref = format!("{TAGS_PREFIX}{}", tag.name);
+        let commit = parse_oid(&tag.commit)?;
+        let outcome =
+            remote_outcome(repo, &full_ref, &tag.name, tag.object, commit, &by_name, conn)?;
+        if outcome == Outcome::ToPublish {
+            kept.push(at);
+        } else {
+            tags[at].outcome = outcome;
+        }
     }
-    let rejected: std::collections::HashMap<String, String> = pushed.rejected.into_iter().collect();
-    for at in due {
-        let tag = &mut tags[at];
-        tag.outcome = match rejected.get(&tag.name) {
-            Some(why) => Outcome::Refused(why.clone()),
-            None => Outcome::Published,
-        };
-    }
+    *due = kept;
     Ok(())
 }
 

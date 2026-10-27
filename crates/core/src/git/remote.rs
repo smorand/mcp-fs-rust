@@ -828,7 +828,8 @@ pub struct TagsPush {
 /// uses. Each refspec is a creation leased on "absent" (the zero id), so a
 /// remote that gained one of those tags after the caller's listing aborts the
 /// whole push before anything is sent, and the tag is named in
-/// [`TagsPush::lease_lost`]. The caller has checked that every tag's commit
+/// [`TagsPush::lease_lost`]; tags in [`TagsPush::rejected`] are final
+/// whatever the rest did. The caller has checked that every tag's commit
 /// is on the remote, so the pack carries at most the tag objects.
 ///
 /// Any failure other than a lease or a per ref refusal is the connection
@@ -841,6 +842,15 @@ pub fn push_tags_to_remote(
     deadline: Option<Instant>,
 ) -> Result<TagsPush> {
     let token_for_redaction = token.clone();
+    #[cfg(test)]
+    let held = bulk_seams::take_rejections(origin_url);
+    #[cfg(not(test))]
+    let held: Vec<(String, String)> = Vec::new();
+    let tags: Vec<&str> =
+        tags.iter().copied().filter(|t| !held.iter().any(|(h, _)| h == t)).collect();
+    if tags.is_empty() {
+        return Ok(TagsPush { rejected: held, lease_lost: Vec::new() });
+    }
     let absent = git2::Oid::ZERO_SHA1.to_string();
     let names: Vec<String> = tags.iter().map(|t| format!("refs/tags/{t}")).collect();
     let refs: Vec<PushRefs<'_>> = names
@@ -853,11 +863,14 @@ pub fn push_tags_to_remote(
     };
     match push_refs(repo, origin_url, &refs, token, deadline) {
         Ok(report) => Ok(TagsPush {
-            rejected: report.rejected.into_iter().map(|(r, why)| (tag_of(r), why)).collect(),
+            rejected: held
+                .into_iter()
+                .chain(report.rejected.into_iter().map(|(r, why)| (tag_of(r), why)))
+                .collect(),
             lease_lost: Vec::new(),
         }),
         Err(PushFailure::Lease(misses)) => Ok(TagsPush {
-            rejected: Vec::new(),
+            rejected: held,
             lease_lost: misses.into_iter().map(|m| tag_of(m.dst)).collect(),
         }),
         Err(PushFailure::Open(e) | PushFailure::Push(e)) => {
@@ -909,6 +922,31 @@ pub(crate) mod delete_seams {
     pub(super) fn take_fault(url: &str) -> bool {
         let mut all = FAULTS.lock().unwrap();
         all.iter().position(|u| u == url).map(|at| all.remove(at)).is_some()
+    }
+}
+
+/// Test seam of the bulk tag push (SPEC-0054 DEC-013), keyed by remote URL
+/// so parallel tests never see each other's, one shot. The local file
+/// transport runs no hooks, so it never refuses one tag of a push; the named
+/// tags are held back from the real push and reported as per ref refusals.
+/// Compiled out of production builds.
+#[cfg(test)]
+pub(crate) mod bulk_seams {
+    use std::sync::Mutex;
+
+    type Refusals = Vec<(String, String)>;
+    static REJECTIONS: Mutex<Vec<(String, Refusals)>> = Mutex::new(Vec::new());
+
+    /// The next bulk tag push to `url` reports each `(tag, reason)` as a per
+    /// ref refusal and sends only the other tags.
+    pub(crate) fn reject(url: &str, tags: &[(&str, &str)]) {
+        let tags = tags.iter().map(|(t, why)| ((*t).to_string(), (*why).to_string())).collect();
+        REJECTIONS.lock().unwrap().push((url.into(), tags));
+    }
+
+    pub(super) fn take_rejections(url: &str) -> Refusals {
+        let mut all = REJECTIONS.lock().unwrap();
+        all.iter().position(|(u, _)| u == url).map(|at| all.remove(at).1).unwrap_or_default()
     }
 }
 
