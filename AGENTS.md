@@ -138,7 +138,8 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `git.remote_delete_tag` (SPEC-0053: delete one remote tag, only after the member states its commit
   in `expected_remote_commit`; local tags untouched; audit `git.tag_remote_delete`),
   `git.remote_push_tags` (SPEC-0054: preview every local tag's outcome, then send the due ones in
-  one push of creation refspecs leased on "absent" once `confirm_count` equals their count)
+  one push of creation refspecs leased on "absent" once `confirm_count` equals their count;
+  audit `git.tag_publish` per tag sent, `differs` tags never replaced)
   and `reconcile_incoming_tags`, which fetch, pull and clone call to add `tags_added`/`tags_kept_local`.
   `diff_files.rs` holds `fs.diff_files` (SPEC-0045): unified diff of two text files, possibly in
   two projects (both must be readable), also served by `GET /api/fs/diff`; the diff runs in

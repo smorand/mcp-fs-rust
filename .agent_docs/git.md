@@ -822,6 +822,38 @@ the call touches no local file, ref or index row. Round trip proof:
 `e2e_tag_035_remote_delete_round_trip` (publish, delete remotely, delete locally, publish
 again from another member, delete again; one audit entry per step).
 
+**Publish every tag** (`git.remote_push_tags`, SPEC-0054, 2026-10-27). Preview, then confirm by
+stating the count. One listing of the remote classifies every local tag, in byte order of the
+name, as `to publish`, `up to date` (same object, or two annotated tags on one commit with one
+message), `differs (remote at <7>)`, `commit not on remote`, then after a send `published` or
+`refused by remote: <reason>`. Without `confirm_count` (absent or null) the answer is a preview
+(`Tags to publish: <N>. Confirm by stating <N> to send them.`, or `No tag to publish.`) and nothing
+is sent. `confirm_count` is a JSON integer or 1 to 9 ASCII digits; anything else is
+`ERR_INVALID_ARGUMENT` `The number to confirm must be a whole number, zero or more.`; a wrong
+number is `ERR_NO_CLOBBER` `Tags to publish: <M>, not <N>. Review the list, then confirm again.`
+followed by one line per tag. Refusal order: not a member, no remote (`Cannot publish tags: this
+project tracks no remote.`), remote not tracked (`... does not track a remote named '<r>'.`; an
+empty name means `origin`, names are case sensitive), credential, connection, number. When the
+count matches, one push carries a creation refspec per due tag, each leased on "absent" (the zero
+id), so a tag another member published after the listing aborts the push before anything is sent.
+That lease loss runs a bounded loop: list again, reclassify each lost tag (`up to date` or
+`differs`, out of the due set), push the rest; if the remote keeps changing a tag the answer is
+`ERR_NO_CLOBBER` `Remote tags kept changing while publishing: <names>. Review the list, then
+confirm again.` (BL-0093: the spec words no such case). Only tags are pushed, never a branch or
+a commit, and a `differs` tag is never replaced: replacing one stays the single tag decision of
+`git.remote_push_tag` with `overwrite` and `expected_remote_commit`, whose contract the bulk tool
+leaves unchanged (a tag the bulk sent is `up to date` for it, with no audit entry). A per ref
+remote refusal marks only that tag `refused by remote`; the others stand. Audit: one
+`git.tag_publish` line `published tag '<n>' at <full sha>` per tag really sent, none for a
+preview or a skipped tag. The whole action holds the write lock, preview included, and no
+paused operation check applies (no file, ref or index row is touched except the tag ref written
+on disk before the push). Tests: `file://` cannot reach the tool (`resolve_clone_credential`), so
+they call `publish_all_tags` through `call_publish_all_tags`; `bulk_seams` (`git/remote.rs`) holds
+back named tags as per ref refusals or drops the answer after N refs, `after_listing`
+(`tools/git_tags.rs`) runs a hook right after the listing to move the remote. Both are
+`#[cfg(test)]` only. Single publish after a bulk send: `e2e_tag_008_publish_all_*`,
+`e2e_tag_044_publish_all_*`, `e2e_tag_048_publish_all_*`. Known limit: BL-0093.
+
 **Receive** (fetch, pull, clone). Tag following stays off. Fetch and pull take candidates
 from the advertised refs: a tag whose peeled commit is the fetched branch tip or one of its
 ancestors. Lightweight candidates need no download; annotated ones are fetched by explicit
@@ -834,6 +866,6 @@ reconciles before the merge decision, so a paused conflict result carries them t
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
 scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
 "on the remote" tip set is every advertised ref, the real rejection mapping is untested,
-`a//b` normalised on disk). Out of scope: BL-0076 publish all. Remote tag deletion (BL-0075) is delivered by SPEC-0053.
+`a//b` normalised on disk). Remote tag deletion (BL-0075, SPEC-0053) and publishing every tag (BL-0076, SPEC-0054) are delivered.
 Round trip proof: `e2e_tag_051_create_publish_receive_round_trip` (two servers, one bare
 remote).

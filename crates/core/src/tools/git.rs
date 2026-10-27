@@ -28330,6 +28330,95 @@ mod tests {
         assert_eq!(audit_count(&e), audit + 1);
     }
 
+    /// SPEC-0054/E2E-008: after a bulk send the single publish of the same tag
+    /// is up to date and silent; another tag alone sends only itself.
+    #[tokio::test]
+    async fn e2e_tag_008_publish_all_then_single_publish_is_up_to_date() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-p008").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        confirm_all(&e, json!(1)).await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let out = call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(out["up_to_date"], true);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit, "no further audit entry");
+
+        tag(&e, json!({"name": "v3.0", "target": b})).await.unwrap();
+        // Creating the tag is audited too; the publish must add exactly one more.
+        let audit = audit_count(&e);
+        let out = call_publish_tag(&e, &url, "v3.0").await.unwrap();
+
+        assert_eq!(out["up_to_date"], false);
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v3.0", &b)]));
+        assert_eq!(audit_count(&e), audit + 1);
+        assert_eq!(
+            publish_audit(&e, OWNER),
+            vec![published_line("v1.0", &a), published_line("v3.0", &b)]
+        );
+    }
+
+    /// The state of SPEC-0054/E2E-013 after the confirmed send: local `v1.0` at
+    /// A, remote `v1.0` at another commit, which the bulk skipped as `differs`.
+    async fn skipped_differing_tag(
+        e: &Env,
+        label: &str,
+    ) -> (std::path::PathBuf, String, String, String) {
+        let (dir, url, a, b, f) = three_commit_remote(e, label).await;
+        tag(e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(e, json!({"name": "v2.0", "target": b})).await.unwrap();
+        plain_tag_bare_remote(&dir, "v1.0", &f);
+        let out = confirm_all(e, json!(1)).await;
+        assert_eq!(names(&out["lines"]), [differs("v1.0", &f), "v2.0 published".into()]);
+        (dir, url, a, f)
+    }
+
+    /// SPEC-0054/E2E-044: the single publish still refuses to replace a tag
+    /// without the overwrite confirmation.
+    #[tokio::test]
+    async fn e2e_tag_044_publish_all_single_publish_keeps_its_overwrite_rule() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = skipped_differing_tag(&e, "remote-p044").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(
+            (err.code, err.message),
+            (
+                code::NO_CLOBBER,
+                format!(
+                    "Remote tag 'v1.0' already exists at a different commit ({}). Confirm \
+                     overwriting to replace it.",
+                    short7(&f)
+                )
+            )
+        );
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-048: replacing a tag the bulk skipped is a decision about
+    /// that one tag, with one audit entry.
+    #[tokio::test]
+    async fn e2e_tag_048_publish_all_overwrite_stays_a_single_tag_decision() {
+        let e = Env::new().await;
+        let (dir, url, a, f) = skipped_differing_tag(&e, "remote-p048").await;
+        let audit = audit_count(&e);
+
+        call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(audit_count(&e), audit + 1);
+        assert_eq!(
+            publish_audit(&e, OWNER).last().map(String::as_str),
+            Some(published_line("v1.0", &a).as_str())
+        );
+    }
+
     /// SPEC-0054/E2E-014: a differing kind is skipped.
     #[tokio::test]
     async fn e2e_tag_014_publish_all_a_differing_kind_is_skipped() {
