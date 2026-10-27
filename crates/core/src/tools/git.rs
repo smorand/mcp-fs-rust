@@ -28610,4 +28610,428 @@ mod tests {
         assert_eq!(publish_audit(&e, OWNER), vec![published_line("v1.0", &b)]);
         assert_eq!(audit_count(&e), audit + 1);
     }
+
+    // ── SPEC-0054 US-0099: connection failures, concurrency, paused operations, cost ──
+    //
+    // Connection texts follow the SPEC-0053 convention: a `file://` remote has
+    // no host, so the refusal names the URL itself (`extract_host` falls back
+    // to it) and the tests compare the prefix `connection_prefix` builds; the
+    // spec's `github.ibm.com` appears only where the registered tool runs on an
+    // https origin (the credential legs of E2E-022).
+
+    /// The bulk engine on `url` as `person`, skipping the remote lookup.
+    async fn publish_all_to(
+        e: &Env,
+        person: &str,
+        url: &str,
+        confirm: Option<Value>,
+    ) -> Result<Value> {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        super::super::git_tags::publish_all_tags(
+            entry,
+            e.f.state.safety.clone(),
+            super::super::git_tags::PublishAllTarget {
+                mount_id: MOUNT,
+                person,
+                remote: "origin",
+                url,
+                token: None,
+                auth: "anonymous",
+                timeout_secs: e.f.state.config.git.remote_timeout_secs,
+                confirm_count: confirm.as_ref(),
+            },
+        )
+        .await
+    }
+
+    /// [`call_publish_all_tags`] as `person`, on the tracked `origin`.
+    async fn publish_all_as(e: &Env, person: &str, confirm: Option<Value>) -> Result<Value> {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let (_, url) = super::super::git_tags::tracked_remote(&entry, "origin").await?;
+        publish_all_to(e, person, &url, confirm).await
+    }
+
+    /// A remote that is not there: the local transport refuses to open it.
+    fn down_remote(e: &Env) -> String {
+        format!("file://{}", e.f.dir.path().join("no-such-remote").display())
+    }
+
+    /// Track `url` as the only remote, `origin`.
+    async fn retrack(e: &Env, url: &str) {
+        untrack_every_remote(e).await;
+        track_remote(e, "origin", url).await;
+    }
+
+    fn assert_connection_refused(err: &ToolError, url: &str) {
+        assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
+        assert!(err.message.starts_with(&connection_prefix(url)), "{}", err.message);
+    }
+
+    /// SPEC-0054/E2E-020: the remote is unreachable; nothing is sent.
+    #[tokio::test]
+    async fn e2e_tag_020_publish_all_the_remote_is_unreachable() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p020").await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        let down = down_remote(&e);
+        retrack(&e, &down).await;
+
+        let err = call_publish_all_tags(&e, "origin", None).await.unwrap_err();
+
+        assert_connection_refused(&err, &down);
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-021: the connection drops after the remote applied
+    /// `v1.0` only; nothing is reported sent and the retry is safe.
+    #[tokio::test]
+    async fn e2e_tag_021_publish_all_the_connection_drops_while_sending() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-p021").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        assert_eq!(preview_all(&e).await["message"], count_line(2));
+        crate::git::remote::bulk_seams::drop_after(&url, 1);
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
+        let lost = format!("{}connection reset", connection_prefix(&url));
+        assert!(err.message.starts_with(&lost), "{}", err.message);
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a)]), "only v1.0 arrived");
+        assert_eq!(audit_count(&e), audit, "nothing was reported sent, nothing audited");
+
+        let again = preview_all(&e).await;
+        assert_eq!(names(&again["lines"]), ["v1.0 up to date", "v1.1 to publish"]);
+        assert_eq!(again["message"], count_line(1));
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 up to date", "v1.1 published"]);
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a), ("v1.1", &b)]));
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v1.1", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0054/E2E-022: expired credential, no credential (the registered
+    /// tool on an https origin), a remote that rate limits (a remote dropping
+    /// every connection, as no file remote can answer 429) and one that does
+    /// not answer within 1 second.
+    #[test]
+    fn e2e_tag_022_publish_all_credential_or_answer_problems() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts_and_timeout(REFERENCE_HOSTS, 1).await;
+            e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+            let (dir, _, _) = two_due(&e, "remote-p022").await;
+            let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+            track_remote(&e, "origin", "https://github.ibm.com/org/repo.git").await;
+            e.tokens
+                .store_token(
+                    OWNER,
+                    "github.ibm.com",
+                    "github",
+                    "ghp_expired",
+                    vec![],
+                    Some(past_expiry()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = publish_all_by_tool(&e, OWNER, json!({})).await.unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert_eq!(
+                err.message,
+                "token expired for host github.ibm.com; authenticate with git.auth or \
+                 git.token_set for host github.ibm.com"
+            );
+            assert!(!err.message.contains("ghp_expired"));
+
+            let err = publish_all_by_tool(&e, BOB, json!({})).await.unwrap_err();
+            assert_eq!(err.code, code::UNAUTHENTICATED);
+            assert_eq!(
+                err.message,
+                "no token for host github.ibm.com; authenticate with git.auth or \
+                 git.token_set for host github.ibm.com"
+            );
+
+            let (refusing, handle) = closing_remote().await;
+            let err = publish_all_to(&e, OWNER, &refusing, None).await.unwrap_err();
+            handle.abort();
+            assert_connection_refused(&err, &refusing);
+
+            let (silent, srv) = silent_remote().await;
+            let err = publish_all_to(&e, OWNER, &silent, None).await.unwrap_err();
+            srv.abort();
+            assert_eq!(err.code, code::INTERNAL_ERROR);
+            assert_eq!(
+                err.message,
+                format!(
+                    "remote timeout: host '{}' did not respond within 1s",
+                    crate::git::remote::extract_host(&silent)
+                )
+            );
+
+            assert_eq!(bare_refs(&dir), before, "nothing was sent");
+            assert_eq!(audit_count(&e), audit, "no audit entry was added");
+        });
+    }
+
+    /// `n` lightweight tags named `<prefix><nn>` at `target`.
+    async fn tag_many(e: &Env, prefix: &str, range: std::ops::RangeInclusive<u32>, target: &str) {
+        for i in range {
+            tag(e, json!({"name": format!("{prefix}{i:02}"), "target": target})).await.unwrap();
+        }
+    }
+
+    /// SPEC-0054/E2E-026: 25 identical annotated tags and 25 lightweight tags
+    /// to send, within the deadline, in name order.
+    #[tokio::test]
+    async fn e2e_tag_026_publish_all_fifty_tags_annotated_and_lightweight() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-p026").await;
+        // Created on the remote and fetched, so the local tag objects are
+        // the remote's own: identical objects, which cost no probe (DEC-016).
+        for i in 1..=25 {
+            let (name, message) = (format!("a{i:02}"), format!("Release a{i:02}"));
+            annotated_tag_bare_remote(&dir, &name, &a, &message);
+        }
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(tag_names(&e).await.len(), 25, "the annotated tags arrived");
+        tag_many(&e, "r", 26..=50, &b).await;
+        let expect = |sent: &str| -> Vec<String> {
+            let up = (1..=25).map(|i| format!("a{i:02} up to date"));
+            up.chain((26..=50).map(|i| format!("r{i} {sent}"))).collect()
+        };
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), expect("to publish"));
+        assert_eq!(preview["message"], count_line(25));
+        let out = confirm_all(&e, json!(25)).await;
+
+        assert_eq!(names(&out["lines"]), expect("published"));
+        assert_eq!(out["published"], 25);
+        let tags_now = bare_refs(&dir).keys().filter(|k| k.starts_with("refs/tags/")).count();
+        assert_eq!(tags_now, 50);
+        assert_eq!(bare_refs(&dir).len(), before.len() + 25);
+        assert_eq!(publish_audit(&e, OWNER).len(), 25);
+        assert_eq!(audit_count(&e), audit + 25);
+    }
+
+    /// SPEC-0054/E2E-029: a connection failure beats a wrong number.
+    #[tokio::test]
+    async fn e2e_tag_029_publish_all_a_connection_failure_beats_a_wrong_number() {
+        let e = Env::new().await;
+        two_due(&e, "remote-p029").await;
+        let down = down_remote(&e);
+        retrack(&e, &down).await;
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(7))).await.unwrap_err();
+
+        assert_connection_refused(&err, &down);
+        assert!(!err.message.contains("Tags to publish"), "{}", err.message);
+    }
+
+    /// SPEC-0054/E2E-035: Alice and Bob confirm at once. The test holds the
+    /// repository write lock so both calls are provably queued behind it,
+    /// whatever the scheduler does, and repeats on fresh state.
+    #[tokio::test]
+    async fn e2e_tag_035_publish_all_two_members_confirm_at_once() {
+        for round in 0..3 {
+            let e = Env::new().await;
+            e.f.state.admin.add_member(MOUNT, BOB, OWNER).await.unwrap();
+            let (dir, a, b) = two_due(&e, &format!("remote-p035-{round}")).await;
+            for person in [OWNER, BOB] {
+                let seen = publish_all_as(&e, person, None).await.unwrap();
+                assert_eq!(seen["message"], count_line(2));
+            }
+            let (before, audit) = (bare_refs(&dir), audit_count(&e));
+            let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+            let guard = entry.write_lock.lock().await;
+
+            let alice = publish_all_as(&e, OWNER, Some(json!(2)));
+            let bob = publish_all_as(&e, BOB, Some(json!(2)));
+            tokio::pin!(alice, bob);
+            tokio::select! {
+                _ = &mut alice => panic!("round {round}: Alice ran under the held lock"),
+                _ = &mut bob => panic!("round {round}: Bob ran under the held lock"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
+            }
+            assert_eq!(bare_refs(&dir), before, "round {round}: both are still waiting");
+            drop(guard);
+            let (ra, rb) = tokio::join!(alice, bob);
+
+            let (winner, won, loser) = match (ra, rb) {
+                (Ok(out), Err(err)) => (OWNER, out, err),
+                (Err(err), Ok(out)) => (BOB, out, err),
+                other => panic!("round {round}: exactly one confirmation wins: {other:?}"),
+            };
+            assert_eq!(names(&won["lines"]), ["v1.0 published", "v1.1 published"]);
+            let first = "Tags to publish: 0, not 2. Review the list, then confirm again.";
+            assert_wrong_number(loser, first, &["v1.0 up to date", "v1.1 up to date"]);
+            assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a), ("v1.1", &b)]));
+            assert_eq!(publish_audit(&e, winner).len(), 2, "round {round}");
+            assert_eq!(audit_count(&e), audit + 2, "round {round}: one entry per tag");
+        }
+    }
+
+    /// A bare remote holding every object of the project and `main` at the
+    /// project's `main`, so a tag on that commit is due.
+    async fn remote_from_project(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let main = e.ref_sha("refs/heads/main").await.unwrap();
+        let dir = e.f.dir.path().join(label);
+        let bare = git2::Repository::init_bare(&dir).unwrap();
+        let repo = entry.repo.lock().await;
+        hydrate(&entry, &repo).await.unwrap();
+        let (from, to) = (repo.odb().unwrap(), bare.odb().unwrap());
+        from.foreach(|oid| {
+            let object = from.read(*oid).unwrap();
+            to.write(object.kind(), object.data()).unwrap();
+            true
+        })
+        .unwrap();
+        bare.reference("refs/heads/main", git2::Oid::from_str(&main).unwrap(), true, "seed")
+            .unwrap();
+        bare.set_head("refs/heads/main").unwrap();
+        (dir.clone(), format!("file://{}", dir.display()), main)
+    }
+
+    /// Seed `kind`'s divergence, give the project a remote holding its
+    /// `main`, tag that commit `v1.0` (creation is refused once paused),
+    /// then pause the operation on a conflict. Returns (remote dir, commit).
+    async fn pause_with_due_tag(e: &Env, kind: &str) -> (std::path::PathBuf, String) {
+        let seeded = match kind {
+            "merge" => {
+                seed_conflict(e).await;
+                Vec::new()
+            }
+            "rebase" => {
+                let (_c1, _c2, f1, f2) = seed_fork_conflict(e).await;
+                vec![f1, f2]
+            }
+            _ => {
+                let (_c2, f1) = seed_fork_conflict_at(e, MOUNT, "main").await;
+                vec![f1]
+            }
+        };
+        let (dir, url, main) = remote_from_project(e, &format!("remote-pause-{kind}")).await;
+        track_remote(e, "origin", &url).await;
+        tag(e, json!({"name": "v1.0", "target": main})).await.unwrap();
+        let paused = match kind {
+            "merge" => e.merge("feature").await.unwrap(),
+            "rebase" => {
+                rebase(e, "main", json!([pick(&seeded[0]), pick(&seeded[1])])).await.unwrap()
+            }
+            _ => cherry_pick(e, &seeded[0]).await.unwrap(),
+        };
+        assert_eq!(paused["status"], "conflict", "{kind}: {paused}");
+        (dir, main)
+    }
+
+    /// A due tag is published while an operation of `kind` is paused, which
+    /// stays exactly as it was.
+    async fn assert_publish_during(kind: &str) {
+        let e = Env::new().await;
+        let (dir, main) = pause_with_due_tag(&e, kind).await;
+        let (op_before, before) = (e.op_row().await, bare_refs(&dir));
+        assert!(op_before.is_some(), "{kind}: an operation is paused");
+
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 published"], "{kind}");
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &main)]), "{kind}");
+        assert_eq!(e.op_row().await, op_before, "{kind}: the operation is untouched");
+        assert_eq!(publish_audit(&e, OWNER), vec![published_line("v1.0", &main)], "{kind}");
+    }
+
+    /// SPEC-0054/E2E-036: a paused merge does not block.
+    #[tokio::test]
+    async fn e2e_tag_036_publish_all_a_paused_merge_does_not_block() {
+        assert_publish_during("merge").await;
+    }
+
+    /// SPEC-0054/E2E-043: a paused rebase does not block.
+    #[tokio::test]
+    async fn e2e_tag_043_publish_all_a_paused_rebase_does_not_block() {
+        assert_publish_during("rebase").await;
+    }
+
+    /// SPEC-0054/E2E-046: a paused cherry pick does not block.
+    #[tokio::test]
+    async fn e2e_tag_046_publish_all_a_paused_cherry_pick_does_not_block() {
+        assert_publish_during("cherry_pick").await;
+    }
+
+    /// SPEC-0054/E2E-045: fifty tags all up to date, no timeout.
+    #[tokio::test]
+    async fn e2e_tag_045_publish_all_fifty_tags_all_up_to_date() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p045").await;
+        tag_many(&e, "r", 1..=50, &a).await;
+        for i in 1..=50 {
+            plain_tag_bare_remote(&dir, &format!("r{i:02}"), &a);
+        }
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let out = preview_all(&e).await;
+
+        let lines: Vec<String> = (1..=50).map(|i| format!("r{i:02} up to date")).collect();
+        assert_eq!(names(&out["lines"]), lines);
+        assert_eq!(out["message"], "No tag to publish.");
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-047: fifty tags due, previewed only.
+    #[tokio::test]
+    async fn e2e_tag_047_publish_all_fifty_tags_due_preview_only() {
+        let e = Env::new().await;
+        let (dir, _, a) = cloned_remote(&e, "remote-p047").await;
+        tag_many(&e, "r", 1..=50, &a).await;
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let out = preview_all(&e).await;
+
+        let lines: Vec<String> = (1..=50).map(|i| format!("r{i:02} to publish")).collect();
+        assert_eq!(names(&out["lines"]), lines);
+        assert_eq!(out["message"], count_line(50));
+        assert_eq!(bare_refs(&dir), before, "the remote has no new tag");
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0054/E2E-050: a word instead of a number, at each stage of the
+    /// order of refusals: no remote, then the number, then the connection.
+    #[tokio::test]
+    async fn e2e_tag_050_publish_all_a_word_instead_of_a_number() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-p050").await;
+        let url = format!("file://{}", dir.display());
+        let before = bare_refs(&dir);
+        untrack_every_remote(&e).await;
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!("two"))).await.unwrap_err();
+        assert_eq!(
+            (err.code, err.message),
+            (code::NOT_FOUND, "Cannot publish tags: this project tracks no remote.".into())
+        );
+
+        retrack(&e, &url).await;
+        let err = call_publish_all_tags(&e, "origin", Some(json!("two"))).await.unwrap_err();
+        assert_eq!(
+            (err.code, err.message),
+            (
+                code::INVALID_ARGUMENT,
+                "The number to confirm must be a whole number, zero or more.".into()
+            )
+        );
+
+        let down = down_remote(&e);
+        retrack(&e, &down).await;
+        let err = call_publish_all_tags(&e, "origin", Some(json!("two"))).await.unwrap_err();
+        assert_connection_refused(&err, &down);
+        assert_eq!(bare_refs(&dir), before);
+    }
 }

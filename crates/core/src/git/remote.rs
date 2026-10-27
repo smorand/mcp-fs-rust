@@ -851,10 +851,18 @@ pub fn push_tags_to_remote(
     if tags.is_empty() {
         return Ok(TagsPush { rejected: held, lease_lost: Vec::new() });
     }
+    #[cfg(test)]
+    let (dropped, carried) = {
+        let after = bulk_seams::take_drop(origin_url);
+        (after.is_some(), after.unwrap_or(usize::MAX))
+    };
+    #[cfg(not(test))]
+    let (dropped, carried) = (false, usize::MAX);
     let absent = git2::Oid::ZERO_SHA1.to_string();
     let names: Vec<String> = tags.iter().map(|t| format!("refs/tags/{t}")).collect();
     let refs: Vec<PushRefs<'_>> = names
         .iter()
+        .take(carried)
         .map(|n| PushRefs { src: n, dst: n, force: false, lease: Some(&absent) })
         .collect();
     let tag_of = |refname: String| match refname.strip_prefix("refs/tags/") {
@@ -862,6 +870,10 @@ pub fn push_tags_to_remote(
         None => refname,
     };
     match push_refs(repo, origin_url, &refs, token, deadline) {
+        Ok(_) if dropped => {
+            let lost = git2::Error::from_str("connection reset before the answer arrived");
+            Err(connection_error(origin_url, &lost, token_for_redaction.as_deref()))
+        }
         Ok(report) => Ok(TagsPush {
             rejected: held
                 .into_iter()
@@ -942,6 +954,21 @@ pub(crate) mod bulk_seams {
     pub(crate) fn reject(url: &str, tags: &[(&str, &str)]) {
         let tags = tags.iter().map(|(t, why)| ((*t).to_string(), (*why).to_string())).collect();
         REJECTIONS.lock().unwrap().push((url.into(), tags));
+    }
+
+    static DROPS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+    /// The next bulk tag push to `url` carries only its first `n` tags, which
+    /// the remote really applies, then reports a connection error, as when
+    /// the link breaks before the answer: the caller cannot know what landed.
+    pub(crate) fn drop_after(url: &str, n: usize) {
+        DROPS.lock().unwrap().push((url.into(), n));
+    }
+
+    pub(super) fn take_drop(url: &str) -> Option<usize> {
+        let mut all = DROPS.lock().unwrap();
+        let at = all.iter().position(|(u, _)| u == url)?;
+        Some(all.remove(at).1)
     }
 
     pub(super) fn take_rejections(url: &str) -> Refusals {
