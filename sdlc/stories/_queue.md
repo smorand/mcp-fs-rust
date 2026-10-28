@@ -107,3 +107,5 @@
 | US-0105 | SPEC-0056 | refuse the ref names git refuses at creation | main | 2 | landed | story/US-0105-refuse-ref-names-git-refuses-at-creation | main |
 | US-0106 | SPEC-0056 | refuse a refused branch name at push, documentation and spec close | US-0105 | 2 | landed | story/US-0106-refuse-refused-branch-names-at-push-docs-and-close | main |
 | US-0107 | SPEC-0057 | return Parquet strings as text from the db tools | main | 2 | landed | story/US-0107-return-parquet-strings-as-text-from-the-db-tools | main |
+| US-0108 | SPEC-0058 | return dates and timestamps as readable text | main | 2 | todo | | |
+| US-0109 | SPEC-0058 | return decimals and binary values as readable text and close the spec | US-0108 | 2 | todo | | |
