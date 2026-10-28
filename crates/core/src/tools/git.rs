@@ -1681,7 +1681,11 @@ pub(crate) async fn tool_remote_push(
     // FR-MOD-102 with FR-NEW-104: the remote side name obeys the
     // same rule as a local one, checked here, before any remote is
     // resolved or contacted, and deliberately outside the audited
-    // operation: a malformed argument is not a remote operation.
+    // operation: a malformed argument is not a remote operation. The local
+    // name is held to the same rule: a branch stored before the creation
+    // check existed (SPEC-0056) would otherwise fail deep in the push as an
+    // internal error from libgit2 instead of this refusal.
+    validate_branch_name(&branch)?;
     if let Some(name) = remote_branch.as_deref() {
         validate_branch_name(name)?;
     }
@@ -16525,7 +16529,7 @@ mod tests {
         assert_eq!(e.bytes_written(), bytes);
     }
 
-    /// SPEC-0056/BT-002: a component ending in `.` is refused.
+    /// SPEC-0056/BT-002: a name ending in `.` is refused.
     #[tokio::test]
     async fn bt_0056_002_a_trailing_dot_branch_is_refused() {
         let e = Env::new().await;
@@ -16692,6 +16696,58 @@ mod tests {
         assert_eq!(e.audit().len(), audit);
         assert_eq!(e.bytes_written(), bytes);
         assert_eq!(ref_names(&e).await, refs);
+    }
+
+    /// SPEC-0056/BT-013: a stored branch with a refused name is refused at push, before
+    /// any remote is resolved or contacted, instead of failing late with an internal error.
+    #[tokio::test]
+    async fn bt_0056_013_a_legacy_branch_is_refused_at_push_before_the_network() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-bt0056-013");
+        let (_url, _r1, c2) = seed_r(&e, &remote_dir).await;
+        seed_legacy_ref(&e, "refs/heads/a//b", &c2).await;
+        let refs_before = bare_ref_names(&remote_dir);
+
+        let err = e
+            .call("git.remote_push", json!({"mount_id": MOUNT, "branch": "a//b"}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.message, "'a//b' is not a valid branch name: it contains '//'");
+        assert_eq!(bare_ref_names(&remote_dir), refs_before);
+        assert!(
+            !e.audit().iter().any(|a| a.op == "git.remote_push"),
+            "a rejected argument must not be audited as a remote operation"
+        );
+    }
+
+    /// SPEC-0056/BT-014: a `remote_branch` name git refuses is refused before the remote,
+    /// for each of the new classes.
+    #[tokio::test]
+    async fn bt_0056_014_an_invalid_remote_branch_name_is_refused_for_the_new_classes() {
+        let e = Env::new().await;
+        let remote_dir = e.f.dir.path().join("remote-bt0056-014");
+        seed_r(&e, &remote_dir).await;
+        let refs_before = bare_ref_names(&remote_dir);
+
+        for (bad, reason) in [
+            ("a//b", "it contains '//'"),
+            ("v1.", "it ends with '.'"),
+            ("x@{y}", "it contains '@{'"),
+        ] {
+            let err = e
+                .call(
+                    "git.remote_push",
+                    json!({"mount_id": MOUNT, "branch": "main", "remote_branch": bad}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{bad}: {err:?}");
+            assert_eq!(err.message, format!("'{bad}' is not a valid branch name: {reason}"));
+        }
+
+        assert_eq!(bare_ref_names(&remote_dir), refs_before);
     }
 
     /// DEC-002: the hand written rules accept exactly the names libgit2 accepts.

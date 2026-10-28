@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: M
 > Depth evidence: 2 modules (tools/git.rs, tools/git_tags.rs), 10 requirements, the refusal texts of 3 tools change, no data model change
-> Status: designed
+> Status: implemented
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: Medium

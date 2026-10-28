@@ -866,6 +866,14 @@ reconciles before the merge decision, so a paused conflict result carries them t
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
 scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
 "on the remote" tip set is every advertised ref, the real rejection mapping is untested,
-`a//b` normalised on disk). Remote tag deletion (BL-0075, SPEC-0053) and publishing every tag (BL-0076, SPEC-0054) are delivered.
+`a//b` normalised on disk; names like `a//b` are now refused at creation, see below). Remote tag deletion (BL-0075, SPEC-0053) and publishing every tag (BL-0076, SPEC-0054) are delivered.
 Round trip proof: `e2e_tag_051_create_publish_receive_round_trip` (two servers, one bare
 remote).
+
+## Ref name rules (SPEC-0056, 2026-10-28)
+Branch and tag names are checked by `validate_ref_name` (`crates/core/src/tools/git.rs`), the rules of `git check-ref-format`, in this order, the first that applies giving the reason: empty; over 255 bytes of UTF-8; a forbidden character (control, space, `~ ^ : ? * [ \\`); `..`; begins or ends with `/`; a `/` separated component begins with `.`; ends with `.lock`; then, added by SPEC-0056, contains `//`; ends with `.`; contains `@{`; a non final `/` separated component ends with `.lock`. A name such as `a./b` or `@` is valid for git and stays accepted. Message: `'<name>' is not a valid <branch|tag> name: <reason>`, code `ERR_INVALID_ARGUMENT`.
+
+- **Strict form** (the eleven rules): `git.branch_create`, `git.tag_create`, and `git.remote_push` for both `branch` and `remote_branch`, before any remote is resolved.
+- **Existing form** (the first seven rules only, `validate_existing_ref_name`): `git.branch_switch`, `git.branch_reset`, `git.branch_delete`, so a branch stored before the strict rules (for example `a//b`) can still be switched to, reset and deleted. Such a branch cannot be pushed: `git.remote_push` refuses it with the strict message. A stored tag with such a name is deletable and its publish keeps `Remote refused tag '<n>': invalid ref name`.
+- Guard: the unit test `ref_name_validator_matches_libgit2` compares the validator with libgit2's `Reference::is_valid_name` over every name of up to 5 characters of a 9 character alphabet, in both directions. The `let _ = repo.reference(...)` that ignores a failed on disk ref write in `branch_create` and `tag_create` is BL-0095.
+
