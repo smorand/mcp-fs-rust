@@ -36,7 +36,7 @@ No tool schema change. New private helper in `crates/core/src/tools/db.rs`: `fn 
 | `crates/core/src/tools/tool_surface_e2e.rs` | modify (BT-001, BT-002) |
 | `.agent_docs/dependencies.md` | modify (line 11: drop "A Parquet string column still comes out as the text `<Utf8View>`: that is the existing bug BL-0090, not fixed here.", note it was fixed by SPEC-0057) |
 ### Existing patterns
-- `db.rs` tests: `db_harness` (`:721`), `three_row_harness` (`:730`), `call_on` (`:739`), `zstd_parquet()` as the model for writing a Parquet with the arrow writer (BT-012).
+- `db.rs` tests: `db_harness` (`:721`), `three_row_harness` (`:730`), `call_on` (`:743`), `zstd_parquet()` as the model for writing a Parquet with the arrow writer (BT-012).
 - `tool_surface_e2e.rs`: `bt_001_an_enabled_sqlite_family_is_callable` (`:374`) for `setup`, `c.db.enabled = true`, `app_with_atlas`, `call_tool`, `success_payload`; seed the CSV with `fs.write` (`mount_id`, `path`, `content`), read the file back with `fs.read_bytes` (`base64` field).
 
 ## Acceptance tests
