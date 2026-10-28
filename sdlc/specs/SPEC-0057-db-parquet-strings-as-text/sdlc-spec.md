@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: S
 > Depth evidence: 1 module (`crates/core/src/tools/db.rs`), 5 requirements, no public contract change (tool names, descriptions and input schemas untouched), no data model change
-> Status: specified
+> Status: designed
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: High
