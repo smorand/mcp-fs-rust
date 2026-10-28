@@ -109,3 +109,4 @@
 | US-0107 | SPEC-0057 | return Parquet strings as text from the db tools | main | 2 | landed | story/US-0107-return-parquet-strings-as-text-from-the-db-tools | main |
 | US-0108 | SPEC-0058 | return dates and timestamps as readable text | main | 2 | landed | story/US-0108-return-dates-and-timestamps-as-readable-text | main |
 | US-0109 | SPEC-0058 | return decimals and binary values as readable text and close the spec | US-0108 | 2 | landed | story/US-0109-return-decimals-and-binary-as-readable-text | main |
+| US-0110 | SPEC-0059 | build the S3 blob store without depending on the OS trust store | main | 2 | todo | | |
