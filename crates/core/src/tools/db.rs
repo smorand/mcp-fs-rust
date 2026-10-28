@@ -142,9 +142,15 @@ fn cap_rows(requested: i64, config_max: usize) -> usize {
 /// by construction. `None` leaves the column to `arrow_value_to_json`.
 fn text_formatter(col: &dyn Array) -> Option<ArrayFormatter<'_>> {
     match col.data_type() {
-        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
-            ArrayFormatter::try_new(col, &FormatOptions::default()).ok()
-        }
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_)
+        | DataType::BinaryView => ArrayFormatter::try_new(col, &FormatOptions::default()).ok(),
         _ => None,
     }
 }
@@ -627,6 +633,13 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
 /// kind the data tools render as text, plus a whole number and a string.
 #[cfg(test)]
 pub(crate) fn t1_parquet() -> Vec<u8> {
+    t1_parquet_rows(false)
+}
+
+/// Fixture T1, plus (when asked) a second row where every typed column is missing,
+/// `n` is 6 and `name` is `Bob` (E2E-006).
+#[cfg(test)]
+pub(crate) fn t1_parquet_rows(with_missing_row: bool) -> Vec<u8> {
     use arrow::array::{
         BinaryArray, Date32Array, Date64Array, Decimal128Array, TimestampMicrosecondArray,
         TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
@@ -647,22 +660,42 @@ pub(crate) fn t1_parquet() -> Vec<u8> {
         Field::new("n", DataType::Int64, true),
         Field::new("name", DataType::Utf8, true),
     ]));
+    // One value, or that value then a missing one.
+    fn row<T>(v: T, two: bool) -> Vec<Option<T>> {
+        if two { vec![Some(v), None] } else { vec![Some(v)] }
+    }
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(TimestampSecondArray::from(vec![1_700_000_000])),
-            Arc::new(TimestampMillisecondArray::from(vec![1_700_000_000_123])),
-            Arc::new(TimestampMicrosecondArray::from(vec![1_700_000_000_123_456])),
-            Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_123_456_789])),
+            Arc::new(TimestampSecondArray::from(row(1_700_000_000, with_missing_row))),
+            Arc::new(TimestampMillisecondArray::from(row(1_700_000_000_123, with_missing_row))),
+            Arc::new(TimestampMicrosecondArray::from(row(1_700_000_000_123_456, with_missing_row))),
+            Arc::new(TimestampNanosecondArray::from(row(
+                1_700_000_000_123_456_789,
+                with_missing_row,
+            ))),
             Arc::new(
-                TimestampMicrosecondArray::from(vec![1_700_000_000_123_456]).with_timezone("UTC"),
+                TimestampMicrosecondArray::from(row(1_700_000_000_123_456, with_missing_row))
+                    .with_timezone("UTC"),
             ),
-            Arc::new(Date32Array::from(vec![19_675])),
-            Arc::new(Date64Array::from(vec![1_700_000_000_000])),
-            Arc::new(Decimal128Array::from(vec![12_345]).with_precision_and_scale(10, 2).unwrap()),
-            Arc::new(BinaryArray::from(vec![&b"\x00\x01ab"[..]])),
-            Arc::new(Int64Array::from(vec![5])),
-            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(Date32Array::from(row(19_675, with_missing_row))),
+            Arc::new(Date64Array::from(row(1_700_000_000_000, with_missing_row))),
+            Arc::new(
+                Decimal128Array::from(row(12_345, with_missing_row))
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(BinaryArray::from(if with_missing_row {
+                vec![Some(&b"\x00\x01ab"[..]), None]
+            } else {
+                vec![Some(&b"\x00\x01ab"[..])]
+            })),
+            Arc::new(Int64Array::from(if with_missing_row { vec![5, 6] } else { vec![5] })),
+            Arc::new(StringArray::from(if with_missing_row {
+                vec!["Alice", "Bob"]
+            } else {
+                vec!["Alice"]
+            })),
         ],
     )
     .unwrap();
@@ -1392,6 +1425,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r["rows"], json!([{"lst": "<List(Int64)>"}, {"lst": null}]));
+    }
+
+    /// A Parquet file made of the given named columns.
+    fn parquet_of(columns: Vec<(&str, arrow::array::ArrayRef)>) -> Vec<u8> {
+        use arrow::datatypes::{Field, Schema};
+        let fields: Vec<Field> =
+            columns.iter().map(|(n, a)| Field::new(*n, a.data_type().clone(), true)).collect();
+        let schema = std::sync::Arc::new(Schema::new(fields));
+        let batch =
+            RecordBatch::try_new(schema.clone(), columns.into_iter().map(|(_, a)| a).collect())
+                .unwrap();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// SPEC-0058/E2E-003
+    #[tokio::test]
+    async fn bt_0058_e2e_003_a_decimal_reads_as_text() {
+        let h = t1_harness().await;
+        let r = call_on(&h, "db.query", "/t.parquet", json!({"sql": "SELECT dec FROM t"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], json!([{"dec": "123.45"}]));
+        assert!(r["rows"][0]["dec"].is_string());
+    }
+
+    /// SPEC-0058/E2E-004
+    #[tokio::test]
+    async fn bt_0058_e2e_004_a_binary_value_reads_as_hexadecimal_text() {
+        let h = t1_harness().await;
+        let r = call_on(&h, "db.query", "/t.parquet", json!({"sql": "SELECT bin FROM t"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], json!([{"bin": "00016162"}]));
+    }
+
+    /// SPEC-0058/E2E-007
+    #[tokio::test]
+    async fn bt_0058_e2e_007_missing_values_are_null() {
+        use arrow::array::{BinaryArray, Decimal128Array, TimestampMicrosecondArray};
+        use std::sync::Arc;
+        let h = db_harness().await;
+        let bytes = parquet_of(vec![
+            ("d", Arc::new(Date32Array::from(vec![None::<i32>]))),
+            ("ts", Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]))),
+            (
+                "x",
+                Arc::new(
+                    Decimal128Array::from(vec![None::<i128>])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+            ),
+            ("b", Arc::new(BinaryArray::from(vec![None::<&[u8]>]))),
+        ]);
+        put(&h, "/n.parquet", &bytes).await;
+        let r =
+            call_on(&h, "db.query", "/n.parquet", json!({"sql": "SELECT * FROM n"})).await.unwrap();
+        assert_eq!(r["rows"], json!([{"d": null, "ts": null, "x": null, "b": null}]));
+    }
+
+    /// SPEC-0058/E2E-008
+    #[tokio::test]
+    async fn bt_0058_e2e_008_decimal_edge_values() {
+        use arrow::array::Decimal128Array;
+        use std::sync::Arc;
+        let h = db_harness().await;
+        let dec = |v: i128, p: u8, s: i8| -> arrow::array::ArrayRef {
+            Arc::new(Decimal128Array::from(vec![v]).with_precision_and_scale(p, s).unwrap())
+        };
+        let bytes = parquet_of(vec![
+            ("big", dec(1_234_567_890_123_456_789_012, 22, 2)),
+            ("neg", dec(-5, 10, 2)),
+            ("s0", dec(42, 10, 0)),
+        ]);
+        put(&h, "/d.parquet", &bytes).await;
+        let r = call_on(&h, "db.query", "/d.parquet", json!({"sql": "SELECT big, neg, s0 FROM d"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r["rows"],
+            json!([{"big": "12345678901234567890.12", "neg": "-0.05", "s0": "42"}])
+        );
+    }
+
+    /// SPEC-0058/E2E-011
+    #[tokio::test]
+    async fn bt_0058_e2e_011_binary_edge_values() {
+        use arrow::array::BinaryArray;
+        use std::sync::Arc;
+        let h = db_harness().await;
+        let bytes = parquet_of(vec![
+            ("b0", Arc::new(BinaryArray::from(vec![Some(&b""[..]), None]))),
+            ("bff", Arc::new(BinaryArray::from(vec![Some(&b"\x00\xff"[..]), None]))),
+        ]);
+        put(&h, "/b.parquet", &bytes).await;
+        let rows = json!([{"b0": "", "bff": "00ff"}, {"b0": null, "bff": null}]);
+        let r = call_on(&h, "db.query", "/b.parquet", json!({"sql": "SELECT b0, bff FROM b"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], rows);
+        convert(&h, "/b.parquet", "/b.ndjson").await;
+        let text = h.client().await.read_text("/b.ndjson").await.unwrap();
+        assert_eq!(text, "{\"b0\":\"\",\"bff\":\"00ff\"}\n{\"b0\":null,\"bff\":null}\n");
+    }
+
+    /// SPEC-0058/E2E-014: protects.
+    #[tokio::test]
+    async fn bt_0058_e2e_014_csv_conversion_and_type_names_do_not_move() {
+        let h = t1_harness().await;
+        convert(&h, "/t.parquet", "/o.csv").await;
+        let csv = h.client().await.read_text("/o.csv").await.unwrap();
+        assert_eq!(
+            csv,
+            "ts_s,ts_ms,ts_us,ts_ns,ts_utc,d32,d64,dec,bin,n,name\n\
+             2023-11-14T22:13:20,2023-11-14T22:13:20.123,2023-11-14T22:13:20.123456,\
+             2023-11-14T22:13:20.123456789,2023-11-14T22:13:20.123456Z,2023-11-14,\
+             2023-11-14T22:13:20,123.45,00016162,5,Alice\n"
+        );
+        let schema = call_on(&h, "db.schema", "/t.parquet", json!({})).await.unwrap();
+        let types: Vec<&str> =
+            schema.as_array().unwrap().iter().map(|c| c["data_type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "Timestamp(s)",
+                "Timestamp(ms)",
+                "Timestamp(\u{b5}s)",
+                "Timestamp(ns)",
+                "Timestamp(\u{b5}s, \"UTC\")",
+                "Date32",
+                "Date64",
+                "Decimal128(10, 2)",
+                "BinaryView",
+                "Int64",
+                "Utf8"
+            ]
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: FEAT / depth M: 1 module (the optional data analytics tools), 7 anticipated requirements, no persisted change; an output format changes, no tool name, parameter or schema does
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-28
 > Project: existing
 > From backlog: BL-0091

@@ -674,3 +674,89 @@ async fn bt_0058_e2e_001_timestamps_of_every_unit_read_as_text_through_mcp() {
         })
     );
 }
+
+// ── SPEC-0058/E2E-006 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bt_0058_e2e_006_conversion_to_ndjson_writes_the_same_text_as_csv() {
+    use base64::Engine as _;
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.db.enabled = true;
+    let (app, _state) = app_with_atlas(c).await;
+    let b64 =
+        base64::engine::general_purpose::STANDARD.encode(crate::tools::db::t1_parquet_rows(true));
+    success_payload(
+        &call_tool(
+            &app,
+            &token,
+            "fs.write_bytes",
+            json!({"mount_id": PROJECT, "path": "/t.parquet", "base64": b64}),
+        )
+        .await,
+    );
+
+    let ndjson = call_tool(
+        &app,
+        &token,
+        "db.convert",
+        json!({"mount_id": PROJECT, "src_path": "/t.parquet", "dst_path": "/o.ndjson"}),
+    )
+    .await;
+    assert_eq!(
+        success_payload(&ndjson),
+        json!({"src_path": "/t.parquet", "dst_path": "/o.ndjson", "rows_converted": 2, "format": "ndjson"})
+    );
+    success_payload(
+        &call_tool(
+            &app,
+            &token,
+            "db.convert",
+            json!({"mount_id": PROJECT, "src_path": "/t.parquet", "dst_path": "/o.csv"}),
+        )
+        .await,
+    );
+
+    let read = |path: &'static str| {
+        let (app, token) = (app.clone(), token.clone());
+        async move {
+            let v = call_tool(
+                &app,
+                &token,
+                "fs.read_bytes",
+                json!({"mount_id": PROJECT, "path": path}),
+            )
+            .await;
+            let b64 = success_payload(&v)["base64"].as_str().unwrap().to_string();
+            String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap())
+                .unwrap()
+        }
+    };
+    let ndjson_text = read("/o.ndjson").await;
+    let csv_text = read("/o.csv").await;
+    let lines: Vec<&str> = ndjson_text.lines().collect();
+    assert_eq!(
+        lines[0],
+        concat!(
+            "{\"ts_s\":\"2023-11-14T22:13:20\",\"ts_ms\":\"2023-11-14T22:13:20.123\",",
+            "\"ts_us\":\"2023-11-14T22:13:20.123456\",\"ts_ns\":\"2023-11-14T22:13:20.123456789\",",
+            "\"ts_utc\":\"2023-11-14T22:13:20.123456Z\",\"d32\":\"2023-11-14\",",
+            "\"d64\":\"2023-11-14T22:13:20\",\"dec\":\"123.45\",\"bin\":\"00016162\",",
+            "\"n\":5,\"name\":\"Alice\"}"
+        )
+    );
+    assert_eq!(
+        lines[1],
+        concat!(
+            "{\"ts_s\":null,\"ts_ms\":null,\"ts_us\":null,\"ts_ns\":null,\"ts_utc\":null,",
+            "\"d32\":null,\"d64\":null,\"dec\":null,\"bin\":null,\"n\":6,\"name\":\"Bob\"}"
+        )
+    );
+    // Each typed text of line 1 equals the matching cell of CSV line 2.
+    let first: Value = serde_json::from_str(lines[0]).unwrap();
+    let csv_cells: Vec<&str> = csv_text.lines().nth(1).unwrap().split(',').collect();
+    let names = ["ts_s", "ts_ms", "ts_us", "ts_ns", "ts_utc", "d32", "d64", "dec", "bin"];
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(first[name].as_str().unwrap(), csv_cells[i], "{name}");
+    }
+}
