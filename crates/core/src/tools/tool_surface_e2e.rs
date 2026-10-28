@@ -626,3 +626,51 @@ async fn bt_0057_002_a_converted_ndjson_file_holds_the_text() {
         "{\"id\":1,\"name\":\"Alice\"}\n{\"id\":2,\"name\":\"Bob\"}\n"
     );
 }
+
+// ── SPEC-0058/E2E-001 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bt_0058_e2e_001_timestamps_of_every_unit_read_as_text_through_mcp() {
+    use base64::Engine as _;
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.db.enabled = true;
+    let (app, _state) = app_with_atlas(c).await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(crate::tools::db::t1_parquet());
+    let written = call_tool(
+        &app,
+        &token,
+        "fs.write_bytes",
+        json!({"mount_id": PROJECT, "path": "/t.parquet", "base64": b64}),
+    )
+    .await;
+    success_payload(&written);
+
+    let v = call_tool(
+        &app,
+        &token,
+        "db.query",
+        json!({
+            "mount_id": PROJECT,
+            "path": "/t.parquet",
+            "sql": "SELECT ts_s, ts_ms, ts_us, ts_ns, ts_utc, n, name FROM t"
+        }),
+    )
+    .await;
+    assert_eq!(
+        success_payload(&v),
+        json!({
+            "columns": ["ts_s", "ts_ms", "ts_us", "ts_ns", "ts_utc", "n", "name"],
+            "rows": [{
+                "ts_s": "2023-11-14T22:13:20",
+                "ts_ms": "2023-11-14T22:13:20.123",
+                "ts_us": "2023-11-14T22:13:20.123456",
+                "ts_ns": "2023-11-14T22:13:20.123456789",
+                "ts_utc": "2023-11-14T22:13:20.123456Z",
+                "n": 5,
+                "name": "Alice"
+            }],
+            "row_count": 1
+        })
+    );
+}

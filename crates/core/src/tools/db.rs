@@ -14,12 +14,13 @@ use crate::tools::registry_support::handler;
 use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::tools::{norm, volume};
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
-    TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::*;
 use serde_json::{Value, json};
 
@@ -136,6 +137,18 @@ fn cap_rows(requested: i64, config_max: usize) -> usize {
     if requested <= 0 { max } else { (requested as usize).min(max) }
 }
 
+/// A formatter for the column types whose JSON text is the cell text of the CSV
+/// writer (SPEC-0058). The same `FormatOptions::default()` makes the two paths agree
+/// by construction. `None` leaves the column to `arrow_value_to_json`.
+fn text_formatter(col: &dyn Array) -> Option<ArrayFormatter<'_>> {
+    match col.data_type() {
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+            ArrayFormatter::try_new(col, &FormatOptions::default()).ok()
+        }
+        _ => None,
+    }
+}
+
 fn batches_to_json(batches: &[RecordBatch], limit: usize) -> Value {
     if batches.is_empty() {
         return json!({"columns": [], "rows": [], "row_count": 0});
@@ -145,6 +158,10 @@ fn batches_to_json(batches: &[RecordBatch], limit: usize) -> Value {
 
     let mut rows: Vec<Value> = Vec::new();
     'outer: for batch in batches {
+        // One formatter per column and batch: a timestamp formatter parses its time
+        // zone when built, which would repeat for every cell otherwise.
+        let formatters: Vec<Option<ArrayFormatter<'_>>> =
+            batch.columns().iter().map(|c| text_formatter(c.as_ref())).collect();
         for row_idx in 0..batch.num_rows() {
             if rows.len() >= limit {
                 break 'outer;
@@ -154,7 +171,10 @@ fn batches_to_json(batches: &[RecordBatch], limit: usize) -> Value {
                 .enumerate()
                 .map(|(col_idx, name)| {
                     let col = batch.column(col_idx);
-                    let v = arrow_value_to_json(col.as_ref(), row_idx);
+                    let v = match &formatters[col_idx] {
+                        Some(f) if !col.is_null(row_idx) => json!(f.value(row_idx).to_string()),
+                        _ => arrow_value_to_json(col.as_ref(), row_idx),
+                    };
                     (name.clone(), v)
                 })
                 .collect();
@@ -202,20 +222,6 @@ fn arrow_value_to_json(col: &dyn Array, row: usize) -> Value {
         }
         DataType::LargeUtf8 => {
             json!(col.as_any().downcast_ref::<LargeStringArray>().unwrap().value(row))
-        }
-        DataType::Date32 => {
-            json!(col.as_any().downcast_ref::<Date32Array>().unwrap().value(row))
-        }
-        DataType::Date64 => {
-            json!(col.as_any().downcast_ref::<Date64Array>().unwrap().value(row))
-        }
-        DataType::Timestamp(_, _) => {
-            json!(
-                col.as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .map(|a| a.value(row).to_string())
-                    .unwrap_or_else(|| "?".to_string())
-            )
         }
         other => json!(format!("<{other}>")),
     }
@@ -617,11 +623,62 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
     );
 }
 
+/// Fixture T1 of SPEC-0058: one row holding every date, timestamp, decimal and binary
+/// kind the data tools render as text, plus a whole number and a string.
+#[cfg(test)]
+pub(crate) fn t1_parquet() -> Vec<u8> {
+    use arrow::array::{
+        BinaryArray, Date32Array, Date64Array, Decimal128Array, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+        Field::new("ts_ms", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        Field::new("ts_us", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new("ts_ns", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        Field::new("ts_utc", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+        Field::new("d32", DataType::Date32, true),
+        Field::new("d64", DataType::Date64, true),
+        Field::new("dec", DataType::Decimal128(10, 2), true),
+        Field::new("bin", DataType::Binary, true),
+        Field::new("n", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampSecondArray::from(vec![1_700_000_000])),
+            Arc::new(TimestampMillisecondArray::from(vec![1_700_000_000_123])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1_700_000_000_123_456])),
+            Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_123_456_789])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_700_000_000_123_456]).with_timezone("UTC"),
+            ),
+            Arc::new(Date32Array::from(vec![19_675])),
+            Arc::new(Date64Array::from(vec![1_700_000_000_000])),
+            Arc::new(Decimal128Array::from(vec![12_345]).with_precision_and_scale(10, 2).unwrap()),
+            Arc::new(BinaryArray::from(vec![&b"\x00\x01ab"[..]])),
+            Arc::new(Int64Array::from(vec![5])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+        ],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DbConfig;
     use crate::tools::registry_support::ToolRegistry;
+    use arrow::array::Date32Array;
 
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();
@@ -1146,6 +1203,195 @@ mod tests {
                 {"id": 2, "name": "Bob", "score": 2.5}
             ])
         );
+    }
+
+    /// A one column Parquet file written with the arrow writer.
+    fn one_column_parquet(array: arrow::array::ArrayRef, name: &str) -> Vec<u8> {
+        use arrow::datatypes::{Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            name,
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    async fn put(h: &crate::tools::testkit::Harness, path: &str, bytes: &[u8]) {
+        h.client().await.write_bytes_atomic(path, bytes).await.unwrap();
+    }
+
+    async fn t1_harness() -> crate::tools::testkit::Harness {
+        let h = db_harness().await;
+        put(&h, "/t.parquet", &t1_parquet()).await;
+        h
+    }
+
+    /// SPEC-0058/E2E-002
+    #[tokio::test]
+    async fn bt_0058_e2e_002_dates_read_as_text() {
+        let h = t1_harness().await;
+        let r = call_on(&h, "db.query", "/t.parquet", json!({"sql": "SELECT d32, d64 FROM t"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], json!([{"d32": "2023-11-14", "d64": "2023-11-14T22:13:20"}]));
+    }
+
+    /// SPEC-0058/E2E-005
+    #[tokio::test]
+    async fn bt_0058_e2e_005_dates_in_a_csv_file_read_as_text() {
+        let h = db_harness().await;
+        h.seed("/c.csv", "d,ts,x\n2023-11-14,2023-11-14T22:13:20,1.50\n,,2.50\n").await;
+        let expected = json!([
+            {"d": "2023-11-14", "ts": "2023-11-14T22:13:20", "x": 1.5},
+            {"d": null, "ts": null, "x": 2.5}
+        ]);
+        let s = call_on(&h, "db.sample", "/c.csv", json!({"n": 5})).await.unwrap();
+        assert_eq!(s["rows"], expected);
+        let q =
+            call_on(&h, "db.query", "/c.csv", json!({"sql": "SELECT d, ts, x FROM c ORDER BY x"}))
+                .await
+                .unwrap();
+        assert_eq!(q["rows"], expected);
+    }
+
+    /// SPEC-0058/E2E-009
+    #[tokio::test]
+    async fn bt_0058_e2e_009_moments_before_1970() {
+        use arrow::array::TimestampSecondArray;
+        use arrow::datatypes::{Field, Schema, TimeUnit};
+        let h = db_harness().await;
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("pre", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new("dpre", DataType::Date32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(TimestampSecondArray::from(vec![-1])),
+                std::sync::Arc::new(Date32Array::from(vec![-1])),
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        put(&h, "/p.parquet", &out).await;
+        let r =
+            call_on(&h, "db.query", "/p.parquet", json!({"sql": "SELECT * FROM p"})).await.unwrap();
+        assert_eq!(r["rows"], json!([{"pre": "1969-12-31T23:59:59", "dpre": "1969-12-31"}]));
+    }
+
+    /// SPEC-0058/E2E-010
+    #[tokio::test]
+    async fn bt_0058_e2e_010_a_time_zone_with_an_offset() {
+        use arrow::array::TimestampMicrosecondArray;
+        let h = db_harness().await;
+        let array =
+            TimestampMicrosecondArray::from(vec![1_700_000_000_123_456]).with_timezone("+02:00");
+        put(&h, "/z.parquet", &one_column_parquet(std::sync::Arc::new(array), "tz2")).await;
+        let r = call_on(&h, "db.query", "/z.parquet", json!({"sql": "SELECT tz2 FROM z"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], json!([{"tz2": "2023-11-15T00:13:20.123456+02:00"}]));
+        convert(&h, "/z.parquet", "/z.csv").await;
+        let csv = h.client().await.read_text("/z.csv").await.unwrap();
+        assert_eq!(csv.lines().nth(1), Some("2023-11-15T00:13:20.123456+02:00"));
+    }
+
+    /// A Parquet file with a list column `lst` ([1, 2], or missing), a date column and, when asked, a whole number column `k`.
+    fn list_parquet(second_row_missing: bool, with_k: bool) -> Vec<u8> {
+        use arrow::array::ListArray;
+        use arrow::datatypes::{Field, Int64Type, Schema};
+        let rows: Vec<Option<Vec<Option<i64>>>> = if second_row_missing {
+            vec![Some(vec![Some(1), Some(2)]), None]
+        } else {
+            vec![Some(vec![Some(1), Some(2)])]
+        };
+        let n = rows.len();
+        let lst = ListArray::from_iter_primitive::<Int64Type, _, _>(rows);
+        let d32 = Date32Array::from(vec![Some(19_675); n]);
+        let mut fields = vec![
+            Field::new("lst", lst.data_type().clone(), true),
+            Field::new("d32", DataType::Date32, true),
+        ];
+        let mut columns: Vec<arrow::array::ArrayRef> =
+            vec![std::sync::Arc::new(lst), std::sync::Arc::new(d32)];
+        if with_k {
+            fields.push(Field::new("k", DataType::Int64, true));
+            columns.push(std::sync::Arc::new(Int64Array::from(vec![7; n])));
+        }
+        let schema = std::sync::Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// SPEC-0058/E2E-012: protects, passes before the change for `lst`, fails for `d32`.
+    #[tokio::test]
+    async fn bt_0058_e2e_012_a_nested_column_keeps_its_placeholder() {
+        let h = db_harness().await;
+        put(&h, "/l.parquet", &list_parquet(false, false)).await;
+        let schema = call_on(&h, "db.schema", "/l.parquet", json!({})).await.unwrap();
+        assert_eq!(schema[0]["name"], "lst");
+        assert_eq!(schema[0]["data_type"], "List(Int64)");
+        let r = call_on(&h, "db.query", "/l.parquet", json!({"sql": "SELECT lst, d32 FROM l"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], json!([{"lst": "<List(Int64)>", "d32": "2023-11-14"}]));
+        let src = "/l.parquet";
+        let c = h
+            .call(
+                "db.convert",
+                json!({"mount_id": crate::tools::testkit::MOUNT, "src_path": src, "dst_path": "/l.ndjson"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(c["format"], "ndjson");
+        let text = h.client().await.read_text("/l.ndjson").await.unwrap();
+        assert_eq!(text, "{\"lst\":\"<List(Int64)>\",\"d32\":\"2023-11-14\"}\n");
+    }
+
+    /// SPEC-0058/E2E-013: protects.
+    #[tokio::test]
+    async fn bt_0058_e2e_013_plain_columns_do_not_move() {
+        let h = three_row_harness().await;
+        let expected = json!({
+            "columns": ["id", "name", "score"],
+            "rows": [
+                {"id": 1, "name": "Alice", "score": 1.5},
+                {"id": 2, "name": "Bob", "score": 2.5},
+                {"id": 3, "name": "Carol", "score": 4.0}
+            ],
+            "row_count": 3
+        });
+        for path in ["/t.csv", "/t.ndjson", "/t.parquet"] {
+            let r = call_on(&h, "db.query", path, json!({"sql": SELECT_ALL})).await.unwrap();
+            assert_eq!(r, expected, "{path}");
+        }
+        put(&h, "/l.parquet", &list_parquet(false, true)).await;
+        let r =
+            call_on(&h, "db.query", "/l.parquet", json!({"sql": "SELECT k FROM l"})).await.unwrap();
+        assert_eq!(r, json!({"columns": ["k"], "rows": [{"k": 7}], "row_count": 1}));
+    }
+
+    /// SPEC-0058/E2E-015: protects.
+    #[tokio::test]
+    async fn bt_0058_e2e_015_a_missing_nested_value_is_null() {
+        let h = db_harness().await;
+        put(&h, "/m.parquet", &list_parquet(true, false)).await;
+        let r = call_on(&h, "db.query", "/m.parquet", json!({"sql": "SELECT lst FROM m"}))
+            .await
+            .unwrap();
+        assert_eq!(r["rows"], json!([{"lst": "<List(Int64)>"}, {"lst": null}]));
     }
 
     #[test]
