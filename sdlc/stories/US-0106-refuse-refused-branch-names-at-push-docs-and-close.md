@@ -26,7 +26,7 @@ Make `git.remote_push` refuse, before any remote is resolved or contacted, a loc
 No schema change. Refs already stored with a refused name are left as they are.
 
 ### Contracts
-No tool, parameter or result change. Refusal: `ERR_INVALID_ARGUMENT`, `'<name>' is not a valid <branch|tag> name: <reason>`. Reasons tried in order after the seven existing ones: 8 `it contains '//'`; 9 `one of its '/' separated components ends with '.'`; 10 `it contains '@{'`; 11 `one of its '/' separated components ends with '.lock'` (the whole name ending in `.lock` stays `it ends with '.lock'`). Signatures in `crates/core/src/tools/git.rs`: `pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()>` (strict); `pub(crate) fn validate_existing_ref_name(name: &str, noun: &str) -> Result<()>` (the seven original rules).
+No tool, parameter or result change. Refusal: `ERR_INVALID_ARGUMENT`, `'<name>' is not a valid <branch|tag> name: <reason>`. Reasons tried in order after the seven existing ones: 8 `it contains '//'`; 9 `it ends with '.'`; 10 `it contains '@{'`; 11 `one of its '/' separated components ends with '.lock'` (the whole name ending in `.lock` stays `it ends with '.lock'`). Signatures in `crates/core/src/tools/git.rs`: `pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()>` (strict); `pub(crate) fn validate_existing_ref_name(name: &str, noun: &str) -> Result<()>` (the seven original rules).
 
 ### Paths
 | Path | Action |

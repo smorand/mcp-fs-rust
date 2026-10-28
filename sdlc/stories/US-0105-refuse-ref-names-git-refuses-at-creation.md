@@ -13,10 +13,10 @@ Fix the root cause: add the four missing rules to the ref name validator so a br
 
 ## Requirements covered
 - SPEC-0056/BR-001: IF a member creates a branch whose name contains `//`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: it contains '//'` and create nothing.
-- SPEC-0056/BR-002: IF a member creates a branch whose name has a `/` separated component ending with `.`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: one of its '/' separated components ends with '.'` and create nothing.
+- SPEC-0056/BR-002: IF a member creates a branch whose name ends with `.`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: it ends with '.'` and create nothing.
 - SPEC-0056/BR-003: IF a member creates a branch whose name contains `@{`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: it contains '@{'` and create nothing.
 - SPEC-0056/BR-004: IF a member creates a branch whose name has a `/` separated component ending with `.lock` and the whole name does not end with `.lock`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: one of its '/' separated components ends with '.lock'` and create nothing.
-- SPEC-0056/BR-005: The Versioning context SHALL apply BR-001 to BR-004 to tag names with the word `tag` in place of `branch` (`'<name>' is not a valid tag name: <reason>`), and SHALL check the reasons in this order, the first that applies being the one given: the seven existing reasons in their existing order, then `it contains '//'`, then `one of its '/' separated components ends with '.'`, then `it contains '@{'`, then `one of its '/' separated components ends with '.lock'`.
+- SPEC-0056/BR-005: The Versioning context SHALL apply BR-001 to BR-004 to tag names with the word `tag` in place of `branch` (`'<name>' is not a valid tag name: <reason>`), and SHALL check the reasons in this order, the first that applies being the one given: the seven existing reasons in their existing order, then `it contains '//'`, then `it ends with '.'`, then `it contains '@{'`, then `one of its '/' separated components ends with '.lock'`.
 - SPEC-0056/BR-007: The Versioning context SHALL NOT refuse to switch to, reset or delete an existing branch because its name is one that BR-001 to BR-004 refuse for creation.
 - SPEC-0056/BR-008: The Versioning context SHALL NOT refuse to delete an existing tag because of its name, and publishing such a tag SHALL keep giving `Remote refused tag '<name>': invalid ref name`.
 - SPEC-0056/BR-009: The Versioning context SHALL NOT refuse a branch or tag name that `git check-ref-format` accepts.
@@ -40,7 +40,7 @@ Fix the root cause: add the four missing rules to the ref name validator so a br
 No schema change. Refs already stored with a refused name are left as they are.
 
 ### Contracts
-No tool, parameter or result change. Refusal: `ERR_INVALID_ARGUMENT`, `'<name>' is not a valid <branch|tag> name: <reason>`. Reasons tried in order after the seven existing ones: 8 `it contains '//'`; 9 `one of its '/' separated components ends with '.'`; 10 `it contains '@{'`; 11 `one of its '/' separated components ends with '.lock'` (the whole name ending in `.lock` stays `it ends with '.lock'`). Signatures in `crates/core/src/tools/git.rs`: `pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()>` (strict); `pub(crate) fn validate_existing_ref_name(name: &str, noun: &str) -> Result<()>` (the seven original rules).
+No tool, parameter or result change. Refusal: `ERR_INVALID_ARGUMENT`, `'<name>' is not a valid <branch|tag> name: <reason>`. Reasons tried in order after the seven existing ones: 8 `it contains '//'`; 9 `it ends with '.'`; 10 `it contains '@{'`; 11 `one of its '/' separated components ends with '.lock'` (the whole name ending in `.lock` stays `it ends with '.lock'`). Signatures in `crates/core/src/tools/git.rs`: `pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()>` (strict); `pub(crate) fn validate_existing_ref_name(name: &str, noun: &str) -> Result<()>` (the seven original rules).
 
 ### Paths
 | Path | Action |
@@ -64,14 +64,14 @@ No tool, parameter or result change. Refusal: `ERR_INVALID_ARGUMENT`, `'<name>' 
 - Level / Driver / Location: functional e2e / registered tools through `Env::call` / `crates/core/src/tools/git.rs`, `bt_0056_002_*`
 - **Reproduces:** BUG-001
 - **Driver:** as BT-001.
-- **Fails today because:** no rule for a component ending in `.`.
-- Given the project of BT-001. When Alice creates the branch `v1.`. Then `ERR_INVALID_ARGUMENT` `'v1.' is not a valid branch name: one of its '/' separated components ends with '.'`, And `git.branches` lists only `main`.
+- **Fails today because:** no rule for a name ending in `.`.
+- Given the project of BT-001. When Alice creates the branch `v1.`. Then `ERR_INVALID_ARGUMENT` `'v1.' is not a valid branch name: it ends with '.'`, And `git.branches` lists only `main`.
 
 ### SPEC-0056/BT-010: the four classes are refused for branches
 - Level / Driver / Location: functional e2e / registered tools through `Env::call` / `crates/core/src/tools/git.rs`, `bt_0056_010_*`
 - **Validates:** BR-001, BR-002, BR-003, BR-004
 - **Driver:** as BT-001.
-- Given the project. When Alice creates, one at a time, `a//b`, `a./b`, `x@{y}`, `a.lock/b`. Then each is refused with `ERR_INVALID_ARGUMENT` and respectively `it contains '//'`, `one of its '/' separated components ends with '.'`, `it contains '@{'`, `one of its '/' separated components ends with '.lock'` (full message `'<name>' is not a valid branch name: <reason>`), And `git.branches` lists only `main` after the four.
+- Given the project. When Alice creates, one at a time, `a//b`, `a/b.`, `x@{y}`, `a.lock/b`. Then each is refused with `ERR_INVALID_ARGUMENT` and respectively `it contains '//'`, `it ends with '.'`, `it contains '@{'`, `one of its '/' separated components ends with '.lock'` (full message `'<name>' is not a valid branch name: <reason>`), And `git.branches` lists only `main` after the four.
 
 ### SPEC-0056/BT-011: the four classes are refused for tags
 - Level / Driver / Location: functional e2e / registered tools through `Env::call` / `crates/core/src/tools/git.rs`, `bt_0056_011_*`
@@ -83,7 +83,7 @@ No tool, parameter or result change. Refusal: `ERR_INVALID_ARGUMENT`, `'<name>' 
 - Level / Driver / Location: functional e2e / registered tools through `Env::call` / `crates/core/src/tools/git.rs`, `bt_0056_012_*`
 - **Validates:** BR-005
 - **Driver:** as BT-011, and `git.branch_create`.
-- Given the project. When Alice creates the tag `a@{b.` and the branch `a.lock/b//c`. Then the tag is refused with `'a@{b.' is not a valid tag name: one of its '/' separated components ends with '.'`, And the branch is refused with `'a.lock/b//c' is not a valid branch name: it contains '//'`.
+- Given the project. When Alice creates the tag `a@{b.` and the branch `a.lock/b//c`. Then the tag is refused with `'a@{b.' is not a valid tag name: it ends with '.'`, And the branch is refused with `'a.lock/b//c' is not a valid branch name: it contains '//'`.
 
 ### SPEC-0056/BT-015: legacy branches stay manageable
 - Level / Driver / Location: functional e2e / registered tools through `Env::call` / `crates/core/src/tools/git.rs`, `bt_0056_015_*`

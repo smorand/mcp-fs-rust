@@ -31,7 +31,7 @@
   Delete, switch and reset of such a branch succeed (they call the same validator, which accepts the name).
 - **Expected per authority:** SPEC-0012 FR-NEW-104 / FR-NEW-116 (`sdlc/specs/SPEC-0012-full-git-dev-process/spec.md:103`): "branch-name validation mirrors `git check-ref-format`". For tags, SPEC-0052 section 3.3 (`sdlc/specs/SPEC-0052-git-tags/sdlc-spec.md:59`): "Tag names follow the same rules as branch names. Imposed by the user."
 - **Reproduction:** project with one commit; create the branch `a//b`; push it. Expected: the creation is refused with a clear message. Actual: the creation succeeds and the push fails with an internal error.
-- **Root cause:** `validate_ref_name` (`crates/core/src/tools/git.rs:2357-2392`) checks seven rules (empty, 255 bytes, forbidden characters, `..`, leading or trailing `/`, a component beginning with `.`, a whole name ending in `.lock`) and has none for four classes `git check-ref-format` refuses: a `//` anywhere, a `/` separated component ending with `.`, the sequence `@{`, and a component ending with `.lock` that is not the whole name. A differential run of the validator against libgit2's `Reference::is_valid_name` on 66 439 names (alphabet `a . / @ { } - l :`, up to 5 characters, plus 10 hand picked) found 4 538 names the validator accepts and libgit2 refuses, and none the other way: 576 with `//`, 2 539 with a component ending in `.`, 1 422 with `@{`, 1 with a non final `.lock` component, and no other class.
+- **Root cause:** `validate_ref_name` (`crates/core/src/tools/git.rs:2357-2392`) checks seven rules (empty, 255 bytes, forbidden characters, `..`, leading or trailing `/`, a component beginning with `.`, a whole name ending in `.lock`) and has none for four classes `git check-ref-format` refuses: a `//` anywhere, a name ending with `.`, the sequence `@{`, and a component ending with `.lock` that is not the whole name. A differential run of the validator against libgit2's `Reference::is_valid_name` on 66 436 names (alphabet `a . / @ { } - l :`, up to 5 characters, plus 7 hand picked) found 4 536 names the validator accepts and libgit2 refuses, and none the other way: 576 with `//`, 2 526 ending with `.`, 1 433 with `@{`, 1 with a non final `.lock` component, and no other class. Amended 2026-10-28: the first version of this analysis counted any `/` separated component ending with `.` (`a./b`); git accepts `a./b` and refuses only a name that ends with `.`, which the implementation of US-0105 found (`git check-ref-format refs/heads/a./b` is accepted).
 - **Contributing factors:** `branch_create` (`git.rs:2465`) and `tag_create` (`git_tags.rs:157`) write the on disk ref with `let _ = repo.reference(...)`, so libgit2's refusal is dropped silently; the failure surfaces at the first push (`git.rs:3647-3653`, mapped to `sync local branch ref`) or as an `invalid refspec` from libgit2's refspec parser.
 - **Impact:** a member creates a branch or tag that can never be pushed and gets an internal error with libgit2 wording, at a distance from the cause. No data loss. Workaround: delete the branch or tag and create it under another name.
 - **Rollback posture:** names accepted today and valid for git stay accepted. Branches and tags that already exist with a refused name must stay switchable, resettable and deletable, so nobody is locked out of cleaning them.
@@ -46,11 +46,11 @@
 - **Outputs:** `ERR_INVALID_ARGUMENT`, the message above with `<name>` as given, no ref row, no audit entry, no quota charge (`git.rs:2346-2348` states a refused name never leaves a partial row).
 - **Exact names:** code `ERR_INVALID_ARGUMENT`.
 
-#### BR-002 [EARS-O]: refuse a name with a component ending in `.`
-> IF a member creates a branch whose name has a `/` separated component ending with `.`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: one of its '/' separated components ends with '.'` and create nothing.
+#### BR-002 [EARS-O]: refuse a name ending in `.`
+> IF a member creates a branch whose name ends with `.`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: it ends with '.'` and create nothing.
 
 - **Source:** restored from SPEC-0012/FR-NEW-104.
-- **Business Rules:** a name that ends with `.` (`v1.`, `a.`) and a name whose inner component ends with `.` (`a./b`) are both covered.
+- **Business Rules:** `v1.`, `a.` and `a/b.` are refused; only the whole name matters, so `a./b` stays accepted (git accepts it, BR-009).
 
 #### BR-003 [EARS-O]: refuse a name containing `@{`
 > IF a member creates a branch whose name contains `@{`, THEN THE Versioning context SHALL refuse with `'<name>' is not a valid branch name: it contains '@{'` and create nothing.
@@ -63,7 +63,7 @@
 - **Source:** restored from SPEC-0012/FR-NEW-104. The whole name ending in `.lock` keeps today's text `it ends with '.lock'` (`git.rs:2388-2390`).
 
 #### BR-005 [EARS-U]: tags follow the same rules, in the same order
-> The Versioning context SHALL apply BR-001 to BR-004 to tag names with the word `tag` in place of `branch` (`'<name>' is not a valid tag name: <reason>`), and SHALL check the reasons in this order, the first that applies being the one given: the seven existing reasons in their existing order, then `it contains '//'`, then `one of its '/' separated components ends with '.'`, then `it contains '@{'`, then `one of its '/' separated components ends with '.lock'`.
+> The Versioning context SHALL apply BR-001 to BR-004 to tag names with the word `tag` in place of `branch` (`'<name>' is not a valid tag name: <reason>`), and SHALL check the reasons in this order, the first that applies being the one given: the seven existing reasons in their existing order, then `it contains '//'`, then `it ends with '.'`, then `it contains '@{'`, then `one of its '/' separated components ends with '.lock'`.
 
 - **Source:** restored from SPEC-0052 section 3.3 (tag names follow the branch rules) and decided here for the order and wording (user answer 2026-10-28: "go" on the defaults).
 - **Business Rules:** `a@{b.` gives the `'.'` reason; `a.lock/b//c` gives the `'//'` reason.
@@ -101,7 +101,8 @@
 | Case | Expected behavior | Requirement |
 |------|-------------------|-------------|
 | `a//b`, `a///b` | refused, `'//'` reason | BR-001 |
-| `v1.`, `a./b`, `a.` | refused, `'.'` reason | BR-002 |
+| `v1.`, `a.`, `a/b.` | refused, `'.'` reason | BR-002 |
+| `a./b` | accepted (git accepts it) | BR-009 |
 | `x@{y}`, `@{` | refused, `'@{'` reason | BR-003 |
 | `a.lock/b` | refused, component `.lock` reason | BR-004 |
 | `a/b.lock`, `tip.lock` | refused, `it ends with '.lock'` (unchanged) | BR-004, BR-010 |
@@ -125,14 +126,14 @@
 #### BT-002: a branch named `v1.` is refused at creation
 - **Reproduces:** BUG-001
 - **Driver:** as BT-001.
-- **Fails today because:** no rule for a component ending in `.`.
-- Given the project of BT-001. When Alice creates the branch `v1.`. Then `ERR_INVALID_ARGUMENT` `'v1.' is not a valid branch name: one of its '/' separated components ends with '.'`, And `git.branches` lists only `main`.
+- **Fails today because:** no rule for a name ending in `.`.
+- Given the project of BT-001. When Alice creates the branch `v1.`. Then `ERR_INVALID_ARGUMENT` `'v1.' is not a valid branch name: it ends with '.'`, And `git.branches` lists only `main`.
 
 ### 4.2 New behavior
 #### BT-010: the four classes are refused for branches
 - **Validates:** BR-001, BR-002, BR-003, BR-004
 - **Driver:** as BT-001.
-- Given the project. When Alice creates, one at a time, `a//b`, `a./b`, `x@{y}`, `a.lock/b`. Then each is refused with `ERR_INVALID_ARGUMENT` and respectively `it contains '//'`, `one of its '/' separated components ends with '.'`, `it contains '@{'`, `one of its '/' separated components ends with '.lock'` (full message `'<name>' is not a valid branch name: <reason>`), And `git.branches` lists only `main` after the four.
+- Given the project. When Alice creates, one at a time, `a//b`, `a/b.`, `x@{y}`, `a.lock/b`. Then each is refused with `ERR_INVALID_ARGUMENT` and respectively `it contains '//'`, `it ends with '.'`, `it contains '@{'`, `one of its '/' separated components ends with '.lock'` (full message `'<name>' is not a valid branch name: <reason>`), And `git.branches` lists only `main` after the four.
 
 #### BT-011: the four classes are refused for tags
 - **Validates:** BR-005
@@ -142,7 +143,7 @@
 #### BT-012: the first reason that applies is given
 - **Validates:** BR-005
 - **Driver:** as BT-011, and `git.branch_create`.
-- Given the project. When Alice creates the tag `a@{b.` and the branch `a.lock/b//c`. Then the tag is refused with `'a@{b.' is not a valid tag name: one of its '/' separated components ends with '.'`, And the branch is refused with `'a.lock/b//c' is not a valid branch name: it contains '//'`.
+- Given the project. When Alice creates the tag `a@{b.` and the branch `a.lock/b//c`. Then the tag is refused with `'a@{b.' is not a valid tag name: it ends with '.'`, And the branch is refused with `'a.lock/b//c' is not a valid branch name: it contains '//'`.
 
 #### BT-013: a legacy branch is refused at push before the network
 - **Validates:** BR-006

@@ -43,7 +43,7 @@ No tool, parameter, result shape or description changes (the frozen descriptions
 | # | Condition | Reason |
 |---|---|---|
 | 8 | the name contains `//` | `it contains '//'` |
-| 9 | a `/` separated component ends with `.` | `one of its '/' separated components ends with '.'` |
+| 9 | the whole name ends with `.` | `it ends with '.'` |
 | 10 | the name contains `@{` | `it contains '@{'` |
 | 11 | a `/` separated component ends with `.lock` (the whole name ending in `.lock` is rule 7, `it ends with '.lock'`) | `one of its '/' separated components ends with '.lock'` |
 
