@@ -2350,11 +2350,44 @@ fn validate_branch_name(name: &str) -> Result<()> {
     validate_ref_name(name, "branch")
 }
 
-/// The rules of [`validate_branch_name`] for any ref family. `noun` only
-/// changes the wording (`branch name`, `tag name`): tags and branches share
-/// one rule set, so a name refused for one is refused for the other with the
-/// very same reason.
+/// The seven original rules only, for a branch that already exists: a name
+/// stored before SPEC-0056 (`a//b`) must stay switchable, resettable and
+/// deletable, and the refusals it always had (`has space`) must not change.
+fn validate_existing_branch_name(name: &str) -> Result<()> {
+    validate_existing_ref_name(name, "branch")
+}
+
+/// The rules of [`validate_branch_name`] for any ref family, applied where a
+/// ref is created. `noun` only changes the wording (`branch name`, `tag name`):
+/// tags and branches share one rule set, so a name refused for one is refused
+/// for the other with the very same reason. The seven original rules come
+/// first and keep their order, then the four that make the name equal to what
+/// `git check-ref-format` accepts; a guard test keeps both in step with libgit2.
 pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()> {
+    validate_existing_ref_name(name, noun)?;
+    let reject = |why: &str| {
+        Err(ToolError::invalid_argument(format!("'{name}' is not a valid {noun} name: {why}")))
+    };
+    if name.contains("//") {
+        return reject("it contains '//'");
+    }
+    if name.ends_with('.') {
+        return reject("it ends with '.'");
+    }
+    if name.contains("@{") {
+        return reject("it contains '@{'");
+    }
+    // The whole name ending in `.lock` was already refused by the original
+    // rules, so this only ever fires for an inner component.
+    if name.split('/').any(|part| part.ends_with(".lock")) {
+        return reject("one of its '/' separated components ends with '.lock'");
+    }
+    Ok(())
+}
+
+/// The seven original rules, shared by the strict form and by the tools that
+/// act on a ref which already exists.
+pub(crate) fn validate_existing_ref_name(name: &str, noun: &str) -> Result<()> {
     let reject = |why: &str| {
         Err(ToolError::invalid_argument(format!("'{name}' is not a valid {noun} name: {why}")))
     };
@@ -2539,7 +2572,7 @@ async fn branch_switch(
     person: &str,
     name: &str,
 ) -> Result<Value> {
-    validate_branch_name(name)?;
+    validate_existing_branch_name(name)?;
     let branch_ref = format!("refs/heads/{name}");
 
     let _write = entry.write_lock.lock().await;
@@ -2641,7 +2674,7 @@ async fn branch_delete(
     name: &str,
     force: bool,
 ) -> Result<Value> {
-    validate_branch_name(name)?;
+    validate_existing_branch_name(name)?;
     let branch_ref = format!("refs/heads/{name}");
 
     let _write = entry.write_lock.lock().await;
@@ -2707,7 +2740,7 @@ async fn branch_reset(
     target_commit: &str,
     force: bool,
 ) -> Result<Value> {
-    validate_branch_name(name)?;
+    validate_existing_branch_name(name)?;
     let branch_ref = format!("refs/heads/{name}");
 
     let _write = entry.write_lock.lock().await;
@@ -16456,6 +16489,243 @@ mod tests {
         assert_eq!(ref_names(&e).await, vec!["HEAD", "refs/heads/main"]);
     }
 
+    // ── SPEC-0056 US-0105: refuse the ref names git refuses at creation ─────
+
+    /// Legacy state: a ref stored with a name the creation tools now refuse,
+    /// as a project created before SPEC-0056 holds. Written straight into the
+    /// ref table so no production helper exists for it (DEC-006).
+    async fn seed_legacy_ref(e: &Env, full_ref_name: &str, sha: &str) {
+        e.entry().await.db.set_ref(full_ref_name, sha, false).await.unwrap();
+    }
+
+    async fn branch_list_names(e: &Env) -> Vec<String> {
+        let out = e.call("git.branches", json!({"mount_id": MOUNT})).await.unwrap();
+        out["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// SPEC-0056/BT-001: `a//b` is refused and nothing is created or charged.
+    #[tokio::test]
+    async fn bt_0056_001_a_double_slash_branch_is_refused() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+        let audit = e.audit().len();
+        let bytes = e.bytes_written();
+
+        let err = branch_create(&e, json!({"name": "a//b"})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.message, "'a//b' is not a valid branch name: it contains '//'");
+        assert_eq!(branch_list_names(&e).await, vec!["main"]);
+        assert_eq!(e.audit().len(), audit);
+        assert_eq!(e.bytes_written(), bytes);
+    }
+
+    /// SPEC-0056/BT-002: a component ending in `.` is refused.
+    #[tokio::test]
+    async fn bt_0056_002_a_trailing_dot_branch_is_refused() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        let err = branch_create(&e, json!({"name": "v1."})).await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.message, "'v1.' is not a valid branch name: it ends with '.'");
+        assert_eq!(branch_list_names(&e).await, vec!["main"]);
+    }
+
+    const NEW_REFUSALS: [(&str, &str); 4] = [
+        ("a//b", "it contains '//'"),
+        ("a/b.", "it ends with '.'"),
+        ("x@{y}", "it contains '@{'"),
+        ("a.lock/b", "one of its '/' separated components ends with '.lock'"),
+    ];
+
+    /// SPEC-0056/BT-010: the four classes are refused for branches.
+    #[tokio::test]
+    async fn bt_0056_010_the_four_classes_are_refused_for_branches() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        for (name, reason) in NEW_REFUSALS {
+            let err = branch_create(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{name}: {err:?}");
+            assert_eq!(err.message, format!("'{name}' is not a valid branch name: {reason}"));
+        }
+        assert_eq!(branch_list_names(&e).await, vec!["main"]);
+    }
+
+    /// SPEC-0056/BT-011: the four classes are refused for tags.
+    #[tokio::test]
+    async fn bt_0056_011_the_four_classes_are_refused_for_tags() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        for (name, reason) in
+            NEW_REFUSALS.iter().map(|(n, r)| (*n, *r)).chain([("v1.", NEW_REFUSALS[1].1)])
+        {
+            let err = tag(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{name}: {err:?}");
+            assert_eq!(err.message, format!("'{name}' is not a valid tag name: {reason}"));
+        }
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0056/BT-012: the first reason that applies is the one given.
+    #[tokio::test]
+    async fn bt_0056_012_the_first_reason_that_applies_is_given() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        let err = tag(&e, json!({"name": "a@{b."})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.message, "'a@{b.' is not a valid tag name: it ends with '.'");
+
+        let err = branch_create(&e, json!({"name": "a.lock/b//c"})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(err.message, "'a.lock/b//c' is not a valid branch name: it contains '//'");
+    }
+
+    /// SPEC-0056/BT-015: a branch stored with a now refused name stays manageable.
+    #[tokio::test]
+    async fn bt_0056_015_legacy_branches_stay_manageable() {
+        let e = Env::new().await;
+        let (_c1, c2) = seed_a(&e).await;
+        seed_legacy_ref(&e, "refs/heads/a//b", &c2).await;
+
+        let out = switch_to(&e, "a//b").await.unwrap();
+        assert_eq!(out["branch"], "a//b", "{out}");
+        let out = switch_to(&e, "main").await.unwrap();
+        assert_eq!(out["branch"], "main", "{out}");
+
+        e.call("git.branch_reset", json!({"mount_id": MOUNT, "name": "a//b", "target_commit": c2}))
+            .await
+            .unwrap();
+        let out =
+            e.call("git.branch_delete", json!({"mount_id": MOUNT, "name": "a//b"})).await.unwrap();
+        assert_eq!(out["branch"], "a//b", "{out}");
+        assert_eq!(branch_list_names(&e).await, vec!["main"]);
+    }
+
+    /// SPEC-0056/BT-016: a legacy tag is still deletable and its publish refusal is unchanged.
+    #[tokio::test]
+    async fn bt_0056_016_legacy_tags_stay_deletable_and_keep_their_publish_refusal() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-bt0056-016").await;
+        seed_legacy_ref(&e, "refs/tags/a//b", &a).await;
+        let before = bare_refs(&dir);
+
+        let err = call_publish_tag(&e, &url, "a//b").await.unwrap_err();
+        assert_eq!(err.code, code::INTERNAL_ERROR, "{err:?}");
+        assert_eq!(err.message, "Remote refused tag 'a//b': invalid ref name");
+        assert_eq!(bare_refs(&dir), before);
+
+        e.call("git.tag_delete", json!({"mount_id": MOUNT, "name": "a//b"})).await.unwrap();
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0056/BT-020: names git accepts stay accepted.
+    #[tokio::test]
+    async fn bt_0056_020_valid_names_stay_accepted() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        let long = "a".repeat(255);
+        // `a./b` is accepted by git: only a name that itself ends with `.` is refused.
+        for name in ["@", "ok/name", "release/2026-q1", "é", "a./b", long.as_str()] {
+            branch_create(&e, json!({"name": name}))
+                .await
+                .unwrap_or_else(|x| panic!("{name}: {x:?}"));
+        }
+        for name in ["v1.0", "@", "release/2026-q1", "é", "a./b"] {
+            tag(&e, json!({"name": name})).await.unwrap_or_else(|x| panic!("{name}: {x:?}"));
+        }
+
+        let too_long = "a".repeat(256);
+        let err = branch_create(&e, json!({"name": too_long})).await.unwrap_err();
+        assert_eq!(err.code, code::INVALID_ARGUMENT, "{err:?}");
+        assert_eq!(
+            err.message,
+            format!(
+                "'{too_long}' is not a valid branch name: it is 256 bytes of UTF-8, over the 255 byte limit"
+            )
+        );
+    }
+
+    /// SPEC-0056/BT-021: the seven existing reasons are unchanged.
+    #[tokio::test]
+    async fn bt_0056_021_the_seven_existing_reasons_are_unchanged() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+
+        for (name, reason) in [
+            ("bad..name", "it contains '..'"),
+            ("has space", "it contains the forbidden character ' '"),
+            ("/leading", "it begins or ends with '/'"),
+            ("trailing/", "it begins or ends with '/'"),
+            ("tip.lock", "it ends with '.lock'"),
+            ("a/.hidden", "one of its '/' separated components begins with '.'"),
+            ("", "it is empty"),
+            ("a/b.lock", "it ends with '.lock'"),
+        ] {
+            let err = branch_create(&e, json!({"name": name})).await.unwrap_err();
+            assert_eq!(err.code, code::INVALID_ARGUMENT, "{name:?}: {err:?}");
+            assert_eq!(err.message, format!("'{name}' is not a valid branch name: {reason}"));
+        }
+    }
+
+    /// SPEC-0056/BT-022: a refused creation leaves nothing behind.
+    #[tokio::test]
+    async fn bt_0056_022_a_refused_creation_leaves_nothing_behind() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+        let audit = e.audit().len();
+        let bytes = e.bytes_written();
+        let refs = ref_names(&e).await;
+
+        branch_create(&e, json!({"name": "a//b"})).await.unwrap_err();
+
+        assert_eq!(e.audit().len(), audit);
+        assert_eq!(e.bytes_written(), bytes);
+        assert_eq!(ref_names(&e).await, refs);
+    }
+
+    /// DEC-002: the hand written rules accept exactly the names libgit2 accepts.
+    #[test]
+    fn ref_name_validator_matches_libgit2() {
+        const ALPHABET: [char; 9] = ['a', '.', '/', '@', '{', '}', '-', 'l', ':'];
+        let mut names: Vec<String> =
+            ["a.lock", "a.lock/b", "a/b.lock", "@", "a@b", "a@{b", "x.lock/"]
+                .iter()
+                .map(|n| n.to_string())
+                .collect();
+        let mut layer: Vec<String> = vec![String::new()];
+        for _ in 0..5 {
+            layer = layer
+                .iter()
+                .flat_map(|p| ALPHABET.iter().map(move |c| format!("{p}{c}")))
+                .collect();
+            names.extend(layer.iter().cloned());
+        }
+        let disagreements: Vec<&String> = names
+            .iter()
+            .filter(|n| {
+                validate_ref_name(n, "branch").is_ok()
+                    != git2::Reference::is_valid_name(&format!("refs/heads/{n}"))
+            })
+            .collect();
+        assert!(
+            disagreements.is_empty(),
+            "validator and libgit2 disagree on {} names, first: {:?}",
+            disagreements.len(),
+            &disagreements[..disagreements.len().min(10)]
+        );
+    }
+
     /// E2E-NEW-405: FR-NEW-101/104/116, a unicode name round-trips byte for byte.
     #[tokio::test]
     async fn e2e_new_405_a_unicode_branch_name_round_trips_exactly() {
@@ -26040,7 +26310,7 @@ mod tests {
     async fn e2e_tag_085_remote_refuses_the_tag_name() {
         let e = Env::new().await;
         let (dir, url, a) = cloned_remote(&e, "remote-t085").await;
-        tag(&e, json!({"name": "a//b"})).await.unwrap();
+        seed_legacy_ref(&e, "refs/tags/a//b", &a).await;
         let before = bare_refs(&dir);
 
         let err = call_publish_tag(&e, &url, "a//b").await.unwrap_err();
@@ -28683,7 +28953,7 @@ mod tests {
     async fn e2e_tag_057_publish_all_an_invalid_ref_name() {
         let e = Env::new().await;
         let (dir, _, a, b, _) = three_commit_remote(&e, "remote-p057").await;
-        tag(&e, json!({"name": "a//b", "target": a})).await.unwrap();
+        seed_legacy_ref(&e, "refs/tags/a//b", &a).await;
         tag(&e, json!({"name": "v1.0", "target": b})).await.unwrap();
         let audit = audit_count(&e);
 
