@@ -15,8 +15,8 @@ use crate::tools::registry_support::{ToolRegistry, ToolSchema};
 use crate::tools::{norm, volume};
 use arrow::array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampNanosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -100,8 +100,8 @@ async fn register_from_bytes(
 
 /// Session with the SQL string mapping of datafusion 43: `CAST(.. AS VARCHAR)`
 /// yields `Utf8`, so `db.profile` min and max stay rendered text (SPEC-0055 DR-009).
-/// Since datafusion 49 the default maps VARCHAR to `Utf8View`, which
-/// `arrow_value_to_json` renders as the placeholder `<Utf8View>`.
+/// Since datafusion 49 the default maps VARCHAR to `Utf8View`; `arrow_value_to_json`
+/// renders such a column as text either way.
 fn session() -> SessionContext {
     let mut config = SessionConfig::new();
     config.options_mut().sql_parser.map_string_types_to_utf8view = false;
@@ -118,6 +118,16 @@ fn sql_error(e: datafusion::error::DataFusionError) -> ToolError {
     });
     let text = e.to_string();
     ToolError::invalid_argument(format!("SQL error: {}", POSITION.replace_all(&text, "")))
+}
+
+/// Column type name shown to callers. A `Utf8View` string (what the Parquet reader
+/// yields) is reported as `Utf8`, the name CSV and NDJSON give the same data
+/// (SPEC-0009 E2E-019, SPEC-0057/BR-003).
+fn type_name(t: &DataType) -> String {
+    match t {
+        DataType::Utf8View => "Utf8".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn cap_rows(requested: i64, config_max: usize) -> usize {
@@ -185,6 +195,10 @@ fn arrow_value_to_json(col: &dyn Array, row: usize) -> Value {
         }
         DataType::Utf8 => {
             json!(col.as_any().downcast_ref::<StringArray>().unwrap().value(row))
+        }
+        // The Parquet reader types strings as views (SPEC-0057); same text as `Utf8`.
+        DataType::Utf8View => {
+            json!(col.as_any().downcast_ref::<StringViewArray>().unwrap().value(row))
         }
         DataType::LargeUtf8 => {
             json!(col.as_any().downcast_ref::<LargeStringArray>().unwrap().value(row))
@@ -357,7 +371,7 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
                 .map(|f| {
                     json!({
                         "name": f.name(),
-                        "data_type": format!("{}", f.data_type()),
+                        "data_type": type_name(f.data_type()),
                         "nullable": f.is_nullable(),
                     })
                 })
@@ -463,7 +477,7 @@ pub fn register(reg: &mut ToolRegistry, config: &DbConfig) {
 
                 columns.push(json!({
                     "name": col,
-                    "type": format!("{}", field.data_type()),
+                    "type": type_name(field.data_type()),
                     "non_null": non_null,
                     "distinct": distinct,
                     "min": min_val,
@@ -785,9 +799,9 @@ mod tests {
         );
     }
 
-    /// SPEC-0055/DT-002. Recorded on datafusion 43: a Parquet written by
+    /// SPEC-0055/DT-002, amended by SPEC-0057/BR-001: a Parquet written by
     /// db.convert reads its string column back as `Utf8View`, which the row
-    /// serializer renders as the placeholder `<Utf8View>`. DR-009 keeps that.
+    /// serializer renders as the stored text.
     #[tokio::test]
     async fn spec_0055_dt_002_query_parquet() {
         let h = three_row_harness().await;
@@ -797,9 +811,9 @@ mod tests {
             json!({
                 "columns": ["id", "name", "score"],
                 "rows": [
-                    {"id": 1, "name": "<Utf8View>", "score": 1.5},
-                    {"id": 2, "name": "<Utf8View>", "score": 2.5},
-                    {"id": 3, "name": "<Utf8View>", "score": 4.0}
+                    {"id": 1, "name": "Alice", "score": 1.5},
+                    {"id": 2, "name": "Bob", "score": 2.5},
+                    {"id": 3, "name": "Carol", "score": 4.0}
                 ],
                 "row_count": 3
             })
@@ -822,14 +836,15 @@ mod tests {
         ])
     }
 
-    /// SPEC-0055/DT-004. The Parquet string column is `Utf8View` on 43.
+    /// SPEC-0055/DT-004, amended by SPEC-0057/BR-003: the Parquet string column
+    /// reports `Utf8`, like the CSV and the NDJSON.
     #[tokio::test]
     async fn spec_0055_dt_004_schema_type_names() {
         let h = three_row_harness().await;
         let csv = call_on(&h, "db.schema", "/t.csv", json!({})).await.unwrap();
         assert_eq!(csv, schema_of(["Int64", "Utf8", "Float64"]));
         let parquet = call_on(&h, "db.schema", "/t.parquet", json!({})).await.unwrap();
-        assert_eq!(parquet, schema_of(["Int64", "Utf8View", "Float64"]));
+        assert_eq!(parquet, schema_of(["Int64", "Utf8", "Float64"]));
         let ndjson = call_on(&h, "db.schema", "/t.ndjson", json!({})).await.unwrap();
         assert_eq!(ndjson, schema_of(["Int64", "Utf8", "Float64"]));
     }
@@ -853,13 +868,12 @@ mod tests {
         assert_eq!(r, profile_of("Utf8"));
     }
 
-    /// SPEC-0055/DT-006. Same profile as the CSV except the recorded type name
-    /// of the string column, `Utf8View`.
+    /// SPEC-0055/DT-006, amended by SPEC-0057/BR-004: same profile as the CSV.
     #[tokio::test]
     async fn spec_0055_dt_006_profile_parquet() {
         let h = three_row_harness().await;
         let r = call_on(&h, "db.profile", "/t.parquet", json!({})).await.unwrap();
-        assert_eq!(r, profile_of("Utf8View"));
+        assert_eq!(r, profile_of("Utf8"));
     }
 
     /// SPEC-0055/DT-007: the first two rows, in file order, on 43.
@@ -993,14 +1007,13 @@ mod tests {
     fn id_name_rows() -> Value {
         json!({
             "columns": ["id", "name"],
-            "rows": [{"id": 1, "name": "<Utf8View>"}, {"id": 2, "name": "<Utf8View>"}],
+            "rows": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
             "row_count": 2
         })
     }
 
     /// SPEC-0055/DT-040. Effect not observable by assertion (memory class); this
-    /// proves the zstd read path works. The string column renders as the
-    /// recorded `<Utf8View>` placeholder, as in DT-002.
+    /// proves the zstd read path works. The string column renders as text.
     #[tokio::test]
     async fn spec_0055_dt_040_zstd_parquet_is_read() {
         let h = db_harness().await;
@@ -1047,6 +1060,92 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ok, id_name_rows());
+    }
+
+    /// SPEC-0057/BT-010: the three formats report the same column types.
+    #[tokio::test]
+    async fn bt_0057_010_schema_type_of_a_parquet_string_column() {
+        let h = three_row_harness().await;
+        for path in ["/t.csv", "/t.parquet", "/t.ndjson"] {
+            let r = call_on(&h, "db.schema", path, json!({})).await.unwrap();
+            assert_eq!(r, schema_of(["Int64", "Utf8", "Float64"]), "{path}");
+        }
+    }
+
+    /// SPEC-0057/BT-011: the Parquet profile equals the CSV profile.
+    #[tokio::test]
+    async fn bt_0057_011_profile_of_a_parquet_string_column() {
+        let h = three_row_harness().await;
+        let r = call_on(&h, "db.profile", "/t.parquet", json!({})).await.unwrap();
+        assert_eq!(r, profile_of("Utf8"));
+    }
+
+    /// A Parquet with one nullable string column `s`.
+    fn string_parquet(values: &[Option<&str>]) -> Vec<u8> {
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(StringArray::from(values.to_vec()))],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// SPEC-0057/BT-012: null, empty, long and non ASCII strings survive.
+    #[tokio::test]
+    async fn bt_0057_012_edge_values_survive_a_parquet_round_trip() {
+        let h = db_harness().await;
+        let bytes = string_parquet(&[
+            Some("h\u{e9}llo \u{65e5}\u{672c}"),
+            Some(""),
+            None,
+            Some("a string well over twelve bytes"),
+        ]);
+        h.client().await.write_bytes_atomic("/t.parquet", &bytes).await.unwrap();
+        let expected = json!([
+            {"s": "h\u{e9}llo \u{65e5}\u{672c}"},
+            {"s": ""},
+            {"s": null},
+            {"s": "a string well over twelve bytes"}
+        ]);
+        let r =
+            call_on(&h, "db.query", "/t.parquet", json!({"sql": "SELECT s FROM t"})).await.unwrap();
+        assert_eq!(r["rows"], expected);
+        convert(&h, "/t.parquet", "/o.ndjson").await;
+        let text = h.client().await.read_text("/o.ndjson").await.unwrap();
+        let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(Value::Array(lines), expected);
+        assert!(text.ends_with('\n'));
+    }
+
+    /// SPEC-0057/BT-013: a string computed from a Parquet column, and a sample.
+    #[tokio::test]
+    async fn bt_0057_013_computed_and_sampled_strings() {
+        let h = three_row_harness().await;
+        let r = call_on(
+            &h,
+            "db.query",
+            "/t.parquet",
+            json!({"sql": "SELECT upper(name) AS u FROM t ORDER BY id"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["rows"], json!([{"u": "ALICE"}, {"u": "BOB"}, {"u": "CAROL"}]));
+        let r = call_on(&h, "db.sample", "/t.parquet", json!({"n": 2})).await.unwrap();
+        assert_eq!(
+            r["rows"],
+            json!([
+                {"id": 1, "name": "Alice", "score": 1.5},
+                {"id": 2, "name": "Bob", "score": 2.5}
+            ])
+        );
     }
 
     #[test]

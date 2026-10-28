@@ -548,3 +548,81 @@ fn no_optional_family_tool_shadows_a_contract_tool() {
     assert!(clashes.is_empty(), "optional tools shadowing contract tools: {clashes:?}");
     assert!(registry.names().len() >= 20, "the families registered: {:?}", registry.names());
 }
+
+// ── SPEC-0057/BT-001, BT-002 ────────────────────────────────────────────────
+
+/// `/t.parquet` made by `db.convert` from a two row CSV, through the MCP route.
+async fn parquet_of_alice_and_bob(app: &Router, token: &str) {
+    let written = call_tool(
+        app,
+        token,
+        "fs.write",
+        json!({"mount_id": PROJECT, "path": "/t.csv", "content": "id,name\n1,Alice\n2,Bob\n"}),
+    )
+    .await;
+    success_payload(&written);
+    let converted = call_tool(
+        app,
+        token,
+        "db.convert",
+        json!({"mount_id": PROJECT, "src_path": "/t.csv", "dst_path": "/t.parquet"}),
+    )
+    .await;
+    success_payload(&converted);
+}
+
+#[tokio::test]
+async fn bt_0057_001_parquet_strings_come_back_as_text_through_mcp() {
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.db.enabled = true;
+    let (app, _state) = app_with_atlas(c).await;
+    parquet_of_alice_and_bob(&app, &token).await;
+
+    let v = call_tool(
+        &app,
+        &token,
+        "db.query",
+        json!({"mount_id": PROJECT, "path": "/t.parquet", "sql": "SELECT id, name FROM t ORDER BY id"}),
+    )
+    .await;
+    assert_eq!(
+        success_payload(&v),
+        json!({
+            "columns": ["id", "name"],
+            "rows": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
+            "row_count": 2
+        })
+    );
+}
+
+#[tokio::test]
+async fn bt_0057_002_a_converted_ndjson_file_holds_the_text() {
+    use base64::Engine as _;
+    let d = tempfile::tempdir().unwrap();
+    let (mut c, token) = setup(d.path());
+    c.db.enabled = true;
+    let (app, _state) = app_with_atlas(c).await;
+    parquet_of_alice_and_bob(&app, &token).await;
+
+    let v = call_tool(
+        &app,
+        &token,
+        "db.convert",
+        json!({"mount_id": PROJECT, "src_path": "/t.parquet", "dst_path": "/o.ndjson"}),
+    )
+    .await;
+    assert_eq!(
+        success_payload(&v),
+        json!({"src_path": "/t.parquet", "dst_path": "/o.ndjson", "rows_converted": 2, "format": "ndjson"})
+    );
+    let read =
+        call_tool(&app, &token, "fs.read_bytes", json!({"mount_id": PROJECT, "path": "/o.ndjson"}))
+            .await;
+    let b64 = success_payload(&read)["base64"].as_str().unwrap().to_string();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+    assert_eq!(
+        String::from_utf8(bytes).unwrap(),
+        "{\"id\":1,\"name\":\"Alice\"}\n{\"id\":2,\"name\":\"Bob\"}\n"
+    );
+}

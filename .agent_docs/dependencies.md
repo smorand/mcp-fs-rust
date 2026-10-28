@@ -8,5 +8,5 @@
 - Exit condition: BL-0089. When `cargo search datafusion` shows a release above 55.2.0 whose `arrow` requirement is 60 or more, depend on it from crates.io and delete the `allow-git` entry and this section.
 
 ## Behaviour kept on purpose
-- `crates/core/src/tools/db.rs` sets `sql_parser.map_string_types_to_utf8view = false` and strips the ` at Line: N, Column: N` suffix datafusion's SQL parser added to its error text, so the `db.*` tool outputs stay byte identical to datafusion 43 (characterization tests DT-001 to DT-011). A Parquet string column still comes out as the text `<Utf8View>`: that is the existing bug BL-0090, not fixed here.
+- `crates/core/src/tools/db.rs` sets `sql_parser.map_string_types_to_utf8view = false` and strips the ` at Line: N, Column: N` suffix datafusion's SQL parser added to its error text, so the `db.*` tool outputs stay byte identical to datafusion 43 (characterization tests DT-001 to DT-011). A Parquet string column (read as `Utf8View`) is rendered as its text and reported as `Utf8`, which fixed BL-0090 (SPEC-0057, 2026-10-28); other view types such as `BinaryView` still print the placeholder (BL-0091).
 - Search: the tantivy 0.26 index fixture (`crates/core/src/search/fixtures/tantivy_0_26/`) still opens and answers under 0.27. tantivy 0.27 swapped its stemmer crate; BL-0092 tracks a comparison on real text.
