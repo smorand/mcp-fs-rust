@@ -378,3 +378,15 @@ to what a client should be told. A caller still sees `ERR_INTERNAL_ERROR`, becau
 conflict the server already retried three times is a server problem, not something the
 caller can fix by changing the request. The message names the real cause, so a pool
 timeout never reads as a generic SQLite failure.
+## S3 blob client and the OS trust store (SPEC-0059, 2026-10-29)
+
+`S3BlobStore::new` hands the SDK an explicit HTTP client chosen by endpoint scheme. The SDK
+default client loads the operating system root certificates and asserts (debug and test
+builds) that one parsed, so a locked or slow keychain made a plain `http://` MinIO build
+panic or wait. `http://` now uses an empty trust store (no TLS, nothing to trust); `https://`
+and the empty (AWS) endpoint use the OS store, probed once per process, and fall back to an
+empty root set when it is unusable, so the first request fails instead of the constructor.
+Certificate verification is never switched off. Tests run each case in a child process
+because the SDK loads the roots once per process; `SSL_CERT_FILE` and `SSL_CERT_DIR` steer
+the loader on every platform. Gotcha: `--ignored --exact` skips a non ignored test, use
+`--include-ignored`.

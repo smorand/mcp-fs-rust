@@ -5,7 +5,7 @@
 > Nature: BUG
 > Depth: S
 > Depth evidence: 1 module (`storage/blob/s3.rs`), 4 requirements, no public contract change, no data model change
-> Status: designed
+> Status: implemented
 > Verdict: authority exists
 > Defect class: n/a (code violates a clear authority)
 > Severity: Low
