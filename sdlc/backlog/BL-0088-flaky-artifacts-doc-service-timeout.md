@@ -14,3 +14,6 @@ Created: 2026-10-25
 
 ## Proposed
 Find what the fake doc service waits on (process spawn under load); raise the test deadline or make the spawn cheaper.
+
+## Update 2026-10-29
+Root cause not established; not reproduced in 7 runs of the family nor under CPU load. Mitigation applied: the two tests' doc service deadline raised 30 s to 120 s (`artifacts.rs:2131`, `:2947`), same remedy as BL-0055. Keep this entry open: if the timeout recurs, capture the failing log (with process list) before touching anything else.
