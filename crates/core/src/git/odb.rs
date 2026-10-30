@@ -231,6 +231,40 @@ impl BlobObjectDb {
         Ok(stored)
     }
 
+    /// Copy exactly one object libgit2 holds into the blob store and the index.
+    /// Returns 1 when it was newly stored, 0 when the store already had it or the
+    /// object type is not storable. Callers that just created one object use this
+    /// instead of [`Self::import_from_repo`], which walks and reads every object of
+    /// the repository. An object libgit2 lacks is `ERR_NOT_FOUND`, so a caller never
+    /// records a ref naming an object the store does not hold.
+    pub async fn import_object(&self, repo: &git2::Repository, oid: Oid) -> Result<usize> {
+        // Copy out before any await: the git2 Odb borrow cannot be held across one.
+        let (kind, payload) = {
+            let odb =
+                repo.odb().map_err(|e| ToolError::internal(format!("odb open failed: {e}")))?;
+            let obj = odb.read(oid).map_err(|_| {
+                ToolError::not_found(format!("git object '{oid}' not found in the repository"))
+            })?;
+            if object_type_name(obj.kind()).is_err() {
+                return Ok(0);
+            }
+            (obj.kind(), obj.data().to_vec())
+        };
+
+        let sha = oid.to_string();
+        if self.exists(&sha).await? {
+            // Same index repair as import_from_repo, so prefix lookups work after an index loss.
+            if !self.index.object_exists(&sha).await? {
+                self.index
+                    .record_object(&sha, object_type_name(kind)?, payload.len() as i64)
+                    .await?;
+            }
+            return Ok(0);
+        }
+        self.write_with_sha(&sha, kind, &payload).await?;
+        Ok(1)
+    }
+
     /// Hydrate libgit2's on disk ODB from the blob store, so pack building, log,
     /// diff and blame can run. Returns how many objects were written to disk.
     pub async fn export_to_repo(&self, repo: &git2::Repository) -> Result<usize> {
@@ -503,5 +537,67 @@ mod tests {
 
         assert_eq!(o.import_from_repo(&repo).await.unwrap(), 0, "blob already stored");
         assert!(o.index().object_exists(&sha).await.unwrap(), "index repaired");
+    }
+
+    #[tokio::test]
+    async fn import_object_stores_exactly_one_object() {
+        let (_d, o) = odb().await;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();
+        let oid = repo.blob(b"one").unwrap();
+
+        assert_eq!(o.import_object(&repo, oid).await.unwrap(), 1);
+        assert_eq!(o.import_object(&repo, oid).await.unwrap(), 0);
+        let (kind, payload) = o.read(&oid.to_string()).await.unwrap();
+        assert_eq!(kind, ObjectType::Blob);
+        assert_eq!(payload, b"one");
+        assert_eq!(o.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_object_leaves_other_objects_alone() {
+        let (_d, o) = odb().await;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();
+        for i in 0..2000 {
+            repo.blob(format!("blob {i}").as_bytes()).unwrap();
+        }
+        let target = repo.blob(b"target").unwrap();
+
+        assert_eq!(o.import_object(&repo, target).await.unwrap(), 1);
+        assert_eq!(o.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_object_repairs_a_missing_index_row() {
+        let (_d, o) = odb().await;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();
+        let oid = repo.blob(b"orphan").unwrap();
+        let sha = oid.to_string();
+        o.blobs()
+            .put(&blob_key(&sha), &serialize(ObjectType::Blob, b"orphan").unwrap())
+            .await
+            .unwrap();
+        assert!(!o.index().object_exists(&sha).await.unwrap());
+
+        assert_eq!(o.import_object(&repo, oid).await.unwrap(), 0, "blob already stored");
+        assert!(o.index().object_exists(&sha).await.unwrap(), "index repaired");
+    }
+
+    #[tokio::test]
+    async fn import_object_on_an_unknown_id_is_not_found() {
+        let (_d, o) = odb().await;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(repo_dir.path()).unwrap();
+        let unknown = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+
+        let e = o.import_object(&repo, unknown).await.unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        assert_eq!(
+            e.message,
+            "git object '1111111111111111111111111111111111111111' not found in the repository"
+        );
+        assert!(o.list().await.unwrap().is_empty());
     }
 }
