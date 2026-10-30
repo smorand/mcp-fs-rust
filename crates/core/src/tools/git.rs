@@ -27849,6 +27849,25 @@ mod tests {
         assert_eq!(paused["status"], "conflict", "{kind}: {paused}");
     }
 
+    /// What a paused operation leaves behind: the HEAD commit, every ref, and
+    /// the content of each conflicted path. Index entries are not compared.
+    async fn paused_state(
+        e: &Env,
+    ) -> (Option<String>, Vec<crate::git::db::GitRefRow>, Vec<(String, String)>) {
+        let paths: Vec<String> = e
+            .op_row()
+            .await
+            .and_then(|r| r.conflicts)
+            .map(|c| serde_json::from_str(&c).unwrap())
+            .unwrap_or_default();
+        let mut files = Vec::new();
+        for p in paths {
+            let content = e.read(&p).await;
+            files.push((p, content));
+        }
+        (e.ref_sha("refs/heads/main").await, e.entry().await.db.list_refs().await.unwrap(), files)
+    }
+
     /// SPEC-0053/E2E-029: a paused merge, rebase, cherry pick or revert does
     /// not block the deletion, and the paused operation is left as it was.
     #[tokio::test]
@@ -27859,12 +27878,19 @@ mod tests {
             let (dir, url, f) = standalone_remote(&e, "remote-d029");
             let (op_before, before) = (e.op_row().await, bare_refs(&dir));
             assert!(op_before.is_some(), "{kind}: an operation is paused");
+            let state_before = paused_state(&e).await;
+            assert!(!state_before.2.is_empty(), "{kind}: at least one conflicted path");
 
             let out = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await;
 
             assert_eq!(out.unwrap()["deleted_commit"], json!(f), "{kind}");
             assert_eq!(bare_refs(&dir), without(&before, "v1.0"), "{kind}");
             assert_eq!(e.op_row().await, op_before, "{kind}: the operation is untouched");
+            assert_eq!(
+                paused_state(&e).await,
+                state_before,
+                "{kind}: HEAD, refs and conflicted files are untouched"
+            );
             assert_eq!(delete_audit(&e, OWNER), vec![deleted_line("v1.0", &f)], "{kind}");
         }
     }
