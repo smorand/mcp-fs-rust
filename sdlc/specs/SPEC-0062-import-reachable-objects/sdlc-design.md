@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 2 modules (`crates/core/src/git/odb.rs`, `crates/core/src/tools/git.rs`), 7 call sites changed, no public contract, no persisted change; 4 requirements.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0110
@@ -210,3 +210,43 @@ Each step leaves the suite green; steps 1, 2 and 3 are separate stories along th
 | 2 | 0 | 0 | IMPLEMENTABLE |
 
 **Amendments applied:** round 1: DT-016 no store length bound (the pull's fetch step imports everything) with its own mutation; DR-001 step 2 on an unreadable parent; distinct contents stated for DT-002 and DT-005; `odb.rs` citation corrected to the `object_type_name` check (`:208-210`).
+
+## Design additions (2026-10-30)
+
+Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skill: `rust` (loaded earlier in this session; project gate: `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, and `make check`). Spot checks of cited code done: the seven production call sites (`tools/git.rs:2323,4262,4891,4928,5632,6935,7178`), the four kept sites (`git/http/mod.rs:572`, `tools/git.rs:3324,3918,6803`), `hydrate` (`tools/git.rs:2069`), `S3BlobStore::exists` (`storage/blob/s3.rs:128`).
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/odb.rs` | modify: add `import_reachable`; 10 unit tests and 2 test wrappers in `mod tests` | DR-001 | US-0119 |
+| `crates/core/src/tools/git.rs` (production) | modify: `commit` call (`:2323`) | DR-002 | US-0120 |
+| `crates/core/src/tools/git.rs` (tests) | modify: closure helper and DT-011 | DR-002, DR-004 | US-0120 |
+| `crates/core/src/tools/git.rs` (production) | modify: six calls (`:4262,4891,4928,5632,6935,7178`) | DR-002 | US-0121 |
+| `crates/core/src/tools/git.rs` (tests) | modify: DT-012 to DT-017 | DR-002 | US-0121 |
+
+Affected existing tests: none to modify (Section 8.4). Affected documentation: none.
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 to DT-010 | unit | direct call on `BlobObjectDb`, counting and recording wrappers | `crates/core/src/git/odb.rs` `mod tests` | US-0119 |
+| DT-011 | integration | `Env` harness, `git.commit` | `crates/core/src/tools/git.rs` `mod tests`, near `e2e_tag_028_annotated_tag_imports_only_its_own_object` | US-0120 |
+| DT-012 to DT-017 | integration | `Env` harness (merge, rebase, merge_resolve, pull, stash) | `crates/core/src/tools/git.rs` `mod tests`; pull pattern `e2e_new_940` (`:12151`) | US-0121 |
+| DT-018 | structural | `awk` and `rg` on the source | repository | US-0122 |
+| DT-019 | measurement, not gating | temporary test, not committed | scratch in `tools/git.rs` | US-0122 |
+
+Test data: generated (blobs written with `repo.blob`, repositories built with libgit2 in temp dirs). The mutation proofs of DT-001, DT-003, DT-010, DT-011 to DT-017 are run by their stories.
+
+### Decisions (continued)
+- **DEC-008:** four stories in the order of Section 9, serialized: US-0119 (the method and its unit tests), US-0120 (the first site and the closure helper), US-0121 (the six other sites), US-0122 (structural check, measurement, close). **Obliged by:** DR-004 (invariance; each step leaves the suite green). **Rationale:** the method alone cannot change behavior; the first site proves the pattern and builds the closure helper the six others reuse; the six others are one story because they share the helper and the 2 000 stray setup; the close is independent and carries the numbers. **Alternatives considered:** one story per site (rejected: seven stories of one edit and one test, the same re read cost seven times); one story for everything (rejected: 17 tests and 7 edits, too wide for one tier 2 review). **Source:** design.
+- **DEC-009:** every story `min_tier` 2: each reads existing patterns by path in a 29k line test module and needs a mutation proof, which tier 3 and 4 budgets cannot hold; US-0119 carries a 10 test algorithm with two backend wrappers, a decision density tier 3 cannot absorb. **Obliged by:** n/a (no code impact): routing choice. **Source:** design.
+- **DEC-010:** the closure helper `assert_closure_in_store(entry, tip)` is written in US-0120 and reused by US-0121. **Obliged by:** DR-002 (it is how the tests prove the dropped repairs of DEC-005 cost nothing). **Rationale:** one definition of "the whole tip is stored". **Alternatives considered:** a copy per test (rejected: seven copies). **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0119 | import the objects reachable from a tip | P1 | DR-001 | main | 2 | no |
+| US-0120 | import only the new objects when committing | P1 | DR-002 (commit site), DR-004 | US-0119 | 2 | no |
+| US-0121 | import only the new objects on merge, replay, resolve, pull and stash | P1 | DR-002 (six sites), DR-004 | US-0120 | 2 | no |
+| US-0122 | keep the pack sites on the whole walk and close the spec | P2 | DR-003, DR-004 | US-0121 | 2 | yes |
+
