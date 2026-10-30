@@ -2316,11 +2316,13 @@ async fn commit(
         .map_err(|e| git_err("create commit", e))?;
     let sha = oid.to_string();
 
-    // Persist everything libgit2 just wrote (blobs, trees, the commit) into the
+    // Persist what the new commit reaches (its blobs, trees and itself) into the
     // blob store, which is the authoritative object store. Without this the commit
-    // would live only in the rebuildable on disk cache. This also indexes the
-    // objects with their real size, where the C# recorded the commit with size 0.
-    entry.objects.import_from_repo(&repo).await?;
+    // would live only in the rebuildable on disk cache. Only the closure is walked,
+    // so the cost follows the new objects, not the repository size. This also
+    // indexes the objects with their real size, where the C# recorded the commit
+    // with size 0.
+    entry.objects.import_reachable(&repo, &[oid]).await?;
 
     entry.db.set_ref(&branch_ref, &sha, false).await?;
     if head.is_none() {
@@ -25286,6 +25288,58 @@ mod tests {
         let t = listed.iter().find(|t| t["name"] == "v1.0").unwrap();
         assert_eq!(t["kind"], "annotated");
         assert_eq!(t["message"], "m");
+    }
+
+    /// Asserts that every commit, tree and blob reachable from `tip` is in the
+    /// blob store. Ids are collected under the repo lock, checked after it drops.
+    async fn assert_closure_in_store(entry: &GitRepoEntry, tip: git2::Oid) {
+        let ids = {
+            let repo = entry.repo.lock().await;
+            let mut walk = repo.revwalk().unwrap();
+            walk.push(tip).unwrap();
+            let mut ids = Vec::new();
+            for c in walk {
+                let commit = repo.find_commit(c.unwrap()).unwrap();
+                ids.push(commit.id());
+                let tree = commit.tree().unwrap();
+                ids.push(tree.id());
+                tree.walk(git2::TreeWalkMode::PreOrder, |_, e| {
+                    // A gitlink names a commit of another repository, never stored here.
+                    if e.kind() != Some(git2::ObjectType::Commit) {
+                        ids.push(e.id());
+                    }
+                    0
+                })
+                .unwrap();
+            }
+            ids
+        };
+        for id in ids {
+            assert!(entry.objects.exists(&id.to_string()).await.unwrap(), "missing {id}");
+        }
+    }
+
+    /// SPEC-0062/DT-011: `git.commit` adds exactly three objects (blob, tree,
+    /// commit), although 2000 unrelated objects sit un-imported in libgit2.
+    #[tokio::test]
+    async fn e2e_commit_030_commit_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let entry = e.entry().await;
+        {
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            for i in 0..2000 {
+                repo.blob(format!("stray {i}").as_bytes()).unwrap();
+            }
+        }
+        let before = entry.objects.list().await.unwrap().len();
+
+        e.write("/c.txt", "c\n").await;
+        let sha = e.commit("c").await;
+
+        assert_eq!(entry.objects.list().await.unwrap().len(), before + 3);
+        assert_closure_in_store(&entry, git2::Oid::from_str(&sha).unwrap()).await;
     }
 
     /// SPEC-0061/DT-006: the stored tag object round trips into a fresh repository.
