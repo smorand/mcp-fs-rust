@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 1 module (the tests module of `crates/core/src/tools/git.rs`), 1 source file changed, no public contract, no persisted change; about 12 requirements.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0081, BL-0082, BL-0083, BL-0086, BL-0087, BL-0094 (partly each; the rest is carried by BL-0098 to BL-0107)
