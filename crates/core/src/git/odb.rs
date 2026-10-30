@@ -321,6 +321,20 @@ impl BlobObjectDb {
         Ok(order.len())
     }
 
+    /// Import the closure of the tips a pack names, so the cost follows the new
+    /// objects and not the repository size. `import_reachable` is strict: a tip or
+    /// parent libgit2 lacks fails it with `ERR_NOT_FOUND` before anything is
+    /// written, and a client can cause that (a push naming an unknown tip). Only
+    /// then does the whole walk run, so such a request keeps its per ref answer.
+    /// Any other error (a failed blob write, an index error) is returned as is: the
+    /// whole walk would hit the same failure after more work.
+    pub async fn import_tips(&self, repo: &git2::Repository, tips: &[Oid]) -> Result<usize> {
+        match self.import_reachable(repo, tips).await {
+            Err(e) if e.code == code::NOT_FOUND => self.import_from_repo(repo).await,
+            other => other,
+        }
+    }
+
     /// Hydrate libgit2's on disk ODB from the blob store, so pack building, log,
     /// diff and blame can run. Returns how many objects were written to disk.
     pub async fn export_to_repo(&self, repo: &git2::Repository) -> Result<usize> {
@@ -476,6 +490,35 @@ mod tests {
         }
         async fn exists(&self, key: &str) -> Result<bool> {
             self.exists_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+    }
+
+    /// Delegates to a local store, but every `put` is counted and fails.
+    struct FailingPutBlobs {
+        inner: LocalBlobStore,
+        puts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BlobBackend for FailingPutBlobs {
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::internal("disk full"))
+        }
+        async fn get(&self, key: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(key, offset, length).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
             self.inner.exists(key).await
         }
         async fn delete(&self, key: &str) -> Result<()> {
@@ -983,6 +1026,63 @@ mod tests {
                 blob_key(&commit.to_string())
             ]
         );
+    }
+
+    /// 2 000 unimported blobs plus one commit (blob, tree, commit): 2 003 objects.
+    fn commit_among_strays(repo: &git2::Repository) -> Oid {
+        for i in 0..2000 {
+            repo.blob(format!("blob {i}").as_bytes()).unwrap();
+        }
+        commit_on(repo, flat_tree(repo, &[("a.txt", "a")]), &[])
+    }
+
+    #[tokio::test]
+    async fn us0123_dt001_one_new_commit_among_strays() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let commit = commit_among_strays(&repo);
+
+        assert_eq!(o.import_tips(&repo, &[commit]).await.unwrap(), 3);
+        assert_eq!(o.list().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn us0123_dt002_an_unreadable_tip_falls_back_to_the_whole_walk() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        commit_among_strays(&repo);
+        let unknown = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+
+        let imported = o.import_tips(&repo, &[unknown]).await;
+        assert_eq!(imported.as_ref().ok(), Some(&2003), "{imported:?}");
+        assert_eq!(o.list().await.unwrap().len(), 2003);
+    }
+
+    #[tokio::test]
+    async fn us0123_dt003_a_write_failure_is_not_retried_by_the_whole_walk() {
+        let d = tempfile::tempdir().unwrap();
+        let failing = Arc::new(FailingPutBlobs {
+            inner: LocalBlobStore::new(d.path(), "mcpfs-git-test"),
+            puts: AtomicUsize::new(0),
+        });
+        let o = odb_over(failing.clone()).await;
+        let (_r, repo) = bare();
+        let commit = commit_among_strays(&repo);
+
+        let e = o.import_tips(&repo, &[commit]).await.unwrap_err();
+        assert!(e.message.contains("disk full"), "{}", e.message);
+        assert_eq!(failing.puts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn us0123_dt004_empty_tips() {
+        let (_d, counting, o) = counting_odb().await;
+        let (_r, repo) = bare();
+        commit_among_strays(&repo);
+
+        assert_eq!(o.import_tips(&repo, &[]).await.unwrap(), 0);
+        assert_eq!(counting.exists_calls.load(Ordering::SeqCst), 0);
+        assert!(o.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]

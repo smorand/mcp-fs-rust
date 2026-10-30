@@ -122,7 +122,7 @@
 | US-0120 | SPEC-0062 | import only the new objects when committing | US-0119 | 2 | landed | story/US-0120-import-only-the-new-objects-when-committing | main |
 | US-0121 | SPEC-0062 | import only the new objects on merge, replay, resolve, pull and stash | US-0120 | 2 | landed | story/US-0121-import-only-the-new-objects-on-merge-replay-resolve-pull-and-stash | main |
 | US-0122 | SPEC-0062 | keep the pack sites on the whole walk and close the spec | US-0121 | 2 | landed | story/US-0122-keep-the-pack-sites-on-the-whole-walk-and-close-the-spec | main |
-| US-0123 | SPEC-0063 | import the objects of a list of tips with a whole walk fallback | main | 2 | todo | | |
+| US-0123 | SPEC-0063 | import the objects of a list of tips with a whole walk fallback | main | 2 | landed | story/US-0123-import-the-objects-of-a-list-of-tips-with-a-fallback | main |
 | US-0124 | SPEC-0063 | import only the new objects of a fetch and a pull | US-0123 | 2 | todo | | |
 | US-0125 | SPEC-0063 | import only the new objects of a push | US-0124 | 2 | todo | | |
 | US-0126 | SPEC-0063 | keep clone on the whole walk and close the spec | US-0125 | 2 | todo | | |
