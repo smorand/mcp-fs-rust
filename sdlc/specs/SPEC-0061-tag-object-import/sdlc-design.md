@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 2 modules (`crates/core/src/git/odb.rs`, `crates/core/src/tools/git_tags.rs`), 3 production edit sites, no public contract, no persisted change; 4 requirements.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0080
@@ -186,3 +186,39 @@ Each step leaves the suite green; steps 1 and 2 may be one story, step 3 another
 | 1 | 0 | 2 (MINOR) | IMPLEMENTABLE |
 
 **Amendments applied:** DT-007 commands made literal (the method `peel_to_commit` no longer matches; no output is not `0`).
+
+## Design additions (2026-10-30)
+
+Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skill: `rust` (loaded earlier in this session; the project gate is `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, and `make check`). Spot checks of cited code done: `git_tags.rs:149` (`import_from_repo` call), `odb.rs:188` (definition), `tools/git.rs:2069` (`hydrate`), `git_tags.rs:340-346` (`tag_entry` first lookup).
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/odb.rs` | modify: add `import_object`; 4 unit tests in `mod tests` | DR-001 | US-0116 |
+| `crates/core/src/tools/git_tags.rs` | modify: `tag_create` calls `import_object` | DR-002 | US-0117 |
+| `crates/core/src/tools/git.rs` (tests module) | modify: 2 integration tests | DR-002, DR-004 | US-0117 |
+| `crates/core/src/tools/git_tags.rs` | modify: `tag_entry` and `annotation_details` take one looked up object | DR-003 | US-0118 |
+
+Affected existing tests: none to modify (Section 8.4). Affected documentation: none (`rg import_from_repo` outside `crates` and `sdlc` returns nothing).
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001, DT-002, DT-003, DT-004 | unit | direct call on `BlobObjectDb` | `crates/core/src/git/odb.rs` `mod tests` | US-0116 |
+| DT-005, DT-006 | integration | `tag` / `tag_list` through the `Env` harness | `crates/core/src/tools/git.rs` `mod tests` | US-0117 |
+| DT-007 | structural | `awk` and `rg` on the source | repository | US-0118 |
+| DT-008 | measurement, not gating | temporary test, not committed | `crates/core/src/tools/git.rs` (scratch) | US-0118 |
+
+Test data: generated (blobs written with `repo.blob`). The mutation proofs of DT-002 and DT-005 are run by their stories.
+
+### Decisions (continued)
+- **DEC-007:** three stories in the order of Section 9, serialized: US-0116 (the method), US-0117 (the switch), US-0118 (the listing, measurement and close). **Obliged by:** DR-004 (invariance; each step leaves the suite green). **Rationale:** step 1 adds an unused method and cannot change behavior; step 2 is the behavior bearing switch with its mutation proof; step 3 is independent of the import but ends the spec with the measurement, so it closes. **Alternatives considered:** one story (rejected: two test files, three edit sites, a measurement, too wide for a tier 2 review); listing story before the switch (rejected: the closing story carries the measurement of the import fix, so it must come last). **Source:** design.
+- **DEC-008:** every story `min_tier` 2: each reads existing patterns by path in a 29k line test module and `odb.rs`, and DT-002 and DT-005 need a mutation proof, which tier 3 and 4 budgets cannot hold. **Obliged by:** n/a (no code impact): routing choice. **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0116 | import a single git object into the blob store | P1 | DR-001 | main | 2 | no |
+| US-0117 | import only the tag object when creating an annotated tag | P1 | DR-002, DR-004 | US-0116 | 2 | no |
+| US-0118 | look up each listed tag once and close the spec | P2 | DR-003, DR-004 | US-0117 | 2 | yes |
+
