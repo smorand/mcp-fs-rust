@@ -124,5 +124,5 @@
 | US-0122 | SPEC-0062 | keep the pack sites on the whole walk and close the spec | US-0121 | 2 | landed | story/US-0122-keep-the-pack-sites-on-the-whole-walk-and-close-the-spec | main |
 | US-0123 | SPEC-0063 | import the objects of a list of tips with a whole walk fallback | main | 2 | landed | story/US-0123-import-the-objects-of-a-list-of-tips-with-a-fallback | main |
 | US-0124 | SPEC-0063 | import only the new objects of a fetch and a pull | US-0123 | 2 | landed | story/US-0124-import-only-the-new-objects-of-a-fetch-and-a-pull | main |
-| US-0125 | SPEC-0063 | import only the new objects of a push | US-0124 | 2 | todo | | |
+| US-0125 | SPEC-0063 | import only the new objects of a push | US-0124 | 2 | landed | story/US-0125-import-only-the-new-objects-of-a-push | main |
 | US-0126 | SPEC-0063 | keep clone on the whole walk and close the spec | US-0125 | 2 | todo | | |

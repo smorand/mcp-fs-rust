@@ -558,6 +558,16 @@ pub fn parse_receive_pack_request(body: &[u8]) -> (Vec<RefUpdate>, String, &[u8]
     (updates, client_caps, reader.remaining())
 }
 
+/// The tips a push brought: the `new_sha` of every non delete command. One that does
+/// not parse is skipped here and refused per ref later by `process_ref_update`.
+fn push_tips(updates: &[RefUpdate]) -> Vec<Oid> {
+    updates
+        .iter()
+        .filter(|u| u.new_sha != ZERO_ID)
+        .filter_map(|u| Oid::from_str(&u.new_sha).ok())
+        .collect()
+}
+
 /// Serve a push. The caller must already hold the project write lock.
 async fn receive_pack_locked(
     entry: &GitRepoEntry,
@@ -569,7 +579,7 @@ async fn receive_pack_locked(
     if pack.len() > 12 {
         let repo = entry.repo.lock().await;
         index_pack(&repo, pack)?;
-        entry.objects.import_from_repo(&repo).await?;
+        entry.objects.import_tips(&repo, &push_tips(updates)).await?;
     }
 
     // `report-status` requires an `unpack` status line before the per ref lines.
@@ -1077,6 +1087,122 @@ mod tests {
         assert_eq!(kind, ObjectType::Blob);
         assert_eq!(payload, b"pushed content");
         assert!(e.objects.list().await.unwrap().len() >= 3);
+    }
+
+    /// A scratch repo holding one commit (tree with `f.txt`), the way a client builds a push.
+    fn scratch_commit() -> (tempfile::TempDir, git2::Repository, Oid, Oid, Oid) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = git2::Repository::init_bare(dir.path()).unwrap();
+        let blob = src.blob(b"pushed content").unwrap();
+        let tree = {
+            let mut tb = src.treebuilder(None).unwrap();
+            tb.insert("f.txt", blob, 0o100644).unwrap();
+            tb.write().unwrap()
+        };
+        let sig =
+            git2::Signature::new("t", "t@example.test", &git2::Time::new(1700000000, 0)).unwrap();
+        let commit =
+            src.commit(None, &sig, &sig, "pushed", &src.find_tree(tree).unwrap(), &[]).unwrap();
+        (dir, src, commit, tree, blob)
+    }
+
+    fn pack_of(src: &git2::Repository, tip: Oid) -> git2::Buf {
+        let mut buf = git2::Buf::new();
+        let mut pb = src.packbuilder().unwrap();
+        pb.insert_recursive(tip, None).unwrap();
+        pb.write_buf(&mut buf).unwrap();
+        drop(pb);
+        buf
+    }
+
+    /// SPEC-0063/DT-008: a push imports its own closure, not the strays libgit2 holds.
+    #[tokio::test]
+    async fn push_of_a_real_pack_imports_only_its_closure_among_strays() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        {
+            let repo = e.repo.lock().await;
+            for i in 0..2000 {
+                repo.blob(format!("stray {i}").as_bytes()).unwrap();
+            }
+        }
+        let before = e.objects.list().await.unwrap().len();
+
+        let (_dir, src, commit, tree, blob) = scratch_commit();
+        let buf = pack_of(&src, commit);
+        let mut body = Vec::new();
+        body.extend_from_slice(&pktline::encode_raw(
+            format!("{ZERO_ID} {commit} refs/heads/main\0report-status\n").as_bytes(),
+        ));
+        body.extend_from_slice(&pktline::flush());
+        body.extend_from_slice(&buf);
+
+        let out = handle_receive_pack(&e, &body).await.unwrap();
+        let lines = read_pkt_lines(&out);
+        assert_eq!(lines[0].as_deref(), Some("unpack ok"));
+        assert_eq!(lines[1].as_deref(), Some("ok refs/heads/main"));
+        for oid in [commit, tree, blob] {
+            assert!(e.objects.exists(&oid.to_string()).await.unwrap());
+        }
+        let after = e.objects.list().await.unwrap().len();
+        assert!(after < before + 200, "store grew from {before} to {after}");
+    }
+
+    /// SPEC-0063/DT-009: an annotated tag object is imported with the commit it points at.
+    #[tokio::test]
+    async fn push_of_an_annotated_tag_object_imports_the_tag_and_its_closure() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+
+        let (_dir, src, commit, tree, blob) = scratch_commit();
+        let sig =
+            git2::Signature::new("t", "t@example.test", &git2::Time::new(1700000000, 0)).unwrap();
+        let commit_obj = src.find_object(commit, None).unwrap();
+        let tag_oid = src.tag("v1", &commit_obj, &sig, "m", false).unwrap();
+        let buf = pack_of(&src, tag_oid);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&pktline::encode_raw(
+            format!("{ZERO_ID} {tag_oid} refs/tags/v1\0report-status\n").as_bytes(),
+        ));
+        body.extend_from_slice(&pktline::flush());
+        body.extend_from_slice(&buf);
+
+        let out = handle_receive_pack(&e, &body).await.unwrap();
+        let lines = read_pkt_lines(&out);
+        assert_eq!(lines[0].as_deref(), Some("unpack ok"));
+        assert_eq!(lines[1].as_deref(), Some("ok refs/tags/v1"));
+        for oid in [tag_oid, commit, tree, blob] {
+            assert!(e.objects.exists(&oid.to_string()).await.unwrap());
+        }
+    }
+
+    /// SPEC-0063/DT-012: a ghost tip next to a real pack still gets its per ref refusal.
+    #[tokio::test]
+    async fn push_naming_a_ghost_tip_with_a_pack_keeps_the_per_ref_answer() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+
+        let (_dir, src, commit, tree, blob) = scratch_commit();
+        let buf = pack_of(&src, commit);
+        let ghost = "b".repeat(40);
+        let mut body = Vec::new();
+        body.extend_from_slice(&pktline::encode_raw(
+            format!("{ZERO_ID} {commit} refs/heads/main\0report-status\n").as_bytes(),
+        ));
+        body.extend_from_slice(&pktline::encode(&format!("{ZERO_ID} {ghost} refs/heads/ghost\n")));
+        body.extend_from_slice(&pktline::flush());
+        body.extend_from_slice(&buf);
+
+        let out = handle_receive_pack(&e, &body).await.unwrap();
+        let lines = read_pkt_lines(&out);
+        assert_eq!(lines[0].as_deref(), Some("unpack ok"));
+        assert_eq!(lines[1].as_deref(), Some("ok refs/heads/main"));
+        assert_eq!(lines[2].as_deref(), Some("ng refs/heads/ghost object not found"));
+        for oid in [commit, tree, blob] {
+            assert!(e.objects.exists(&oid.to_string()).await.unwrap());
+        }
+        assert!(e.db.get_ref("refs/heads/ghost").await.unwrap().is_none());
     }
 
     // ── router level tests (auth gating, headers, status codes) ─────────────
