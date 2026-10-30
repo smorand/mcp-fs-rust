@@ -3858,6 +3858,14 @@ async fn fetch_branch(
     .await
 }
 
+/// The objects a fetch brought: the new tip of every updated remote ref, then
+/// every incoming tag object. Not every ref of the repository: a project with
+/// thousands of tags would pay one store probe per tag on each fetch.
+fn fetch_tips(outcome: &crate::git::remote::FetchOutcome) -> Vec<Oid> {
+    let updated = outcome.refs_updated.iter().filter_map(|u| Oid::from_str(&u.new_sha).ok());
+    updated.chain(outcome.incoming_tags.iter().map(|t| t.oid)).collect()
+}
+
 async fn fetch_branch_inner(
     store: Arc<GitRepoStore>,
     mount_id: &str,
@@ -3917,7 +3925,7 @@ async fn fetch_branch_inner(
                 Some(deadline),
                 scope,
             )?;
-            entry_for_thread.objects.import_from_repo(&repo).await?;
+            entry_for_thread.objects.import_tips(&repo, &fetch_tips(&outcome)).await?;
             // After the import, never before: a ref row must not name a tag
             // object the blob store does not hold yet (DEC-012).
             let tags = crate::tools::git_tags::reconcile_incoming_tags(
@@ -6802,7 +6810,7 @@ async fn pull_branch_inner(
                 Some(deadline),
                 crate::git::remote::TagScope::Branch(&branch_owned),
             )?;
-            entry_for_thread.objects.import_from_repo(&repo).await?;
+            entry_for_thread.objects.import_tips(&repo, &fetch_tips(&outcome)).await?;
             // After the import (a ref row must not name an object the blob
             // store lacks) and before the merge decision, so a pull that
             // pauses on a conflict has already delivered its tags (DEC-013).
@@ -25440,6 +25448,57 @@ mod tests {
         let entry = e.entry().await;
         let tip = git2::Oid::from_str(out["merge_commit"].as_str().unwrap()).unwrap();
         assert_closure_in_store(&entry, tip).await;
+    }
+
+    /// SPEC-0063/DT-005: a fetch of one new remote commit stores its closure
+    /// only, although 2000 unrelated objects sit un-imported in libgit2.
+    #[tokio::test]
+    async fn e2e_fetch_063_one_new_commit_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        let (dir, url, _a) = cloned_remote(&e, "remote-063-fetch").await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+        let tip = advance_bare_remote(&dir, "refs/heads/main", "new\n");
+
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_only_new_objects(&entry, &tip, before).await;
+    }
+
+    /// SPEC-0063/DT-006: a fetch carrying an annotated tag stores the tag
+    /// object (reconcile names it in a ref row) and still skips the strays.
+    /// The whole walk also stored the tag object, so this test alone does not
+    /// turn red on the old code; the mutation that drops the incoming tag
+    /// oids from `fetch_tips` is what guards it.
+    #[tokio::test]
+    async fn e2e_fetch_063_annotated_tag_object_is_stored() {
+        let e = Env::new().await;
+        let (dir, url, _a) = cloned_remote(&e, "remote-063-tag").await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+        let tip = advance_bare_remote(&dir, "refs/heads/main", "new\n");
+        let tag_oid = annotated_tag_bare_remote(&dir, "v1.0", &tip, "m");
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert!(entry.objects.exists(&tag_oid).await.unwrap(), "tag object missing");
+        assert_only_new_objects(&entry, &tip, before).await;
+    }
+
+    /// SPEC-0063/DT-007: the fetch step of a diverged `git.remote_pull`
+    /// stores the new objects only, the merge commit's closure included.
+    #[tokio::test]
+    async fn e2e_pull_063_diverged_pull_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote_tip) = seed_pull_disjoint(&e, "remote-063-pull").await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(out["status"], "merged", "{out}");
+        assert_only_new_objects(&entry, out["merge_commit"].as_str().unwrap(), before).await;
     }
 
     /// SPEC-0062/DT-017: `git.stash_save` stores its new objects only.
