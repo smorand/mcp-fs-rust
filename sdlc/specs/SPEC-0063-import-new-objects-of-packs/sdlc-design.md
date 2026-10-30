@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: escalated from M while writing: 3 modules touched (`crates/core/src/git/odb.rs`, `crates/core/src/tools/git.rs`, `crates/core/src/git/http/mod.rs`), 3 production call sites changed, no public contract, no persisted change; 5 requirements.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0112
@@ -203,3 +203,43 @@ Each step leaves the suite green; steps 1, 2, 3 are separate stories along these
 | 1 | 0 | 3 (MINOR) | IMPLEMENTABLE |
 
 **Amendments applied:** guardrail list corrected (`:1368` covers upload-pack only; `:985` sends no pack); DR-005 given its own test DT-012; DT-011 wording made non gating.
+
+## Design additions (2026-10-30)
+
+Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skill: `rust` (loaded earlier in this session; project gate: `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, and `make check`). Spot checks of cited code done: the three call sites (`git/http/mod.rs:572`, `tools/git.rs:3920`, `:6805`), the clone site (`:3326`), `import_from_repo` (`odb.rs:192`), `import_reachable` (`odb.rs:289`), the `mod tests` markers (`odb.rs:455`, `http/mod.rs:663`, `tools/git.rs:7657`), the wrapper pattern `CountingBlobs` (`odb.rs:464`) and the http test helper `entry` (`http/mod.rs:681`).
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/odb.rs` | modify: add `import_tips`; 4 unit tests and 1 wrapper in `mod tests` | DR-001 | US-0123 |
+| `crates/core/src/tools/git.rs` (production) | modify: helper `fetch_tips`, calls `:3920` and `:6805` | DR-002 | US-0124 |
+| `crates/core/src/tools/git.rs` (tests) | modify: 3 integration tests | DR-002, DR-004 | US-0124 |
+| `crates/core/src/git/http/mod.rs` (production) | modify: helper `push_tips`, call `:572` | DR-002, DR-005 | US-0125 |
+| `crates/core/src/git/http/mod.rs` (tests) | modify: 3 integration tests | DR-002, DR-005 | US-0125 |
+
+Affected existing tests: none to modify (Section 8.4). Affected documentation: none.
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 to DT-004 | unit | direct call on `BlobObjectDb`, counting and failing wrappers | `crates/core/src/git/odb.rs` `mod tests` | US-0123 |
+| DT-005 to DT-007 | integration | `Env` harness (`git.remote_fetch`, `git.remote_pull`) | `crates/core/src/tools/git.rs` `mod tests`, helpers `plant_strays`, `assert_closure_in_store`, `cloned_remote` | US-0124 |
+| DT-008, DT-009, DT-012 | integration | direct `handle_receive_pack` on the http test `entry` | `crates/core/src/git/http/mod.rs` `mod tests`, pattern `:1037` | US-0125 |
+| DT-010 | structural | `awk` and `rg` on the source | repository | US-0126 |
+| DT-011 | measurement, not gating | temporary test, not committed | scratch in `tools/git.rs` | US-0126 |
+
+Test data: generated (blobs written with `repo.blob`, bare remotes built with the existing helpers). The mutation proofs of DT-001, DT-002, DT-003, DT-005, DT-006, DT-007, DT-008 and DT-012 are run by their stories.
+
+### Decisions (continued)
+- **DEC-008:** four stories in the order of Section 9, serialized: US-0123 (the method and its unit tests), US-0124 (fetch and pull, which share `fetch_tips` and the same test setup), US-0125 (push receive, a different module and harness), US-0126 (structural check, measurement, close). **Obliged by:** DR-004 (invariance; each step leaves the suite green). **Alternatives considered:** one story per site (rejected: fetch and pull share one helper and one setup, splitting them duplicates both); one story for everything (rejected: three modules and 10 tests, too wide for one tier 2 review). **Source:** design.
+- **DEC-009:** every story `min_tier` 2: each reads existing harness helpers by path in two large test modules and needs a mutation proof; US-0125 needs a real pack and a protocol level request, which tier 3 and 4 budgets cannot hold. **Obliged by:** n/a (no code impact): routing choice. **Source:** design.
+- **DEC-010:** US-0126 carries DR-003 (clone unchanged) because it is a negative requirement proven by the structural check DT-010 on the final tree. **Obliged by:** DR-003. **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0123 | import the objects of a list of tips with a whole walk fallback | P1 | DR-001 | main | 2 | no |
+| US-0124 | import only the new objects of a fetch and a pull | P1 | DR-002 (fetch, pull), DR-004 | US-0123 | 2 | no |
+| US-0125 | import only the new objects of a push | P1 | DR-002 (push), DR-004, DR-005 | US-0124 | 2 | no |
+| US-0126 | keep clone on the whole walk and close the spec | P2 | DR-003, DR-004 | US-0125 | 2 | yes |
+
