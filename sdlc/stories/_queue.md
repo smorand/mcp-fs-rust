@@ -118,7 +118,7 @@
 | US-0116 | SPEC-0061 | import a single git object into the blob store | main | 2 | landed | story/US-0116-import-a-single-git-object-into-the-blob-store | main |
 | US-0117 | SPEC-0061 | import only the tag object when creating an annotated tag | US-0116 | 2 | landed | story/US-0117-import-only-the-tag-object-when-creating-an-annotated-tag | main |
 | US-0118 | SPEC-0061 | look up each listed tag once and close the spec | US-0117 | 2 | landed | story/US-0118-look-up-each-listed-tag-once-and-close-the-spec | main |
-| US-0119 | SPEC-0062 | import the objects reachable from a tip | main | 2 | todo | | |
+| US-0119 | SPEC-0062 | import the objects reachable from a tip | main | 2 | landed | story/US-0119-import-the-objects-reachable-from-a-tip | main |
 | US-0120 | SPEC-0062 | import only the new objects when committing | US-0119 | 2 | todo | | |
 | US-0121 | SPEC-0062 | import only the new objects on merge, replay, resolve, pull and stash | US-0120 | 2 | todo | | |
 | US-0122 | SPEC-0062 | keep the pack sites on the whole walk and close the spec | US-0121 | 2 | todo | | |

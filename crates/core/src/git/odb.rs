@@ -35,7 +35,11 @@ use crate::errors::{Result, ToolError, code};
 use crate::git::db::{GitObjectRow, RelationalGitDb};
 use crate::storage::BlobBackend;
 use git2::{ObjectType, Oid};
+use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Tree entry mode of a submodule commit.
+const GITLINK_MODE: i32 = 0o160000;
 
 /// Blob store key for a git object. Git objects and file blobs share the bucket;
 /// the `git:` prefix keeps them from ever colliding (a sha256 is plain hex).
@@ -265,6 +269,58 @@ impl BlobObjectDb {
         Ok(1)
     }
 
+    /// Copy into the blob store and the index every object reachable from `tips`
+    /// that the store lacks. Returns how many were stored.
+    ///
+    /// [`Self::import_from_repo`] reads and probes every object of the repository,
+    /// so a bounded change (one commit) paid O(repository). This walks from the new
+    /// tip and stops at any object the store holds, so it costs O(new objects): a
+    /// tree is compared with its first parent's tree and only the changed entries
+    /// are read or probed (one probe is one network request on S3).
+    ///
+    /// Stopping at a stored object is sound because of the closure invariant: an
+    /// object is written only after everything it references that must be stored,
+    /// so a stored object implies its whole closure is stored. Hence the two phase
+    /// shape: every read and probe happens in the traversal, which fills a post
+    /// order list (blobs, trees, parents, children); only then is the list written
+    /// front to back. A crash leaves a closed prefix, and an object `repo` lacks
+    /// fails the call before anything is written. A gitlink entry names a
+    /// submodule commit that is never in the odb, so it is skipped.
+    pub async fn import_reachable(&self, repo: &git2::Repository, tips: &[Oid]) -> Result<usize> {
+        let mut stack: Vec<Frame> =
+            tips.iter().rev().map(|oid| Frame::Enter { oid: *oid, base: None }).collect();
+        let mut seen: HashSet<Oid> = HashSet::new();
+        let mut order: Vec<(String, ObjectType, Vec<u8>)> = Vec::new();
+
+        while let Some(frame) = stack.pop() {
+            let (oid, base) = match frame {
+                Frame::Exit(object) => {
+                    order.push(object);
+                    continue;
+                }
+                Frame::Enter { oid, base } => (oid, base),
+            };
+            if base == Some(oid) || !seen.insert(oid) {
+                continue;
+            }
+            let sha = oid.to_string();
+            if self.exists(&sha).await? {
+                continue;
+            }
+            // No git2 borrow survives `expand`, so the awaits above and below are safe.
+            let Some((kind, payload, children)) = expand(repo, oid, base)? else {
+                continue;
+            };
+            stack.push(Frame::Exit((sha, kind, payload)));
+            stack.extend(children.into_iter().rev());
+        }
+
+        for (sha, kind, payload) in &order {
+            self.write_with_sha(sha, *kind, payload).await?;
+        }
+        Ok(order.len())
+    }
+
     /// Hydrate libgit2's on disk ODB from the blob store, so pack building, log,
     /// diff and blame can run. Returns how many objects were written to disk.
     pub async fn export_to_repo(&self, repo: &git2::Repository) -> Result<usize> {
@@ -300,6 +356,75 @@ impl BlobObjectDb {
     }
 }
 
+/// An object read from the repository: its type, payload and the frames it queues.
+type Expanded = (ObjectType, Vec<u8>, Vec<Frame>);
+
+/// One step of the [`BlobObjectDb::import_reachable`] traversal.
+enum Frame {
+    /// Visit an object; `base` is the same-named tree of the first parent, if any.
+    Enter { oid: Oid, base: Option<Oid> },
+    /// All the object's dependencies are queued before it: record it for writing.
+    Exit((String, ObjectType, Vec<u8>)),
+}
+
+fn git_err(what: &str, e: git2::Error) -> ToolError {
+    ToolError::internal(format!("{what} failed: {e}"))
+}
+
+/// Read one object and list the objects it references that must be visited.
+/// `None` when the type is not storable. Everything is copied out of the git2
+/// borrows so the caller can await afterwards.
+fn expand(repo: &git2::Repository, oid: Oid, base: Option<Oid>) -> Result<Option<Expanded>> {
+    let odb = repo.odb().map_err(|e| git_err("odb open", e))?;
+    let obj = odb.read(oid).map_err(|_| {
+        ToolError::not_found(format!("git object '{oid}' not found in the repository"))
+    })?;
+    let kind = obj.kind();
+    if object_type_name(kind).is_err() {
+        return Ok(None);
+    }
+    let payload = obj.data().to_vec();
+    let mut children = Vec::new();
+    match kind {
+        ObjectType::Commit => {
+            let commit = repo.find_commit(oid).map_err(|e| git_err("commit parse", e))?;
+            // The first parent's tree is the comparison base, when repo can read it.
+            let base = commit
+                .parent_id(0)
+                .ok()
+                .and_then(|p| repo.find_commit(p).ok())
+                .map(|p| p.tree_id());
+            children.push(Frame::Enter { oid: commit.tree_id(), base });
+            children.extend(commit.parent_ids().map(|oid| Frame::Enter { oid, base: None }));
+        }
+        ObjectType::Tag => {
+            let tag = repo.find_tag(oid).map_err(|e| git_err("tag parse", e))?;
+            children.push(Frame::Enter { oid: tag.target_id(), base: None });
+        }
+        ObjectType::Tree => {
+            let tree = repo.find_tree(oid).map_err(|e| git_err("tree parse", e))?;
+            let base_tree = base.and_then(|b| repo.find_tree(b).ok());
+            for entry in tree.iter() {
+                if entry.filemode() == GITLINK_MODE {
+                    continue;
+                }
+                let counterpart =
+                    base_tree.as_ref().and_then(|t| t.get_name_bytes(entry.name_bytes()));
+                if counterpart.as_ref().is_some_and(|c| c.id() == entry.id()) {
+                    continue;
+                }
+                let base = counterpart
+                    .filter(|c| c.kind() == Some(ObjectType::Tree))
+                    .filter(|_| entry.kind() == Some(ObjectType::Tree))
+                    .map(|c| c.id());
+                children.push(Frame::Enter { oid: entry.id(), base });
+            }
+        }
+        _ => {}
+    }
+    Ok(Some((kind, payload, children)))
+}
+
 /// Write a commit straight into the blob backed store, for tests and for tools
 /// that need a starting point. Returns `(commit sha, tree sha, blob sha)`.
 pub async fn seed_commit(
@@ -330,6 +455,135 @@ pub async fn seed_commit(
 mod tests {
     use super::*;
     use crate::storage::blob::local::LocalBlobStore;
+
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Delegates to a local store and counts `exists` probes.
+    struct CountingBlobs {
+        inner: LocalBlobStore,
+        exists_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BlobBackend for CountingBlobs {
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn get(&self, key: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(key, offset, length).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.exists_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+    }
+
+    /// Delegates to a local store and records the key of every `put`, in order.
+    struct RecordingBlobs {
+        inner: LocalBlobStore,
+        puts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BlobBackend for RecordingBlobs {
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.puts.lock().unwrap().push(key.to_string());
+            self.inner.put(key, data).await
+        }
+        async fn get(&self, key: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.inner.get(key, offset, length).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+    }
+
+    async fn odb_over(blobs: Arc<dyn BlobBackend>) -> BlobObjectDb {
+        let index = Arc::new(RelationalGitDb::open_in_memory().await.unwrap());
+        BlobObjectDb::new(blobs, index)
+    }
+
+    async fn counting_odb() -> (tempfile::TempDir, Arc<CountingBlobs>, BlobObjectDb) {
+        let d = tempfile::tempdir().unwrap();
+        let counting = Arc::new(CountingBlobs {
+            inner: LocalBlobStore::new(d.path(), "mcpfs-git-test"),
+            exists_calls: AtomicUsize::new(0),
+        });
+        let o = odb_over(counting.clone()).await;
+        (d, counting, o)
+    }
+
+    fn bare() -> (tempfile::TempDir, git2::Repository) {
+        let d = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(d.path()).unwrap();
+        (d, repo)
+    }
+
+    fn sig() -> git2::Signature<'static> {
+        git2::Signature::now("t", "t@t").unwrap()
+    }
+
+    fn commit_on(repo: &git2::Repository, tree: Oid, parents: &[Oid]) -> Oid {
+        let tree = repo.find_tree(tree).unwrap();
+        let parents: Vec<git2::Commit> =
+            parents.iter().map(|p| repo.find_commit(*p).unwrap()).collect();
+        let refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(None, &sig(), &sig(), "m", &tree, &refs).unwrap()
+    }
+
+    /// A flat tree of `name -> content` blobs.
+    fn flat_tree(repo: &git2::Repository, files: &[(&str, &str)]) -> Oid {
+        let mut tb = repo.treebuilder(None).unwrap();
+        for (name, content) in files {
+            tb.insert(name, repo.blob(content.as_bytes()).unwrap(), 0o100644).unwrap();
+        }
+        tb.write().unwrap()
+    }
+
+    /// First commit: `top` plus a directory `d` of 200 files. Second commit (child of the
+    /// first): only `d/f007` changes.
+    fn wide_history(repo: &git2::Repository) -> (Oid, Oid) {
+        let mut dir = repo.treebuilder(None).unwrap();
+        for i in 0..200 {
+            let blob = repo.blob(format!("content {i}").as_bytes()).unwrap();
+            dir.insert(format!("f{i:03}"), blob, 0o100644).unwrap();
+        }
+        let dir = dir.write().unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        root.insert("top", repo.blob(b"top").unwrap(), 0o100644).unwrap();
+        root.insert("d", dir, 0o040000).unwrap();
+        let first = commit_on(repo, root.write().unwrap(), &[]);
+
+        let dir_tree = repo.find_tree(dir).unwrap();
+        let mut dir2 = repo.treebuilder(Some(&dir_tree)).unwrap();
+        dir2.insert("f007", repo.blob(b"changed").unwrap(), 0o100644).unwrap();
+        let dir2 = dir2.write().unwrap();
+        let root_tree = repo.find_tree(root.write().unwrap()).unwrap();
+        let mut root2 = repo.treebuilder(Some(&root_tree)).unwrap();
+        root2.insert("d", dir2, 0o040000).unwrap();
+        let second = commit_on(repo, root2.write().unwrap(), &[first]);
+        (first, second)
+    }
 
     async fn odb() -> (tempfile::TempDir, BlobObjectDb) {
         let d = tempfile::tempdir().unwrap();
@@ -583,6 +837,152 @@ mod tests {
 
         assert_eq!(o.import_object(&repo, oid).await.unwrap(), 0, "blob already stored");
         assert!(o.index().object_exists(&sha).await.unwrap(), "index repaired");
+    }
+
+    #[tokio::test]
+    async fn dt001_a_commit_tip_imports_exactly_its_three_objects() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        for i in 0..2000 {
+            repo.blob(format!("blob {i}").as_bytes()).unwrap();
+        }
+        let commit = commit_on(&repo, flat_tree(&repo, &[("a.txt", "a")]), &[]);
+
+        assert_eq!(o.import_reachable(&repo, &[commit]).await.unwrap(), 3);
+        assert_eq!(o.list().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dt002_a_second_commit_stores_only_what_changed() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let (first, second) = wide_history(&repo);
+        assert_eq!(o.import_reachable(&repo, &[first]).await.unwrap(), 204);
+        let before = o.list().await.unwrap().len();
+
+        assert_eq!(o.import_reachable(&repo, &[second]).await.unwrap(), 4);
+        assert_eq!(o.list().await.unwrap().len(), before + 4);
+    }
+
+    #[tokio::test]
+    async fn dt003_the_store_probes_are_bounded() {
+        let (_d, counting, o) = counting_odb().await;
+        let (_r, repo) = bare();
+        let (first, second) = wide_history(&repo);
+        o.import_reachable(&repo, &[first]).await.unwrap();
+        counting.exists_calls.store(0, Ordering::SeqCst);
+
+        assert_eq!(o.import_reachable(&repo, &[second]).await.unwrap(), 4);
+        let probes = counting.exists_calls.load(Ordering::SeqCst);
+        assert!(probes <= 8, "{probes} store probes for 1 changed file in a 200 file directory");
+    }
+
+    #[tokio::test]
+    async fn dt004_a_merge_commit_sharing_its_second_parents_tree() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let t1 = flat_tree(&repo, &[("a", "1")]);
+        let t2 = flat_tree(&repo, &[("b", "2")]);
+        let p1 = commit_on(&repo, t1, &[]);
+        let p2 = commit_on(&repo, t2, &[]);
+        o.import_reachable(&repo, &[p1, p2]).await.unwrap();
+        let merge = commit_on(&repo, t2, &[p1, p2]);
+
+        assert_eq!(o.import_reachable(&repo, &[merge]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn dt005_a_root_commit_imports_all_its_entries() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let sub = flat_tree(&repo, &[("z.txt", "zzz")]);
+        let mut root = repo.treebuilder(None).unwrap();
+        root.insert("x.txt", repo.blob(b"xxx").unwrap(), 0o100644).unwrap();
+        root.insert("y.txt", repo.blob(b"yyy").unwrap(), 0o100644).unwrap();
+        root.insert("s", sub, 0o040000).unwrap();
+        let commit = commit_on(&repo, root.write().unwrap(), &[]);
+
+        assert_eq!(o.import_reachable(&repo, &[commit]).await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn dt006_a_gitlink_entry_is_skipped() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let sub = "2222222222222222222222222222222222222222";
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert("sub", Oid::from_str(sub).unwrap(), 0o160000).unwrap();
+        let commit = commit_on(&repo, tb.write().unwrap(), &[]);
+
+        assert_eq!(o.import_reachable(&repo, &[commit]).await.unwrap(), 2);
+        assert!(!o.exists(sub).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dt007_an_unknown_tip() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let unknown = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+
+        let e = o.import_reachable(&repo, &[unknown]).await.unwrap_err();
+        assert_eq!(e.code, code::NOT_FOUND);
+        assert_eq!(
+            e.message,
+            "git object '1111111111111111111111111111111111111111' not found in the repository"
+        );
+        assert!(o.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dt008_an_annotated_tag_tip() {
+        let (_d, o) = odb().await;
+        let (_r, repo) = bare();
+        let commit = commit_on(&repo, flat_tree(&repo, &[("a.txt", "a")]), &[]);
+        let target = repo.find_object(commit, None).unwrap();
+        let tag = repo.tag("v1", &target, &sig(), "m", false).unwrap();
+
+        assert_eq!(o.import_reachable(&repo, &[tag]).await.unwrap(), 4);
+        assert!(o.exists(&tag.to_string()).await.unwrap());
+        assert!(o.exists(&commit.to_string()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dt009_a_tip_the_store_already_holds() {
+        let (_d, counting, o) = counting_odb().await;
+        let (_r, repo) = bare();
+        let commit = commit_on(&repo, flat_tree(&repo, &[("a.txt", "a")]), &[]);
+        assert_eq!(o.import_reachable(&repo, &[commit]).await.unwrap(), 3);
+        counting.exists_calls.store(0, Ordering::SeqCst);
+
+        assert_eq!(o.import_reachable(&repo, &[commit]).await.unwrap(), 0);
+        assert_eq!(counting.exists_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dt010_dependencies_are_written_first() {
+        let d = tempfile::tempdir().unwrap();
+        let recording = Arc::new(RecordingBlobs {
+            inner: LocalBlobStore::new(d.path(), "mcpfs-git-test"),
+            puts: Mutex::new(Vec::new()),
+        });
+        let o = odb_over(recording.clone()).await;
+        let (_r, repo) = bare();
+        let blob = repo.blob(b"a").unwrap();
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert("a.txt", blob, 0o100644).unwrap();
+        let tree = tb.write().unwrap();
+        let commit = commit_on(&repo, tree, &[]);
+
+        o.import_reachable(&repo, &[commit]).await.unwrap();
+        let puts = recording.puts.lock().unwrap().clone();
+        assert_eq!(
+            puts,
+            vec![
+                blob_key(&blob.to_string()),
+                blob_key(&tree.to_string()),
+                blob_key(&commit.to_string())
+            ]
+        );
     }
 
     #[tokio::test]
