@@ -340,13 +340,14 @@ async fn list_tags(entry: &GitRepoEntry) -> Result<Vec<Value>> {
 
 fn tag_entry(repo: &Repository, full_ref: String, target: String) -> Value {
     let name = full_ref.strip_prefix(TAGS_PREFIX).unwrap_or(&full_ref).to_string();
-    let annotated = Oid::from_str(&target)
-        .ok()
-        .and_then(|oid| repo.find_object(oid, None).ok())
-        .is_some_and(|o| o.kind() == Some(ObjectType::Tag));
+    let object = Oid::from_str(&target).ok().and_then(|oid| repo.find_object(oid, None).ok());
+    let annotated = object.as_ref().is_some_and(|o| o.kind() == Some(ObjectType::Tag));
     // A target the store cannot peel (an object never imported) is still
     // listed, under its own id, rather than hiding the tag or failing the list.
-    let sha = peel_to_commit(repo, &target).unwrap_or_else(|| target.clone());
+    let sha = object
+        .as_ref()
+        .and_then(|o| o.peel_to_commit().ok())
+        .map_or_else(|| target.clone(), |c| c.id().to_string());
     let kind = if annotated { "annotated" } else { "lightweight" };
     let mut entry = json!({
         "name": name,
@@ -355,19 +356,18 @@ fn tag_entry(repo: &Repository, full_ref: String, target: String) -> Value {
         "object": target,
         "kind": kind,
     });
-    if let (true, Some(map)) = (annotated, entry.as_object_mut()) {
-        annotation_details(repo, &target, map);
+    if let (Some(tag), Some(map)) =
+        (object.as_ref().and_then(|o| o.as_tag()), entry.as_object_mut())
+    {
+        annotation_details(tag, map);
     }
     entry
 }
 
 /// FR-MOD-001: message exactly as stored, tagger name and email, creation
-/// time in UTC. A tag object that cannot be parsed adds nothing rather than
-/// failing the listing, the same leniency as an unpeelable target.
-fn annotation_details(repo: &Repository, target: &str, map: &mut serde_json::Map<String, Value>) {
-    let Some(tag) = Oid::from_str(target).ok().and_then(|oid| repo.find_tag(oid).ok()) else {
-        return;
-    };
+/// time in UTC. A tag object without a tagger adds only the message, the same
+/// leniency as an unpeelable target.
+fn annotation_details(tag: &git2::Tag<'_>, map: &mut serde_json::Map<String, Value>) {
     map.insert(
         "message".to_string(),
         Value::String(

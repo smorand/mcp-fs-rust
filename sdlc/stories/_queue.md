@@ -117,4 +117,4 @@
 | US-0115 | SPEC-0060 | assert the transport reason on connection failure tests and close the spec | US-0114 | 2 | landed | story/US-0115-assert-the-transport-reason-on-connection-failure-tests-and-close-the-spec | main |
 | US-0116 | SPEC-0061 | import a single git object into the blob store | main | 2 | landed | story/US-0116-import-a-single-git-object-into-the-blob-store | main |
 | US-0117 | SPEC-0061 | import only the tag object when creating an annotated tag | US-0116 | 2 | landed | story/US-0117-import-only-the-tag-object-when-creating-an-annotated-tag | main |
-| US-0118 | SPEC-0061 | look up each listed tag once and close the spec | US-0117 | 2 | todo | | |
+| US-0118 | SPEC-0061 | look up each listed tag once and close the spec | US-0117 | 2 | landed | story/US-0118-look-up-each-listed-tag-once-and-close-the-spec | main |
