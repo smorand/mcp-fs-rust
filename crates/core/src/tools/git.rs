@@ -4261,7 +4261,7 @@ async fn merge_inner(
             let oid = repo
                 .commit(None, &sig, &sig, &pretty, &merged_tree, &parents)
                 .map_err(|e| git_err("create merge commit", e))?;
-            entry.objects.import_from_repo(&repo).await?;
+            entry.objects.import_reachable(&repo, &[oid]).await?;
             entry.db.set_ref(&branch_ref, &oid.to_string(), false).await?;
             let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.merge");
             Ok(MergeReport::Applied {
@@ -4890,7 +4890,7 @@ async fn land_replay(
     let changes = merge::diff_tree_changes(repo, &original_tip_tree, &new_tree)?;
     merge::charge_and_apply(tool, repo, safety, person, client, &changes).await?;
 
-    entry.objects.import_from_repo(repo).await?;
+    entry.objects.import_reachable(repo, &[new_tip]).await?;
     let branch_ref = format!("refs/heads/{branch}");
     let tip = new_tip.to_string();
     entry.db.set_ref(&branch_ref, &tip, false).await?;
@@ -4927,7 +4927,7 @@ async fn pause_replay(
     // makes the distinction visible.
     let steps = matches!(op, crate::git::db::GitOpType::Rebase)
         .then_some((index as i64, todo.len() as i64));
-    entry.objects.import_from_repo(repo).await?;
+    entry.objects.import_reachable(repo, &[replay_tip]).await?;
     let replay_sha = replay_tip.to_string();
     entry.db.set_ref(REPLAY_HEAD_REF, &replay_sha, false).await?;
     let _ = repo.reference(REPLAY_HEAD_REF, replay_tip, true, "mcp-fs git.rebase pause");
@@ -5631,7 +5631,7 @@ async fn merge_resolve_inner(
         &merged_tree,
         &[&tip_commit, &source_commit],
     )?;
-    entry.objects.import_from_repo(&repo).await?;
+    entry.objects.import_reachable(&repo, &[oid]).await?;
     let branch_ref = format!("refs/heads/{branch}");
     entry.db.set_ref(&branch_ref, &oid.to_string(), false).await?;
     let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.merge_resolve");
@@ -6934,7 +6934,7 @@ async fn pull_branch_inner(
                     &merged_tree,
                     &[&local_commit, &remote_commit],
                 )?;
-                entry_for_thread.objects.import_from_repo(&repo).await?;
+                entry_for_thread.objects.import_reachable(&repo, &[merge_oid]).await?;
 
                 let branch_ref_name = format!("refs/heads/{branch_owned}");
                 entry_for_thread
@@ -7177,7 +7177,7 @@ async fn stash_save(
         .commit(None, &sig, &sig, &full_message, &snapshot, &[&base])
         .map_err(|e| git_err("create stash commit", e))?;
     let stash_id = oid.to_string();
-    entry.objects.import_from_repo(&repo).await?;
+    entry.objects.import_reachable(&repo, &[oid]).await?;
 
     // The ref lands before the revert, so a revert that fails on quota or on an
     // unwritable path leaves the caller's work saved rather than lost; the ref
@@ -25340,6 +25340,120 @@ mod tests {
 
         assert_eq!(entry.objects.list().await.unwrap().len(), before + 3);
         assert_closure_in_store(&entry, git2::Oid::from_str(&sha).unwrap()).await;
+    }
+
+    /// Puts 2000 objects into libgit2 that no tip reaches and the store has
+    /// never seen, then returns the store length: a site that walks the whole
+    /// repository grows by that much, a site that walks its tip does not.
+    async fn plant_strays(entry: &GitRepoEntry) -> usize {
+        {
+            let repo = entry.repo.lock().await;
+            hydrate(entry, &repo).await.unwrap();
+            for i in 0..2000 {
+                repo.blob(format!("blob {i}").as_bytes()).unwrap();
+            }
+        }
+        entry.objects.list().await.unwrap().len()
+    }
+
+    /// Closure of `tip` stored and the strays left out (slack of 200 for the
+    /// new commits, trees and blobs of the operation itself).
+    async fn assert_only_new_objects(entry: &GitRepoEntry, tip: &str, before: usize) {
+        assert_closure_in_store(entry, git2::Oid::from_str(tip).unwrap()).await;
+        let after = entry.objects.list().await.unwrap().len();
+        assert!(after < before + 200, "store grew from {before} to {after}");
+    }
+
+    /// SPEC-0062/DT-012: a clean `git.merge` stores its new objects only.
+    #[tokio::test]
+    async fn e2e_merge_062_clean_merge_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        seed_automerge(&e).await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+
+        let out = e.merge("feature").await.unwrap();
+
+        assert_eq!(out["status"], "merged", "{out}");
+        assert_only_new_objects(&entry, out["merge_commit"].as_str().unwrap(), before).await;
+    }
+
+    /// SPEC-0062/DT-013: a rebase of two commits landing stores its new objects only.
+    #[tokio::test]
+    async fn e2e_rebase_062_landing_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_clean(&e).await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        assert_eq!(out["status"], "completed", "{out}");
+        let tip = e.ref_sha("refs/heads/feature").await.unwrap();
+        assert_only_new_objects(&entry, &tip, before).await;
+    }
+
+    /// SPEC-0062/DT-014: a rebase pausing on a conflict stores the closure of
+    /// the replay ref tip only.
+    #[tokio::test]
+    async fn e2e_rebase_062_pause_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        let (_c1, _c2, f1, f2) = seed_fork_conflict(&e).await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+
+        let out = rebase(&e, "main", json!([pick(&f1), pick(&f2)])).await.unwrap();
+
+        assert_eq!(out["status"], "conflict", "{out}");
+        let tip = e.ref_sha(REPLAY_HEAD_REF).await.unwrap();
+        assert_only_new_objects(&entry, &tip, before).await;
+    }
+
+    /// SPEC-0062/DT-015: `git.merge_resolve` completing stores its new objects only.
+    #[tokio::test]
+    async fn e2e_merge_062_resolve_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let paused = e.merge("feature").await.unwrap();
+        assert_eq!(paused["status"], "conflict", "{paused}");
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+
+        let done = e.resolve(json!([{"path": CFG, "strategy": "theirs"}])).await.unwrap();
+
+        assert_eq!(done["status"], "merged", "{done}");
+        assert_only_new_objects(&entry, done["merge_commit"].as_str().unwrap(), before).await;
+    }
+
+    /// SPEC-0062/DT-016: the merge commit of a divergent `git.remote_pull` is
+    /// fully stored. No length bound: the fetch step of the same pull imports
+    /// everything, and this closure check is what the merge step's own import
+    /// is guarded by.
+    #[tokio::test]
+    async fn e2e_pull_062_merge_commit_closure_is_stored() {
+        let e = Env::new().await;
+        let (_dir, url, _local, _remote_tip) = seed_pull_disjoint(&e, "remote-062").await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(out["status"], "merged", "{out}");
+        let entry = e.entry().await;
+        let tip = git2::Oid::from_str(out["merge_commit"].as_str().unwrap()).unwrap();
+        assert_closure_in_store(&entry, tip).await;
+    }
+
+    /// SPEC-0062/DT-017: `git.stash_save` stores its new objects only.
+    #[tokio::test]
+    async fn e2e_stash_062_save_imports_only_the_new_objects() {
+        let e = Env::new().await;
+        seed_a11(&e).await;
+        e.write("/src/lib.rs", "fn a() { 1 }\n").await;
+        let entry = e.entry().await;
+        let before = plant_strays(&entry).await;
+
+        let out = stash_save(&e, json!({"message": "wip"})).await.unwrap();
+
+        assert_only_new_objects(&entry, out["stash_id"].as_str().unwrap(), before).await;
     }
 
     /// SPEC-0061/DT-006: the stored tag object round trips into a fresh repository.

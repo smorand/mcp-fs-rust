@@ -120,5 +120,5 @@
 | US-0118 | SPEC-0061 | look up each listed tag once and close the spec | US-0117 | 2 | landed | story/US-0118-look-up-each-listed-tag-once-and-close-the-spec | main |
 | US-0119 | SPEC-0062 | import the objects reachable from a tip | main | 2 | landed | story/US-0119-import-the-objects-reachable-from-a-tip | main |
 | US-0120 | SPEC-0062 | import only the new objects when committing | US-0119 | 2 | landed | story/US-0120-import-only-the-new-objects-when-committing | main |
-| US-0121 | SPEC-0062 | import only the new objects on merge, replay, resolve, pull and stash | US-0120 | 2 | todo | | |
+| US-0121 | SPEC-0062 | import only the new objects on merge, replay, resolve, pull and stash | US-0120 | 2 | landed | story/US-0121-import-only-the-new-objects-on-merge-replay-resolve-pull-and-stash | main |
 | US-0122 | SPEC-0062 | keep the pack sites on the whole walk and close the spec | US-0121 | 2 | todo | | |
