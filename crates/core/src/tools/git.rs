@@ -25240,6 +25240,27 @@ mod tests {
         assert!(repo.find_reference("refs/tags/v1.0").is_err(), "the on disk ref is gone too");
     }
 
+    /// SPEC-0060/DR-001: deleting an annotated tag reports and audits the
+    /// commit it pointed at, not the tag object id.
+    #[tokio::test]
+    async fn e2e_tag_026_delete_an_annotated_tag_reports_the_commit() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        tag(&e, json!({"name": "v3.0", "message": "three"})).await.unwrap();
+        let tag_object = tag_target(&e, "v3.0").await.unwrap();
+
+        let out = untag(&e, "v3.0").await.unwrap();
+
+        assert_ne!(tag_object, a, "an annotated tag ref holds the tag object, not the commit");
+        assert_eq!(out["sha"], json!(a), "{out}");
+        assert_ne!(out["sha"], json!(tag_object), "{out}");
+        assert_eq!(
+            deletion_audit(&e),
+            vec![(OWNER.to_string(), format!("deleted tag 'v3.0' (was at {a})"))]
+        );
+        assert!(!tag_names(&e).await.contains(&"v3.0".to_string()));
+    }
+
     /// SPEC-0052/E2E-027: an unknown tag is refused and nothing changes.
     #[tokio::test]
     async fn e2e_tag_027_delete_an_unknown_tag() {
@@ -25363,6 +25384,29 @@ mod tests {
         the_one_winner(&ra, &rb, "v1.0");
         assert_eq!(tag_names(&e).await, vec!["v2.0".to_string()]);
         assert_eq!(tag_target(&e, "v2.0").await.as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0060/DR-002: a local deletion waits on the repository write lock;
+    /// no operation is paused, otherwise the pause guard would refuse first.
+    #[tokio::test]
+    async fn e2e_tag_032_deletion_waits_on_the_write_lock() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let entry = e.git.get_or_open_repo(MOUNT).await.unwrap();
+        let guard = entry.write_lock.lock().await;
+
+        let del = untag_as(&e, OWNER, "v1.0");
+        tokio::pin!(del);
+        tokio::select! {
+            _ = &mut del => panic!("the deletion ran under the held lock"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
+        }
+        assert_eq!(tag_names(&e).await, vec!["v1.0".to_string()], "still waiting");
+        drop(guard);
+        del.await.unwrap();
+
+        assert!(tag_names(&e).await.is_empty());
     }
 
     /// SPEC-0052/E2E-053: a project with no commit and no tag (the harness
