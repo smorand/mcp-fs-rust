@@ -145,8 +145,9 @@ async fn tag_create(
     } else {
         let tag_oid = write_tag_object(&repo, person, name, commit, message)?;
         // The tag object must be in the authoritative blob store before the
-        // ref row names it, or a reader could find a ref to nothing.
-        entry.objects.import_from_repo(&repo).await?;
+        // ref row names it, or a reader could find a ref to nothing. Only that
+        // object is imported: O(1) instead of a walk of the whole repository.
+        entry.objects.import_object(&repo, tag_oid).await?;
         ("annotated", tag_oid)
     };
     let object_sha = object.to_string();

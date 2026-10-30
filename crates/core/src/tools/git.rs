@@ -25261,6 +25261,54 @@ mod tests {
         assert!(!tag_names(&e).await.contains(&"v3.0".to_string()));
     }
 
+    /// SPEC-0061/DT-005: creating an annotated tag adds exactly one object to
+    /// the store, although 2000 unrelated objects sit un-imported in libgit2.
+    #[tokio::test]
+    async fn e2e_tag_028_annotated_tag_imports_only_its_own_object() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let entry = e.entry().await;
+        {
+            let repo = entry.repo.lock().await;
+            hydrate(&entry, &repo).await.unwrap();
+            for i in 0..2000 {
+                repo.blob(format!("blob {i}").as_bytes()).unwrap();
+            }
+        }
+        let before = entry.objects.list().await.unwrap().len();
+
+        let out = tag(&e, json!({"name": "v1.0", "message": "m"})).await.unwrap();
+
+        assert_eq!(entry.objects.list().await.unwrap().len(), before + 1);
+        let (kind, _) = entry.objects.read(out["object"].as_str().unwrap()).await.unwrap();
+        assert_eq!(kind, git2::ObjectType::Tag);
+        let listed = tag_list(&e).await;
+        let t = listed.iter().find(|t| t["name"] == "v1.0").unwrap();
+        assert_eq!(t["kind"], "annotated");
+        assert_eq!(t["message"], "m");
+    }
+
+    /// SPEC-0061/DT-006: the stored tag object round trips into a fresh repository.
+    #[tokio::test]
+    async fn e2e_tag_029_stored_tag_object_round_trips() {
+        let e = Env::new().await;
+        let (a, _b) = seed_tags(&e).await;
+        let out = tag(&e, json!({"name": "v2.0", "message": "second"})).await.unwrap();
+        let sha = out["object"].as_str().unwrap().to_string();
+        let entry = e.entry().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = git2::Repository::init_bare(dir.path()).unwrap();
+        entry.objects.export_to_repo(&fresh).await.unwrap();
+
+        let found = fresh.find_tag(git2::Oid::from_str(&sha).unwrap()).unwrap();
+        assert_eq!(found.target_id().to_string(), a);
+        assert_eq!(found.message().unwrap().map(str::trim_end), Some("second"));
+        assert_eq!(found.tagger().unwrap().name().unwrap(), OWNER.split('@').next().unwrap());
+        assert!(entry.objects.exists(&sha).await.unwrap());
+        assert!(entry.objects.index().object_exists(&sha).await.unwrap());
+    }
+
     /// SPEC-0052/E2E-027: an unknown tag is refused and nothing changes.
     #[tokio::test]
     async fn e2e_tag_027_delete_an_unknown_tag() {
