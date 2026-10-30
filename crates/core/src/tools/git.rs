@@ -27579,12 +27579,14 @@ mod tests {
             let err = call_delete_remote_tag(&e, &down, "v1.0", short7(&f)).await.unwrap_err();
             assert_eq!(err.code, code::INTERNAL_ERROR);
             assert!(err.message.starts_with(&connection_prefix(&down)), "{}", err.message);
+            assert!(err.message.contains("No such file or directory"), "{}", err.message);
 
             let (refusing, handle) = closing_remote().await;
             let err = call_delete_remote_tag(&e, &refusing, "v1.0", short7(&f)).await.unwrap_err();
             handle.abort();
             assert_eq!(err.code, code::INTERNAL_ERROR);
             assert!(err.message.starts_with(&connection_prefix(&refusing)), "{}", err.message);
+            assert_dropped_reason(&err.message);
 
             track_remote(&e, "origin", "https://github.ibm.com/org/repo.git").await;
             e.tokens
@@ -27647,6 +27649,7 @@ mod tests {
 
         assert_eq!(err.code, code::INTERNAL_ERROR);
         assert!(err.message.starts_with(&connection_prefix(&dropping)), "{}", err.message);
+        assert_dropped_reason(&err.message);
         assert_eq!(bare_refs(&dir), before, "the remote tag is still there");
         assert!(delete_audit(&e, OWNER).is_empty());
 
@@ -27669,6 +27672,7 @@ mod tests {
 
         assert_eq!(err.code, code::INTERNAL_ERROR);
         assert!(err.message.starts_with(&connection_prefix(&dropping)), "{}", err.message);
+        assert_dropped_reason(&err.message);
         assert_eq!(audit_size(&e), audit);
     }
 
@@ -29200,9 +29204,19 @@ mod tests {
         track_remote(e, "origin", url).await;
     }
 
-    fn assert_connection_refused(err: &ToolError, url: &str) {
+    /// libgit2's TLS handshake races on a peer that accepts then drops: it reports
+    /// either an EOF or a reset, so a dropped connection accepts both reasons.
+    const DROPPED_CONNECTION_REASONS: [&str; 2] =
+        ["unexpected eof while reading", "Connection reset by peer"];
+
+    fn assert_dropped_reason(msg: &str) {
+        assert!(DROPPED_CONNECTION_REASONS.iter().any(|r| msg.contains(r)), "{msg}");
+    }
+
+    fn assert_connection_refused(err: &ToolError, url: &str, reasons: &[&str]) {
         assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
         assert!(err.message.starts_with(&connection_prefix(url)), "{}", err.message);
+        assert!(reasons.iter().any(|r| err.message.contains(r)), "{}", err.message);
     }
 
     /// SPEC-0054/E2E-020: the remote is unreachable; nothing is sent.
@@ -29216,7 +29230,7 @@ mod tests {
 
         let err = call_publish_all_tags(&e, "origin", None).await.unwrap_err();
 
-        assert_connection_refused(&err, &down);
+        assert_connection_refused(&err, &down, &["No such file or directory"]);
         assert_eq!(bare_refs(&dir), before);
         assert_eq!(audit_count(&e), audit);
     }
@@ -29297,7 +29311,7 @@ mod tests {
             let (refusing, handle) = closing_remote().await;
             let err = publish_all_to(&e, OWNER, &refusing, None).await.unwrap_err();
             handle.abort();
-            assert_connection_refused(&err, &refusing);
+            assert_connection_refused(&err, &refusing, &DROPPED_CONNECTION_REASONS);
 
             let (silent, srv) = silent_remote().await;
             let err = publish_all_to(&e, OWNER, &silent, None).await.unwrap_err();
@@ -29368,7 +29382,7 @@ mod tests {
 
         let err = call_publish_all_tags(&e, "origin", Some(json!(7))).await.unwrap_err();
 
-        assert_connection_refused(&err, &down);
+        assert_connection_refused(&err, &down, &["No such file or directory"]);
         assert!(!err.message.contains("Tags to publish"), "{}", err.message);
     }
 
@@ -29580,7 +29594,7 @@ mod tests {
         let down = down_remote(&e);
         retrack(&e, &down).await;
         let err = call_publish_all_tags(&e, "origin", Some(json!("two"))).await.unwrap_err();
-        assert_connection_refused(&err, &down);
+        assert_connection_refused(&err, &down, &["No such file or directory"]);
         assert_eq!(bare_refs(&dir), before);
     }
 }

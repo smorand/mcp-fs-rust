@@ -369,3 +369,8 @@ Smoke test both stdin modes, since they take different code paths:
 printf 'Liste mes projets.\nexit\n' | ./target/release/agent --user you   # piped
 ./agent.sh --user you                                                     # interactive
 ```
+
+- 2026-10-30 gotcha: `closing_remote` (accepts TCP then drops) yields one of two libgit2 TLS reasons depending on a handshake
+  race: `unexpected eof while reading` (class Ssl) or `Connection reset by peer` (class Os). The tag tests that use it assert
+  the transport reason through `assert_dropped_reason` / `DROPPED_CONNECTION_REASONS` and accept either; the missing `file://`
+  legs stay exact (`No such file or directory`). Never pin a single reason for a dropped connection.

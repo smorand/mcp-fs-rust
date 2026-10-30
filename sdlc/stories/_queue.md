@@ -114,4 +114,4 @@
 | US-0112 | SPEC-0060 | test a fetch of 501 annotated tags and a blank remote name | US-0111 | 2 | landed | story/US-0112-test-a-fetch-of-501-annotated-tags-and-a-blank-remote-name | main |
 | US-0113 | SPEC-0060 | test publish all during a paused revert | US-0112 | 2 | landed | story/US-0113-test-publish-all-during-a-paused-revert | main |
 | US-0114 | SPEC-0060 | prove a remote delete leaves a paused operation untouched | US-0113 | 2 | landed | story/US-0114-prove-a-remote-delete-leaves-a-paused-operation-untouched | main |
-| US-0115 | SPEC-0060 | assert the transport reason on connection failure tests and close the spec | US-0114 | 2 | todo | | |
+| US-0115 | SPEC-0060 | assert the transport reason on connection failure tests and close the spec | US-0114 | 2 | landed | story/US-0115-assert-the-transport-reason-on-connection-failure-tests-and-close-the-spec | main |
