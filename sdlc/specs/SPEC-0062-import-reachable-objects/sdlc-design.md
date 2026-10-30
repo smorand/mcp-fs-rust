@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 2 modules (`crates/core/src/git/odb.rs`, `crates/core/src/tools/git.rs`), 7 call sites changed, no public contract, no persisted change; 4 requirements.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0110
