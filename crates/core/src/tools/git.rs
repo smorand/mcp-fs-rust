@@ -25663,6 +25663,44 @@ mod tests {
         assert_eq!(listed[1996]["message"], "message 1996\n");
     }
 
+    /// SPEC-0060/DR-003: 501 annotated tags on 3 commits make two refspec
+    /// batches (`TAG_REFSPEC_BATCH` is 500); the 501st, sent in the second
+    /// batch, must arrive with its message and commit like the others.
+    /// Limit (BL-0108): libgit2's local transport sends every tag object
+    /// whatever the refspecs ask for, so dropping the second batch does not
+    /// turn this test red; it guards the end to end receive of 501 tags.
+    #[tokio::test]
+    async fn e2e_tag_501_annotated_tags_span_two_batches() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-t501").await;
+        let mut commits = vec![a];
+        for i in 0..2 {
+            commits.push(advance_bare_remote(&dir, "refs/heads/main", &format!("c{i}\n")));
+        }
+        // The commits are fetched before the tags exist: a tag on a commit the
+        // fetch carries comes with it, and then no tag would need the batched
+        // download this test is about.
+        let first = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(first["tags_added"], json!([]));
+        for i in 0..501 {
+            annotated_tag_bare_remote(&dir, &format!("t{i:03}"), &commits[i % 3], &format!("m{i}"));
+        }
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]).len(), 501);
+        let listed = tag_list(&e).await;
+        assert_eq!(listed.len(), 501);
+        for (i, t) in listed.iter().enumerate() {
+            assert_eq!(t["name"], format!("t{i:03}"));
+            assert_eq!(t["kind"], "annotated");
+            assert_eq!(t["message"], format!("m{i}"));
+            assert_eq!(t["sha"], commits[i % 3]);
+        }
+        assert_eq!(listed[500]["name"], "t500");
+        assert_eq!(listed[500]["message"], "m500");
+    }
+
     /// SPEC-0052 E2E-049: a non member gets the usual refusal on fetch and on
     /// pull, and no tag arrives.
     #[test]
@@ -27330,6 +27368,21 @@ mod tests {
         for name in ["", "   "] {
             let refusal = (code::NOT_FOUND, absent_text(name));
             assert_delete_refused(&e, &dir, &url, name, short7(&f), refusal).await;
+        }
+    }
+
+    /// SPEC-0060/DR-004: a blank remote name is a given name, not the
+    /// default: refused as untracked with the text shown as given, spaces
+    /// kept, while `origin` is tracked and holds the tag.
+    #[tokio::test]
+    async fn e2e_tag_remote_delete_blank_remote_name_is_refused_as_given() {
+        let e = Env::new().await;
+        let (dir, _, _, f) = deletion_remote(&e, "remote-blank").await;
+        for name in ["", "   "] {
+            let case = ("v1.0", short7(&f), Some(name));
+            assert_lookup_refused(&e, &dir, case, untracked_text("v1.0", name)).await;
+            assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(f.as_str()));
+            assert!(delete_audit(&e, OWNER).is_empty());
         }
     }
 
