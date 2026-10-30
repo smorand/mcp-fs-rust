@@ -29424,6 +29424,10 @@ mod tests {
                 let (_c1, _c2, f1, f2) = seed_fork_conflict(e).await;
                 vec![f1, f2]
             }
+            "revert" => {
+                let c = seed_fx_line_rewritten(e).await;
+                vec![c[2].clone()]
+            }
             _ => {
                 let (_c2, f1) = seed_fork_conflict_at(e, MOUNT, "main").await;
                 vec![f1]
@@ -29437,6 +29441,7 @@ mod tests {
             "rebase" => {
                 rebase(e, "main", json!([pick(&seeded[0]), pick(&seeded[1])])).await.unwrap()
             }
+            "revert" => revert(e, &seeded[0]).await.unwrap(),
             _ => cherry_pick(e, &seeded[0]).await.unwrap(),
         };
         assert_eq!(paused["status"], "conflict", "{kind}: {paused}");
@@ -29475,6 +29480,12 @@ mod tests {
     #[tokio::test]
     async fn e2e_tag_046_publish_all_a_paused_cherry_pick_does_not_block() {
         assert_publish_during("cherry_pick").await;
+    }
+
+    /// SPEC-0060/DR-006: a paused revert does not block (SPEC-0054 FR-NEW-014).
+    #[tokio::test]
+    async fn e2e_tag_publish_all_a_paused_revert_does_not_block() {
+        assert_publish_during("revert").await;
     }
 
     /// SPEC-0054/E2E-045: fifty tags all up to date, no timeout.
