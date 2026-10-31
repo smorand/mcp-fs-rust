@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: FEAT / depth M: one area (the git service), 14 functional requirements and 3 qualities, no persisted data change; what a client observes during a fetch changes, which rules out S.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-31
 > Project: existing
 > From backlog: BL-0114
