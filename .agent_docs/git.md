@@ -85,6 +85,30 @@ blob store and the index. Stored bytes are identical; the only visible effect is
 that `state/git-repos/{project}/objects/` becomes a rebuildable cache instead of
 staying empty. Deleting it loses nothing.
 
+### Hydration marker (2026-10-30, SPEC-0065)
+
+`hydrate` calls `BlobObjectDb::hydrate_if_stale`, not `export_to_repo`. The entry's
+`BlobObjectDb` is bound to its own libgit2 repository (`bind_repo`, called by
+`create_entry`) and remembers the object count the index had at the last
+synchronisation. A git tool call reads one `COUNT(*)`; when it equals the marker nothing
+else runs, otherwise the full `export_to_repo` runs and the marker takes the count read
+BEFORE the export (an object stored meanwhile is exported by the next call). Imports from
+the entry's own repository (`import_from_repo`, `import_object`, `import_reachable`,
+`import_tips`) advance the marker by the objects they stored; imports from another
+repository (clone's temporary repo) never do; `delete` resets it. A restart starts without
+a marker, so the first call is a full check. Declared limits:
+
+* The object index only grows: `delete` removes a blob and never an index row, and only
+  `purge_repo` removes rows, after dropping the entry. A change that removes rows must reset
+  the marker.
+* The on disk libgit2 repository is still a rebuildable cache, but wiping it while the server
+  runs is now repaired at the next restart only, not by the next call.
+* Several replicas are supported: a replica that did not store an object sees a different
+  count and exports. Re-writing a sha that already has a row changes no count and is not
+  detected.
+* The upload-pack path (`git/http/mod.rs`) still calls `export_to_repo` on every request
+  (BL-0113).
+
 ## HTTP smart protocol
 
 | Method | Route | Purpose |

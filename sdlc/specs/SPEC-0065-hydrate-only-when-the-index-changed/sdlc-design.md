@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: escalated from M while writing: 3 modules touched (`crates/core/src/git/odb.rs`, `crates/core/src/git/repo.rs`, `crates/core/src/tools/git.rs`), about 6 requirements, no public contract, no persisted change.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0111
