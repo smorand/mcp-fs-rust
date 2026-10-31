@@ -204,6 +204,8 @@ impl GitRepoStore {
         let blobs = crate::storage::build_blob_store(&self.config, project_id)?;
         blobs.ensure_bucket().await?;
         let objects = Arc::new(BlobObjectDb::new(blobs.clone(), db.clone()));
+        // Only this repository may take the hydrate fast path, see `hydrate_if_stale`.
+        objects.bind_repo(repo.path());
 
         if init {
             db.set_ref("HEAD", "refs/heads/main", true).await?;

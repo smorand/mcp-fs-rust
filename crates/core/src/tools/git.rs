@@ -2067,7 +2067,7 @@ async fn resolve_ref(db: &RelationalGitDb, ref_or_sha: &str) -> Result<Option<St
 
 /// Make libgit2 able to see the objects held in the blob store.
 pub(crate) async fn hydrate(entry: &GitRepoEntry, repo: &Repository) -> Result<()> {
-    entry.objects.export_to_repo(repo).await?;
+    entry.objects.hydrate_if_stale(repo).await?;
     Ok(())
 }
 
@@ -30088,5 +30088,52 @@ mod tests {
         let err = call_publish_all_tags(&e, "origin", Some(json!("two"))).await.unwrap_err();
         assert_connection_refused(&err, &down, &["No such file or directory"]);
         assert_eq!(bare_refs(&dir), before);
+    }
+
+    /// SPEC-0065/DT-007: a commit written to the store by another handle (another replica)
+    /// is visible through the first entry. Guards the count marker against a wrong skip.
+    #[tokio::test]
+    async fn hydrate_sees_a_commit_written_by_another_handle() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        let entry = e.entry().await;
+        let second = crate::git::odb::BlobObjectDb::new(
+            entry.objects.blobs().clone(),
+            entry.objects.index().clone(),
+        );
+        let (sha, _, _) =
+            crate::git::odb::seed_commit(&second, "f.txt", b"data", "seeded elsewhere")
+                .await
+                .unwrap();
+        entry.db.set_ref("refs/heads/other", &sha, false).await.unwrap();
+
+        let log = e.call("git.log", json!({"mount_id": MOUNT, "ref_name": "other"})).await.unwrap();
+        assert_eq!(log["commits"][0]["sha"], sha);
+        assert!(log["commits"][0]["message"].as_str().unwrap().contains("seeded elsewhere"));
+        let shown =
+            e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": sha})).await.unwrap();
+        assert_eq!(shown["commit"]["sha"], sha);
+        assert!(shown["commit"]["message"].as_str().unwrap().contains("seeded elsewhere"));
+    }
+
+    /// SPEC-0065/DT-008: the entry's own commit is read back consistently, and the marker
+    /// moved with the import so a second commit still works.
+    #[tokio::test]
+    async fn hydrate_reads_back_the_entrys_own_commit() {
+        let e = Env::new().await;
+        seed_tags(&e).await;
+        e.write("/c.txt", "c\n").await;
+        let sha = e.commit("own commit").await;
+
+        let log = e.call("git.log", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(log["commits"][0]["sha"], sha);
+        let shown =
+            e.call("git.show", json!({"mount_id": MOUNT, "commit_sha": sha})).await.unwrap();
+        assert_eq!(shown["commit"]["sha"], sha);
+
+        e.write("/c.txt", "c2\n").await;
+        let second = e.commit("second own commit").await;
+        let log = e.call("git.log", json!({"mount_id": MOUNT})).await.unwrap();
+        assert_eq!(log["commits"][0]["sha"], second);
     }
 }
