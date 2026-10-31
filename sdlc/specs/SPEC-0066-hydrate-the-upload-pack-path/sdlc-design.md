@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: DEBT / depth S: 1 production line in 1 module (`crates/core/src/git/http/mod.rs`), 3 tests (2 in `http/mod.rs`, 1 in `git/repo.rs`), no public contract, no persisted change.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0113
@@ -127,3 +127,35 @@ Each step leaves the suite green.
 | 1 | 0 | 0 | IMPLEMENTABLE (inline checklist) |
 
 **Amendments applied:** none. Checklist run on the file as written: no forced choice (one line, one method); every technical name and both sides of the one change spelled (`export_to_repo(&repo)` to `hydrate_if_stale(&repo)`); every test fully specified with its mutation; every requirement has tests (DR-001: DT-001, DT-002, DT-004; DR-002: DT-003; DR-003: DT-001, DT-002 and the existing suite); EARS clean, no forbidden modal in a requirement; DEBT changes no behavior and smuggles no feature (the larger debt is BL-0114); every code claim cited and recounted (lines re-read after the draft: `odb.rs:407` definition, `http/mod.rs:411,429,434`, `repo.rs:204,208`); the existing tests to modify list is empty; length within the depth S budget of 80 to 200 lines.
+
+## Design additions (2026-10-30)
+Target tier: 2 (default; no `Tier:` in `sdlc/constitution.md`, no `--tier`). Project state: existing (`Cargo.toml` workspace with `crates/core`). Skill loaded: rust (ids `['rust']`): `make check` is the gate, `cargo fmt`, clippy `-D warnings`.
+
+Validation (Phase 3D): every `DEC-` names its requirement and source; every `DR-` is implemented by a `DEC-` (DR-001 by DEC-001, DR-002 by DEC-003, DR-003 mechanical). Spot checks read on disk: `http/mod.rs:434`, `repo.rs:208`, `odb.rs:144`, `odb.rs:407`, all as cited.
+
+**File structure impact**
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/repo.rs` (tests) | add DT-003 | DR-002 | US-0132 |
+| `crates/core/src/git/http/mod.rs` | one line at `:434`; add DT-001, DT-002 in `mod tests` | DR-001, DR-003 | US-0133 |
+| `.agent_docs/git.md` | rewrite the line at 109 of the Hydration marker section | DR-001 | US-0134 |
+Affected existing tests: none modified. Affected docs: `.agent_docs/git.md` only; `AGENTS.md` and `README.md` hold no mention.
+
+**Test strategy**
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-003 | integration | `GitRepoStore::init_repo` | `crates/core/src/git/repo.rs` `mod tests` | US-0132 |
+| DT-001 | integration | `handle_upload_pack` | `crates/core/src/git/http/mod.rs` `mod tests` | US-0133 |
+| DT-002 | integration | `handle_upload_pack` | same | US-0133 |
+| DT-004 | structural | `rg` / `awk` | n/a | US-0134 |
+| DT-005 | measurement | temporary test, not committed | n/a | US-0134 |
+
+- **DEC-004:** three stories in the order of Section 9: DT-003 first (a test only story, proving the binding through a mutation), then the one line switch with DT-001 and DT-002, then docs plus DT-004 and DT-005 closing the spec. **Obliged by:** SPEC-0066/DR-001, DR-002. **Rationale:** each story leaves main green; the first adds a test that already passes, the second is the change, the third is documentation and the closing audit. **Alternatives considered:** one story for all (3 tests plus a line plus a doc is still within 3 files, rejected because DT-003 is independent of the switch and a failed mutation proof would otherwise block the line change). **Source:** design. **Evidence:** Section 9 of this document.
+- **DEC-005:** `min_tier` 2 for the three stories (the repository tests need `seed_commit`, the pack indexing pattern of `http/mod.rs:1504` and a mutation proof, which a T3 model does not infer). **Obliged by:** n/a (no code impact): routing only. **Source:** design.
+
+## 11. Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0132 | prove the store's entry takes the hydration fast path | P1 | DR-002 | main | 2 | no |
+| US-0133 | hydrate the upload-pack path through the marker | P1 | DR-001, DR-003 | US-0132 | 2 | no |
+| US-0134 | document the upload-pack hydration and close the spec | P1 | DR-001, DR-003 | US-0133 | 2 | yes |
