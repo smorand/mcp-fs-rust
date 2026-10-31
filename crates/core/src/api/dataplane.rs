@@ -1,18 +1,18 @@
-//! The `/api/fs` REST data plane. 1:1 port of the C# `Api/DataPlane.cs`.
+//! The `/api/fs` REST data plane.
 //!
-//! Two families of endpoints share one guard:
+//! Three groups of endpoints share one guard:
 //!
-//! * the bytes plane (`roots`, `list`, `upload`, `download`, `download-zip`,
-//!   plus the small `mkdir` / `delete` / `move` helpers), which talks to the
-//!   [`VolumeClient`] directly and returns the shapes the C# returns;
-//! * tool parity (`read`, `write`, `grep`, ...), which calls the very same
-//!   [`crate::core::fs_ops`] functions the MCP tools call, so the two surfaces
-//!   can never drift apart.
+//! * `roots` only reads the admin store (the projects the caller can see);
+//! * `list`, `download` and `download-zip` read the volume through the
+//!   [`VolumeClient`] directly, because no tool returns their shape;
+//! * every other route, `mkdir`, `delete`, `move`, `upload` and `read-section`
+//!   included, calls the very same [`crate::core::fs_ops`] functions the MCP
+//!   tools call, so the two surfaces can never drift apart.
 //!
-//! Guard order, identical to the C#: verify the bearer (401 on failure), then
-//! `require_member` on the project (404 when the project is unknown, 403 when the
-//! caller is not a member), then run the operation and map any [`ToolError`] to
-//! its HTTP status via [`ToolError::http_status`].
+//! Guard order: verify the bearer (401 on failure), then `require_member` on the
+//! project (404 when the project is unknown, 403 when the caller is not a
+//! member), then run the operation and map any [`ToolError`] to its HTTP status
+//! via [`ToolError::http_status`].
 //!
 //! Query and body parameter names are the MCP tool parameter names, spelled
 //! snake_case. That is a hard requirement: the OpenAPI document inherits its
