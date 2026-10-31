@@ -851,7 +851,8 @@ on disk before the push). Tests: `file://` cannot reach the tool (`resolve_clone
 they call `publish_all_tags` through `call_publish_all_tags`; `bulk_seams` (`git/remote.rs`) holds
 back named tags as per ref refusals or drops the answer after N refs, `after_listing`
 (`tools/git_tags.rs`) runs a hook right after the listing to move the remote. Both are
-`#[cfg(test)]` only. Single publish after a bulk send: `e2e_tag_008_publish_all_*`,
+`#[cfg(test)]` only. 2026-10-30: `bulk_seams::around_push` runs a hook before and after every real bulk push (`PushPhase::Before(n)`/`After(n)`) and `bulk_seams::counts` returns `(pushes, listings)`, so a test can change a bare remote between the listing and the sending (SPEC-0064).
+Single publish after a bulk send: `e2e_tag_008_publish_all_*`,
 `e2e_tag_044_publish_all_*`, `e2e_tag_048_publish_all_*`. Known limit: BL-0093.
 
 **Receive** (fetch, pull, clone). Tag following stays off. Fetch and pull take candidates

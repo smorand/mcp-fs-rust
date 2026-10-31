@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: 1 context (remote exchange), 2 requirements, no persisted change.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-30
 > Project: existing
 > From backlog: BL-0093

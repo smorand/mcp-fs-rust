@@ -29777,6 +29777,150 @@ mod tests {
         assert_eq!(err.message, KEPT_CHANGING_V1);
     }
 
+    /// The remote gains `tag` at `target` before the first send only, as when
+    /// another source publishes the same tag, and `flapping` (when given) is
+    /// created before every send and removed after it.
+    fn identical_before_first_send(
+        dir: &std::path::Path,
+        url: &str,
+        tag: &'static str,
+        target: &str,
+        flapping: Option<&'static str>,
+    ) {
+        use crate::git::remote::bulk_seams::{self, PushPhase};
+        bulk_seams::reset(url);
+        let (dir, target) = (dir.to_path_buf(), target.to_string());
+        bulk_seams::around_push(url, move |phase| match phase {
+            PushPhase::Before(n) => {
+                if n == 0 {
+                    plain_tag_bare_remote(&dir, tag, &target);
+                }
+                if let Some(f) = flapping {
+                    plain_tag_bare_remote(&dir, f, &target);
+                }
+            }
+            PushPhase::After(_) => {
+                if let Some(f) = flapping {
+                    let repo = git2::Repository::open_bare(&dir).unwrap();
+                    repo.find_reference(&format!("refs/tags/{f}")).unwrap().delete().unwrap();
+                }
+            }
+        });
+    }
+
+    /// SPEC-0064/E2E-003: a tag that became identical is not named; the
+    /// stable one and the flapping one are.
+    #[tokio::test]
+    async fn e2e_tag_publish_all_flapping_an_identical_tag_is_not_named() {
+        let e = Env::new().await;
+        let (dir, url, a, b, c) = three_commit_remote(&e, "remote-flap3").await;
+        for (name, target) in [("a1", &a), ("b1", &b), ("c1", &c)] {
+            tag(&e, json!({"name": name, "target": target})).await.unwrap();
+        }
+        assert_eq!(preview_all(&e).await["message"], count_line(3));
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        identical_before_first_send(&dir, &url, "a1", &a, Some("b1"));
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(3))).await.unwrap_err();
+
+        let text = "Remote tags kept changing while publishing: b1, c1. Review the list, then confirm again.";
+        assert_eq!(err.message, text);
+        let (pushes, listings) = crate::git::remote::bulk_seams::counts(&url);
+        assert_eq!((pushes, listings), (2, 3), "a1 left the due tags, so the product sent again");
+        assert_eq!(
+            bare_refs(&dir),
+            with_tags(&before, &[("a1", &a)]),
+            "only a1, from the other source"
+        );
+        assert!(publish_audit(&e, OWNER).is_empty());
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0064/E2E-004: once the remote stops changing, the member previews
+    /// again and the confirmation publishes.
+    #[tokio::test]
+    async fn e2e_tag_publish_all_flapping_retry_after_the_refusal_publishes() {
+        let e = Env::new().await;
+        let (dir, url, a, _, _) = three_commit_remote(&e, "remote-flap4").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(1));
+        flap_remote_tag(&dir, &url, "v1.0", &a);
+        let err = call_publish_all_tags(&e, "origin", Some(json!(1))).await.unwrap_err();
+        assert_eq!(err.message, KEPT_CHANGING_V1);
+        crate::git::remote::bulk_seams::reset(&url);
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+
+        let preview = preview_all(&e).await;
+        assert_eq!(names(&preview["lines"]), ["v1.0 to publish"]);
+        assert_eq!(preview["message"], count_line(1));
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(names(&out["lines"]), ["v1.0 published"]);
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a)]));
+        assert_eq!(publish_audit(&e, OWNER), [published_line("v1.0", &a)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0064/E2E-005: the names come in byte order, `Z` before `a`.
+    #[tokio::test]
+    async fn e2e_tag_publish_all_flapping_names_come_in_byte_order() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-flap5").await;
+        tag(&e, json!({"name": "alpha", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "Zeta", "target": b})).await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(2));
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        flap_remote_tag(&dir, &url, "alpha", &a);
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
+
+        let text = "Remote tags kept changing while publishing: Zeta, alpha. Review the list, then confirm again.";
+        assert_eq!(err.message, text);
+        assert_eq!(bare_refs(&dir), before, "nothing was sent");
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0064/E2E-007: a re-listing that removed a tag allows one more
+    /// send, which succeeds.
+    #[tokio::test]
+    async fn e2e_tag_publish_all_flapping_a_removed_tag_allows_another_send() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-flap7").await;
+        tag(&e, json!({"name": "a1", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "b1", "target": b})).await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(2));
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        identical_before_first_send(&dir, &url, "a1", &a, None);
+
+        let out = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap();
+
+        assert_eq!(names(&out["lines"]), ["a1 up to date", "b1 published"]);
+        let (pushes, listings) = crate::git::remote::bulk_seams::counts(&url);
+        assert_eq!((pushes, listings), (2, 2), "the first push lost, the second accepted");
+        assert_eq!(bare_refs(&dir), with_tags(&before, &[("a1", &a), ("b1", &b)]));
+        assert_eq!(publish_audit(&e, OWNER), [published_line("b1", &b)]);
+        assert_eq!(audit_count(&e), audit + 1);
+    }
+
+    /// SPEC-0064/E2E-008: a wrong number is refused first, nothing is sent.
+    #[tokio::test]
+    async fn e2e_tag_publish_all_flapping_a_wrong_number_comes_first() {
+        let e = Env::new().await;
+        let (dir, url, a, _, _) = three_commit_remote(&e, "remote-flap8").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(1));
+        let (before, audit) = (bare_refs(&dir), audit_count(&e));
+        flap_remote_tag(&dir, &url, "v1.0", &a);
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(5))).await.unwrap_err();
+
+        let first = "Tags to publish: 1, not 5. Review the list, then confirm again.";
+        assert_wrong_number(err, first, &["v1.0 to publish"]);
+        assert_eq!(crate::git::remote::bulk_seams::counts(&url).0, 0, "no sending attempt");
+        assert_eq!(bare_refs(&dir), before);
+        assert_eq!(audit_count(&e), audit);
+    }
+
     /// A bare remote holding every object of the project and `main` at the
     /// project's `main`, so a tag on that commit is due.
     async fn remote_from_project(e: &Env, label: &str) -> (std::path::PathBuf, String, String) {
