@@ -126,7 +126,7 @@
 | US-0124 | SPEC-0063 | import only the new objects of a fetch and a pull | US-0123 | 2 | landed | story/US-0124-import-only-the-new-objects-of-a-fetch-and-a-pull | main |
 | US-0125 | SPEC-0063 | import only the new objects of a push | US-0124 | 2 | landed | story/US-0125-import-only-the-new-objects-of-a-push | main |
 | US-0126 | SPEC-0063 | keep clone on the whole walk and close the spec | US-0125 | 2 | landed | story/US-0126-keep-clone-on-the-whole-walk-and-close-the-spec | main |
-| US-0127 | SPEC-0064 | reproduce a remote that keeps changing and test the refusal | main | 2 | todo | | |
+| US-0127 | SPEC-0064 | reproduce a remote that keeps changing and test the refusal | main | 2 | landed | story/US-0127-reproduce-a-remote-that-keeps-changing | main |
 | US-0128 | SPEC-0064 | test which tags the refusal names, the retry and the order of refusals | US-0127 | 2 | todo | | |
 | US-0129 | SPEC-0065 | remember the object count a libgit2 repository was synchronised with | US-0128 | 2 | todo | | |
 | US-0130 | SPEC-0065 | hydrate libgit2 only when the object index changed | US-0129 | 2 | todo | | |

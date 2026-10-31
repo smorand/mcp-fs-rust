@@ -869,7 +869,14 @@ pub fn push_tags_to_remote(
         Some(tag) => tag.to_string(),
         None => refname,
     };
-    match push_refs(repo, origin_url, &refs, token, deadline) {
+    #[cfg(test)]
+    let attempt = bulk_seams::note_push(origin_url);
+    #[cfg(test)]
+    bulk_seams::run_hook(origin_url, bulk_seams::PushPhase::Before(attempt));
+    let pushed = push_refs(repo, origin_url, &refs, token, deadline);
+    #[cfg(test)]
+    bulk_seams::run_hook(origin_url, bulk_seams::PushPhase::After(attempt));
+    match pushed {
         Ok(_) if dropped => {
             let lost = git2::Error::from_str("connection reset before the answer arrived");
             Err(connection_error(origin_url, &lost, token_for_redaction.as_deref()))
@@ -975,6 +982,75 @@ pub(crate) mod bulk_seams {
         let mut all = REJECTIONS.lock().unwrap();
         all.iter().position(|(u, _)| u == url).map(|at| all.remove(at).1).unwrap_or_default()
     }
+
+    /// Where a hook runs, relative to the real push of attempt `n` (0 based).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PushPhase {
+        Before(usize),
+        After(usize),
+    }
+
+    type Hook = Box<dyn FnMut(PushPhase) + Send>;
+    static HOOKS: Mutex<Vec<(String, Hook)>> = Mutex::new(Vec::new());
+    static COUNTS: Mutex<Vec<(String, (usize, usize))>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` around every bulk tag push to `url`, replacing any earlier
+    /// one. It runs around the real push, so libgit2's lease check fires for
+    /// real: a remote that changes between the listing and the send.
+    pub(crate) fn around_push(url: &str, hook: impl FnMut(PushPhase) + Send + 'static) {
+        let mut all = HOOKS.lock().unwrap();
+        all.retain(|(u, _)| u != url);
+        all.push((url.into(), Box::new(hook)));
+    }
+
+    /// `(pushes, listings)` seen for `url` since the last [`reset`].
+    pub(crate) fn counts(url: &str) -> (usize, usize) {
+        let all = COUNTS.lock().unwrap();
+        all.iter().find(|(u, _)| u == url).map(|(_, c)| *c).unwrap_or_default()
+    }
+
+    /// Drops the hook and the counters of `url`.
+    pub(crate) fn reset(url: &str) {
+        HOOKS.lock().unwrap().retain(|(u, _)| u != url);
+        COUNTS.lock().unwrap().retain(|(u, _)| u != url);
+    }
+
+    fn bump(url: &str, step: impl FnOnce(&mut (usize, usize))) -> (usize, usize) {
+        let mut all = COUNTS.lock().unwrap();
+        if let Some((_, c)) = all.iter_mut().find(|(u, _)| u == url) {
+            step(c);
+            return *c;
+        }
+        let mut c = (0, 0);
+        step(&mut c);
+        all.push((url.into(), c));
+        c
+    }
+
+    pub(super) fn note_listing(url: &str) {
+        bump(url, |c| c.1 += 1);
+    }
+
+    /// Counts one push and returns its attempt index (the count before it).
+    pub(super) fn note_push(url: &str) -> usize {
+        bump(url, |c| c.0 += 1).0 - 1
+    }
+
+    /// The hook leaves its slot while it runs, so it may call [`reset`] or
+    /// [`around_push`] without deadlocking the mutex; it goes back unless the
+    /// hook registered a replacement meanwhile.
+    pub(super) fn run_hook(url: &str, phase: PushPhase) {
+        let taken = {
+            let mut all = HOOKS.lock().unwrap();
+            all.iter().position(|(u, _)| u == url).map(|at| all.remove(at))
+        };
+        let Some((u, mut hook)) = taken else { return };
+        hook(phase);
+        let mut all = HOOKS.lock().unwrap();
+        if !all.iter().any(|(k, _)| *k == u) {
+            all.push((u, hook));
+        }
+    }
 }
 
 /// What a tag push did (SPEC-0052 DEC-018).
@@ -1060,6 +1136,8 @@ pub fn list_advertised_refs(
     token: Option<String>,
     deadline: Option<Instant>,
 ) -> Result<AdvertisedRefs> {
+    #[cfg(test)]
+    bulk_seams::note_listing(origin_url);
     let token_for_redaction = token.clone();
     let mut git_remote = repo
         .remote_anonymous(origin_url)
