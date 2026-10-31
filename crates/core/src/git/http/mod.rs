@@ -431,7 +431,7 @@ pub async fn handle_upload_pack(entry: &GitRepoEntry, body: &[u8]) -> Result<Vec
 
     // libgit2 packs from its own ODB, so the blob store has to be materialized first.
     let repo = entry.repo.lock().await;
-    entry.objects.export_to_repo(&repo).await?;
+    entry.objects.hydrate_if_stale(&repo).await?;
 
     let pack = build_pack(&repo, &req.wants)?;
     drop(repo);
@@ -1522,5 +1522,66 @@ mod tests {
         }
         assert!(client.odb().unwrap().exists(Oid::from_str(&commit).unwrap()));
         assert!(client.odb().unwrap().exists(Oid::from_str(&blob).unwrap()));
+    }
+
+    /// Run an upload-pack for `commit` and index the answer into a fresh bare repository.
+    async fn fetch_into_fresh_client(
+        e: &GitRepoEntry,
+        commit: &str,
+    ) -> (tempfile::TempDir, git2::Repository) {
+        let mut req = Vec::new();
+        req.extend_from_slice(&pktline::encode(&format!("want {commit}\n")));
+        req.extend_from_slice(&pktline::flush());
+        let out = handle_upload_pack(e, &req).await.unwrap();
+        let mut pack = Vec::new();
+        let mut r = PktReader::new(&out);
+        while let (Some(data), PacketType::Data) = r.read_packet() {
+            if data.len() > 1 && data[0] == 1 {
+                pack.extend_from_slice(&data[1..]);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let client = git2::Repository::init_bare(dir.path()).unwrap();
+        {
+            use std::io::Write;
+            let odb = client.odb().unwrap();
+            let mut w = odb.packwriter().unwrap();
+            w.write_all(&pack).unwrap();
+            w.commit().unwrap();
+        }
+        (dir, client)
+    }
+
+    #[tokio::test]
+    async fn an_upload_pack_serves_a_commit_written_by_another_handle() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        let (first, _t, _b) = seed_commit(&e.objects, "a.txt", b"one", "c1").await.unwrap();
+        fetch_into_fresh_client(&e, &first).await;
+
+        // another handle over the same stores: this entry's hydration marker cannot know it
+        let other = crate::git::odb::BlobObjectDb::new(
+            e.objects.blobs().clone(),
+            e.objects.index().clone(),
+        );
+        let (second, _t, blob) = seed_commit(&other, "b.txt", b"two", "c2").await.unwrap();
+        e.db.set_ref("refs/heads/main", &second, false).await.unwrap();
+
+        let (_dir, client) = fetch_into_fresh_client(&e, &second).await;
+        assert!(client.odb().unwrap().exists(Oid::from_str(&second).unwrap()));
+        assert!(client.odb().unwrap().exists(Oid::from_str(&blob).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn two_upload_packs_in_a_row_both_serve_the_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        let (commit, _t, blob) = seed_commit(&e.objects, "a.txt", b"twice", "c1").await.unwrap();
+        e.db.set_ref("refs/heads/main", &commit, false).await.unwrap();
+        for _ in 0..2 {
+            let (_dir, client) = fetch_into_fresh_client(&e, &commit).await;
+            assert!(client.odb().unwrap().exists(Oid::from_str(&commit).unwrap()));
+            assert!(client.odb().unwrap().exists(Oid::from_str(&blob).unwrap()));
+        }
     }
 }
