@@ -36,7 +36,8 @@ use crate::git::db::{GitObjectRow, RelationalGitDb};
 use crate::storage::BlobBackend;
 use git2::{ObjectType, Oid};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Tree entry mode of a submodule commit.
 const GITLINK_MODE: i32 = 0o160000;
@@ -100,15 +101,75 @@ pub fn object_id(kind: ObjectType, payload: &[u8]) -> Result<String> {
         .map_err(|e| ToolError::internal(format!("git hash-object failed: {e}")))
 }
 
+/// What [`BlobObjectDb::hydrate_if_stale`] remembers about the entry's own libgit2 repository.
+#[derive(Default)]
+struct HydrationState {
+    /// Canonical path of the repository this object store hydrates, once bound.
+    own: Option<PathBuf>,
+    /// Number of indexed objects at the last synchronisation of `own`.
+    synced: Option<i64>,
+}
+
 /// Read/write access to one project's git objects.
 pub struct BlobObjectDb {
     blobs: Arc<dyn BlobBackend>,
     index: Arc<RelationalGitDb>,
+    /// Never held across an await: every access is a short read or write.
+    hydration: Mutex<HydrationState>,
 }
 
 impl BlobObjectDb {
     pub fn new(blobs: Arc<dyn BlobBackend>, index: Arc<RelationalGitDb>) -> Self {
-        Self { blobs, index }
+        Self { blobs, index, hydration: Mutex::new(HydrationState::default()) }
+    }
+
+    fn hydration(&self) -> std::sync::MutexGuard<'_, HydrationState> {
+        self.hydration.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record the path of the entry's own libgit2 repository, once; a second call is ignored.
+    /// Only that repository may use the fast path of [`Self::hydrate_if_stale`] and advance
+    /// the marker, so the clone's temporary repository can never move it.
+    pub fn bind_repo(&self, path: &Path) {
+        let mut state = self.hydration();
+        if state.own.is_none() {
+            state.own = std::fs::canonicalize(path).ok();
+        }
+    }
+
+    /// [`Self::export_to_repo`], unless the index holds the same number of objects as at the
+    /// last synchronisation of the bound repository. A git tool call should not re check
+    /// every object when nothing changed: the fast path is one `COUNT(*)`, no row listing and
+    /// no blob store or libgit2 probe. Any other repository gets the plain full export.
+    pub async fn hydrate_if_stale(&self, repo: &git2::Repository) -> Result<usize> {
+        if !self.is_own(repo) {
+            return self.export_to_repo(repo).await;
+        }
+        // Read before exporting: an object stored while the export runs makes the next
+        // count differ, so it is exported by the next call instead of being forgotten.
+        let count = self.index.count_objects().await?;
+        if self.hydration().synced == Some(count) {
+            return Ok(0);
+        }
+        let written = self.export_to_repo(repo).await?;
+        self.hydration().synced = Some(count);
+        Ok(written)
+    }
+
+    /// Whether `repo` is the bound repository (paths compared canonicalised).
+    fn is_own(&self, repo: &git2::Repository) -> bool {
+        let Ok(path) = std::fs::canonicalize(repo.path()) else { return false };
+        self.hydration().own.as_deref() == Some(path.as_path())
+    }
+
+    /// Move a held marker by the `stored` objects an import of `repo` just added. Conservative:
+    /// a foreign writer or a stale marker leaves a difference, so the next call exports.
+    fn advance(&self, repo: &git2::Repository, stored: usize) {
+        if !self.is_own(repo) {
+            return;
+        }
+        let mut state = self.hydration();
+        state.synced = state.synced.map(|c| c + stored as i64);
     }
 
     pub fn index(&self) -> &Arc<RelationalGitDb> {
@@ -179,7 +240,10 @@ impl BlobObjectDb {
     /// Delete an object from the blob store. Not part of the C# surface (a git
     /// ODB never deletes), kept for volume teardown and tests.
     pub async fn delete(&self, sha: &str) -> Result<()> {
-        self.blobs.delete(&blob_key(sha)).await
+        self.blobs.delete(&blob_key(sha)).await?;
+        // The index row stays, so the count is unchanged: only a reset forces a re check.
+        self.hydration().synced = None;
+        Ok(())
     }
 
     pub async fn list(&self) -> Result<Vec<GitObjectRow>> {
@@ -232,6 +296,7 @@ impl BlobObjectDb {
             self.write_with_sha(&sha, kind, &payload).await?;
             stored += 1;
         }
+        self.advance(repo, stored);
         Ok(stored)
     }
 
@@ -266,6 +331,7 @@ impl BlobObjectDb {
             return Ok(0);
         }
         self.write_with_sha(&sha, kind, &payload).await?;
+        self.advance(repo, 1);
         Ok(1)
     }
 
@@ -318,6 +384,7 @@ impl BlobObjectDb {
         for (sha, kind, payload) in &order {
             self.write_with_sha(sha, *kind, payload).await?;
         }
+        self.advance(repo, order.len());
         Ok(order.len())
     }
 
@@ -474,10 +541,11 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Delegates to a local store and counts `exists` probes.
+    /// Delegates to a local store and counts `exists` probes and `get` reads.
     struct CountingBlobs {
         inner: LocalBlobStore,
         exists_calls: AtomicUsize,
+        get_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -486,6 +554,7 @@ mod tests {
             self.inner.put(key, data).await
         }
         async fn get(&self, key: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.get(key, offset, length).await
         }
         async fn exists(&self, key: &str) -> Result<bool> {
@@ -571,6 +640,7 @@ mod tests {
         let counting = Arc::new(CountingBlobs {
             inner: LocalBlobStore::new(d.path(), "mcpfs-git-test"),
             exists_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
         });
         let o = odb_over(counting.clone()).await;
         (d, counting, o)
@@ -1099,5 +1169,180 @@ mod tests {
             "git object '1111111111111111111111111111111111111111' not found in the repository"
         );
         assert!(o.list().await.unwrap().is_empty());
+    }
+
+    /// On its first `get`, writes one more object through a second handle over the same
+    /// store and index: an object stored while an export is running.
+    struct HookBlobs {
+        inner: LocalBlobStore,
+        other: Arc<std::sync::OnceLock<BlobObjectDb>>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl BlobBackend for HookBlobs {
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn get(&self, key: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+            if !self.fired.swap(true, Ordering::SeqCst)
+                && let Some(other) = self.other.get()
+            {
+                other.write(ObjectType::Blob, b"stored during the export").await?;
+            }
+            self.inner.get(key, offset, length).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn ensure_bucket(&self) -> Result<()> {
+            self.inner.ensure_bucket().await
+        }
+        async fn remove_bucket(&self) -> Result<()> {
+            self.inner.remove_bucket().await
+        }
+    }
+
+    /// Drop the loose objects libgit2 holds, as a deleted `objects/` cache would: a full
+    /// export must then re read the blob store, which is what the counters observe.
+    fn forget_loose_objects(repo: &git2::Repository) {
+        for entry in std::fs::read_dir(repo.path().join("objects")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n.len() == 2) {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+
+    /// `n` objects in the store, a bound repository synchronised with them, counters reset.
+    async fn synced_counting(
+        n: usize,
+    ) -> (
+        tempfile::TempDir,
+        Arc<CountingBlobs>,
+        BlobObjectDb,
+        tempfile::TempDir,
+        git2::Repository,
+        Vec<String>,
+    ) {
+        let (d, counting, o) = counting_odb().await;
+        let (rd, repo) = bare();
+        o.bind_repo(repo.path());
+        let mut shas = Vec::new();
+        for i in 0..n {
+            shas.push(o.write(ObjectType::Blob, format!("object {i}").as_bytes()).await.unwrap());
+        }
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), n);
+        counting.exists_calls.store(0, Ordering::SeqCst);
+        counting.get_calls.store(0, Ordering::SeqCst);
+        (d, counting, o, rd, repo, shas)
+    }
+
+    fn probes(counting: &CountingBlobs) -> (usize, usize) {
+        (counting.exists_calls.load(Ordering::SeqCst), counting.get_calls.load(Ordering::SeqCst))
+    }
+
+    fn reset(counting: &CountingBlobs) {
+        counting.exists_calls.store(0, Ordering::SeqCst);
+        counting.get_calls.store(0, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn us0129_dt001_an_unchanged_index_is_not_rechecked() {
+        let (_d, counting, o, _rd, repo, _) = synced_counting(200).await;
+        forget_loose_objects(&repo);
+
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 0);
+        assert_eq!(probes(&counting), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn us0129_dt002_an_object_added_by_another_writer_is_exported() {
+        let (_d, _counting, o, _rd, repo, _) = synced_counting(200).await;
+        let replica = BlobObjectDb::new(o.blobs().clone(), o.index().clone());
+        let sha = replica.write(ObjectType::Blob, b"from the replica").await.unwrap();
+
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 1);
+        assert!(repo.odb().unwrap().exists(Oid::from_str(&sha).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn us0129_dt003_the_entrys_own_imports_keep_the_fast_path() {
+        let (_d, counting, o, _rd, repo, _) = synced_counting(20).await;
+
+        let oid = repo.blob(b"imported one").unwrap();
+        assert_eq!(o.import_object(&repo, oid).await.unwrap(), 1);
+        forget_loose_objects(&repo);
+        reset(&counting);
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 0);
+        assert_eq!(probes(&counting), (0, 0), "import_object");
+
+        let commit = commit_on(&repo, flat_tree(&repo, &[("a.txt", "a")]), &[]);
+        assert_eq!(o.import_reachable(&repo, &[commit]).await.unwrap(), 3);
+        forget_loose_objects(&repo);
+        reset(&counting);
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 0);
+        assert_eq!(probes(&counting), (0, 0), "import_reachable");
+
+        repo.blob(b"imported two").unwrap();
+        assert_eq!(o.import_from_repo(&repo).await.unwrap(), 1);
+        forget_loose_objects(&repo);
+        reset(&counting);
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 0);
+        assert_eq!(probes(&counting), (0, 0), "import_from_repo");
+    }
+
+    #[tokio::test]
+    async fn us0129_dt004_another_repositorys_imports_do_not_advance_the_marker() {
+        let (_d, _counting, o, _rd, repo, _) = synced_counting(5).await;
+        let (_other_dir, other) = bare();
+        let oid = other.blob(b"only in the clone's temporary repository").unwrap();
+        assert_eq!(o.import_from_repo(&other).await.unwrap(), 1);
+
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 1);
+        assert!(repo.odb().unwrap().exists(oid));
+    }
+
+    #[tokio::test]
+    async fn us0129_dt005_a_delete_forgets_the_marker() {
+        let (_d, counting, o, _rd, repo, shas) = synced_counting(200).await;
+        o.delete(&shas[0]).await.unwrap();
+        forget_loose_objects(&repo);
+
+        o.hydrate_if_stale(&repo).await.unwrap();
+        let (exists, gets) = probes(&counting);
+        assert!(
+            exists >= 199 && gets >= 199,
+            "{exists} exists and {gets} gets, expected a full check"
+        );
+    }
+
+    #[tokio::test]
+    async fn us0129_dt006_an_object_stored_during_an_export_is_seen_by_the_next_one() {
+        let d = tempfile::tempdir().unwrap();
+        let other = Arc::new(std::sync::OnceLock::new());
+        let hook = Arc::new(HookBlobs {
+            inner: LocalBlobStore::new(d.path(), "mcpfs-git-test"),
+            other: other.clone(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        let o = odb_over(hook.clone()).await;
+        assert!(other.set(BlobObjectDb::new(hook.clone(), o.index().clone())).is_ok());
+        let (_rd, repo) = bare();
+        o.bind_repo(repo.path());
+        for i in 0..3 {
+            o.write(ObjectType::Blob, format!("object {i}").as_bytes()).await.unwrap();
+        }
+
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 3);
+        let extra = object_id(ObjectType::Blob, b"stored during the export").unwrap();
+        assert!(o.exists(&extra).await.unwrap(), "the hook must have fired");
+        assert!(!repo.odb().unwrap().exists(Oid::from_str(&extra).unwrap()));
+
+        assert_eq!(o.hydrate_if_stale(&repo).await.unwrap(), 1);
+        assert!(repo.odb().unwrap().exists(Oid::from_str(&extra).unwrap()));
     }
 }

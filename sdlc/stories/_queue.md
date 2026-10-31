@@ -128,6 +128,6 @@
 | US-0126 | SPEC-0063 | keep clone on the whole walk and close the spec | US-0125 | 2 | landed | story/US-0126-keep-clone-on-the-whole-walk-and-close-the-spec | main |
 | US-0127 | SPEC-0064 | reproduce a remote that keeps changing and test the refusal | main | 2 | landed | story/US-0127-reproduce-a-remote-that-keeps-changing | main |
 | US-0128 | SPEC-0064 | test which tags the refusal names, the retry and the order of refusals | US-0127 | 2 | landed | story/US-0128-test-which-tags-the-refusal-names | main |
-| US-0129 | SPEC-0065 | remember the object count a libgit2 repository was synchronised with | US-0128 | 2 | todo | | |
+| US-0129 | SPEC-0065 | remember the object count a libgit2 repository was synchronised with | US-0128 | 2 | landed | story/US-0129-remember-the-object-count-a-repository-was-synced-with | main |
 | US-0130 | SPEC-0065 | hydrate libgit2 only when the object index changed | US-0129 | 2 | todo | | |
 | US-0131 | SPEC-0065 | document the hydration marker and close the spec | US-0130 | 2 | todo | | |
