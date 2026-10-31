@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: L
 > Depth evidence: escalated from M while writing: 3 modules touched (`crates/core/src/git/odb.rs`, `crates/core/src/git/repo.rs`, `crates/core/src/tools/git.rs`), about 6 requirements, no public contract, no persisted change.
-> Status: specified
+> Status: designed
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0111
@@ -190,3 +190,41 @@ Each step leaves the suite green: step 1 changes no caller, step 2 is the behavi
 | 1 | 1 (MINOR) | 4 (MINOR) | IMPLEMENTABLE |
 
 **Amendments applied:** DR-001 step 2 spells the path comparison (canonicalised both sides); DR-003 corrected (`delete` removes the blob, not the row; re-writing an existing sha is not detected); DEC-006(a) corrected; DT-005 rebuilt around probe counts with its own mutation; DT-006 says how the hook wrapper is built (`Arc<OnceLock<BlobObjectDb>>`); line citations corrected (`tools/git.rs` `mod tests` at 7665, `CountingBlobs` at `odb.rs:478`, `counting_odb` 569, `odb()` 631). Self consistency re-read after the amendments: ids present, every requirement tested (DR-001: DT-001, 002, 006; DR-002: DT-003, 004; DR-003: DT-005; DR-004: DT-007, 008, 009; DR-005: DT-009; DR-006: DT-007, 008), every DEC names its DR.
+
+## Design additions (2026-10-30)
+
+Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skill: `rust` (loaded earlier in this session; project gate: `cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `make check`). Spot checks of cited code done: `export_to_repo` (`odb.rs:340`), `hydrate` (`tools/git.rs:2069-2072`), `BlobObjectDb::new` call in `create_entry` (`repo.rs:206`), `count_objects` (`git/db.rs:334`), `delete` (`odb.rs:181`), `purge_repo`/`teardown_repo` (`repo.rs:134-153`).
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/odb.rs` | modify: state struct, field, `bind_repo`, `hydrate_if_stale`, advance in four import methods, reset in `delete`; 6 unit tests and 1 hook wrapper in `mod tests` | DR-001, DR-002, DR-003 | US-0129 |
+| `crates/core/src/git/repo.rs` | modify: `bind_repo` call in `create_entry` | DR-004 | US-0130 |
+| `crates/core/src/tools/git.rs` (production) | modify: `hydrate` | DR-004 | US-0130 |
+| `crates/core/src/tools/git.rs` (tests) | modify: DT-007, DT-008 | DR-004, DR-006 | US-0130 |
+| `.agent_docs/git.md` | modify: document the marker and its limits | DR-001 (DEC-006) | US-0131 |
+
+Affected existing tests: none to modify (Section 8.4). Affected documentation: `.agent_docs/git.md` (lines 81 and 138 describe the hydration).
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 to DT-006 | unit | direct calls on `BlobObjectDb` with counting and hook blob wrappers | `crates/core/src/git/odb.rs` `mod tests` | US-0129 |
+| DT-007, DT-008 | integration | `Env` harness (`git.log`, `git.show`, `git.commit`), a second `BlobObjectDb` over the same store | `crates/core/src/tools/git.rs` `mod tests` | US-0130 |
+| DT-009 | structural | `awk`, `rg` on sources and the doc | repository | US-0131 |
+| DT-010 | measurement, not gating | temporary test, not committed | scratch in `tools/git.rs` | US-0131 |
+
+Test data: generated (blobs written with `repo.blob`, objects with `BlobObjectDb::write`). The mutation proofs of DT-001, DT-003, DT-004, DT-005, DT-006 and DT-007 are run by their stories.
+
+### Decisions (continued)
+- **DEC-009:** three stories in the order of Section 9, serialized: US-0129 (the state and its unit tests, no caller), US-0130 (the binding and the switch of `hydrate`, the behavior bearing step), US-0131 (documentation, structural check, measurement, close). **Obliged by:** DR-006 (invariance; each step leaves the suite green). **Alternatives considered:** one story (rejected: three modules, ten tests, a doc); `hydrate` switch first with the advance later (rejected: every write would make the next call a full export and a measurement taken then would mislead). **Source:** design.
+- **DEC-010:** every story `min_tier` 2: each needs interior mutability and async discipline in `odb.rs` (no lock held across an await), two blob backend wrappers, and a mutation proof. **Obliged by:** n/a (no code impact): routing choice. **Source:** design.
+- **DEC-011:** US-0129 depends on the last story of SPEC-0064 (US-0128) although the two specs share no requirement: both edit the test module of `tools/git.rs` (US-0130 here, US-0127 and US-0128 there) and the implementation chain is linear, so the order is fixed once here. **Obliged by:** DR-006 (one writer per file at a time). **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0129 | remember the object count a libgit2 repository was synchronised with | P1 | DR-001, DR-002, DR-003 | US-0128 | 2 | no |
+| US-0130 | hydrate libgit2 only when the object index changed | P1 | DR-004, DR-006 | US-0129 | 2 | no |
+| US-0131 | document the hydration marker and close the spec | P2 | DR-005, DR-006 | US-0130 | 2 | yes |
+
