@@ -106,8 +106,9 @@ a marker, so the first call is a full check. Declared limits:
 * Several replicas are supported: a replica that did not store an object sees a different
   count and exports. Re-writing a sha that already has a row changes no count and is not
   detected.
-* The upload-pack path (`git/http/mod.rs`) still calls `export_to_repo` on every request
-  (BL-0113).
+* The upload-pack path (`git/http/mod.rs`) hydrates through the same marker since SPEC-0066
+  (2026-10-30). Its remaining cost is the pack build, which ignores `have` lines and packs
+  everything reachable on every request (BL-0114).
 
 ## HTTP smart protocol
 

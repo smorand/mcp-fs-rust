@@ -133,4 +133,4 @@
 | US-0131 | SPEC-0065 | document the hydration marker and close the spec | US-0130 | 2 | landed | story/US-0131-document-the-hydration-marker-and-close-the-spec | main |
 | US-0132 | SPEC-0066 | prove the store's entry takes the fast path | main | 2 | landed | story/US-0132-prove-the-store-entry-takes-the-fast-path | main |
 | US-0133 | SPEC-0066 | hydrate the upload-pack path through the marker | US-0132 | 2 | landed | story/US-0133-hydrate-the-upload-pack-path-through-the-marker | main |
-| US-0134 | SPEC-0066 | document the upload-pack hydration and close the spec | US-0133 | 2 | todo | | |
+| US-0134 | SPEC-0066 | document the upload-pack hydration and close the spec | US-0133 | 2 | landed | story/US-0134-document-the-upload-pack-hydration-and-close-the-spec | main |

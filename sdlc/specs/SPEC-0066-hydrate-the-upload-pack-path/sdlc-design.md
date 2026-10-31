@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: DEBT / depth S: 1 production line in 1 module (`crates/core/src/git/http/mod.rs`), 3 tests (2 in `http/mod.rs`, 1 in `git/repo.rs`), no public contract, no persisted change.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-10-30
 > Behavior change: none
 > From backlog: BL-0113
