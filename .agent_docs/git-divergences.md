@@ -1,7 +1,7 @@
 # Git divergences from standard git
 
 Created 2026-10-24 (BL-0027). Last updated 2026-10-24: D15 closed by SPEC-0052. Register of the ways `git.*` differs from ordinary git, so the set
-can be judged as a whole. Not to be confused with `parity.md`, which lists divergences from the C#
+can be judged as a whole. Not to be confused with `lineage.md`, which covers the C#
 lineage. Citations are `file:LINE` at the date above; line numbers drift, the symbol is the anchor.
 Paths are under `crates/core/src/` unless stated.
 

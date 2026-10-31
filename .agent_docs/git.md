@@ -774,7 +774,7 @@ documented at its call site. Headlines only:
 * `admin.delete_project` purges the git state instead of leaking it.
 
 The authoritative list, with the reasoning and the non git divergences, is in
-[`.agent_docs/parity.md`](parity.md). Do not restate it elsewhere.
+[`.agent_docs/lineage.md`](lineage.md). Do not restate it elsewhere.
 
 Divergences from standard git (no index, dirty tree refusal, HTTPS only, no tags) are a different
 set: see [`git-divergences.md`](git-divergences.md).
