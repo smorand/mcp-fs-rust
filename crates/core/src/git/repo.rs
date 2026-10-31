@@ -238,6 +238,33 @@ mod tests {
         Arc::new(c)
     }
 
+    /// Without `bind_repo` in `create_entry`, `hydrate_if_stale` degrades to a full export on
+    /// every call and nothing else notices: wiping libgit2's loose objects after a sync is
+    /// the only way to tell the fast path from the slow one.
+    #[tokio::test]
+    async fn the_stores_entry_takes_the_hydration_fast_path() {
+        let d = tempfile::tempdir().unwrap();
+        let store = GitRepoStore::new(config(d.path()), crate::storage::test_registry());
+        let e = store.init_repo("proj").await.unwrap();
+        let (commit, _tree, _blob) =
+            crate::git::odb::seed_commit(&e.objects, "a.txt", b"fast path", "c1").await.unwrap();
+        let oid = git2::Oid::from_str(&commit).unwrap();
+        let repo = e.repo.lock().await;
+        assert_eq!(e.objects.hydrate_if_stale(&repo).await.unwrap(), 3, "first sync exports all");
+
+        for entry in std::fs::read_dir(repo.path().join("objects")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n.len() == 2) {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+        assert_eq!(e.objects.hydrate_if_stale(&repo).await.unwrap(), 0, "marker holds");
+        assert!(!repo.odb().unwrap().exists(oid), "nothing was re exported");
+
+        assert_eq!(e.objects.export_to_repo(&repo).await.unwrap(), 3);
+        assert!(repo.odb().unwrap().exists(oid), "a full export restores it");
+    }
+
     #[tokio::test]
     async fn init_creates_the_expected_layout() {
         let d = tempfile::tempdir().unwrap();
