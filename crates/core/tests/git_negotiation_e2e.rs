@@ -1953,3 +1953,146 @@ async fn spec_0069_e2e_008_a_clone_larger_than_one_packet_without_the_side_band(
     );
     assert_eq!(env.refs(), refs0);
 }
+
+// ── the cap on held ids per request (SPEC-0070) ──────────────────────────────
+
+/// `n` well formed ids the project never held, distinct from each other.
+fn unknown_ids(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{:040x}", 0x10_0000 + i)).collect()
+}
+
+/// Our answer, produced within a second in at least one of three attempts: a loaded machine
+/// costs an attempt, a path that grows with the request does not pass any of them.
+async fn answer_within_a_second(env: &Env, request: &[u8]) -> Answer {
+    let mut last = std::time::Duration::ZERO;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let answer = our_answer(env, request).await;
+        last = started.elapsed();
+        if last < std::time::Duration::from_secs(1) {
+            return answer;
+        }
+    }
+    panic!("three attempts, the last took {last:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_001_exactly_the_limit_with_the_held_commit_last() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let mut held = unknown_ids(4_999);
+    held.push(c4.clone());
+    assert_eq!(held.len(), 5_000);
+    let haves: Vec<&str> = held.iter().map(String::as_str).collect();
+    let req = request(&[&env.shas[5]], &haves, true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.lines, vec![format!("ACK {c4} common"), format!("ACK {c4}")]);
+    assert_eq!(ours.objects.len(), 6, "the objects of c5 and c6");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_002_one_over_the_limit_with_the_held_commit_last() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let mut held = unknown_ids(5_000);
+    held.push(c4.clone());
+    assert_eq!(held.len(), 5_001);
+    let haves: Vec<&str> = held.iter().map(String::as_str).collect();
+    let ours = our_answer(&env, &request(&[&env.shas[5]], &haves, true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "c4 is the 5 001st: not read");
+    assert_eq!(ours.objects.len(), 18, "everything reachable from c6");
+    assert!(ours.lines.iter().all(|l| !l.contains(c4.as_str())));
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_003_twenty_thousand_unknown_held_ids() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let held = unknown_ids(20_000);
+    let haves: Vec<&str> = held.iter().map(String::as_str).collect();
+    let ours = answer_within_a_second(&env, &request(&[&env.shas[5]], &haves, true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert_eq!(ours.objects.len(), 18, "everything reachable from c6");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_004_the_held_commit_repeated_6000_times() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let haves = vec![c4.as_str(); 6_000];
+    let ours = our_answer(&env, &request(&[&env.shas[5]], &haves, true)).await;
+    let mut expected = vec![format!("ACK {c4} common"); 5_000];
+    expected.push(format!("ACK {c4}"));
+    assert_eq!(ours.lines, expected, "exactly 5 000 common lines, then the closing line");
+    assert_eq!(ours.objects.len(), 6, "the objects of c5 and c6");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_005_a_real_fetch_is_unaffected() {
+    let env = Env::with_history(6, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    for i in 1..=40 {
+        commit_file(&copy, &format!("local{i}.txt"), "local\n", &format!("local {i}"));
+    }
+    let c7 = commit_file(env.work.path(), "g7.txt", "seven\n", "c7");
+    env.push();
+    let refs0 = env.refs();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c7);
+    assert_eq!(count_commits(&copy, "HEAD"), 46, "the 6 commits and the 40 local commits are kept");
+    assert_intact(&copy);
+    let held = git_ok(&copy, None, &["rev-list", "HEAD"]);
+    let haves: Vec<&str> = held.lines().collect();
+    let ours = our_answer(&env, &request(&[&c7], &haves, true)).await;
+    assert_eq!(ours.objects.len(), 3, "the commit, its folder listing, the file of c7");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_006_a_small_request_is_read_in_full() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let unknown = unknown_ids(1);
+    let req = request(&[&env.shas[5]], &[&env.shas[2], &env.shas[3], &unknown[0]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_007_the_held_commit_repeated_20000_times_round_not_ended() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let haves = vec![c4.as_str(); 20_000];
+    let ours = answer_within_a_second(&env, &request(&[&env.shas[5]], &haves, false)).await;
+    let mut expected = vec![format!("ACK {c4} common"); 5_000];
+    expected.push(format!("ACK {c4} ready"));
+    expected.push("NAK".to_string());
+    assert_eq!(ours.lines, expected);
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0070_e2e_008_twenty_thousand_ids_of_a_folder_listing() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let tree = git_ok(env.work.path(), None, &["rev-parse", &format!("{c4}^{{tree}}")]);
+    let haves = vec![tree.as_str(); 20_000];
+    let ours = answer_within_a_second(&env, &request(&[&env.shas[5]], &haves, true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert_eq!(ours.objects.len(), 18, "everything reachable from c6");
+    assert_eq!(env.refs(), refs0);
+}

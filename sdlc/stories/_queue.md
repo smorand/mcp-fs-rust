@@ -145,4 +145,4 @@
 | US-0143 | SPEC-0068 | pin the ready line that names an unknown id | main | 2 | landed | story/US-0143-pin-the-ready-line-that-names-an-unknown-id | main |
 | US-0144 | SPEC-0069 | announce only the options the service honours | US-0143 | 2 | landed | story/US-0144-announce-only-the-honoured-options | main |
 | US-0145 | SPEC-0069 | send the objects unframed without the side band | US-0144 | 2 | landed | story/US-0145-send-objects-unframed-without-side-band | main |
-| US-0146 | SPEC-0070 | cap the held ids read from one request | US-0145 | 2 | todo | | |
+| US-0146 | SPEC-0070 | cap the held ids read from one request | US-0145 | 2 | landed | story/US-0146-cap-the-held-ids-read-from-one-request | main |

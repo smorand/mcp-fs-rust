@@ -13,12 +13,18 @@ use crate::errors::{Result, ToolError};
 use git2::{ObjectType, Oid, Repository};
 use std::collections::HashSet;
 
+/// The most held ids read from one request (SPEC-0070). Each costs an object lookup, so the
+/// bound keeps a huge request from costing work in proportion to its size. A real client states
+/// a few hundred at most; the ids beyond the limit are treated as not stated.
+const MAX_HAVE_LINES: usize = 5_000;
+
 /// A parsed `git-upload-pack` request.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Request {
     /// Wanted ids as written, in order; the options after the first id are not kept.
     pub wants: Vec<String>,
-    /// Held ids as written, in order, wherever they appear in the request.
+    /// Held ids as written, in order, wherever they appear in the request; at most
+    /// `MAX_HAVE_LINES` of them.
     pub haves: Vec<String>,
     /// The end marker was present: the client now expects the objects.
     pub done: bool,
@@ -51,7 +57,9 @@ pub fn parse(body: &[u8]) -> Request {
                 req.side_band = words.any(|o| o == "side-band-64k");
             }
         } else if let Some(rest) = line.strip_prefix("have ") {
-            req.haves.push(rest.trim().to_string());
+            if req.haves.len() < MAX_HAVE_LINES {
+                req.haves.push(rest.trim().to_string());
+            }
         } else if line == "done" {
             req.done = true;
         } else if line.starts_with("shallow ")
@@ -446,8 +454,22 @@ mod tests {
         format!("{:04x}{line}", line.len() + 4).into_bytes()
     }
 
-    /// Wanting an annotated tag while holding a commit must not hide the tagged commit: the
-    /// edge computation works on the peeled commit, not on the tag id.
+    /// The limit keeps the first held ids in order and drops the rest.
+    #[test]
+    fn only_the_first_held_ids_are_kept() {
+        let id = "1".repeat(40);
+        let mut body = pkt(&format!("want {id}\n"));
+        for i in 0..MAX_HAVE_LINES + 3 {
+            body.extend(pkt(&format!("have {i:040x}\n")));
+        }
+        body.extend(pkt("done\n"));
+        let req = parse(&body);
+        assert_eq!(req.haves.len(), MAX_HAVE_LINES);
+        assert_eq!(req.haves[0], format!("{:040x}", 0));
+        assert_eq!(req.haves[MAX_HAVE_LINES - 1], format!("{:040x}", MAX_HAVE_LINES - 1));
+        assert!(req.done, "lines after the limit are still read for the end marker");
+    }
+
     /// The side band choice comes from the options of the first wanted line only.
     #[test]
     fn the_side_band_is_asked_for_on_the_first_wanted_line() {
@@ -461,6 +483,8 @@ mod tests {
         assert!(!parse(&second).side_band, "only the first wanted line carries options");
     }
 
+    /// Wanting an annotated tag while holding a commit must not hide the tagged commit: the
+    /// edge computation works on the peeled commit, not on the tag id.
     #[test]
     fn a_wanted_tag_leads_to_its_commit_beyond_the_held_one() {
         let (_d, repo, held, tagged, tag) = repo_with_tag();
