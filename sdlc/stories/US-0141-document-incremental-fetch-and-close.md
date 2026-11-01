@@ -6,7 +6,7 @@
 > Depends on: US-0140
 > min_tier: 2
 > Files touched: 3
-> Closes spec: yes
+> Closes spec: no
 
 ## Objective
 Document the negotiation in the project docs and close the spec: the full acceptance set and the requirement coverage audit.
@@ -52,5 +52,5 @@ No new test. The full acceptance set of SPEC-0067 (E2E-001 to E2E-053) must be g
 - [ ] Non regression: the existing tests of `crates/core/src/git/http/mod.rs` (`parses_wants_and_haves`, `parses_an_empty_upload_pack_request`, `upload_pack_without_wants_answers_a_bare_flush`, the `handle_upload_pack` round trips) and the three real clones of `crates/core/tests/full_stack_e2e.rs` keep passing unchanged.
 - [ ] Docs updated: `.agent_docs/git.md`, `.agent_docs/git-divergences.md`, `AGENTS.md` (the paragraph "There is no have/want negotiation" is replaced by the negotiation description).
 - [ ] Self review: full (complexity of the critical path stated: the answer is O(included commits + objects); no nested loop over wants and haves beyond O(W x H) reachability checks, bounded by the number of wanted ids).
-- [ ] Closes spec: the spec's full acceptance set green (E2E-001 to E2E-053) and every requirement of SPEC-0067 cited by at least one story with status done or landed.
+- [ ] (moved to US-0142 by the converge audit) Closes spec: the spec's full acceptance set green (E2E-001 to E2E-053) and every requirement of SPEC-0067 cited by at least one story with status done or landed.
 - [ ] One commit `US-0141: document incremental fetch and close the spec`, body `Spec: SPEC-0067` and the requirement ids.

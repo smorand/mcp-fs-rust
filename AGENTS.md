@@ -160,7 +160,8 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   volume apply, one quota charge, and the response TYPES every combine operation
   serializes through, so a wire shape disagreement fails to compile),
   `odb.rs` (objects in the blob store under `git:{sha}`),
-  `repo.rs` (per project repository + write lock), `http/` (pkt-line, upload-pack,
+  `repo.rs` (per project repository + write lock), `http/` (pkt-line, `negotiate.rs`: the
+  fetch negotiation that answers like git's own upload-pack, SPEC-0067; upload-pack,
   receive-pack), `oauth/` (store, AES-GCM cipher, encrypted persistence, device flow),
   `provider/` (the pull request seam: host to provider and API base resolution, the
   injectable `ProviderClient`, the transport safety rules, and `model.rs`, the ONE

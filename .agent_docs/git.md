@@ -107,8 +107,8 @@ a marker, so the first call is a full check. Declared limits:
   count and exports. Re-writing a sha that already has a row changes no count and is not
   detected.
 * The upload-pack path (`git/http/mod.rs`) hydrates through the same marker since SPEC-0066
-  (2026-10-30). Its remaining cost is the pack build, which ignores `have` lines and packs
-  everything reachable on every request (BL-0114).
+  (2026-10-30). Since SPEC-0067 (2026-10-31) the pack build also negotiates, so an up to date
+  fetch no longer packs the project (see "Negotiation" below).
 
 ## HTTP smart protocol
 
@@ -144,14 +144,47 @@ Capabilities are advertised verbatim:
 upload-pack, `report-status delete-refs side-band-64k quiet atomic ofs-delta
 agent=mcp-fs/0.1.0` for receive-pack.
 
-There is no have/want negotiation: `have` lines are parsed and ignored, a NAK is
-sent, and the pack carries everything reachable from the wanted tips. It is built
-from a revwalk over those tips fed to `insert_walk`, not `insert_recursive`, which
-would omit ancestry and break any repository with more than one commit. Pack data
-goes out on side-band channel 1 in 65519 byte chunks, then a bare channel byte and
-a flush. On push, the report is wrapped in band 1 when the client negotiated
-`side-band-64k` and sent raw otherwise; without that wrapping git aborts with
-"bad band" after the refs have already been updated.
+### Negotiation (SPEC-0067, 2026-10-31)
+
+`git/http/negotiate.rs` answers a fetch the way git's own `upload-pack` does in stateless
+mode with `multi_ack_detailed`. One request carries the whole exchange (the wants, every
+held commit stated so far, then `done` or a flush), so nothing is kept between requests.
+
+* One `ACK <id> common` per held id that is a commit the project holds, repeats included.
+  Without `done`: `ACK <last> ready` when git would send it (a held commit, no well formed
+  unknown id before the wants are satisfied, every wanted commit reaches a held commit; an
+  unknown id met after that point is answered `ACK <unknown id> ready` on the spot), then
+  `NAK`, and no object. With `done`: the closing `ACK <last>` or `NAK`, then the objects.
+* The objects are what the wanted commits need minus the contents of the held commits. Only
+  git's edge commits are hidden from the walk (the parents of the commits sent that the
+  client holds, and wanted commits it holds): libgit2 treats the contents of the commits
+  hidden as known, so hiding every held commit would exclude more than git does.
+* An annotated tag is sent as an object of its own, then its commit as any wanted commit.
+* A wanted id is served only when a branch or tag reaches it (a ref value, a commit in a
+  ref's history, or a folder listing or file version inside such a commit). Malformed,
+  unknown or unreachable ids are dropped; when none is left the answer is `NAK` and an
+  empty pack, whatever the client holds.
+* Pack data goes out on side-band channel 1 in 65515 byte chunks (the largest pkt-line is
+  65520 bytes, 4 for the length and 1 for the channel; the chunk was 65519 until SPEC-0067,
+  which made every clone or fetch of a project over 64 KiB fail with "bad line length"),
+  then a bare channel byte and a flush. The pack is built from a revwalk over the wanted
+  commits fed to `insert_walk`, not `insert_recursive`, which would omit ancestry. On push,
+  the report is wrapped in band 1 when the client negotiated `side-band-64k` and sent raw
+  otherwise; without that wrapping git aborts with "bad band" after the refs have already
+  been updated.
+
+Declared differences from git's own server (the reference of the tests): a request with no
+`have` line is answered with everything even without `done`; a held id that is not 40 hex
+characters or names an object that is not a commit is treated as not stated (git
+acknowledges any held object); a wanted id that cannot be served is dropped silently (git
+refuses the request); `shallow`, `deepen` and `filter` lines are not honoured (the answer is
+`NAK` and everything); options other than `multi_ack`, `multi_ack_detailed`, `side-band-64k`,
+`ofs-delta` and `agent` are ignored; an empty request, a request without a wanted line, one
+cut in the middle of a line or lacking a flush is read up to the cut and answered without
+error. Lines after the closing flush or the end marker are not read. No limit applies to
+the number of `have` lines (BL-0117). Known gaps: the options the client chose are not honoured, the
+answer is always the `multi_ack_detailed` form on side-band (BL-0119); an unknown held id can appear in
+an `ACK <id> ready` line as it does with git's own server, which the spec words differently (BL-0118).
 
 ## `git.*` tool behaviour
 

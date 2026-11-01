@@ -1,6 +1,6 @@
 # Git divergences from standard git
 
-Created 2026-10-24 (BL-0027). Last updated 2026-10-24: D15 closed by SPEC-0052. Register of the ways `git.*` differs from ordinary git, so the set
+Created 2026-10-24 (BL-0027). Last updated 2026-10-31: D18 added by SPEC-0067; D15 closed by SPEC-0052. Register of the ways `git.*` differs from ordinary git, so the set
 can be judged as a whole. Not to be confused with `lineage.md`, which covers the C#
 lineage. Citations are `file:LINE` at the date above; line numbers drift, the symbol is the anchor.
 Paths are under `crates/core/src/` unless stated.
@@ -41,6 +41,12 @@ Paths are under `crates/core/src/` unless stated.
 | D15 | Tags are created, deleted, pushed and fetched | **Closed by SPEC-0052 (2026-10-24)** except: remote tag deletion was delivered by SPEC-0053 (`git.remote_delete_tag`, BL-0075, 2026-10-25) and publishing every tag was delivered by SPEC-0054 (`git.remote_push_tags`, BL-0076, 2026-10-27). Fetch and pull receive only the tags in the fetched branch history, clone those of the cloned branch; a differing local tag is kept, never replaced | Auto tag following stays off (`AutotagOption::None`); candidates come from the advertised refs, so fetch still touches no ref outside the asked branch and its history tags | None left for tags | `tools/git_tags.rs`, `git/remote.rs` `history_tags` |
 | D16 | Fetch with any refspec | Fetch works on one branch, tag following off, pruning forced off | Bounded, predictable ref updates | Cannot mirror a remote | `git/remote.rs:686` |
 | D17 | `stash` can include untracked files | Stash saves "uncommitted changes" of the volume and refuses when there are none | Follows D1 | No untracked versus tracked distinction | `tools/git.rs:605` |
+
+## The smart HTTP server
+
+| # | Standard git | This server | Why | Cost to a user | Anchor |
+|---|---|---|---|---|---|
+| D18 | `git upload-pack` stops on a request it cannot parse, refuses an unreachable wanted id, honours `shallow`, `deepen` and `filter`, acknowledges any held object and sends nothing for wants without `done` | Tolerant: an unusable held id (not 40 hex, or not a commit) counts as not stated, an unservable wanted id is dropped silently (`NAK` and an empty pack when none is left), `shallow`, `deepen` and `filter` lines are not honoured (`NAK` and everything), a request without a wanted line, cut in the middle of a line or lacking a flush is read up to the cut, wants without a held id get everything even without `done` | The service already answered these requests quietly before the negotiation existed (SPEC-0067 FR-NEW-003, 004, 007 to 010, 012 to 014); the tests compare every other case with git's own server | No shallow or partial clone; a bad request is never reported as an error | `git/http/negotiate.rs`, `.agent_docs/git.md` "Negotiation" |
 
 ## Closed since BL-0027 was written (SPEC-0012)
 

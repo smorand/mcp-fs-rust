@@ -282,6 +282,27 @@ exercised indirectly, after a `delete()`, in `integration_put_get_range_delete`,
 `#[ignore]` meant nobody had run it in a while); this is the gap a black-box, all-real-
 dependencies test closes that a mocked or SQLite-backed one cannot.
 
+## The git negotiation against git's own server (SPEC-0067, 2026-10-31)
+
+`crates/core/tests/git_negotiation_e2e.rs` sends requests over HTTP to an in process server
+and runs the same bytes through `git upload-pack --stateless-rpc` on a bare copy of the same
+project data (`git clone --bare` from the server), then compares the acknowledgement lines
+in order and the set of objects. It also runs real `git` clients for the user journeys.
+It needs the `git` program on PATH (a missing `git` fails the test) and loopback; no database
+or object store service.
+
+* One state directory and two servers (anonymous reading off and on) live for the whole test
+  binary, on a runtime of their own. `GitRepoStore::shared` is process wide and fixed by the
+  first server built, so two servers with separate directories cannot coexist in one process
+  (the symptom is a push answered 500 "failed to load object database" when the first test
+  ends and its temp directory goes away). Projects are named per test.
+* The 20 000 object timing tests (E2E-023, 024, 028, 038, 039, 040) are integration tests in
+  `git/http/mod.rs`: pushing that many objects over the wire costs minutes in a debug build.
+  They run one at a time and get three attempts at the one second bound.
+* A fetch during a push needs a push of several hundred KB to overlap (see `heavy_text`).
+* Gotcha found on the way: a pack over 64 KiB used to break every clone (side-band chunk too
+  large by 4 bytes, see `.agent_docs/git.md`).
+
 ## Functional scenarios
 
 `tests/functional/run_all.sh [--user NAME] [FILTER]` sources every
