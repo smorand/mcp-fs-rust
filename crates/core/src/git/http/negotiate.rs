@@ -54,25 +54,34 @@ pub fn parse(body: &[u8]) -> Request {
 }
 
 /// The whole response body of a `git-upload-pack` request.
-pub fn answer(repo: &Repository, _ref_values: &[String], req: &Request) -> Result<Vec<u8>> {
+pub fn answer(repo: &Repository, ref_values: &[String], req: &Request) -> Result<Vec<u8>> {
     if req.wants.is_empty() {
         return Ok(pktline::flush());
     }
     let mut out = Vec::new();
+    // Only what a branch or tag reaches is served. When nothing wanted can be served the
+    // answer is one NAK and no object, whatever the client holds (declared difference: git
+    // would refuse the request).
+    let wants = servable_wants(repo, ref_values, &req.wants)?;
+    if wants.is_empty() {
+        out.extend_from_slice(&pktline::encode("NAK\n"));
+        return finish(repo, &[], &[], out);
+    }
+    let (haves, done) = (&req.haves, req.done);
     // A request that states no held id is a clone, or a client that does not negotiate: one
     // NAK and everything reachable, as before the negotiation existed.
-    if req.haves.is_empty() {
+    if haves.is_empty() {
         out.extend_from_slice(&pktline::encode("NAK\n"));
-        return finish(repo, &req.wants, &[], out);
+        return finish(repo, &wants, &[], out);
     }
-    let (commons, got_unknown) = acknowledge(repo, &req.haves, &req.wants, &mut out)?;
-    if !req.done {
+    let (commons, got_unknown) = acknowledge(repo, haves, &wants, &mut out)?;
+    if !done {
         // A round that does not end the negotiation: acknowledgements only. Like git, say
         // the client has enough when it stated no id the project lacks and every wanted
         // commit leads to a commit it holds.
         if let Some(last) = commons.last()
             && !got_unknown
-            && every_want_reaches(repo, &req.wants, &commons)?
+            && every_want_reaches(repo, &wants, &commons)?
         {
             out.extend_from_slice(&pktline::encode(&format!("ACK {last} ready\n")));
         }
@@ -83,7 +92,7 @@ pub fn answer(repo: &Repository, _ref_values: &[String], req: &Request) -> Resul
         Some(last) => out.extend_from_slice(&pktline::encode(&format!("ACK {last}\n"))),
         None => out.extend_from_slice(&pktline::encode("NAK\n")),
     }
-    finish(repo, &req.wants, &commons, out)
+    finish(repo, &wants, &commons, out)
 }
 
 /// Append the objects the client lacks, framed on side-band channel 1, and the closing bytes.
@@ -104,6 +113,98 @@ fn finish(
     out.extend_from_slice(&pktline::encode("\u{1}"));
     out.extend_from_slice(&pktline::flush());
     Ok(out)
+}
+
+/// The wanted ids a branch or tag reaches, in order. An id that is not 40 hexadecimal
+/// characters, that the project does not hold, or that no branch or tag reaches is dropped.
+fn servable_wants(
+    repo: &Repository,
+    ref_values: &[String],
+    wants: &[String],
+) -> Result<Vec<String>> {
+    // The commits the refs lead to (a tag is followed to its commit), built on first need: a
+    // fetch of a branch tip is answered from `ref_values` alone.
+    let mut tips: Option<Vec<Oid>> = None;
+    let mut out = Vec::new();
+    for want in wants {
+        if want.len() != 40 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(oid) = Oid::from_str(want) else { continue };
+        let object = match repo.find_object(oid, None) {
+            Ok(o) => o,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => continue,
+            Err(e) => return Err(ToolError::internal(format!("object lookup failed: {e}"))),
+        };
+        let reachable = if ref_values.iter().any(|v| v.eq_ignore_ascii_case(want)) {
+            true
+        } else {
+            let tips = tips.get_or_insert_with(|| {
+                ref_values
+                    .iter()
+                    .filter_map(|v| Oid::from_str(v).ok())
+                    .filter_map(|o| peel_commit(repo, o))
+                    .collect()
+            });
+            match object.kind() {
+                Some(ObjectType::Commit) => commit_reachable(repo, tips, oid)?,
+                Some(ObjectType::Tree | ObjectType::Blob) => content_reachable(repo, tips, oid)?,
+                // An inner tag of a chain is not served unless a ref names it.
+                _ => false,
+            }
+        };
+        if reachable {
+            out.push(want.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `oid` is a ref tip or in the history of one.
+fn commit_reachable(repo: &Repository, tips: &[Oid], oid: Oid) -> Result<bool> {
+    for tip in tips {
+        if *tip == oid
+            || repo
+                .graph_descendant_of(*tip, oid)
+                .map_err(|e| ToolError::internal(format!("ancestry check failed: {e}")))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a folder listing or a file version belongs to a commit some ref reaches. Rare (a
+/// client wants such an object directly), so a walk over the history of every tip is fine; a
+/// folder listing already seen is not entered twice.
+fn content_reachable(repo: &Repository, tips: &[Oid], target: Oid) -> Result<bool> {
+    let err = |e: git2::Error| ToolError::internal(format!("reachability walk failed: {e}"));
+    let mut walk = repo.revwalk().map_err(err)?;
+    for tip in tips {
+        walk.push(*tip).map_err(err)?;
+    }
+    let mut seen = HashSet::new();
+    for commit in walk {
+        let tree = repo.find_commit(commit.map_err(err)?).and_then(|c| c.tree()).map_err(err)?;
+        let mut stack = vec![tree.id()];
+        while let Some(id) = stack.pop() {
+            if id == target {
+                return Ok(true);
+            }
+            if !seen.insert(id) {
+                continue;
+            }
+            let tree = repo.find_tree(id).map_err(err)?;
+            for entry in tree.iter() {
+                match entry.kind() {
+                    Some(ObjectType::Tree) => stack.push(entry.id()),
+                    _ if entry.id() == target => return Ok(true),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// One `ACK <id> common` line per held id that is a commit the project holds, repeats
@@ -184,6 +285,16 @@ fn every_want_reaches(repo: &Repository, wants: &[String], commons: &[Oid]) -> R
     Ok(true)
 }
 
+/// Add the tag objects between a wanted id and its commit (a tag may point at a tag).
+fn insert_tag_chain(repo: &Repository, pb: &mut git2::PackBuilder<'_>, mut oid: Oid) -> Result<()> {
+    while let Ok(tag) = repo.find_tag(oid) {
+        pb.insert_object(oid, None)
+            .map_err(|e| ToolError::internal(format!("pack insert failed: {e}")))?;
+        oid = tag.target_id();
+    }
+    Ok(())
+}
+
 /// The commit a wanted id leads to: itself for a commit, the tagged commit for an annotated
 /// tag. `None` for a tree or a file version.
 fn peel_commit(repo: &Repository, oid: Oid) -> Option<Oid> {
@@ -247,7 +358,9 @@ fn build_pack(repo: &Repository, wants: &[String], commons: &[Oid]) -> Result<Ve
             // Unknown or unreachable wants are skipped, like the reference does.
             let Ok(oid) = Oid::from_str(want) else { continue };
             if let Some(commit) = peel_commit(repo, oid) {
-                // An annotated tag leads to its commit; the tag object itself is a later story.
+                // An annotated tag is sent as an object of its own, then its commit is
+                // handled like a wanted commit (a held one sends nothing more).
+                insert_tag_chain(repo, &mut pb, oid)?;
                 walk.push(commit)
                     .map_err(|e| ToolError::internal(format!("revwalk push failed: {e}")))?;
                 commit_wants.push(commit);

@@ -403,9 +403,11 @@ pub async fn handle_upload_pack(entry: &GitRepoEntry, body: &[u8]) -> Result<Vec
         return Ok(pktline::flush());
     }
     // libgit2 packs from its own ODB, so the blob store has to be materialized first.
+    let ref_values: Vec<String> =
+        concrete_refs(entry, false).await?.into_iter().map(|(_, sha)| sha).collect();
     let repo = entry.repo.lock().await;
     entry.objects.hydrate_if_stale(&repo).await?;
-    negotiate::answer(&repo, &[], &req)
+    negotiate::answer(&repo, &ref_values, &req)
 }
 
 /// The canonical empty packfile: `PACK`, version 2, zero objects, sha1 trailer.

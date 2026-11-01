@@ -982,3 +982,130 @@ async fn ready_is_withheld_like_git_does() {
     let req = request(&[&env.shas[5]], &[&env.shas[3], &unknown], true);
     assert_same_answer(&our_answer(&env, &req).await, &reference_answer(bare.path(), &req));
 }
+
+// ── wanted ids that cannot be served, and annotated tags (US-0138) ───────────
+
+/// A commit no branch or tag reaches: pushed under a branch name, then the branch is deleted.
+/// The project keeps the object, which is what the service must not serve.
+fn orphan_commit(env: &Env) -> String {
+    let w = env.work.path();
+    let t = env.admin();
+    git_ok(w, None, &["checkout", "-q", "-b", "scratch"]);
+    let o1 = commit_file(w, "orphan.txt", "orphan\n", "o1");
+    git_ok(
+        w,
+        Some(&t),
+        &["push", "-q", &env.server.url(&env.project), "scratch:refs/heads/scratch"],
+    );
+    git_ok(w, Some(&t), &["push", "-q", &env.server.url(&env.project), ":refs/heads/scratch"]);
+    git_ok(w, None, &["checkout", "-q", "main"]);
+    o1
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_008_annotated_tag_on_a_held_commit() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let w = env.work.path();
+    git_ok(w, None, &["tag", "-a", "-m", "first release", "v1", &env.shas[3]]);
+    git_ok(w, Some(&env.admin()), &["push", "-q", &env.server.url(&env.project), "v1"]);
+    fetch(&copy, Some(&env.admin()));
+    let tag = git_ok(&copy, None, &["rev-parse", "v1"]);
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "v1^{commit}"]), env.shas[3]);
+    assert!(git_ok(&copy, None, &["cat-file", "-p", "v1"]).ends_with("first release"));
+    assert_intact(&copy);
+
+    let bare = env.bare_copy();
+    let req = request(&[&tag], &[&env.shas[3]], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects, BTreeSet::from([tag]), "the tag only");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_009_annotated_tag_on_a_new_commit() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let w = env.work.path();
+    let c5 = commit_file(w, "d.txt", "d\n", "c5");
+    git_ok(w, None, &["tag", "-a", "-m", "second release", "v2", &c5]);
+    env.push();
+    git_ok(w, Some(&env.admin()), &["push", "-q", &env.server.url(&env.project), "v2"]);
+    fetch(&copy, Some(&env.admin()));
+    let tag = git_ok(&copy, None, &["rev-parse", "v2"]);
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "v2^{commit}"]), c5);
+    assert_intact(&copy);
+
+    let bare = env.bare_copy();
+    let req = request(&[&tag, &c5], &[&env.shas[3]], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects.len(), 4, "the tag, c5, its folder listing, d.txt");
+    assert!(ours.objects.contains(&tag) && ours.objects.contains(&c5));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_030_wanted_commit_that_no_branch_reaches() {
+    let env = Env::with_history(4, false).await;
+    let o1 = orphan_commit(&env);
+    let refs0 = env.refs();
+    assert!(!refs0.contains(&o1), "no ref reaches the orphan");
+    let ours = our_answer(&env, &request(&[&o1], &[], true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert!(ours.objects.is_empty(), "nothing is sent for it");
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_047_unreachable_wanted_commit_with_a_held_id_and_no_end() {
+    let env = Env::with_history(4, false).await;
+    let o1 = orphan_commit(&env);
+    let refs0 = env.refs();
+    let ours = our_answer(&env, &request(&[&o1], &[&env.shas[2]], false)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "no ACK line for the held id");
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_048_malformed_wanted_id_with_a_held_id() {
+    let env = Env::with_history(4, false).await;
+    let refs0 = env.refs();
+    let ours = our_answer(&env, &request(&["xyz"], &[&env.shas[2]], true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "no ACK line for the held id");
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_049_one_servable_and_one_unservable_wanted_id() {
+    let env = Env::with_history(6, false).await;
+    let o1 = orphan_commit(&env);
+    let bare = env.bare_copy();
+    let ours = our_answer(&env, &request(&[&env.shas[5], &o1], &[&env.shas[3]], true)).await;
+    // git would refuse the orphan; the service answers on the servable want alone
+    let reference = reference_answer(bare.path(), &request(&[&env.shas[5]], &[&env.shas[3]], true));
+    assert_same_answer(&ours, &reference);
+    assert!(!ours.objects.contains(&o1), "nothing of the orphan is sent");
+}
+
+/// Beyond the story's tests: a file version or a folder listing is wanted directly (FR-NEW-008
+/// covers every kind of object): served when a branch reaches it, silent when none does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wanted_file_version_is_served_only_when_a_ref_reaches_it() {
+    let env = Env::with_history(4, false).await;
+    let reachable =
+        git_ok(env.work.path(), None, &["rev-parse", &format!("{}:f2.txt", env.shas[3])]);
+    let o1 = orphan_commit(&env);
+    let orphan_blob = git_ok(env.work.path(), None, &["rev-parse", &format!("{o1}:orphan.txt")]);
+    let bare = env.bare_copy();
+
+    let req = request(&[&reachable], &[], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects, BTreeSet::from([reachable]));
+
+    let ours = our_answer(&env, &request(&[&orphan_blob], &[], true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert!(ours.objects.is_empty(), "no branch reaches that file version");
+}
