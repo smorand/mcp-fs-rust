@@ -136,7 +136,7 @@
 | US-0134 | SPEC-0066 | document the upload-pack hydration and close the spec | US-0133 | 2 | landed | story/US-0134-document-the-upload-pack-hydration-and-close-the-spec | main |
 | US-0135 | SPEC-0067 | build the oracle harness and the baseline guards | main | 2 | landed | story/US-0135-oracle-harness-and-baseline-guards | main |
 | US-0136 | SPEC-0067 | answer the end of a negotiation like git does | US-0135 | 1 | landed | story/US-0136-negotiate-the-end-of-the-exchange | main |
-| US-0137 | SPEC-0067 | answer the rounds that do not end the negotiation | US-0136 | 2 | todo | | |
+| US-0137 | SPEC-0067 | answer the rounds that do not end the negotiation | US-0136 | 2 | landed | story/US-0137-answer-rounds-that-do-not-end | main |
 | US-0138 | SPEC-0067 | serve only wanted ids a branch or tag reaches | US-0137 | 2 | todo | | |
 | US-0139 | SPEC-0067 | tolerate odd requests and options the service does not offer | US-0138 | 2 | todo | | |
 | US-0140 | SPEC-0067 | prove speed and consistency of fetches | US-0139 | 2 | todo | | |

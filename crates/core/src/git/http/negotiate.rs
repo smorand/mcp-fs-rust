@@ -65,9 +65,17 @@ pub fn answer(repo: &Repository, _ref_values: &[String], req: &Request) -> Resul
         out.extend_from_slice(&pktline::encode("NAK\n"));
         return finish(repo, &req.wants, &[], out);
     }
-    let commons = acknowledge(repo, &req.haves, &mut out)?;
+    let (commons, got_unknown) = acknowledge(repo, &req.haves, &req.wants, &mut out)?;
     if !req.done {
-        // A round that does not end the negotiation: acknowledgements only.
+        // A round that does not end the negotiation: acknowledgements only. Like git, say
+        // the client has enough when it stated no id the project lacks and every wanted
+        // commit leads to a commit it holds.
+        if let Some(last) = commons.last()
+            && !got_unknown
+            && every_want_reaches(repo, &req.wants, &commons)?
+        {
+            out.extend_from_slice(&pktline::encode(&format!("ACK {last} ready\n")));
+        }
         out.extend_from_slice(&pktline::encode("NAK\n"));
         return Ok(out);
     }
@@ -101,9 +109,18 @@ fn finish(
 /// One `ACK <id> common` line per held id that is a commit the project holds, repeats
 /// included, as git does. An id that is not 40 hexadecimal characters, or names an object
 /// that is not a commit, is treated as not stated (declared differences of the spec); an
-/// unknown id is not acknowledged. Returns the commits acknowledged, in order.
-fn acknowledge(repo: &Repository, haves: &[String], out: &mut Vec<u8>) -> Result<Vec<Oid>> {
+/// unknown id is not acknowledged. Returns the commits acknowledged, in order, and whether a
+/// well formed id the project does not hold was stated (git then withholds `ready`).
+fn acknowledge(
+    repo: &Repository,
+    haves: &[String],
+    wants: &[String],
+    out: &mut Vec<u8>,
+) -> Result<(Vec<Oid>, bool)> {
     let mut commons = Vec::new();
+    let mut got_unknown = false;
+    // The verdict of `every_want_reaches` only changes when a commit joins `commons`.
+    let mut reaches: Option<(usize, bool)> = None;
     for have in haves {
         if have.len() != 40 || !have.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
@@ -117,11 +134,54 @@ fn acknowledge(repo: &Repository, haves: &[String], out: &mut Vec<u8>) -> Result
             Ok(_) => {}
             // Only "not found" means the project does not hold the id; a corrupt object or
             // an I/O error must not silently drop acknowledgements.
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {}
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                got_unknown = true;
+                // git cuts in as soon as it knows enough: an id it lacks, met after held
+                // commits that already satisfy every want, is answered with `ready`
+                // carrying that id.
+                if !commons.is_empty() {
+                    let enough = match reaches {
+                        Some((n, verdict)) if n == commons.len() => verdict,
+                        _ => {
+                            let verdict = every_want_reaches(repo, wants, &commons)?;
+                            reaches = Some((commons.len(), verdict));
+                            verdict
+                        }
+                    };
+                    if enough {
+                        out.extend_from_slice(&pktline::encode(&format!("ACK {oid} ready\n")));
+                    }
+                }
+            }
             Err(e) => return Err(ToolError::internal(format!("object lookup failed: {e}"))),
         }
     }
-    Ok(commons)
+    Ok((commons, got_unknown))
+}
+
+/// Whether every wanted commit is a held commit or has one in its history. A want that leads
+/// to no commit (a tree or a file version) is skipped, as git does.
+fn every_want_reaches(repo: &Repository, wants: &[String], commons: &[Oid]) -> Result<bool> {
+    for want in wants {
+        let Some(commit) = Oid::from_str(want).ok().and_then(|o| peel_commit(repo, o)) else {
+            continue;
+        };
+        let mut reaches = false;
+        for common in commons {
+            if commit == *common
+                || repo
+                    .graph_descendant_of(commit, *common)
+                    .map_err(|e| ToolError::internal(format!("ancestry check failed: {e}")))?
+            {
+                reaches = true;
+                break;
+            }
+        }
+        if !reaches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The commit a wanted id leads to: itself for a commit, the tagged commit for an annotated

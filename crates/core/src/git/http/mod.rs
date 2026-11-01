@@ -1555,7 +1555,15 @@ mod tests {
         let out = handle_upload_pack(&e, &req).await.unwrap();
         let elapsed = started.elapsed();
         let (lines, pack) = lines_and_pack(&out);
-        assert_eq!(lines, vec![format!("ACK {tip} common"), format!("ACK {tip}")]);
+        // git's own server answers `ready` with the second unknown id, met after the held tip
+        assert_eq!(
+            lines,
+            vec![
+                format!("ACK {tip} common"),
+                format!("ACK {:040x} ready", 0x2222_u32),
+                format!("ACK {tip}"),
+            ]
+        );
         assert_eq!(pack, empty_pack(), "nothing is sent");
         assert!(elapsed < std::time::Duration::from_secs(1), "took {elapsed:?}");
     }

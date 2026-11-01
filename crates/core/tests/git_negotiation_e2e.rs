@@ -883,3 +883,102 @@ async fn e2e_034_held_id_of_an_annotated_tag() {
     assert!(ours.lines.iter().all(|l| !l.contains(&tag)));
     assert_eq!(ours.objects, reference.objects, "every object reachable from c5");
 }
+
+// ── the rounds that do not end the negotiation (US-0137) ─────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_010_negotiation_stopped_before_the_end() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let req = request(&[&env.shas[5]], &[&env.shas[2], &env.shas[3]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.objects.is_empty(), "no object data before the end");
+    // c6 reaches the held commits, so git tells the client it has enough; the service does too
+    assert_eq!(
+        ours.lines,
+        vec![
+            format!("ACK {} common", env.shas[2]),
+            format!("ACK {} common", env.shas[3]),
+            format!("ACK {} ready", env.shas[3]),
+            "NAK".to_string(),
+        ]
+    );
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_041_unusable_held_ids_without_the_end_of_the_negotiation() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let unknown: Vec<String> = (0..12).map(|i| format!("{:040x}", 0x1000 + i)).collect();
+    let haves: Vec<&str> = unknown.iter().map(String::as_str).collect();
+    let req = request(&[&env.shas[5]], &haves, false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_042_held_id_of_a_file_version_without_the_end_of_the_negotiation() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let blob = git_ok(env.work.path(), None, &["rev-parse", &format!("{c4}:f1.txt")]);
+    let ours = our_answer(&env, &request(&[&env.shas[5]], &[&blob], false)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "the reference would acknowledge the id");
+    assert!(ours.lines.iter().all(|l| !l.contains(&blob)));
+    assert!(ours.objects.is_empty(), "no object data before the end");
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_043_malformed_held_id_without_the_end_of_the_negotiation() {
+    let env = Env::with_history(6, false).await;
+    let ours = our_answer(&env, &request(&[&env.shas[5]], &["not-an-id"], false)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert!(ours.objects.is_empty());
+    assert!(ours.lines.iter().all(|l| !l.contains("not-an-id")));
+}
+
+/// Beyond the story's tests: the two cases where git withholds `ready` (the rule of DEC-004).
+#[tokio::test(flavor = "multi_thread")]
+async fn ready_is_withheld_like_git_does() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let unknown = format!("{:040x}", 0x1234);
+    // an id the project never held, beside a held one
+    let req = request(&[&env.shas[5]], &[&unknown, &env.shas[3]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.lines.iter().all(|l| !l.ends_with("ready")));
+    // a want older than the held commit: it does not reach it
+    let req = request(&[&env.shas[3]], &[&env.shas[5]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.lines.iter().all(|l| !l.ends_with("ready")));
+    // the same held commit and a want that reaches it: ready
+    let req = request(&[&env.shas[5]], &[&env.shas[3]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.lines.iter().any(|l| l.ends_with("ready")));
+    // an unknown id met after a held commit that already satisfies the want: git answers
+    // `ready` with that id, right where it meets it
+    let req = request(&[&env.shas[5]], &[&env.shas[3], &unknown], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.lines[1], format!("ACK {unknown} ready"));
+    // a want that is a folder listing leads to no commit: it does not hold `ready` back
+    let tree = git_ok(env.work.path(), None, &["rev-parse", &format!("{}^{{tree}}", env.shas[5])]);
+    let req = request(&[&tree], &[&env.shas[3]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.lines.iter().any(|l| l.ends_with("ready")));
+    // and the same exchange with the end marker keeps the `ready` of the unknown id
+    let req = request(&[&env.shas[5]], &[&env.shas[3], &unknown], true);
+    assert_same_answer(&our_answer(&env, &req).await, &reference_answer(bare.path(), &req));
+}
