@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: one observable behavior (what the service offers and does when a client does not ask for the side band), one area (the git service), 3 requirements, no persisted change.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-01
 > Project: existing
 > From backlog: BL-0119

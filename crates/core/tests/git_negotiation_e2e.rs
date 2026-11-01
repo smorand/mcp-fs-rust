@@ -1843,3 +1843,113 @@ async fn spec_0069_e2e_007_several_options_the_service_does_not_offer() {
     assert_eq!(many.lines, vec![format!("ACK {c4} common"), format!("ACK {c4}")]);
     assert_eq!(env.refs(), refs0);
 }
+
+// ── objects without the side band (SPEC-0069) ────────────────────────────────
+
+/// The answer to a request that did not ask for the side band: acknowledgement lines as pkt-lines,
+/// then the objects as they are, with nothing around them.
+fn parse_answer_raw(body: &[u8]) -> Answer {
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i + 4 <= body.len() && &body[i..i + 4] != b"PACK" {
+        let len = usize::from_str_radix(std::str::from_utf8(&body[i..i + 4]).expect("hex"), 16)
+            .expect("pkt length");
+        assert!(len >= 4 && i + len <= body.len(), "bad pkt length {len} at {i}");
+        let line = String::from_utf8_lossy(&body[i + 4..i + len]).trim_end().to_string();
+        assert!(
+            line.starts_with("ACK ") || line == "NAK",
+            "unexpected line {line:?}: a channel byte?"
+        );
+        lines.push(line);
+        i += len;
+    }
+    Answer { lines, objects: pack_objects(&body[i..]) }
+}
+
+/// What git's own server writes for `request`, untouched.
+fn reference_bytes(bare: &Path, request: &[u8]) -> Vec<u8> {
+    let mut child = Command::new("git")
+        .args(["upload-pack", "--stateless-rpc", bare.join("ref.git").to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git upload-pack");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let body = request.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&body));
+    let out = child.wait_with_output().expect("reference output");
+    let _ = writer.join();
+    assert!(
+        out.status.success(),
+        "the reference program failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+async fn our_bytes(env: &Env, request: &[u8]) -> Vec<u8> {
+    let (status, body) = env.server.upload_pack(&env.project, Some(&env.admin()), request).await;
+    assert_eq!(status, 200);
+    body
+}
+
+const NO_SIDE_BAND: &str = "multi_ack_detailed ofs-delta";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_003_a_client_that_does_not_ask_for_the_side_band() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c4, c6) = (&env.shas[3], &env.shas[5]);
+    let req = request_caps(NO_SIDE_BAND, &[c6], &[c4], true);
+    let body = our_bytes(&env, &req).await;
+    let ours = parse_answer_raw(&body);
+    assert_same_answer(&ours, &parse_answer_raw(&reference_bytes(bare.path(), &req)));
+    assert_eq!(ours.lines, vec![format!("ACK {c4} common"), format!("ACK {c4}")]);
+    assert_eq!(ours.objects.len(), 6, "the objects of c5 and c6");
+    assert!(
+        !body.ends_with(b"0000") && !body.ends_with(b"0005\x01"),
+        "no closing byte or flush follows the objects"
+    );
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_005_an_up_to_date_client_without_the_side_band() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let c6 = &env.shas[5];
+    let req = request_caps(NO_SIDE_BAND, &[c6], &[c6], true);
+    let body = our_bytes(&env, &req).await;
+    let ours = parse_answer_raw(&body);
+    assert_same_answer(&ours, &parse_answer_raw(&reference_bytes(bare.path(), &req)));
+    assert_eq!(ours.lines, vec![format!("ACK {c6} common"), format!("ACK {c6}")]);
+    assert!(ours.objects.is_empty());
+    assert!(
+        !body.ends_with(b"0000") && !body.ends_with(b"0005\x01"),
+        "no closing byte or flush follows the empty set of objects"
+    );
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_008_a_clone_larger_than_one_packet_without_the_side_band() {
+    let env = Env::new(false).await;
+    let big = commit_file(env.work.path(), "big.txt", &heavy_text(9, 400), "big");
+    env.push();
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let req = request_caps(NO_SIDE_BAND, &[&big], &[], true);
+    let body = our_bytes(&env, &req).await;
+    let ours = parse_answer_raw(&body);
+    assert_same_answer(&ours, &parse_answer_raw(&reference_bytes(bare.path(), &req)));
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert_eq!(ours.objects.len(), 3, "the commit, its folder listing, the file");
+    assert!(
+        body.len() > 2 * 65_515,
+        "the answer is longer than two side band packets, and unbroken"
+    );
+    assert_eq!(env.refs(), refs0);
+}

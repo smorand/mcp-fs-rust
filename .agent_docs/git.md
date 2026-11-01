@@ -164,6 +164,10 @@ held commit stated so far, then `done` or a flush), so nothing is kept between r
   ref's history, or a folder listing or file version inside such a commit). Malformed,
   unknown or unreachable ids are dropped; when none is left the answer is `NAK` and an
   empty pack, whatever the client holds.
+* A client that did not ask for `side-band-64k` (the options after the id of the first wanted
+  line) gets the objects right after the acknowledgement lines as they are, with no framing,
+  no closing byte and no flush, as git's own server sends them (SPEC-0069). Real clients always
+  ask for the side band.
 * Pack data goes out on side-band channel 1 in 65515 byte chunks (the largest pkt-line is
   65520 bytes, 4 for the length and 1 for the channel; the chunk was 65519 until SPEC-0067,
   which made every clone or fetch of a project over 64 KiB fail with "bad line length"),
@@ -182,8 +186,8 @@ refuses the request); `shallow`, `deepen` and `filter` lines are not honoured (t
 `ofs-delta` and `agent` are ignored (plain `multi_ack` included); an empty request, a request without a wanted line, one
 cut in the middle of a line or lacking a flush is read up to the cut and answered without
 error. Every line is read, in any order, to the end of the request (lines after the end marker too). No limit applies to
-the number of `have` lines (BL-0117). Known gaps: the options the client chose are not honoured, the
-answer is always the `multi_ack_detailed` form on side-band (BL-0119); an unknown held id is never named by a
+the number of `have` lines (BL-0117). Known gaps: a client that asks only for the plain `multi_ack` gets the detailed form (the plain one
+is not offered, SPEC-0069); an unknown held id is never named by a
 `common` line, and a `ready` line names it when it follows held commits that already satisfy every
 want, once per such id, as with git's own server (SPEC-0068).
 

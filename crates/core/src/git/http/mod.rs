@@ -1419,7 +1419,7 @@ mod tests {
         e.db.set_ref("refs/heads/main", &commit, false).await.unwrap();
 
         let mut req = Vec::new();
-        req.extend_from_slice(&pktline::encode(&format!("want {commit}\n")));
+        req.extend_from_slice(&pktline::encode(&format!("want {commit} side-band-64k\n")));
         req.extend_from_slice(&pktline::flush());
         let out = handle_upload_pack(&e, &req).await.unwrap();
 
@@ -1450,7 +1450,7 @@ mod tests {
         commit: &str,
     ) -> (tempfile::TempDir, git2::Repository) {
         let mut req = Vec::new();
-        req.extend_from_slice(&pktline::encode(&format!("want {commit}\n")));
+        req.extend_from_slice(&pktline::encode(&format!("want {commit} side-band-64k\n")));
         req.extend_from_slice(&pktline::flush());
         let out = handle_upload_pack(e, &req).await.unwrap();
         let mut pack = Vec::new();

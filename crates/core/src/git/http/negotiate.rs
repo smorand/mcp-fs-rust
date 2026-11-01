@@ -24,6 +24,9 @@ pub struct Request {
     pub done: bool,
     /// A shallow, deepen or filter line was present: options the service does not offer.
     pub option_line: bool,
+    /// The first wanted line asked for `side-band-64k`: the objects go out framed on channel 1.
+    /// Without it they go out as they are, like git's own server sends them.
+    pub side_band: bool,
 }
 
 /// Read the whole request: every line, whatever its order, to the end of the input. Flushes
@@ -42,7 +45,11 @@ pub fn parse(body: &[u8]) -> Request {
         let (PacketType::Data, Some(line)) = (kind, line) else { continue };
         if let Some(rest) = line.strip_prefix("want ") {
             // The first want carries the client's options after a space.
-            req.wants.push(rest.trim().split(' ').next().unwrap_or("").to_string());
+            let mut words = rest.split_whitespace();
+            req.wants.push(words.next().unwrap_or("").to_string());
+            if req.wants.len() == 1 {
+                req.side_band = words.any(|o| o == "side-band-64k");
+            }
         } else if let Some(rest) = line.strip_prefix("have ") {
             req.haves.push(rest.trim().to_string());
         } else if line == "done" {
@@ -69,7 +76,7 @@ pub fn answer(repo: &Repository, ref_values: &[String], req: &Request) -> Result
     let wants = servable_wants(repo, ref_values, &req.wants)?;
     if wants.is_empty() {
         out.extend_from_slice(&pktline::encode("NAK\n"));
-        return finish(repo, &[], &[], out);
+        return finish(repo, &[], &[], req.side_band, out);
     }
     let (haves, done) = (&req.haves, req.done);
     // A request that states no held id is a clone, or a client that does not negotiate: one
@@ -78,7 +85,7 @@ pub fn answer(repo: &Repository, ref_values: &[String], req: &Request) -> Result
     // ids without the option would send a different answer from the one it expects.
     if haves.is_empty() || req.option_line {
         out.extend_from_slice(&pktline::encode("NAK\n"));
-        return finish(repo, &wants, &[], out);
+        return finish(repo, &wants, &[], req.side_band, out);
     }
     let (commons, got_unknown) = acknowledge(repo, haves, &wants, &mut out)?;
     if !done {
@@ -98,17 +105,25 @@ pub fn answer(repo: &Repository, ref_values: &[String], req: &Request) -> Result
         Some(last) => out.extend_from_slice(&pktline::encode(&format!("ACK {last}\n"))),
         None => out.extend_from_slice(&pktline::encode("NAK\n")),
     }
-    finish(repo, &wants, &commons, out)
+    finish(repo, &wants, &commons, req.side_band, out)
 }
 
-/// Append the objects the client lacks, framed on side-band channel 1, and the closing bytes.
+/// Append the objects the client lacks: framed on side-band channel 1 with the closing bytes
+/// when the client asked for the side band, as they are otherwise.
 fn finish(
     repo: &Repository,
     wants: &[String],
     commons: &[Oid],
+    side_band: bool,
     mut out: Vec<u8>,
 ) -> Result<Vec<u8>> {
     let pack = build_pack(repo, wants, commons)?;
+    if !side_band {
+        // The client did not ask for the side band: the objects follow the acknowledgement
+        // lines as they are, with no framing and nothing after them.
+        out.extend_from_slice(&pack);
+        return Ok(out);
+    }
     for chunk in pack.chunks(SIDE_BAND_CHUNK) {
         let mut framed = Vec::with_capacity(chunk.len() + 1);
         framed.push(1u8); // channel 1: packfile data
@@ -427,8 +442,25 @@ mod tests {
         (dir, repo, ids[0], ids[1], tag)
     }
 
+    fn pkt(line: &str) -> Vec<u8> {
+        format!("{:04x}{line}", line.len() + 4).into_bytes()
+    }
+
     /// Wanting an annotated tag while holding a commit must not hide the tagged commit: the
     /// edge computation works on the peeled commit, not on the tag id.
+    /// The side band choice comes from the options of the first wanted line only.
+    #[test]
+    fn the_side_band_is_asked_for_on_the_first_wanted_line() {
+        let id = "1".repeat(40);
+        let with = parse(&pkt(&format!("want {id} multi_ack_detailed side-band-64k ofs-delta\n")));
+        assert!(with.side_band);
+        let without = parse(&pkt(&format!("want {id} multi_ack_detailed ofs-delta\n")));
+        assert!(!without.side_band);
+        let mut second = pkt(&format!("want {id} multi_ack_detailed\n"));
+        second.extend(pkt(&format!("want {id} side-band-64k\n")));
+        assert!(!parse(&second).side_band, "only the first wanted line carries options");
+    }
+
     #[test]
     fn a_wanted_tag_leads_to_its_commit_beyond_the_held_one() {
         let (_d, repo, held, tagged, tag) = repo_with_tag();
