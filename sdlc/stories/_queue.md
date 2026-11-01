@@ -142,3 +142,4 @@
 | US-0140 | SPEC-0067 | prove speed and consistency of fetches | US-0139 | 2 | landed | story/US-0140-prove-speed-and-consistency | main |
 | US-0141 | SPEC-0067 | document incremental fetch and close the spec | US-0140 | 2 | landed | story/US-0141-document-incremental-fetch-and-close | main |
 | US-0142 | SPEC-0067 | read the lines of a request in any order | US-0141 | 2 | landed | story/US-0142-read-the-lines-of-a-request-in-any-order | main |
+| US-0143 | SPEC-0068 | pin the ready line that names an unknown id | main | 2 | todo | | |
