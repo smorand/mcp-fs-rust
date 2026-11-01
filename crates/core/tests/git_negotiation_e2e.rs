@@ -181,7 +181,8 @@ impl Server {
             .unwrap_or_else(|| panic!("{name}: not JSON: {text}"));
         assert!(envelope.get("error").is_none(), "{name}: {envelope}");
         let content = envelope["result"]["content"][0]["text"].as_str().expect("content");
-        serde_json::from_str(content).expect("content json")
+        serde_json::from_str(content)
+            .unwrap_or_else(|e| panic!("{name}: the result is not JSON ({e}): {content}"))
     }
 
     /// A project the admin owns, with its git repository initialised and no commit.
@@ -1108,4 +1109,245 @@ async fn a_wanted_file_version_is_served_only_when_a_ref_reaches_it() {
     let ours = our_answer(&env, &request(&[&orphan_blob], &[], true)).await;
     assert_eq!(ours.lines, vec!["NAK".to_string()]);
     assert!(ours.objects.is_empty(), "no branch reaches that file version");
+}
+
+// ── odd requests and options the service does not offer (US-0139) ───────────
+
+/// A request with extra lines between the wanted lines and their flush, as a client with
+/// options sends them: `extra` lines go right after the wants.
+fn request_with(extra: &[&str], wants: &[&str], haves: &[&str], done: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, w) in wants.iter().enumerate() {
+        let caps = if i == 0 { format!(" {CAPS}") } else { String::new() };
+        out.extend(pkt(&format!("want {w}{caps}\n")));
+    }
+    for line in extra {
+        out.extend(pkt(&format!("{line}\n")));
+    }
+    out.extend(b"0000");
+    for h in haves {
+        out.extend(pkt(&format!("have {h}\n")));
+    }
+    if done {
+        out.extend(pkt("done\n"));
+    } else {
+        out.extend(b"0000");
+    }
+    out
+}
+
+/// A request whose first want carries one more option than the service offers.
+fn request_with_option(option: &str, wants: &[&str], haves: &[&str], done: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, w) in wants.iter().enumerate() {
+        let caps = if i == 0 { format!(" {CAPS} {option}") } else { String::new() };
+        out.extend(pkt(&format!("want {w}{caps}\n")));
+    }
+    out.extend(b"0000");
+    for h in haves {
+        out.extend(pkt(&format!("have {h}\n")));
+    }
+    if done {
+        out.extend(pkt("done\n"));
+    } else {
+        out.extend(b"0000");
+    }
+    out
+}
+
+/// Every object reachable from `tip`, as the reference sends it for a clone.
+fn everything(bare: &Path, tip: &str) -> Answer {
+    reference_answer(bare, &request(&[tip], &[], true))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_031_deepen_option_with_a_held_id() {
+    let env = Env::with_history(4, false).await;
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let refs0 = env.refs();
+    let ours = our_answer(&env, &request_with(&["deepen 1"], &[c4], &[&env.shas[2]], true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "no ACK line, no shallow line");
+    assert_eq!(ours.objects, everything(bare.path(), c4).objects);
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_035_filter_option() {
+    let env = Env::with_history(4, false).await;
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let ours =
+        our_answer(&env, &request_with(&["filter blob:none"], &[c4], &[&env.shas[2]], true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "no ACK line");
+    assert_eq!(ours.objects, everything(bare.path(), c4).objects);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_036_shallow_line_from_the_client() {
+    let env = Env::with_history(4, false).await;
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let line = format!("shallow {}", env.shas[2]);
+    let ours = our_answer(&env, &request_with(&[&line], &[c4], &[], true)).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "no shallow line, no ACK line");
+    assert_eq!(ours.objects, everything(bare.path(), c4).objects);
+    // with a held id beside it, the option still wins over the negotiation
+    let both = our_answer(&env, &request_with(&[&line], &[c4], &[&env.shas[1]], true)).await;
+    assert_eq!(both, ours);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_037_held_ids_but_nothing_wanted() {
+    let env = Env::with_history(4, false).await;
+    let refs0 = env.refs();
+    let (status, body) = env
+        .server
+        .upload_pack(&env.project, Some(&env.admin()), &request(&[], &[&env.shas[3]], true))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0000".to_vec(), "the answer to a request that wants nothing");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_044_no_done_option_that_the_service_does_not_offer() {
+    let env = Env::with_history(4, false).await;
+    let refs0 = env.refs();
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let with = request_with_option("no-done", &[c4], &[&env.shas[2]], false);
+    let without = request(&[c4], &[&env.shas[2]], false);
+    let ours = our_answer(&env, &with).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &without));
+    assert!(ours.objects.is_empty(), "no object data");
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_045_include_tag_option_that_the_service_does_not_offer() {
+    let env = Env::with_history(4, false).await;
+    let w = env.work.path();
+    git_ok(w, None, &["tag", "-a", "-m", "third", "v1", &env.shas[2]]);
+    git_ok(w, Some(&env.admin()), &["push", "-q", &env.server.url(&env.project), "v1"]);
+    let tag = git_ok(w, None, &["rev-parse", "v1"]);
+    let refs0 = env.refs();
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let with = our_answer(&env, &request_with_option("include-tag", &[c4], &[], true)).await;
+    let without = our_answer(&env, &request(&[c4], &[], true)).await;
+    assert_eq!(with, without, "the option changes nothing");
+    assert_eq!(with.objects, everything(bare.path(), c4).objects);
+    assert!(!with.objects.contains(&tag), "the tag object is not among them");
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_046_an_unknown_option() {
+    let env = Env::with_history(4, false).await;
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let with = our_answer(&env, &request_with_option("x-foo", &[c4], &[&env.shas[2]], true)).await;
+    let without = our_answer(&env, &request(&[c4], &[&env.shas[2]], true)).await;
+    assert_eq!(with, without);
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_050_deepen_line_with_no_wanted_line() {
+    let env = Env::with_history(4, false).await;
+    let refs0 = env.refs();
+    let req = request_with(&["deepen 1"], &[], &[&env.shas[2]], true);
+    let (status, body) = env.server.upload_pack(&env.project, Some(&env.admin()), &req).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"0000".to_vec(), "a bare flush, no NAK");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_018_request_cut_in_the_middle_of_a_held_line() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let c6 = &env.shas[5];
+    let refs0 = env.refs();
+    // wants c6, holds c4, then a second held line whose last byte (the newline) is missing:
+    // an id that looks complete but was cut, so it must not be read
+    let complete = request(&[c6], &[&env.shas[3], &env.shas[2]], false);
+    let cut = &complete[..complete.len() - 4 - 1]; // drop the closing flush and the newline
+    let before_cut = request(&[c6], &[&env.shas[3]], false);
+    let ours = our_answer(&env, cut).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &before_cut));
+    assert!(ours.lines.iter().all(|l| !l.contains(&env.shas[2])), "the cut id is not read");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_051_no_flush_after_the_wanted_line() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let bare = env.bare_copy();
+    let c6 = &env.shas[5];
+    let mut req = pkt(&format!("want {c6} {CAPS}\n"));
+    req.extend(pkt(&format!("have {}\n", env.shas[3])));
+    let completed = request(&[c6], &[&env.shas[3]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &completed));
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_052_end_marker_without_a_flush_after_the_wanted_line() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let bare = env.bare_copy();
+    let c6 = &env.shas[5];
+    let mut req = pkt(&format!("want {c6} {CAPS}\n"));
+    req.extend(pkt(&format!("have {}\n", env.shas[3])));
+    req.extend(pkt("done\n"));
+    let completed = request(&[c6], &[&env.shas[3]], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &completed));
+    assert_eq!(ours.objects.len(), 6, "every object of c5 and c6");
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_053_wanted_line_only_without_a_flush() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let bare = env.bare_copy();
+    let c6 = &env.shas[5];
+    let req = pkt(&format!("want {c6} {CAPS}\n"));
+    let ours = our_answer(&env, &req).await;
+    // a clone: the reference sends every object once the negotiation is ended
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert_eq!(ours.objects, everything(bare.path(), c6).objects);
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+/// The other cuts: in the middle of a wanted line, of the end marker, and of a line header.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_cut_elsewhere_is_read_up_to_the_cut() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let (c6, c4) = (&env.shas[5], &env.shas[3]);
+    let refs0 = env.refs();
+    // the only wanted line cut: nothing is wanted, the answer to a request that wants nothing
+    let full = request(&[c6], &[c4], true);
+    let (status, body) =
+        env.server.upload_pack(&env.project, Some(&env.admin()), &full[..30]).await;
+    assert_eq!((status, body), (200, b"0000".to_vec()));
+    // the end marker cut after "do": the lines before it are answered, the negotiation is not ended
+    let mut cut = request(&[c6], &[c4], false);
+    cut.truncate(cut.len() - 4);
+    cut.extend(b"0009do");
+    let ours = our_answer(&env, &cut).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &request(&[c6], &[c4], false)));
+    // a line header cut in two: the request ends there
+    let mut stub = request(&[c6], &[c4], false);
+    stub.truncate(stub.len() - 4);
+    stub.extend(b"00");
+    let ours = our_answer(&env, &stub).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &request(&[c6], &[c4], false)));
+    assert_eq!(env.refs(), refs0);
 }

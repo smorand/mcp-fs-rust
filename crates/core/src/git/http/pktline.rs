@@ -55,17 +55,25 @@ pub fn delimiter() -> Vec<u8> {
 pub struct PktReader<'a> {
     buf: &'a [u8],
     pos: usize,
+    cut: bool,
 }
 
 impl<'a> PktReader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self { buf, pos: 0, cut: false }
     }
 
     /// Bytes not yet consumed. After the ref update section of a push this is the
     /// raw packfile, which is not pkt-line framed.
     pub fn remaining(&self) -> &'a [u8] {
         &self.buf[self.pos.min(self.buf.len())..]
+    }
+
+    /// Whether the last packet read announced more bytes than the input held, so what it
+    /// returned is only the start of the line. A request cut in the middle of a line is
+    /// read up to the line before it.
+    pub fn last_was_cut(&self) -> bool {
+        self.cut
     }
 
     pub fn position(&self) -> usize {
@@ -75,6 +83,7 @@ impl<'a> PktReader<'a> {
     /// Read one packet. Returns `(None, Flush)` at end of input, matching the C#
     /// treatment of EOF, and `(Some(&[]), Data)` for the empty packet `0004`.
     pub fn read_packet(&mut self) -> (Option<&'a [u8]>, PacketType) {
+        self.cut = false;
         if self.pos + 4 > self.buf.len() {
             self.pos = self.buf.len();
             return (None, PacketType::Flush);
@@ -108,6 +117,7 @@ impl<'a> PktReader<'a> {
             return (Some(&self.buf[self.pos..self.pos]), PacketType::Data);
         }
         // A truncated packet yields whatever arrived, like the C# partial read.
+        self.cut = self.pos + data_len > self.buf.len();
         let end = (self.pos + data_len).min(self.buf.len());
         let data = &self.buf[self.pos..end];
         self.pos = end;
@@ -130,6 +140,19 @@ impl<'a> PktReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_was_cut_is_true_only_when_the_input_ends_inside_a_line() {
+        let mut r = PktReader::new(b"0009abcde");
+        assert_eq!(r.read_packet().0, Some(&b"abcde"[..]));
+        assert!(!r.last_was_cut(), "a line that ends exactly at the end of the input is whole");
+
+        let mut r = PktReader::new(b"0009abc");
+        assert_eq!(r.read_packet().0, Some(&b"abc"[..]), "what arrived is still returned");
+        assert!(r.last_was_cut());
+        r.read_packet();
+        assert!(!r.last_was_cut(), "the flag follows the last packet only");
+    }
 
     #[test]
     fn encode_prefixes_the_total_length_in_hex() {

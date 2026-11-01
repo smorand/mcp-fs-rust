@@ -22,16 +22,23 @@ pub struct Request {
     pub haves: Vec<String>,
     /// The end marker was present: the client now expects the objects.
     pub done: bool,
+    /// A shallow, deepen or filter line was present: options the service does not offer.
+    pub option_line: bool,
 }
 
 /// Read the whole request. A flush that follows the haves, a second flush or the end marker
-/// closes it; the flush after the wanted lines does not.
+/// closes it; the flush after the wanted lines does not. A line cut by the end of the input is
+/// dropped, and lines after the closing flush or the end marker are not read.
 pub fn parse(body: &[u8]) -> Request {
     let mut req = Request::default();
     let mut reader = PktReader::new(body);
     let mut flushes = 0;
     while !reader.remaining().is_empty() {
         let (line, kind) = reader.read_line();
+        // A line cut by the end of the request is dropped: only complete lines are read.
+        if reader.last_was_cut() {
+            break;
+        }
         if kind == PacketType::Flush {
             flushes += 1;
             if flushes > 1 || !req.haves.is_empty() {
@@ -48,6 +55,11 @@ pub fn parse(body: &[u8]) -> Request {
         } else if line == "done" {
             req.done = true;
             break;
+        } else if line.starts_with("shallow ")
+            || line.starts_with("deepen")
+            || line.starts_with("filter ")
+        {
+            req.option_line = true;
         }
     }
     req
@@ -69,8 +81,10 @@ pub fn answer(repo: &Repository, ref_values: &[String], req: &Request) -> Result
     }
     let (haves, done) = (&req.haves, req.done);
     // A request that states no held id is a clone, or a client that does not negotiate: one
-    // NAK and everything reachable, as before the negotiation existed.
-    if haves.is_empty() {
+    // NAK and everything reachable, as before the negotiation existed. So is one that asks
+    // for an option the service does not offer (shallow, deepen, filter): honouring the held
+    // ids without the option would send a different answer from the one it expects.
+    if haves.is_empty() || req.option_line {
         out.extend_from_slice(&pktline::encode("NAK\n"));
         return finish(repo, &wants, &[], out);
     }
