@@ -266,13 +266,18 @@ struct Env {
 }
 
 impl Env {
-    async fn with_history(n: usize, anonymous_read: bool) -> Env {
+    /// A project with no commit yet, and an empty working repository.
+    async fn new(anonymous_read: bool) -> Env {
         let server = Server::start(anonymous_read).await;
         let project = unique_project();
         server.project(&project).await;
         let work = tempfile::tempdir().expect("work dir");
         work_repo(work.path());
-        let mut env = Env { server, project, work, shas: Vec::new() };
+        Env { server, project, work, shas: Vec::new() }
+    }
+
+    async fn with_history(n: usize, anonymous_read: bool) -> Env {
+        let mut env = Env::new(anonymous_read).await;
         for i in 1..=n {
             let sha = commit_file(
                 env.work.path(),
@@ -318,6 +323,37 @@ impl Env {
         let t = self.admin();
         git_ok(self.work.path(), Some(&t), &["ls-remote", &self.server.url(&self.project)])
     }
+}
+
+/// A working copy of the project made with a real `git clone`, ready to commit locally.
+fn clone_copy(env: &Env, token: Option<&str>) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("copy dir");
+    let copy = dir.path().join("copy");
+    git_ok(
+        dir.path(),
+        token,
+        &["clone", "-q", &env.server.url(&env.project), copy.to_str().unwrap()],
+    );
+    git_ok(&copy, None, &["config", "user.email", "neg@mcp-fs.test"]);
+    git_ok(&copy, None, &["config", "user.name", "neg"]);
+    (dir, copy)
+}
+
+fn fetch(copy: &Path, token: Option<&str>) {
+    git_ok(copy, token, &["fetch", "-q", "--tags"]);
+}
+
+/// `git fsck` on a copy: the integrity check of the spec.
+fn assert_intact(copy: &Path) {
+    git_ok(copy, None, &["fsck", "--strict"]);
+}
+
+fn count_commits(copy: &Path, rev: &str) -> usize {
+    git_ok(copy, None, &["rev-list", "--count", rev]).parse().expect("count")
+}
+
+fn holds_any(answer: &Answer, ids: &[&str]) -> bool {
+    ids.iter().any(|i| answer.objects.contains(*i))
 }
 
 // ── requests and answers ─────────────────────────────────────────────────────
@@ -434,7 +470,11 @@ fn reference_answer(bare: &Path, request: &[u8]) -> Answer {
 
 /// Our answer to the same request, over HTTP as the admin.
 async fn our_answer(env: &Env, request: &[u8]) -> Answer {
-    let (status, body) = env.server.upload_pack(&env.project, Some(&env.admin()), request).await;
+    our_answer_as(env, request, Some(&env.admin())).await
+}
+
+async fn our_answer_as(env: &Env, request: &[u8], token: Option<&str>) -> Answer {
+    let (status, body) = env.server.upload_pack(&env.project, token, request).await;
     assert_eq!(status, 200, "upload-pack status");
     parse_answer(&body)
 }
@@ -601,4 +641,245 @@ async fn e2e_022_reads_change_nothing() {
     assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c6);
     assert_eq!(env.refs(), refs1, "branches and tags are identical");
     assert_eq!(side_state(&env).await, side1, "the fetch added no audit entry and left the trash");
+}
+
+// ── the end of the exchange (US-0136) ───────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_002_fetch_of_two_new_commits() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let c5 = commit_file(env.work.path(), "c.txt", "c\n", "c5");
+    let c6 = commit_file(env.work.path(), "f1.txt", "changed\n", "c6");
+    env.push();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(count_commits(&copy, "origin/main"), 6);
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c6);
+    assert_intact(&copy);
+
+    // what the client sent: wants c6, holds c4, ends the negotiation
+    let bare = env.bare_copy();
+    let req = request(&[&c6], &[&env.shas[3]], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects.len(), 6, "commit, folder listing and file, for c5 and for c6");
+    let old: Vec<&str> = env.shas.iter().map(String::as_str).collect();
+    assert!(!holds_any(&ours, &old) && ours.objects.contains(&c5));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_003_fetch_with_nothing_new() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let refs0 = env.refs();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(count_commits(&copy, "HEAD"), 4);
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let req = request(&[c4], &[c4], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.objects.is_empty(), "nothing to send");
+    assert_eq!(ours.lines, vec![format!("ACK {c4} common"), format!("ACK {c4}")]);
+    assert_eq!(env.refs(), refs0, "the project is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_004_the_copy_holds_commits_the_project_lacks() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let mut locals = Vec::new();
+    for i in 1..=3 {
+        locals.push(commit_file(&copy, &format!("l{i}.txt"), "local\n", &format!("l{i}")));
+    }
+    let c5 = commit_file(env.work.path(), "d.txt", "d\n", "c5");
+    env.push();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c5);
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "HEAD"]), locals[2], "local commits are kept");
+    assert_intact(&copy);
+
+    let bare = env.bare_copy();
+    let haves: Vec<&str> =
+        [locals[2].as_str(), locals[1].as_str(), locals[0].as_str(), env.shas[3].as_str()].to_vec();
+    let req = request(&[&c5], &haves, true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects.len(), 3, "the commit, its folder listing, d.txt");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_005_forty_local_commits_two_in_common() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    for i in 1..=36 {
+        commit_file(&copy, &format!("local{i}.txt"), "local\n", &format!("local {i}"));
+    }
+    assert_eq!(count_commits(&copy, "HEAD"), 40);
+    let c5 = commit_file(env.work.path(), "d.txt", "d\n", "c5");
+    let c6 = commit_file(env.work.path(), "e.txt", "e\n", "c6");
+    env.push();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c6);
+    assert_eq!(count_commits(&copy, "HEAD"), 40, "the 40 commits are kept");
+    assert_intact(&copy);
+
+    // the last exchange as the client sends it: every commit it holds, newest first
+    let held = git_ok(&copy, None, &["rev-list", "HEAD"]);
+    let haves: Vec<&str> = held.lines().collect();
+    let bare = env.bare_copy();
+    let req = request(&[&c6], &haves, true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects.len(), 6, "only c5 and c6");
+    assert!(ours.objects.contains(&c5) && ours.objects.contains(&c6));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_006_merge_history_with_one_side_held() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let w = env.work.path();
+    git_ok(w, None, &["checkout", "-q", "-b", "side", &env.shas[2]]);
+    let s1 = commit_file(w, "side.txt", "side\n", "s1");
+    git_ok(w, None, &["checkout", "-q", "main"]);
+    git_ok(w, None, &["merge", "-q", "--no-ff", "-m", "m1", "side"]);
+    let m1 = git_ok(w, None, &["rev-parse", "HEAD"]);
+    env.push();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), m1);
+    assert_intact(&copy);
+
+    let bare = env.bare_copy();
+    let req = request(&[&m1], &[&env.shas[3]], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert!(ours.objects.contains(&s1) && ours.objects.contains(&m1));
+    let old: Vec<&str> = env.shas.iter().map(String::as_str).collect();
+    assert!(!holds_any(&ours, &old), "no commit of c1 to c4 is sent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_007_a_file_deleted_long_ago_and_added_back() {
+    let env = Env::new(false).await;
+    let w = env.work.path();
+    commit_file(w, "old.txt", "old\n", "c1");
+    git_ok(w, None, &["rm", "-q", "old.txt"]);
+    git_ok(w, None, &["commit", "-q", "-m", "c2"]);
+    commit_file(w, "other.txt", "other\n", "c3");
+    let c3 = git_ok(w, None, &["rev-parse", "HEAD"]);
+    env.push();
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let c4 = commit_file(w, "old.txt", "old\n", "c4");
+    env.push();
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c4);
+    assert_intact(&copy);
+
+    // whichever objects git sends here, the service sends the same ones
+    let bare = env.bare_copy();
+    let req = request(&[&c4], &[&c3], true);
+    assert_same_answer(&our_answer(&env, &req).await, &reference_answer(bare.path(), &req));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_011_twelve_unknown_held_commits() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let unknown: Vec<String> = (0..12).map(|i| format!("{:040x}", 0x1000 + i)).collect();
+    let haves: Vec<&str> = unknown.iter().map(String::as_str).collect();
+    let req = request(&[&env.shas[5]], &haves, true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "no acknowledgement for an unknown id");
+    assert_eq!(ours.objects.len(), 18, "everything reachable from c6");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_014_a_held_id_that_is_not_a_valid_id() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let tip = &env.shas[5];
+    let ours = our_answer(&env, &request(&[tip], &["not-an-id"], true)).await;
+    // as if the id had not been stated: the reference answer to the request without it
+    let reference = reference_answer(bare.path(), &request(&[tip], &[], true));
+    assert_same_answer(&ours, &reference);
+    assert!(ours.lines.iter().all(|l| !l.contains("not-an-id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_021_anonymous_caller_allowed_when_anonymous_reading_is_on() {
+    let env = Env::with_history(4, true).await;
+    let (_d, copy) = clone_copy(&env, None);
+    let c5 = commit_file(env.work.path(), "c.txt", "c\n", "c5");
+    let c6 = commit_file(env.work.path(), "f1.txt", "changed\n", "c6");
+    env.push();
+    fetch(&copy, None);
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c6);
+    assert_eq!(count_commits(&copy, "origin/main"), 6);
+    let bare = env.bare_copy();
+    let req = request(&[&c6], &[&env.shas[3]], true);
+    let ours = our_answer_as(&env, &req, None).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.objects.len(), 6, "exactly the objects of c5 and c6");
+    assert!(ours.objects.contains(&c5));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_029_held_id_of_a_file_version() {
+    let env = Env::with_history(4, false).await;
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let blob = git_ok(env.work.path(), None, &["rev-parse", &format!("{c4}:f1.txt")]);
+    let ours = our_answer(&env, &request(&[c4], &[&blob], true)).await;
+    let reference = reference_answer(bare.path(), &request(&[c4], &[], true));
+    assert_eq!(
+        ours.lines,
+        vec!["NAK".to_string()],
+        "the reference would acknowledge it, the service does not"
+    );
+    assert!(ours.lines.iter().all(|l| !l.contains(&blob)));
+    assert_eq!(ours.objects, reference.objects, "every object reachable from c4");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_032_held_id_with_only_ten_characters() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let short = &env.shas[3][..10];
+    let ours = our_answer(&env, &request(&[&env.shas[5]], &[short], true)).await;
+    let reference = reference_answer(bare.path(), &request(&[&env.shas[5]], &[], true));
+    assert_same_answer(&ours, &reference);
+    assert!(ours.lines.iter().all(|l| !l.contains(short)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_033_held_id_of_a_folder_listing() {
+    let env = Env::with_history(4, false).await;
+    let bare = env.bare_copy();
+    let c4 = &env.shas[3];
+    let tree = git_ok(env.work.path(), None, &["rev-parse", &format!("{c4}^{{tree}}")]);
+    let ours = our_answer(&env, &request(&[c4], &[&tree], true)).await;
+    let reference = reference_answer(bare.path(), &request(&[c4], &[], true));
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert_eq!(ours.objects, reference.objects, "every object reachable from c4");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_034_held_id_of_an_annotated_tag() {
+    let env = Env::with_history(4, false).await;
+    let w = env.work.path();
+    let c5 = commit_file(w, "d.txt", "d\n", "c5");
+    env.push();
+    // the reference copy is taken before the tag is pushed: a clone that has to carry an
+    // annotated tag is the subject of a later story
+    let bare = env.bare_copy();
+    git_ok(w, None, &["tag", "-a", "-m", "first release", "v1", &env.shas[3]]);
+    git_ok(w, Some(&env.admin()), &["push", "-q", &env.server.url(&env.project), "v1"]);
+    let tag = git_ok(w, None, &["rev-parse", "v1"]);
+    let ours = our_answer(&env, &request(&[&c5], &[&tag], true)).await;
+    let reference = reference_answer(bare.path(), &request(&[&c5], &[], true));
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert!(ours.lines.iter().all(|l| !l.contains(&tag)));
+    assert_eq!(ours.objects, reference.objects, "every object reachable from c5");
 }

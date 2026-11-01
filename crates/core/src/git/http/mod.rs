@@ -38,6 +38,7 @@
 //! * `git.max_pack_size_mb` is enforced on push bodies (`413`). The C# parsed the
 //!   setting and never used it.
 
+mod negotiate;
 pub mod pktline;
 
 use crate::errors::{Result, ToolError};
@@ -387,110 +388,24 @@ pub async fn advertise_receive_pack(entry: &GitRepoEntry) -> Result<Vec<u8>> {
 
 // ── upload-pack ─────────────────────────────────────────────────────────────
 
-/// Parsed `git-upload-pack` request.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct UploadPackRequest {
-    pub wants: Vec<String>,
-    pub haves: Vec<String>,
-}
+/// Parsed `git-upload-pack` request (see [`negotiate`]).
+pub type UploadPackRequest = negotiate::Request;
 
-/// Parse the want/have section, C# parity: stop at the first flush or `done`.
+/// Parse a `git-upload-pack` request body.
 pub fn parse_upload_pack_request(body: &[u8]) -> UploadPackRequest {
-    let mut req = UploadPackRequest::default();
-    let mut reader = PktReader::new(body);
-    loop {
-        let (line, kind) = reader.read_line();
-        if kind == PacketType::Flush {
-            break;
-        }
-        let Some(line) = line else { break };
-        if let Some(rest) = line.strip_prefix("want ") {
-            // The first want carries the client capabilities after a space.
-            let sha = rest.trim().split(' ').next().unwrap_or("").to_string();
-            req.wants.push(sha);
-        } else if let Some(rest) = line.strip_prefix("have ") {
-            req.haves.push(rest.trim().to_string());
-        } else if line == "done" {
-            break;
-        }
-    }
-    req
+    negotiate::parse(body)
 }
 
 /// Serve a clone or fetch. Returns the full response body.
 pub async fn handle_upload_pack(entry: &GitRepoEntry, body: &[u8]) -> Result<Vec<u8>> {
-    let req = parse_upload_pack_request(body);
-    let mut out = Vec::new();
+    let req = negotiate::parse(body);
     if req.wants.is_empty() {
-        out.extend_from_slice(&pktline::flush());
-        return Ok(out);
+        return Ok(pktline::flush());
     }
-
-    // No negotiation: acknowledge nothing and send everything reachable.
-    out.extend_from_slice(&pktline::encode("NAK\n"));
-
     // libgit2 packs from its own ODB, so the blob store has to be materialized first.
     let repo = entry.repo.lock().await;
     entry.objects.hydrate_if_stale(&repo).await?;
-
-    let pack = build_pack(&repo, &req.wants)?;
-    drop(repo);
-
-    for chunk in pack.chunks(SIDE_BAND_CHUNK) {
-        let mut framed = Vec::with_capacity(chunk.len() + 1);
-        framed.push(1u8); // channel 1: packfile data
-        framed.extend_from_slice(chunk);
-        out.extend_from_slice(&pktline::encode_raw(&framed));
-    }
-    // C# writes a bare channel byte to close the side-band, then flushes.
-    out.extend_from_slice(&pktline::encode("\u{1}"));
-    out.extend_from_slice(&pktline::flush());
-    Ok(out)
-}
-
-/// Build the packfile for a set of wanted tips.
-///
-/// The pack must contain the wanted objects AND everything reachable from them,
-/// parents included. `insert_recursive` only adds an object plus what it directly
-/// references (for a commit: its tree, recursively), NOT its ancestry, so a repository
-/// with more than one commit produced a pack that made the client fail with
-/// "Failed to traverse parents" / "remote did not send all necessary objects". The
-/// reference implementation has the same defect. A revwalk over the tips, fed to
-/// `insert_walk`, is the API that yields a complete pack.
-fn build_pack(repo: &git2::Repository, wants: &[String]) -> Result<Vec<u8>> {
-    let mut buf = git2::Buf::new();
-    {
-        let mut pb = repo
-            .packbuilder()
-            .map_err(|e| ToolError::internal(format!("packbuilder failed: {e}")))?;
-
-        let mut walk =
-            repo.revwalk().map_err(|e| ToolError::internal(format!("revwalk failed: {e}")))?;
-        let mut pushed_any = false;
-        for want in wants {
-            // Unknown or unreachable wants are skipped, like the reference does.
-            if let Ok(oid) = Oid::from_str(want) {
-                if walk.push(oid).is_ok() {
-                    pushed_any = true;
-                } else {
-                    // Not a commit (a tag or a bare tree can be wanted directly).
-                    let _ = pb.insert_recursive(oid, None);
-                }
-            }
-        }
-        if pushed_any {
-            pb.insert_walk(&mut walk)
-                .map_err(|e| ToolError::internal(format!("pack walk failed: {e}")))?;
-        }
-
-        pb.write_buf(&mut buf)
-            .map_err(|e| ToolError::internal(format!("pack write failed: {e}")))?;
-    }
-    let pack = buf.to_vec();
-    if pack.is_empty() {
-        return Ok(empty_pack());
-    }
-    Ok(pack)
+    negotiate::answer(&repo, &[], &req)
 }
 
 /// The canonical empty packfile: `PACK`, version 2, zero objects, sha1 trailer.
@@ -1583,5 +1498,65 @@ mod tests {
             assert!(client.odb().unwrap().exists(Oid::from_str(&commit).unwrap()));
             assert!(client.odb().unwrap().exists(Oid::from_str(&blob).unwrap()));
         }
+    }
+
+    /// A commit whose tree holds `n` files, imported into the entry's object store the way a
+    /// push is, so the hydration marker is current and the first request pays no export.
+    async fn seed_large_commit(e: &GitRepoEntry, n: usize) -> Oid {
+        let repo = e.repo.lock().await;
+        let mut tb = repo.treebuilder(None).unwrap();
+        for i in 0..n {
+            let b = repo.blob(format!("file {i}").as_bytes()).unwrap();
+            tb.insert(format!("f{i:05}"), b, 0o100644).unwrap();
+        }
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig =
+            git2::Signature::new("t", "t@x.test", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        let c = repo.commit(None, &sig, &sig, "big", &tree, &[]).unwrap();
+        e.objects.import_reachable(&repo, &[c]).await.unwrap();
+        c
+    }
+
+    /// The acknowledgement lines and the pack bytes of an answer.
+    fn lines_and_pack(body: &[u8]) -> (Vec<String>, Vec<u8>) {
+        let (mut lines, mut pack) = (Vec::new(), Vec::new());
+        let mut r = PktReader::new(body);
+        while let (Some(data), PacketType::Data) = r.read_packet() {
+            match data.first() {
+                Some(1) => pack.extend_from_slice(&data[1..]),
+                Some(_) => lines.push(String::from_utf8_lossy(data).trim_end().to_string()),
+                None => {}
+            }
+        }
+        (lines, pack)
+    }
+
+    /// E2E-038: a request for the tip a client holds, with two ids the project never held
+    /// beside it, on 20 000 objects: acknowledged, nothing sent, and fast.
+    #[tokio::test]
+    async fn e2e_038_up_to_date_request_with_unknown_ids_besides_the_held_tip() {
+        let d = tempfile::tempdir().unwrap();
+        let (_s, e) = entry(d.path()).await;
+        let tip = seed_large_commit(&e, 20_000).await;
+        e.db.set_ref("refs/heads/main", &tip.to_string(), false).await.unwrap();
+        let mut req = Vec::new();
+        req.extend_from_slice(&pktline::encode(&format!(
+            "want {tip} multi_ack_detailed side-band-64k\n"
+        )));
+        req.extend_from_slice(&pktline::flush());
+        for have in
+            [format!("{:040x}", 0x1111_u32), tip.to_string(), format!("{:040x}", 0x2222_u32)]
+        {
+            req.extend_from_slice(&pktline::encode(&format!("have {have}\n")));
+        }
+        req.extend_from_slice(&pktline::encode("done\n"));
+
+        let started = std::time::Instant::now();
+        let out = handle_upload_pack(&e, &req).await.unwrap();
+        let elapsed = started.elapsed();
+        let (lines, pack) = lines_and_pack(&out);
+        assert_eq!(lines, vec![format!("ACK {tip} common"), format!("ACK {tip}")]);
+        assert_eq!(pack, empty_pack(), "nothing is sent");
+        assert!(elapsed < std::time::Duration::from_secs(1), "took {elapsed:?}");
     }
 }
