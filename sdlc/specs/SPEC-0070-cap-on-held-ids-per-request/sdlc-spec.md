@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: one observable behavior (what a request that states a very large number of held ids gets), one area (the git service), 3 requirements, no persisted change.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-01
 > Project: existing
 > From backlog: BL-0117
