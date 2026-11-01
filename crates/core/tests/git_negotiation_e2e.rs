@@ -1619,3 +1619,120 @@ async fn fr_new_014_lines_after_the_end_marker_and_control_packets_between_lines
     let ours = our_answer(&env, &odd).await;
     assert_eq!(ours.lines, vec!["NAK".to_string()]);
 }
+
+// ── unknown held ids and the ready line (SPEC-0068) ──────────────────────────
+
+/// A well formed id the project never held.
+fn unknown_id(n: u32) -> String {
+    format!("{:040x}", 0x1111_1111_u32.wrapping_mul(n))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0068_e2e_001_unknown_ids_after_a_satisfying_held_commit() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c4, u1, u2) = (&env.shas[3], unknown_id(1), unknown_id(2));
+    let req = request(&[&env.shas[5]], &[c4, &u1, &u2], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(
+        ours.lines,
+        vec![
+            format!("ACK {c4} common"),
+            format!("ACK {u1} ready"),
+            format!("ACK {u2} ready"),
+            "NAK".to_string()
+        ]
+    );
+    assert!(ours.objects.is_empty());
+    assert!(
+        ours.lines.iter().all(|l| !(l.contains(&u1) || l.contains(&u2)) || l.ends_with("ready"))
+    );
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0068_e2e_002_an_unknown_id_before_any_held_commit() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c4, u1, u2) = (&env.shas[3], unknown_id(1), unknown_id(2));
+    let req = request(&[&env.shas[5]], &[&u1, c4, &u2], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(
+        ours.lines,
+        vec![format!("ACK {c4} common"), format!("ACK {u2} ready"), format!("ACK {c4}")]
+    );
+    assert_eq!(ours.objects.len(), 6, "the objects of c5 and c6");
+    assert!(ours.lines.iter().all(|l| !l.contains(&u1)), "no line names U1");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0068_e2e_003_the_held_commit_is_newer_than_the_wanted_one() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c6, u1) = (&env.shas[5], unknown_id(1));
+    let req = request(&[&env.shas[3]], &[c6, &u1], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.lines, vec![format!("ACK {c6} common"), "NAK".to_string()]);
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0068_e2e_004_only_unknown_ids() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let req = request(&[&env.shas[5]], &[&unknown_id(1), &unknown_id(2)], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0068_e2e_005_an_unknown_id_between_two_held_commits() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c3, c4, u1) = (&env.shas[2], &env.shas[3], unknown_id(1));
+    let req = request(&[&env.shas[5]], &[c3, &u1, c4], true);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    assert_eq!(
+        ours.lines,
+        vec![
+            format!("ACK {c3} common"),
+            format!("ACK {u1} ready"),
+            format!("ACK {c4} common"),
+            format!("ACK {c4}"),
+        ]
+    );
+    assert_eq!(ours.objects.len(), 6, "the objects of c5 and c6");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0068_e2e_006_three_unknown_ids_after_a_satisfying_held_commit() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let c4 = &env.shas[3];
+    let unknown: Vec<String> = (1..=3).map(unknown_id).collect();
+    let req = request(&[&env.shas[5]], &[c4, &unknown[0], &unknown[1], &unknown[2]], false);
+    let ours = our_answer(&env, &req).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &req));
+    let mut expected = vec![format!("ACK {c4} common")];
+    expected.extend(unknown.iter().map(|u| format!("ACK {u} ready")));
+    expected.push("NAK".to_string());
+    assert_eq!(ours.lines, expected, "one ready line per unknown id, in the order stated");
+    assert!(ours.objects.is_empty());
+    assert_eq!(env.refs(), refs0);
+}

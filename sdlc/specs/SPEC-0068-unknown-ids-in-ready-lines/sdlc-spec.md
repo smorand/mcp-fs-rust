@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: one observable behavior (what a fetch answer says about a held id the project lacks), one area (the git service), 2 requirements, no persisted change, and no code change expected: the service already answers this way.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-01
 > Project: existing
 > From backlog: BL-0118

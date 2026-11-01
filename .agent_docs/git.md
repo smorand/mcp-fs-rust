@@ -183,8 +183,9 @@ refuses the request); `shallow`, `deepen` and `filter` lines are not honoured (t
 cut in the middle of a line or lacking a flush is read up to the cut and answered without
 error. Every line is read, in any order, to the end of the request (lines after the end marker too). No limit applies to
 the number of `have` lines (BL-0117). Known gaps: the options the client chose are not honoured, the
-answer is always the `multi_ack_detailed` form on side-band (BL-0119); an unknown held id can appear in
-an `ACK <id> ready` line as it does with git's own server, which the spec words differently (BL-0118).
+answer is always the `multi_ack_detailed` form on side-band (BL-0119); an unknown held id is never named by a
+`common` line, and a `ready` line names it when it follows held commits that already satisfy every
+want, once per such id, as with git's own server (SPEC-0068).
 
 ## `git.*` tool behaviour
 

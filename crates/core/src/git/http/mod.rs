@@ -1567,6 +1567,10 @@ mod tests {
                 format!("ACK {tip}"),
             ]
         );
+        assert!(
+            lines.iter().all(|l| !l.contains(&format!("{:040x}", 0x1111_u32))),
+            "no line names U1"
+        );
         assert_eq!(pack, empty_pack(), "nothing is sent");
     }
 
