@@ -15,7 +15,8 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 
 use mcp_fs_core::app;
 use mcp_fs_core::config::ServerConfig;
@@ -1350,4 +1351,209 @@ async fn a_request_cut_elsewhere_is_read_up_to_the_cut() {
     let ours = our_answer(&env, &stub).await;
     assert_same_answer(&ours, &reference_answer(bare.path(), &request(&[c6], &[c4], false)));
     assert_eq!(env.refs(), refs0);
+}
+
+// ── fetches during pushes (US-0140) ──────────────────────────────────────────
+
+/// Incompressible text of about `kb` kilobytes: a push of several of these takes long enough
+/// for fetches to overlap it.
+fn heavy_text(seed: u64, kb: usize) -> String {
+    let mut x = seed | 1;
+    let mut out = String::with_capacity(kb * 1024);
+    while out.len() < kb * 1024 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.push_str(&format!("{x:016x}"));
+    }
+    out
+}
+
+/// What the fetches of a copy saw: the branch tips after each fetch, and how many fetches began
+/// before the push was over (the ones that overlapped it).
+struct Seen {
+    tips: Vec<Vec<String>>,
+    overlapping: usize,
+}
+
+/// Fetch into `copy` at least `min_rounds` times and until `pushed` is set; every fetch must
+/// succeed and leave the copy intact. Records `origin/<branch>` after each fetch.
+fn fetch_rounds(
+    copy: &Path,
+    token: &str,
+    branches: &[&str],
+    min_rounds: usize,
+    pushed: &std::sync::atomic::AtomicBool,
+) -> Seen {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut seen = Seen { tips: Vec::new(), overlapping: 0 };
+    loop {
+        if !pushed.load(SeqCst) {
+            seen.overlapping += 1;
+        }
+        let out = git(copy, Some(token), &["fetch", "-q"]);
+        assert!(
+            out.status.success(),
+            "a fetch during the push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git_ok(copy, None, &["fsck", "--strict"]);
+        seen.tips.push(
+            branches
+                .iter()
+                .map(|b| git_ok(copy, None, &["rev-parse", &format!("origin/{b}")]))
+                .collect(),
+        );
+        if seen.tips.len() >= min_rounds && pushed.load(SeqCst) {
+            return seen;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_025_fetch_during_a_push() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let c4 = env.shas[3].clone();
+    let mut c8 = String::new();
+    for i in 5..=8 {
+        c8 = commit_file(
+            env.work.path(),
+            &format!("p{i}.txt"),
+            &heavy_text(i as u64, 600),
+            &format!("c{i}"),
+        );
+    }
+    let (work, url, token) =
+        (env.work.path().to_path_buf(), env.server.url(&env.project), env.admin());
+    let pushed = Arc::new(AtomicBool::new(false));
+    let pusher = {
+        let (work, url, token, pushed) = (work.clone(), url.clone(), token.clone(), pushed.clone());
+        tokio::task::spawn_blocking(move || {
+            git_ok(&work, Some(&token), &["push", "-q", &url, "main:refs/heads/main"]);
+            pushed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let (copy2, token2, flag) = (copy.clone(), token.clone(), pushed.clone());
+    let fetcher =
+        tokio::task::spawn_blocking(move || fetch_rounds(&copy2, &token2, &["main"], 3, &flag));
+    let seen = fetcher.await.expect("fetches");
+    pusher.await.expect("push");
+    assert!(seen.overlapping >= 1, "no fetch began before the push was over");
+    for tips in &seen.tips {
+        assert!(tips[0] == c4 || tips[0] == c8, "a fetch saw {} between c4 and c8", tips[0]);
+    }
+    let last = fetch_rounds(&copy, &token, &["main"], 1, &pushed);
+    assert_eq!(last.tips[0][0], c8, "once the push is over the copy gets all of it");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_026_a_push_that_fails_during_a_fetch() {
+    let env = Env::with_history(4, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    let c4 = env.shas[3].clone();
+    let c5 = commit_file(env.work.path(), "p5.txt", &heavy_text(5, 600), "c5");
+    let stranger = env.server.token(STRANGER);
+    let (work, url) = (env.work.path().to_path_buf(), env.server.url(&env.project));
+    let pushed = Arc::new(AtomicBool::new(false));
+    let pusher = {
+        let (stranger, url, pushed) = (stranger, url, pushed.clone());
+        tokio::task::spawn_blocking(move || {
+            // not a member: the membership check refuses the request before any pack is read
+            let out = git(&work, Some(&stranger), &["push", "-q", &url, "main:refs/heads/main"]);
+            pushed.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(!out.status.success(), "the push is rejected");
+        })
+    };
+    let (copy2, token, flag) = (copy.clone(), env.admin(), pushed.clone());
+    let fetcher =
+        tokio::task::spawn_blocking(move || fetch_rounds(&copy2, &token, &["main"], 3, &flag));
+    let seen = fetcher.await.expect("fetches");
+    pusher.await.expect("push");
+    assert!(seen.tips.iter().all(|t| t[0] == c4), "the copy stays at c4");
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "HEAD"]), c4);
+    let refs = env.refs();
+    assert!(refs.contains(&format!("{c4}\trefs/heads/main")), "main is still at c4: {refs}");
+    assert!(!refs.contains(&c5), "c5 never reached the project");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_027_two_fetches_during_a_push_moving_two_branches() {
+    let env = Env::with_history(4, false).await;
+    let w = env.work.path();
+    let c4 = env.shas[3].clone();
+    git_ok(w, None, &["checkout", "-q", "-b", "feature"]);
+    let f1 = commit_file(w, "feature1.txt", "f1\n", "f1");
+    git_ok(
+        w,
+        Some(&env.admin()),
+        &["push", "-q", &env.server.url(&env.project), "feature:refs/heads/feature"],
+    );
+    git_ok(w, None, &["checkout", "-q", "main"]);
+    let (_d1, copy1) = clone_copy(&env, Some(&env.admin()));
+    let (_d2, copy2) = clone_copy(&env, Some(&env.admin()));
+    let mut c8 = String::new();
+    for i in 5..=8 {
+        c8 = commit_file(w, &format!("p{i}.txt"), &heavy_text(i as u64, 600), &format!("c{i}"));
+    }
+    git_ok(w, None, &["checkout", "-q", "feature"]);
+    commit_file(w, "feature2.txt", &heavy_text(20, 300), "f2");
+    let f3 = commit_file(w, "feature3.txt", &heavy_text(21, 300), "f3");
+    let (work, url, token) = (w.to_path_buf(), env.server.url(&env.project), env.admin());
+    let pushed = Arc::new(AtomicBool::new(false));
+    let pusher = {
+        let (url, token, pushed) = (url.clone(), token.clone(), pushed.clone());
+        tokio::task::spawn_blocking(move || {
+            git_ok(
+                &work,
+                Some(&token),
+                &["push", "-q", &url, "main:refs/heads/main", "feature:refs/heads/feature"],
+            );
+            pushed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let fetchers: Vec<_> = [copy1.clone(), copy2.clone()]
+        .into_iter()
+        .map(|copy| {
+            let (token, flag) = (token.clone(), pushed.clone());
+            tokio::task::spawn_blocking(move || {
+                fetch_rounds(&copy, &token, &["main", "feature"], 3, &flag)
+            })
+        })
+        .collect();
+    for f in fetchers {
+        let seen = f.await.expect("fetches");
+        assert!(seen.overlapping >= 1, "no fetch began before the push was over");
+        for tips in &seen.tips {
+            assert!(tips[0] == c4 || tips[0] == c8, "main saw {}", tips[0]);
+            assert!(tips[1] == f1 || tips[1] == f3, "feature saw {}", tips[1]);
+        }
+    }
+    pusher.await.expect("push");
+    // the push is over: each copy gets both branches, whether or not they moved together
+    for copy in [&copy1, &copy2] {
+        let last = fetch_rounds(copy, &token, &["main", "feature"], 1, &pushed);
+        assert_eq!(last.tips[0], vec![c8.clone(), f3.clone()]);
+    }
+}
+
+/// A pack longer than one side band packet: the framing must keep every packet within the 65520
+/// bytes the protocol allows, or the client stops with "bad line length". Found by E2E-025.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clone_larger_than_one_side_band_packet() {
+    let env = Env::new(false).await;
+    commit_file(env.work.path(), "big.txt", &heavy_text(7, 400), "big");
+    env.push();
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    assert_eq!(count_commits(&copy, "HEAD"), 1);
+    assert_intact(&copy);
+    let req = request(&[&git_ok(&copy, None, &["rev-parse", "HEAD"])], &[], true);
+    let (status, body) = env.server.upload_pack(&env.project, Some(&env.admin()), &req).await;
+    assert_eq!(status, 200);
+    let mut i = 0;
+    while i + 4 <= body.len() {
+        let len = usize::from_str_radix(std::str::from_utf8(&body[i..i + 4]).unwrap(), 16).unwrap();
+        assert!(len <= 65520, "a packet of {len} bytes at {i}");
+        i += len.max(4);
+    }
 }

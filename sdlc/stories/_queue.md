@@ -139,5 +139,5 @@
 | US-0137 | SPEC-0067 | answer the rounds that do not end the negotiation | US-0136 | 2 | landed | story/US-0137-answer-rounds-that-do-not-end | main |
 | US-0138 | SPEC-0067 | serve only wanted ids a branch or tag reaches | US-0137 | 2 | landed | story/US-0138-serve-only-reachable-wanted-ids | main |
 | US-0139 | SPEC-0067 | tolerate odd requests and options the service does not offer | US-0138 | 2 | landed | story/US-0139-tolerate-odd-requests-and-options | main |
-| US-0140 | SPEC-0067 | prove speed and consistency of fetches | US-0139 | 2 | todo | | |
+| US-0140 | SPEC-0067 | prove speed and consistency of fetches | US-0139 | 2 | landed | story/US-0140-prove-speed-and-consistency | main |
 | US-0141 | SPEC-0067 | document incremental fetch and close the spec | US-0140 | 2 | todo | | |
