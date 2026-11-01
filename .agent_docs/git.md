@@ -140,8 +140,8 @@ Auth gate (`git/http/mod.rs::gate`), in order:
    body limit layer and by an explicit check.
 
 Capabilities are advertised verbatim:
-`multi_ack multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0` for
-upload-pack, `report-status delete-refs side-band-64k quiet atomic ofs-delta
+`multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0` for
+upload-pack (no plain `multi_ack`: SPEC-0069), `report-status delete-refs side-band-64k quiet atomic ofs-delta
 agent=mcp-fs/0.1.0` for receive-pack.
 
 ### Negotiation (SPEC-0067, 2026-10-31)
@@ -178,8 +178,8 @@ Declared differences from git's own server (the reference of the tests): a reque
 characters or names an object that is not a commit is treated as not stated (git
 acknowledges any held object); a wanted id that cannot be served is dropped silently (git
 refuses the request); `shallow`, `deepen` and `filter` lines are not honoured (the answer is
-`NAK` and everything); options other than `multi_ack`, `multi_ack_detailed`, `side-band-64k`,
-`ofs-delta` and `agent` are ignored; an empty request, a request without a wanted line, one
+`NAK` and everything); options other than `multi_ack_detailed`, `side-band-64k`,
+`ofs-delta` and `agent` are ignored (plain `multi_ack` included); an empty request, a request without a wanted line, one
 cut in the middle of a line or lacking a flush is read up to the cut and answered without
 error. Every line is read, in any order, to the end of the request (lines after the end marker too). No limit applies to
 the number of `have` lines (BL-0117). Known gaps: the options the client chose are not honoured, the

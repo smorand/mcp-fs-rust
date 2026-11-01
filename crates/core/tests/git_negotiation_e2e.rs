@@ -1736,3 +1736,110 @@ async fn spec_0068_e2e_006_three_unknown_ids_after_a_satisfying_held_commit() {
     assert!(ours.objects.is_empty());
     assert_eq!(env.refs(), refs0);
 }
+
+// ── the options the service offers and honours (SPEC-0069) ───────────────────
+
+/// A request whose first wanted line carries exactly `caps` as its options.
+fn request_caps(caps: &str, wants: &[&str], haves: &[&str], done: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, w) in wants.iter().enumerate() {
+        let c = if i == 0 { format!(" {caps}") } else { String::new() };
+        out.extend(pkt(&format!("want {w}{c}\n")));
+    }
+    out.extend(b"0000");
+    for h in haves {
+        out.extend(pkt(&format!("have {h}\n")));
+    }
+    if done {
+        out.extend(pkt("done\n"));
+    } else {
+        out.extend(b"0000");
+    }
+    out
+}
+
+/// The options announced with the first ref of the project's listing: the text between the NUL
+/// byte and the newline of the first ref line.
+async fn announced_options(env: &Env) -> String {
+    let url = format!("{}/info/refs?service=git-upload-pack", env.server.url(&env.project));
+    let body = env
+        .server
+        .http
+        .get(url)
+        .bearer_auth(env.admin())
+        .send()
+        .await
+        .expect("info/refs")
+        .bytes()
+        .await
+        .expect("body");
+    let nul = body.iter().position(|b| *b == 0).expect("a NUL byte after the first ref");
+    let end = body[nul..].iter().position(|b| *b == b'\n').expect("a newline") + nul;
+    String::from_utf8(body[nul + 1..end].to_vec()).expect("utf8 options")
+}
+
+const OFFERED: &str = "multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_001_a_real_client_still_clones_and_fetches() {
+    let env = Env::with_history(6, false).await;
+    let (_d, copy) = clone_copy(&env, Some(&env.admin()));
+    assert_eq!(count_commits(&copy, "HEAD"), 6);
+    let c7 = commit_file(env.work.path(), "g7.txt", "seven\n", "c7");
+    env.push();
+    let refs0 = env.refs();
+    // the real client also asks for options the service does not offer (thin-pack, no-done...)
+    fetch(&copy, Some(&env.admin()));
+    assert_eq!(git_ok(&copy, None, &["rev-parse", "origin/main"]), c7);
+    assert_eq!(count_commits(&copy, "origin/main"), 7);
+    assert_intact(&copy);
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_002_the_options_the_service_offers() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let options = announced_options(&env).await;
+    assert_eq!(options, OFFERED);
+    assert!(!options.split(' ').any(|o| o == "multi_ack"), "plain multi_ack is not offered");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_004_a_client_that_asks_only_for_the_plain_multi_ack() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let (c4, c6) = (&env.shas[3], &env.shas[5]);
+    let plain =
+        our_answer(&env, &request_caps("multi_ack side-band-64k ofs-delta", &[c6], &[c4], true))
+            .await;
+    let detailed = our_answer(&env, &request_caps(CAPS, &[c6], &[c4], true)).await;
+    assert_eq!(plain, detailed, "the plain form is answered as the detailed one");
+    assert_eq!(plain.lines, vec![format!("ACK {c4} common"), format!("ACK {c4}")]);
+    assert_eq!(plain.objects.len(), 6);
+    assert!(plain.lines.iter().all(|l| !l.contains("continue")));
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_006_the_options_of_an_empty_project() {
+    let env = Env::new(false).await;
+    assert_eq!(announced_options(&env).await, OFFERED);
+    assert_eq!(env.refs(), "", "no branch is listed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_0069_e2e_007_several_options_the_service_does_not_offer() {
+    let env = Env::with_history(6, false).await;
+    let refs0 = env.refs();
+    let (c4, c6) = (&env.shas[3], &env.shas[5]);
+    let caps = "multi_ack multi_ack_detailed side-band-64k thin-pack include-tag";
+    let many = our_answer(&env, &request_caps(caps, &[c6], &[c4], true)).await;
+    let plain =
+        our_answer(&env, &request_caps("multi_ack_detailed side-band-64k", &[c6], &[c4], true))
+            .await;
+    assert_eq!(many, plain);
+    assert_eq!(many.lines, vec![format!("ACK {c4} common"), format!("ACK {c4}")]);
+    assert_eq!(env.refs(), refs0);
+}

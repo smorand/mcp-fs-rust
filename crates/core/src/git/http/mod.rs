@@ -16,12 +16,10 @@
 //! Deliberate parity choices, all matching the C# byte for byte:
 //!
 //! * Capability strings match the reference, including `agent=mcp-fs/0.1.0`, with one
-//!   addition: `multi_ack_detailed` on upload-pack, which git requires over smart HTTP
-//!   (see `UPLOAD_PACK_CAPABILITIES`).
-//! * The pack is always full (no real have/want negotiation): a revwalk is pushed with
-//!   every wanted tip and fed to `insert_walk`, so the pack carries the tips plus their
-//!   whole ancestry, then a NAK is sent. A want that is not a commit (a tag or a bare
-//!   tree) still goes through `insert_recursive`.
+//!   difference: upload-pack announces `multi_ack_detailed` (which git requires over smart
+//!   HTTP) and not the plain `multi_ack` (see `UPLOAD_PACK_CAPABILITIES`).
+//! * Fetch negotiates like git's own server (`negotiate.rs`, SPEC-0067): the pack carries what
+//!   the wanted commits need minus the contents of the commits the client holds.
 //! * The receive-pack report DOES send the `unpack ok` line that git's report-status
 //!   requires. The C# omits it, which makes a real `git push` report a failure even
 //!   though the refs update correctly. This is a deliberate divergence: reproducing a
@@ -56,7 +54,9 @@ use pktline::{PacketType, PktReader};
 use serde::Deserialize;
 use std::sync::Arc;
 
-/// Advertised upload-pack capabilities.
+/// Advertised upload-pack capabilities: exactly the options the service honours (SPEC-0069).
+/// The plain `multi_ack` is not among them: git itself refuses to negotiate over HTTP
+/// without the detailed form, so no client can use the plain one.
 ///
 /// `multi_ack_detailed` is REQUIRED by git over smart HTTP: with `--stateless-rpc` the
 /// client refuses to negotiate without it ("the option '--stateless-rpc' requires
@@ -65,7 +65,7 @@ use std::sync::Arc;
 /// detailed variant is a deliberate divergence: parity that leaves the documented git
 /// protocol unusable is not useful parity.
 const UPLOAD_PACK_CAPABILITIES: &str =
-    "multi_ack multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0";
+    "multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0";
 const RECEIVE_PACK_CAPABILITIES: &str =
     "report-status delete-refs side-band-64k quiet atomic ofs-delta agent=mcp-fs/0.1.0";
 const ZERO_ID: &str = "0000000000000000000000000000000000000000";
@@ -634,10 +634,11 @@ mod tests {
     }
 
     #[test]
-    fn capability_strings_match_the_csharp() {
+    fn capability_strings_are_the_options_the_service_honours() {
+        // the C# text plus nothing the service does not honour: no plain `multi_ack`
         assert_eq!(
             UPLOAD_PACK_CAPABILITIES,
-            "multi_ack multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0"
+            "multi_ack_detailed side-band-64k ofs-delta agent=mcp-fs/0.1.0"
         );
         assert_eq!(
             RECEIVE_PACK_CAPABILITIES,

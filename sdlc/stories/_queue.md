@@ -143,6 +143,6 @@
 | US-0141 | SPEC-0067 | document incremental fetch and close the spec | US-0140 | 2 | landed | story/US-0141-document-incremental-fetch-and-close | main |
 | US-0142 | SPEC-0067 | read the lines of a request in any order | US-0141 | 2 | landed | story/US-0142-read-the-lines-of-a-request-in-any-order | main |
 | US-0143 | SPEC-0068 | pin the ready line that names an unknown id | main | 2 | landed | story/US-0143-pin-the-ready-line-that-names-an-unknown-id | main |
-| US-0144 | SPEC-0069 | announce only the options the service honours | US-0143 | 2 | todo | | |
+| US-0144 | SPEC-0069 | announce only the options the service honours | US-0143 | 2 | landed | story/US-0144-announce-only-the-honoured-options | main |
 | US-0145 | SPEC-0069 | send the objects unframed without the side band | US-0144 | 2 | todo | | |
 | US-0146 | SPEC-0070 | cap the held ids read from one request | US-0145 | 2 | todo | | |
