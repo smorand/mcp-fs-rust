@@ -181,7 +181,7 @@ refuses the request); `shallow`, `deepen` and `filter` lines are not honoured (t
 `NAK` and everything); options other than `multi_ack`, `multi_ack_detailed`, `side-band-64k`,
 `ofs-delta` and `agent` are ignored; an empty request, a request without a wanted line, one
 cut in the middle of a line or lacking a flush is read up to the cut and answered without
-error. Lines after the closing flush or the end marker are not read. No limit applies to
+error. Every line is read, in any order, to the end of the request (lines after the end marker too). No limit applies to
 the number of `have` lines (BL-0117). Known gaps: the options the client chose are not honoured, the
 answer is always the `multi_ack_detailed` form on side-band (BL-0119); an unknown held id can appear in
 an `ACK <id> ready` line as it does with git's own server, which the spec words differently (BL-0118).

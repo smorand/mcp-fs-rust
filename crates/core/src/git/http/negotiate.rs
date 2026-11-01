@@ -18,7 +18,7 @@ use std::collections::HashSet;
 pub struct Request {
     /// Wanted ids as written, in order; the options after the first id are not kept.
     pub wants: Vec<String>,
-    /// Held ids as written, in order, up to the flush or end marker that closes the haves.
+    /// Held ids as written, in order, wherever they appear in the request.
     pub haves: Vec<String>,
     /// The end marker was present: the client now expects the objects.
     pub done: bool,
@@ -26,27 +26,20 @@ pub struct Request {
     pub option_line: bool,
 }
 
-/// Read the whole request. A flush that follows the haves, a second flush or the end marker
-/// closes it; the flush after the wanted lines does not. A line cut by the end of the input is
-/// dropped, and lines after the closing flush or the end marker are not read.
+/// Read the whole request: every line, whatever its order, to the end of the input. Flushes
+/// and the other control packets only separate the sections a client writes (wants, haves) and
+/// carry no meaning here, so a missing one changes nothing; the end marker is noted and the
+/// lines after it are still read. A line cut by the end of the input is dropped.
 pub fn parse(body: &[u8]) -> Request {
     let mut req = Request::default();
     let mut reader = PktReader::new(body);
-    let mut flushes = 0;
     while !reader.remaining().is_empty() {
         let (line, kind) = reader.read_line();
         // A line cut by the end of the request is dropped: only complete lines are read.
         if reader.last_was_cut() {
             break;
         }
-        if kind == PacketType::Flush {
-            flushes += 1;
-            if flushes > 1 || !req.haves.is_empty() {
-                break;
-            }
-            continue;
-        }
-        let Some(line) = line else { break };
+        let (PacketType::Data, Some(line)) = (kind, line) else { continue };
         if let Some(rest) = line.strip_prefix("want ") {
             // The first want carries the client's options after a space.
             req.wants.push(rest.trim().split(' ').next().unwrap_or("").to_string());
@@ -54,7 +47,6 @@ pub fn parse(body: &[u8]) -> Request {
             req.haves.push(rest.trim().to_string());
         } else if line == "done" {
             req.done = true;
-            break;
         } else if line.starts_with("shallow ")
             || line.starts_with("deepen")
             || line.starts_with("filter ")

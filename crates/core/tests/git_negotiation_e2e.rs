@@ -1557,3 +1557,65 @@ async fn a_clone_larger_than_one_side_band_packet() {
         i += len.max(4);
     }
 }
+
+// ── lines in an unexpected order (US-0142) ───────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fr_new_014_a_held_id_before_the_wanted_line() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c6, c4) = (&env.shas[5], &env.shas[3]);
+    let mut odd = pkt(&format!("have {c4}\n"));
+    odd.extend(pkt(&format!("want {c6} {CAPS}\n")));
+    odd.extend(b"0000");
+    odd.extend(pkt("done\n"));
+    let ours = our_answer(&env, &odd).await;
+    assert_same_answer(&ours, &reference_answer(bare.path(), &request(&[c6], &[c4], true)));
+    assert_eq!(ours.objects.len(), 6, "the objects of c5 and c6");
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fr_new_014_a_deepen_line_after_the_held_ids() {
+    let env = Env::with_history(4, false).await;
+    let bare = env.bare_copy();
+    let refs0 = env.refs();
+    let (c4, c2) = (&env.shas[3], &env.shas[1]);
+    let mut odd = pkt(&format!("want {c4} {CAPS}\n"));
+    odd.extend(b"0000");
+    odd.extend(pkt(&format!("have {c2}\n")));
+    odd.extend(b"0000");
+    odd.extend(pkt("deepen 1\n"));
+    odd.extend(pkt("done\n"));
+    let ours = our_answer(&env, &odd).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()], "the option still wins over the held id");
+    assert_eq!(ours.objects, everything(bare.path(), c4).objects);
+    assert_eq!(env.refs(), refs0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fr_new_014_lines_after_the_end_marker_and_control_packets_between_lines() {
+    let env = Env::with_history(6, false).await;
+    let bare = env.bare_copy();
+    let (c6, c4) = (&env.shas[5], &env.shas[3]);
+    let usual = request(&[c6], &[c4], true);
+    let expected = reference_answer(bare.path(), &usual);
+    // the wanted line and a held id after the end marker
+    let mut odd = pkt("done\n");
+    odd.extend(pkt(&format!("have {c4}\n")));
+    odd.extend(pkt(&format!("want {c6} {CAPS}\n")));
+    assert_same_answer(&our_answer(&env, &odd).await, &expected);
+    // delimiter and response end packets between the lines are skipped like flushes
+    let mut odd = pkt(&format!("want {c6} {CAPS}\n"));
+    odd.extend(b"0001");
+    odd.extend(pkt(&format!("have {c4}\n")));
+    odd.extend(b"0002");
+    odd.extend(pkt("done\n"));
+    assert_same_answer(&our_answer(&env, &odd).await, &expected);
+    // a deepen line after the end marker still counts
+    let mut odd = request(&[c4], &[&env.shas[1]], true);
+    odd.extend(pkt("deepen 1\n"));
+    let ours = our_answer(&env, &odd).await;
+    assert_eq!(ours.lines, vec!["NAK".to_string()]);
+}
