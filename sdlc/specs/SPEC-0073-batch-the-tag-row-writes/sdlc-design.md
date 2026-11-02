@@ -16,7 +16,7 @@
 
 ## 1. Debt
 ### DBT-001: one database commit per incoming tag
-- **Current structure:** `reconcile_incoming_tags` awaits `entry.db.set_ref(...)` once per added tag inside its loop (`crates/core/src/tools/git_tags.rs:446-447`). `set_ref` is a single autocommit upsert (`crates/core/src/git/db.rs:371-383`), so n added tags cost n commits. The function runs at three sites: clone (`crates/core/src/tools/git.rs:3375`), fetch (`:3931`) and pull (`:6817`). The function also runs `list_refs` before its loop even when `incoming` is empty (`git_tags.rs:433-438`).
+- **Current structure:** `reconcile_incoming_tags` awaits `entry.db.set_ref(...)` once per added tag inside its loop (`crates/core/src/tools/git_tags.rs:446`). `set_ref` is a single autocommit upsert (`crates/core/src/git/db.rs:371-383`), so n added tags cost n commits. The function runs at three sites: clone (`crates/core/src/tools/git.rs:3375`), fetch (`:3931`) and pull (`:6817`). The function also runs `list_refs` before its loop even when `incoming` is empty (`git_tags.rs:433-438`).
 - **Cost paid today:** 2 000 sequential commits for the 2 000 tags of `e2e_tag_048_two_thousand_tags` (`git.rs:25901`), a test that takes 6.59 s end to end in a run of 2026-11-02 (fetch and 2 000 tags built included; the reconcile share is not separated, which is why the gain is stated as a count of commits, Section 2, NFR).
 - **Target structure:** `RelationalGitDb` gets `set_refs(&self, refs: &[(String, String)])` which writes every row in one transaction (`RelationalDb::begin`, `crates/core/src/storage/rel/mod.rs:272`, `RelationalTx::commit` `:292`). `reconcile_incoming_tags` collects the rows to add, calls `set_refs` once, and returns early before `list_refs` when `incoming` is empty. The on disk ref writes (SPEC-0071's `sync_disk_ref`) run after the commit.
 - **Observable behavior:** unchanged for every run that succeeds (DEC-002 for a failure).
@@ -25,7 +25,7 @@
 | File | Change | Occurrences |
 |---|---|---|
 | `crates/core/src/git/db.rs` | add `set_refs`; unit tests | 1 new function |
-| `crates/core/src/tools/git_tags.rs` | `reconcile_incoming_tags` collects, batches, early return on empty | 1 loop (`:446-447`), 1 listing (`:433`) |
+| `crates/core/src/tools/git_tags.rs` | `reconcile_incoming_tags` collects, batches, early return on empty | 1 loop (`:446`), 1 listing (`:433`) |
 | `.agent_docs/git.md` | one sentence in the tag section: the reconcile writes in one transaction | 1 |
 | `sdlc/backlog/BL-0102-*.md` | deleted in the landing commit | 1 |
 
@@ -45,7 +45,7 @@ Not applicable (`Security: n/a`).
 > The git index store SHALL write the tag rows of one reconcile through one call that uses one transaction.
 - **Old form:** `entry.db.set_ref(&tag_ref, &tag.oid.to_string(), false).await?;` inside the loop.
 - **New form:** `entry.db.set_refs(&rows).await?;` once, where `rows: Vec<(String, String)>` holds `(refs/tags/<name>, <oid>)` in the incoming order; the rows are written non symbolic.
-- **Applies to:** `git_tags.rs:446-447`, `git/db.rs`.
+- **Applies to:** `git_tags.rs:446`, `git/db.rs`.
 - **Casing convention:** snake_case, the codebase's.
 
 #### DR-002 [EARS-O]: empty input
