@@ -93,9 +93,9 @@ The added tags named in the refusal of a pull that fails after they were deliver
 | E2E-012 | New | side effect | SC-002 | FR-NEW-002 | Medium |
 | E2E-013 | New | failure | SC-003 | FR-NEW-003 | Medium |
 | E2E-014 | New | side effect | SC-003 | FR-NEW-003 | Medium |
-| E2E-015 | New | happy | SC-002 | FR-NEW-002 | Medium |
+| E2E-015 | New | edge | SC-002 | FR-NEW-002 | Medium |
 
-Coverage: happy 2, failure 6, side effect 3, edge 4, state transition 0 (none changes), security 0 (not a security change). Happy to failure ratio 1:3.
+Coverage: happy 1, failure 6, side effect 3, edge 5, state transition 0 (none changes), security 0 (not a security change). Happy to failure ratio 1:6.
 
 ### 9.2 New tests
 #### E2E-001: a pull that succeeds
@@ -133,7 +133,7 @@ Coverage: happy 2, failure 6, side effect 3, edge 4, state transition 0 (none ch
 | Scenario | Requirements | Happy | Failure | Edge |
 |---|---|---|---|---|
 | SC-001 | FR-NEW-001, FR-NEW-003 | E2E-013 (pause is not failure) | E2E-002, 003, 004, 010 | E2E-005 |
-| SC-002 | FR-NEW-002 | E2E-015 | E2E-011 | E2E-006, 007 |
+| SC-002 | FR-NEW-002 | E2E-001 (a pull that delivers no list needs no shortening) | E2E-011 | E2E-006, 007, 015 |
 | SC-003 | FR-NEW-001, FR-NEW-003 | E2E-001 | E2E-013, 014 | E2E-008 |
 
 Side effects: SC-001 E2E-009; SC-002 E2E-012; SC-003 E2E-014. Requirement coverage: FR-NEW-001 has E2E-002, 003, 008, 009, 010 (5); FR-NEW-002 has E2E-006, 007, 011, 012, 015 (5); FR-NEW-003 has E2E-001, 004, 005, 008, 013, 014 (6).
