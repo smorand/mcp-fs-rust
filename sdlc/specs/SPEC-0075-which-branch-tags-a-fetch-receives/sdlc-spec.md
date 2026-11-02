@@ -79,22 +79,28 @@ The branch rule for fetch and pull, and its tests.
 |---|---|---|---|---|---|
 | E2E-001 | New | happy | SC-001 | FR-NEW-001 | High |
 | E2E-002 | New | failure | SC-001 | FR-NEW-001 | Critical |
-| E2E-003 | New | edge | SC-002 | FR-NEW-001 | High |
+| E2E-003 | New | happy | SC-002 | FR-NEW-001 | High |
 | E2E-004 | New | edge | SC-003 | FR-NEW-001, FR-NEW-002 | High |
 | E2E-005 | New | happy | SC-003 | FR-NEW-002 | High |
 | E2E-006 | New | failure | SC-003 | FR-NEW-002 | High |
 | E2E-007 | New | edge | SC-001 | FR-NEW-001, FR-NEW-002 | Medium |
 | E2E-008 | New | side effect | SC-001 | FR-NEW-001 | Medium |
 | E2E-009 | New | failure | SC-001 | FR-NEW-001 | Medium |
+| E2E-010 | New | failure | SC-002 | FR-NEW-001 | High |
+| E2E-011 | New | edge | SC-002 | FR-NEW-001 | Medium |
+| E2E-012 | New | side effect | SC-002 | FR-NEW-001 | Medium |
+| E2E-013 | New | side effect | SC-003 | FR-NEW-002 | Medium |
+| E2E-014 | New | failure | SC-003 | FR-NEW-002 | Medium |
+| E2E-015 | New | failure | SC-002 | FR-NEW-001 | Medium |
 
-Coverage: happy 2, failure 3, side effect 1, edge 3, state transition 0 (none changes), security 0 (not a security change). Happy to failure ratio 2:3.
+Coverage: happy 3, failure 6, side effect 3, edge 3, state transition 0 (none changes), security 0 (not a security change). Happy to failure ratio 3:6 (1:2).
 
 ### 9.2 New tests
 #### E2E-001: fetch on the checked-out branch
 - **Given** Alice with `main` checked out; remote tag `v1.0` on `main`'s history. **When** she fetches. **Then** `v1.0` is reported as added and listed in the project.
 #### E2E-002: tag on another branch is ignored
 - **Given** the E2E-001 remote plus `experimental` holding tag `v9.0` (plain) and `v9.1` (annotated, message `outside`) only. **When** Alice, on `main`, fetches. **Then** neither is listed and neither name appears in the result.
-#### E2E-003: no checked-out branch
+#### E2E-003: no checked-out branch (happy)
 - **Given** no branch checked out; the remote's default branch is `main`. **When** Alice fetches. **Then** `v1.0` is added and `v9.0` is not.
 #### E2E-004: a later fetch of the other branch
 - **Given** E2E-002's end state, then Alice checks out `experimental`. **When** she fetches. **Then** `v9.0` and `v9.1` are added; `v1.0` stays and is not reported again.
@@ -109,15 +115,28 @@ Coverage: happy 2, failure 3, side effect 1, edge 3, state transition 0 (none ch
 #### E2E-009: remote down
 - **Given** Alice with `main` checked out and a remote that does not exist. **When** she fetches. **Then** the fetch fails with the connection failure text and no tag is listed.
 
+#### E2E-010: no checked-out branch, other branch's tag
+- **Failure.** **Given** no branch checked out, the remote's default branch `main`, and `v9.0` only on `experimental`. **When** Alice fetches. **Then** `v9.0` is not listed and not mentioned in the result.
+#### E2E-011: a detached position behaves like no branch
+- **Edge.** **Given** Alice has checked out the commit `a1b2c3d` rather than a branch, and the remote's default branch is `main`. **When** she fetches. **Then** `v1.0` is added and `v9.0` is not.
+#### E2E-012: a fetch with no checked-out branch changes nothing else
+- **Side effect.** **Given** E2E-010's set up. **When** Alice fetches. **Then** the project's tag list is exactly `v1.0` and the remote's tags are unchanged.
+#### E2E-013: pulling both branches
+- **Side effect.** **Given** the E2E-002 remote. **When** Alice pulls `experimental`, then `main`, then `experimental` again. **Then** the project lists `v1.0`, `v9.0` and `v9.1` once each, and the third pull reports no tag added.
+#### E2E-014: a pull fails
+- **Failure.** **Given** Alice and a remote that does not exist. **When** she pulls `experimental`. **Then** the pull fails with the connection failure text and no tag is listed.
+#### E2E-015: the remote has no default branch
+- **Failure.** **Given** no branch checked out in the project and a remote whose default position names no branch. **When** Alice fetches. **Then** the fetch succeeds, the remote's branches are updated, and no tag is added, with no tag error.
+
 ## 10. Traceability
 | Scenario | Requirements | Happy | Failure | Edge |
 |---|---|---|---|---|
 | SC-001 | FR-NEW-001 | E2E-001 | E2E-002, 009 | E2E-007 |
-| SC-002 | FR-NEW-001 | E2E-003 (default branch) | E2E-002 (no other-branch tag) | E2E-003 |
-| SC-003 | FR-NEW-002, FR-NEW-001 | E2E-005 | E2E-006 | E2E-004 |
+| SC-002 | FR-NEW-001 | E2E-003 (default branch decides) | E2E-010, 015 | E2E-011 |
+| SC-003 | FR-NEW-002 | E2E-005 | E2E-006, 014 | E2E-004 |
 
-Requirement coverage: FR-NEW-001 has E2E-001, 002, 003, 004, 007, 008, 009 (7 tests); FR-NEW-002 has E2E-004, 005, 006, 007 (4 tests).
-SC-001 side effect: E2E-008. SC-002 and SC-003 inherit it (same assertion).
+Side effects: SC-001 E2E-008; SC-002 E2E-012; SC-003 E2E-013. Per scenario: SC-001 has E2E-001, 002, 007, 008, 009 (5); SC-002 has E2E-003, 010, 011, 012, 015 (5); SC-003 has E2E-004, 005, 006, 013, 014 (5).
+Requirement coverage: FR-NEW-001 has E2E-001, 002, 003, 004, 007, 008, 009, 010, 011, 012, 015 (11 tests); FR-NEW-002 has E2E-004, 005, 006, 007, 013, 014 (6 tests).
 
 ## 11. Open questions
 None.
