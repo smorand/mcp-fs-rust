@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: one observable behavior (the text of a failed pull), one module family, 3 anticipated requirements, no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-02
 > Project: existing
 > From backlog: BL-0100

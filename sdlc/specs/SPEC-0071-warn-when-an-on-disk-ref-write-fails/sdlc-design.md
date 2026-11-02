@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 2 files, 3 sites, no public contract change, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-02
 > Behavior change: none
 > From backlog: BL-0095, BL-0105
@@ -117,3 +117,32 @@ None.
 | 1 | 0 | 0 | IMPLEMENTABLE |
 
 **Amendments applied:** none.
+
+## Design additions (2026-11-02)
+> Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skills loaded: rust.
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/tools/git.rs` | modify (add `sync_disk_ref` near `validate_ref_name`, switch `branch_create`, add tests DT-001, DT-003, DT-004, DT-010, DT-011) | DR-001, DR-002, DR-004 | US-0147 |
+| `crates/core/src/tools/git_tags.rs` | modify (`tag_create` and `reconcile_incoming_tags` call the helper; the `is_valid_name` guard in the reconcile) | DR-001, DR-003 | US-0147 |
+| `.agent_docs/git.md` | modify (the sentence at `:942` that names BL-0095 states the warning) | DR-002 | US-0147 |
+Affected existing tests: keep all. Documentation: `.agent_docs/git.md`.
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001, DT-002, DT-003, DT-004 | integration | direct tool call on `Env` plus the `CapturedLog` writer of `git.rs:23637` (`tracing::subscriber::set_default`) | `crates/core/src/tools/git.rs` tests | US-0147 |
+| DT-010, DT-011 | structural | `include_str!` of the two source files, function body sliced from `fn <name>(` to the next line starting with `fn ` or `async fn ` | `crates/core/src/tools/git.rs` tests | US-0147 |
+Test data: generated. The blocked write is made by creating an empty file `<repo path>/refs/heads/feat.lock` (or `refs/tags/v1.lock`) before the call: libgit2 refuses to take the lock and `Repository::reference` returns an error (ASSUMED: libgit2 behavior; the RED run shows it).
+
+### Decisions (continuing)
+- **DEC-004:** the helper is `pub(crate) fn sync_disk_ref(repo: &git2::Repository, ref_name: &str, oid: git2::Oid, tool: &str)`, in `crates/core/src/tools/git.rs`, returning nothing. It calls `repo.reference(ref_name, oid, true, &format!("mcp-fs {tool}"))` and on `Err(e)` emits `tracing::warn!(tool, r#ref = ref_name, error = %e, "on disk ref write failed")`. **Obliged by:** DR-001, DR-002. **Rationale:** a unit return keeps the three call sites one line each; the reflog message stays `mcp-fs <tool>`. **Alternatives considered:** returning a `Result` the caller ignores (rejected: recreates the silent discard); a method on `BlobObjectDb` (rejected: the repository handle is not owned there). **Source:** design. **Evidence:** `git.rs:2504`, `git_tags.rs:158`, `:449`.
+- **DEC-005:** `reconcile_incoming_tags` checks `git2::Reference::is_valid_name(&tag_ref)` before calling the helper; a rejected name logs the same warning with `error = "invalid reference name"` through a second function `warn_disk_ref_skipped(tool, ref_name, why)` that the helper also uses. **Obliged by:** DR-003. **Rationale:** one warning shape. **Alternatives considered:** let `reference` fail on `a//b` (rejected: libgit2 normalises it to `a/b` instead of failing, `git_tags.rs:699-704`). **Source:** existing code.
+- **DEC-006:** one story: three call sites, one helper, six tests, three files, tier 2. **Obliged by:** n/a (no code impact): partitioning only. **Alternatives considered:** one story per site (rejected: each would add a helper use with no way to show the new warning). **Source:** design.
+- **DEC-007:** red evidence: DT-001 to DT-003 fail before the change (no warning); DT-004 passes on arrival and is proven by the named mutation of the spec (the helper always warns). DT-010 and DT-011 fail before the change (the discarded writes exist). **Obliged by:** DR-002. **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0147 | warn when an on disk ref write fails | P1 | DR-001 to DR-005 | main | 2 | yes |

@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 2 files, 1 debt item, no public contract change, no persisted schema change
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-02
 > Behavior change: none
 > From backlog: BL-0102
@@ -115,3 +115,34 @@ Order note: apply after SPEC-0071 (same function), or resolve the small merge by
 | 1 | 0 | 0 | IMPLEMENTABLE |
 
 **Amendments applied:** none.
+
+## Design additions (2026-11-02)
+> Target tier: 2 (default). Skills loaded: rust.
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/db.rs` | modify (add `set_refs` after `set_ref`; a test wrapper `CountingRel` and tests) | DR-001, DR-005 | US-0148 |
+| `crates/core/src/tools/git_tags.rs` | modify (`reconcile_incoming_tags`: early return on empty, collect, one `set_refs`; tests DT-003, DT-004, DT-010) | DR-001, DR-002, DR-003 | US-0148 |
+| `.agent_docs/git.md` | modify (one sentence: the reconcile writes its rows in one transaction) | DR-001 | US-0148 |
+Affected existing tests: keep all. Documentation: `.agent_docs/git.md`.
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001, DT-002 | integration | `set_refs` on a `RelationalGitDb` over `CountingRel` | `crates/core/src/git/db.rs` tests | US-0148 |
+| DT-003, DT-004 | integration | `reconcile_incoming_tags` on a `GitRepoEntry` built in the test (temp bare repository, `RelationalGitDb` over `CountingRel`, the blob backend the `git/repo.rs` tests use at `repo.rs:226+`) | `crates/core/src/tools/git_tags.rs` tests | US-0148 |
+| DT-010 | structural | `include_str!("git_tags.rs")`, body of `reconcile_incoming_tags` sliced to the next `fn ` | `crates/core/src/tools/git_tags.rs` tests | US-0148 |
+Test data: generated. `CountingRel` is a `RelationalDb` wrapper over `SqliteRelationalDb::open_in_memory()` that counts `execute` (autocommit), `query`, `begin` and commits, and can be told to fail the n-th statement executed inside a transaction; the existing `CountingDb` of `storage/rel/mod.rs:395` is private and writes nothing, so it cannot be reused.
+
+### Decisions (continuing)
+- **DEC-004:** `pub async fn set_refs(&self, refs: &[(String, String)]) -> Result<()>` on `RelationalGitDb`: `let mut tx = self.db.begin().await?;` then one upsert per row (the SQL of `set_ref`, `symbolic` bound to 0), `tx.commit().await?`; an error returns before `commit`, so dropping the handle rolls back (`rel/mod.rs:271`). **Obliged by:** DR-001, DR-005. **Rationale:** `begin()` and not `run_retrying`: the upserts are idempotent so either works, and no transient failure of this write was ever shown; a plain transaction is the least code. **Alternatives considered:** `run_retrying` (rejected: no retry need shown; adds a closure); multi row insert (rejected by DEC-001). **Source:** design. **Evidence:** `db.rs:371-383`, `rel/mod.rs:268-274`.
+- **DEC-005:** `reconcile_incoming_tags` order: return `(vec![], vec![])` when `incoming` is empty (before `list_refs`); build `added` rows and `kept_local`; call `set_refs(&rows)` once if `rows` is non empty; then for each added tag call the on disk write (`sync_disk_ref` from SPEC-0071 when present, else the existing `let _ = repo.reference(...)`). **Obliged by:** DR-001, DR-002. **Source:** design. **Evidence:** `git_tags.rs:433-460`.
+- **DEC-006:** one story (three files, five tests). **Obliged by:** n/a (no code impact): partitioning only. **Source:** design.
+- **DEC-007:** red evidence: DT-002, DT-003, DT-004, DT-010 fail before the change; DT-001 passes on arrival and is proven by the named mutation of the spec. **Obliged by:** DR-005. **Source:** design.
+- **DEC-008:** order against SPEC-0071: US-0148 depends on US-0147 in the queue; if US-0147 has landed, step 3 of DEC-005 calls `sync_disk_ref`; the story must not reintroduce a discarded `let _ = repo.reference(` in `reconcile_incoming_tags` (DT-010 of SPEC-0071 forbids it). **Obliged by:** DR-001. **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0148 | batch the tag row writes of the reconcile | P1 | DR-001 to DR-005 | US-0147 | 2 | yes |
