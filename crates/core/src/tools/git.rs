@@ -6640,6 +6640,49 @@ async fn remote_pull(
     .await
 }
 
+/// The sentence a failed pull appends to its refusal when it already brought
+/// tags in: the tags stay in the project, the error carries no data, and a retry
+/// cannot list them as added because they are local by then (SPEC-0076).
+fn delivered_tags_sentence(added: &[String]) -> Option<String> {
+    if added.is_empty() {
+        return None;
+    }
+    Some(format!("Tags received before the failure: {}.", added.join(", ")))
+}
+
+/// Test only fault injection for the pull, fired right after the reconcile
+/// stored its tags: a merge error that is not a conflict and a deadline cannot be
+/// made from outside. Keyed by remote URL so parallel tests never see each
+/// other's, the same way `git_tags::after_listing` is.
+#[cfg(test)]
+pub(crate) mod after_reconcile {
+    use super::ToolError;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    pub(crate) enum PullFault {
+        /// The pull fails with this error.
+        Fail(ToolError),
+        /// The pull stalls for this long, so the remote deadline fires first.
+        Stall(Duration),
+    }
+
+    static HOOKS: Mutex<Option<HashMap<String, PullFault>>> = Mutex::new(None);
+
+    pub(crate) fn set(url: &str, fault: PullFault) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(url.into(), fault);
+    }
+
+    pub(super) fn take(url: &str) -> Option<PullFault> {
+        HOOKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut()?.remove(url)
+    }
+}
+
 /// Everything a pull does once the branch guard has passed and a credential
 /// (or none) is resolved: refusing a dirty volume (FR-NEW-029), the fetch
 /// through [`crate::git::remote::fetch_from_remote`] (DEC-012: pull's first
@@ -6851,6 +6894,14 @@ async fn pull_branch_inner(
             )
             .await?;
             *tags_slot_for_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = tags;
+            #[cfg(test)]
+            match after_reconcile::take(&origin_owned) {
+                Some(after_reconcile::PullFault::Fail(e)) => return Err(e),
+                // A blocking sleep: this runs on a blocking pool thread, and a timer
+                // still pending when the test runtime shuts down panics a worker.
+                Some(after_reconcile::PullFault::Stall(d)) => std::thread::sleep(d),
+                None => {}
+            }
             for u in &outcome.refs_updated {
                 entry_for_thread.db.set_ref(&u.ref_name, &u.new_sha, false).await?;
             }
@@ -7022,10 +7073,24 @@ async fn pull_branch_inner(
             })
         }),
     )
-    .await?;
+    .await;
+    let take_tags = || {
+        std::mem::take(&mut *tags_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(mut e) => {
+            // The tags were brought in before the merge was tried and stay in
+            // the project; say which, since a retry cannot (SPEC-0076).
+            if let Some(sentence) = delivered_tags_sentence(&take_tags().0) {
+                e.message.push(' ');
+                e.message.push_str(&sentence);
+            }
+            return Err(e);
+        }
+    };
 
-    let (tags_added, tags_kept_local) =
-        std::mem::take(&mut *tags_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    let (tags_added, tags_kept_local) = take_tags();
 
     let mut result = match outcome {
         PullOutcome::FastForward { old_sha, new_sha, files_changed } => json!({
@@ -26827,6 +26892,178 @@ mod tests {
         call_publish_tag(&e, &url, "v1.0").await.unwrap();
 
         assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(c.as_str()));
+    }
+
+    // ── SPEC-0076: a failed pull reports the tags it delivered ───────────────
+
+    const SENTENCE: &str = "Tags received before the failure:";
+
+    /// A merge error that is not a conflict, injected after the reconcile.
+    fn fail_the_merge(url: &str) {
+        after_reconcile::set(
+            url,
+            after_reconcile::PullFault::Fail(ToolError::internal("merge failed: injected")),
+        );
+    }
+
+    /// A remote one commit ahead of the project, with tag `v1.0` on that commit.
+    async fn pullable_remote(e: &Env, label: &str) -> (std::path::PathBuf, String) {
+        let (dir, url, _) = cloned_remote(e, label).await;
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+        (dir, url)
+    }
+
+    /// SPEC-0076/E2E-001: a pull that succeeds adds no sentence.
+    #[tokio::test]
+    async fn spec_0076_e2e_001_a_pull_that_succeeds() {
+        let e = Env::new().await;
+        let (_dir, url) = pullable_remote(&e, "remote-s76-001").await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert!(!out.to_string().contains(SENTENCE), "{out}");
+    }
+
+    /// SPEC-0076/E2E-002: a quota refusal after the tags names them.
+    #[tokio::test]
+    async fn spec_0076_e2e_002_a_quota_refusal_after_the_tags() {
+        let e = Env::with_quota(800).await;
+        let remote_dir = e.f.dir.path().join("remote-s76-002");
+        let url = seed_bare_remote(&remote_dir, &"A".repeat(790));
+        call_clone_and_import(&e, &url, "anonymous").await.unwrap();
+        e.write("/LOCAL.md", "local only\n").await;
+        e.commit("local addition").await;
+        let first = bare_ref_sha(&remote_dir, "refs/heads/main").unwrap();
+        let c =
+            advance_bare_remote_write(&remote_dir, "refs/heads/main", "README.md", &"B".repeat(20));
+        plain_tag_bare_remote(&remote_dir, "v1.0", &first);
+        plain_tag_bare_remote(&remote_dir, "v2.0", &c);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.code, code::WRITE_QUOTA_EXCEEDED);
+        assert!(
+            err.message.ends_with(" Tags received before the failure: v1.0, v2.0."),
+            "{}",
+            err.message
+        );
+        assert_eq!(tag_names(&e).await, ["v1.0", "v2.0"]);
+    }
+
+    /// SPEC-0076/E2E-003: a merge error after the tags names them.
+    #[tokio::test]
+    async fn spec_0076_e2e_003_a_merge_error_after_the_tags() {
+        let e = Env::new().await;
+        let (_dir, url) = pullable_remote(&e, "remote-s76-003").await;
+        fail_the_merge(&url);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.message, format!("merge failed: injected {SENTENCE} v1.0."));
+    }
+
+    /// SPEC-0076/E2E-004: a remote that is down adds no sentence.
+    #[tokio::test]
+    async fn spec_0076_e2e_004_the_remote_is_down() {
+        let e = Env::new().await;
+        pullable_remote(&e, "remote-s76-004").await;
+        let down = down_remote(&e);
+
+        let err = call_pull_branch(&e, &down, "main", "anonymous").await.unwrap_err();
+
+        assert!(err.message.starts_with(&connection_prefix(&down)), "{}", err.message);
+        assert!(!err.message.contains(SENTENCE), "{}", err.message);
+    }
+
+    /// SPEC-0076/E2E-005: no tag delivered, the merge fails, no sentence.
+    #[tokio::test]
+    async fn spec_0076_e2e_005_no_tag_delivered_and_the_merge_fails() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-s76-005").await;
+        advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        fail_the_merge(&url);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.message, "merge failed: injected");
+    }
+
+    /// SPEC-0076/E2E-008: a retry reports nothing new and the tags stay.
+    #[tokio::test]
+    async fn spec_0076_e2e_008_a_retry_reports_nothing_new() {
+        let e = Env::new().await;
+        let (_dir, url) = pullable_remote(&e, "remote-s76-008").await;
+        fail_the_merge(&url);
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+    }
+
+    /// SPEC-0076/E2E-009: a failed pull changes nothing but the delivered tags.
+    #[tokio::test]
+    async fn spec_0076_e2e_009_nothing_else_changes() {
+        let e = Env::new().await;
+        let (dir, url) = pullable_remote(&e, "remote-s76-009").await;
+        let remote = bare_refs(&dir);
+        let head = e.ref_sha("refs/heads/main").await;
+        fail_the_merge(&url);
+
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(bare_refs(&dir), remote);
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+        assert_eq!(e.ref_sha("refs/heads/main").await, head, "the branch did not move");
+    }
+
+    /// SPEC-0076/E2E-010: a deadline after the tags were delivered names them.
+    #[tokio::test]
+    async fn spec_0076_e2e_010_a_deadline_after_the_tags() {
+        let e = Env::with_hosts_and_timeout(REFERENCE_HOSTS, 1).await;
+        let (_dir, url) = pullable_remote(&e, "remote-s76-010").await;
+        after_reconcile::set(&url, after_reconcile::PullFault::Stall(Duration::from_secs(3)));
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert!(err.message.starts_with("remote timeout: host"), "{}", err.message);
+        assert!(err.message.ends_with(&format!(" {SENTENCE} v1.0.")), "{}", err.message);
+    }
+
+    /// SPEC-0076/E2E-013: a pull that pauses on a conflict is not a failure.
+    #[tokio::test]
+    async fn spec_0076_e2e_013_a_pause_on_a_conflict_is_not_a_failure() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-s76-013").await;
+        e.write("/shared.txt", "local content\n").await;
+        e.commit("local change").await;
+        let c = advance_bare_remote_write(&dir, "refs/heads/main", "shared.txt", "remote\n");
+        plain_tag_bare_remote(&dir, "v1.0", &c);
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(out["status"], "conflict");
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert!(!out.to_string().contains(SENTENCE), "{out}");
+    }
+
+    /// SPEC-0076/E2E-014: a second failure delivers no tag and adds no sentence.
+    #[tokio::test]
+    async fn spec_0076_e2e_014_a_second_failure_adds_no_sentence() {
+        let e = Env::new().await;
+        let (_dir, url) = pullable_remote(&e, "remote-s76-014").await;
+        fail_the_merge(&url);
+        let first = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+        assert!(first.message.contains(SENTENCE), "{}", first.message);
+        fail_the_merge(&url);
+
+        let second = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(second.message, "merge failed: injected");
     }
 
     // ── SPEC-0075: which branch's tags a fetch receives ──────────────────────
