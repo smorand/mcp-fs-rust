@@ -27170,6 +27170,194 @@ mod tests {
         assert_eq!(second.message, "merge failed: injected");
     }
 
+    // ── SPEC-0078: a test transport that answers like a real git server ──────
+
+    use crate::git::test_remote::{Behavior, Remote};
+
+    /// A project cloned from a fresh bare remote, with the double serving that
+    /// remote. Returns the remote directory, the double and the commit `main` is at.
+    async fn served_remote(
+        e: &Env,
+        label: &str,
+        behavior: Behavior,
+    ) -> (std::path::PathBuf, Remote, String) {
+        let (dir, _, a) = cloned_remote(e, label).await;
+        let remote = Remote::start(&dir, behavior).await;
+        (dir, remote, a)
+    }
+
+    /// Runs a blocking libgit2 call off the runtime thread that serves the double.
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    /// SPEC-0078/DT-001: the double serves a clone of a real bare repository.
+    #[tokio::test]
+    async fn dt_0078_001_the_double_serves_a_clone() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-s78-001");
+        seed_bare_remote(&dir, "hi\n");
+        let remote = Remote::start(&dir, Behavior::Normal).await;
+        let (url, into) = (remote.url(), e.f.dir.path().join("clone-s78-001"));
+
+        let tip = blocking(move || {
+            let cloned =
+                crate::git::remote::clone_to_temp(&url, &into, None, 0, None, None).unwrap();
+            cloned.head().unwrap().peel_to_commit().unwrap().id().to_string()
+        })
+        .await;
+
+        assert_eq!(Some(tip), bare_ref_sha(&dir, "refs/heads/main"));
+    }
+
+    /// SPEC-0078/DT-002: a 429 is reported as such, not as a dropped connection.
+    #[tokio::test]
+    async fn dt_0078_002_a_429_is_not_a_dropped_connection() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-s78-002");
+        seed_bare_remote(&dir, "hi\n");
+        let remote = Remote::start(&dir, Behavior::Rate(429)).await;
+        let (url, into) = (remote.url(), e.f.dir.path().join("fetch-s78-002"));
+        let url_for_call = url.clone();
+
+        let message = blocking(move || {
+            let repo = git2::Repository::init_bare(&into).unwrap();
+            match crate::git::remote::fetch_from_remote(
+                &repo,
+                "origin",
+                &url_for_call,
+                None,
+                None,
+                crate::git::remote::TagScope::Off,
+            ) {
+                Ok(_) => panic!("a rate limited fetch must fail"),
+                Err(err) => err.message,
+            }
+        })
+        .await;
+
+        assert!(message.starts_with(&connection_prefix(&url)), "{message}");
+        assert!(message.contains("unexpected http status code: 429"), "{message}");
+        assert!(!message.contains("EOF"), "not a dropped connection: {message}");
+    }
+
+    /// SPEC-0078/DT-003: remote delete and publish all keep their wording against
+    /// a rate limited remote and change nothing (the legs of `e2e_tag_032` and
+    /// `e2e_tag_022`).
+    #[tokio::test]
+    async fn dt_0078_003_rate_limited_delete_and_publish_all() {
+        let e = Env::new().await;
+        let (dir, remote, a) = served_remote(&e, "remote-s78-003", Behavior::Rate(429)).await;
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let url = remote.url();
+        let (refs, audit) = (bare_refs(&dir), audit_size(&e));
+
+        let delete = call_delete_remote_tag(&e, &url, "v1.0", short7(&a)).await.unwrap_err();
+        retrack(&e, &url).await;
+        let publish_all = call_publish_all_tags(&e, "origin", None).await.unwrap_err();
+
+        assert!(delete.message.starts_with(&connection_prefix(&url)), "{}", delete.message);
+        assert!(delete.message.contains("unexpected http status code: 429"), "{}", delete.message);
+        assert!(
+            publish_all.message.starts_with(&publish_tags_prefix(&url)),
+            "{}",
+            publish_all.message
+        );
+        assert!(
+            publish_all.message.contains("unexpected http status code: 429"),
+            "{}",
+            publish_all.message
+        );
+        assert_eq!(bare_refs(&dir), refs);
+        assert_eq!(audit_size(&e), audit);
+    }
+
+    /// SPEC-0078/DT-004: a real server side rejection of a tag push.
+    #[tokio::test]
+    async fn dt_0078_004_a_pre_receive_hook_rejects_the_tag() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = Env::new().await;
+        let (dir, remote, _) = served_remote(&e, "remote-s78-004", Behavior::Normal).await;
+        let hook = dir.join("hooks/pre-receive");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\necho 'tags are frozen' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        let err = call_publish_tag(&e, &remote.url(), "v1.0").await.unwrap_err();
+
+        assert_eq!(err.message, "Remote refused tag 'v1.0': pre-receive hook declined");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+    }
+
+    /// SPEC-0078/DT-005: a clone with a depth keeps the tags of the cloned history.
+    #[tokio::test]
+    async fn dt_0078_005_a_shallow_clone_filters_the_tags_by_history() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-s78-005");
+        seed_bare_remote(&dir, "hi\n");
+        let first = bare_ref_sha(&dir, "refs/heads/main").unwrap();
+        for i in 0..4 {
+            advance_bare_remote(&dir, "refs/heads/main", &format!("c{i}\n"));
+        }
+        let last = bare_ref_sha(&dir, "refs/heads/main").unwrap();
+        plain_tag_bare_remote(&dir, "v1", &first);
+        plain_tag_bare_remote(&dir, "v5", &last);
+        let remote = Remote::start(&dir, Behavior::Normal).await;
+        let (url, into) = (remote.url(), e.f.dir.path().join("clone-s78-005"));
+
+        let names = blocking(move || {
+            let cloned =
+                crate::git::remote::clone_to_temp(&url, &into, None, 2, None, None).unwrap();
+            let tip = cloned.head().unwrap().peel_to_commit().unwrap().id();
+            crate::git::remote::clone_history_tags(&cloned, tip)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        assert_eq!(names, ["v5"]);
+    }
+
+    /// SPEC-0078/DT-006: the answer is lost after the remote applied the tag
+    /// (E2E-077 made real); a retry sees an identical remote tag.
+    #[tokio::test]
+    async fn dt_0078_006_the_answer_is_lost_after_the_remote_accepted_the_tag() {
+        let e = Env::new().await;
+        let (dir, remote, a) = served_remote(&e, "remote-s78-006", Behavior::DropAfterPush).await;
+        tag(&e, json!({"name": "v2.0"})).await.unwrap();
+        let url = remote.url();
+
+        let err = call_publish_tag(&e, &url, "v2.0").await.unwrap_err();
+
+        assert!(err.message.starts_with(&publish_tag_prefix("v2.0", &url)), "{}", err.message);
+        assert!(err.message.contains("unexpected EOF"), "{}", err.message);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v2.0").as_deref(), Some(a.as_str()));
+        let again = Remote::start(&dir, Behavior::Normal).await;
+        let out = call_publish_tag(&e, &again.url(), "v2.0").await.unwrap();
+        assert_eq!(out["up_to_date"], true, "{out}");
+        assert_eq!(out["created"], false, "{out}");
+    }
+
+    /// SPEC-0078/DT-007: the connection drops before the tag arrives (E2E-039 made real).
+    #[tokio::test]
+    async fn dt_0078_007_the_connection_drops_before_the_tag_arrives() {
+        let e = Env::new().await;
+        let (dir, remote, _) = served_remote(&e, "remote-s78-007", Behavior::DropBeforePush).await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let url = remote.url();
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert!(err.message.starts_with(&publish_tag_prefix("v1.0", &url)), "{}", err.message);
+        assert!(err.message.contains("unexpected EOF"), "{}", err.message);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
     // ── SPEC-0077: the other on disk ref writes are reported too ─────────────
 
     /// The `(tool, ref)` of every failed on disk ref write of this test's project.

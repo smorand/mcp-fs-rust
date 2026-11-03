@@ -395,3 +395,21 @@ printf 'Liste mes projets.\nexit\n' | ./target/release/agent --user you   # pipe
   race: `unexpected eof while reading` (class Ssl) or `Connection reset by peer` (class Os). The tag tests that use it assert
   the transport reason through `assert_dropped_reason` / `DROPPED_CONNECTION_REASONS` and accept either; the missing `file://`
   legs stay exact (`No such file or directory`). Never pin a single reason for a dropped connection.
+
+## The git test transport (`git/test_remote.rs`, SPEC-0078, 2026-11-03)
+
+A `file://` remote cannot answer HTTP 429, run server hooks or serve a shallow fetch, and the tool layer
+refuses it anyway. `test_remote::Remote::start(repo_dir, Behavior)` serves a bare repository over
+`http://127.0.0.1:<port>/repo.git` (a free port per test, stopped on drop) through the real
+`git upload-pack` and `git receive-pack` (`--stateless-rpc`), so hooks and shallow negotiation are git's own.
+`Behavior`: `Normal`; `Rate(status)` answers every request with that status and `Retry-After: 1`;
+`DropAfterPush` applies a push then closes without answering; `DropBeforePush` closes when the push arrives.
+
+- Call the blocking libgit2 functions (`clone_to_temp`, `fetch_from_remote`) through `spawn_blocking`; the tool
+  helpers (`call_publish_tag`, `call_delete_remote_tag`, `retrack` then `call_publish_all_tags`) already do.
+- Pinned texts, read from real runs: a 429 reads `unexpected http status code: 429`; a dropped answer or a drop
+  before the push reads `unexpected EOF`; a `pre-receive` rejection reads `Remote refused tag '<t>': pre-receive hook declined`.
+- The tests are `dt_0078_*` in `tools/git.rs`. They describe behavior that exists, so each was proven by a
+  mutation (double answers 500, `Rate` closes the connection, hook removed, depth ignored).
+- The simulated legs (`e2e_tag_039`, `e2e_tag_077`, the file remote tests) stay as cheap guards.
+- An https mode for the registered tool path is SPEC-0078's second story.

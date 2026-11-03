@@ -36,6 +36,8 @@ pub mod odb;
 pub mod provider;
 pub mod remote;
 pub mod repo;
+#[cfg(test)]
+pub(crate) mod test_remote;
 
 pub use db::{GitObjectRow, GitRefRow, RelationalGitDb};
 pub use oauth::{OAuthSession, OAuthTokenStore, RelationalOAuthPersistence};

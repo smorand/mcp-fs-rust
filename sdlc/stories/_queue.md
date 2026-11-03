@@ -156,5 +156,5 @@
 | US-0154 | SPEC-0076 | name the tags a failed pull delivered | US-0153 | 2 | landed | story/US-0154-name-the-tags-a-failed-pull-delivered | main |
 | US-0155 | SPEC-0076 | shorten a long list of delivered tags | US-0154 | 2 | landed | story/US-0155-shorten-a-long-list-of-delivered-tags | main |
 | US-0156 | SPEC-0077 | route the other on disk ref writes through sync_disk_ref | main | 2 | landed | story/US-0156-route-the-other-disk-ref-writes-through-sync | main |
-| US-0157 | SPEC-0078 | add a test transport that answers like a real git server | main | 2 | todo | | |
+| US-0157 | SPEC-0078 | add a test transport that answers like a real git server | main | 2 | landed | story/US-0157-add-a-test-transport-like-real-git | main |
 | US-0158 | SPEC-0078 | serve the test transport over https | US-0157 | 1 | todo | | |
