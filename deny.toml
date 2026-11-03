@@ -21,6 +21,7 @@ ignore = [
     "RUSTSEC-2026-0367", # zip SUID/SGID bits kept on extract, utoipa-swagger-ui build dependency (until BL-0059)
     "RUSTSEC-2026-0368", # zip symlink target escape on extract, utoipa-swagger-ui build dependency (until BL-0059)
     "RUSTSEC-2026-0369", # zip permissions applied through symlinks on extract, utoipa-swagger-ui build dependency (until BL-0059)
+    "RUSTSEC-2026-0429", # zip extract aborts on a symlink entry with a large declared size, utoipa-swagger-ui build dependency (until BL-0059)
 ]
 
 [licenses]

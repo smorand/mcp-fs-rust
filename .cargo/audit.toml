@@ -8,4 +8,5 @@ ignore = [
     "RUSTSEC-2026-0367", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
     "RUSTSEC-2026-0368", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
     "RUSTSEC-2026-0369", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
+    "RUSTSEC-2026-0429", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
 ]

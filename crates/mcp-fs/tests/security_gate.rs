@@ -159,6 +159,7 @@ fn accepted_advisories_are_recorded_once_with_a_reason() {
         "RUSTSEC-2026-0367",
         "RUSTSEC-2026-0368",
         "RUSTSEC-2026-0369",
+        "RUSTSEC-2026-0429",
     ];
     expected.sort_unstable();
     assert_eq!(ids, expected);
@@ -215,14 +216,16 @@ fn archive_rs_cites_no_zip_2_4_2_source() {
     assert!(!raw.contains("zip-2.4.2"), "stale zip-2.4.2 citation in archive.rs");
 }
 
-/// SPEC-0036/DT-036: the three zip ids stay accepted only for the build time
+/// SPEC-0036/DT-036: the four zip ids stay accepted only for the build time
 /// zip 3.0.0 of utoipa-swagger-ui, tracked by BL-0059.
 #[test]
 fn zip_acceptances_name_the_build_time_copy() {
     for file in [".cargo/audit.toml", "deny.toml"] {
         let raw = fs::read_to_string(repo_root().join(file)).expect(file);
         assert!(!raw.contains("BL-0058"), "{file} still names BL-0058");
-        for id in ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"] {
+        for id in
+            ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369", "RUSTSEC-2026-0429"]
+        {
             let line =
                 raw.lines().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{file} lacks {id}"));
             assert!(
