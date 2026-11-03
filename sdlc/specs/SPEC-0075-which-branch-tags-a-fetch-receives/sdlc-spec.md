@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: one observable rule (which branch decides the tags received), one module family, 2 requirements, no persisted change. Override with --depth.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-02
 > Project: existing
 > From backlog: BL-0099

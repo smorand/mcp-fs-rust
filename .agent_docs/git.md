@@ -941,6 +941,13 @@ or an ancestor of one whose history the project holds. A position the project la
 never fetched. Refusal: `Cannot publish tag '<t>': commit <short7> is not on the remote. Publish its
 branch first.`; it comes before any refusal about the remote tag. Tests: `spec_0074_e2e_*`.
 
+**Which branch decides the tags (SPEC-0075).** A fetch scopes the tags to the history of the branch the
+project's `HEAD` row names; with no `HEAD` row, or a non symbolic one (detached), to the history of the
+remote's default branch; a remote with no default branch brings in no tag and no tag error. A pull scopes
+them to the pulled branch. Tags only another branch holds are neither received nor mentioned until that
+branch is checked out and fetched or pulled. Tests: `spec_0075_*`. The tests pull a branch only after
+checking it out, because a pull writes the volume.
+
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
 scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
 real rejection mapping is untested,

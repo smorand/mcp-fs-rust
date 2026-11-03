@@ -26973,6 +26973,107 @@ mod tests {
         assert_eq!(tag_names(&e).await, ["v1.0"]);
     }
 
+    /// SPEC-0075/E2E-004: after the project moves to `experimental`, a fetch
+    /// brings in its tags; `v1.0` stays and is not reported again.
+    #[tokio::test]
+    async fn spec_0075_e2e_004_a_later_fetch_of_the_other_branch() {
+        let e = Env::new().await;
+        let (_dir, url, _, x) = two_branch_remote(&e, "remote-s75-004").await;
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+        e.set_branch("experimental", &x).await;
+        e.checkout("experimental").await;
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v9.0", "v9.1"]);
+        assert_eq!(tag_names(&e).await, ["v1.0", "v9.0", "v9.1"]);
+    }
+
+    /// SPEC-0075/E2E-005: a pull of `experimental` brings in its tags.
+    #[tokio::test]
+    async fn spec_0075_e2e_005_pull_decides_by_the_pulled_branch() {
+        let e = Env::new().await;
+        let (_dir, url, a, _) = two_branch_remote(&e, "remote-s75-005").await;
+        e.set_branch("experimental", &a).await;
+        e.checkout("experimental").await;
+
+        let out = call_pull_branch(&e, &url, "experimental", "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0", "v9.0", "v9.1"]);
+    }
+
+    /// SPEC-0075/E2E-006: a pull of `main` leaves the other branch's tags out.
+    #[tokio::test]
+    async fn spec_0075_e2e_006_a_pull_of_main_leaves_the_other_tags_out() {
+        let e = Env::new().await;
+        let (_dir, url, _, _) = two_branch_remote(&e, "remote-s75-006").await;
+
+        let out = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+        assert!(!out.to_string().contains("v9."), "{out}");
+    }
+
+    /// SPEC-0075/E2E-007: a tag on the commit `experimental` branched from is
+    /// in both histories and arrives either way.
+    #[tokio::test]
+    async fn spec_0075_e2e_007_a_tag_in_both_histories() {
+        let e = Env::new().await;
+        let (dir, url, a, _) = two_branch_remote(&e, "remote-s75-007").await;
+        plain_tag_bare_remote(&dir, "v0.5", &a);
+        let fetched = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        assert_eq!(names(&fetched["tags_added"]), ["v0.5", "v1.0"]);
+
+        let fresh = Env::new().await;
+        let (_, fresh_url, fresh_a) = cloned_remote(&fresh, "remote-s75-007b").await;
+        let fresh_dir = fresh.f.dir.path().join("remote-s75-007b");
+        plain_tag_bare_remote(&fresh_dir, "v0.5", &fresh_a);
+        create_branch_on_bare_remote(&fresh_dir, "refs/heads/experimental", "refs/heads/main");
+        advance_bare_remote(&fresh_dir, "refs/heads/experimental", "x\n");
+        fresh.set_branch("experimental", &fresh_a).await;
+        fresh.checkout("experimental").await;
+        let pulled =
+            call_pull_branch(&fresh, &fresh_url, "experimental", "anonymous").await.unwrap();
+        assert_eq!(names(&pulled["tags_added"]), ["v0.5"]);
+    }
+
+    /// SPEC-0075/E2E-013: pulling both branches lists each tag once.
+    #[tokio::test]
+    async fn spec_0075_e2e_013_pulling_both_branches() {
+        let e = Env::new().await;
+        let (_dir, url, a, _) = two_branch_remote(&e, "remote-s75-013").await;
+        e.set_branch("experimental", &a).await;
+
+        // `main` first: checking `main` out again after a fast forward of
+        // `experimental` leaves that pull's files in the volume and the next
+        // pull refuses, which is not what this test is about.
+        let first = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(names(&first["tags_added"]), ["v1.0"]);
+        e.checkout("experimental").await;
+        let second = call_pull_branch(&e, &url, "experimental", "anonymous").await.unwrap();
+        assert_eq!(names(&second["tags_added"]), ["v9.0", "v9.1"]);
+        let third = call_pull_branch(&e, &url, "experimental", "anonymous").await.unwrap();
+
+        assert_eq!(tag_names(&e).await, ["v1.0", "v9.0", "v9.1"]);
+        assert_eq!(third["tags_added"], json!([]));
+    }
+
+    /// SPEC-0075/E2E-014: a failed pull brings in no tag.
+    #[tokio::test]
+    async fn spec_0075_e2e_014_a_pull_fails() {
+        let e = Env::new().await;
+        let (_dir, _, a, _) = two_branch_remote(&e, "remote-s75-014").await;
+        e.set_branch("experimental", &a).await;
+        let down = down_remote(&e);
+
+        let err = call_pull_branch(&e, &down, "experimental", "anonymous").await.unwrap_err();
+
+        assert!(err.message.starts_with(&connection_prefix(&down)), "{}", err.message);
+        assert!(tag_list(&e).await.is_empty());
+    }
+
     /// SPEC-0075/E2E-015: a remote whose default position names no branch.
     #[tokio::test]
     async fn spec_0075_e2e_015_the_remote_has_no_default_branch() {
