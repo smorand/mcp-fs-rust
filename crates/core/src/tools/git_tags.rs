@@ -14,7 +14,7 @@ use crate::git::{GitRepoEntry, GitRepoStore};
 use crate::safety::SafetyManager;
 use crate::tools::git::{
     hydrate, on_git_thread, open, parse_oid, reject_if_operation_in_progress,
-    resolve_clone_credential, validate_ref_name,
+    resolve_clone_credential, sync_disk_ref, validate_ref_name, warn_disk_ref_skipped,
 };
 use crate::tools::registry_support::ToolCtx;
 use chrono::{DateTime, Utc};
@@ -155,7 +155,7 @@ async fn tag_create(
     // Keep the on disk refs in step, the same way git.branch_create does. The
     // index row is the source of truth; libgit2 refuses a few names the branch
     // rules accept (DEC-019), and that refusal must not undo a valid tag.
-    let _ = repo.reference(&tag_ref, object, true, "mcp-fs git.tag_create");
+    sync_disk_ref(&repo, &tag_ref, object, "git.tag_create");
 
     // The previous target of a plain tag is its commit; peeling also covers a
     // tag that was annotated before, so the line always names a commit.
@@ -445,8 +445,13 @@ pub(crate) async fn reconcile_incoming_tags(
             None => {
                 entry.db.set_ref(&tag_ref, &tag.oid.to_string(), false).await?;
                 // Keep the on disk refs in step, as git.tag_create does; a
-                // name libgit2 refuses (DEC-019) must not undo the row.
-                let _ = repo.reference(&tag_ref, tag.oid, true, "mcp-fs git.remote_fetch");
+                // name libgit2 would rewrite (`a//b` becomes `a/b`) is not
+                // written at all, and must not undo the row.
+                if git2::Reference::is_valid_name(&tag_ref) {
+                    sync_disk_ref(repo, &tag_ref, tag.oid, "git.remote_fetch");
+                } else {
+                    warn_disk_ref_skipped("git.remote_fetch", &tag_ref, "invalid reference name");
+                }
                 added.push(tag.name.clone());
             }
             Some(target) => {

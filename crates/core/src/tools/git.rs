@@ -2391,6 +2391,36 @@ pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()> {
     Ok(())
 }
 
+/// Keeps the on disk ref in step with the index row that was just written.
+/// The index is the source of truth, so a libgit2 failure (a locked ref, a full
+/// disk) never fails the call; it is logged once so an operator can see that the
+/// two disagree, since nothing repairs the on disk ref later.
+pub(crate) fn sync_disk_ref(repo: &Repository, ref_name: &str, oid: Oid, tool: &str) {
+    if let Err(e) = repo.reference(ref_name, oid, true, &format!("mcp-fs {tool}")) {
+        warn_disk_ref_skipped(tool, ref_name, &e.to_string());
+    }
+}
+
+/// The one warning for an on disk ref that was not written, shared by the helper
+/// and by the callers that refuse to write a name libgit2 would rewrite.
+pub(crate) fn warn_disk_ref_skipped(tool: &str, ref_name: &str, why: &str) {
+    #[cfg(test)]
+    DISK_REF_WARNINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((
+        tool.to_string(),
+        ref_name.to_string(),
+        why.to_string(),
+    ));
+    tracing::warn!(tool, r#ref = ref_name, error = why, "on disk ref write failed");
+}
+
+/// Every warning of [`warn_disk_ref_skipped`] since the process started, for the
+/// tests: the git tools run on blocking pool threads, where no thread local
+/// subscriber of a test can see the event, so the call is also recorded here and
+/// each test reads only the entries of its own, unique, ref name.
+#[cfg(test)]
+pub(crate) static DISK_REF_WARNINGS: std::sync::Mutex<Vec<(String, String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// The seven original rules, shared by the strict form and by the tools that
 /// act on a ref which already exists.
 pub(crate) fn validate_existing_ref_name(name: &str, noun: &str) -> Result<()> {
@@ -2501,7 +2531,7 @@ async fn branch_create(
     entry.db.set_ref(&branch_ref, &sha, false).await?;
     // Keep the on disk refs in step, the same way git.commit does, so libgit2
     // based reads and an operator running `git branch` agree with the index.
-    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.branch_create");
+    sync_disk_ref(&repo, &branch_ref, oid, "git.branch_create");
 
     if checkout {
         entry.db.set_ref("HEAD", &branch_ref, true).await?;
@@ -23711,6 +23741,171 @@ mod tests {
                 assert!(!text.contains(SECRET), "token leaked: {text}");
             }
         });
+    }
+
+    // ── SPEC-0071: a failed on disk ref write is reported, never silent ──────
+
+    /// The captured log and the guard that keeps it installed for the test.
+    fn capture_log() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Takes the lock libgit2 needs for `rel_ref`, so its next write fails.
+    async fn block_disk_ref(e: &Env, rel_ref: &str) {
+        let entry = e.entry().await;
+        let lock = entry.repo.lock().await.path().join(format!("{rel_ref}.lock"));
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, "").unwrap();
+    }
+
+    /// The `(tool, error)` of every warning recorded for exactly `ref_name`.
+    fn disk_ref_warnings(ref_name: &str) -> Vec<(String, String)> {
+        DISK_REF_WARNINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, r, _)| r == ref_name)
+            .map(|(tool, _, why)| (tool.clone(), why.clone()))
+            .collect()
+    }
+
+    /// SPEC-0071/DT-001: a blocked on disk write does not fail `branch_create`.
+    #[tokio::test]
+    async fn dt_0071_001_branch_create_survives_a_blocked_disk_write() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+        block_disk_ref(&e, "refs/heads/dt71-feat").await;
+
+        let out = branch_create(&e, json!({"name": "dt71-feat"})).await;
+
+        assert!(out.is_ok(), "{out:?}");
+        assert!(ref_names(&e).await.contains(&"refs/heads/dt71-feat".to_string()));
+        let warned = disk_ref_warnings("refs/heads/dt71-feat");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0].0, "git.branch_create");
+        assert!(warned[0].1.contains("lock"), "the cause is kept: {warned:?}");
+    }
+
+    /// SPEC-0071/DT-002: a blocked on disk write does not fail `tag_create`.
+    #[tokio::test]
+    async fn dt_0071_002_tag_create_survives_a_blocked_disk_write() {
+        let e = Env::new().await;
+        seed_a(&e).await;
+        block_disk_ref(&e, "refs/tags/dt71-v1").await;
+
+        let out = tag(&e, json!({"name": "dt71-v1"})).await;
+
+        assert!(out.is_ok(), "{out:?}");
+        assert!(tag_target(&e, "dt71-v1").await.is_some());
+        let warned = disk_ref_warnings("refs/tags/dt71-v1");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0].0, "git.tag_create");
+    }
+
+    /// SPEC-0071/DT-003: the reconcile keeps the row of a name libgit2 would
+    /// rewrite, writes no ref for it and says so.
+    #[tokio::test]
+    async fn dt_0071_003_the_reconcile_skips_a_rewritable_name() {
+        let e = Env::new().await;
+        let (_, head) = seed_a(&e).await;
+        let entry = e.entry().await;
+        let incoming = [crate::git::remote::IncomingTag {
+            name: "a//b".to_string(),
+            oid: Oid::from_str(&head).unwrap(),
+            annotated: false,
+        }];
+
+        let repo = entry.repo.lock().await;
+        let (added, kept) =
+            crate::tools::git_tags::reconcile_incoming_tags(&entry, &repo, &incoming)
+                .await
+                .unwrap();
+
+        assert_eq!((added, kept), (vec!["a//b".to_string()], Vec::<String>::new()));
+        assert!(entry.db.get_ref("refs/tags/a//b").await.unwrap().is_some());
+        assert!(repo.find_reference("refs/tags/a/b").is_err(), "libgit2 must not rename it");
+        assert_eq!(
+            disk_ref_warnings("refs/tags/a//b"),
+            vec![("git.remote_fetch".to_string(), "invalid reference name".to_string())]
+        );
+    }
+
+    /// SPEC-0071/DT-004: healthy writes stay silent.
+    #[tokio::test]
+    async fn dt_0071_004_a_healthy_write_is_silent() {
+        let e = Env::new().await;
+        let (_, head) = seed_a(&e).await;
+
+        branch_create(&e, json!({"name": "dt71-ok"})).await.unwrap();
+        tag(&e, json!({"name": "dt71-ok"})).await.unwrap();
+        let entry = e.entry().await;
+        let repo = entry.repo.lock().await;
+        hydrate(&entry, &repo).await.unwrap();
+        let incoming = [crate::git::remote::IncomingTag {
+            name: "dt71-ok2".to_string(),
+            oid: Oid::from_str(&head).unwrap(),
+            annotated: false,
+        }];
+        crate::tools::git_tags::reconcile_incoming_tags(&entry, &repo, &incoming).await.unwrap();
+
+        for r in ["refs/heads/dt71-ok", "refs/tags/dt71-ok", "refs/tags/dt71-ok2"] {
+            assert!(disk_ref_warnings(r).is_empty(), "{r}: {:?}", disk_ref_warnings(r));
+        }
+    }
+
+    /// SPEC-0071/DR-002: the log line names the message and the three fields.
+    #[test]
+    fn dt_0071_005_the_log_line_carries_the_tool_the_ref_and_the_error() {
+        let (log, _guard) = capture_log();
+
+        warn_disk_ref_skipped("git.tag_create", "refs/tags/x", "boom");
+
+        let text = log.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("on disk ref write failed"), "{text}");
+        assert!(text.contains("git.tag_create"), "{text}");
+        assert!(text.contains("refs/tags/x"), "{text}");
+        assert!(text.contains("boom"), "{text}");
+    }
+
+    /// The text of the function that starts at `header`, up to its closing brace
+    /// in column 0.
+    fn fn_body<'a>(source: &'a str, header: &str) -> &'a str {
+        let start = source.find(header).unwrap_or_else(|| panic!("no {header}"));
+        let rest = &source[start..];
+        &rest[..rest.find("\n}\n").expect("closing brace")]
+    }
+
+    /// SPEC-0071/DT-010: no on disk ref write is discarded at the three sites.
+    #[test]
+    fn dt_0071_010_no_discarded_ref_write_at_the_three_sites() {
+        let tags = include_str!("git_tags.rs");
+        let git = include_str!("git.rs");
+        assert!(!tags.contains("let _ = repo.reference("), "git_tags.rs still discards a write");
+        let branch = fn_body(git, "async fn branch_create(");
+        assert!(!branch.contains("let _ = repo.reference("), "branch_create still discards");
+    }
+
+    /// SPEC-0071/DT-011: the three sites reach libgit2 only through the helper.
+    #[test]
+    fn dt_0071_011_one_writer_for_the_three_sites() {
+        let tags = include_str!("git_tags.rs");
+        let git = include_str!("git.rs");
+        for (source, header) in [
+            (git, "async fn branch_create("),
+            (tags, "async fn tag_create("),
+            (tags, "pub(crate) async fn reconcile_incoming_tags("),
+        ] {
+            let body = fn_body(source, header);
+            assert!(!body.contains(".reference("), "{header} writes a ref by itself");
+            assert!(body.contains("sync_disk_ref("), "{header} does not use the helper");
+        }
     }
 
     // ── US-021: named remotes on push, fetch and pull ────────────────────────

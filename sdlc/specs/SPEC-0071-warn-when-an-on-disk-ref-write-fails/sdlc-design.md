@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 2 files, 3 sites, no public contract change, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-02
 > Behavior change: none
 > From backlog: BL-0095, BL-0105
