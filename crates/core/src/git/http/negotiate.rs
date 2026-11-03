@@ -239,8 +239,10 @@ fn content_reachable(repo: &Repository, tips: &[Oid], target: Oid) -> Result<boo
 /// One `ACK <id> common` line per held id that is a commit the project holds, repeats
 /// included, as git does. An id that is not 40 hexadecimal characters, or names an object
 /// that is not a commit, is treated as not stated (declared differences of the spec); an
-/// unknown id is not acknowledged. Returns the commits acknowledged, in order, and whether a
-/// well formed id the project does not hold was stated (git then withholds `ready`).
+/// unknown id is never named in a `common` line, only in an `ACK <id> ready` line, when it
+/// follows held commits that satisfy every want (SPEC-0068 FR-NEW-001). Returns the commits
+/// acknowledged, in order, and whether a well formed id the project does not hold was stated
+/// (git then withholds `ready`).
 fn acknowledge(
     repo: &Repository,
     haves: &[String],
