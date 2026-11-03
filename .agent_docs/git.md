@@ -948,8 +948,15 @@ them to the pulled branch. Tags only another branch holds are neither received n
 branch is checked out and fetched or pulled. Tests: `spec_0075_*`. The tests pull a branch only after
 checking it out, because a pull writes the volume.
 
+**A failed pull names the tags it delivered (SPEC-0076).** The tags are brought in before the merge
+is tried, so a pull that fails afterwards (quota, merge error, deadline) keeps them. Its refusal now
+ends with ` Tags received before the failure: <names>.`, the added tags only, sorted, at most 20 named
+(`MAX_NAMED_DELIVERED_TAGS`) then ` and <N> more.`; nothing is added when no tag was delivered, and a
+success or a pause on a conflict is unchanged. The tool error carries a code and a text only, hence
+the sentence in the message. Tests inject the failure with the `cfg(test)` hook `after_reconcile`.
+
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
-scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
+scanned, pull error after reconcile drops the lists, now named in the refusal), BL-0083 (the
 real rejection mapping is untested,
 `a//b` normalised on disk; names like `a//b` are now refused at creation, see below). Remote tag deletion (BL-0075, SPEC-0053) and publishing every tag (BL-0076, SPEC-0054) are delivered.
 Round trip proof: `e2e_tag_051_create_publish_receive_round_trip` (two servers, one bare

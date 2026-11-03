@@ -6647,8 +6647,15 @@ fn delivered_tags_sentence(added: &[String]) -> Option<String> {
     if added.is_empty() {
         return None;
     }
-    Some(format!("Tags received before the failure: {}.", added.join(", ")))
+    let named = &added[..added.len().min(MAX_NAMED_DELIVERED_TAGS)];
+    let more = added.len() - named.len();
+    let rest = if more == 0 { String::new() } else { format!(" and {more} more") };
+    Some(format!("Tags received before the failure: {}{rest}.", named.join(", ")))
 }
+
+/// How many delivered tags the sentence of a failed pull names; a pull can bring
+/// in thousands, and the others are counted instead of listed.
+const MAX_NAMED_DELIVERED_TAGS: usize = 20;
 
 /// Test only fault injection for the pull, fired right after the reconcile
 /// stored its tags: a merge error that is not a conflict and a deadline cannot be
@@ -27032,6 +27039,94 @@ mod tests {
 
         assert!(err.message.starts_with("remote timeout: host"), "{}", err.message);
         assert!(err.message.ends_with(&format!(" {SENTENCE} v1.0.")), "{}", err.message);
+    }
+
+    /// A remote one commit ahead with the tags `t01` to `t<n>` on that commit, in
+    /// the order `order` gives their numbers.
+    async fn remote_with_numbered_tags(
+        e: &Env,
+        label: &str,
+        order: impl Iterator<Item = u32>,
+    ) -> String {
+        let (dir, url, _) = cloned_remote(e, label).await;
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        for i in order {
+            plain_tag_bare_remote(&dir, &format!("t{i:02}"), &c);
+        }
+        url
+    }
+
+    /// The sentence for the first twenty tags and `more` others.
+    fn twenty_names_sentence(more: u32) -> String {
+        let names: Vec<String> = (1..=20).map(|i| format!("t{i:02}")).collect();
+        if more == 0 {
+            format!("{SENTENCE} {}.", names.join(", "))
+        } else {
+            format!("{SENTENCE} {} and {more} more.", names.join(", "))
+        }
+    }
+
+    /// SPEC-0076/E2E-006: 25 delivered tags, the first 20 named.
+    #[tokio::test]
+    async fn spec_0076_e2e_006_twenty_five_tags() {
+        let e = Env::new().await;
+        let url = remote_with_numbered_tags(&e, "remote-s76-006", 1..=25).await;
+        fail_the_merge(&url);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.message, format!("merge failed: injected {}", twenty_names_sentence(5)));
+    }
+
+    /// SPEC-0076/E2E-007: exactly 20 tags are all named, with no `and`.
+    #[tokio::test]
+    async fn spec_0076_e2e_007_exactly_twenty_tags() {
+        let e = Env::new().await;
+        let url = remote_with_numbered_tags(&e, "remote-s76-007", 1..=20).await;
+        fail_the_merge(&url);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.message, format!("merge failed: injected {}", twenty_names_sentence(0)));
+        assert!(!err.message.contains(" more."), "{}", err.message);
+    }
+
+    /// SPEC-0076/E2E-011: the shortened list is sorted by name whatever the order of arrival.
+    #[tokio::test]
+    async fn spec_0076_e2e_011_the_shortened_list_is_sorted() {
+        let e = Env::new().await;
+        let url =
+            remote_with_numbered_tags(&e, "remote-s76-011", std::iter::once(25).chain(1..=24))
+                .await;
+        fail_the_merge(&url);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.message, format!("merge failed: injected {}", twenty_names_sentence(5)));
+    }
+
+    /// SPEC-0076/E2E-012: a shortened list leaves all the tags delivered.
+    #[tokio::test]
+    async fn spec_0076_e2e_012_all_the_tags_are_delivered() {
+        let e = Env::new().await;
+        let url = remote_with_numbered_tags(&e, "remote-s76-012", 1..=25).await;
+        fail_the_merge(&url);
+
+        call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(tag_names(&e).await.len(), 25);
+    }
+
+    /// SPEC-0076/E2E-015: 21 tags, one is left out of the sentence.
+    #[tokio::test]
+    async fn spec_0076_e2e_015_twenty_one_tags() {
+        let e = Env::new().await;
+        let url = remote_with_numbered_tags(&e, "remote-s76-015", 1..=21).await;
+        fail_the_merge(&url);
+
+        let err = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
+
+        assert_eq!(err.message, format!("merge failed: injected {}", twenty_names_sentence(1)));
     }
 
     /// SPEC-0076/E2E-013: a pull that pauses on a conflict is not a failure.
