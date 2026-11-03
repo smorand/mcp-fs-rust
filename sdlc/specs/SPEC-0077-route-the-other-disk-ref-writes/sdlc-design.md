@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 file, 10 call sites in 8 functions, no public contract change, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-02
 > Behavior change: none
 > From backlog: BL-0121
@@ -119,3 +119,31 @@ None. (`dt_0071_010` and `dt_0071_011` keep passing: they slice named functions 
 | 1 | 0 | 0 | IMPLEMENTABLE |
 
 **Amendments applied:** none.
+
+## Design additions (2026-11-02)
+> Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`). Skills loaded: rust.
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/tools/git.rs` | modify (ten sites call `sync_disk_ref`; nine tests) | DR-001, DR-002, DR-003 | US-0156 |
+| `.agent_docs/git.md` | modify (the BL-0121 sentence: the family is complete, one checked write remains) | DR-001 | US-0156 |
+Affected existing tests: keep all. `dt_0071_010` and `dt_0071_011` slice named functions and `git_tags.rs`, so they stay green.
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 to DT-006 | integration | direct tool call on `Env` (`commit`, `merge`, `merge_resolve`, `call_pull_branch`, rebase and reset tools), the lock file of `block_disk_ref`, the warnings of `disk_ref_warnings` (SPEC-0071) | `crates/core/src/tools/git.rs` tests | US-0156 |
+| DT-007 | integration | the same operations without a lock file | `crates/core/src/tools/git.rs` tests | US-0156 |
+| DT-010, DT-011 | structural | `include_str!("git.rs")` sliced before `#[cfg(test)]\nmod tests {` (`:7766`) | `crates/core/src/tools/git.rs` tests | US-0156 |
+Test data: generated. Reuse the scenario builders of the existing merge, rebase, cherry pick and pull tests (`seed_a`, `seed_conflict`, `call_pull_branch`).
+
+### Decisions (continuing)
+- **DEC-006:** one story: ten one line changes and nine tests in one file plus a doc line. **Obliged by:** n/a (no code impact): partitioning only. **Alternatives considered:** one story per function (rejected: each would add a site with no way to show a distinct behavior beyond the shared helper). **Source:** design.
+- **DEC-007:** red evidence: DT-001 to DT-006, DT-010 and DT-011 fail before the change; DT-007 passes on arrival and is proven by the named mutation of Section 8.2. **Obliged by:** DR-002, DR-003. **Source:** design.
+- **DEC-008:** the warnings are read through `DISK_REF_WARNINGS` and `disk_ref_warnings(ref_name)` of SPEC-0071, filtered by a ref name unique per test. **Obliged by:** DR-002. **Source:** existing code `git.rs:23840`.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0156 | route the other on disk ref writes through sync_disk_ref | P1 | DR-001 to DR-004 | main | 2 | yes |
