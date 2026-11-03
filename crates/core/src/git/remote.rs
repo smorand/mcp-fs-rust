@@ -891,7 +891,12 @@ pub fn push_tags_to_remote(
     match pushed {
         Ok(_) if dropped => {
             let lost = git2::Error::from_str("connection reset before the answer arrived");
-            Err(connection_error(origin_url, &lost, token_for_redaction.as_deref()))
+            Err(connection_error_for(
+                ConnectionWording::PublishTags,
+                origin_url,
+                &lost,
+                token_for_redaction.as_deref(),
+            ))
         }
         Ok(report) => Ok(TagsPush {
             rejected: held
@@ -904,9 +909,12 @@ pub fn push_tags_to_remote(
             rejected: held,
             lease_lost: misses.into_iter().map(|m| tag_of(m.dst)).collect(),
         }),
-        Err(PushFailure::Open(e) | PushFailure::Push(e)) => {
-            Err(connection_error(origin_url, &e, token_for_redaction.as_deref()))
-        }
+        Err(PushFailure::Open(e) | PushFailure::Push(e)) => Err(connection_error_for(
+            ConnectionWording::PublishTags,
+            origin_url,
+            &e,
+            token_for_redaction.as_deref(),
+        )),
         // push_refs reports per ref refusals in its report, never as a failure.
         Err(PushFailure::Rejected(reason)) => {
             Err(ToolError::internal(format!("push of tags failed: {reason}")))
@@ -1606,6 +1614,8 @@ pub enum ConnectionWording<'a> {
     Fetch,
     /// `push of tag '<tag>' to host '<host>' failed: <cause>`, publishing one tag.
     PublishTag(&'a str),
+    /// `push of tags to host '<host>' failed: <cause>`, publishing all tags.
+    PublishTags,
 }
 
 /// [`connection_error`] with the wording of `wording`; the code is always
@@ -1622,6 +1632,7 @@ fn connection_error_for(
         ConnectionWording::PublishTag(tag) => {
             format!("push of tag '{tag}' to host '{host}' failed: {e}")
         }
+        ConnectionWording::PublishTags => format!("push of tags to host '{host}' failed: {e}"),
     };
     ToolError::internal(redact(text, token))
 }

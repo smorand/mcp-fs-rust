@@ -1068,7 +1068,7 @@ fn publish_all_on_repo(
         conn.url,
         conn.token.clone(),
         Some(conn.deadline),
-        ConnectionWording::Fetch,
+        ConnectionWording::PublishTags,
     )?;
     #[cfg(test)]
     after_listing::fire(conn.url);
@@ -1160,7 +1160,7 @@ fn remote_outcome(
                 token: conn.token.clone(),
                 deadline: conn.deadline,
             };
-            probe_identical(repo, &publish, ConnectionWording::Fetch)?
+            probe_identical(repo, &publish, ConnectionWording::PublishTags)?
         });
     Ok(if identical { Outcome::UpToDate } else { Outcome::Differs(remote_commit.to_string()) })
 }
@@ -1275,7 +1275,7 @@ fn reclassify_lost(
         conn.url,
         conn.token.clone(),
         Some(conn.deadline),
-        ConnectionWording::Fetch,
+        ConnectionWording::PublishTags,
     )?;
     let by_name: std::collections::HashMap<&str, Oid> =
         advertised.iter().map(|(n, oid)| (n.as_str(), *oid)).collect();

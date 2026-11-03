@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: S
 > Depth evidence: FEAT / depth S: one behavior family (the text of two tag publish refusals), one module family, 3 anticipated requirements, no persisted change.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-02
 > Project: existing
 > From backlog: BL-0104, BL-0106

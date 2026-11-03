@@ -927,6 +927,14 @@ runs after the object import: an absent tag is added, an identical one skipped, 
 local tag kept. Results gain `tags_added` and `tags_kept_local` (sorted names); a pull
 reconciles before the merge decision, so a paused conflict result carries them too.
 
+**Connection failure wording (SPEC-0072, 2026-11-02).** `ConnectionWording` in `git/remote.rs` is
+passed to `list_advertised_refs`, `probe_remote_tag` and `tag_push_error`, so the same functions read
+as the operation that called them: fetch, pull, clone and `git.remote_delete_tag` say `fetch from host
+'<host>' failed: <cause>`; `git.remote_push_tag` says `push of tag '<tag>' to host '<host>' failed:
+<cause>`; `git.remote_push_tags` says `push of tags to host '<host>' failed: <cause>`. The code stays
+`ERR_INTERNAL_ERROR`. A remote tag that vanishes between the listing and the push of a confirmed
+overwrite reads `Remote tag '<tag>' does not exist.` (`ERR_NOT_FOUND`), not `has moved to 0000000`.
+
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
 scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
 "on the remote" tip set is every advertised ref, the real rejection mapping is untested,

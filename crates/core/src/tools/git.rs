@@ -27300,6 +27300,62 @@ mod tests {
         }
     }
 
+    /// SPEC-0072/E2E-001: publishing still works, one tag then all the others.
+    #[tokio::test]
+    async fn spec_0072_e2e_001_publishing_still_works() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-s72-001").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(1));
+        let out = confirm_all(&e, json!(1)).await;
+
+        assert_eq!(out["published"], 1);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.1").as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0072/E2E-003: publish all, the remote is down, preview and send.
+    #[tokio::test]
+    async fn spec_0072_e2e_003_publish_all_remote_down() {
+        let e = Env::new().await;
+        let (dir, _, _) = two_due(&e, "remote-s72-003").await;
+        let (refs, audit) = (bare_refs(&dir), audit_count(&e));
+        let down = down_remote(&e);
+        retrack(&e, &down).await;
+
+        let preview = call_publish_all_tags(&e, "origin", None).await.unwrap_err();
+        let send = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
+
+        for err in [preview, send] {
+            assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
+            assert!(err.message.starts_with(&publish_tags_prefix(&down)), "{}", err.message);
+            assert!(!err.message.contains("fetch from host"), "{}", err.message);
+        }
+        assert_eq!(bare_refs(&dir), refs);
+        assert_eq!(audit_count(&e), audit);
+    }
+
+    /// SPEC-0072/E2E-011: publish all, the connection drops after the first tag.
+    #[tokio::test]
+    async fn spec_0072_e2e_011_publish_all_the_connection_drops_after_the_first_tag() {
+        let e = Env::new().await;
+        let (dir, url, a, b, _) = three_commit_remote(&e, "remote-s72-011").await;
+        tag(&e, json!({"name": "v1.0", "target": a})).await.unwrap();
+        tag(&e, json!({"name": "v1.1", "target": b})).await.unwrap();
+        assert_eq!(preview_all(&e).await["message"], count_line(2));
+        crate::git::remote::bulk_seams::drop_after(&url, 1);
+
+        let err = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
+
+        assert!(err.message.starts_with(&publish_tags_prefix(&url)), "{}", err.message);
+        assert!(err.message.contains("connection reset"), "{}", err.message);
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(a.as_str()));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.1"), None, "only v1.0 arrived");
+    }
+
     /// SPEC-0072 regression: the push of a remote tag deletion shares its failure
     /// wording code with the publish and keeps `fetch from host`.
     #[tokio::test]
@@ -27318,11 +27374,10 @@ mod tests {
         assert!(err.message.starts_with(&connection_prefix(&url)), "{}", err.message);
     }
 
-    /// SPEC-0072 regression: until publish all has its own wording, the message
-    /// check of publish all keeps `fetch from host`, though one tag publish
-    /// shares the probe.
+    /// SPEC-0072 regression: the message check of publish all reads as a push of
+    /// tags, though one tag publish shares the probe.
     #[tokio::test]
-    async fn spec_0072_regression_a_publish_all_message_check_keeps_the_fetch_wording() {
+    async fn spec_0072_regression_a_publish_all_message_check_reads_as_a_push_of_tags() {
         let e = Env::new().await;
         let (dir, url, a) = cloned_remote(&e, "remote-s72-pa").await;
         tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
@@ -27336,7 +27391,7 @@ mod tests {
         let err = call_publish_all_tags(&e, "origin", None).await.unwrap_err();
 
         std::fs::rename(&gone, &dir).unwrap();
-        assert!(err.message.starts_with(&connection_prefix(&url)), "{}", err.message);
+        assert!(err.message.starts_with(&publish_tags_prefix(&url)), "{}", err.message);
     }
 
     /// SPEC-0072/E2E-007: the connection is lost at the push, after the listing.
@@ -29856,9 +29911,14 @@ mod tests {
         assert!(DROPPED_CONNECTION_REASONS.iter().any(|r| msg.contains(r)), "{msg}");
     }
 
+    /// The first part of a publish all connection refusal.
+    fn publish_tags_prefix(url: &str) -> String {
+        format!("push of tags to host '{}' failed: ", crate::git::remote::extract_host(url))
+    }
+
     fn assert_connection_refused(err: &ToolError, url: &str, reasons: &[&str]) {
         assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
-        assert!(err.message.starts_with(&connection_prefix(url)), "{}", err.message);
+        assert!(err.message.starts_with(&publish_tags_prefix(url)), "{}", err.message);
         assert!(reasons.iter().any(|r| err.message.contains(r)), "{}", err.message);
     }
 
@@ -29893,7 +29953,7 @@ mod tests {
         let err = call_publish_all_tags(&e, "origin", Some(json!(2))).await.unwrap_err();
 
         assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
-        let lost = format!("{}connection reset", connection_prefix(&url));
+        let lost = format!("{}connection reset", publish_tags_prefix(&url));
         assert!(err.message.starts_with(&lost), "{}", err.message);
         assert_eq!(bare_refs(&dir), with_tags(&before, &[("v1.0", &a)]), "only v1.0 arrived");
         assert_eq!(audit_count(&e), audit, "nothing was reported sent, nothing audited");
