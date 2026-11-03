@@ -935,9 +935,15 @@ as the operation that called them: fetch, pull, clone and `git.remote_delete_tag
 `ERR_INTERNAL_ERROR`. A remote tag that vanishes between the listing and the push of a confirmed
 overwrite reads `Remote tag '<tag>' does not exist.` (`ERR_NOT_FOUND`), not `has moved to 0000000`.
 
+**What counts as on the remote (SPEC-0074).** `git.remote_push_tag` accepts a tag whose commit is any
+position the remote advertises (a branch, a `refs/pull/*` reference, a tag, its default position),
+or an ancestor of one whose history the project holds. A position the project lacks is skipped and
+never fetched. Refusal: `Cannot publish tag '<t>': commit <short7> is not on the remote. Publish its
+branch first.`; it comes before any refusal about the remote tag. Tests: `spec_0074_e2e_*`.
+
 **Known limits.** BL-0082 (batching loop untested, only the checked out or default branch is
 scanned, sequential row writes, pull error after reconcile drops the lists), BL-0083 (the
-"on the remote" tip set is every advertised ref, the real rejection mapping is untested,
+real rejection mapping is untested,
 `a//b` normalised on disk; names like `a//b` are now refused at creation, see below). Remote tag deletion (BL-0075, SPEC-0053) and publishing every tag (BL-0076, SPEC-0054) are delivered.
 Round trip proof: `e2e_tag_051_create_publish_receive_round_trip` (two servers, one bare
 remote).

@@ -26829,6 +26829,203 @@ mod tests {
         assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(c.as_str()));
     }
 
+    // ── SPEC-0074: what counts as "on the remote" for a tag publish ──────────
+
+    /// Point the bare remote's `ref_name` at `commit`.
+    fn set_bare_ref(dir: &std::path::Path, ref_name: &str, commit: &str) {
+        let repo = git2::Repository::open_bare(dir).unwrap();
+        repo.reference(ref_name, git2::Oid::from_str(commit).unwrap(), true, "test").unwrap();
+    }
+
+    /// A remote whose commit `b` (a child of `a`) is advertised only by the
+    /// references `holders` make, never by a branch: `main` is moved back to
+    /// `a` after the project fetched `b`, so the project holds `b`. Returns
+    /// `(dir, url, a, b)`.
+    async fn commit_held_only_by(
+        e: &Env,
+        label: &str,
+        holders: impl FnOnce(&std::path::Path, &str),
+    ) -> (std::path::PathBuf, String, String, String) {
+        let (dir, url, a) = cloned_remote(e, label).await;
+        let b = advance_bare_remote(&dir, "refs/heads/main", "b\n");
+        call_fetch_branch(e, &url, "anonymous").await.unwrap();
+        holders(&dir, &b);
+        set_bare_ref(&dir, "refs/heads/main", &a);
+        (dir, url, a, b)
+    }
+
+    fn not_on_remote(tag: &str, sha: &str) -> String {
+        format!(
+            "Cannot publish tag '{tag}': commit {} is not on the remote. Publish its branch first.",
+            short7(sha)
+        )
+    }
+
+    /// SPEC-0074/E2E-001: a commit at a branch tip is published.
+    #[tokio::test]
+    async fn spec_0074_e2e_001_a_commit_at_a_branch_tip() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s74-001").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let before = bare_refs(&dir);
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        let mut expected = before;
+        expected.insert("refs/tags/v1.0".to_string(), a);
+        assert_eq!(bare_refs(&dir), expected, "the remote gains the tag and nothing else");
+    }
+
+    /// SPEC-0074/E2E-002: a commit only a pull request reference holds is published.
+    #[tokio::test]
+    async fn spec_0074_e2e_002_a_commit_only_under_a_pull_request_reference() {
+        let e = Env::new().await;
+        let (dir, url, _, b) = commit_held_only_by(&e, "remote-s74-002", |dir, b| {
+            set_bare_ref(dir, "refs/pull/7/head", b);
+        })
+        .await;
+        tag(&e, json!({"name": "v1.0", "target": b})).await.unwrap();
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0074/E2E-003: a commit the remote does not hold is refused.
+    #[tokio::test]
+    async fn spec_0074_e2e_003_a_commit_the_remote_does_not_hold() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s74-003").await;
+        let l = local_commit_on(&e, "dev", &a, "/l.txt").await;
+        tag(&e, json!({"name": "v1.0", "target": "dev"})).await.unwrap();
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::INVALID_ARGUMENT);
+        assert_eq!(err.message, not_on_remote("v1.0", &l));
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+    }
+
+    /// SPEC-0074/E2E-004: a commit only a remote tag points at is published, and
+    /// a commit absent from the remote's history is still refused.
+    #[tokio::test]
+    async fn spec_0074_e2e_004_a_commit_only_a_remote_tag_points_at() {
+        let e = Env::new().await;
+        let (dir, url, a, b) = commit_held_only_by(&e, "remote-s74-004", |dir, b| {
+            plain_tag_bare_remote(dir, "old", b);
+        })
+        .await;
+        tag(&e, json!({"name": "v1.0", "target": b})).await.unwrap();
+        let l = local_commit_on(&e, "dev", &a, "/l.txt").await;
+        tag(&e, json!({"name": "v2.0", "target": "dev"})).await.unwrap();
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+        let err = call_publish_tag(&e, &url, "v2.0").await.unwrap_err();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(b.as_str()));
+        assert_eq!(err.message, not_on_remote("v2.0", &l));
+    }
+
+    /// SPEC-0074/E2E-005: an ancestor of a pull request tip, in history the
+    /// project holds, is published.
+    #[tokio::test]
+    async fn spec_0074_e2e_005_an_ancestor_of_a_pull_request_tip() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s74-005").await;
+        let b = advance_bare_remote(&dir, "refs/heads/main", "b\n");
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        set_bare_ref(&dir, "refs/pull/7/head", &c);
+        set_bare_ref(&dir, "refs/heads/main", &a);
+        tag(&e, json!({"name": "v1.0", "target": b})).await.unwrap();
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0074/E2E-006: a pull request tip the project does not hold is
+    /// skipped and never fetched, so a commit only under it is refused.
+    #[tokio::test]
+    async fn spec_0074_e2e_006_a_tip_the_project_does_not_hold() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s74-006").await;
+        let p = advance_bare_remote(&dir, "refs/heads/main", "p\n");
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+        let c = advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        set_bare_ref(&dir, "refs/pull/7/head", &c);
+        set_bare_ref(&dir, "refs/heads/main", &a);
+        tag(&e, json!({"name": "v1.0", "target": p})).await.unwrap();
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.message, not_on_remote("v1.0", &p));
+        let entry = e.entry().await;
+        assert!(!entry.db.object_exists(&c).await.unwrap(), "the unheld tip was never fetched");
+    }
+
+    /// SPEC-0074/E2E-007: a commit only the remote's default position holds is
+    /// published.
+    #[tokio::test]
+    async fn spec_0074_e2e_007_the_default_position_only() {
+        let e = Env::new().await;
+        let (dir, url, _, b) = commit_held_only_by(&e, "remote-s74-007", |dir, b| {
+            let repo = git2::Repository::open_bare(dir).unwrap();
+            repo.set_head_detached(git2::Oid::from_str(b).unwrap()).unwrap();
+        })
+        .await;
+        tag(&e, json!({"name": "v1.0", "target": b})).await.unwrap();
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap();
+
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(b.as_str()));
+    }
+
+    /// SPEC-0074/E2E-008: a refusal changes nothing.
+    #[tokio::test]
+    async fn spec_0074_e2e_008_a_refusal_changes_nothing() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s74-008").await;
+        local_commit_on(&e, "dev", &a, "/l.txt").await;
+        tag(&e, json!({"name": "v1.0", "target": "dev"})).await.unwrap();
+        let (refs, audit, local) = (bare_refs(&dir), audit_size(&e), tag_target(&e, "v1.0").await);
+
+        call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(bare_refs(&dir), refs);
+        assert_eq!(audit_size(&e), audit);
+        assert_eq!(tag_target(&e, "v1.0").await, local);
+    }
+
+    /// SPEC-0074/E2E-009: the commit refusal comes before the remote tag one.
+    #[tokio::test]
+    async fn spec_0074_e2e_009_the_commit_refusal_comes_first() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s74-009").await;
+        let l = local_commit_on(&e, "dev", &a, "/l.txt").await;
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        tag(&e, json!({"name": "v1.0", "target": "dev"})).await.unwrap();
+
+        let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&a)).await.unwrap_err();
+
+        assert_eq!(err.message, not_on_remote("v1.0", &l));
+    }
+
+    /// SPEC-0074/E2E-010: a remote that advertises nothing refuses every commit.
+    #[tokio::test]
+    async fn spec_0074_e2e_010_a_remote_that_advertises_nothing() {
+        let e = Env::new().await;
+        let (_, _, a) = cloned_remote(&e, "remote-s74-010").await;
+        let empty = e.f.dir.path().join("empty-s74-010");
+        git2::Repository::init_bare(&empty).unwrap();
+        let url = format!("file://{}", empty.display());
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.message, not_on_remote("v1.0", &a));
+    }
+
     /// SPEC-0052/E2E-074: membership is checked before anything else, so a
     /// non member learns nothing about tags or remotes.
     #[tokio::test]

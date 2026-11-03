@@ -1517,8 +1517,10 @@ fn moved(tag: &str, remote_commit: &str) -> ToolError {
     ))
 }
 
-/// DEC-020: the commit is on the remote when an advertised ref names it, or
-/// when it is an ancestor of an advertised commit the project already holds.
+/// DEC-020, as SPEC-0074 FR-MOD-001 words it: the commit is on the remote when
+/// any position the remote advertises names it (a branch, a pull request
+/// reference, a tag or the default position), or when it is an ancestor of such
+/// a position whose history the project already holds.
 /// A tip the project lacks is skipped rather than fetched, so such a commit
 /// counts as absent even when the remote has it (E2E-084).
 fn commit_on_remote(repo: &Repository, commit: Oid, advertised: &[(String, Oid)]) -> bool {
