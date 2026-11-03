@@ -423,13 +423,17 @@ pub(crate) fn tags_identical(repo: &Repository, a: Oid, b: Oid) -> Result<bool> 
 /// fetched objects are imported into the blob store, so no row ever names an
 /// object the store lacks.
 ///
-/// Cost: one ref listing, then for n incoming tags O(n) map lookups, one
-/// comparison per name clash and one row write per added tag; O(n) space.
+/// Cost: nothing when no tag is incoming; otherwise one ref listing, then for n
+/// incoming tags O(n) map lookups, one comparison per name clash and one
+/// transaction for every added tag row; O(n) space.
 pub(crate) async fn reconcile_incoming_tags(
     entry: &GitRepoEntry,
     repo: &Repository,
     incoming: &[crate::git::remote::IncomingTag],
 ) -> Result<(Vec<String>, Vec<String>)> {
+    if incoming.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let local: std::collections::HashMap<String, String> = entry
         .db
         .list_refs()
@@ -439,19 +443,12 @@ pub(crate) async fn reconcile_incoming_tags(
         .map(|r| (r.name, r.target))
         .collect();
     let (mut added, mut kept_local) = (Vec::new(), Vec::new());
+    let mut fresh: Vec<(String, Oid)> = Vec::new();
     for tag in incoming {
         let tag_ref = format!("{TAGS_PREFIX}{}", tag.name);
         match local.get(&tag_ref) {
             None => {
-                entry.db.set_ref(&tag_ref, &tag.oid.to_string(), false).await?;
-                // Keep the on disk refs in step, as git.tag_create does; a
-                // name libgit2 would rewrite (`a//b` becomes `a/b`) is not
-                // written at all, and must not undo the row.
-                if git2::Reference::is_valid_name(&tag_ref) {
-                    sync_disk_ref(repo, &tag_ref, tag.oid, "git.remote_fetch");
-                } else {
-                    warn_disk_ref_skipped("git.remote_fetch", &tag_ref, "invalid reference name");
-                }
+                fresh.push((tag_ref, tag.oid));
                 added.push(tag.name.clone());
             }
             Some(target) => {
@@ -459,6 +456,20 @@ pub(crate) async fn reconcile_incoming_tags(
                     kept_local.push(tag.name.clone());
                 }
             }
+        }
+    }
+    // One transaction for every row: a failure stores none of them.
+    let rows: Vec<(String, String)> =
+        fresh.iter().map(|(tag_ref, oid)| (tag_ref.clone(), oid.to_string())).collect();
+    entry.db.set_refs(&rows).await?;
+    // Keep the on disk refs in step, as git.tag_create does; a name libgit2
+    // would rewrite (`a//b` becomes `a/b`) is not written at all, and must not
+    // undo the row.
+    for (tag_ref, oid) in &fresh {
+        if git2::Reference::is_valid_name(tag_ref) {
+            sync_disk_ref(repo, tag_ref, *oid, "git.remote_fetch");
+        } else {
+            warn_disk_ref_skipped("git.remote_fetch", tag_ref, "invalid reference name");
         }
     }
     added.sort_unstable();
@@ -1530,5 +1541,92 @@ mod tests {
         let err = crate::git::remote::remote_refused_tag("a//b", "invalid ref name");
         assert_eq!(err.code, crate::errors::code::INTERNAL_ERROR);
         assert_eq!(err.message, "Remote refused tag 'a//b': invalid ref name");
+    }
+
+    // ── SPEC-0073: the reconcile writes its rows in one transaction ──────────
+
+    use crate::git::db::counting::{CountingRel, Counts};
+
+    /// A project entry whose index sits on a counting engine, over the repository
+    /// and blob store of a real one made by the store.
+    async fn counted_entry() -> (tempfile::TempDir, GitRepoEntry, std::sync::Arc<CountingRel>) {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = crate::config::ServerConfig::default();
+        c.infra.meta.dir = d.path().join("state/volumes").display().to_string();
+        c.infra.blob.dir = d.path().join("state/blobs").display().to_string();
+        c.infra.admin.path = d.path().join("state/admin.db").display().to_string();
+        c.git.enabled = true;
+        let store =
+            crate::git::GitRepoStore::new(std::sync::Arc::new(c), crate::storage::test_registry());
+        let real = store.init_repo("proj").await.unwrap();
+        let rel = CountingRel::over_memory();
+        let db = std::sync::Arc::new(rel.index().await);
+        let repo = git2::Repository::open_bare(real.repo.lock().await.path()).unwrap();
+        let entry = GitRepoEntry {
+            project_id: "proj".into(),
+            repo: tokio::sync::Mutex::new(repo),
+            db,
+            objects: real.objects.clone(),
+            blobs: real.blobs.clone(),
+            write_lock: tokio::sync::Mutex::new(()),
+        };
+        (d, entry, rel)
+    }
+
+    fn incoming(
+        names: impl Iterator<Item = String>,
+        oid: Oid,
+    ) -> Vec<crate::git::remote::IncomingTag> {
+        names.map(|name| crate::git::remote::IncomingTag { name, oid, annotated: false }).collect()
+    }
+
+    /// SPEC-0073/DT-003: nothing incoming means no read and no write at all.
+    #[tokio::test]
+    async fn dt_0073_003_empty_input_touches_nothing() {
+        let (_d, entry, rel) = counted_entry().await;
+        let repo = entry.repo.lock().await;
+
+        let out = reconcile_incoming_tags(&entry, &repo, &[]).await.unwrap();
+
+        assert_eq!(out, (Vec::<String>::new(), Vec::<String>::new()));
+        assert_eq!(Counts::get(&rel.counts.queries), 0, "no listing");
+        assert_eq!(Counts::get(&rel.counts.executes), 0);
+        assert_eq!(Counts::get(&rel.counts.begins), 0);
+    }
+
+    /// SPEC-0073/DT-004: 2 000 incoming tags cost one transaction.
+    #[tokio::test]
+    async fn dt_0073_004_two_thousand_tags_cost_one_transaction() {
+        let (_d, entry, rel) = counted_entry().await;
+        let repo = entry.repo.lock().await;
+        let oid = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let tags = incoming((0..2000).map(|i| format!("t{i:04}")), oid);
+
+        let (added, kept) = reconcile_incoming_tags(&entry, &repo, &tags).await.unwrap();
+
+        assert_eq!((added.len(), kept.len()), (2000, 0));
+        assert_eq!(added[0], "t0000");
+        assert_eq!(added[1999], "t1999");
+        assert_eq!(Counts::get(&rel.counts.begins), 1);
+        assert_eq!(Counts::get(&rel.counts.commits), 1);
+        assert_eq!(Counts::get(&rel.counts.executes), 0, "no autocommit write");
+        assert_eq!(entry.db.list_refs().await.unwrap().len(), 2000);
+    }
+
+    /// The text of the function that starts at `header`, up to its closing brace
+    /// in column 0.
+    fn fn_body<'a>(source: &'a str, header: &str) -> &'a str {
+        let start = source.find(header).unwrap_or_else(|| panic!("no {header}"));
+        let rest = &source[start..];
+        &rest[..rest.find("\n}\n").expect("closing brace")]
+    }
+
+    /// SPEC-0073/DT-010: the reconcile has no `set_ref` call, only the batch.
+    #[test]
+    fn dt_0073_010_no_single_row_write_in_the_reconcile() {
+        let body =
+            fn_body(include_str!("git_tags.rs"), "pub(crate) async fn reconcile_incoming_tags(");
+        assert!(!body.contains("set_ref("), "the reconcile still writes row by row");
+        assert!(body.contains("set_refs("), "the reconcile does not use the batch");
     }
 }

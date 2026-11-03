@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 2 files, 1 debt item, no public contract change, no persisted schema change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-02
 > Behavior change: none
 > From backlog: BL-0102

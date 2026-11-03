@@ -382,6 +382,23 @@ impl RelationalGitDb {
         Ok(())
     }
 
+    /// Writes every `(name, target)` row, non symbolic, in one transaction: the
+    /// cost of a batch is one commit, not one per row, and a failing row leaves
+    /// none of them stored. Dropping the handle on an error rolls back.
+    pub async fn set_refs(&self, refs: &[(String, String)]) -> Result<()> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let sql = self.upsert_sql("git_refs", vec!["volume_id", "name", "target", "symbolic"]);
+        let mut tx = self.db.begin().await?;
+        for (name, target) in refs {
+            let row =
+                Query::new(sql.clone()).bind(&self.volume_id).bind(name).bind(target).bind(0_i64);
+            tx.execute(&row).await?;
+        }
+        tx.commit().await
+    }
+
     pub async fn delete_ref(&self, name: &str) -> Result<()> {
         self.db
             .execute(
@@ -530,6 +547,116 @@ impl RelationalGitDb {
             )
             .await?;
         rows.iter().map(|r| Ok((r.text(0)?, r.text(1)?))).collect()
+    }
+}
+
+/// A relational engine wrapper that counts what the git index asks of it, for the
+/// tests that must see how many transactions and autocommit writes an operation
+/// costs, and that can fail one statement inside a transaction.
+#[cfg(test)]
+pub(crate) mod counting {
+    use super::*;
+    use crate::storage::rel::{RelationalTx, RowValues};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct Counts {
+        /// Autocommit writes (`RelationalDb::execute`).
+        pub executes: AtomicU32,
+        /// Reads (`RelationalDb::query`).
+        pub queries: AtomicU32,
+        pub begins: AtomicU32,
+        pub commits: AtomicU32,
+        /// Statements run inside a transaction.
+        pub tx_executes: AtomicU32,
+        /// The n-th (1 based) statement run inside a transaction fails; 0 means never.
+        pub fail_tx_execute_at: AtomicU32,
+    }
+
+    impl Counts {
+        pub(crate) fn get(counter: &AtomicU32) -> u32 {
+            counter.load(Ordering::SeqCst)
+        }
+    }
+
+    pub(crate) struct CountingRel {
+        inner: Arc<dyn RelationalDb>,
+        pub counts: Arc<Counts>,
+    }
+
+    impl CountingRel {
+        pub(crate) fn over_memory() -> Arc<Self> {
+            let inner =
+                Arc::new(crate::storage::rel::SqliteRelationalDb::open_in_memory().unwrap());
+            Arc::new(Self { inner, counts: Arc::default() })
+        }
+
+        /// The index over this engine, with the counters reset after the schema is applied.
+        pub(crate) async fn index(self: &Arc<Self>) -> RelationalGitDb {
+            let db = RelationalGitDb::open(self.clone(), "test").await.unwrap();
+            for c in [
+                &self.counts.executes,
+                &self.counts.queries,
+                &self.counts.begins,
+                &self.counts.commits,
+                &self.counts.tx_executes,
+            ] {
+                c.store(0, Ordering::SeqCst);
+            }
+            db
+        }
+    }
+
+    struct CountingTx {
+        inner: Box<dyn RelationalTx>,
+        counts: Arc<Counts>,
+    }
+
+    #[async_trait]
+    impl RelationalTx for CountingTx {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+        async fn execute(&mut self, query: &Query) -> Result<u64> {
+            let n = self.counts.tx_executes.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.counts.fail_tx_execute_at.load(Ordering::SeqCst) {
+                return Err(ToolError::internal("injected statement failure"));
+            }
+            self.inner.execute(query).await
+        }
+        async fn query(&mut self, query: &Query) -> Result<Vec<RowValues>> {
+            self.inner.query(query).await
+        }
+        async fn commit(self: Box<Self>) -> Result<()> {
+            self.counts.commits.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit().await
+        }
+    }
+
+    #[async_trait]
+    impl RelationalDb for CountingRel {
+        fn dialect(&self) -> crate::storage::rel::Dialect {
+            self.inner.dialect()
+        }
+        async fn execute(&self, query: &Query) -> Result<u64> {
+            self.counts.executes.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute(query).await
+        }
+        async fn query(&self, query: &Query) -> Result<Vec<RowValues>> {
+            self.counts.queries.fetch_add(1, Ordering::SeqCst);
+            self.inner.query(query).await
+        }
+        async fn begin(&self) -> Result<Box<dyn RelationalTx>> {
+            self.counts.begins.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingTx {
+                inner: self.inner.begin().await?,
+                counts: self.counts.clone(),
+            }))
+        }
+        async fn migrate(&self, schema: &SchemaSet) -> Result<()> {
+            self.inner.migrate(schema).await
+        }
     }
 }
 
@@ -817,5 +944,57 @@ mod tests {
         let d2 = open(&path).await.unwrap();
         assert!(d2.get_ref("HEAD").await.unwrap().unwrap().symbolic);
         assert_eq!(d2.get_object("deadbeef").await.unwrap().unwrap().size, 120);
+    }
+
+    // ── SPEC-0073: the tag rows of one reconcile go in one transaction ───────
+
+    fn rows(names: &[&str]) -> Vec<(String, String)> {
+        names.iter().map(|n| (format!("refs/tags/{n}"), format!("{:0>40}", n.len()))).collect()
+    }
+
+    /// SPEC-0073/DT-001: three rows give three identical non symbolic rows.
+    #[tokio::test]
+    async fn dt_0073_001_three_rows_are_stored_as_one_write_each_would() {
+        let d = db().await;
+        let batch = rows(&["v1", "v22", "v333"]);
+
+        d.set_refs(&batch).await.unwrap();
+
+        let stored = d.list_refs().await.unwrap();
+        let got: Vec<(String, String, bool)> =
+            stored.into_iter().map(|r| (r.name, r.target, r.symbolic)).collect();
+        let want: Vec<(String, String, bool)> =
+            batch.into_iter().map(|(n, t)| (n, t, false)).collect();
+        assert_eq!(got, want);
+    }
+
+    /// SPEC-0073/DT-002: a statement failing in the middle stores none of the rows.
+    #[tokio::test]
+    async fn dt_0073_002_a_failing_row_stores_nothing() {
+        let rel = counting::CountingRel::over_memory();
+        let d = rel.index().await;
+        rel.counts.fail_tx_execute_at.store(2, std::sync::atomic::Ordering::SeqCst);
+
+        let err = d.set_refs(&rows(&["a", "bb", "ccc"])).await.unwrap_err();
+
+        assert!(err.message.contains("injected"), "{}", err.message);
+        assert!(d.list_refs().await.unwrap().is_empty(), "no row of the batch survives");
+    }
+
+    /// SPEC-0073/DR-001: 2 000 rows cost one transaction and no autocommit write.
+    #[tokio::test]
+    async fn dt_0073_004_set_refs_uses_one_transaction_for_any_number_of_rows() {
+        let rel = counting::CountingRel::over_memory();
+        let d = rel.index().await;
+        let names: Vec<String> = (0..2000).map(|i| format!("t{i:04}")).collect();
+        let batch = rows(&names.iter().map(String::as_str).collect::<Vec<_>>());
+
+        d.set_refs(&batch).await.unwrap();
+
+        use counting::Counts;
+        assert_eq!(Counts::get(&rel.counts.begins), 1);
+        assert_eq!(Counts::get(&rel.counts.commits), 1);
+        assert_eq!(Counts::get(&rel.counts.executes), 0, "no autocommit write");
+        assert_eq!(d.list_refs().await.unwrap().len(), 2000);
     }
 }

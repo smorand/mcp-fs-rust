@@ -147,7 +147,7 @@
 | US-0145 | SPEC-0069 | send the objects unframed without the side band | US-0144 | 2 | landed | story/US-0145-send-objects-unframed-without-side-band | main |
 | US-0146 | SPEC-0070 | cap the held ids read from one request | US-0145 | 2 | landed | story/US-0146-cap-the-held-ids-read-from-one-request | main |
 | US-0147 | SPEC-0071 | warn when an on disk ref write fails | main | 2 | landed | story/US-0147-warn-when-an-on-disk-ref-write-fails | main |
-| US-0148 | SPEC-0073 | batch the tag row writes of the reconcile | US-0147 | 2 | todo | | |
+| US-0148 | SPEC-0073 | batch the tag row writes of the reconcile | US-0147 | 2 | landed | story/US-0148-batch-the-tag-row-writes-of-the-reconcile | main |
 | US-0149 | SPEC-0072 | word a one tag publish failure as a push and a vanished tag as gone | US-0148 | 2 | todo | | |
 | US-0150 | SPEC-0072 | word a publish all failure as a push of tags | US-0149 | 2 | todo | | |
 | US-0151 | SPEC-0074 | pin what counts as on the remote for a tag publish | US-0150 | 2 | todo | | |
