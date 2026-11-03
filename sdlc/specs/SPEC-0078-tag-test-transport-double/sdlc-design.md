@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 4 modules (git test support, remote seam, tools tests, test fixtures), 10 tests, no public contract change
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-03
 > Behavior change: none
 > From backlog: BL-0098
@@ -130,3 +130,38 @@ None.
 | 1 | 0 | 4 (all MINOR, all amended) | IMPLEMENTABLE |
 
 **Amendments applied:** the hook reason read in the RED run (DT-004, DEC-006), the perimeter row of DT-001 to DT-010, the host map of DT-008 and DT-009 with the expected wording of DT-009, the citations `remote.rs:1603` and `:2011` and the named guardrail tests. Auditor: a general purpose subagent of the same model family, no F finding.
+
+## Design additions (2026-11-03)
+> Target tier: 2 (default: no `--tier`, no `Tier:` in `sdlc/constitution.md`, no `.spec.json`); story B is `min_tier` 1 (DEC-007). Skills loaded: rust.
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `crates/core/src/git/test_remote.rs` | new (`Remote`, `Behavior`, the plain HTTP server, the real git services) | DR-001, DR-002, DR-003 | US-0157 |
+| `crates/core/src/git/mod.rs` | modify (`#[cfg(test)] mod test_remote;`) | DR-001 | US-0157 |
+| `crates/core/src/tools/git.rs` | modify (tests DT-001 to DT-007, then DT-008 and DT-009) | all | US-0157, US-0158 |
+| `.agent_docs/testing.md` | modify (the double, its behaviors, how to add a leg) | DR-001 | US-0157 |
+| `crates/core/src/git/remote.rs` | modify (the `#[cfg(test)]` certificate seam; DT-010 in its test module) | DR-004, DR-005 | US-0158 |
+| `crates/core/src/git/test_remote.rs` | modify (the `Tls` mode) | DR-004 | US-0158 |
+| `crates/core/Cargo.toml` | modify (`tokio-rustls` dev-dependency) | DR-004 | US-0158 |
+| `crates/core/tests/fixtures/test-remote.pem`, `test-remote.key` | new | DR-004 | US-0158 |
+Affected existing tests: keep all (DEC-002). Documentation: `.agent_docs/testing.md`.
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 to DT-007 | integration | the engine functions (`fetch_from_remote`, `delete_tag_on_remote`, `push_tag_to_remote`, `push_tags_to_remote`, clone) against `test_remote::Remote` over `http://127.0.0.1:<port>/repo.git` | `crates/core/src/tools/git.rs` tests | US-0157 |
+| DT-008, DT-009 | functional e2e | the registered tools over `https://127.0.0.1:<port>/repo.git` | `crates/core/src/tools/git.rs` tests | US-0158 |
+| DT-010 | structural | `include_str!` of `remote.rs` and `git/mod.rs` | `crates/core/src/git/remote.rs` tests | US-0158 |
+Test data: generated bare repositories in the test's temporary directory; one committed certificate and key.
+
+### Decisions (continuing)
+- **DEC-007:** two stories. US-0157 (plain HTTP: the server, the behaviors, the real hooks, seven tests, the doc) touches 4 files at tier 2. US-0158 (https: the seam, the fixtures, the dev-dependency, the `Tls` mode, three tests) touches 7 files and rests on an unverified TLS backend behavior (DEC-004), so it is `min_tier` 1: the density of decisions, not the file count, sets it. **Obliged by:** n/a (no code impact): partitioning only. **Source:** design.
+- **DEC-008:** the double picks a free loopback port (`127.0.0.1:0`) per test and serves until its handle is dropped; no fixed port, so tests run in parallel. **Obliged by:** DR-001. **Source:** existing practice `git.rs:9809-9818` (`closing_remote` binds port 0).
+- **DEC-009:** a request to `git upload-pack` or `git receive-pack` runs with the bare repository directory as its working directory and `GIT_HTTP_EXPORT_ALL` unset; the service names come from the `service` query of `info/refs` and the path of the POST. **Obliged by:** DR-001. **Source:** design.
+
+### Stories
+| Story | Title | Priority | Requirements | Depends on | min_tier | Closes spec |
+|---|---|---|---|---|---|---|
+| US-0157 | add a test transport that answers like a real git server | P1 | DR-001, DR-002, DR-003, DR-006 | main | 2 | no |
+| US-0158 | serve the test transport over https | P1 | DR-004, DR-005, DR-006 | US-0157 | 1 | yes |
