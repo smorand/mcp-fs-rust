@@ -3,7 +3,7 @@
 Mounted only when `api.enabled` is true (default). Two families share one guard:
 a **bytes plane** for a UI or a script (browse, upload, download, zip) and
 **endpoint for endpoint parity with the `fs.*` tools**, which calls the very same
-`core::fs_ops` functions the tools call. 38 routes, asserted against the
+`core::fs_ops` functions the tools call. Every route is asserted against the
 documentation table by a test, so a route cannot ship undocumented.
 
 Implementation: `api/dataplane.rs` (routes), `api/openapi.rs` (spec plus UI).

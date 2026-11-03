@@ -814,7 +814,7 @@ documented at its call site. Headlines only:
 The authoritative list, with the reasoning and the non git divergences, is in
 [`.agent_docs/lineage.md`](lineage.md). Do not restate it elsewhere.
 
-Divergences from standard git (no index, dirty tree refusal, HTTPS only, no tags) are a different
+Divergences from standard git (no index, dirty tree refusal, HTTPS only) are a different
 set: see [`git-divergences.md`](git-divergences.md).
 
 ## SPEC-0021 (2026-10-12): a refused branch checkout creates no branch
