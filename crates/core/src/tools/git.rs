@@ -26829,6 +26829,166 @@ mod tests {
         assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0").as_deref(), Some(c.as_str()));
     }
 
+    // ── SPEC-0075: which branch's tags a fetch receives ──────────────────────
+
+    /// A remote with `main` (tag `v1.0` on its history) and `experimental` (one
+    /// commit ahead, tags `v9.0` plain and `v9.1` annotated on that commit only).
+    async fn two_branch_remote(
+        e: &Env,
+        label: &str,
+    ) -> (std::path::PathBuf, String, String, String) {
+        let (dir, url, a) = cloned_remote(e, label).await;
+        plain_tag_bare_remote(&dir, "v1.0", &a);
+        create_branch_on_bare_remote(&dir, "refs/heads/experimental", "refs/heads/main");
+        let x = advance_bare_remote(&dir, "refs/heads/experimental", "x\n");
+        plain_tag_bare_remote(&dir, "v9.0", &x);
+        annotated_tag_bare_remote(&dir, "v9.1", &x, "outside\n");
+        (dir, url, a, x)
+    }
+
+    fn remote_tag_refs(dir: &std::path::Path) -> BTreeMap<String, String> {
+        bare_refs(dir).into_iter().filter(|(k, _)| k.starts_with("refs/tags/")).collect()
+    }
+
+    /// Makes the project's `HEAD` row name no branch.
+    async fn detach_head(e: &Env, sha: &str) {
+        e.entry().await.db.set_ref("HEAD", sha, false).await.unwrap();
+    }
+
+    /// SPEC-0075/E2E-001: a fetch on `main` brings in the tag of `main`.
+    #[tokio::test]
+    async fn spec_0075_e2e_001_fetch_on_the_checked_out_branch() {
+        let e = Env::new().await;
+        let (_dir, url, _, _) = two_branch_remote(&e, "remote-s75-001").await;
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert!(tag_target(&e, "v1.0").await.is_some());
+    }
+
+    /// SPEC-0075/E2E-002: a tag only `experimental` holds is neither received nor mentioned.
+    #[tokio::test]
+    async fn spec_0075_e2e_002_a_tag_on_another_branch_is_ignored() {
+        let e = Env::new().await;
+        let (_dir, url, _, _) = two_branch_remote(&e, "remote-s75-002").await;
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+        assert!(!out.to_string().contains("v9."), "the result must not mention it: {out}");
+    }
+
+    /// SPEC-0075/E2E-003: with no `HEAD` row the remote's default branch decides.
+    #[tokio::test]
+    async fn spec_0075_e2e_003_no_checked_out_branch() {
+        let e = Env::new().await;
+        let (_dir, url, _, _) = two_branch_remote(&e, "remote-s75-003").await;
+        e.entry().await.db.delete_ref("HEAD").await.unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+    }
+
+    /// SPEC-0075/E2E-008: the tags not received change nothing else.
+    #[tokio::test]
+    async fn spec_0075_e2e_008_nothing_else_changes() {
+        let e = Env::new().await;
+        let (dir, url, _, _) = two_branch_remote(&e, "remote-s75-008").await;
+        let remote_tags = remote_tag_refs(&dir);
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+        assert_eq!(remote_tag_refs(&dir), remote_tags);
+        assert_eq!(out["tags_kept_local"], json!([]));
+    }
+
+    /// SPEC-0075/E2E-009: a down remote brings in no tag.
+    #[tokio::test]
+    async fn spec_0075_e2e_009_the_remote_is_down() {
+        let e = Env::new().await;
+        two_branch_remote(&e, "remote-s75-009").await;
+        let down = down_remote(&e);
+
+        let err = call_fetch_branch(&e, &down, "anonymous").await.unwrap_err();
+
+        assert!(err.message.starts_with(&connection_prefix(&down)), "{}", err.message);
+        assert!(tag_list(&e).await.is_empty());
+    }
+
+    /// SPEC-0075/E2E-010: no `HEAD` row, the other branch's tag is not received.
+    #[tokio::test]
+    async fn spec_0075_e2e_010_no_checked_out_branch_other_branch_tag() {
+        let e = Env::new().await;
+        let (_dir, url, _, _) = two_branch_remote(&e, "remote-s75-010").await;
+        e.entry().await.db.delete_ref("HEAD").await.unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert!(!tag_names(&e).await.contains(&"v9.0".to_string()));
+        assert!(!out.to_string().contains("v9."), "the result must not mention it: {out}");
+    }
+
+    /// SPEC-0075/E2E-011: a detached position behaves like no branch.
+    #[tokio::test]
+    async fn spec_0075_e2e_011_a_detached_position() {
+        let e = Env::new().await;
+        let (_dir, url, a, _) = two_branch_remote(&e, "remote-s75-011").await;
+        detach_head(&e, &a).await;
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+    }
+
+    /// SPEC-0075/E2E-012: with no `HEAD` row nothing but `v1.0` arrives and the remote is unchanged.
+    #[tokio::test]
+    async fn spec_0075_e2e_012_no_checked_out_branch_changes_nothing_else() {
+        let e = Env::new().await;
+        let (dir, url, _, _) = two_branch_remote(&e, "remote-s75-012").await;
+        e.entry().await.db.delete_ref("HEAD").await.unwrap();
+        let remote_tags = remote_tag_refs(&dir);
+
+        call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+        assert_eq!(remote_tag_refs(&dir), remote_tags);
+    }
+
+    /// SPEC-0075 (FR-NEW-001): the checked out branch wins over the remote's
+    /// default branch, which is `experimental` here while `main` is checked out.
+    #[tokio::test]
+    async fn spec_0075_the_checked_out_branch_wins_over_the_remote_default() {
+        let e = Env::new().await;
+        let (dir, url, _, _) = two_branch_remote(&e, "remote-s75-wins").await;
+        git2::Repository::open_bare(&dir).unwrap().set_head("refs/heads/experimental").unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(names(&out["tags_added"]), ["v1.0"]);
+        assert_eq!(tag_names(&e).await, ["v1.0"]);
+    }
+
+    /// SPEC-0075/E2E-015: a remote whose default position names no branch.
+    #[tokio::test]
+    async fn spec_0075_e2e_015_the_remote_has_no_default_branch() {
+        let e = Env::new().await;
+        let (dir, url, _, _) = two_branch_remote(&e, "remote-s75-015").await;
+        e.entry().await.db.delete_ref("HEAD").await.unwrap();
+        git2::Repository::open_bare(&dir).unwrap().set_head("refs/heads/nope").unwrap();
+
+        let out = call_fetch_branch(&e, &url, "anonymous").await.unwrap();
+
+        assert_eq!(out["tags_added"], json!([]));
+        assert_eq!(out["tags_kept_local"], json!([]));
+        assert!(tag_list(&e).await.is_empty());
+        assert!(e.ref_sha("refs/remotes/origin/main").await.is_some(), "branches still update");
+    }
+
     // ── SPEC-0074: what counts as "on the remote" for a tag publish ──────────
 
     /// Point the bare remote's `ref_name` at `commit`.
