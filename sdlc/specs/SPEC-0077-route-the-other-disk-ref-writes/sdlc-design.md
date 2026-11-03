@@ -25,13 +25,14 @@
 | File | Change | Occurrences |
 |---|---|---|
 | `crates/core/src/tools/git.rs` | ten sites call `sync_disk_ref`; tests DT-001 to DT-007, DT-010, DT-011 | 10 sites |
+| `crates/core/src/tools/git.rs:3716` | checked write of `push_branch`, unchanged (its error fails the push; DEC-005) | 1 site, not changed |
 | `.agent_docs/git.md` | the sentence naming BL-0121 ("Ten more sites ... still discard the write") states the family is complete | 1 |
 | `sdlc/backlog/BL-0121-*.md` | deleted in the landing commit | 1 |
 
 **Non source occurrences:** none (`rg 'repo\.reference\(' --glob '!crates/**' --glob '!sdlc/**'` finds only `.agent_docs/git.md`).
 **Contracts touched:** none public. `sync_disk_ref` is crate internal.
 **Guardrail coverage:** the git lib tests, including the merge, rebase, cherry pick, pull and commit suites (ASSUMED: count not recounted; the command below runs them). **Test command:** `export MCPFS_TEST_PG_DSN="${MCPFS_TEST_PG_DSN/:5432\//:5433/}"; cargo test -p mcp-fs-core --lib git`
-**Total:** 1 source file, 10 sites, 1 doc line.
+**Total:** 1 source file, 10 sites changed, 1 checked site left as is (11 non test matches of `.reference(` besides `sync_disk_ref`'s own), 1 doc line.
 
 ## 3. Class sweep
 Not applicable (`Security: n/a`).
@@ -49,7 +50,7 @@ Not applicable (`Security: n/a`).
 > WHEN the on disk ref write of any of the ten sites fails THE git tools SHALL log one warning `on disk ref write failed` carrying `tool`, `ref` and `error`, and SHALL return the same result as when the write succeeds.
 
 #### DR-003 [EARS-UB]: no discarded write
-> The non test code of `crates/core/src/tools/git.rs` SHALL NOT contain `let _ = repo.reference(`, and SHALL contain `.reference(` only inside `sync_disk_ref`.
+> The non test code of `crates/core/src/tools/git.rs` SHALL NOT contain `let _ = repo.reference(`, and SHALL contain `.reference(` only inside `sync_disk_ref` and at the checked write of `push_branch` (`:3716`), whose error already fails the push.
 
 ### 4.2 Invariance
 #### DR-004 [EARS-U]: behavior invariance
@@ -70,6 +71,7 @@ None: no public contract moves.
 - **DEC-002:** `land_replay` wrote its raw `tool` as reflog text (`git.rs:4937`); through the helper it reads `mcp-fs <tool>` like every other site. **Alternatives considered:** a helper variant taking the full message (rejected: one more form for a text a bare repository does not keep). **Implemented by:** DR-001. **Evidence:** `git.rs:4937`.
 - **DEC-003:** `pause_replay` writes `refs/mcp-fs/rebase-head`, not a branch; it takes the same helper, so its failure is logged too. **Implemented by:** DR-001, DR-002. **Evidence:** `git.rs:4521`, `:4971`.
 - **DEC-004:** one story: ten one line changes and nine tests in one file. **Obliged by:** n/a (no code impact): partitioning only.
+- **DEC-005:** the checked write at `git.rs:3716` stays as is: its failure must fail `git.remote_push`, which names the branch by ref. **Alternatives considered:** routing it through `sync_disk_ref` (rejected: a refusal would become a warning, a behavior change). **Implemented by:** DR-003. **Evidence:** `git.rs:3711-3721`.
 - **Assumption:** SPEC-0071's block mechanism (an empty `<ref>.lock` file) makes libgit2 refuse each of these writes; the RED run shows it per site.
 
 ## 7. Declared breaks
@@ -101,7 +103,7 @@ The existing test suite passes **unmodified**:
 #### DT-010: no discarded write
 - **Asserts:** the non test part of `git.rs` (text before `#[cfg(test)]\nmod tests`) contains no `let _ = repo.reference(`. **Method:** `include_str!("git.rs")` sliced at the test module.
 #### DT-011: one writer
-- **Asserts:** that same slice contains `.reference(` exactly once, inside `sync_disk_ref`. **Method:** count and slice as DT-010.
+- **Asserts:** that same slice contains `.reference(` exactly twice: once inside `sync_disk_ref`, once in `push_branch` followed by `.map_err(`. **Method:** count and slice as DT-010.
 
 ### 8.4 Existing tests to modify
 None. (`dt_0071_010` and `dt_0071_011` keep passing: they slice named functions and `git_tags.rs`.)
