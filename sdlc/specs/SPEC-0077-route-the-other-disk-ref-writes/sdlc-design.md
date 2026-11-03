@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 file, 10 call sites in 8 functions, no public contract change, no persisted change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-02
 > Behavior change: none
 > From backlog: BL-0121

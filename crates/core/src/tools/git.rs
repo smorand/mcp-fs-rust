@@ -2330,7 +2330,7 @@ async fn commit(
     }
     // Keep the on disk refs in step, so libgit2 based reads (blame, revwalk) and
     // an operator running `git log` inside the bare repo agree with the index.
-    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.commit");
+    sync_disk_ref(&repo, &branch_ref, oid, "git.commit");
     if head.is_none() {
         let _ = repo.set_head(&branch_ref);
     }
@@ -2397,9 +2397,23 @@ pub(crate) fn validate_ref_name(name: &str, noun: &str) -> Result<()> {
 /// two disagree, since nothing repairs the on disk ref later.
 pub(crate) fn sync_disk_ref(repo: &Repository, ref_name: &str, oid: Oid, tool: &str) {
     if let Err(e) = repo.reference(ref_name, oid, true, &format!("mcp-fs {tool}")) {
+        #[cfg(test)]
+        DISK_REF_FAILURES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((
+            repo.path().to_path_buf(),
+            tool.to_string(),
+            ref_name.to_string(),
+        ));
         warn_disk_ref_skipped(tool, ref_name, &e.to_string());
     }
 }
+
+/// Every failed write of [`sync_disk_ref`] with the path of the repository it
+/// happened in, for the tests: each test owns a temporary repository, so reading
+/// by path leaves no room for another test's warning on a shared ref name such
+/// as `refs/heads/main`.
+#[cfg(test)]
+pub(crate) static DISK_REF_FAILURES: std::sync::Mutex<Vec<(std::path::PathBuf, String, String)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// The one warning for an on disk ref that was not written, shared by the helper
 /// and by the callers that refuse to write a name libgit2 would rewrite.
@@ -2867,7 +2881,7 @@ async fn set_branch_ref(
     tool: &str,
 ) -> Result<()> {
     entry.db.set_ref(branch_ref, new_sha, false).await?;
-    let _ = repo.reference(branch_ref, parse_oid(new_sha)?, true, &format!("mcp-fs {tool}"));
+    sync_disk_ref(repo, branch_ref, parse_oid(new_sha)?, tool);
     Ok(())
 }
 
@@ -4227,7 +4241,7 @@ async fn merge_inner(
         let changes = merge::diff_tree_changes(&repo, &tip_tree, &source_tree)?;
         merge::charge_and_apply("git.merge", &repo, &safety, &person, &client, &changes).await?;
         entry.db.set_ref(&branch_ref, &source_sha, false).await?;
-        let _ = repo.reference(&branch_ref, source_oid, true, "mcp-fs git.merge fast-forward");
+        sync_disk_ref(&repo, &branch_ref, source_oid, "git.merge fast-forward");
         return Ok(MergeReport::Applied {
             sha: source_sha,
             files_changed: changes.len(),
@@ -4301,7 +4315,7 @@ async fn merge_inner(
                 .map_err(|e| git_err("create merge commit", e))?;
             entry.objects.import_reachable(&repo, &[oid]).await?;
             entry.db.set_ref(&branch_ref, &oid.to_string(), false).await?;
-            let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.merge");
+            sync_disk_ref(&repo, &branch_ref, oid, "git.merge");
             Ok(MergeReport::Applied {
                 sha: oid.to_string(),
                 files_changed: changes.len(),
@@ -4934,7 +4948,7 @@ async fn land_replay(
     entry.db.set_ref(&branch_ref, &tip, false).await?;
     // The dual write `git.commit` establishes: the on disk ref must agree with
     // the index, or a later libgit2 read walks the pre-replay history.
-    let _ = repo.reference(&branch_ref, new_tip, true, tool);
+    sync_disk_ref(repo, &branch_ref, new_tip, tool);
     clear_replay_state(entry, repo).await?;
     Ok(tip)
 }
@@ -4968,7 +4982,7 @@ async fn pause_replay(
     entry.objects.import_reachable(repo, &[replay_tip]).await?;
     let replay_sha = replay_tip.to_string();
     entry.db.set_ref(REPLAY_HEAD_REF, &replay_sha, false).await?;
-    let _ = repo.reference(REPLAY_HEAD_REF, replay_tip, true, "mcp-fs git.rebase pause");
+    sync_disk_ref(repo, REPLAY_HEAD_REF, replay_tip, "git.rebase pause");
 
     let now = Utc::now().to_rfc3339();
     let created_at = created_at.unwrap_or_else(|| now.clone());
@@ -5672,7 +5686,7 @@ async fn merge_resolve_inner(
     entry.objects.import_reachable(&repo, &[oid]).await?;
     let branch_ref = format!("refs/heads/{branch}");
     entry.db.set_ref(&branch_ref, &oid.to_string(), false).await?;
-    let _ = repo.reference(&branch_ref, oid, true, "mcp-fs git.merge_resolve");
+    sync_disk_ref(&repo, &branch_ref, oid, "git.merge_resolve");
     Ok((Some(oid.to_string()), changes.len()))
 }
 
@@ -6061,7 +6075,7 @@ async fn replay_abort(
         let repo = thread_entry.repo.lock().await;
         let branch_ref = format!("refs/heads/{branch}");
         thread_entry.db.set_ref(&branch_ref, &restore_to, false).await?;
-        let _ = repo.reference(&branch_ref, parse_oid(&restore_to)?, true, "mcp-fs replay abort");
+        sync_disk_ref(&repo, &branch_ref, parse_oid(&restore_to)?, "replay abort");
         clear_replay_state(&thread_entry, &repo).await
     })
     .await?;
@@ -7037,12 +7051,7 @@ async fn pull_branch_inner(
                     .db
                     .set_ref(&branch_ref_name, &merge_oid.to_string(), false)
                     .await?;
-                let _ = repo.reference(
-                    &branch_ref_name,
-                    merge_oid,
-                    true,
-                    "mcp-fs git.remote_pull merge",
-                );
+                sync_disk_ref(&repo, &branch_ref_name, merge_oid, "git.remote_pull merge");
 
                 return Ok(PullOutcome::Merged {
                     merge_commit: merge_oid.to_string(),
@@ -7071,7 +7080,7 @@ async fn pull_branch_inner(
 
             let branch_ref_name = format!("refs/heads/{branch_owned}");
             entry_for_thread.db.set_ref(&branch_ref_name, &remote_oid.to_string(), false).await?;
-            let _ = repo.reference(&branch_ref_name, remote_oid, true, "mcp-fs git.remote_pull");
+            sync_disk_ref(&repo, &branch_ref_name, remote_oid, "git.remote_pull");
 
             Ok(PullOutcome::FastForward {
                 old_sha: local_sha_owned.clone(),
@@ -27159,6 +27168,201 @@ mod tests {
         let second = call_pull_branch(&e, &url, "main", "anonymous").await.unwrap_err();
 
         assert_eq!(second.message, "merge failed: injected");
+    }
+
+    // ── SPEC-0077: the other on disk ref writes are reported too ─────────────
+
+    /// The `(tool, ref)` of every failed on disk ref write of this test's project.
+    async fn disk_ref_failures(e: &Env) -> Vec<(String, String)> {
+        let path = e.entry().await.repo.lock().await.path().to_path_buf();
+        let failures: Vec<(String, String)> = DISK_REF_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(p, _, _)| *p == path)
+            .map(|(_, tool, r)| (tool.clone(), r.clone()))
+            .collect();
+        // Every failed write was also reported: the warning of SPEC-0071 carries
+        // the same tool and ref (other tests may add entries, never remove one).
+        for (tool, r) in &failures {
+            assert!(
+                disk_ref_warnings(r).iter().any(|(t, _)| t == tool),
+                "no warning for {tool} on {r}"
+            );
+        }
+        failures
+    }
+
+    fn failure(tool: &str, r: &str) -> (String, String) {
+        (tool.to_string(), r.to_string())
+    }
+
+    /// SPEC-0077/DT-001: a commit survives a blocked write of the branch ref.
+    #[tokio::test]
+    async fn dt_0077_001_commit_survives_a_blocked_disk_write() {
+        let e = Env::new().await;
+        e.call("git.init", json!({"mount_id": MOUNT})).await.unwrap();
+        e.write("/a.txt", "a\n").await;
+        e.commit("first").await;
+        block_disk_ref(&e, "refs/heads/main").await;
+        e.write("/b.txt", "b\n").await;
+
+        let sha = e.commit("second").await;
+
+        assert_eq!(e.ref_sha("refs/heads/main").await.as_deref(), Some(sha.as_str()));
+        assert_eq!(disk_ref_failures(&e).await, [failure("git.commit", "refs/heads/main")]);
+    }
+
+    /// SPEC-0077/DT-002: a fast forward merge and a true merge survive a blocked write.
+    #[tokio::test]
+    async fn dt_0077_002_merge_survives_a_blocked_disk_write() {
+        let ff = Env::new().await;
+        seed_ff(&ff).await;
+        block_disk_ref(&ff, "refs/heads/main").await;
+        ff.merge("feature").await.unwrap();
+        assert_eq!(
+            disk_ref_failures(&ff).await,
+            [failure("git.merge fast-forward", "refs/heads/main")]
+        );
+
+        let merged = Env::new().await;
+        seed_automerge(&merged).await;
+        block_disk_ref(&merged, "refs/heads/main").await;
+        merged.merge("feature").await.unwrap();
+        assert_eq!(disk_ref_failures(&merged).await, [failure("git.merge", "refs/heads/main")]);
+    }
+
+    /// SPEC-0077/DT-003: resolving a conflicted merge survives a blocked write.
+    #[tokio::test]
+    async fn dt_0077_003_merge_resolve_survives_a_blocked_disk_write() {
+        let e = Env::new().await;
+        seed_conflict(&e).await;
+        let out = e.merge("feature").await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        block_disk_ref(&e, "refs/heads/main").await;
+
+        e.resolve(json!([{"path": CFG, "strategy": "theirs"}])).await.unwrap();
+
+        assert_eq!(disk_ref_failures(&e).await, [failure("git.merge_resolve", "refs/heads/main")]);
+    }
+
+    /// SPEC-0077/DT-004: a fast forward pull and a merging pull survive a blocked write.
+    #[tokio::test]
+    async fn dt_0077_004_pull_survives_a_blocked_disk_write() {
+        let ff = Env::new().await;
+        let (dir, url, _) = cloned_remote(&ff, "remote-s77-004a").await;
+        advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        block_disk_ref(&ff, "refs/heads/main").await;
+        call_pull_branch(&ff, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(disk_ref_failures(&ff).await, [failure("git.remote_pull", "refs/heads/main")]);
+
+        let merged = Env::new().await;
+        let (dir, url, _) = cloned_remote(&merged, "remote-s77-004b").await;
+        merged.write("/local.txt", "local\n").await;
+        merged.commit("local").await;
+        advance_bare_remote(&dir, "refs/heads/main", "c\n");
+        block_disk_ref(&merged, "refs/heads/main").await;
+        call_pull_branch(&merged, &url, "main", "anonymous").await.unwrap();
+        assert_eq!(
+            disk_ref_failures(&merged).await,
+            [failure("git.remote_pull merge", "refs/heads/main")]
+        );
+    }
+
+    /// SPEC-0077/DT-005: a rebase that pauses, one that lands and an abort survive a blocked write.
+    #[tokio::test]
+    async fn dt_0077_005_rebase_paths_survive_a_blocked_disk_write() {
+        let picks = |g: &[String]| json!([pick(&g[0]), pick(&g[1]), pick(&g[2])]);
+
+        let pause = Env::new().await;
+        let g = seed_fork3c(&pause).await;
+        block_disk_ref(&pause, "refs/mcp-fs/rebase-head").await;
+        let out = rebase(&pause, "main", picks(&g)).await.unwrap();
+        assert_eq!(out["status"], "conflict", "{out}");
+        assert_eq!(
+            disk_ref_failures(&pause).await,
+            [failure("git.rebase pause", "refs/mcp-fs/rebase-head")]
+        );
+
+        let land = Env::new().await;
+        let g = seed_fork3c(&land).await;
+        let mut out = rebase(&land, "main", picks(&g)).await.unwrap();
+        block_disk_ref(&land, "refs/heads/feature").await;
+        while out["status"] == "conflict" {
+            out = rebase_continue(&land, json!([res("/a.txt", "ours")])).await.unwrap();
+        }
+        let landed = disk_ref_failures(&land).await;
+        assert_eq!(landed, [failure("git.rebase_continue", "refs/heads/feature")]);
+
+        let abort = Env::new().await;
+        let g = seed_fork3c(&abort).await;
+        rebase(&abort, "main", picks(&g)).await.unwrap();
+        block_disk_ref(&abort, "refs/heads/feature").await;
+        rebase_abort(&abort).await.unwrap();
+        assert_eq!(
+            disk_ref_failures(&abort).await,
+            [failure("replay abort", "refs/heads/feature")]
+        );
+    }
+
+    /// SPEC-0077/DT-006: a branch reset survives a blocked write.
+    #[tokio::test]
+    async fn dt_0077_006_branch_reset_survives_a_blocked_disk_write() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        block_disk_ref(&e, "refs/heads/main").await;
+
+        branch_reset(&e, json!({"name": "main", "target_commit": c[1], "force": true}))
+            .await
+            .unwrap();
+
+        assert_eq!(disk_ref_failures(&e).await, [failure("git.branch_reset", "refs/heads/main")]);
+    }
+
+    /// SPEC-0077/DT-007: the same operations with nothing blocked fail no write.
+    #[tokio::test]
+    async fn dt_0077_007_healthy_writes_are_silent() {
+        let e = Env::new().await;
+        let c = seed_line(&e).await;
+        e.write("/z.txt", "z\n").await;
+        e.commit("more").await;
+        branch_reset(&e, json!({"name": "main", "target_commit": c[1], "force": true}))
+            .await
+            .unwrap();
+        let ff = Env::new().await;
+        seed_ff(&ff).await;
+        ff.merge("feature").await.unwrap();
+        let conflicted = Env::new().await;
+        seed_conflict(&conflicted).await;
+        conflicted.merge("feature").await.unwrap();
+        conflicted.resolve(json!([{"path": CFG, "strategy": "theirs"}])).await.unwrap();
+
+        for env in [&e, &ff, &conflicted] {
+            assert_eq!(disk_ref_failures(env).await, []);
+        }
+    }
+
+    /// The non test part of `git.rs`, before its test module.
+    fn production_source() -> &'static str {
+        let source = include_str!("git.rs");
+        &source[..source.find("#[cfg(test)]\nmod tests {").expect("test module")]
+    }
+
+    /// SPEC-0077/DT-010: no discarded on disk ref write is left.
+    #[test]
+    fn dt_0077_010_no_discarded_ref_write_is_left() {
+        assert!(!production_source().contains("let _ = repo.reference("));
+    }
+
+    /// SPEC-0077/DT-011: `.reference(` appears in `sync_disk_ref` and at the
+    /// checked write of `push_branch`, nowhere else.
+    #[test]
+    fn dt_0077_011_one_writer_and_one_checked_write() {
+        let source = production_source();
+        assert_eq!(source.matches(".reference(").count(), 2);
+        let checked = &source[source.find("repo.reference(\n").expect("checked write")..];
+        assert!(checked.contains(".map_err(|e| git_err(\"sync local branch ref\", e))?"));
+        assert!(fn_body(source, "pub(crate) fn sync_disk_ref(").contains(".reference("));
     }
 
     // ── SPEC-0075: which branch's tags a fetch receives ──────────────────────
