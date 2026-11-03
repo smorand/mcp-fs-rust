@@ -27224,7 +27224,7 @@ mod tests {
     /// DEC-018 through the real publication: the remote tag is deleted
     /// between the listing and the push. The lease on f sees the zero id, the
     /// push sends nothing, and the second listing finds no tag, so the
-    /// refusal names the zero id: that is what the code does today.
+    /// refusal says the tag does not exist (SPEC-0072/FR-NEW-003, E2E-004).
     #[tokio::test]
     async fn e2e_tag_extra_lease_lost_deleted_between_listing_and_push() {
         let e = Env::new().await;
@@ -27234,13 +27234,186 @@ mod tests {
             let repo = git2::Repository::open_bare(&hook_dir).unwrap();
             repo.find_reference("refs/tags/v1.0").unwrap().delete().unwrap();
         });
+        let (refs_before, audit_before) = (bare_refs(&dir), audit_size(&e));
+
+        let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap_err();
+
+        assert_eq!(err.code, code::NOT_FOUND);
+        assert_eq!(err.message, "Remote tag 'v1.0' does not exist.");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
+        assert!(publish_audit(&e, OWNER).is_empty());
+        assert_eq!(bare_refs(&dir).len(), refs_before.len() - 1, "only the hook removed a ref");
+        assert_eq!(audit_size(&e), audit_before);
+    }
+
+    /// The first part of a one tag publish connection refusal.
+    fn publish_tag_prefix(tag: &str, url: &str) -> String {
+        format!("push of tag '{tag}' to host '{}' failed: ", crate::git::remote::extract_host(url))
+    }
+
+    /// SPEC-0072/E2E-002: one tag, the remote is down.
+    #[tokio::test]
+    async fn spec_0072_e2e_002_one_tag_remote_down() {
+        let e = Env::new().await;
+        cloned_remote(&e, "remote-s72-002").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let down = down_remote(&e);
+
+        let err = call_publish_tag(&e, &down, "v1.0").await.unwrap_err();
+
+        assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
+        assert!(err.message.starts_with(&publish_tag_prefix("v1.0", &down)), "{}", err.message);
+        assert!(!err.message.contains("fetch from host"), "{}", err.message);
+    }
+
+    /// SPEC-0072/E2E-005: a remote tag that moved keeps the moved wording.
+    #[tokio::test]
+    async fn spec_0072_e2e_005_a_moved_remote_tag_keeps_its_wording() {
+        let e = Env::new().await;
+        let (dir, url, a, f) = diverged_remote_tag(&e, "remote-s72-005").await;
+        let g = another_published_commit(&e, &url, &a).await;
+        let (hook_dir, hook_g) = (dir.clone(), g.clone());
+        super::super::git_tags::after_listing::set(&url, move || {
+            plain_tag_bare_remote(&hook_dir, "v1.0", &hook_g);
+        });
 
         let err = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await.unwrap_err();
 
         assert_eq!(err.code, code::NO_CLOBBER);
-        assert_eq!(err.message, moved_text(&"0".repeat(40)));
+        assert_eq!(err.message, moved_text(&g));
+    }
+
+    /// SPEC-0072/E2E-006: fetch, pull and remote delete keep `fetch from host`.
+    #[tokio::test]
+    async fn spec_0072_e2e_006_other_operations_keep_the_fetch_wording() {
+        let e = Env::new().await;
+        cloned_remote(&e, "remote-s72-006").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let down = down_remote(&e);
+
+        let fetch = call_fetch_branch(&e, &down, "anonymous").await.unwrap_err();
+        let pull = call_pull_branch(&e, &down, "main", "anonymous").await.unwrap_err();
+        let delete = call_delete_remote_tag(&e, &down, "v1.0", "f6a7b8c").await.unwrap_err();
+
+        for err in [fetch, pull, delete] {
+            assert!(err.message.starts_with(&connection_prefix(&down)), "{}", err.message);
+        }
+    }
+
+    /// SPEC-0072 regression: the push of a remote tag deletion shares its failure
+    /// wording code with the publish and keeps `fetch from host`.
+    #[tokio::test]
+    async fn spec_0072_regression_a_delete_push_failure_keeps_the_fetch_wording() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = deletion_remote(&e, "remote-s72-del").await;
+        let (hook_dir, gone) = (dir.clone(), dir.with_extension("gone"));
+        let hook_gone = gone.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            std::fs::rename(&hook_dir, &hook_gone).unwrap();
+        });
+
+        let err = call_delete_remote_tag(&e, &url, "v1.0", short7(&f)).await.unwrap_err();
+
+        std::fs::rename(&gone, &dir).unwrap();
+        assert!(err.message.starts_with(&connection_prefix(&url)), "{}", err.message);
+    }
+
+    /// SPEC-0072 regression: until publish all has its own wording, the message
+    /// check of publish all keeps `fetch from host`, though one tag publish
+    /// shares the probe.
+    #[tokio::test]
+    async fn spec_0072_regression_a_publish_all_message_check_keeps_the_fetch_wording() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s72-pa").await;
+        tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "release 1.0\n");
+        let (hook_dir, gone) = (dir.clone(), dir.with_extension("gone"));
+        let hook_gone = gone.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            std::fs::rename(&hook_dir, &hook_gone).unwrap();
+        });
+
+        let err = call_publish_all_tags(&e, "origin", None).await.unwrap_err();
+
+        std::fs::rename(&gone, &dir).unwrap();
+        assert!(err.message.starts_with(&connection_prefix(&url)), "{}", err.message);
+    }
+
+    /// SPEC-0072/E2E-007: the connection is lost at the push, after the listing.
+    #[tokio::test]
+    async fn spec_0072_e2e_007_the_connection_is_lost_at_the_push() {
+        let e = Env::new().await;
+        let (dir, url, _) = cloned_remote(&e, "remote-s72-007").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let (hook_dir, gone) = (dir.clone(), dir.with_extension("gone"));
+        let hook_gone = gone.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            std::fs::rename(&hook_dir, &hook_gone).unwrap();
+        });
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        std::fs::rename(&gone, &dir).unwrap();
+        assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
+        assert!(err.message.starts_with(&publish_tag_prefix("v1.0", &url)), "{}", err.message);
         assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None);
-        assert!(publish_audit(&e, OWNER).is_empty());
+    }
+
+    /// SPEC-0072/E2E-008: a refused publish changes nothing.
+    #[tokio::test]
+    async fn spec_0072_e2e_008_a_refused_publish_changes_nothing() {
+        let e = Env::new().await;
+        let (dir, _, _) = cloned_remote(&e, "remote-s72-008").await;
+        tag(&e, json!({"name": "v1.0"})).await.unwrap();
+        let (refs, audit, local) = (bare_refs(&dir), audit_size(&e), tag_target(&e, "v1.0").await);
+
+        let err = call_publish_tag(&e, &down_remote(&e), "v1.0").await.unwrap_err();
+
+        assert!(err.message.starts_with("push of tag 'v1.0'"), "{}", err.message);
+        assert_eq!(bare_refs(&dir), refs);
+        assert_eq!(audit_size(&e), audit);
+        assert_eq!(tag_target(&e, "v1.0").await, local);
+    }
+
+    /// SPEC-0072/E2E-009: the check of an annotated tag's message loses the
+    /// connection.
+    #[tokio::test]
+    async fn spec_0072_e2e_009_the_message_check_loses_the_connection() {
+        let e = Env::new().await;
+        let (dir, url, a) = cloned_remote(&e, "remote-s72-009").await;
+        tag(&e, json!({"name": "v1.0", "message": "release 1.0\n"})).await.unwrap();
+        annotated_tag_bare_remote(&dir, "v1.0", &a, "release 1.0\n");
+        let (hook_dir, gone) = (dir.clone(), dir.with_extension("gone"));
+        let hook_gone = gone.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            std::fs::rename(&hook_dir, &hook_gone).unwrap();
+        });
+
+        let err = call_publish_tag(&e, &url, "v1.0").await.unwrap_err();
+
+        std::fs::rename(&gone, &dir).unwrap();
+        assert!(err.message.starts_with(&publish_tag_prefix("v1.0", &url)), "{}", err.message);
+        assert_eq!(probe_refs(&e).await, 0);
+    }
+
+    /// SPEC-0072/E2E-010: after a vanished remote tag the repeated publish is
+    /// a creation and needs no confirmation.
+    #[tokio::test]
+    async fn spec_0072_e2e_010_a_repeat_after_a_vanished_tag_creates_it() {
+        let e = Env::new().await;
+        let (dir, url, _, f) = diverged_remote_tag(&e, "remote-s72-010").await;
+        let hook_dir = dir.clone();
+        super::super::git_tags::after_listing::set(&url, move || {
+            let repo = git2::Repository::open_bare(&hook_dir).unwrap();
+            repo.find_reference("refs/tags/v1.0").unwrap().delete().unwrap();
+        });
+        let first = call_publish_tag_with(&e, &url, "v1.0", true, short7(&f)).await;
+        assert_eq!(first.unwrap_err().code, code::NOT_FOUND);
+
+        let again = call_publish_tag(&e, &url, "v1.0").await;
+
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), tag_target(&e, "v1.0").await);
     }
 
     /// DEC-017: the probe compares the object it actually fetched, not the

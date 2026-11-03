@@ -764,7 +764,13 @@ pub fn push_tag_to_remote(
     match push_ref(repo, origin_url, refs, token, deadline) {
         Ok(_) => Ok(TagPush::Pushed),
         Err(PushFailure::Lease(_)) => Ok(TagPush::LeaseLost),
-        Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
+        Err(f) => Err(tag_push_error(
+            f,
+            tag,
+            origin_url,
+            token_for_redaction.as_deref(),
+            ConnectionWording::PublishTag(tag),
+        )),
     }
 }
 
@@ -809,7 +815,13 @@ pub fn delete_tag_on_remote(
         }
         Err(PushFailure::Lease(_)) => Ok(TagPush::LeaseLost),
         Err(PushFailure::Rejected(reason)) => Err(remote_refused_delete(tag, &reason)),
-        Err(f) => Err(tag_push_error(f, tag, origin_url, token_for_redaction.as_deref())),
+        Err(f) => Err(tag_push_error(
+            f,
+            tag,
+            origin_url,
+            token_for_redaction.as_deref(),
+            ConnectionWording::Fetch,
+        )),
     }
 }
 
@@ -1080,6 +1092,7 @@ pub fn probe_remote_tag(
     tag: &str,
     token: Option<String>,
     deadline: Option<Instant>,
+    wording: ConnectionWording<'_>,
 ) -> Result<Option<git2::Oid>> {
     let token_for_redaction = token.clone();
     let probe_ref = format!("{PROBE_TAGS_PREFIX}{tag}");
@@ -1097,7 +1110,9 @@ pub fn probe_remote_tag(
         Err(e) if e.code() == git2::ErrorCode::NotFound => (None, Ok(())),
         Err(e) => (None, Err(e)),
     };
-    fetched.map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+    fetched.map_err(|e| {
+        connection_error_for(wording, origin_url, &e, token_for_redaction.as_deref())
+    })?;
     removed.map_err(|e| ToolError::internal(format!("remove probe tag ref: {e}")))?;
     Ok(fetched_object)
 }
@@ -1109,10 +1124,13 @@ fn tag_push_error(
     tag: &str,
     origin_url: &str,
     token: Option<&str>,
+    wording: ConnectionWording<'_>,
 ) -> ToolError {
     match failure {
         PushFailure::Rejected(reason) => remote_refused_tag(tag, &reason),
-        PushFailure::Open(e) | PushFailure::Push(e) => connection_error(origin_url, &e, token),
+        PushFailure::Open(e) | PushFailure::Push(e) => {
+            connection_error_for(wording, origin_url, &e, token)
+        }
         PushFailure::Lease(_) => {
             ToolError::internal(format!("push of tag '{tag}' failed: unexpected lease"))
         }
@@ -1135,14 +1153,15 @@ pub fn list_advertised_refs(
     origin_url: &str,
     token: Option<String>,
     deadline: Option<Instant>,
+    wording: ConnectionWording<'_>,
 ) -> Result<AdvertisedRefs> {
     #[cfg(test)]
     bulk_seams::note_listing(origin_url);
     let token_for_redaction = token.clone();
-    let mut git_remote = repo
-        .remote_anonymous(origin_url)
-        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
-    advertise(&mut git_remote, origin_url, token, deadline, false).map(|(refs, _)| refs)
+    let mut git_remote = repo.remote_anonymous(origin_url).map_err(|e| {
+        connection_error_for(wording, origin_url, &e, token_for_redaction.as_deref())
+    })?;
+    advertise(&mut git_remote, origin_url, token, deadline, false, wording).map(|(refs, _)| refs)
 }
 
 /// Every `(name, oid)` a remote advertises, in advertisement order.
@@ -1158,15 +1177,17 @@ fn advertise(
     token: Option<String>,
     deadline: Option<Instant>,
     want_default: bool,
+    wording: ConnectionWording<'_>,
 ) -> Result<(AdvertisedRefs, Option<String>)> {
     let token_for_redaction = token.clone();
     let list_callbacks = credential_callbacks(token, deadline);
-    let conn = git_remote
-        .connect_auth(git2::Direction::Fetch, Some(list_callbacks), None)
-        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
-    let heads = conn
-        .list()
-        .map_err(|e| connection_error(origin_url, &e, token_for_redaction.as_deref()))?;
+    let conn =
+        git_remote.connect_auth(git2::Direction::Fetch, Some(list_callbacks), None).map_err(
+            |e| connection_error_for(wording, origin_url, &e, token_for_redaction.as_deref()),
+        )?;
+    let heads = conn.list().map_err(|e| {
+        connection_error_for(wording, origin_url, &e, token_for_redaction.as_deref())
+    })?;
     let refs = heads.iter().map(|h| (h.name().to_string(), h.oid())).collect();
     let default_branch = if want_default {
         conn.default_branch().ok().and_then(|b| {
@@ -1328,8 +1349,14 @@ pub fn fetch_from_remote(
         // Only asked for when needed: an empty or detached remote HEAD just
         // means no history to take tags from.
         let want_default = matches!(tag_scope, TagScope::RemoteDefault);
-        let (heads, default_branch) =
-            advertise(&mut git_remote, origin_url, token.clone(), deadline, want_default)?;
+        let (heads, default_branch) = advertise(
+            &mut git_remote,
+            origin_url,
+            token.clone(),
+            deadline,
+            want_default,
+            ConnectionWording::Fetch,
+        )?;
         let branches: Vec<String> = heads
             .iter()
             .filter_map(|(name, _)| name.strip_prefix("refs/heads/").map(str::to_string))
@@ -1566,8 +1593,37 @@ fn remove_incoming_refs(repo: &git2::Repository) -> Result<()> {
 /// `require_valid_credential`. This is always `ERR_INTERNAL_ERROR`, so the two
 /// are machine-distinguishable by code alone.
 fn connection_error(origin_url: &str, e: &git2::Error, token: Option<&str>) -> ToolError {
+    connection_error_for(ConnectionWording::Fetch, origin_url, e, token)
+}
+
+/// Which operation a connection failure reads as. The same listing and probe
+/// functions serve fetch, delete and publish, so the caller that knows the
+/// operation names it (SPEC-0072): an operator reading a publish failure must
+/// not see the word fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionWording<'a> {
+    /// `fetch from host '<host>' failed: <cause>`, also fetch, pull, clone and delete.
+    Fetch,
+    /// `push of tag '<tag>' to host '<host>' failed: <cause>`, publishing one tag.
+    PublishTag(&'a str),
+}
+
+/// [`connection_error`] with the wording of `wording`; the code is always
+/// `ERR_INTERNAL_ERROR` and a token in the cause is redacted.
+fn connection_error_for(
+    wording: ConnectionWording<'_>,
+    origin_url: &str,
+    e: &git2::Error,
+    token: Option<&str>,
+) -> ToolError {
     let host = extract_host(origin_url);
-    ToolError::internal(redact(format!("fetch from host '{host}' failed: {e}"), token))
+    let text = match wording {
+        ConnectionWording::Fetch => format!("fetch from host '{host}' failed: {e}"),
+        ConnectionWording::PublishTag(tag) => {
+            format!("push of tag '{tag}' to host '{host}' failed: {e}")
+        }
+    };
+    ToolError::internal(redact(text, token))
 }
 
 /// The bare hostname of a URL, or the URL itself when it does not parse: the

@@ -10,6 +10,7 @@
 //! rather than copied, so a tag refusal reads the same as a branch refusal.
 
 use crate::errors::{Result, ToolError};
+use crate::git::remote::ConnectionWording;
 use crate::git::{GitRepoEntry, GitRepoStore};
 use crate::safety::SafetyManager;
 use crate::tools::git::{
@@ -659,8 +660,13 @@ fn publish_on_repo(
         ToolError::internal(format!("tag '{tag}' does not name a commit held by the project"))
     })?;
     let commit_oid = parse_oid(&commit)?;
-    let advertised =
-        crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+    let advertised = crate::git::remote::list_advertised_refs(
+        repo,
+        url,
+        token.clone(),
+        Some(deadline),
+        ConnectionWording::PublishTag(tag),
+    )?;
     #[cfg(test)]
     after_listing::fire(url);
 
@@ -687,7 +693,7 @@ fn publish_on_repo(
             || (remote_annotated
                 && local_annotated
                 && remote_commit == commit_oid
-                && probe_identical(repo, publish)?);
+                && probe_identical(repo, publish, ConnectionWording::PublishTag(publish.tag))?);
         if identical {
             return Ok((commit, Published::UpToDate));
         }
@@ -732,12 +738,23 @@ fn publish_on_repo(
         // The remote tag moved between the listing and the push, and the
         // push was aborted before anything was sent. One more listing names
         // where it went, so the refusal reads like case 5 of DEC-018.
-        let now =
-            crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
-        let peeled = advertised_oid(&now, &format!("{tag_ref}^{{}}"))
-            .or_else(|| advertised_oid(&now, &tag_ref))
-            .unwrap_or(Oid::ZERO_SHA1);
-        return Err(moved(tag, &peeled.to_string()));
+        let now = crate::git::remote::list_advertised_refs(
+            repo,
+            url,
+            token.clone(),
+            Some(deadline),
+            ConnectionWording::PublishTag(tag),
+        )?;
+        return Err(
+            match advertised_oid(&now, &format!("{tag_ref}^{{}}"))
+                .or_else(|| advertised_oid(&now, &tag_ref))
+            {
+                Some(peeled) => moved(tag, &peeled.to_string()),
+                // Deleted between the listing and the push: say it is gone
+                // rather than that it moved to the zero id.
+                None => remote_tag_absent(tag),
+            },
+        );
     }
     let outcome = if lease.is_some() { Published::Replaced } else { Published::Created };
     Ok((commit, outcome))
@@ -751,13 +768,18 @@ fn publish_on_repo(
 /// removed whatever happened, so no ref outside the project's namespaces
 /// survives. A tag gone from the remote is not identical; the push lease
 /// then reports where it went.
-fn probe_identical(repo: &Repository, publish: &Publish<'_>) -> Result<bool> {
+fn probe_identical(
+    repo: &Repository,
+    publish: &Publish<'_>,
+    wording: ConnectionWording<'_>,
+) -> Result<bool> {
     let fetched = crate::git::remote::probe_remote_tag(
         repo,
         publish.url,
         publish.tag,
         publish.token.clone(),
         Some(publish.deadline),
+        wording,
     )?;
     match fetched {
         Some(remote_object) => tags_identical(repo, publish.object, remote_object),
@@ -1046,6 +1068,7 @@ fn publish_all_on_repo(
         conn.url,
         conn.token.clone(),
         Some(conn.deadline),
+        ConnectionWording::Fetch,
     )?;
     #[cfg(test)]
     after_listing::fire(conn.url);
@@ -1137,7 +1160,7 @@ fn remote_outcome(
                 token: conn.token.clone(),
                 deadline: conn.deadline,
             };
-            probe_identical(repo, &publish)?
+            probe_identical(repo, &publish, ConnectionWording::Fetch)?
         });
     Ok(if identical { Outcome::UpToDate } else { Outcome::Differs(remote_commit.to_string()) })
 }
@@ -1252,6 +1275,7 @@ fn reclassify_lost(
         conn.url,
         conn.token.clone(),
         Some(conn.deadline),
+        ConnectionWording::Fetch,
     )?;
     let by_name: std::collections::HashMap<&str, Oid> =
         advertised.iter().map(|(n, oid)| (n.as_str(), *oid)).collect();
@@ -1420,8 +1444,13 @@ fn delete_on_repo(
     stated: &str,
 ) -> Result<String> {
     let tag_ref = format!("{TAGS_PREFIX}{tag}");
-    let advertised =
-        crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+    let advertised = crate::git::remote::list_advertised_refs(
+        repo,
+        url,
+        token.clone(),
+        Some(deadline),
+        ConnectionWording::Fetch,
+    )?;
     #[cfg(test)]
     after_listing::fire(url);
 
@@ -1454,8 +1483,13 @@ fn delete_on_repo(
         // DEC-008: the tag moved or vanished between the listing and the
         // push, and nothing was sent. One more listing says which; the push
         // is never retried, since the member confirmed only the old commit.
-        let now =
-            crate::git::remote::list_advertised_refs(repo, url, token.clone(), Some(deadline))?;
+        let now = crate::git::remote::list_advertised_refs(
+            repo,
+            url,
+            token.clone(),
+            Some(deadline),
+            ConnectionWording::Fetch,
+        )?;
         return Err(match remote_tag_state(&now, &tag_ref) {
             Some((_, now_commit)) => moved(tag, &now_commit),
             None => remote_tag_absent(tag),
