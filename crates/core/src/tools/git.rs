@@ -26220,6 +26220,7 @@ mod tests {
     /// Limit (BL-0108): libgit2's local transport sends every tag object
     /// whatever the refspecs ask for, so dropping the second batch does not
     /// turn this test red; it guards the end to end receive of 501 tags.
+    /// `bl_0108_the_second_tag_batch_is_really_requested` is the test that does.
     #[tokio::test]
     async fn e2e_tag_501_annotated_tags_span_two_batches() {
         let e = Env::new().await;
@@ -27189,6 +27190,62 @@ mod tests {
     /// Runs a blocking libgit2 call off the runtime thread that serves the double.
     async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    /// BL-0108: 501 annotated tags make two refspec batches, and a server that honours `want`
+    /// lines only sends what each batch asks for, so a dropped second batch leaves the 501st tag
+    /// object out of the clone. The local file transport cannot show that: it sends every tag.
+    #[tokio::test]
+    async fn bl_0108_the_second_tag_batch_is_really_requested() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-bl0108");
+        seed_bare_remote(&dir, "hi\n");
+        let mut commits = vec![bare_ref_sha(&dir, "refs/heads/main").unwrap()];
+        for i in 0..2 {
+            commits.push(advance_bare_remote(&dir, "refs/heads/main", &format!("c{i}\n")));
+        }
+        let remote = Remote::start(&dir, Behavior::Normal).await;
+        let (url, into) = (remote.url(), e.f.dir.path().join("clone-bl0108"));
+        let cloned = blocking({
+            let (url, into) = (url.clone(), into.clone());
+            move || crate::git::remote::clone_to_temp(&url, &into, None, 0, None, None).unwrap()
+        })
+        .await;
+        // The tags come after the clone, so none rides along with a fetched commit.
+        let objects: Vec<String> = (0..501)
+            .map(|i| {
+                annotated_tag_bare_remote(
+                    &dir,
+                    &format!("t{i:03}"),
+                    &commits[i % 3],
+                    &format!("m{i}"),
+                )
+            })
+            .collect();
+
+        let (tags, missing) = blocking(move || {
+            let out = crate::git::remote::fetch_from_remote(
+                &cloned,
+                "origin",
+                &url,
+                None,
+                None,
+                crate::git::remote::TagScope::Branch("main"),
+            )
+            .unwrap();
+            let missing: Vec<usize> = objects
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| cloned.find_object(git2::Oid::from_str(o).unwrap(), None).is_err())
+                .map(|(i, _)| i)
+                .collect();
+            (out.incoming_tags, missing)
+        })
+        .await;
+
+        assert_eq!(tags.len(), 501);
+        assert_eq!(tags[500].name, "t500");
+        assert!(missing.is_empty(), "tag objects never requested: {missing:?}");
     }
 
     /// BL-0107: the annotated tag probe is a plain single tag fetch, and it moves exactly one
