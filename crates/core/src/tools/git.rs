@@ -27358,6 +27358,59 @@ mod tests {
         assert!(publish_audit(&e, OWNER).is_empty());
     }
 
+    /// SPEC-0078/DT-008: a remote tag deletion through the registered tool, over
+    /// https, while a merge is paused. A wrong stated commit is refused as moved,
+    /// the right one deletes the tag, and the paused merge, HEAD and the conflict
+    /// files stay as they were.
+    #[test]
+    fn dt_0078_008_a_remote_delete_over_https_leaves_a_paused_merge_alone() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(&[("127.0.0.1", "anonymous")]).await;
+            pause_operation(&e, "merge").await;
+            let (dir, _, f) = standalone_remote(&e, "remote-s78-008");
+            let remote = Remote::start_tls(&dir, Behavior::Normal).await;
+            track_remote(&e, "origin", &remote.url()).await;
+            let (op_before, head_before) = (e.op_row().await, e.ref_sha("HEAD").await);
+            let (volume_before, refs_before) = (e.byte_map().await, bare_refs(&dir));
+
+            let err = delete_by_tool(&e, "v1.0", "c3d4e5f", None).await.unwrap_err();
+
+            assert_eq!((err.code, err.message), (code::NO_CLOBBER, moved_tag_text("v1.0", &f)));
+            assert_eq!(bare_refs(&dir), refs_before, "the remote tag is unchanged");
+            delete_by_tool(&e, "v1.0", short7(&f), None).await.unwrap();
+            assert_eq!(bare_ref_sha(&dir, "refs/tags/v1.0"), None, "the right commit deletes it");
+            assert_eq!(e.op_row().await, op_before, "the merge is still paused");
+            assert_eq!(e.ref_sha("HEAD").await, head_before);
+            assert_eq!(e.byte_map().await, volume_before, "the conflict files are untouched");
+        });
+    }
+
+    /// SPEC-0078/DT-009: the registered tool over https against a host that is
+    /// down names that host in the connection wording. The example host
+    /// `github.ibm.com` cannot be resolved offline, so a loopback host mapped in
+    /// the host map stands for it; the wording takes its host from the URL alone.
+    #[test]
+    fn dt_0078_009_the_down_leg_names_the_host_through_the_tool_path() {
+        with_git_hosts_lock(async {
+            let e = Env::with_hosts(&[("127.0.0.1", "anonymous")]).await;
+            cloned_remote(&e, "remote-s78-009").await;
+            let port =
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let url = format!("https://127.0.0.1:{port}/repo.git");
+            track_remote(&e, "origin", &url).await;
+
+            let err = delete_by_tool(&e, "v1.0", "f6a7b8c", None).await.unwrap_err();
+
+            assert_eq!(err.code, code::INTERNAL_ERROR, "{}", err.message);
+            assert!(
+                err.message.starts_with("fetch from host '127.0.0.1' failed: "),
+                "{}",
+                err.message
+            );
+            assert!(err.message.contains("Connection refused"), "{}", err.message);
+        });
+    }
+
     // ── SPEC-0077: the other on disk ref writes are reported too ─────────────
 
     /// The `(tool, ref)` of every failed on disk ref write of this test's project.

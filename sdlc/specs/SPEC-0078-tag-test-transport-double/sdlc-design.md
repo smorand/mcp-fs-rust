@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: M
 > Depth evidence: 4 modules (git test support, remote seam, tools tests, test fixtures), 10 tests, no public contract change
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-03
 > Behavior change: none
 > From backlog: BL-0098

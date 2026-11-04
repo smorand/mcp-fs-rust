@@ -9,8 +9,8 @@
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::process::Command;
 
 /// How the double answers.
@@ -29,38 +29,93 @@ pub(crate) enum Behavior {
 
 /// A running double; the server stops when this is dropped.
 pub(crate) struct Remote {
+    scheme: &'static str,
     port: u16,
     accept: tokio::task::JoinHandle<()>,
+    /// Whether this double holds one count of the certificate seam.
+    tls: bool,
 }
 
 impl Remote {
-    /// Serve the bare repository `repo_dir` on a free loopback port.
+    /// Serve the bare repository `repo_dir` on a free loopback port over http.
     pub(crate) async fn start(repo_dir: &Path, behavior: Behavior) -> Remote {
+        Self::launch(repo_dir, behavior, None).await
+    }
+
+    /// Serve it over https with the fixture certificate. The libgit2 certificate
+    /// check of the code under test is switched to accept any certificate while
+    /// this double lives (`TEST_ACCEPT_ANY_CERTIFICATE`), because the system
+    /// trust store of some platforms cannot be given a test certificate.
+    pub(crate) async fn start_tls(repo_dir: &Path, behavior: Behavior) -> Remote {
+        Self::launch(repo_dir, behavior, Some(acceptor())).await
+    }
+
+    async fn launch(
+        repo_dir: &Path,
+        behavior: Behavior,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Remote {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
         let port = listener.local_addr().expect("local address").port();
         let dir = repo_dir.to_path_buf();
+        let (scheme, secure) = if tls.is_some() { ("https", true) } else { ("http", false) };
+        if secure {
+            crate::git::remote::TEST_ACCEPT_ANY_CERTIFICATE
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let accept = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let dir = dir.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
                     // A client that gives up mid request is not a test failure.
-                    let _ = serve(stream, &dir, behavior).await;
+                    let _ = match tls {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(secured) => serve(secured, &dir, behavior).await,
+                            Err(_) => Ok(()),
+                        },
+                        None => serve(stream, &dir, behavior).await,
+                    };
                 });
             }
         });
-        Remote { port, accept }
+        Remote { scheme, port, accept, tls: secure }
     }
 
     /// The base URL of the repository.
     pub(crate) fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/repo.git", self.port)
+        format!("{}://127.0.0.1:{}/repo.git", self.scheme, self.port)
     }
 }
 
 impl Drop for Remote {
     fn drop(&mut self) {
         self.accept.abort();
+        if self.tls {
+            crate::git::remote::TEST_ACCEPT_ANY_CERTIFICATE
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
+}
+
+/// The TLS acceptor of the fixture certificate and key.
+fn acceptor() -> tokio_rustls::TlsAcceptor {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(dir.join("test-remote.pem"))
+            .expect("fixture certificate")
+            .map(|c| c.expect("a certificate"))
+            .collect();
+    let key = PrivateKeyDer::from_pem_file(dir.join("test-remote.key")).expect("fixture key");
+    // The first caller installs the process default provider; later ones find it set.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("a valid certificate and key");
+    tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config))
 }
 
 struct Request {
@@ -71,12 +126,12 @@ struct Request {
 
 /// A buffered reader over a connection, enough for a request line, headers, and a
 /// body that is either `Content-Length` sized or chunked.
-struct Wire<'a> {
-    stream: &'a mut TcpStream,
+struct Wire<'a, S> {
+    stream: &'a mut S,
     buf: Vec<u8>,
 }
 
-impl Wire<'_> {
+impl<S: AsyncRead + AsyncWrite + Unpin> Wire<'_, S> {
     async fn fill(&mut self) -> io::Result<()> {
         let mut chunk = [0u8; 8192];
         let n = self.stream.read(&mut chunk).await?;
@@ -107,7 +162,7 @@ impl Wire<'_> {
     }
 }
 
-async fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
+async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> io::Result<Request> {
     let mut wire = Wire { stream, buf: Vec::new() };
     let request_line = wire.line().await?;
     let mut parts = request_line.split_whitespace();
@@ -149,8 +204,8 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     Ok(Request { method, target, body })
 }
 
-async fn respond(
-    stream: &mut TcpStream,
+async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     content_type: &str,
     extra: &str,
@@ -202,7 +257,11 @@ async fn run_git(service: &str, dir: &Path, advertise: bool, input: &[u8]) -> io
     Ok(output.stdout)
 }
 
-async fn serve(mut stream: TcpStream, dir: &Path, behavior: Behavior) -> io::Result<()> {
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    dir: &Path,
+    behavior: Behavior,
+) -> io::Result<()> {
     let request = read_request(&mut stream).await?;
     if let Behavior::Rate(status) = behavior {
         return respond(&mut stream, status, "text/plain", "Retry-After: 1\r\n", b"").await;

@@ -384,6 +384,11 @@ fn credential_callbacks(
     deadline: Option<Instant>,
 ) -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
+    // Test only: while a test https double lives, accept its fixture certificate.
+    #[cfg(test)]
+    if TEST_ACCEPT_ANY_CERTIFICATE.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        callbacks.certificate_check(|_, _| Ok(git2::CertificateCheckStatus::CertificateOk));
+    }
     if let Some(t) = token {
         // The provider expects the token as the password; "oauth2" is the
         // conventional username for both GitHub and GitLab.
@@ -395,6 +400,12 @@ fn credential_callbacks(
     }
     callbacks
 }
+
+/// Test only: how many https test doubles are running; above zero the libgit2
+/// certificate check accepts any certificate (SPEC-0078 DEC-004).
+#[cfg(test)]
+pub(crate) static TEST_ACCEPT_ANY_CERTIFICATE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Clone into a real directory: libgit2 needs a filesystem to clone into.
 ///
@@ -1724,6 +1735,39 @@ fn lease_mismatch_error(
 pub(crate) mod tests {
     use super::*;
     use crate::config::GitConfig;
+
+    /// The line before `index` that is neither blank nor a plain comment.
+    fn attribute_before<'a>(lines: &[&'a str], index: usize) -> &'a str {
+        lines[..index]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && (!l.starts_with("//") || l.starts_with("///")))
+            .unwrap_or("")
+    }
+
+    /// SPEC-0078/DT-010: the certificate seam exists in test builds only, and so
+    /// does the module that switches it on.
+    #[test]
+    fn dt_0078_010_the_certificate_seam_is_test_only() {
+        let source = include_str!("remote.rs");
+        let production = &source[..source.find("#[cfg(test)]\npub(crate) mod tests {").unwrap()];
+        let lines: Vec<&str> = production.lines().collect();
+        let uses: Vec<usize> = (0..lines.len())
+            .filter(|i| {
+                lines[*i].contains("TEST_ACCEPT_ANY_CERTIFICATE")
+                    && !lines[*i].trim_start().starts_with("//")
+            })
+            .collect();
+        assert!(uses.len() >= 2, "the declaration and the check: {uses:?}");
+        for i in uses {
+            assert_eq!(attribute_before(&lines, i), "#[cfg(test)]", "line {}: {}", i + 1, lines[i]);
+        }
+        let module = include_str!("mod.rs");
+        let module_lines: Vec<&str> = module.lines().collect();
+        let at = module_lines.iter().position(|l| l.contains("mod test_remote;")).unwrap();
+        assert_eq!(attribute_before(&module_lines, at), "#[cfg(test)]");
+    }
 
     /// Serializes every test that publishes to or reads from the process-global
     /// [`HOSTS`] map. `validate_hosts` replaces the whole map on every call, and

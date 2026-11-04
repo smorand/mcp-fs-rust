@@ -412,4 +412,15 @@ refuses it anyway. `test_remote::Remote::start(repo_dir, Behavior)` serves a bar
 - The tests are `dt_0078_*` in `tools/git.rs`. They describe behavior that exists, so each was proven by a
   mutation (double answers 500, `Rate` closes the connection, hook removed, depth ignored).
 - The simulated legs (`e2e_tag_039`, `e2e_tag_077`, the file remote tests) stay as cheap guards.
-- An https mode for the registered tool path is SPEC-0078's second story.
+- `Remote::start_tls(repo_dir, behavior)` serves https with the fixture certificate and key
+  (`crates/core/tests/fixtures/test-remote.pem` and `.key`, a self signed certificate for `127.0.0.1`, valid to
+  2036, generated with `openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=127.0.0.1 -addext
+  subjectAltName=IP:127.0.0.1`). The registered tools accept only https URLs, so tests that go through
+  them (`delete_by_tool`) use it. While such a double lives, `TEST_ACCEPT_ANY_CERTIFICATE` (a `cfg(test)`
+  counter in `git/remote.rs`) makes the libgit2 certificate check accept any certificate: the macOS
+  libgit2 HTTPS backend validates through the system trust store, so a test certificate cannot be given to it.
+  `dt_0078_010` checks the seam and the module are test only.
+- A test that builds a host map (`Env::with_hosts`, here `127.0.0.1` mapped to `anonymous`) must run inside
+  `with_git_hosts_lock`: the map is process wide.
+- The `github.ibm.com` example host cannot be resolved offline, so the down leg through the tool path uses
+  a closed loopback port; the wording takes its host from the URL alone (`dt_0078_009`).

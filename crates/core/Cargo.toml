@@ -113,6 +113,8 @@ zerocopy = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test only: the https mode of the git test transport (SPEC-0078).
+tokio-rustls = "0.26"
 reqwest = { workspace = true }
 tokio-tungstenite = "0.30.0"
 # Test-only: fixtures in `tools::archive` build their own `.7z` files with
