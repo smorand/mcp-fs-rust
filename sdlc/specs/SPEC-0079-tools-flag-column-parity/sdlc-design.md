@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 file, 1 debt item, no contract change, no persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-03
 > Behavior change: none
 > From backlog: BL-0115
@@ -98,3 +98,8 @@ None.
 | 1 | 0 | 0 | IMPLEMENTABLE (inline checklist, depth S) |
 
 **Amendments applied:** none
+
+## Design additions (2026-11-03)
+- **File structure impact:** `crates/core/src/tools/contract_golden.rs` modified (one parser `documented_flags`, one pure function `flag_column_verdict(table_text, golden_tools) -> Result<(), String>`, four tests next to `e2e_new_957..959`, reusing the `TOOLS_MD` const and `frozen_tools()`). No other file. Affected existing tests: none. Docs: one line in `.agent_docs/testing.md` is not needed; `.agent_docs/tools.md` is read only.
+- **Test strategy:** DT-001..DT-004 are unit level tests, direct calls, in `crates/core/src/tools/contract_golden.rs`, all in US-0159. DT-003 and DT-004 feed `flag_column_verdict` literal mutated text, so they never touch the real files.
+- **DEC-003:** one story. **Obliged by:** DR-001..DR-003. **Alternatives considered:** parser then verdict as two stories (rejected: neither is verifiable alone). **Rationale:** 1 file, 4 tests, one coherent guard; tier 2 enough.
