@@ -395,6 +395,10 @@ printf 'Liste mes projets.\nexit\n' | ./target/release/agent --user you   # pipe
   race: `unexpected eof while reading` (class Ssl) or `Connection reset by peer` (class Os). The tag tests that use it assert
   the transport reason through `assert_dropped_reason` / `DROPPED_CONNECTION_REASONS` and accept either; the missing `file://`
   legs stay exact (`No such file or directory`). Never pin a single reason for a dropped connection.
+- 2026-11-04 erratum to SPEC-0060 (implemented, not edited): DR-007, DR-008 and DEC-002 name `unexpected eof while reading`
+  alone for the `closing_remote` legs; the tests accept both reasons, as the gotcha above says. Its mutation table row for
+  DR-003 (only the first chunk of `TAG_REFSPEC_BATCH`) cannot turn `e2e_tag_501_annotated_tags_span_two_batches` red over a
+  `file://` remote; `bl_0108_the_second_tag_batch_is_really_requested` does, through the test transport.
 
 ## The git test transport (`git/test_remote.rs`, SPEC-0078, 2026-11-03)
 
