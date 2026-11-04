@@ -521,3 +521,147 @@ fn e2e_new_959_a_tool_missing_from_the_documentation_fails_the_parity_test() {
         .expect_err("an undocumented tool must fail the gate");
     assert!(err.contains("git.undocumented_probe"), "the failure must name the offender: {err}");
 }
+
+/// The flags cell a golden tool's annotations imply, in the notation of the
+/// legend of `.agent_docs/tools.md`: a read only tool omits the `D` flag.
+fn expected_flags(tool: &Value) -> String {
+    let hint = |key: &str| tool["annotations"][key].as_bool().unwrap_or(false);
+    let flag = |on: bool, name: &str| if on { name.to_string() } else { format!("!{name}") };
+    let tail =
+        format!("{},{}", flag(hint("idempotentHint"), "I"), flag(hint("openWorldHint"), "OW"));
+    if hint("readOnlyHint") {
+        format!("RO,{tail}")
+    } else {
+        format!("{},!RO,{tail}", flag(hint("destructiveHint"), "D"))
+    }
+}
+
+/// Every table row as `(tool name, flags cell)`. A row is a line whose first cell names an
+/// `fs.`, `admin.` or `git.` tool; the flags cell is the second to last one. A cell that is not
+/// a comma list of known flags is an error naming the tool, never a skipped row.
+fn documented_flag_rows(text: &str) -> Result<Vec<(String, String)>, String> {
+    const KNOWN: [&str; 8] = ["D", "!D", "RO", "!RO", "I", "!I", "OW", "!OW"];
+    let mut rows = Vec::new();
+    for line in text.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("| `") else { continue };
+        let name = rest.split('`').next().unwrap_or_default();
+        if !["fs.", "admin.", "git."].iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('|').collect();
+        let flags = cells.len().checked_sub(3).map(|i| cells[i].trim()).unwrap_or_default();
+        if flags.split(',').any(|f| !KNOWN.contains(&f)) {
+            return Err(format!("{name}: unreadable flags cell {flags:?}"));
+        }
+        rows.push((name.to_string(), flags.to_string()));
+    }
+    Ok(rows)
+}
+
+/// Compares the table with the frozen annotations. Returns the number of rows compared, or
+/// every disagreement, so the negative tests can prove the guard fires.
+fn flag_column_verdict(table: &str, golden: &[Value]) -> Result<usize, String> {
+    let rows = documented_flag_rows(table)?;
+    let mut problems = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, flags) in &rows {
+        if !seen.insert(name.as_str()) {
+            problems.push(format!("{name}: duplicate row"));
+            continue;
+        }
+        match golden.iter().find(|t| t["name"] == name.as_str()) {
+            None => problems.push(format!("{name}: documented but not in the contract")),
+            Some(t) if expected_flags(t) != *flags => problems.push(format!(
+                "{name}: table says {flags}, contract implies {}",
+                expected_flags(t)
+            )),
+            Some(_) => {}
+        }
+    }
+    for t in golden {
+        let name = t["name"].as_str().unwrap_or_default();
+        if !seen.contains(name) {
+            problems.push(format!("{name}: in the contract but missing from the table"));
+        }
+    }
+    if problems.is_empty() { Ok(rows.len()) } else { Err(problems.join("; ")) }
+}
+
+fn real_flag_inputs() -> Option<(String, Vec<Value>)> {
+    let golden = frozen_tools()?;
+    Some((
+        std::fs::read_to_string(TOOLS_MD).expect(".agent_docs/tools.md must be readable"),
+        golden,
+    ))
+}
+
+/// The table with the flags cell of `tool` replaced.
+fn with_flags(table: &str, tool: &str, flags: &str) -> String {
+    let prefix = format!("| `{tool}` ");
+    table
+        .lines()
+        .map(|l| {
+            if !l.starts_with(&prefix) {
+                return l.to_string();
+            }
+            let mut cells: Vec<String> = l.split('|').map(str::to_string).collect();
+            let at = cells.len() - 3;
+            cells[at] = format!(" {flags} ");
+            cells.join("|")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// DT-001: every row of the table carries the flags the contract implies.
+#[test]
+fn dt_0079_001_every_row_matches_the_golden_annotations() {
+    let Some((table, golden)) = real_flag_inputs() else { return };
+    let compared = flag_column_verdict(&table, &golden).expect("the flag column must match");
+    assert_eq!(compared, golden.len(), "one row per frozen tool");
+}
+
+/// DT-002: the table names exactly the frozen tools, each once.
+#[test]
+fn dt_0079_002_table_names_equal_golden_names() {
+    let Some((table, golden)) = real_flag_inputs() else { return };
+    let rows = documented_flag_rows(&table).expect("rows must parse");
+    let names: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    let frozen: std::collections::BTreeSet<&str> =
+        golden.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names.len(), rows.len(), "a tool is documented twice");
+    assert_eq!(names, frozen);
+}
+
+/// DT-003: a flipped flag, a removed row and a duplicated row each fail, by tool name.
+#[test]
+fn dt_0079_003_the_guard_fires_on_flag_missing_and_duplicate_rows() {
+    let Some((table, golden)) = real_flag_inputs() else { return };
+    let tool = "git.remote_push_tag";
+    let real = documented_flag_rows(&table).unwrap().into_iter().find(|r| r.0 == tool).unwrap().1;
+    let wrong = if real.starts_with("!D") {
+        real.replacen("!D", "D", 1)
+    } else {
+        real.replacen('D', "!D", 1)
+    };
+    let err = flag_column_verdict(&with_flags(&table, tool, &wrong), &golden).unwrap_err();
+    assert!(err.contains(tool) && err.contains(&wrong) && err.contains(&real), "{err}");
+
+    let prefix = format!("| `{tool}` ");
+    let removed: String =
+        table.lines().filter(|l| !l.starts_with(&prefix)).collect::<Vec<_>>().join("\n");
+    let err = flag_column_verdict(&removed, &golden).unwrap_err();
+    assert!(err.contains(tool) && err.contains("missing from the table"), "{err}");
+
+    let row = table.lines().find(|l| l.starts_with(&prefix)).unwrap();
+    let err = flag_column_verdict(&format!("{table}\n{row}"), &golden).unwrap_err();
+    assert!(err.contains(tool) && err.contains("duplicate row"), "{err}");
+}
+
+/// DT-004: an unreadable flags cell fails naming the tool instead of being skipped.
+#[test]
+fn dt_0079_004_a_malformed_flags_cell_names_the_tool() {
+    let Some((table, golden)) = real_flag_inputs() else { return };
+    let err = flag_column_verdict(&with_flags(&table, "fs.read", "D,XX"), &golden).unwrap_err();
+    assert!(err.contains("fs.read") && err.contains("D,XX"), "{err}");
+}
