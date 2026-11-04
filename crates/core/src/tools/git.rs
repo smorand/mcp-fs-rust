@@ -27191,6 +27191,62 @@ mod tests {
         tokio::task::spawn_blocking(f).await.unwrap()
     }
 
+    /// BL-0107: the annotated tag probe is a plain single tag fetch, and it moves exactly one
+    /// object when the project already holds the commit the tag peels to. That is what makes a
+    /// shallow fetch unnecessary, and a shallow one would write a `shallow` file into the
+    /// project's repository.
+    #[tokio::test]
+    async fn bl_0107_the_probe_transfers_only_the_tag_object() {
+        let e = Env::new().await;
+        let dir = e.f.dir.path().join("remote-bl0107");
+        seed_bare_remote(&dir, "hi\n");
+        for i in 0..4 {
+            advance_bare_remote(&dir, "refs/heads/main", &format!("c{i}\n"));
+        }
+        let tip = bare_ref_sha(&dir, "refs/heads/main").unwrap();
+        let remote = Remote::start(&dir, Behavior::Normal).await;
+        let (url, into) = (remote.url(), e.f.dir.path().join("clone-bl0107"));
+
+        let cloned = blocking({
+            let (url, into) = (url.clone(), into.clone());
+            move || crate::git::remote::clone_to_temp(&url, &into, None, 0, None, None).unwrap()
+        })
+        .await;
+        let tag_object = annotated_tag_bare_remote(&dir, "v1", &tip, "release one\n");
+
+        let (fetched, before, after, probe_ref_left) = blocking(move || {
+            let count = |r: &git2::Repository| {
+                let mut n = 0;
+                r.odb()
+                    .unwrap()
+                    .foreach(|_| {
+                        n += 1;
+                        true
+                    })
+                    .unwrap();
+                n
+            };
+            let before = count(&cloned);
+            let fetched = crate::git::remote::probe_remote_tag(
+                &cloned,
+                &url,
+                "v1",
+                None,
+                None,
+                crate::git::remote::ConnectionWording::Fetch,
+            )
+            .unwrap();
+            let left = cloned.find_reference("refs/mcpfs/probe/v1").is_ok();
+            (fetched, before, count(&cloned), left)
+        })
+        .await;
+
+        assert_eq!(fetched.map(|o| o.to_string()), Some(tag_object));
+        assert_eq!(after, before + 1, "the probe must move the tag object and nothing else");
+        assert!(!probe_ref_left, "the probe ref is removed");
+        assert!(!into.join(".git/shallow").exists() && !into.join("shallow").exists());
+    }
+
     /// SPEC-0078/DT-001: the double serves a clone of a real bare repository.
     #[tokio::test]
     async fn dt_0078_001_the_double_serves_a_clone() {
