@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 file, 1 debt item, no contract change, no persisted change
-> Status: draft
+> Status: specified
 > Generated on: 2026-11-03
 > Behavior change: none
 > From backlog: BL-0115
