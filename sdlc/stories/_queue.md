@@ -159,3 +159,21 @@
 | US-0157 | SPEC-0078 | add a test transport that answers like a real git server | main | 2 | landed | story/US-0157-add-a-test-transport-like-real-git | main |
 | US-0158 | SPEC-0078 | serve the test transport over https | US-0157 | 1 | landed | story/US-0158-serve-the-test-transport-over-https | main |
 | US-0159 | SPEC-0079 | test the flag column of tools.md against the contract | main | 2 | landed | story/US-0159-test-the-tools-flag-column | main |
+| US-0160 | SPEC-0081 | extract a bare gzip file next to the archive | main | 2 | todo | | |
+| US-0161 | SPEC-0081 | decode several gzip members and refuse corrupt input | US-0160 | 2 | todo | | |
+| US-0162 | SPEC-0081 | gzip password, collision and destination rules | US-0161 | 2 | todo | | |
+| US-0163 | SPEC-0081 | stop gzip decoding at the storage and session limits | US-0162 | 2 | todo | | |
+| US-0164 | SPEC-0081 | pin the gzip order of refusals and document it | US-0163 | 2 | todo | | |
+| US-0165 | SPEC-0083 | extract a bare bzip2 file next to the archive | US-0160 | 2 | todo | | |
+| US-0166 | SPEC-0083 | decode several bzip2 streams and refuse corrupt input | US-0165, US-0162 | 2 | todo | | |
+| US-0167 | SPEC-0083 | check the bzip2 collision, destination and order rules | US-0166, US-0164 | 2 | todo | | |
+| US-0168 | SPEC-0083 | check the bzip2 storage and session limits and document the format | US-0167, US-0163 | 2 | todo | | |
+| US-0169 | SPEC-0080 | tell the user how to retry with a password for zip and 7z | main | 2 | todo | | |
+| US-0170 | SPEC-0080 | extract a RAR archive when the server has RAR support | main | 1 | todo | | |
+| US-0171 | SPEC-0080 | refuse unsafe RAR entries, oversized entries and collisions | US-0170 | 2 | todo | | |
+| US-0172 | SPEC-0080 | apply the storage limit and the session allowance to RAR archives | US-0171 | 2 | todo | | |
+| US-0173 | SPEC-0080 | refuse multi volume names, corrupt files, a missing path and a folder | US-0172 | 2 | todo | | |
+| US-0174 | SPEC-0080 | read RAR4, RAR5 and solid RAR archives | US-0170 | 2 | todo | | |
+| US-0175 | SPEC-0080 | ask for the password of an encrypted RAR and accept the right one | US-0170, US-0169 | 2 | todo | | |
+| US-0176 | SPEC-0080 | handle partly encrypted RAR archives and empty or ignored passwords | US-0175 | 2 | todo | | |
+| US-0177 | SPEC-0080 | pin the RAR order of refusals, check membership and document the format | US-0172, US-0173, US-0174, US-0176 | 2 | todo | | |

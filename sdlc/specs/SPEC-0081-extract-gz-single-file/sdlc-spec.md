@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (archive extraction), about 12 anticipated requirements, public contract change (a refusal becomes a success), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-04
 > Project: existing
 > From backlog: BL-0111
