@@ -36,7 +36,8 @@ shipped as an optional capability of the server: a server delivered without it b
   and nothing is written. The checks refuse: a link or device entry (`ERR_NOT_SUPPORTED`), an entry whose
   resolved path lies outside the destination (`ERR_PATH_OUT_OF_BOUNDS`), an existing file when `overwrite` is false
   (`ERR_NO_CLOBBER`, first collision in archive order), an entry that decodes to more bytes than it
-  declares (`ERR_INVALID_ARGUMENT`), and a declared total above the project's remaining write quota
+  declares (`ERR_INVALID_ARGUMENT`), and a declared total above a limit: the project's storage
+  limit on net growth (`ERR_PROJECT_QUOTA_EXCEEDED`) or the member's session write allowance on the gross total
   (`ERR_WRITE_QUOTA_EXCEEDED`). [row 3]
 - An encrypted zip or 7z archive with no password, or a wrong one, is refused with
   `ERR_PASSWORD_REQUIRED`; the user calls again with the `password` parameter. The two messages are
@@ -54,7 +55,7 @@ shipped as an optional capability of the server: a server delivered without it b
   scope entirely, per an explicit user decision" and its unsupported extension rule (FR-NEW-006) names
   `.rar` as refused. This increment deviates from both: RAR becomes supported. SPEC-0018 is not modified.
 - SPEC-0041 (refuse inconsistent zips) [row 15] FR-NEW-003 and the tests that quote the old missing password message are updated by FR-MOD-002; its rule that the password is asked before the structural refusal is untouched.
-- SPEC-0020 (project storage quota) governs the quota check the extraction reuses.
+- SPEC-0020 (project storage quota) governs the project storage limit the extraction reuses; the session write allowance predates it (SPEC-0018).
 
 ### 2.3 What is verified today
 
@@ -98,7 +99,7 @@ shipped as an optional capability of the server: a server delivered without it b
 | Context | What it owns | Key concepts |
 |---|---|---|
 | Archive extraction | reading a stored archive and materializing its entries in the project | archive, entry, destination, password, refusal |
-| Project storage | the write quota and the files of a project | quota, collision, overwrite |
+| Project storage | the files, the storage limit and the session write allowance of a project | storage limit, session write allowance, collision, overwrite |
 
 ## 5. Usage scenarios
 
@@ -135,14 +136,15 @@ shipped as an optional capability of the server: a server delivered without it b
 **Flow:**
 1. The member asks to extract it → the system reads and checks the whole archive first.
 2. The system refuses with the same code and message family as for other formats; nothing is written, not even the valid entries that precede the problem entry.
-**Postconditions:** the project is unchanged and the remaining write quota is unchanged.
+**Postconditions:** the project is unchanged and the remaining storage and the session write allowance are unchanged.
 **Order when several problems apply:** FR-NEW-015.
 **Exceptions:**
 - EXC-003a: a symbolic link, hard link or device entry → `ERR_NOT_SUPPORTED`, the message names the entry.
 - EXC-003b: an entry named `../../etc/passwd`, or an absolute name such as `/etc/cron.d/x` → `ERR_PATH_OUT_OF_BOUNDS`.
 - EXC-003c: an entry that decodes to more bytes than it declares → `ERR_INVALID_ARGUMENT`, the message names the entry.
 - EXC-003d: a file already exists at an entry's destination and `overwrite` is false → `ERR_NO_CLOBBER` naming the first colliding path in archive order.
-- EXC-003e: the declared total is above the remaining write quota → `ERR_WRITE_QUOTA_EXCEEDED`.
+- EXC-003e: the net growth is above the project's remaining storage → `ERR_PROJECT_QUOTA_EXCEEDED` with a message starting `project storage quota of`.
+- EXC-003f: the declared total is above the member's remaining session write allowance → `ERR_WRITE_QUOTA_EXCEEDED` with the message `session write quota of <N> bytes exceeded`; a destination listed twice counts twice.
 **Interactions:** SC-001.
 
 ### SC-004: A multi volume RAR
@@ -240,14 +242,20 @@ shipped as an optional capability of the server: a server delivered without it b
 - **Scenario:** SC-001, SC-002
 - **Priority:** Must
 
-#### FR-NEW-014 [EARS-O]: Write quota
-> IF the net growth of the project's stored bytes caused by the extraction exceeds the remaining write quota THEN THE archive extraction SHALL refuse with `ERR_WRITE_QUOTA_EXCEEDED`, leave the remaining write quota unchanged and write nothing.
-- **Business rules:** net growth is the sum of the declared sizes of the files to write minus the sizes of the files they replace when `overwrite` is true; a net growth equal to the remaining write quota is accepted; the rule is the one zip, 7z and tar already follow; when an archive lists the same destination more than once only the last occurrence counts toward net growth; net growth is checked against the project's remaining write quota, and any per session write allowance is charged the declared total, as for the other formats.
+#### FR-NEW-014 [EARS-O]: Project storage limit
+> IF the project has a storage limit AND the net growth of the project's stored bytes caused by the extraction exceeds the remaining storage THEN THE archive extraction SHALL refuse with `ERR_PROJECT_QUOTA_EXCEEDED` and a message starting `project storage quota of`, leave the remaining storage unchanged and write nothing.
+- **Business rules:** net growth is the sum of the declared sizes of the files to write minus the sizes of the files they replace when `overwrite` is true; a net growth equal to the remaining storage is accepted; when an archive lists the same destination more than once only the last occurrence counts toward net growth; the rule is the one zip, 7z and tar already follow; a project without a storage limit never triggers this refusal.
+- **Scenario:** SC-003
+- **Priority:** Must
+
+#### FR-NEW-022 [EARS-O]: Session write allowance
+> IF the declared total of the files to write exceeds the member's remaining session write allowance THEN THE archive extraction SHALL refuse with `ERR_WRITE_QUOTA_EXCEEDED` and the message `session write quota of <N> bytes exceeded`, charge nothing and write nothing.
+- **Business rules:** on success the allowance is charged the full declared total, with no netting for replaced files; the project storage refusal (FR-NEW-014) is checked first, and the allowance is charged only after it passed; a declared total equal to the remaining allowance is accepted; when an archive lists the same destination more than once, every occurrence counts toward the declared total (gross, unlike FR-NEW-014).
 - **Scenario:** SC-003
 - **Priority:** Must
 
 #### FR-NEW-015 [EARS-O]: Order of refusals
-> IF several refusals apply to the same RAR archive THEN THE archive extraction SHALL report the first of this list: (1) the caller is not a member (FR-NEW-018); (2) the path is missing (FR-NEW-019) or is a folder (FR-NEW-021); (3) multi volume name (FR-NEW-010) or, on a server without RAR support, FR-NEW-012; (4) the file names are encrypted and the password is missing or wrong (FR-NEW-002, FR-NEW-003, FR-NEW-020), including when the archive is also truncated; (5) corrupt (FR-NEW-011); (6) the first offending entry in archive order, a link or device entry (FR-NEW-006) or an escaping name (FR-NEW-007); (7) the data is encrypted and the password is missing or wrong (FR-NEW-002, FR-NEW-003, FR-NEW-016, FR-NEW-020); (8) decoded larger than declared (FR-NEW-008); (9) a `destination` that lies outside the project (`ERR_PATH_OUT_OF_BOUNDS`, message `path escapes the volume root: <destination>`); (10) collision (FR-NEW-009); (11) quota (FR-NEW-014).
+> IF several refusals apply to the same RAR archive THEN THE archive extraction SHALL report the first of this list: (1) the caller is not a member (FR-NEW-018); (2) the path is missing (FR-NEW-019) or is a folder (FR-NEW-021); (3) multi volume name (FR-NEW-010) or, on a server without RAR support, FR-NEW-012; (4) the file names are encrypted and the password is missing or wrong (FR-NEW-002, FR-NEW-003, FR-NEW-020), including when the archive is also truncated; (5) corrupt (FR-NEW-011); (6) the first offending entry in archive order, a link or device entry (FR-NEW-006) or an escaping name (FR-NEW-007); (7) the data is encrypted and the password is missing or wrong (FR-NEW-002, FR-NEW-003, FR-NEW-016, FR-NEW-020); (8) decoded larger than declared (FR-NEW-008); (9) a `destination` that lies outside the project (`ERR_PATH_OUT_OF_BOUNDS`, message `path escapes the volume root: <destination>`); (10) collision (FR-NEW-009); (11) project storage limit (FR-NEW-014); (12) session write allowance (FR-NEW-022).
 - **Why this order:** membership and the path checks come first for every format. Zip also reports a visible link or escaping name before it asks for the password; 7z asks for the password first and checks entries while decoding. For RAR this order is new, chosen so that a visible problem is reported before any password work, and so that a member who is not allowed learns nothing about the project's files.
 - **Scenario:** SC-003
 - **Priority:** Must
@@ -321,7 +329,7 @@ Performance: unchanged, same as the other formats; no new target is set.
 - THE archive extraction SHALL name the `password` parameter in both password refusals and say whether the password is missing or wrong.
 
 ### 7.5 Reliability
-- IF an extraction is refused THEN THE archive extraction SHALL leave the project files and the remaining write quota unchanged.
+- IF an extraction is refused THEN THE archive extraction SHALL leave the project files, the remaining storage and the session write allowance unchanged.
 
 ### 7.6 Operability
 - WHEN an extraction succeeds THE archive extraction SHALL record one audit line stating who extracted what and where.
@@ -332,7 +340,7 @@ Performance: unchanged, same as the other formats; no new target is set.
 | Category | Case | Expected behavior | Test |
 |---|---|---|---|
 | Empty states | RAR with no entry; 0 byte file named `.rar` | empty folder created; corrupt refusal | E2E-017, E2E-027 |
-| Boundary values | decoded size exceeds declared by 1 byte; quota remaining equal to the declared total | refused; succeeds | E2E-036, E2E-037, E2E-038 |
+| Boundary values | decoded size exceeds declared by 1 byte; remaining storage or session allowance equal to the declared total | refused; succeeds | E2E-036, E2E-037, E2E-038, E2E-079 |
 | Concurrent actions | not applicable: one synchronous request; concurrency is covered by the shared project storage rules | none | none |
 | Slow or lost connectivity | not applicable: the archive is already stored | none | none |
 | Access states | not a member; platform administrator without membership; member of another project | `ERR_FORBIDDEN` | E2E-053, E2E-054, E2E-055 |
@@ -341,7 +349,7 @@ Performance: unchanged, same as the other formats; no new target is set.
 | Partial operations | a link entry after valid entries; one encrypted entry among plain ones | nothing written | E2E-033, E2E-050 |
 | Dependency failures | server without RAR support | FR-NEW-012 | E2E-015, E2E-039 |
 | Ordering and timing | first collision in archive order; several refusals at once | named; FR-NEW-015 order | E2E-010, E2E-047, E2E-048, E2E-049, E2E-057 to E2E-061, E2E-066 to E2E-068 |
-| Exhaustion | quota reached | FR-NEW-014 | E2E-011, E2E-041 |
+| Exhaustion | storage limit reached; session allowance reached | FR-NEW-014, FR-NEW-022 | E2E-011, E2E-041, E2E-077 |
 
 ## 9. Acceptance tests (the contract)
 
@@ -424,6 +432,11 @@ Performance: unchanged, same as the other formats; no new target is set.
 | E2E-071 | New | failure | SC-001 | FR-NEW-019 | Low |
 | E2E-072 | New | failure | SC-002 | FR-NEW-016 | Medium |
 | E2E-073 | New | edge | SC-003 | FR-NEW-014 | High |
+| E2E-077 | New | failure | SC-003 | FR-NEW-022 | High |
+| E2E-078 | New | edge | SC-003 | FR-NEW-022 | Medium |
+| E2E-079 | New | edge | SC-003 | FR-NEW-022 | Medium |
+| E2E-080 | New | side effect | SC-003 | FR-NEW-022 | Medium |
+| E2E-081 | New | failure | SC-003 | FR-NEW-015, FR-NEW-022, FR-NEW-014 | Medium |
 | E2E-074 | New | failure | SC-001 | FR-NEW-019 | Low |
 | E2E-075 | New | failure | SC-001 | FR-NEW-021 | Medium |
 | E2E-076 | New | failure | SC-001 | FR-NEW-021 | Medium |
@@ -433,9 +446,9 @@ Performance: unchanged, same as the other formats; no new target is set.
 | E2E-MOD-004 | Modified | failure | SC-002 | FR-MOD-003 | Medium |
 | E2E-MOD-005 | Modified | failure | SC-002 | FR-MOD-003 | Medium |
 
-Coverage (all 81 tests, 76 new and 5 modified): happy 9, failure 56 (security 4 of them), edge 11, side effect 5, state transition 0 (no state machine). Failure to happy ratio 56:9, failure tests outnumber happy tests.
+Coverage (all 86 tests, 81 new and 5 modified): happy 9, failure 58, edge 13, side effect 6, security 4 (E2E-009, E2E-012, E2E-034, E2E-035), state transition 0 (no state machine). Failure to happy ratio 58:9, failure tests outnumber happy tests.
 
-FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 13).
+FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 13). Unless a test says otherwise, the session write allowance is large enough not to matter and the project has no storage limit; a figure for "remaining storage" sets a project storage limit, reached by filling the project with other files up to that remainder (the limit itself is set in whole megabytes).
 
 ### 9.2 New tests
 
@@ -515,11 +528,11 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **And** both existing files keep their content
 - **Priority:** High
 
-#### E2E-011: Over the write quota
+#### E2E-011: Over the project storage limit
 - **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-014
-- **Given** a project with 5 bytes of remaining write quota and `/uploads/report.rar` declaring 12 bytes
+- **Given** a project storage limit with 5 bytes of remaining storage and `/uploads/report.rar` declaring 12 bytes
 - **When** the member extracts it
-- **Then** the refusal is `ERR_WRITE_QUOTA_EXCEEDED`; the remaining quota is still 5 bytes and `/uploads/report` does not exist
+- **Then** the refusal is `ERR_PROJECT_QUOTA_EXCEEDED` with a message starting `project storage quota of`; the remaining storage is still 5 bytes and `/uploads/report` does not exist
 - **Priority:** High
 
 #### E2E-012: Entry that decodes larger than declared
@@ -527,7 +540,7 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Given** `/uploads/bomb.rar` whose entry `big.bin` declares 10 bytes and decodes to 1 000 000 bytes
 - **When** the member extracts it
 - **Then** the refusal is `ERR_INVALID_ARGUMENT` and the message names `big.bin`
-- **And** `/uploads/bomb` does not exist and the remaining quota is unchanged
+- **And** `/uploads/bomb` does not exist, and the remaining storage and the session write allowance are unchanged
 - **Priority:** Critical
 
 #### E2E-013: Multi volume name
@@ -707,11 +720,11 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Then** 1 file and 10 bytes are written
 - **Priority:** High
 
-#### E2E-038: Quota exactly equal to the declared total
+#### E2E-038: Storage exactly equal to the declared total
 - **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-014
-- **Given** 12 bytes of remaining write quota and `/uploads/report.rar` of E2E-001
+- **Given** a project storage limit with 12 bytes of remaining storage and `/uploads/report.rar` of E2E-001
 - **When** the member extracts it
-- **Then** 2 files are written and the remaining quota is 0 bytes
+- **Then** 2 files are written and the remaining storage is 0 bytes
 - **Priority:** Medium
 
 #### E2E-039: Multi volume name without RAR support
@@ -728,11 +741,11 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Then** the refusal is `ERR_NOT_SUPPORTED` with the message `unsupported archive extension: '.RAR'`
 - **Priority:** Medium
 
-#### E2E-041: A refused quota leaves the project usable
+#### E2E-041: A refused storage limit leaves the project usable
 - **Category:** side effect; **Scenario:** SC-003; **Requirements:** FR-NEW-014
 - **Given** the situation of E2E-011
 - **When** the extraction is refused, then the member writes a 3 byte file `/uploads/small.txt`
-- **Then** the small write succeeds and the remaining quota is 2 bytes
+- **Then** the small write succeeds and the remaining storage is 2 bytes
 - **Priority:** Medium
 
 #### E2E-042: Empty password on a plain RAR is ignored
@@ -906,11 +919,11 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **When** the member extracts it with overwrite false
 - **Then** the refusal is `ERR_INVALID_ARGUMENT` naming `big.bin`, not `ERR_NO_CLOBBER`
 
-#### E2E-068: Collision wins over the quota
+#### E2E-068: Collision wins over the storage limit
 - **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-015, FR-NEW-009; **Priority:** Medium
 - **Given** the situation of E2E-011 (5 bytes remaining, 12 declared) and `/uploads/report/data/a.txt` already existing
 - **When** the member extracts it with overwrite false
-- **Then** the refusal is `ERR_NO_CLOBBER`, not `ERR_WRITE_QUOTA_EXCEEDED`
+- **Then** the refusal is `ERR_NO_CLOBBER`, not `ERR_PROJECT_QUOTA_EXCEEDED`
 
 #### E2E-069: Empty password on encrypted file names
 - **Category:** failure; **Scenario:** SC-002; **Requirements:** FR-NEW-020, FR-NEW-004; **Priority:** Medium
@@ -936,11 +949,11 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **When** a client asks the HTTP API to extract it with no password
 - **Then** the error code and message are those of E2E-005; `/uploads/part` does not exist
 
-#### E2E-073: Overwrite counts net growth against the quota
+#### E2E-073: Overwrite counts net growth against the storage limit
 - **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-014; **Priority:** High
-- **Given** 5 bytes of remaining write quota, `/uploads/report.rar` as in E2E-001 (12 declared bytes), and existing `/uploads/report/data/a.txt` and `/uploads/report/data/b.txt` totalling 20 bytes
+- **Given** a project storage limit with 5 bytes of remaining storage, `/uploads/report.rar` as in E2E-001 (12 declared bytes), and existing `/uploads/report/data/a.txt` and `/uploads/report/data/b.txt` totalling 20 bytes
 - **When** the member extracts it with overwrite true
-- **Then** 2 files are written and the remaining write quota is 13 bytes
+- **Then** 2 files are written and the remaining storage is 13 bytes
 
 #### E2E-074: Missing archive with an explicit destination
 - **Category:** failure; **Scenario:** SC-001; **Requirements:** FR-NEW-019; **Priority:** Low
@@ -959,6 +972,36 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Given** a folder `/uploads/dir.rar`
 - **When** a client asks the HTTP API to extract it
 - **Then** the error code and message are those of E2E-056
+
+#### E2E-077: Over the session write allowance
+- **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-022; **Priority:** High
+- **Given** a project without a storage limit, a session write allowance with 5 bytes remaining, and `/uploads/report.rar` declaring 12 bytes
+- **When** the member extracts it
+- **Then** the refusal is `ERR_WRITE_QUOTA_EXCEEDED` with a message starting `session write quota of`; `/uploads/report` does not exist and the allowance is still 5 bytes
+
+#### E2E-078: The allowance is charged the full declared total
+- **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-022; **Priority:** Medium
+- **Given** a session write allowance with 20 bytes remaining, existing `/uploads/report/data/a.txt` and `/uploads/report/data/b.txt` totalling 20 bytes, and `/uploads/report.rar` as in E2E-001 (12 declared bytes)
+- **When** the member extracts it with overwrite true
+- **Then** 2 files are written and the allowance has 8 bytes remaining (12 charged, nothing netted)
+
+#### E2E-079: Allowance equal to the declared total
+- **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-022; **Priority:** Medium
+- **Given** a session write allowance with 12 bytes remaining and `/uploads/report.rar` as in E2E-001
+- **When** the member extracts it
+- **Then** 2 files are written and the allowance has 0 bytes remaining
+
+#### E2E-080: A refused extraction charges nothing
+- **Category:** side effect; **Scenario:** SC-003; **Requirements:** FR-NEW-022; **Priority:** Medium
+- **Given** the situation of E2E-077
+- **When** the extraction is refused, then the member writes a 3 byte file `/uploads/small.txt`
+- **Then** the small write succeeds and the allowance has 2 bytes remaining
+
+#### E2E-081: The project refusal comes first
+- **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-015, FR-NEW-022, FR-NEW-014; **Priority:** Medium
+- **Given** a project storage limit with 5 bytes of remaining storage, a session write allowance with 5 bytes remaining, and `/uploads/report.rar` declaring 12 bytes
+- **When** the member extracts it
+- **Then** the refusal is `ERR_PROJECT_QUOTA_EXCEEDED`, not `ERR_WRITE_QUOTA_EXCEEDED`; both limits are unchanged
 
 ### 9.3 Exploit tests
 
@@ -1006,7 +1049,7 @@ None.
 |---|---|---|---|---|---|
 | SC-001 | FR-MOD-001, FR-NEW-001, FR-NEW-009, FR-NEW-013, FR-NEW-018, FR-NEW-019, FR-NEW-021 | E2E-001, E2E-002, E2E-062, E2E-063, E2E-064 | E2E-016, E2E-053, E2E-054, E2E-055, E2E-056, E2E-071, E2E-074, E2E-075, E2E-076 | E2E-017, E2E-018, E2E-019 | E2E-020 |
 | SC-002 | FR-MOD-002, FR-MOD-003, FR-NEW-002, FR-NEW-003, FR-NEW-004, FR-NEW-005, FR-NEW-013, FR-NEW-016, FR-NEW-017, FR-NEW-020 | E2E-003, E2E-004, E2E-052 | E2E-005, E2E-006, E2E-007, E2E-030, E2E-045, E2E-046, E2E-050, E2E-051, E2E-065, E2E-069, E2E-070, E2E-072, E2E-MOD-002, E2E-MOD-003, E2E-MOD-004, E2E-MOD-005 | E2E-031, E2E-042 | E2E-021, E2E-022, E2E-043 |
-| SC-003 | FR-NEW-002, FR-NEW-003, FR-NEW-004, FR-NEW-006, FR-NEW-007, FR-NEW-008, FR-NEW-009, FR-NEW-011, FR-NEW-014, FR-NEW-015, FR-NEW-018 | none | E2E-008, E2E-009, E2E-010, E2E-011, E2E-012, E2E-032, E2E-033, E2E-034, E2E-035, E2E-036, E2E-047, E2E-048, E2E-049, E2E-057, E2E-058, E2E-059, E2E-060, E2E-061, E2E-066, E2E-067, E2E-068 | E2E-037, E2E-038, E2E-044, E2E-073 | E2E-041 |
+| SC-003 | FR-NEW-002, FR-NEW-003, FR-NEW-004, FR-NEW-006, FR-NEW-007, FR-NEW-008, FR-NEW-009, FR-NEW-011, FR-NEW-014, FR-NEW-015, FR-NEW-018, FR-NEW-022 | none | E2E-008, E2E-009, E2E-010, E2E-011, E2E-012, E2E-032, E2E-033, E2E-034, E2E-035, E2E-036, E2E-047, E2E-048, E2E-049, E2E-057, E2E-058, E2E-059, E2E-060, E2E-061, E2E-066, E2E-067, E2E-068, E2E-077, E2E-081 | E2E-037, E2E-038, E2E-044, E2E-073, E2E-078, E2E-079 | E2E-041, E2E-080 |
 | SC-004 | FR-NEW-010 | none | E2E-013, E2E-023, E2E-025 | E2E-024 | none |
 | SC-005 | FR-NEW-011 | none | E2E-014, E2E-026 | E2E-027 | none |
 | SC-006 | FR-MOD-001, FR-NEW-012 | E2E-029 | E2E-015, E2E-028, E2E-039, E2E-040, E2E-MOD-001 | none | none |
@@ -1031,14 +1074,15 @@ SC-004 and SC-005 are refusal scenarios; their happy path is the ordinary extrac
 | FR-NEW-011 | E2E-014, E2E-026, E2E-027, E2E-048, E2E-060 | 5 |
 | FR-NEW-012 | E2E-015, E2E-028, E2E-029, E2E-039, E2E-040 | 5 |
 | FR-NEW-013 | E2E-020, E2E-021, E2E-030 | 3 |
-| FR-NEW-014 | E2E-011, E2E-038, E2E-041, E2E-073 | 4 |
-| FR-NEW-015 | E2E-047, E2E-048, E2E-049, E2E-057, E2E-058, E2E-059, E2E-060, E2E-061, E2E-066, E2E-067, E2E-068 | 11 |
+| FR-NEW-014 | E2E-011, E2E-038, E2E-041, E2E-073, E2E-081 | 5 |
+| FR-NEW-015 | E2E-047, E2E-048, E2E-049, E2E-057, E2E-058, E2E-059, E2E-060, E2E-061, E2E-066, E2E-067, E2E-068, E2E-081 | 12 |
 | FR-NEW-016 | E2E-050, E2E-052, E2E-072 | 3 |
 | FR-NEW-017 | E2E-031, E2E-042, E2E-043 | 3 |
 | FR-NEW-018 | E2E-053, E2E-054, E2E-055, E2E-057 | 4 |
 | FR-NEW-019 | E2E-016, E2E-071, E2E-074 | 3 |
 | FR-NEW-020 | E2E-051, E2E-069, E2E-070 | 3 |
 | FR-NEW-021 | E2E-056, E2E-075, E2E-076 | 3 |
+| FR-NEW-022 | E2E-077, E2E-078, E2E-079, E2E-080, E2E-081 | 5 |
 
 ## 11. Open questions
 
@@ -1060,7 +1104,9 @@ None.
 | Multi volume archive | an archive split over several files, named `.partN.rar` | extraction |
 | RAR support | the optional capability of a server to read RAR archives | extraction |
 | Audit line | the one line an operator reads to see who extracted what and where | extraction |
-| Remaining write quota | the project's write allowance minus what is already used | project storage |
+| Storage limit | the optional cap on the total bytes a project stores, set in whole megabytes | project storage |
+| Remaining storage | the project's storage limit minus the bytes already stored | project storage |
+| Session write allowance | the bytes a member can still write in the current session; always set | project storage |
 | Member | a person with access to a project | project storage |
 | Operator | the person who runs the server and reads its audit trail | extraction |
 | Platform administrator | an operator account that manages projects and members and has no implicit access to files | project storage |
@@ -1077,6 +1123,7 @@ None.
 | 3 | 1 | 2 | NOT-IMPLEMENTABLE (F: quota rule ambiguous, amended as FR-NEW-014 and E2E-073) |
 | 4 | 0 | 2 | IMPLEMENTABLE |
 
+**Erratum 2026-11-04 (found while writing SPEC-0081):** the single "write quota" was two limits; FR-NEW-014 now names the project storage limit, FR-NEW-022 the session write allowance, with E2E-077 to E2E-081 and the order item (12). Reviewed by a fresh read only agent on the changed parts: 3 findings (one leftover wording, duplicate destinations in FR-NEW-022, line citations), all applied; verdict IMPLEMENTABLE.
 **Amendments applied after round 3:** F-1 quota rule (FR-NEW-014 net growth, E2E-073); A-1 7z exact message citations; A-2 `password_required_message` reuse; FR-NEW-019 split with FR-NEW-021 (E2E-056, E2E-074 to E2E-076); E2E-069 to E2E-072 added in round 2 fixes.
 **Amendments applied after round 4:** A-1 duplicate destinations and session allowance in FR-NEW-014; A-2 wording of 3.3; Section 13 and 9.1 note corrected.
 **Amendments applied after round 2:** F-1 order (membership first, FR-NEW-015 rewritten), F-2 encrypted names ordering (FR-NEW-015 items 4 and 5, E2E-058 to E2E-060), F-3 destination in the order (E2E-061), F-4 RAR versions and solid (E2E-062 to E2E-065), A-1 to A-4, and the consistency fixes (categories, EARS shapes, FR-NEW-019, FR-NEW-020, glossary, order pair tests E2E-066 to E2E-068).
@@ -1098,7 +1145,7 @@ None.
 | 7 | zip tests prefix only, 7z exact for both messages | `crates/core/src/tools/archive.rs:1034`, `:1047`, `:2158`, `:2174` |
 | 8 | no RAR fixture in the tree | `fd -e rar` over the repository returns 0 files (recounted) |
 | 9 | SPEC-0018 states rar out of scope and FR-NEW-006 names the refusal | `sdlc/specs/SPEC-0018-archive-extract-in-place/spec.md` (Summary) and `archive.rs:56-58` |
-| 10 | SPEC-0020 quota check reused | `crates/core/src/tools/archive.rs:178-198` |
+| 10 | two limits: project storage on net growth (`ERR_PROJECT_QUOTA_EXCEEDED`), session allowance on the gross declared total (`ERR_WRITE_QUOTA_EXCEEDED`); project checked first | `crates/core/src/tools/archive.rs:178-198`, `crates/core/src/quota.rs:96-113`, `:136-158`, `crates/core/src/safety.rs:136-147`, `crates/core/src/errors.rs:101-112` |
 | 11 | bare `.gz` refusal pinned by E2E-NEW-034 | `crates/core/src/tools/archive.rs:806-815` |
 | 12 | membership refusal text and code | `crates/core/src/storage/admin.rs:393` (text), `crates/core/src/errors.rs:60` (code) |
 | 13 | folder path refusal text | `crates/core/src/tools/archive.rs:136-140` |
@@ -1117,7 +1164,7 @@ Not applicable (`--security` not set).
 - Its licence is not in `deny.toml` `[licenses] allow` (`deny.toml:31`); `cargo deny check` fails until an exception is added (`deny.toml:21-27` shows how the advisory ignores are documented). Signal: the `make check` security step.
 - Feature name `rar`, off by default, forwarded from `crates/mcp-fs` like `postgres` (`crates/core/Cargo.toml:15-23`). `make check` uses `--all-features`, so CI compiles it. A build without the feature must not link the reader: check with `cargo tree -p mcp-fs-core` without the feature (licence constraint of 3.3).
 - RAR fixtures cannot be created from Rust; commit small binary fixtures and document how they were built (needs the RARLAB command line tool, to confirm). Cases: plain, encrypted data, encrypted names, partly encrypted, symlink, hardlink, traversal names, oversized, truncated.
-- The quota rule is `quota::admit_paths` (net change per destination, `crates/core/src/quota.rs:148-158`); RAR reuses it unchanged. Signal: E2E-073.
+- The quota rule is `quota::admit_paths` (net change per destination, `crates/core/src/quota.rs:148-158`); RAR reuses it unchanged; the session allowance is charged by the same call (`quota.rs:96-113`). Signal: E2E-073, E2E-078.
 - The reader may report a hard link as a file (FR-NEW-006); verify with the E2E-032 fixture.
 - The password messages are literals at `archive.rs:441`, `:489`, `:531`, `:617`, `:619`; extend the existing `password_required_message` (`archive.rs:615`) to carry the new suffixes, route the three remaining literals (`:441`, `:489`, `:531`) through it, and use it for RAR (FR-NEW-002, 003, MOD-002, MOD-003).
 - "folders created" in the answer is the key `dirs_created`; "files written" is `files_written`; "bytes written" is `bytes_written` (`archive.rs:265-268`).
