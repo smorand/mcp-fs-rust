@@ -27,15 +27,15 @@ const REDIR_UNIX_SYMLINK: u64 = 1;
 const REDIR_HARD_LINK: u64 = 4;
 
 /// What one entry of the built archive is.
-// Symlink and HardLink are built here but first used by the entry rule stories
-// (US-0171 and later), so this story leaves them unconstructed.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum RarKind {
     File,
     Dir,
     Symlink(String),
     HardLink(String),
+    /// A file whose header declares this unpacked size while the stored data is
+    /// `RarEntry::data`, whatever its length (the oversize lie, FR-NEW-008).
+    Declares(u64),
 }
 
 /// One entry of the built archive, in archive order.
@@ -54,6 +54,26 @@ impl RarEntry {
     pub(crate) fn dir(name: &str) -> Self {
         Self { name: name.to_string(), kind: RarKind::Dir, data: Vec::new() }
     }
+
+    pub(crate) fn symlink(name: &str, target: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            kind: RarKind::Symlink(target.to_string()),
+            data: Vec::new(),
+        }
+    }
+
+    pub(crate) fn hard_link(name: &str, target: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            kind: RarKind::HardLink(target.to_string()),
+            data: Vec::new(),
+        }
+    }
+
+    pub(crate) fn declaring(name: &str, declared: u64, data: &[u8]) -> Self {
+        Self { name: name.to_string(), kind: RarKind::Declares(declared), data: data.to_vec() }
+    }
 }
 
 /// A valid RAR5 archive holding `entries` stored without compression.
@@ -70,6 +90,7 @@ pub(crate) fn rar5_store(entries: &[RarEntry]) -> Vec<u8> {
 }
 
 fn push_file(out: &mut Vec<u8>, entry: &RarEntry) {
+    let mut declared = None;
     let (file_flags, mode, data, extra) = match &entry.kind {
         RarKind::File => (FHFL_CRC32, MODE_FILE, entry.data.as_slice(), Vec::new()),
         RarKind::Dir => (FHFL_DIRECTORY, MODE_DIR, &[][..], Vec::new()),
@@ -79,10 +100,14 @@ fn push_file(out: &mut Vec<u8>, entry: &RarEntry) {
         RarKind::HardLink(target) => {
             (FHFL_CRC32, MODE_FILE, &[][..], redirection(REDIR_HARD_LINK, target))
         }
+        RarKind::Declares(size) => {
+            declared = Some(*size);
+            (FHFL_CRC32, MODE_FILE, entry.data.as_slice(), Vec::new())
+        }
     };
     let mut fields = Vec::new();
     fields.extend(vint(file_flags));
-    fields.extend(vint(data.len() as u64));
+    fields.extend(vint(declared.unwrap_or(data.len() as u64)));
     fields.extend(vint(mode));
     if file_flags & FHFL_CRC32 != 0 {
         fields.extend(crc32(data).to_le_bytes());

@@ -9,12 +9,12 @@
 > Closes spec: no
 
 ## Objective
-A RAR archive holding a symbolic link, a hard link, a name that escapes the destination, or an entry whose data is larger than it declares is refused whole with nothing written; an existing file is refused unless `overwrite`.
+A RAR archive holding a symbolic link, a name that escapes the destination, or an entry whose data does not match its declared size is refused whole with nothing written; an existing file is refused unless `overwrite`.
 
 ## Requirements covered
-- SPEC-0080/FR-NEW-006: IF a RAR archive holds a symbolic link, hard link or device entry THEN THE archive extraction SHALL refuse the whole archive with `ERR_NOT_SUPPORTED`, name the offending entry in the message, and write nothing.
+- SPEC-0080/FR-NEW-006: IF a RAR archive holds a symbolic link entry THEN THE archive extraction SHALL refuse the whole archive with `ERR_NOT_SUPPORTED`, name the offending entry in the message, and write nothing. A hard link entry is extracted as an empty regular file (SPEC-0080 erratum 2).
 - SPEC-0080/FR-NEW-007: IF a RAR entry name, once resolved, lies outside the destination, whether through `..` or an absolute name, THEN THE archive extraction SHALL refuse the whole archive with `ERR_PATH_OUT_OF_BOUNDS` and write nothing.
-- SPEC-0080/FR-NEW-008: IF a RAR entry decodes to more bytes than it declares THEN THE archive extraction SHALL refuse the whole archive with `ERR_INVALID_ARGUMENT`, name the offending entry in the message, and write nothing.
+- SPEC-0080/FR-NEW-008: IF the data of a RAR entry does not match its declared size and checksum THEN THE archive extraction SHALL refuse the whole archive with `ERR_INVALID_ARGUMENT`, name the offending entry in the message, and write nothing.
 - SPEC-0080/FR-NEW-009: IF an entry targets a path that already holds a file AND `overwrite` is false THEN THE archive extraction SHALL refuse with `ERR_NO_CLOBBER` naming the first colliding path in archive order, and write nothing.
 
 ## Independent Test
@@ -29,7 +29,7 @@ Run `cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_008 e2e_0080_009
 ### Data model
 None.
 ### Contracts
-Entry rules in `decode_rar` (archive order, before any read): folder = `is_directory()`; symlink = `file_attr & 0o170000 == 0o120000` or `file_attr & 0x400 != 0`, refused with `ERR_NOT_SUPPORTED` `archive entry '<name>' is a symlink, which is not supported`; hard link, device: see the spike below; escaping name: `ensure_entry_path_safe(&name)` (`archive.rs:359-385`) gives `ERR_PATH_OUT_OF_BOUNDS`; size: a data read whose length differs from `unpacked_size`, or a read error on a plain entry, gives `ERR_INVALID_ARGUMENT` `archive entry '<name>' decompressed to more bytes than declared <declared>`; collision: the existing pipeline scan (`archive.rs:166-176`). SPIKE FIRST: build the E2E-008, E2E-032 and E2E-012 fixtures with the store builder (symlink redirection record, hard link redirection record, a header declaring 10 bytes over 1 000 000 bytes of data) and see what the safe `unrar` API reports; if the hard link or the oversize case cannot be observed, stop BLOCKED_ON_SPEC and write `sdlc/specs/SPEC-0080-extract-rar-archives/design-issues.md` (options: raw FFI through `unrar_sys`, which needs `unsafe`; or amend E2E-032 and E2E-012).
+Entry rules in `decode_rar` (archive order, before any read): folder = `is_directory()`; symlink = `file_attr & 0o170000 == 0o120000` or `file_attr & 0x400 != 0`, refused with `ERR_NOT_SUPPORTED` `archive entry '<name>' is a symlink, which is not supported`; hard link: extracted as an empty file (SPEC-0080 erratum 2); devices are not classified; escaping name: `ensure_entry_path_safe(&name)` (`archive.rs:359-385`) gives `ERR_PATH_OUT_OF_BOUNDS`; size: a data read whose length differs from `unpacked_size`, or a read error on a plain entry, gives `ERR_INVALID_ARGUMENT` `archive entry '<name>' decompressed to more bytes than declared <declared>`; collision: the existing pipeline scan (`archive.rs:166-176`). SPIKE FIRST: build the E2E-008, E2E-032 and E2E-012 fixtures with the store builder (symlink redirection record, hard link redirection record, a header declaring 10 bytes over 1 000 000 bytes of data) and see what the safe `unrar` API reports; if the hard link or the oversize case cannot be observed, stop BLOCKED_ON_SPEC and write `sdlc/specs/SPEC-0080-extract-rar-archives/design-issues.md` (options: raw FFI through `unrar_sys`, which needs `unsafe`; or amend E2E-032 and E2E-012).
 ### Paths
 | Path | Action |
 |---|---|
@@ -70,7 +70,7 @@ Entry rules in `decode_rar` (archive order, before any read): folder = `is_direc
 - **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-009
 - **Given** `/uploads/report.rar` as in E2E-001, and `/uploads/report/data/a.txt` and `/uploads/report/data/b.txt` already existing
 - **When** the member extracts with overwrite false
-- **Then** the refusal is `ERR_NO_CLOBBER` naming `/uploads/report/data/a.txt`
+- **Then** the refusal is `ERR_NO_CLOBBER` naming `/uploads/report/data` (the first colliding path in archive order)
 - **And** both existing files keep their content
 - **Priority:** High
 - Level / Driver / Location: functional e2e / typed engine call `extract_archive` (the function both doors call), after `f.state.authorize(MOUNT, person)` when the test is about membership / crates/core/src/tools/archive_rar.rs tests, `#[cfg(feature = "rar")]`
@@ -101,11 +101,11 @@ Entry rules in `decode_rar` (archive order, before any read): folder = `is_direc
 - RED before the change: the test fails (the behavior does not exist yet) and goes green with this story
 - Cleanup: none, the fixture is dropped with the in memory store
 
-### SPEC-0080/E2E-032: Hard link entry
-- **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-006
+### SPEC-0080/E2E-032: Hard link entry extracts as an empty file
+- **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-006
 - **Given** `/uploads/hl.rar` holding `a.txt` and a hard link `b.txt` to it
 - **When** the member extracts it
-- **Then** the refusal is `ERR_NOT_SUPPORTED` and the message names `b.txt`; `/uploads/hl` does not exist
+- **Then** the extraction succeeds, `/uploads/hl/a.txt` has its content and `/uploads/hl/b.txt` exists with 0 bytes
 - **Priority:** High
 - Level / Driver / Location: functional e2e / typed engine call `extract_archive` (the function both doors call), after `f.state.authorize(MOUNT, person)` when the test is about membership / crates/core/src/tools/archive_rar.rs tests, `#[cfg(feature = "rar")]`
 - Function: `e2e_0080_032_hard_link_entry`
@@ -172,7 +172,7 @@ Entry rules in `decode_rar` (archive order, before any read): folder = `is_direc
 - **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-009
 - **Given** `/uploads/report.rar` as in E2E-001 and `/out/data/b.txt` already existing
 - **When** the member extracts it to the destination `/out` with overwrite false
-- **Then** the refusal is `ERR_NO_CLOBBER` naming `/out/data/b.txt`; `/out/data/a.txt` does not exist
+- **Then** the refusal is `ERR_NO_CLOBBER` naming `/out/data`; `/out/data/a.txt` does not exist
 - **Priority:** Medium
 - Level / Driver / Location: functional e2e / typed engine call `extract_archive` (the function both doors call), after `f.state.authorize(MOUNT, person)` when the test is about membership / crates/core/src/tools/archive_rar.rs tests, `#[cfg(feature = "rar")]`
 - Function: `e2e_0080_044_collision_under_an_explicit_destinat`
@@ -192,3 +192,7 @@ Entry rules in `decode_rar` (archive order, before any read): folder = `is_direc
 - [ ] Self review: every new branch has a test; no `unwrap` or `expect` on fallible paths; no dash as punctuation in code, comments or docs; failure modes of the new code listed in the commit body.
 - [ ] Does not close its spec.
 - [ ] One commit `US-0171: refuse unsafe RAR entries, oversized entries and collisions`, body `Spec: SPEC-0080` and the requirement ids.
+
+## Resolved
+
+The three spec questions of the first run were settled with the recommended options and recorded as SPEC-0080 erratum 2 (hard link extracts as an empty file; FR-NEW-008 reworded to a size and checksum mismatch; E2E-010 and E2E-044 name the colliding folder). Devices are not classified: the Windows attribute bits 0x1000 and 0x2000 alias the Unix FIFO and character types. A Windows reparse flag counts as a symlink unless the type bits say regular file or folder.
