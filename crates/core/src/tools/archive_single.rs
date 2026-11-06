@@ -36,10 +36,12 @@ pub(crate) struct CappedRead {
     pub(crate) high_water: u64,
 }
 
-/// Decoder over `bytes`; `GzDecoder` reads the first member only.
+/// Decoder over `bytes`; `MultiGzDecoder` reads every member back to back
+/// and fails on bytes that are not a gzip member, where `GzDecoder` would stop
+/// after the first member and ignore the rest.
 fn decoder(format: SingleFormat, bytes: &[u8]) -> Box<dyn Read + '_> {
     match format {
-        SingleFormat::Gzip => Box::new(flate2::read::GzDecoder::new(bytes)),
+        SingleFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
     }
 }
 
@@ -309,6 +311,153 @@ mod tests {
         assert_eq!(lines.len(), 1, "{log:?}");
         assert_eq!(lines[0].path, "/uploads/data.csv.gz");
         assert_eq!(lines[0].detail, "destination=/uploads files_written=1 bytes_written=16");
+    }
+
+    /// Members written back to back, the shape `cat a.gz b.gz` produces.
+    fn members(parts: &[&[u8]]) -> Vec<u8> {
+        parts.iter().flat_map(|p| gzip(p)).collect()
+    }
+
+    /// A gzip file whose header carries a name, a comment and an extra field.
+    fn gzip_with_header(content: &[u8], name: &str, comment: &str, extra: &[u8]) -> Vec<u8> {
+        let mut gz = flate2::GzBuilder::new()
+            .filename(name)
+            .comment(comment)
+            .extra(extra.to_vec())
+            .write(Vec::new(), flate2::Compression::default());
+        gz.write_all(content).unwrap();
+        gz.finish().unwrap()
+    }
+
+    const CORRUPT: &str = "archive is corrupt or not a valid gz file:";
+
+    fn assert_corrupt(v: &Result<Value>) {
+        let e = v.as_ref().expect_err("a corrupt file must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+        assert!(e.message.starts_with(CORRUPT), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_005_two_gzip_members_back_to_back() {
+        let f = fixture().await;
+        seed(&f, "/uploads/two.txt.gz", &members(&[b"hello ", b"world"])).await;
+        let v = extract(&f, "/uploads/two.txt.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(v.unwrap_or_default()["bytes_written"], 11);
+        assert_eq!(read(&f, "/uploads/two.txt").await.as_deref(), Some(&b"hello world"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_008_truncated_file() {
+        let f = fixture().await;
+        let whole = gzip(CSV);
+        seed(&f, "/uploads/cut.gz", &whole[..whole.len() / 2]).await;
+        let v = extract(&f, "/uploads/cut.gz", None).await;
+        assert_corrupt(&v);
+        assert_eq!(read(&f, "/uploads/cut").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_009_text_file_named_gz() {
+        let f = fixture().await;
+        seed(&f, "/uploads/fake.gz", b"not gzip").await;
+        let v = extract(&f, "/uploads/fake.gz", None).await;
+        assert_corrupt(&v);
+        assert_eq!(read(&f, "/uploads/fake").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_010_bytes_after_a_valid_stream() {
+        let f = fixture().await;
+        let mut junk = gzip(CSV);
+        junk.extend_from_slice(b"JUNK");
+        seed(&f, "/uploads/tail.gz", &junk).await;
+        let v = extract(&f, "/uploads/tail.gz", None).await;
+        assert_corrupt(&v);
+        assert_eq!(read(&f, "/uploads/tail").await, None);
+
+        let mut zeros = gzip(CSV);
+        zeros.extend_from_slice(&[0u8; 4]);
+        seed(&f, "/uploads/pad.gz", &zeros).await;
+        let v = extract(&f, "/uploads/pad.gz", None).await;
+        assert_corrupt(&v);
+        assert_eq!(read(&f, "/uploads/pad").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_018_name_stored_inside_the_file_is_ignor() {
+        let f = fixture().await;
+        let archive = gzip_with_header(CSV, "../../etc/passwd", "", b"");
+        seed(&f, "/uploads/data.csv.gz", &archive).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/etc/passwd").await, None);
+        assert_eq!(read(&f, "/uploads/etc").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_033_a_refused_extraction_creates_nothing() {
+        let f = fixture().await;
+        let whole = gzip(CSV);
+        seed(&f, "/uploads/cut.gz", &whole[..whole.len() / 2]).await;
+        let v = extract(&f, "/uploads/cut.gz", Some("/fresh")).await;
+        assert_corrupt(&v);
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        assert!(!c.exists("/fresh").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_037_three_gzip_members() {
+        let f = fixture().await;
+        seed(&f, "/uploads/three.txt.gz", &members(&[b"a", b"b", b"c"])).await;
+        let v = extract(&f, "/uploads/three.txt.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(v.unwrap_or_default()["bytes_written"], 3);
+        assert_eq!(read(&f, "/uploads/three.txt").await.as_deref(), Some(&b"abc"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_038_an_empty_gzip_member_between_two_oth() {
+        let f = fixture().await;
+        seed(&f, "/uploads/gap.txt.gz", &members(&[b"a", b"", b"b"])).await;
+        let v = extract(&f, "/uploads/gap.txt.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/gap.txt").await.as_deref(), Some(&b"ab"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_042_a_different_stored_name() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip_with_header(CSV, "other.txt", "", b"")).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/other.txt").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_043_comment_and_extra_fields_in_the_head() {
+        let f = fixture().await;
+        let archive = gzip_with_header(CSV, "x.txt", "from alice", b"\x01\x02\x03");
+        seed(&f, "/uploads/data.csv.gz", &archive).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let mut names: Vec<String> =
+            c.list_dir("/uploads").await.unwrap().into_iter().map(|n| n.path).collect();
+        names.sort();
+        assert_eq!(names, vec!["/uploads/data.csv", "/uploads/data.csv.gz"], "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_046_empty_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/zero.gz", b"").await;
+        let v = extract(&f, "/uploads/zero.gz", None).await;
+        assert_corrupt(&v);
+        assert_eq!(read(&f, "/uploads/zero").await, None);
     }
 
     #[tokio::test]
