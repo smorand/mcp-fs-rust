@@ -35,6 +35,8 @@ pub(crate) enum ArchiveFormat {
     SevenZ,
     Tar(TarCompression),
     Single(SingleFormat),
+    #[cfg(feature = "rar")]
+    Rar,
 }
 
 /// Suffix table, matched in order: every compound tar suffix sits before the
@@ -47,6 +49,10 @@ const SUFFIXES: &[(&str, ArchiveFormat)] = &[
     (".tar.xz", ArchiveFormat::Tar(TarCompression::Xz)),
     (".txz", ArchiveFormat::Tar(TarCompression::Xz)),
     (".tar", ArchiveFormat::Tar(TarCompression::None)),
+    // Only a build with the opt in `rar` feature knows `.rar`; without it the name
+    // falls through to the unsupported extension refusal (SPEC-0080 FR-NEW-012).
+    #[cfg(feature = "rar")]
+    (".rar", ArchiveFormat::Rar),
     (".zip", ArchiveFormat::Zip),
     (".7z", ArchiveFormat::SevenZ),
     // Single file rows come after every tar entry: `x.tar.gz` and `x.tar.bz2` must reach
@@ -345,6 +351,8 @@ fn decode_archive(
         ArchiveFormat::Zip => decode_zip(bytes, password),
         ArchiveFormat::SevenZ => decode_sevenz(bytes, password),
         ArchiveFormat::Tar(compression) => decode_tar(compression, bytes),
+        #[cfg(feature = "rar")]
+        ArchiveFormat::Rar => crate::tools::archive_rar::decode_rar(bytes, password),
         ArchiveFormat::Single(_) => Err(ToolError::internal(
             "a single file format is extracted by archive_single, not decode_archive",
         )),
@@ -414,7 +422,7 @@ pub(crate) fn corrupt(format_name: &str, detail: impl std::fmt::Display) -> Tool
 /// traversal (`..\\..\\windows\\system32\\evil.dll`) the same way, since a
 /// POSIX destination never treats a backslash as a legitimate path
 /// character worth preserving literally when it is used to spell `..`.
-fn ensure_entry_path_safe(raw: &str) -> Result<()> {
+pub(crate) fn ensure_entry_path_safe(raw: &str) -> Result<()> {
     if raw.starts_with('/') {
         return Err(ToolError::path_out_of_bounds(format!(
             "archive entry path escapes the destination: '{raw}'"
@@ -847,14 +855,88 @@ pub(crate) mod tests {
         c.write_bytes_atomic(path, b"anything").await.unwrap();
     }
 
-    /// E2E-NEW-022: `.rar` is not in the supported mapping.
+    /// E2E-0080-MOD-001 (was SPEC-0018 E2E-NEW-022): with RAR support a valid
+    /// `.rar` extracts; without it the old refusal naming `.rar` still holds.
     #[tokio::test]
-    async fn e2e_new_022_rar_extension_is_not_supported() {
+    async fn e2e_0080_mod_001_rar_support_was_spec_0018_e2e_new_02() {
         let f = fixture().await;
-        seed_file(&f, "/uploads/data.rar").await;
-        let e = extract(&f, "/uploads/data.rar").await.unwrap_err();
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        #[cfg(feature = "rar")]
+        {
+            use crate::tools::archive_rar_fixtures::{RarEntry, rar5_store};
+            let c = f.state.stores.client(MOUNT).await.unwrap();
+            let rar = rar5_store(&[RarEntry::file("a.txt", b"hello")]);
+            c.write_bytes_atomic("/uploads/data.rar", &rar).await.unwrap();
+            let v = extract(&f, "/uploads/data.rar").await;
+            assert!(v.is_ok(), "{v:?}");
+            assert_eq!(c.read_bytes("/uploads/data/a.txt").await.unwrap(), b"hello");
+        }
+        #[cfg(not(feature = "rar"))]
+        {
+            seed_file(&f, "/uploads/data.rar").await;
+            let e = extract(&f, "/uploads/data.rar").await.unwrap_err();
+            assert_eq!(e.code, code::NOT_SUPPORTED);
+            assert!(e.message.contains(".rar"), "{}", e.message);
+        }
+    }
+
+    /// SPEC-0080 tests for a server built without the `rar` feature: `.rar`, in any
+    /// case and with a multi volume name, keeps today's refusal; other formats work.
+    #[cfg(not(feature = "rar"))]
+    async fn assert_rar_refused(path: &str, ext: &str) {
+        let f = fixture().await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        seed_file(&f, path).await;
+        let e = extract(&f, path).await.unwrap_err();
         assert_eq!(e.code, code::NOT_SUPPORTED);
-        assert!(e.message.contains(".rar"), "{}", e.message);
+        assert_eq!(e.message, format!("unsupported archive extension: '{ext}'"));
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let stem = &path[..path.rfind('.').unwrap()];
+        assert!(!c.exists(stem).await.unwrap(), "nothing written at {stem}");
+    }
+
+    #[cfg(not(feature = "rar"))]
+    #[tokio::test]
+    async fn e2e_0080_015_server_without_rar_support() {
+        assert_rar_refused("/uploads/report.rar", ".rar").await;
+    }
+
+    #[cfg(not(feature = "rar"))]
+    #[tokio::test]
+    async fn e2e_0080_028_extension_shown_as_typed() {
+        assert_rar_refused("/uploads/report.RAR", ".RAR").await;
+    }
+
+    #[cfg(not(feature = "rar"))]
+    #[tokio::test]
+    async fn e2e_0080_029_other_formats_unchanged_without_rar() {
+        let f = fixture().await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/pack.zip", &build_zip(&[("a.txt", b"hello")], None))
+            .await
+            .unwrap();
+        let v = extract(&f, "/uploads/pack.zip").await.unwrap();
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(c.read_bytes("/uploads/pack/a.txt").await.unwrap(), b"hello");
+        // The mutation that recognizes `.rar` without the feature must show here too:
+        // every format shares one table, so `.rar` stays unknown alongside `.zip`.
+        assert_eq!(
+            detect_format("/uploads/x.rar").unwrap_err().message,
+            "unsupported archive extension: '.rar'"
+        );
+    }
+
+    #[cfg(not(feature = "rar"))]
+    #[tokio::test]
+    async fn e2e_0080_039_multi_volume_name_without_rar_suppor() {
+        assert_rar_refused("/uploads/big.part1.rar", ".rar").await;
+    }
+
+    #[cfg(not(feature = "rar"))]
+    #[tokio::test]
+    async fn e2e_0080_040_upper_case_multi_volume_name_without() {
+        assert_rar_refused("/uploads/big.PART2.RAR", ".RAR").await;
     }
 
     /// E2E-0081-MOD-001 (was SPEC-0018 E2E-NEW-034): a bare `.gz` is a
@@ -951,6 +1033,15 @@ pub(crate) mod tests {
             ("/a/X.CSV.BZ2", Single(Bz), 4),
         ] {
             assert_eq!(detect_format(path).unwrap(), (fmt, len), "{path}");
+        }
+    }
+
+    /// The `.rar` row exists only in a build with the `rar` feature.
+    #[cfg(feature = "rar")]
+    #[test]
+    fn detect_format_maps_rar_with_the_feature() {
+        for path in ["/a/x.rar", "/a/X.RAR"] {
+            assert_eq!(detect_format(path).unwrap(), (ArchiveFormat::Rar, 4), "{path}");
         }
     }
 
