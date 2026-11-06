@@ -32,8 +32,26 @@ impl SingleFormat {
 #[derive(Debug)]
 pub(crate) struct CappedRead {
     pub(crate) bytes: Vec<u8>,
-    /// Largest number of bytes held at once, which later stories bound.
+    /// Largest number of output bytes held at once, at most the cap.
     pub(crate) high_water: u64,
+}
+
+/// Why a bounded read stopped early.
+#[derive(Debug)]
+pub(crate) enum ReadError {
+    /// The output would have passed the cap; `high_water` is the most bytes held.
+    CapExceeded {
+        high_water: u64,
+    },
+    Io(std::io::Error),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Largest buffer the last decode of this thread held, so a test can
+    /// measure the decoder inside a whole extraction.
+    pub(crate) static LAST_HIGH_WATER: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Decoder over `bytes`; `MultiGzDecoder` reads every member back to back
@@ -45,19 +63,20 @@ fn decoder(format: SingleFormat, bytes: &[u8]) -> Box<dyn Read + '_> {
     }
 }
 
-/// Read `reader` to its end in `CHUNK` pieces, stopping with an error past
-/// `cap` bytes. Time O(n) in the output, memory O(n): the output is held
-/// once, the chunk buffer is fixed.
-fn read_capped(mut reader: impl Read, cap: u64) -> std::io::Result<CappedRead> {
+/// Read `reader` to its end in `CHUNK` pieces, stopping with `CapExceeded`
+/// once the output would pass `cap` bytes (equal is accepted); at most `cap`
+/// bytes are held, plus the fixed chunk. Time O(n) in the output read, memory O(min(n, cap)):
+/// the output is held once and the chunk buffer is fixed.
+fn read_capped(mut reader: impl Read, cap: u64) -> std::result::Result<CappedRead, ReadError> {
     let mut bytes = Vec::new();
     let mut chunk = vec![0u8; CHUNK];
     loop {
-        let n = reader.read(&mut chunk)?;
+        let n = reader.read(&mut chunk).map_err(ReadError::Io)?;
         if n == 0 {
             break;
         }
         if (bytes.len() + n) as u64 > cap {
-            return Err(std::io::Error::other("decoded size is over the cap"));
+            return Err(ReadError::CapExceeded { high_water: bytes.len() as u64 });
         }
         bytes.extend_from_slice(&chunk[..n]);
     }
@@ -110,6 +129,64 @@ async fn check_collision(client: &VolumeClient, out: &str, overwrite: bool) -> R
     }
 }
 
+/// Which limit a cap comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapKind {
+    Project,
+    Session,
+}
+
+/// The most output bytes the extraction may produce, and the limit that sets it.
+#[derive(Debug, Clone, Copy)]
+struct Caps {
+    limit: u64,
+    which: CapKind,
+}
+
+impl Caps {
+    /// The refusal for the limit that was met first.
+    async fn refusal(self, state: &AppState, client: &VolumeClient) -> Result<ToolError> {
+        match self.which {
+            CapKind::Project => {
+                let limit = state.safety.project_limit(&client.project_id).await?.unwrap_or(0);
+                let used = quota::used_bytes(client).await?;
+                let requested = i64::try_from(self.limit).unwrap_or(i64::MAX).saturating_add(1);
+                Ok(ToolError::project_quota_exceeded(limit, used, requested))
+            }
+            CapKind::Session => {
+                let quota = state.safety.config().write_quota_bytes;
+                Ok(ToolError::write_quota_exceeded(format!(
+                    "session write quota of {quota} bytes exceeded"
+                )))
+            }
+        }
+    }
+}
+
+/// Output cap, computed before anything is read: the lower of the project's
+/// remaining storage (plus the file an overwrite replaces, because the
+/// admission counts net growth) and the session's remaining allowance (charged
+/// gross). A tie goes to the project, which the admission also checks first.
+async fn caps(
+    state: &AppState,
+    client: &VolumeClient,
+    mount_id: &str,
+    person: &str,
+    out: &str,
+    overwrite: bool,
+) -> Result<Caps> {
+    let replaced = match client.meta.get(out).await? {
+        Some(node) if overwrite && node.is_file() => node.size,
+        _ => 0,
+    };
+    let session = state.safety.session_remaining(person, mount_id).max(0) as u64;
+    let project = quota::project_remaining_for(client, &state.safety, replaced).await?;
+    Ok(match project.map(|p| p.max(0) as u64) {
+        Some(p) if p <= session => Caps { limit: p, which: CapKind::Project },
+        _ => Caps { limit: session, which: CapKind::Session },
+    })
+}
+
 /// Extract the one file held by `normalized` next to it, or into
 /// `destination`. Order: output name, destination, collision, then the read
 /// and decode, admission and the writes; nothing is created and the archive
@@ -138,14 +215,25 @@ pub(crate) async fn extract_single(
     let out = crate::util::PosixPath::normpath(&format!("{}/{name}", dest.trim_end_matches('/')));
     check_collision(client, &out, overwrite).await?;
 
+    let caps = caps(state, client, mount_id, person, &out, overwrite).await?;
     let bytes = client.read_bytes(normalized).await?;
     let label = format.label();
-    let decoded = tokio::task::spawn_blocking(move || {
-        read_capped(decoder(format, &bytes), u64::MAX).map_err(|e| corrupt(label, e))
-    })
-    .await
-    .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??;
-
+    let cap = caps.limit;
+    let read = tokio::task::spawn_blocking(move || read_capped(decoder(format, &bytes), cap))
+        .await
+        .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))?;
+    let decoded = match read {
+        Ok(decoded) => decoded,
+        Err(ReadError::Io(e)) => return Err(corrupt(label, e)),
+        Err(ReadError::CapExceeded { high_water }) => {
+            #[cfg(test)]
+            LAST_HIGH_WATER.with(|c| c.set(Some(high_water)));
+            tracing::debug!(path = %normalized, high_water, "single file decode stopped at the cap");
+            return Err(caps.refusal(state, client).await?);
+        }
+    };
+    #[cfg(test)]
+    LAST_HIGH_WATER.with(|c| c.set(Some(decoded.high_water)));
     tracing::debug!(path = %normalized, high_water = decoded.high_water, "single file decoded");
 
     let len = decoded.bytes.len() as i64;
@@ -648,5 +736,210 @@ mod tests {
     #[tokio::test]
     async fn e2e_0081_055_a_file_among_the_ancestors_of_the_de() {
         destination_refused("/uploads/notes.txt/sub").await;
+    }
+
+    // Quota and session cap tests (US-0163).
+
+    const BOMB_LEN: usize = 10_000_000;
+
+    fn bomb() -> Vec<u8> {
+        gzip(&vec![0u8; BOMB_LEN])
+    }
+
+    /// Fixture whose session write allowance is `n` bytes.
+    async fn fixture_allowance(n: i64) -> Fixture {
+        let f = Fixture::with_config(move |c| c.safety.write_quota_bytes = n).await;
+        f.seed_project(MOUNT, OWNER).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads", true).await.unwrap();
+        f
+    }
+
+    /// Give the project exactly `n` bytes of remaining storage.
+    async fn limit_remaining(f: &Fixture, n: i64) {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let used = crate::quota::used_bytes(&c).await.unwrap();
+        f.state.admin.set_quota(MOUNT, Some(used + n)).await.unwrap();
+    }
+
+    async fn remaining_storage(f: &Fixture) -> i64 {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let limit = f.state.safety.project_limit(MOUNT).await.unwrap().unwrap();
+        limit - crate::quota::used_bytes(&c).await.unwrap()
+    }
+
+    fn allowance(f: &Fixture) -> i64 {
+        f.state.safety.session_remaining(OWNER, MOUNT)
+    }
+
+    async fn write_small(f: &Fixture) {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let v = crate::core::fs_ops::write_bytes(
+            &c,
+            &f.state.safety,
+            OWNER,
+            MOUNT,
+            "/uploads/small.txt",
+            b"abc",
+            false,
+            true,
+        )
+        .await;
+        assert!(v.is_ok(), "{v:?}");
+    }
+
+    fn project_refusal(v: &Result<Value>) {
+        let e = v.as_ref().expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::PROJECT_QUOTA_EXCEEDED, "{e:?}");
+        assert!(e.message.starts_with("project storage quota of"), "{}", e.message);
+    }
+
+    fn session_refusal(v: &Result<Value>, quota: i64) {
+        let e = v.as_ref().expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::WRITE_QUOTA_EXCEEDED, "{e:?}");
+        assert_eq!(e.message, format!("session write quota of {quota} bytes exceeded"));
+    }
+
+    /// The bomb is stopped by the decoder itself: it never holds more than
+    /// the cap plus one chunk.
+    fn assert_bomb_bounded(cap: u64) {
+        let err = super::read_capped(super::decoder(super::SingleFormat::Gzip, &bomb()), cap)
+            .expect_err("the bomb is over the cap");
+        match err {
+            super::ReadError::CapExceeded { high_water } => {
+                assert!(high_water <= cap + 65_536, "held {high_water} bytes");
+                assert!(high_water < 1_000_000, "held {high_water} bytes");
+            }
+            super::ReadError::Io(e) => panic!("expected the cap error, got {e}"),
+        }
+    }
+
+    /// The decode inside the extraction call just made held at most the cap
+    /// plus one chunk (the tokio test runtime is single threaded, so the
+    /// thread local belongs to this test alone).
+    fn assert_extraction_bounded(cap: u64) {
+        let held = super::LAST_HIGH_WATER.with(std::cell::Cell::take);
+        let held = held.expect("the extraction decoded nothing");
+        assert!(held <= cap + 65_536, "the extraction held {held} bytes");
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_007_output_over_the_remaining_quota() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        limit_remaining(&f, 10).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+        assert_eq!(remaining_storage(&f).await, 10);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_017_decompression_bomb() {
+        let f = fixture().await;
+        seed(&f, "/uploads/bomb.gz", &bomb()).await;
+        limit_remaining(&f, 1000).await;
+        let v = extract(&f, "/uploads/bomb.gz", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/bomb").await, None);
+        assert_eq!(remaining_storage(&f).await, 1000);
+        assert_bomb_bounded(1000);
+        assert_extraction_bounded(1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_025_output_exactly_equal_to_the_remainin() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        limit_remaining(&f, 16).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(remaining_storage(&f).await, 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_032_a_refused_extraction_leaves_the_proj() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        limit_remaining(&f, 10).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        project_refusal(&v);
+        write_small(&f).await;
+        assert_eq!(remaining_storage(&f).await, 7);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_047_one_byte_over_the_remaining_storage() {
+        let f = fixture().await;
+        seed(&f, "/uploads/odd.gz", &gzip(b"id,name\n1,Alice\nx")).await;
+        limit_remaining(&f, 16).await;
+        let v = extract(&f, "/uploads/odd.gz", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/odd").await, None);
+        assert_eq!(remaining_storage(&f).await, 16);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_048_bomb_against_the_session_allowance() {
+        let f = fixture_allowance(1000).await;
+        seed(&f, "/uploads/bomb.gz", &bomb()).await;
+        let v = extract(&f, "/uploads/bomb.gz", None).await;
+        session_refusal(&v, 1000);
+        assert_eq!(read(&f, "/uploads/bomb").await, None);
+        assert_eq!(allowance(&f), 1000);
+        assert_bomb_bounded(1000);
+        assert_extraction_bounded(1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_049_the_allowance_is_charged_the_full_ou() {
+        let f = fixture_allowance(20).await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        seed(&f, "/uploads/data.csv", &[b'x'; 40]).await;
+        let v = extract_with(&f, "/uploads/data.csv.gz", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(allowance(&f), 4);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_050_a_refused_extraction_charges_nothing() {
+        let f = fixture_allowance(10).await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        session_refusal(&v, 10);
+        write_small(&f).await;
+        assert_eq!(allowance(&f), 7);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_051_both_limits_at_the_same_byte() {
+        let f = fixture_allowance(10).await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        limit_remaining(&f, 10).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        project_refusal(&v);
+        assert_eq!(allowance(&f), 10);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_052_the_lower_limit_is_met_first() {
+        let f = fixture_allowance(100).await;
+        seed(&f, "/uploads/bomb.gz", &bomb()).await;
+        limit_remaining(&f, 1000).await;
+        let v = extract(&f, "/uploads/bomb.gz", None).await;
+        session_refusal(&v, 100);
+        assert_eq!(remaining_storage(&f).await, 1000);
+        assert_eq!(allowance(&f), 100);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_053_allowance_equal_to_the_output() {
+        let f = fixture_allowance(16).await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.gz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(allowance(&f), 0);
     }
 }

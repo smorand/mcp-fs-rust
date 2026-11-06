@@ -146,6 +146,13 @@ impl SafetyManager {
         })
     }
 
+    /// Bytes the session may still write, never negative. Read only: it
+    /// charges nothing, so a caller can bound work before doing it.
+    pub fn session_remaining(&self, person: &str, project: &str) -> i64 {
+        let quota = self.config.write_quota_bytes;
+        self.with_session(person, project, |s| (quota - s.bytes_written).max(0))
+    }
+
     /// Give back bytes charged for a write that never landed.
     ///
     /// Only sound when the caller knows nothing was written, which is what the

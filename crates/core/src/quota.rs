@@ -159,6 +159,21 @@ pub(crate) async fn admit_paths(
     Ok(Admission { _guard: guard })
 }
 
+/// Storage the project can still grow by, `None` when it has no limit.
+/// `replaced_size` is the size of a file the write replaces, since the check
+/// in [`check_and_charge`] counts net growth. Floor 0.
+pub(crate) async fn project_remaining_for(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    replaced_size: i64,
+) -> Result<Option<i64>> {
+    let Some(limit) = safety.project_limit(&client.project_id).await? else {
+        return Ok(None);
+    };
+    let used = used_bytes(client).await?;
+    Ok(Some((limit - used + replaced_size).max(0)))
+}
+
 /// The bytes `client`'s project uses right now: every file's declared size,
 /// trashed files included (FR-NEW-002). A volume whose counter row is missing
 /// is backfilled from its nodes, under the lock.
