@@ -192,3 +192,35 @@ Entry rules in `decode_rar` (archive order, before any read): folder = `is_direc
 - [ ] Self review: every new branch has a test; no `unwrap` or `expect` on fallible paths; no dash as punctuation in code, comments or docs; failure modes of the new code listed in the commit body.
 - [ ] Does not close its spec.
 - [ ] One commit `US-0171: refuse unsafe RAR entries, oversized entries and collisions`, body `Spec: SPEC-0080` and the requirement ids.
+
+## Blocked
+
+Category 3 (two readings or an unmeetable requirement, with the spec silent on the alternative). 11 of the 12 acceptance tests are green with `--features rar`; `e2e_0080_032_hard_link_entry` is `#[ignore = "BLOCKED_ON_SPEC..."]` and is a faithful test of the story. Three questions need the spec owner (`/sdlc-spec` amendment), none can be settled by this run (Invariant 10).
+
+Spike facts (safe `unrar` 0.5.8, fixtures built by `archive_rar_fixtures.rs`, commands in `.implement/US-0171-red.log`):
+
+| Fixture | name returned | size | file_attr | is_file | read() |
+|---|---|---|---|---|---|
+| symlink `l` (redirection type 1) | `l` | 0 | 0o120777 | true | ok, 0 bytes |
+| hard link `b.txt` (redirection type 4) | `b.txt` | 0 | 0o100644 | true | ok, 0 bytes |
+| `../../etc/passwd`, `/etc/cron.d/x`, `a/../../b.txt` | raw, not sanitized | 5, 1, 1 | 0o100644 | true | ok |
+| declares 10, stores 11 or 1 000 000, CRC over all stored bytes | `liar.bin`, `big.bin` | 10 | | | Err `BadData` (File CRC error) |
+| declares 10, stores 11 or 1 000 000, CRC over the first 10 bytes | | 10 | | | ok, 10 bytes, no error |
+
+1. **Hard link (FR-NEW-006, E2E-032).**
+   - Question: how should a RAR5 hard link entry be refused when the safe API shows it as an empty regular file?
+   - Evidence: `crates/core/src/tools/archive_rar.rs` (`ensure_entry_allowed`), `unrar-0.5.8/src/open_archive.rs:582-640` (`FileHeader` has no redirection field), `unrar_sys-0.5.8/src/lib.rs:163-166` (`redir_type` exists only in the raw FFI struct).
+   - Options: (a) amend FR-NEW-006 and E2E-032 to symlinks only, a hard link then extracts as an empty file, which links nothing; (b) allow `unsafe` in one isolated module to read `redir_type` through `unrar_sys`.
+   - Recommendation and default: (a).
+2. **Oversized entry (FR-NEW-008, E2E-012, E2E-036).**
+   - Question: UnRAR stops at the declared size, so an entry cannot decode larger than declared; the case shows only as a CRC error, and a crafted CRC over the declared prefix extracts truncated without error. Is "refuse when the data does not match its declared size and CRC" the intended behavior?
+   - Options: (a) reword FR-NEW-008 that way (output stays bounded by the declared size); (b) none that stays safe.
+   - Recommendation and default: (a).
+3. **Collision names the folder, not the file (E2E-010, E2E-044).**
+   - Question: the shared collision scan refuses an existing folder (pinned by `e2e_new_049`), and the E2E-001 archive lists the folder `data` before `data/a.txt`, so the first colliding path is `/uploads/report/data`, not `/uploads/report/data/a.txt` (and `/out/data`, not `/out/data/b.txt`). Amend the tests, or change the shared scan?
+   - Options: (a) amend E2E-010 and E2E-044 to name the folder; (b) change the shared scan, which breaks `e2e_new_049` and the zip, 7z, tar behavior.
+   - Recommendation and default: (a). The two tests currently assert the folder path, with a comment.
+
+Also decided here, without spec change: devices are not classified (RAR never stores them, and the Windows attribute bits 0x1000 and 0x2000 alias the Unix FIFO and character device types, which would refuse ordinary Windows files); a Windows reparse flag counts as a symlink unless the type bits say regular file or folder.
+
+To unblock: amend SPEC-0080 through `/sdlc-spec` (items 1 to 3), set this story back to `todo`, remove the `#[ignore]` of `e2e_0080_032` if option (a) deletes it, and rerun `/sdlc-implement`.
