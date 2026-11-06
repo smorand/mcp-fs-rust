@@ -3424,6 +3424,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_0083_022_password_through_the_http_api() {
+        use std::io::Write as _;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        bz.write_all(b"id,name\n1,Alice\n").unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.bz2", &bz.finish().unwrap()).await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.bz2", "password": "s3cret"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: password is not applicable to this archive format"
+        );
+        assert!(!c.exists("/uploads/data.csv").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn e2e_0081_056_destination_is_a_file_through_the_ht() {
         let h = Harness::new().await;
         let c = h.state.stores.client(MOUNT).await.unwrap();
