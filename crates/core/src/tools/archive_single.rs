@@ -1415,4 +1415,164 @@ mod tests {
     async fn e2e_0083_008_tar_bz2_is_still_a_tar() {
         tar_bz2_is_a_tar("/uploads/PACK.TAR.BZ2", "/uploads/PACK").await;
     }
+
+    // Collision, destination and order of refusals for bzip2 (US-0167).
+
+    const BZ_EXISTS: &str = "'/uploads/data.csv' already exists; pass overwrite=true to replace it";
+
+    /// A bzip2 stream of `CSV` cut in half.
+    fn truncated_bzip2() -> Vec<u8> {
+        let whole = bzip2(CSV);
+        whole[..whole.len() / 2].to_vec()
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_009_collision() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/data.csv", b"old").await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", None, false, None).await;
+        refused(&v, code::NO_CLOBBER, BZ_EXISTS);
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(&b"old"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_010_a_folder_bears_the_output_name() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/data.csv", true).await.unwrap();
+        let v = extract_with(&f, "/uploads/data.csv.bz2", None, true, None).await;
+        refused(&v, code::NO_CLOBBER, "'/uploads/data.csv' is a folder and cannot be replaced");
+        let node = c.meta.get("/uploads/data.csv").await.unwrap();
+        assert!(node.is_some_and(|n| n.is_dir()));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_026_missing_archive() {
+        let f = fixture().await;
+        let v = extract_with(&f, "/uploads/ghost.bz2", None, false, None).await;
+        refused(&v, code::NOT_FOUND, "'/uploads/ghost.bz2' not found");
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_027_folder_named_like_an_archive() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/dir.bz2", true).await.unwrap();
+        let v = extract_with(&f, "/uploads/dir.bz2", None, false, None).await;
+        refused(
+            &v,
+            code::INVALID_ARGUMENT,
+            "'/uploads/dir.bz2' is a directory, not an archive file",
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_028_non_member() {
+        let f = fixture().await;
+        f.seed_project("alpha", OWNER).await;
+        let c = f.state.stores.client("alpha").await.unwrap();
+        c.makedirs("/uploads", true).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.bz2", &bzip2(CSV)).await.unwrap();
+        let v = extract_as_bob(&f, "/uploads/data.csv.bz2").await;
+        refused(&v, code::FORBIDDEN, "'bob@example.com' is not a member of 'alpha'");
+        assert!(!c.exists("/uploads/data.csv").await.unwrap());
+    }
+
+    async fn bz_destination_refused(destination: &str) {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/notes.txt", b"keep").await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", Some(destination), false, None).await;
+        refused(&v, code::INVALID_ARGUMENT, "'/uploads/notes.txt' is a file, not a folder");
+        assert_eq!(read(&f, "/uploads/notes.txt").await.as_deref(), Some(&b"keep"[..]));
+        assert!(!exists(&f, "/uploads/notes.txt/sub").await);
+        assert!(!exists(&f, "/uploads/data.csv").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_029_destination_is_a_file() {
+        bz_destination_refused("/uploads/notes.txt").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_030_a_file_among_the_ancestors_of_the_de() {
+        bz_destination_refused("/uploads/notes.txt/sub").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_032_destination_outside_the_project_wins() {
+        let f = fixture().await;
+        seed(&f, "/uploads/fake.bz2", b"not bzip2").await;
+        let v = extract_with(&f, "/uploads/fake.bz2", Some("../../x"), false, None).await;
+        refused(&v, code::PATH_OUT_OF_BOUNDS, "path escapes the volume root: ../../x");
+        assert!(!exists(&f, "/x").await);
+        assert!(!exists(&f, "/uploads/fake").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_033_password_wins_over_a_corrupt_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/fake.bz2", b"not bzip2").await;
+        let v = extract_with(&f, "/uploads/fake.bz2", None, false, Some("s3cret")).await;
+        refused(&v, code::INVALID_ARGUMENT, NO_PASSWORD);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_034_collision_wins_over_a_corrupt_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/cut.bz2", &truncated_bzip2()).await;
+        seed(&f, "/uploads/cut", b"old").await;
+        let v = extract_with(&f, "/uploads/cut.bz2", None, false, None).await;
+        refused(
+            &v,
+            code::NO_CLOBBER,
+            "'/uploads/cut' already exists; pass overwrite=true to replace it",
+        );
+        assert_eq!(read(&f, "/uploads/cut").await.as_deref(), Some(&b"old"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_035_collision_wins_over_the_storage_limi() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/data.csv", b"old").await;
+        limit_remaining(&f, 10).await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", None, false, None).await;
+        refused(&v, code::NO_CLOBBER, BZ_EXISTS);
+    }
+
+    /// Pins the outcome the spec states (the file refusal, not `ERR_NO_CLOBBER`). It cannot pin
+    /// the ORDER of the two checks: under a destination that is a file the output path
+    /// `/uploads/notes.txt/data.csv` can never exist, so no collision can apply (BL-0128).
+    #[tokio::test]
+    async fn e2e_0083_036_destination_is_a_file_wins_over_a_co() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/notes.txt", b"keep").await;
+        seed(&f, "/uploads/data.csv", b"old").await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", Some("/uploads/notes.txt"), false, None)
+            .await;
+        refused(&v, code::INVALID_ARGUMENT, "'/uploads/notes.txt' is a file, not a folder");
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_037_unusable_name_wins_over_a_corrupt_fi() {
+        let f = fixture().await;
+        seed(&f, "/uploads/.bz2", b"not bzip2").await;
+        let v = extract_with(&f, "/uploads/.bz2", None, false, None).await;
+        refused(&v, code::INVALID_ARGUMENT, "cannot derive an output file name from '.bz2'");
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_050_overwrite_replaces_a_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/data.csv", b"old").await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(CSV.len(), 16);
+    }
 }

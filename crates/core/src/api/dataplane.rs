@@ -3459,6 +3459,26 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/notes.txt").await.unwrap(), b"keep");
     }
 
+    #[tokio::test]
+    async fn e2e_0083_031_destination_is_a_file_through_the_ht() {
+        use std::io::Write as _;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        bz.write_all(b"id,name\n1,Alice\n").unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.bz2", &bz.finish().unwrap()).await.unwrap();
+        c.write_bytes_atomic("/uploads/notes.txt", b"keep").await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.bz2", "destination": "/uploads/notes.txt"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: '/uploads/notes.txt' is a file, not a folder"
+        );
+        assert_eq!(c.read_bytes("/uploads/notes.txt").await.unwrap(), b"keep");
+    }
+
     /// E2E-NEW-032: missing `path` is 400; no bearer gets what `read` gets,
     /// cross checked through the router; a non member is 403. None writes.
     #[tokio::test]
