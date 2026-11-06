@@ -14,6 +14,7 @@
 use crate::errors::{Result, ToolError};
 use crate::quota;
 use crate::state::AppState;
+use crate::tools::archive_single::{self, SingleFormat};
 use crate::util::PosixPath;
 use serde_json::{Value, json};
 use std::io::{Cursor, Read as _};
@@ -33,6 +34,7 @@ pub(crate) enum ArchiveFormat {
     Zip,
     SevenZ,
     Tar(TarCompression),
+    Single(SingleFormat),
 }
 
 /// Suffix table, matched in order: every compound tar suffix sits before the
@@ -47,6 +49,8 @@ const SUFFIXES: &[(&str, ArchiveFormat)] = &[
     (".tar", ArchiveFormat::Tar(TarCompression::None)),
     (".zip", ArchiveFormat::Zip),
     (".7z", ArchiveFormat::SevenZ),
+    // After every tar entry: `x.tar.gz` must reach its tar row first.
+    (".gz", ArchiveFormat::Single(SingleFormat::Gzip)),
 ];
 
 /// Detect the format of `path` from its filename, case insensitively
@@ -149,6 +153,20 @@ pub(crate) async fn extract_archive(
         ));
     }
 
+    if let ArchiveFormat::Single(single) = format {
+        return archive_single::extract_single(
+            state,
+            &client,
+            mount_id,
+            person,
+            &normalized,
+            destination,
+            single,
+            suffix_len,
+        )
+        .await;
+    }
+
     // CPU-bound (decompression, decryption): run off the async worker so one
     // large or hostile archive cannot stall the executor (rust skill, async
     // guidance on `spawn_blocking`).
@@ -236,6 +254,32 @@ pub(crate) async fn extract_archive(
         bytes_written += entry.bytes.len() as u64;
     }
 
+    finish_extraction(
+        state,
+        person,
+        mount_id,
+        &normalized,
+        &dest,
+        files_written,
+        bytes_written,
+        dirs_created,
+    )
+}
+
+/// The audit line, the tracing event and the answer of a successful
+/// extraction, shared by the archive flow and the single file flow so the
+/// answer shape has one implementation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_extraction(
+    state: &AppState,
+    person: &str,
+    mount_id: &str,
+    normalized: &str,
+    dest: &str,
+    files_written: u64,
+    bytes_written: u64,
+    dirs_created: u64,
+) -> Result<Value> {
     // FR-NEW-025: one audit entry per call, success only, mirroring
     // `core::fs_ops::write_bytes` (`fs_ops.rs:613`). The detail string names
     // the destination and the two counters a caller would want in the
@@ -244,7 +288,7 @@ pub(crate) async fn extract_archive(
         person,
         mount_id,
         "extract_archive",
-        &normalized,
+        normalized,
         &format!("destination={dest} files_written={files_written} bytes_written={bytes_written}"),
     );
 
@@ -298,6 +342,9 @@ fn decode_archive(
         ArchiveFormat::Zip => decode_zip(bytes, password),
         ArchiveFormat::SevenZ => decode_sevenz(bytes, password),
         ArchiveFormat::Tar(compression) => decode_tar(compression, bytes),
+        ArchiveFormat::Single(_) => Err(ToolError::internal(
+            "a single file format is extracted by archive_single, not decode_archive",
+        )),
     }
 }
 
@@ -347,7 +394,7 @@ fn ensure_decoded_size_matches(rel_path: &str, declared: u64, actual: usize) -> 
     Ok(())
 }
 
-fn corrupt(format_name: &str, detail: impl std::fmt::Display) -> ToolError {
+pub(crate) fn corrupt(format_name: &str, detail: impl std::fmt::Display) -> ToolError {
     ToolError::invalid_argument(format!(
         "archive is corrupt or not a valid {format_name} file: {detail}"
     ))
@@ -803,14 +850,20 @@ mod tests {
         assert!(e.message.contains(".rar"), "{}", e.message);
     }
 
-    /// E2E-NEW-034: bare `.gz` (not `.tar.gz`) is not in the mapping.
+    /// E2E-0081-MOD-001 (was SPEC-0018 E2E-NEW-034): a bare `.gz` is a
+    /// supported extension now, so `anything` is refused as corrupt gzip.
     #[tokio::test]
-    async fn e2e_new_034_bare_gz_extension_is_not_supported() {
+    async fn e2e_0081_mod_001_bare_gz_was_spec_0018_e2e_new_034() {
         let f = fixture().await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
         seed_file(&f, "/uploads/data.gz").await;
         let e = extract(&f, "/uploads/data.gz").await.unwrap_err();
-        assert_eq!(e.code, code::NOT_SUPPORTED);
-        assert!(e.message.contains(".gz"), "{}", e.message);
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert!(
+            e.message.starts_with("archive is corrupt or not a valid gz file:"),
+            "{}",
+            e.message
+        );
     }
 
     /// E2E-NEW-035: `.zip.001` split-archive-style name is not in the mapping.
@@ -870,7 +923,8 @@ mod tests {
     /// plain `.tar`, with the suffix length the destination stem needs.
     #[test]
     fn detect_format_maps_every_suffix() {
-        use ArchiveFormat::{SevenZ, Tar, Zip};
+        use ArchiveFormat::{SevenZ, Single, Tar, Zip};
+        use SingleFormat::Gzip as Gz;
         use TarCompression::{Bzip2, Gzip, None as Plain, Xz};
         for (path, fmt, len) in [
             ("/a/x.zip", Zip, 4),
@@ -884,6 +938,8 @@ mod tests {
             ("/a/x.tar", Tar(Plain), 4),
             ("/a/X.TAR.GZ", Tar(Gzip), 7),
             ("/a/Data.Zip", Zip, 4),
+            ("/a/x.gz", Single(Gz), 3),
+            ("/a/X.CSV.GZ", Single(Gz), 3),
         ] {
             assert_eq!(detect_format(path).unwrap(), (fmt, len), "{path}");
         }

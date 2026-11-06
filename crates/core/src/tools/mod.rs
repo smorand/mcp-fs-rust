@@ -29,6 +29,7 @@
 pub(crate) mod admin;
 pub mod all;
 pub(crate) mod archive;
+pub(crate) mod archive_single;
 pub(crate) mod artifacts;
 #[cfg(test)]
 mod case_paths_e2e;

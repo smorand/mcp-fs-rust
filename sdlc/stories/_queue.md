@@ -159,7 +159,7 @@
 | US-0157 | SPEC-0078 | add a test transport that answers like a real git server | main | 2 | landed | story/US-0157-add-a-test-transport-like-real-git | main |
 | US-0158 | SPEC-0078 | serve the test transport over https | US-0157 | 1 | landed | story/US-0158-serve-the-test-transport-over-https | main |
 | US-0159 | SPEC-0079 | test the flag column of tools.md against the contract | main | 2 | landed | story/US-0159-test-the-tools-flag-column | main |
-| US-0160 | SPEC-0081 | extract a bare gzip file next to the archive | main | 2 | todo | | |
+| US-0160 | SPEC-0081 | extract a bare gzip file next to the archive | main | 2 | landed | story/US-0160-extract-a-bare-gzip-file-next-to-it | main |
 | US-0161 | SPEC-0081 | decode several gzip members and refuse corrupt input | US-0160 | 2 | todo | | |
 | US-0162 | SPEC-0081 | gzip password, collision and destination rules | US-0161 | 2 | todo | | |
 | US-0163 | SPEC-0081 | stop gzip decoding at the storage and session limits | US-0162 | 2 | todo | | |

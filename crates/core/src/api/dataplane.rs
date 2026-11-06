@@ -3350,6 +3350,31 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/report/sub/b.txt").await.unwrap(), b"world");
     }
 
+    /// SPEC-0081 E2E-031: the REST door answers what the engine answers for a
+    /// bare gzip file, and a second call hits the no clobber refusal.
+    #[tokio::test]
+    async fn e2e_0081_031_the_http_api_gives_the_same_answer() {
+        use std::io::Write as _;
+        let h = Harness::new().await;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"id,name\n1,Alice\n").unwrap();
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.gz", &gz.finish().unwrap()).await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.gz", "overwrite": false});
+        let (s, v) = h.post(&u("extract-archive"), body.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"destination": "/uploads", "files_written": 1,
+                   "dirs_created": 0, "bytes_written": 16})
+        );
+        assert_eq!(c.read_bytes("/uploads/data.csv").await.unwrap(), b"id,name\n1,Alice\n");
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], code::NO_CLOBBER);
+        assert!(v["detail"].as_str().unwrap_or_default().contains("already exists"), "{v}");
+    }
+
     /// E2E-NEW-032: missing `path` is 400; no bearer gets what `read` gets,
     /// cross checked through the router; a non member is 403. None writes.
     #[tokio::test]
