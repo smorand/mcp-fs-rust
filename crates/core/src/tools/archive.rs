@@ -143,11 +143,11 @@ pub(crate) async fn extract_archive(
         )));
     }
 
-    // Decided on the name alone: a tar stream carries no encryption, so a
-    // password there is a caller mistake, refused before any byte is read
+    // Decided on the name alone: a tar stream or a bare gzip file carries no
+    // encryption, so a password there is a caller mistake, refused before any byte is read
     // (FR-NEW-008).
     let (format, suffix_len) = detect_format(&normalized)?;
-    if matches!(format, ArchiveFormat::Tar(_)) && password.is_some() {
+    if matches!(format, ArchiveFormat::Tar(_) | ArchiveFormat::Single(_)) && password.is_some() {
         return Err(ToolError::invalid_argument(
             "password is not applicable to this archive format",
         ));
@@ -161,6 +161,7 @@ pub(crate) async fn extract_archive(
             person,
             &normalized,
             destination,
+            overwrite,
             single,
             suffix_len,
         )

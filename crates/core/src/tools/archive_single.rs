@@ -76,9 +76,44 @@ fn output_name(file_name: &str, suffix_len: usize) -> Result<&str> {
     Ok(stem)
 }
 
+/// Refuse a destination that is a file or sits under one, naming the first
+/// non folder node from the root (`exists` cannot tell a file from a folder).
+async fn check_destination(client: &VolumeClient, dest: &str) -> Result<()> {
+    let mut path = String::new();
+    for part in dest.split('/').filter(|p| !p.is_empty()) {
+        path.push('/');
+        path.push_str(part);
+        match client.meta.get(&path).await? {
+            Some(node) if !node.is_dir() => {
+                return Err(ToolError::invalid_argument(format!(
+                    "'{path}' is a file, not a folder"
+                )));
+            }
+            Some(_) => {}
+            // Nothing below a missing folder can exist.
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// A folder at the output path is never replaced; a file needs `overwrite`.
+async fn check_collision(client: &VolumeClient, out: &str, overwrite: bool) -> Result<()> {
+    match client.meta.get(out).await? {
+        Some(node) if node.is_dir() => {
+            Err(ToolError::no_clobber(format!("'{out}' is a folder and cannot be replaced")))
+        }
+        Some(_) if !overwrite => Err(ToolError::no_clobber(format!(
+            "'{out}' already exists; pass overwrite=true to replace it"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Extract the one file held by `normalized` next to it, or into
-/// `destination`. Order: output name, decode, destination, collision,
-/// admission, then the writes; nothing is created before the decode passed.
+/// `destination`. Order: output name, destination, collision, then the read
+/// and decode, admission and the writes; nothing is created and the archive
+/// is not read before the checks passed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn extract_single(
     state: &AppState,
@@ -87,11 +122,21 @@ pub(crate) async fn extract_single(
     person: &str,
     normalized: &str,
     destination: Option<&str>,
+    overwrite: bool,
     format: SingleFormat,
     suffix_len: usize,
 ) -> Result<Value> {
     let (parent, file_name) = normalized.rsplit_once('/').unwrap_or(("", normalized));
     let name = output_name(file_name, suffix_len)?.to_string();
+
+    let dest = match destination {
+        Some(d) => state.safety.normalize_path(d)?,
+        None if parent.is_empty() => "/".to_string(),
+        None => parent.to_string(),
+    };
+    check_destination(client, &dest).await?;
+    let out = crate::util::PosixPath::normpath(&format!("{}/{name}", dest.trim_end_matches('/')));
+    check_collision(client, &out, overwrite).await?;
 
     let bytes = client.read_bytes(normalized).await?;
     let label = format.label();
@@ -102,18 +147,6 @@ pub(crate) async fn extract_single(
     .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??;
 
     tracing::debug!(path = %normalized, high_water = decoded.high_water, "single file decoded");
-
-    let dest = match destination {
-        Some(d) => state.safety.normalize_path(d)?,
-        None if parent.is_empty() => "/".to_string(),
-        None => parent.to_string(),
-    };
-    let out = crate::util::PosixPath::normpath(&format!("{}/{name}", dest.trim_end_matches('/')));
-    if client.exists(&out).await? {
-        return Err(ToolError::no_clobber(format!(
-            "'{out}' already exists; pass overwrite=true to replace it"
-        )));
-    }
 
     let len = decoded.bytes.len() as i64;
     let _admission =
@@ -470,5 +503,150 @@ mod tests {
         assert!(v.is_ok(), "{v:?}");
         assert_eq!(v.unwrap_or_default()["destination"], "/out");
         assert_eq!(read(&f, "/out/data.csv").await.as_deref(), Some(CSV));
+    }
+
+    async fn extract_with(
+        f: &Fixture,
+        path: &str,
+        destination: Option<&str>,
+        overwrite: bool,
+        password: Option<&str>,
+    ) -> Result<Value> {
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        extract_archive(&f.state, MOUNT, OWNER, path, destination, overwrite, password).await
+    }
+
+    async fn exists(f: &Fixture, path: &str) -> bool {
+        f.state.stores.client(MOUNT).await.unwrap().exists(path).await.unwrap()
+    }
+
+    const NO_PASSWORD: &str = "password is not applicable to this archive format";
+
+    #[tokio::test]
+    async fn e2e_0081_006_collision() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        seed(&f, "/uploads/data.csv", b"old").await;
+        let e = extract_with(&f, "/uploads/data.csv.gz", None, false, None).await;
+        let e = e.expect_err("an existing output must be refused");
+        assert_eq!(e.code, code::NO_CLOBBER);
+        assert_eq!(
+            e.message,
+            "'/uploads/data.csv' already exists; pass overwrite=true to replace it"
+        );
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(&b"old"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_011_password_given() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        let e = extract_with(&f, "/uploads/data.csv.gz", None, false, Some("s3cret")).await;
+        let e = e.expect_err("a password must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, NO_PASSWORD);
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_039_empty_password() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        let e = extract_with(&f, "/uploads/data.csv.gz", None, false, Some("")).await;
+        let e = e.expect_err("an empty password must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, NO_PASSWORD);
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_024_overwrite_replaces() {
+        let f = fixture().await;
+        let archive = gzip(CSV);
+        seed(&f, "/uploads/data.csv.gz", &archive).await;
+        seed(&f, "/uploads/data.csv", &[b'x'; 40]).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let used = crate::quota::used_bytes(&c).await.unwrap();
+        f.state.admin.set_quota(MOUNT, Some(used + 5)).await.unwrap();
+        let v = extract_with(&f, "/uploads/data.csv.gz", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(crate::quota::used_bytes(&c).await.unwrap(), used - 24);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_034_a_folder_bears_the_output_name() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/data.csv", true).await.unwrap();
+        for overwrite in [true, false] {
+            let e = extract_with(&f, "/uploads/data.csv.gz", None, overwrite, None).await;
+            let e = e.expect_err("a folder must never be replaced");
+            assert_eq!(e.code, code::NO_CLOBBER);
+            assert_eq!(e.message, "'/uploads/data.csv' is a folder and cannot be replaced");
+        }
+        let node = c.meta.get("/uploads/data.csv").await.unwrap();
+        assert!(node.is_some_and(|n| n.is_dir()));
+    }
+
+    async fn tar_gz_is_a_tar(archive: &str, folder: &str, files: u64) {
+        let f = fixture().await;
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_path("a.txt").unwrap();
+            h.set_size(5);
+            h.set_cksum();
+            b.append(&h, &b"hello"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        seed(&f, archive, &gzip(&tar_bytes)).await;
+        let v = extract_with(&f, archive, None, false, None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": folder, "files_written": files,
+                         "dirs_created": 1, "bytes_written": 5})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, &format!("{folder}/a.txt")).await.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_028_tar_gz_is_still_a_tar() {
+        tar_gz_is_a_tar("/uploads/pack.tar.gz", "/uploads/pack", 1).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_029_tgz_is_still_a_tar() {
+        tar_gz_is_a_tar("/uploads/pack.tgz", "/uploads/pack", 1).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_044_tar_gz_is_still_a_tar() {
+        tar_gz_is_a_tar("/uploads/PACK.TAR.GZ", "/uploads/PACK", 1).await;
+    }
+
+    async fn destination_refused(destination: &str) {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        seed(&f, "/uploads/notes.txt", b"keep").await;
+        let e = extract_with(&f, "/uploads/data.csv.gz", Some(destination), false, None).await;
+        let e = e.expect_err("a file destination must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, "'/uploads/notes.txt' is a file, not a folder");
+        assert_eq!(read(&f, "/uploads/notes.txt").await.as_deref(), Some(&b"keep"[..]));
+        assert!(!exists(&f, "/uploads/notes.txt/sub").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_054_destination_is_a_file() {
+        destination_refused("/uploads/notes.txt").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_055_a_file_among_the_ancestors_of_the_de() {
+        destination_refused("/uploads/notes.txt/sub").await;
     }
 }

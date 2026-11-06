@@ -3375,6 +3375,46 @@ mod tests {
         assert!(v["detail"].as_str().unwrap_or_default().contains("already exists"), "{v}");
     }
 
+    fn csv_gz() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"id,name\n1,Alice\n").unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_040_password_through_the_http_api() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.gz", &csv_gz()).await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.gz", "password": "s3cret"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: password is not applicable to this archive format"
+        );
+        assert!(!c.exists("/uploads/data.csv").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_056_destination_is_a_file_through_the_ht() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.gz", &csv_gz()).await.unwrap();
+        c.write_bytes_atomic("/uploads/notes.txt", b"keep").await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.gz", "destination": "/uploads/notes.txt"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: '/uploads/notes.txt' is a file, not a folder"
+        );
+        assert_eq!(c.read_bytes("/uploads/notes.txt").await.unwrap(), b"keep");
+    }
+
     /// E2E-NEW-032: missing `path` is 400; no bearer gets what `read` gets,
     /// cross checked through the router; a non member is 403. None writes.
     #[tokio::test]
