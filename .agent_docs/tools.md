@@ -178,7 +178,7 @@ The full token is never logged, only its first 8 characters.
 | `fs.extract_archive` | extract a stored archive in place | `path`, `destination?`, `overwrite=false`, `password?` | `destination,files_written,dirs_created,bytes_written` | D,!RO,!I,!OW | member |
 
 (2026-10-09, SPEC-0015.) Formats by extension, case insensitive: `.zip`, `.7z`,
-`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, and a bare `.gz`
+`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, and a bare `.gz` or `.bz2`
 (see below); anything else (including `.rar`) is `ERR_NOT_SUPPORTED`. Default destination: the archive
 path minus its suffix. Stateless password retry: an encrypted zip or 7z with no
 or a wrong `password` is `ERR_PASSWORD_REQUIRED` (HTTP 428), the caller just
@@ -211,6 +211,11 @@ charged the full output); a tie goes to the project. Order of refusals, first on
 climbing out of the project (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination>`);
 7. destination is a file; 8. collision; 9. corrupt, project limit or session limit, whichever
 the decoding meets first. Nothing is written, and no folder created, before the decode succeeds.
+
+(2026-11-05, SPEC-0083.) A bare `.bz2` (not `.tar.bz2`/`.tb2`) follows the same flow, name rule
+(minus `.bz2`, case insensitive), limits and order of refusals as `.gz`. Several bzip2 streams are
+decoded as one stream; bytes after a stream that are not another stream are refused. A corrupt or non
+bzip2 file is `ERR_INVALID_ARGUMENT`, `archive is corrupt or not a valid bz2 file: <detail>`.
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,

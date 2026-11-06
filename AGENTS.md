@@ -131,7 +131,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
   type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
   password retry via `ERR_PASSWORD_REQUIRED`. `archive_single.rs` holds the single file flow for a
-  bare gzip `.gz` (SPEC-0081): refusals in a fixed order (membership, missing path, folder, password,
+  bare gzip `.gz` (SPEC-0081) and bare bzip2 `.bz2` (SPEC-0083): refusals in a fixed order (membership, missing path, folder, password,
   output name, destination outside the project, destination is a file, collision, then corrupt or a
   limit, whichever decoding meets first), a capped reader that stops at the lower of the project's
   remaining storage and the session write allowance, nothing written before the decode succeeds.

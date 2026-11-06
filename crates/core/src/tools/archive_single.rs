@@ -1575,4 +1575,98 @@ mod tests {
         assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
         assert_eq!(CSV.len(), 16);
     }
+
+    // Storage and session limits on bare bzip2 files (SPEC-0083, US-0168).
+
+    fn bz_bomb() -> Vec<u8> {
+        bzip2(&vec![0u8; BOMB_LEN])
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_011_output_over_the_project_storage_limi() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        limit_remaining(&f, 10).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+        assert_eq!(remaining_storage(&f).await, 10);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_012_decompression_bomb_against_the_stora() {
+        let f = fixture().await;
+        seed(&f, "/uploads/bomb.bz2", &bz_bomb()).await;
+        limit_remaining(&f, 1000).await;
+        let v = extract(&f, "/uploads/bomb.bz2", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/bomb").await, None);
+        assert_eq!(remaining_storage(&f).await, 1000);
+        assert_extraction_bounded(1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_013_decompression_bomb_against_the_sessi() {
+        let f = fixture_allowance(1000).await;
+        seed(&f, "/uploads/bomb.bz2", &bz_bomb()).await;
+        let v = extract(&f, "/uploads/bomb.bz2", None).await;
+        session_refusal(&v, 1000);
+        assert_eq!(read(&f, "/uploads/bomb").await, None);
+        assert_eq!(allowance(&f), 1000);
+        assert_extraction_bounded(1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_040_output_exactly_equal_to_the_remainin() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        limit_remaining(&f, 16).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(remaining_storage(&f).await, 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_041_overwrite_counts_net_growth() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/data.csv", &[b'x'; 40]).await;
+        limit_remaining(&f, 5).await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(remaining_storage(&f).await, 29);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_042_the_allowance_is_charged_the_full_ou() {
+        let f = fixture_allowance(20).await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/data.csv", &[b'x'; 40]).await;
+        let v = extract_with(&f, "/uploads/data.csv.bz2", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(allowance(&f), 4);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_049_both_limits_at_the_same_byte() {
+        let f = fixture_allowance(1000).await;
+        seed(&f, "/uploads/bomb.bz2", &bz_bomb()).await;
+        limit_remaining(&f, 1000).await;
+        let v = extract(&f, "/uploads/bomb.bz2", None).await;
+        project_refusal(&v);
+        assert_eq!(remaining_storage(&f).await, 1000);
+        assert_eq!(allowance(&f), 1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_053_a_refused_extraction_charges_nothing() {
+        let f = fixture_allowance(10).await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", None).await;
+        session_refusal(&v, 10);
+        write_small(&f).await;
+        assert_eq!(allowance(&f), 7);
+    }
 }
