@@ -488,7 +488,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
     }
 
     if any_encrypted && password.is_none() {
-        return Err(ToolError::password_required("password required to extract this archive"));
+        return Err(password_required_message(None));
     }
 
     // SPEC-0041 FR-NEW-001/FR-MOD-001: an entry whose local header disagrees
@@ -536,7 +536,7 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
                 entries[i].bytes = buf;
             }
             Err(zip::result::ZipError::InvalidPassword) => {
-                return Err(ToolError::password_required("incorrect password for this archive"));
+                return Err(password_required_message(password));
             }
             Err(e) => return Err(corrupt("zip", e)),
         }
@@ -578,7 +578,7 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
     });
 
     if header_encrypted && password.is_none() {
-        return Err(ToolError::password_required("password required to extract this archive"));
+        return Err(password_required_message(None));
     }
 
     // FR-NEW-014 path safety applies to every entry. Entry type rejection
@@ -664,9 +664,13 @@ fn sevenz_special_type(entry: &sevenz_rust2::ArchiveEntry) -> Option<&'static st
 
 fn password_required_message(password: Option<&str>) -> ToolError {
     if password.is_none() {
-        ToolError::password_required("password required to extract this archive")
+        ToolError::password_required(
+            "password required to extract this archive; call again with the 'password' parameter",
+        )
     } else {
-        ToolError::password_required("incorrect password for this archive")
+        ToolError::password_required(
+            "incorrect password for this archive; call again with the correct 'password' parameter",
+        )
     }
 }
 
@@ -762,7 +766,7 @@ fn tar_entry_type_label(t: tar::EntryType) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::errors::code;
     use crate::tools::admin::test_support::Fixture;
@@ -973,7 +977,7 @@ mod tests {
     // ── fixture builders: every archive used below is built in-process with
     // the same crates the decoder uses, never a checked-in binary ─────────
 
-    fn build_zip(entries: &[(&str, &[u8])], aes_password: Option<&str>) -> Vec<u8> {
+    pub(crate) fn build_zip(entries: &[(&str, &[u8])], aes_password: Option<&str>) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
@@ -1086,18 +1090,21 @@ mod tests {
 
     /// E2E-NEW-006: an AES-encrypted zip with no `password` supplied.
     #[tokio::test]
-    async fn e2e_new_006_zip_missing_password_is_password_required() {
+    async fn e2e_0080_mod_003_zip_missing_password_message_was_spe() {
         let f = fixture().await;
         let bytes = build_zip(&[("secret.txt", b"top secret")], Some("correct horse"));
         seed_bytes(&f, "/uploads/secret.zip", &bytes).await;
         let e = extract(&f, "/uploads/secret.zip").await.unwrap_err();
         assert_eq!(e.code, code::PASSWORD_REQUIRED);
-        assert!(e.message.contains("password required"), "{}", e.message);
+        assert_eq!(
+            e.message,
+            "password required to extract this archive; call again with the 'password' parameter"
+        );
     }
 
     /// E2E-NEW-057: an AES-encrypted zip, `password` supplied but wrong.
     #[tokio::test]
-    async fn e2e_new_057_zip_incorrect_password_is_password_required() {
+    async fn e2e_0080_mod_004_zip_wrong_password_message_was_spec() {
         let f = fixture().await;
         let bytes = build_zip(&[("secret.txt", b"top secret")], Some("correct horse"));
         seed_bytes(&f, "/uploads/secret.zip", &bytes).await;
@@ -1105,7 +1112,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code, code::PASSWORD_REQUIRED);
-        assert!(e.message.contains("incorrect password"), "{}", e.message);
+        assert_eq!(
+            e.message,
+            "incorrect password for this archive; call again with the correct 'password' parameter"
+        );
     }
 
     /// E2E-NEW-008/E2E-NEW-058: an AES-encrypted zip, `password` supplied and
@@ -2070,7 +2080,7 @@ mod tests {
 
     /// A 7z built with `sevenz-rust2`. `attrs` sets an entry's raw attributes;
     /// `password` encrypts the content (and the header unless `plain_header`).
-    fn build_sevenz_ext(
+    pub(crate) fn build_sevenz_ext(
         entries: &[(&str, &[u8], Option<u32>)],
         password: Option<&str>,
         plain_header: bool,
@@ -2208,7 +2218,7 @@ mod tests {
     /// FR-NEW-010 on 7z, header encrypted and header plain: no password is
     /// "password required", nothing written.
     #[tokio::test]
-    async fn sevenz_missing_password_is_password_required() {
+    async fn e2e_0080_mod_002_7z_missing_password_message_was_the() {
         let f = fixture().await;
         for (i, plain_header) in [false, true].into_iter().enumerate() {
             let path = format!("/uploads/vault{i}.7z");
@@ -2216,7 +2226,10 @@ mod tests {
             seed_bytes(&f, &path, &bytes).await;
             let e = extract(&f, &path).await.unwrap_err();
             assert_eq!(e.code, code::PASSWORD_REQUIRED, "plain_header={plain_header}");
-            assert_eq!(e.message, "password required to extract this archive");
+            assert_eq!(
+                e.message,
+                "password required to extract this archive; call again with the 'password' parameter"
+            );
             assert!(!exists(&f, &format!("/uploads/vault{i}")).await);
         }
     }
@@ -2224,7 +2237,7 @@ mod tests {
     /// FR-NEW-011 on 7z, header encrypted and header plain: a wrong password is
     /// "incorrect password", nothing written.
     #[tokio::test]
-    async fn sevenz_wrong_password_is_incorrect_password() {
+    async fn e2e_0080_mod_005_7z_wrong_password_message() {
         let f = fixture().await;
         for (i, plain_header) in [false, true].into_iter().enumerate() {
             let path = format!("/uploads/vault{i}.7z");
@@ -2232,7 +2245,10 @@ mod tests {
             seed_bytes(&f, &path, &bytes).await;
             let e = extract_with_password(&f, &path, Some("wrong")).await.unwrap_err();
             assert_eq!(e.code, code::PASSWORD_REQUIRED, "plain_header={plain_header}");
-            assert_eq!(e.message, "incorrect password for this archive");
+            assert_eq!(
+                e.message,
+                "incorrect password for this archive; call again with the correct 'password' parameter"
+            );
             assert!(!exists(&f, &format!("/uploads/vault{i}")).await);
         }
     }
@@ -2276,7 +2292,10 @@ mod tests {
         let bytes = build_sevenz_ext(&[("s.txt", b"retry7", None)], Some("pw7"), false);
         seed_bytes(&f, "/uploads/r.7z", &bytes).await;
         let e = extract_with_password(&f, "/uploads/r.7z", Some("nope")).await.unwrap_err();
-        assert_eq!(e.message, "incorrect password for this archive");
+        assert_eq!(
+            e.message,
+            "incorrect password for this archive; call again with the correct 'password' parameter"
+        );
         extract_with_password(&f, "/uploads/r.7z", Some("pw7")).await.unwrap();
         assert_eq!(read(&f, "/uploads/r/s.txt").await, b"retry7");
     }
@@ -2289,7 +2308,10 @@ mod tests {
         seed_bytes(&f, "/uploads/e.zip", &bytes).await;
         let e = extract_with_password(&f, "/uploads/e.zip", Some("")).await.unwrap_err();
         assert_eq!(e.code, code::PASSWORD_REQUIRED);
-        assert_eq!(e.message, "incorrect password for this archive");
+        assert_eq!(
+            e.message,
+            "incorrect password for this archive; call again with the correct 'password' parameter"
+        );
     }
 
     /// FR-NEW-013 7z clause (DEC-008): an entry whose unix extension
@@ -2698,7 +2720,10 @@ mod tests {
         let bytes = locked_zip();
         let e = extract_to_out(&f, &bytes).await.unwrap_err();
         assert_eq!(e.code, code::PASSWORD_REQUIRED);
-        assert_eq!(e.message, "password required to extract this archive");
+        assert_eq!(
+            e.message,
+            "password required to extract this archive; call again with the 'password' parameter"
+        );
         assert!(!root_has_out(&f).await);
         assert_header_refused(extract_to_out_pw(&f, &bytes, "s3cret").await);
         assert!(!root_has_out(&f).await);
@@ -2721,7 +2746,10 @@ mod tests {
         let bytes = build_zip(&[("a.txt", b"alpha")], Some("s3cret"));
         let e = extract_to_out(&f, &bytes).await.unwrap_err();
         assert_eq!(e.code, code::PASSWORD_REQUIRED);
-        assert_eq!(e.message, "password required to extract this archive");
+        assert_eq!(
+            e.message,
+            "password required to extract this archive; call again with the 'password' parameter"
+        );
         assert!(!root_has_out(&f).await);
     }
 

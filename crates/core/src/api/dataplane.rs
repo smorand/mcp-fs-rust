@@ -3350,6 +3350,47 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/report/sub/b.txt").await.unwrap(), b"world");
     }
 
+    /// SPEC-0080/E2E-045: an encrypted zip with no password is refused with the
+    /// retry instruction through the REST door.
+    #[tokio::test]
+    async fn e2e_0080_045_zip_missing_password_through_the_htt() {
+        let h = Harness::new().await;
+        let bytes = crate::tools::archive::tests::build_zip(&[("a.txt", b"alpha")], Some("pwz"));
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/pack.zip", &bytes).await.unwrap();
+        let (s, v) = h.post(&u("extract-archive"), json!({"path": "/uploads/pack.zip"})).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PASSWORD_REQUIRED);
+        let detail = v["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("password required to extract this archive; call again with the 'password' parameter"),
+            "{v}"
+        );
+    }
+
+    /// SPEC-0080/E2E-046: a wrong 7z password is refused with the retry
+    /// instruction through the REST door.
+    #[tokio::test]
+    async fn e2e_0080_046_7z_wrong_password_through_the_http_a() {
+        let h = Harness::new().await;
+        let bytes = crate::tools::archive::tests::build_sevenz_ext(
+            &[("a.txt", b"alpha", None)],
+            Some("pw7"),
+            false,
+        );
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/pack.7z", &bytes).await.unwrap();
+        let body = json!({"path": "/uploads/pack.7z", "password": "nope"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PASSWORD_REQUIRED);
+        let detail = v["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("incorrect password for this archive; call again with the correct 'password' parameter"),
+            "{v}"
+        );
+    }
+
     /// SPEC-0081 E2E-031: the REST door answers what the engine answers for a
     /// bare gzip file, and a second call hits the no clobber refusal.
     #[tokio::test]
