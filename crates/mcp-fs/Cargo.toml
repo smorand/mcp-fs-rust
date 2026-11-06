@@ -17,6 +17,7 @@ default = []
 postgres = ["mcp-fs-core/postgres"]
 rag = ["mcp-fs-core/rag"]
 all-backends = ["mcp-fs-core/all-backends"]
+rar = ["mcp-fs-core/rar"]
 
 [dependencies]
 tokio = { workspace = true }

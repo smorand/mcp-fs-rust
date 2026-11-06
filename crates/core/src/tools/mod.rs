@@ -29,6 +29,10 @@
 pub(crate) mod admin;
 pub mod all;
 pub(crate) mod archive;
+#[cfg(feature = "rar")]
+pub(crate) mod archive_rar;
+#[cfg(all(test, feature = "rar"))]
+pub(crate) mod archive_rar_fixtures;
 pub(crate) mod archive_single;
 pub(crate) mod artifacts;
 #[cfg(test)]

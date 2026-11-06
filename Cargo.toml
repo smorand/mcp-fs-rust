@@ -89,6 +89,9 @@ lzma-rs = "0.3"
 # an unmaintained advisory and its repository was deleted). Pinned under 0.21 to
 # stay within this workspace's MSRV (0.21+ requires a newer rustc than 1.94.1).
 sevenz-rust2 = { version = "0.20", features = ["util", "aes256"] }
+# `.rar` decompression (SPEC-0080). A wrapper of RARLAB's UnRAR, whose source licence is
+# non free: it forbids recreating the RAR compression algorithm. Opt in feature only.
+unrar = "0.5.8"
 tantivy = "0.27"
 # sqlite-vec is pre-v1: pinned exactly so an upstream breaking change cannot sneak in.
 sqlite-vec = "=0.1.9"

@@ -169,7 +169,7 @@
 | US-0167 | SPEC-0083 | check the bzip2 collision, destination and order rules | US-0166, US-0164 | 2 | landed | story/US-0167-bzip2-collision-destination-and-order-ru | story/US-0166-decode-several-bzip2-streams-and-refuse |
 | US-0168 | SPEC-0083 | check the bzip2 storage and session limits and document the format | US-0167, US-0163 | 2 | landed | story/US-0168-bzip2-limits-and-documentation | story/US-0167-bzip2-collision-destination-and-order-ru |
 | US-0169 | SPEC-0080 | tell the user how to retry with a password for zip and 7z | main | 2 | done | story/US-0169-tell-the-user-how-to-retry-with-a-passwo | main |
-| US-0170 | SPEC-0080 | extract a RAR archive when the server has RAR support | main | 1 | todo | | |
+| US-0170 | SPEC-0080 | extract a RAR archive when the server has RAR support | main | 1 | done | story/US-0170-extract-a-rar-archive-when-the-server-su | story/US-0169-tell-the-user-how-to-retry-with-a-passwo |
 | US-0171 | SPEC-0080 | refuse unsafe RAR entries, oversized entries and collisions | US-0170 | 2 | todo | | |
 | US-0172 | SPEC-0080 | apply the storage limit and the session allowance to RAR archives | US-0171 | 2 | todo | | |
 | US-0173 | SPEC-0080 | refuse multi volume names, corrupt files, a missing path and a folder | US-0172 | 2 | todo | | |
