@@ -17,6 +17,7 @@ const CHUNK: usize = 65_536;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SingleFormat {
     Gzip,
+    Bzip2,
 }
 
 impl SingleFormat {
@@ -24,6 +25,7 @@ impl SingleFormat {
     fn label(self) -> &'static str {
         match self {
             Self::Gzip => "gz",
+            Self::Bzip2 => "bz2",
         }
     }
 }
@@ -54,12 +56,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Decoder over `bytes`; `MultiGzDecoder` reads every member back to back
-/// and fails on bytes that are not a gzip member, where `GzDecoder` would stop
-/// after the first member and ignore the rest.
+/// Decoder over `bytes`. `MultiGzDecoder` reads every gzip member back to back
+/// and fails on bytes that are not a member, where `GzDecoder` would stop after
+/// the first member and ignore the rest. `BzDecoder` still reads one bzip2
+/// stream only: the multi stream decoder arrives with the story that tests it.
 fn decoder(format: SingleFormat, bytes: &[u8]) -> Box<dyn Read + '_> {
     match format {
         SingleFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
+        SingleFormat::Bzip2 => Box::new(bzip2::read::BzDecoder::new(bytes)),
     }
 }
 
@@ -1075,5 +1079,183 @@ mod tests {
         let v = extract(&f, "/uploads/big.gz", None).await;
         project_refusal(&v);
         assert_eq!(read(&f, "/uploads/big").await, None);
+    }
+
+    // Bare bzip2 files (SPEC-0083, US-0165).
+
+    fn bzip2(content: &[u8]) -> Vec<u8> {
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        bz.write_all(content).unwrap();
+        bz.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_001_bzip2_file_decompresses_next_to_the() {
+        let f = fixture().await;
+        let archive = bzip2(CSV);
+        seed(&f, "/uploads/data.csv.bz2", &archive).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/uploads", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 16})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/data.csv.bz2").await, Some(archive));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_002_upper_case_suffix() {
+        let f = fixture().await;
+        seed(&f, "/uploads/DATA.CSV.BZ2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/DATA.CSV.BZ2", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/DATA.CSV").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_003_explicit_existing_destination() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/out", true).await.unwrap();
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", Some("/out")).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/out", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 16})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/out/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+    }
+
+    async fn refuses_bz2_name(file: &str, shown: &str) {
+        let f = fixture().await;
+        let path = format!("/uploads/{file}");
+        seed(&f, &path, &bzip2(CSV)).await;
+        let e = extract(&f, &path, None).await;
+        let e = e.expect_err("a name with no stem must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, format!("cannot derive an output file name from '{shown}'"));
+        assert!(f.state.safety.audit(OWNER, MOUNT).iter().all(|a| a.op != "extract_archive"));
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let names: Vec<String> =
+            c.list_dir("/uploads").await.unwrap().into_iter().map(|n| n.path).collect();
+        assert_eq!(names, vec![path.clone()], "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_023_file_named_bz2() {
+        refuses_bz2_name(".bz2", ".bz2").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_024_file_named_bz2() {
+        refuses_bz2_name("..bz2", "..bz2").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_025_upper_case_bz2_alone() {
+        refuses_bz2_name(".BZ2", ".BZ2").await;
+    }
+
+    /// Green on arrival: `.lz` was already refused before bzip2 existed.
+    #[tokio::test]
+    async fn e2e_0083_038_another_extension_is_still_refused() {
+        let f = fixture().await;
+        seed(&f, "/uploads/pack.lz", b"anything").await;
+        let e = extract(&f, "/uploads/pack.lz", None).await;
+        let e = e.expect_err("an unknown extension must be refused");
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert_eq!(e.message, "unsupported archive extension: '.lz'");
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_039_bzip2_of_an_empty_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/empty.txt.bz2", &bzip2(b"")).await;
+        let v = extract(&f, "/uploads/empty.txt.bz2", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        let v = v.unwrap_or_default();
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(v["bytes_written"], 0);
+        assert_eq!(read(&f, "/uploads/empty.txt").await, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_043_accents_and_spaces() {
+        let f = fixture().await;
+        seed(&f, "/uploads/rapport été.txt.bz2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/rapport été.txt.bz2", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/rapport été.txt").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_044_several_dots_and_no_dot() {
+        let f = fixture().await;
+        seed(&f, "/uploads/a.b.c.bz2", &bzip2(CSV)).await;
+        seed(&f, "/uploads/README.bz2", &bzip2(CSV)).await;
+        for p in ["/uploads/a.b.c.bz2", "/uploads/README.bz2"] {
+            let v = extract(&f, p, None).await;
+            assert!(v.is_ok(), "{p}: {v:?}");
+        }
+        assert_eq!(read(&f, "/uploads/a.b.c").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/README").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_045_archive_directly_under_the_project_r() {
+        let f = fixture().await;
+        seed(&f, "/a.bz2", &bzip2(b"hello")).await;
+        let v = extract(&f, "/a.bz2", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 5})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/a").await.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_046_missing_destination_is_created() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", Some("/new/dir")).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/new/dir", "files_written": 1,
+                         "dirs_created": 1, "bytes_written": 16})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/new/dir/data.csv").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_047_trailing_slash_on_the_destination() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/out", true).await.unwrap();
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", Some("/out/")).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(v.unwrap_or_default()["destination"], "/out");
+        assert_eq!(read(&f, "/out/data.csv").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0083_051_success_is_audited() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.bz2", &bzip2(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.bz2", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        let lines: Vec<_> = log.iter().filter(|e| e.op == "extract_archive").collect();
+        assert_eq!(lines.len(), 1, "{log:?}");
+        assert_eq!(lines[0].path, "/uploads/data.csv.bz2");
+        assert_eq!(lines[0].detail, "destination=/uploads files_written=1 bytes_written=16");
     }
 }

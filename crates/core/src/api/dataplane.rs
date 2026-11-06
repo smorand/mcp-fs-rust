@@ -3375,6 +3375,31 @@ mod tests {
         assert!(v["detail"].as_str().unwrap_or_default().contains("already exists"), "{v}");
     }
 
+    /// SPEC-0083 E2E-052: the REST door answers what the engine answers for a
+    /// bare bzip2 file, and a second call hits the no clobber refusal.
+    #[tokio::test]
+    async fn e2e_0083_052_the_http_api_gives_the_same_answer() {
+        use std::io::Write as _;
+        let h = Harness::new().await;
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        bz.write_all(b"id,name\n1,Alice\n").unwrap();
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.bz2", &bz.finish().unwrap()).await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.bz2", "overwrite": false});
+        let (s, v) = h.post(&u("extract-archive"), body.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"destination": "/uploads", "files_written": 1,
+                   "dirs_created": 0, "bytes_written": 16})
+        );
+        assert_eq!(c.read_bytes("/uploads/data.csv").await.unwrap(), b"id,name\n1,Alice\n");
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], code::NO_CLOBBER);
+        assert!(v["detail"].as_str().unwrap_or_default().contains("already exists"), "{v}");
+    }
+
     fn csv_gz() -> Vec<u8> {
         use std::io::Write as _;
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
