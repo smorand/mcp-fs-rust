@@ -428,3 +428,4 @@ refuses it anyway. `test_remote::Remote::start(repo_dir, Behavior)` serves a bar
   `with_git_hosts_lock`: the map is process wide.
 - The `github.ibm.com` example host cannot be resolved offline, so the down leg through the tool path uses
   a closed loopback port; the wording takes its host from the URL alone (`dt_0078_009`).
+- (2026-11-05, SPEC-0081) `cargo test -p mcp-fs-core --lib -- e2e_0081_` runs the 57 bare gzip acceptance tests. The capped reader records its high water mark in a `cfg(test)` thread local (`LAST_HIGH_WATER` in `tools/archive_single.rs`), read by `assert_extraction_bounded`; the tokio test runtime is single threaded, so the value belongs to one test.

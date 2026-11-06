@@ -130,7 +130,12 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `archive.rs` holds `fs.extract_archive` (SPEC-0015), also served by `POST
   /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
   type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
-  password retry via `ERR_PASSWORD_REQUIRED`. `artifacts.rs` holds the five SPEC-0019 tools
+  password retry via `ERR_PASSWORD_REQUIRED`. `archive_single.rs` holds the single file flow for a
+  bare gzip `.gz` (SPEC-0081): refusals in a fixed order (membership, missing path, folder, password,
+  output name, destination outside the project, destination is a file, collision, then corrupt or a
+  limit, whichever decoding meets first), a capped reader that stops at the lower of the project's
+  remaining storage and the session write allowance, nothing written before the decode succeeds.
+  `artifacts.rs` holds the five SPEC-0019 tools
   (`fs.list_images`/`get_image`/`list_tables`/`get_table`/`get_document_view`), also served by
   five `GET /api/fs/{mount_id}/...` routes with byte identical payloads.
   `git_tags.rs` holds the tag engines (SPEC-0052): `git.tags`, `git.tag_create`, `git.tag_delete`,

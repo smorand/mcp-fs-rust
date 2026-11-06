@@ -95,6 +95,18 @@ fn output_name(file_name: &str, suffix_len: usize) -> Result<&str> {
     Ok(stem)
 }
 
+/// `normalize_path` clamps a leading `..` at the root (`../../x` becomes
+/// `/x`), but a relative destination that climbs out of the project must be
+/// refused (FR-NEW-011 item 6), so check the raw form first.
+fn normalize_destination(state: &AppState, dest: &str) -> Result<String> {
+    let climbs = !dest.starts_with('/')
+        && crate::util::PosixPath::normpath(dest).split('/').next() == Some("..");
+    if climbs {
+        return Err(ToolError::path_out_of_bounds(format!("path escapes the volume root: {dest}")));
+    }
+    state.safety.normalize_path(dest)
+}
+
 /// Refuse a destination that is a file or sits under one, naming the first
 /// non folder node from the root (`exists` cannot tell a file from a folder).
 async fn check_destination(client: &VolumeClient, dest: &str) -> Result<()> {
@@ -207,7 +219,7 @@ pub(crate) async fn extract_single(
     let name = output_name(file_name, suffix_len)?.to_string();
 
     let dest = match destination {
-        Some(d) => state.safety.normalize_path(d)?,
+        Some(d) => normalize_destination(state, d)?,
         None if parent.is_empty() => "/".to_string(),
         None => parent.to_string(),
     };
@@ -941,5 +953,127 @@ mod tests {
         assert!(v.is_ok(), "{v:?}");
         assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
         assert_eq!(allowance(&f), 0);
+    }
+
+    // Order of refusals (US-0164, FR-NEW-011).
+
+    const BOB: &str = "bob@example.com";
+
+    /// `alpha` has its own owner; `bob@example.com` is not a member. The door
+    /// authorizes before the engine, so the helper does too.
+    async fn alpha_fixture() -> Fixture {
+        let f = fixture().await;
+        f.seed_project("alpha", OWNER).await;
+        let c = f.state.stores.client("alpha").await.unwrap();
+        c.makedirs("/uploads", true).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.gz", &gzip(CSV)).await.unwrap();
+        f
+    }
+
+    async fn extract_as_bob(f: &Fixture, path: &str) -> Result<Value> {
+        f.state.authorize("alpha", BOB).await?;
+        extract_archive(&f.state, "alpha", BOB, path, None, false, None).await
+    }
+
+    fn refused(v: &Result<Value>, code: &str, message: &str) {
+        let e = v.as_ref().expect_err("the extraction must be refused");
+        assert_eq!(e.code, code, "{e:?}");
+        assert_eq!(e.message, message);
+    }
+
+    /// A gzip stream whose output is 1000 bytes, cut before its trailer.
+    fn truncated_gzip() -> Vec<u8> {
+        let mut bytes = gzip(&[0u8; 1000]);
+        bytes.truncate(bytes.len() - 8);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_014_missing_archive() {
+        let f = fixture().await;
+        let v = extract(&f, "/uploads/ghost.gz", None).await;
+        refused(&v, code::NOT_FOUND, "'/uploads/ghost.gz' not found");
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_015_folder_named_like_an_archive() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/dir.gz", true).await.unwrap();
+        let v = extract(&f, "/uploads/dir.gz", None).await;
+        refused(
+            &v,
+            code::INVALID_ARGUMENT,
+            "'/uploads/dir.gz' is a directory, not an archive file",
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_016_non_member() {
+        let f = alpha_fixture().await;
+        let v = extract_as_bob(&f, "/uploads/data.csv.gz").await;
+        refused(&v, code::FORBIDDEN, "'bob@example.com' is not a member of 'alpha'");
+        let c = f.state.stores.client("alpha").await.unwrap();
+        assert!(!c.exists("/uploads/data.csv").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_019_membership_wins_over_a_missing_path() {
+        let f = alpha_fixture().await;
+        let v = extract_as_bob(&f, "/uploads/ghost.gz").await;
+        refused(&v, code::FORBIDDEN, "'bob@example.com' is not a member of 'alpha'");
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_020_password_wins_over_a_corrupt_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/fake.gz", b"not gzip").await;
+        let v = extract_with(&f, "/uploads/fake.gz", None, false, Some("s3cret")).await;
+        refused(&v, code::INVALID_ARGUMENT, NO_PASSWORD);
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_021_collision_wins_over_a_corrupt_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/cut.gz", &truncated_gzip()).await;
+        seed(&f, "/uploads/cut", b"old").await;
+        let v = extract_with(&f, "/uploads/cut.gz", None, false, None).await;
+        refused(
+            &v,
+            code::NO_CLOBBER,
+            "'/uploads/cut' already exists; pass overwrite=true to replace it",
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_022_collision_wins_over_the_storage_limi() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.gz", &gzip(CSV)).await;
+        seed(&f, "/uploads/data.csv", b"old").await;
+        limit_remaining(&f, 10).await;
+        let v = extract_with(&f, "/uploads/data.csv.gz", None, false, None).await;
+        refused(
+            &v,
+            code::NO_CLOBBER,
+            "'/uploads/data.csv' already exists; pass overwrite=true to replace it",
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_035_destination_outside_the_project() {
+        let f = fixture().await;
+        seed(&f, "/uploads/cut.gz", &truncated_gzip()).await;
+        let v = extract_with(&f, "/uploads/cut.gz", Some("../../x"), false, None).await;
+        refused(&v, code::PATH_OUT_OF_BOUNDS, "path escapes the volume root: ../../x");
+    }
+
+    #[tokio::test]
+    async fn e2e_0081_045_storage_limit_met_before_the_corrupt() {
+        let f = fixture().await;
+        seed(&f, "/uploads/big.gz", &truncated_gzip()).await;
+        limit_remaining(&f, 10).await;
+        let v = extract(&f, "/uploads/big.gz", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/big").await, None);
     }
 }

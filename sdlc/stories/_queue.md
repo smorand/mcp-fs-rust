@@ -163,7 +163,7 @@
 | US-0161 | SPEC-0081 | decode several gzip members and refuse corrupt input | US-0160 | 2 | landed | story/US-0161-decode-several-gzip-members-and-refuse-c | story/US-0160-extract-a-bare-gzip-file-next-to-it |
 | US-0162 | SPEC-0081 | gzip password, collision and destination rules | US-0161 | 2 | landed | story/US-0162-gzip-password-collision-and-destination | story/US-0161-decode-several-gzip-members-and-refuse-c |
 | US-0163 | SPEC-0081 | stop gzip decoding at the storage and session limits | US-0162 | 2 | landed | story/US-0163-stop-gzip-decoding-at-the-storage-and-se | story/US-0162-gzip-password-collision-and-destination |
-| US-0164 | SPEC-0081 | pin the gzip order of refusals and document it | US-0163 | 2 | todo | | |
+| US-0164 | SPEC-0081 | pin the gzip order of refusals and document it | US-0163 | 2 | landed | story/US-0164-pin-the-gzip-order-of-refusals-and-docum | story/US-0163-stop-gzip-decoding-at-the-storage-and-se |
 | US-0165 | SPEC-0083 | extract a bare bzip2 file next to the archive | US-0160 | 2 | todo | | |
 | US-0166 | SPEC-0083 | decode several bzip2 streams and refuse corrupt input | US-0165, US-0162 | 2 | todo | | |
 | US-0167 | SPEC-0083 | check the bzip2 collision, destination and order rules | US-0166, US-0164 | 2 | todo | | |

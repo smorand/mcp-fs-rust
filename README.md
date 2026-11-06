@@ -292,7 +292,11 @@ is already stored in the project, with no download and re upload through the cli
 ```
 
 Formats, by extension: `.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`,
-`.tar.xz`/`.txz`, all decoded in pure Rust. `destination` defaults to the archive path minus
+`.tar.xz`/`.txz`, all decoded in pure Rust, plus `.gz`. A bare gzip file (not a `.tar.gz`) holds
+one file: it is decompressed next to the archive, or into `destination`, under the archive name
+minus `.gz`; passwords are refused, several gzip members are decoded as one stream, and
+decompression stops at the project's remaining storage or the session write allowance.
+Otherwise `destination` defaults to the archive path minus
 its suffix; `overwrite` defaults to `false`. **Passwords are a plain retry**: an encrypted zip
 or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQUIRED` (HTTP
 428) and the caller sends the same call again with `password`; nothing is stored between

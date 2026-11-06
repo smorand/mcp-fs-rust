@@ -178,8 +178,8 @@ The full token is never logged, only its first 8 characters.
 | `fs.extract_archive` | extract a stored archive in place | `path`, `destination?`, `overwrite=false`, `password?` | `destination,files_written,dirs_created,bytes_written` | D,!RO,!I,!OW | member |
 
 (2026-10-09, SPEC-0015.) Formats by extension, case insensitive: `.zip`, `.7z`,
-`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`; anything else
-(including `.rar`) is `ERR_NOT_SUPPORTED`. Default destination: the archive
+`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, and a bare `.gz`
+(see below); anything else (including `.rar`) is `ERR_NOT_SUPPORTED`. Default destination: the archive
 path minus its suffix. Stateless password retry: an encrypted zip or 7z with no
 or a wrong `password` is `ERR_PASSWORD_REQUIRED` (HTTP 428), the caller just
 retries with it; a password on a tar family archive is `ERR_INVALID_ARGUMENT`.
@@ -191,6 +191,26 @@ decoded size above the declared one (`ERR_INVALID_ARGUMENT`), or the declared
 total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
 untouched on failure). The password is never logged. REST twin: `POST
 /api/fs/{mount_id}/extract-archive`.
+
+(2026-11-05, SPEC-0081.) A bare gzip file (suffix `.gz` that is not `.tar.gz`, flow in
+`tools/archive_single.rs`) holds one file. Output name: the archive file name minus
+`.gz`, case insensitive (`DATA.CSV.GZ` gives `DATA.CSV`); a name with no stem is
+`ERR_INVALID_ARGUMENT`. Default destination: the folder of the archive (not a folder named after it);
+a missing destination is created. Several gzip members are decoded as one stream. No clobber: an
+existing file at the output path is `ERR_NO_CLOBBER` (`'<out>' already exists; pass
+overwrite=true to replace it`), a folder is `ERR_NO_CLOBBER` even with `overwrite`
+(`'<out>' is a folder and cannot be replaced`). A destination that is a file or sits under
+one is `ERR_INVALID_ARGUMENT` (`'<path>' is a file, not a folder`). A password, even empty, is
+`ERR_INVALID_ARGUMENT` (`password is not applicable to this archive format`). A corrupt or non gzip file is
+`ERR_INVALID_ARGUMENT`, `archive is corrupt or not a valid gz file: <detail>`. The decoder never
+holds more than the lower of two limits: the project's remaining storage
+(`ERR_PROJECT_QUOTA_EXCEEDED`) and the session write allowance (`ERR_WRITE_QUOTA_EXCEEDED`,
+charged the full output); a tie goes to the project. Order of refusals, first one wins:
+1. caller not a member (`ERR_FORBIDDEN`); 2. path missing (`ERR_NOT_FOUND`); 3. path is a folder
+(`ERR_INVALID_ARGUMENT`); 4. password given; 5. unusable output name; 6. relative destination
+climbing out of the project (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination>`);
+7. destination is a file; 8. collision; 9. corrupt, project limit or session limit, whichever
+the decoding meets first. Nothing is written, and no folder created, before the decode succeeds.
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,
