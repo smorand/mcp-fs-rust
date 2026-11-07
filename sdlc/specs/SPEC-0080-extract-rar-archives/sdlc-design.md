@@ -216,3 +216,7 @@ Test data: plain archives (nested folders, empty, accents, upper case name, syml
 | US-0176 | handle partly encrypted RAR archives and empty or ignored passwords | P2 | SPEC-0080/FR-NEW-016, SPEC-0080/FR-NEW-017, SPEC-0080/FR-NEW-020 | US-0175 | 2 | no |
 | US-0177 | pin the RAR order of refusals, check membership and document the format | P1 | SPEC-0080/FR-NEW-015, SPEC-0080/FR-NEW-018 | US-0172, US-0173, US-0174, US-0176 | 2 | yes |
 
+
+## Erratum 2 (US-0171 spike)
+
+Supersedes DEC-006 and the entry kind risk where they differ: only symbolic links are refused (Unix `file_attr & 0o170000 == 0o120000`, or a Windows reparse flag when the type bits are not regular file or folder); devices are not classified (the Windows attribute bits 0x1000 and 0x2000 alias the Unix FIFO and character types); a hard link extracts as an empty file (E2E-032). A read error on a plain entry maps to the FR-NEW-008 message; an encrypted entry keeps the corrupt or password mapping.

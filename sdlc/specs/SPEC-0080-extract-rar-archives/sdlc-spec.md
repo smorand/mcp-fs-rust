@@ -33,7 +33,7 @@ shipped as an optional capability of the server: a server delivered without it b
 - A `.rar` archive is refused with `ERR_NOT_SUPPORTED` and the message `unsupported archive extension: '.rar'`.
   [row 2]
 - Before any file is written, the whole archive is read and checked; any problem rejects the whole call
-  and nothing is written. The checks refuse: a link or device entry (`ERR_NOT_SUPPORTED`), an entry whose
+  and nothing is written. The checks refuse: a symbolic link entry (`ERR_NOT_SUPPORTED`), an entry whose
   resolved path lies outside the destination (`ERR_PATH_OUT_OF_BOUNDS`), an existing file when `overwrite` is false
   (`ERR_NO_CLOBBER`, first collision in archive order), an entry that decodes to more bytes than it
   declares (`ERR_INVALID_ARGUMENT`), and a declared total above a limit: the project's storage
@@ -139,7 +139,7 @@ shipped as an optional capability of the server: a server delivered without it b
 **Postconditions:** the project is unchanged and the remaining storage and the session write allowance are unchanged.
 **Order when several problems apply:** FR-NEW-015.
 **Exceptions:**
-- EXC-003a: a symbolic link, hard link or device entry → `ERR_NOT_SUPPORTED`, the message names the entry.
+- EXC-003a: a symbolic link entry → `ERR_NOT_SUPPORTED`, the message names the entry. A hard link entry is not refused: the reader shows it as an empty file (FR-NEW-006).
 - EXC-003b: an entry named `../../etc/passwd`, or an absolute name such as `/etc/cron.d/x` → `ERR_PATH_OUT_OF_BOUNDS`.
 - EXC-003c: an entry that decodes to more bytes than it declares → `ERR_INVALID_ARGUMENT`, the message names the entry.
 - EXC-003d: a file already exists at an entry's destination and `overwrite` is false → `ERR_NO_CLOBBER` naming the first colliding path in archive order.
@@ -200,8 +200,8 @@ shipped as an optional capability of the server: a server delivered without it b
 - **Scenario:** SC-002
 - **Priority:** Must
 
-#### FR-NEW-006 [EARS-O]: Link and device entries
-> IF a RAR archive holds a symbolic link, hard link or device entry THEN THE archive extraction SHALL refuse the whole archive with `ERR_NOT_SUPPORTED`, name the offending entry in the message, and write nothing.
+#### FR-NEW-006 [EARS-O]: Symbolic link entries
+> IF a RAR archive holds a symbolic link entry THEN THE archive extraction SHALL refuse the whole archive with `ERR_NOT_SUPPORTED`, name the offending entry in the message, and write nothing. A hard link entry is extracted as an empty regular file, because the reader reports no redirection record for it and nothing is linked. RAR does not store devices.
 - **Scenario:** SC-003
 - **Priority:** Must
 
@@ -210,8 +210,9 @@ shipped as an optional capability of the server: a server delivered without it b
 - **Scenario:** SC-003
 - **Priority:** Must
 
-#### FR-NEW-008 [EARS-O]: Decoded larger than declared
-> IF a RAR entry decodes to more bytes than it declares THEN THE archive extraction SHALL refuse the whole archive with `ERR_INVALID_ARGUMENT`, name the offending entry in the message, and write nothing.
+#### FR-NEW-008 [EARS-O]: Data that does not match the declared size
+> IF the data of a RAR entry does not match its declared size and checksum THEN THE archive extraction SHALL refuse the whole archive with `ERR_INVALID_ARGUMENT`, name the offending entry in the message, and write nothing.
+The reader stops at the declared size, so the output of an entry never exceeds it; a mismatch shows as a checksum failure. An entry whose checksum covers only the declared prefix of larger stored data extracts truncated to the declared size.
 - **Scenario:** SC-003
 - **Priority:** Must
 
@@ -390,7 +391,7 @@ Performance: unchanged, same as the other formats; no new target is set.
 | E2E-029 | New | happy | SC-006 | FR-NEW-012 | High |
 | E2E-030 | New | failure | SC-002 | FR-NEW-003, FR-NEW-004, FR-NEW-013 | High |
 | E2E-031 | New | edge | SC-002 | FR-NEW-017 | Medium |
-| E2E-032 | New | failure | SC-003 | FR-NEW-006 | High |
+| E2E-032 | New | edge | SC-003 | FR-NEW-006 | High |
 | E2E-033 | New | failure | SC-003 | FR-NEW-006 | High |
 | E2E-034 | New | failure, security | SC-003 | FR-NEW-007 | Critical |
 | E2E-035 | New | failure, security | SC-003 | FR-NEW-007 | High |
@@ -524,7 +525,7 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-009
 - **Given** `/uploads/report.rar` as in E2E-001, and `/uploads/report/data/a.txt` and `/uploads/report/data/b.txt` already existing
 - **When** the member extracts with overwrite false
-- **Then** the refusal is `ERR_NO_CLOBBER` naming `/uploads/report/data/a.txt`
+- **Then** the refusal is `ERR_NO_CLOBBER` naming `/uploads/report/data`, the first colliding path in archive order, because the archive lists the folder before its files and an existing folder is a collision (`e2e_new_049`)
 - **And** both existing files keep their content
 - **Priority:** High
 
@@ -677,11 +678,11 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Then** the answer is that of E2E-001
 - **Priority:** Medium
 
-#### E2E-032: Hard link entry
-- **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-006
+#### E2E-032: Hard link entry extracts as an empty file
+- **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-006
 - **Given** `/uploads/hl.rar` holding `a.txt` and a hard link `b.txt` to it
 - **When** the member extracts it
-- **Then** the refusal is `ERR_NOT_SUPPORTED` and the message names `b.txt`; `/uploads/hl` does not exist
+- **Then** the extraction succeeds, `/uploads/hl/a.txt` has its content and `/uploads/hl/b.txt` exists with 0 bytes
 - **Priority:** High
 
 #### E2E-033: Link after valid entries writes nothing
@@ -766,7 +767,7 @@ FR-NEW-015 to FR-NEW-021 were added after the implementability review (Section 1
 - **Category:** edge; **Scenario:** SC-003; **Requirements:** FR-NEW-009
 - **Given** `/uploads/report.rar` as in E2E-001 and `/out/data/b.txt` already existing
 - **When** the member extracts it to the destination `/out` with overwrite false
-- **Then** the refusal is `ERR_NO_CLOBBER` naming `/out/data/b.txt`; `/out/data/a.txt` does not exist
+- **Then** the refusal is `ERR_NO_CLOBBER` naming `/out/data`, the first colliding path in archive order; `/out/data/a.txt` does not exist
 - **Priority:** Medium
 
 #### E2E-045: Zip missing password through the HTTP API
@@ -1165,10 +1166,14 @@ Not applicable (`--security` not set).
 - Feature name `rar`, off by default, forwarded from `crates/mcp-fs` like `postgres` (`crates/core/Cargo.toml:15-23`). `make check` uses `--all-features`, so CI compiles it. A build without the feature must not link the reader: check with `cargo tree -p mcp-fs-core` without the feature (licence constraint of 3.3).
 - RAR fixtures cannot be created from Rust; commit small binary fixtures and document how they were built (needs the RARLAB command line tool, to confirm). Cases: plain, encrypted data, encrypted names, partly encrypted, symlink, hardlink, traversal names, oversized, truncated.
 - The quota rule is `quota::admit_paths` (net change per destination, `crates/core/src/quota.rs:148-158`); RAR reuses it unchanged; the session allowance is charged by the same call (`quota.rs:96-113`). Signal: E2E-073, E2E-078.
-- The reader may report a hard link as a file (FR-NEW-006); verify with the E2E-032 fixture.
+- The reader reports a hard link as an empty file (verified by the US-0171 spike, `unrar-0.5.8/src/open_archive.rs:582-640`); FR-NEW-006 accepts it, E2E-032 pins it.
 - The password messages are literals at `archive.rs:441`, `:489`, `:531`, `:617`, `:619`; extend the existing `password_required_message` (`archive.rs:615`) to carry the new suffixes, route the three remaining literals (`:441`, `:489`, `:531`) through it, and use it for RAR (FR-NEW-002, 003, MOD-002, MOD-003).
 - "folders created" in the answer is the key `dirs_created`; "files written" is `files_written`; "bytes written" is `bytes_written` (`archive.rs:265-268`).
 - The refusal order of FR-NEW-015: membership runs before path normalization (`crates/core/src/tools/mod.rs:10-16`); zip reports its pre scan before the password (`archive.rs:418-440`, `.agent_docs/tools.md:196-204`); 7z asks the password first and checks entries while decoding (`archive.rs:508-577`); for RAR the order is new. The destination is normalized after decode and before the collision scan (`archive.rs:162-165`).
 - The reader must distinguish a wrong or missing password from corruption for RAR versions 4 and 5, with data encryption and with name encryption. Signal: the fixtures of E2E-007, E2E-030, E2E-051, E2E-058, E2E-065. If the reader reports only a generic failure, FR-NEW-003 cannot be met for that case: the design must raise it before building.
 - Update the exact assertions at `archive.rs:2158` and `:2174` and the US-0048 tests that quote the old missing password text (`sdlc/stories/US-0048-*`).
 - Update `.agent_docs/tools.md:180-183`, `TOOL_CONTRACT.txt` (the golden changes only if a parameter description changes; it need not) and `README.md`; BL-0123 records the multi volume deferral.
+
+## Erratum 2 (US-0171 spike)
+
+Three corrections after the reader was exercised: (1) a hard link cannot be seen through the safe API, so FR-NEW-006 covers symbolic links only and E2E-032 pins the empty file result; devices are dropped (RAR does not store them); (2) FR-NEW-008 is worded as a size and checksum mismatch, because the reader never decodes beyond the declared size; (3) E2E-010 and E2E-044 name the colliding folder, the first path in archive order. The message of FR-NEW-008 is unchanged.
