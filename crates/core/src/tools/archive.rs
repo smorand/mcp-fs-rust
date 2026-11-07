@@ -78,6 +78,17 @@ pub(crate) fn detect_format(path: &str) -> Result<(ArchiveFormat, usize)> {
         })
 }
 
+/// True when the file name is a numbered RAR volume (`name.part1.rar`), ignoring letter
+/// case: the name ends in `.part`, one or more digits, then `.rar`.
+#[cfg(feature = "rar")]
+pub(crate) fn is_multi_volume_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    let Some(stem) = lower.strip_suffix(".rar") else { return false };
+    let Some(digits_at) = stem.rfind(".part").map(|i| i + ".part".len()) else { return false };
+    let digits = &stem[digits_at..];
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Test-dispatch glue for `fs.extract_archive`, mirroring the production
 /// handler (`McpServer::fs_extract_archive`) so the golden contract sees the
 /// same schema. Hints follow `fs.write_bytes`, the closest analogue: it writes
@@ -158,6 +169,17 @@ pub(crate) async fn extract_archive(
     if matches!(format, ArchiveFormat::Tar(_) | ArchiveFormat::Single(_)) && password.is_some() {
         return Err(ToolError::invalid_argument(
             "password is not applicable to this archive format",
+        ));
+    }
+
+    // A numbered volume needs its siblings, which a single project file cannot supply.
+    // Refused on the name alone, before the file is read (SPEC-0080 FR-NEW-010).
+    #[cfg(feature = "rar")]
+    if matches!(format, ArchiveFormat::Rar)
+        && is_multi_volume_name(normalized.rsplit('/').next().unwrap_or(&normalized))
+    {
+        return Err(ToolError::not_supported(
+            "multi volume RAR archives are not supported: extract a single file archive",
         ));
     }
 

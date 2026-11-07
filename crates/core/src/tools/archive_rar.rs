@@ -14,6 +14,9 @@ const TEMP_NAME: &str = "archive.rar";
 /// unpacked size; memory is the archive on disk once plus every decoded entry in memory,
 /// as for zip and 7z, because the admission runs after the decode (BL-0125).
 pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>> {
+    // UnRAR reads a truncated archive as a shorter one or as a CRC error, neither of
+    // which says corrupt (FR-NEW-011), so the block layout is checked first.
+    ensure_rar5_complete(bytes)?;
     // The crate only opens a path (DEC-003), so the bytes go to a private temp dir
     // that is removed when `dir` drops, on every return path.
     let dir = tempfile::tempdir()
@@ -57,6 +60,73 @@ pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<Dec
         cursor = next;
     }
     Ok(entries)
+}
+
+/// RAR5 marker block; RAR 1.5 to 4.x archives start with `Rar!\x1a\x07\x00`.
+const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
+/// Header type of the archive encryption block: every header after it is encrypted,
+/// so the walk cannot read further.
+const HEAD_CRYPT: u64 = 4;
+/// Header type of the end of archive block, the last block of a complete volume.
+const HEAD_END: u64 = 5;
+const HFL_EXTRA: u64 = 0x1;
+const HFL_DATA: u64 = 0x2;
+/// A vint carries 7 bits per byte, so 10 bytes hold any u64.
+const VINT_MAX_BYTES: usize = 10;
+const TRUNCATED: &str = "unexpected end of archive";
+
+/// Walk the RAR5 block chain and refuse an archive whose last block runs past the end
+/// of the input, or that ends before its end of archive block. Linear in the number of
+/// blocks, no copies. A non RAR5 input is left to UnRAR: RAR4 truncation is not
+/// detected (open limitation), and neither is a cut after an archive encryption
+/// header, whose following headers cannot be read without the password.
+fn ensure_rar5_complete(bytes: &[u8]) -> Result<()> {
+    let Some(mut rest) = bytes.strip_prefix(RAR5_SIGNATURE) else {
+        return Ok(());
+    };
+    loop {
+        // Header CRC32, not verified here: UnRAR checks it.
+        rest = rest.get(4..).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        let header_size = read_vint(&mut rest)?;
+        let size = usize::try_from(header_size).map_err(|_| corrupt("rar", TRUNCATED))?;
+        let mut header = rest.get(..size).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        rest = &rest[size..];
+        let kind = read_vint(&mut header)?;
+        let flags = read_vint(&mut header)?;
+        if flags & HFL_EXTRA != 0 {
+            read_vint(&mut header)?;
+        }
+        let data_size = if flags & HFL_DATA != 0 { read_vint(&mut header)? } else { 0 };
+        let data = usize::try_from(data_size).map_err(|_| corrupt("rar", TRUNCATED))?;
+        rest = rest.get(data..).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        if kind == HEAD_END || kind == HEAD_CRYPT {
+            return Ok(());
+        }
+    }
+}
+
+/// Read one RAR5 vint from the front of `input`, refusing more than ten bytes or a
+/// value past u64 instead of wrapping.
+fn read_vint(input: &mut &[u8]) -> Result<u64> {
+    let mut value = 0u64;
+    for (i, &byte) in input.iter().take(VINT_MAX_BYTES).enumerate() {
+        let bits = u64::from(byte & 0x7f);
+        let shift = 7 * i as u32;
+        // The tenth byte may only hold the single top bit of a u64.
+        if shift == 63 && bits > 1 {
+            return Err(corrupt("rar", "variable length integer overflows"));
+        }
+        value |= bits << shift;
+        if byte & 0x80 == 0 {
+            *input = &input[i + 1..];
+            return Ok(value);
+        }
+    }
+    if input.len() < VINT_MAX_BYTES {
+        Err(corrupt("rar", TRUNCATED))
+    } else {
+        Err(corrupt("rar", "variable length integer is too long"))
+    }
 }
 
 fn open<'a>(path: &'a std::path::Path, password: Option<&'a str>) -> unrar::Archive<'a> {
@@ -568,5 +638,230 @@ mod tests {
         session_refusal(&extract(&f, "/uploads/report.rar").await, 5);
         small_write(&f).await.unwrap();
         assert_eq!(allowance(&f), 2);
+    }
+
+    const MULTI_VOLUME_MESSAGE: &str =
+        "multi volume RAR archives are not supported: extract a single file archive";
+
+    fn one_file() -> Vec<u8> {
+        rar5_store(&[RarEntry::file("a.txt", b"hello")])
+    }
+
+    async fn assert_multi_volume_refused(name: &str, stem: &str) {
+        let f = fixture().await;
+        let e = refuse(&f, name, one_file()).await;
+        assert_eq!(e.code, crate::errors::code::NOT_SUPPORTED);
+        assert_eq!(e.message, MULTI_VOLUME_MESSAGE);
+        assert_absent(&f, &[stem]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_013_multi_volume_name() {
+        assert_multi_volume_refused("/uploads/big.part1.rar", "/uploads/big.part1").await;
+    }
+
+    /// Garbage bytes under a multi volume name prove the refusal comes from the name,
+    /// before the file is read: a read would have given the corrupt message.
+    #[tokio::test]
+    async fn multi_volume_name_is_refused_before_the_file_is_read() {
+        let f = fixture().await;
+        let e = refuse(&f, "/uploads/big.part1.rar", b"not a rar archive".to_vec()).await;
+        assert_eq!(e.code, crate::errors::code::NOT_SUPPORTED);
+        assert_eq!(e.message, MULTI_VOLUME_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_014_truncated_rar() {
+        let f = fixture().await;
+        // The structural pre check refuses any cut; every prefix is covered by the
+        // unit tests below.
+        let full = one_file();
+        let e = refuse(&f, "/uploads/broken.rar", full[..full.len() / 2].to_vec()).await;
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(
+            e.message.starts_with("archive is corrupt or not a valid rar file:"),
+            "{}",
+            e.message
+        );
+        assert_absent(&f, &["/uploads/broken"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_014_truncated_report_rar_at_half() {
+        let f = fixture().await;
+        let full = report();
+        let e = refuse(&f, "/uploads/half.rar", full[..full.len() / 2].to_vec()).await;
+        assert!(
+            e.message.starts_with("archive is corrupt or not a valid rar file:"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn every_strict_prefix_of_a_rar5_archive_is_corrupt() {
+        let full = rar5_store(&[RarEntry::file("a.txt", b"hello"), RarEntry::dir("d")]);
+        super::ensure_rar5_complete(&full).unwrap();
+        for len in super::RAR5_SIGNATURE.len()..full.len() {
+            let e = super::ensure_rar5_complete(&full[..len]).unwrap_err();
+            assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "len {len}");
+            assert!(
+                e.message.starts_with("archive is corrupt or not a valid rar file:"),
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_rar5_input_is_left_to_the_library() {
+        super::ensure_rar5_complete(b"Rar!\x1a\x07\x00").unwrap();
+        super::ensure_rar5_complete(b"").unwrap();
+        super::ensure_rar5_complete(b"Rar!\x1a\x07\x01").unwrap();
+    }
+
+    #[test]
+    fn vint_with_eleven_bytes_is_refused() {
+        let mut input = [0x80u8; 11].to_vec();
+        input.push(0);
+        let e = super::read_vint(&mut &input[..]).unwrap_err();
+        assert!(e.message.ends_with("variable length integer is too long"), "{}", e.message);
+        let mut archive = super::RAR5_SIGNATURE.to_vec();
+        archive.extend([0; 4]);
+        archive.extend(&input);
+        assert!(super::ensure_rar5_complete(&archive).is_err());
+    }
+
+    #[test]
+    fn vint_past_u64_is_refused() {
+        let input = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        let e = super::read_vint(&mut &input[..]).unwrap_err();
+        assert!(e.message.ends_with("overflows"), "{}", e.message);
+        let max = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(super::read_vint(&mut &max[..]).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn huge_data_size_is_corrupt_not_a_panic() {
+        // Header: type 2 (file), flags HFL_DATA, data size u64::MAX.
+        let mut body = vec![0x02, 0x02];
+        body.extend([0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        let mut archive = super::RAR5_SIGNATURE.to_vec();
+        archive.extend([0; 4]);
+        archive.push(body.len() as u8);
+        archive.extend(body);
+        let e = super::ensure_rar5_complete(&archive).unwrap_err();
+        assert!(e.message.ends_with("unexpected end of archive"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_016_missing_archive() {
+        let f = fixture().await;
+        let e = extract(&f, "/uploads/ghost.rar").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NOT_FOUND);
+        assert_eq!(e.message, "'/uploads/ghost.rar' not found");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_023_part02_rar_is_multi_volume() {
+        assert_multi_volume_refused("/uploads/big.part02.rar", "/uploads/big.part02").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_024_part1x_is_not_a_multi_volume_name() {
+        let f = fixture().await;
+        for (name, dest) in [
+            ("/uploads/report.part1x.rar", "/uploads/report.part1x"),
+            ("/uploads/big.part.rar", "/uploads/big.part"),
+        ] {
+            seed(&f, name, &one_file()).await;
+            let v = extract(&f, name).await.unwrap();
+            assert_eq!(v["destination"], dest);
+            assert_eq!(v["files_written"], 1);
+            assert_eq!(read(&f, &format!("{dest}/a.txt")).await, b"hello");
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_025_upper_case_multi_volume_name() {
+        assert_multi_volume_refused("/uploads/BIG.PART3.RAR", "/uploads/BIG.PART3").await;
+    }
+
+    fn assert_corrupt(e: &crate::errors::ToolError) {
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert!(
+            e.message.starts_with("archive is corrupt or not a valid rar file:"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_026_a_text_file_named_rar() {
+        let f = fixture().await;
+        let e = refuse(&f, "/uploads/fake.rar", b"not an archive".to_vec()).await;
+        assert_corrupt(&e);
+        assert_absent(&f, &["/uploads/fake"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_027_a_0_byte_rar() {
+        let f = fixture().await;
+        let e = refuse(&f, "/uploads/empty.rar", Vec::new()).await;
+        assert_corrupt(&e);
+        assert_absent(&f, &["/uploads/empty"]).await;
+    }
+
+    async fn assert_folder_refused(name: &str) {
+        let f = fixture().await;
+        f.state.stores.client(MOUNT).await.unwrap().makedirs(name, true).await.unwrap();
+        let e = extract(&f, name).await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert_eq!(e.message, format!("'{name}' is a directory, not an archive file"));
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_056_path_is_a_folder() {
+        assert_folder_refused("/uploads/dir.rar").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_074_missing_archive_with_an_explicit_des() {
+        let f = fixture().await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        let e = extract_archive(
+            &f.state,
+            MOUNT,
+            OWNER,
+            "/uploads/ghost.rar",
+            Some("/out"),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NOT_FOUND);
+        assert_eq!(e.message, "'/uploads/ghost.rar' not found");
+        assert_absent(&f, &["/out"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_075_folder_named_with_an_upper_case_suff() {
+        assert_folder_refused("/uploads/DIR.RAR").await;
+    }
+
+    #[test]
+    fn multi_volume_name_edge_cases() {
+        use crate::tools::archive::is_multi_volume_name as m;
+        assert!(m("a.part1.rar"));
+        assert!(m("a.PART10.RAR"));
+        assert!(m("big.part01.rar"));
+        assert!(m(".part1.rar"));
+        assert!(!m("a.part.rar"));
+        assert!(!m("a.part1x.rar"));
+        assert!(!m("a.partx1.rar"));
+        // No dot before `part`: the spec says the name ends in `.part` digits `.rar`.
+        assert!(!m("part1.rar"));
+        assert!(!m("a.part1.rar.zip"));
+        assert!(!m("a.part1"));
     }
 }

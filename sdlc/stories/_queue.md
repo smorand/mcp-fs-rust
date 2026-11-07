@@ -172,7 +172,7 @@
 | US-0170 | SPEC-0080 | extract a RAR archive when the server has RAR support | main | 1 | landed | story/US-0170-extract-a-rar-archive-when-the-server-su | story/US-0169-tell-the-user-how-to-retry-with-a-passwo |
 | US-0171 | SPEC-0080 | refuse unsafe RAR entries, oversized entries and collisions | US-0170 | 2 | landed | story/US-0171-refuse-unsafe-rar-entries-and-collisions | story/US-0170-extract-a-rar-archive-when-the-server-su |
 | US-0172 | SPEC-0080 | apply the storage limit and the session allowance to RAR archives | US-0171 | 2 | landed | story/US-0172-rar-storage-limit-and-session-allowance | story/US-0171-refuse-unsafe-rar-entries-and-collisions |
-| US-0173 | SPEC-0080 | refuse multi volume names, corrupt files, a missing path and a folder | US-0172 | 2 | todo | | |
+| US-0173 | SPEC-0080 | refuse multi volume names, corrupt files, a missing path and a folder | US-0172 | 2 | landed | story/US-0173-rar-multi-volume-corrupt-missing-path | story/US-0172-rar-storage-limit-and-session-allowance |
 | US-0174 | SPEC-0080 | read RAR4, RAR5 and solid RAR archives | US-0170 | 2 | todo | | |
 | US-0175 | SPEC-0080 | ask for the password of an encrypted RAR and accept the right one | US-0170, US-0169 | 2 | todo | | |
 | US-0176 | SPEC-0080 | handle partly encrypted RAR archives and empty or ignored passwords | US-0175 | 2 | todo | | |

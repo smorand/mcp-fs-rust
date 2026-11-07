@@ -3350,6 +3350,39 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/report/sub/b.txt").await.unwrap(), b"world");
     }
 
+    /// SPEC-0080/E2E-071: a missing `.rar` is the shared not found refusal through the
+    /// REST door, whether or not the build has RAR support (the check runs first).
+    #[tokio::test]
+    async fn e2e_0080_071_missing_archive_through_the_http_api() {
+        let h = Harness::new().await;
+        let (s, v) = h.post(&u("extract-archive"), json!({"path": "/uploads/ghost.rar"})).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::NOT_FOUND);
+        assert!(
+            v["detail"].as_str().unwrap_or_default().contains("'/uploads/ghost.rar' not found"),
+            "{v}"
+        );
+    }
+
+    /// SPEC-0080/E2E-076: a folder named `.rar` is the shared directory refusal through
+    /// the REST door.
+    #[tokio::test]
+    async fn e2e_0080_076_folder_through_the_http_api() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/uploads/dir.rar", true).await.unwrap();
+        let (s, v) = h.post(&u("extract-archive"), json!({"path": "/uploads/dir.rar"})).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert!(
+            v["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("'/uploads/dir.rar' is a directory, not an archive file"),
+            "{v}"
+        );
+    }
+
     /// SPEC-0080/E2E-045: an encrypted zip with no password is refused with the
     /// retry instruction through the REST door.
     #[tokio::test]
