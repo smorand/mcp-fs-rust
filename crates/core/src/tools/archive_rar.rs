@@ -429,4 +429,144 @@ mod tests {
         assert!(e.message.contains("'/out/data'"), "{}", e.message);
         assert_absent(&f, &["/out/data/a.txt"]).await;
     }
+
+    /// Give the project exactly `n` bytes of remaining storage.
+    async fn limit_remaining(f: &Fixture, n: i64) {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let used = crate::quota::used_bytes(&c).await.unwrap();
+        f.state.admin.set_quota(MOUNT, Some(used + n)).await.unwrap();
+    }
+
+    async fn remaining_storage(f: &Fixture) -> i64 {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let limit = f.state.safety.project_limit(MOUNT).await.unwrap().unwrap();
+        limit - crate::quota::used_bytes(&c).await.unwrap()
+    }
+
+    fn allowance(f: &Fixture) -> i64 {
+        f.state.safety.session_remaining(OWNER, MOUNT)
+    }
+
+    /// A fixture whose member may write `quota` bytes in the session.
+    async fn fixture_with_allowance(quota: i64) -> Fixture {
+        let f = Fixture::with_config(move |c| c.safety.write_quota_bytes = quota).await;
+        f.seed_project(MOUNT, OWNER).await;
+        f.state.stores.client(MOUNT).await.unwrap().makedirs("/uploads", true).await.unwrap();
+        f
+    }
+
+    async fn small_write(f: &Fixture) -> Result<Value> {
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        crate::core::fs_ops::write_bytes(
+            &c,
+            &f.state.safety,
+            OWNER,
+            MOUNT,
+            "/uploads/small.txt",
+            b"abc",
+            false,
+            true,
+        )
+        .await
+    }
+
+    fn project_refusal(v: &Result<Value>) {
+        let e = v.as_ref().expect_err("the extraction must be refused");
+        assert_eq!(e.code, crate::errors::code::PROJECT_QUOTA_EXCEEDED, "{e:?}");
+        assert!(e.message.starts_with("project storage quota of"), "{}", e.message);
+    }
+
+    fn session_refusal(v: &Result<Value>, quota: i64) {
+        let e = v.as_ref().expect_err("the extraction must be refused");
+        assert_eq!(e.code, crate::errors::code::WRITE_QUOTA_EXCEEDED, "{e:?}");
+        assert_eq!(e.message, format!("session write quota of {quota} bytes exceeded"));
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_011_over_the_project_storage_limit() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        limit_remaining(&f, 5).await;
+        let v = extract(&f, "/uploads/report.rar").await;
+        project_refusal(&v);
+        assert_eq!(remaining_storage(&f).await, 5);
+        assert_absent(&f, &["/uploads/report"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_038_storage_exactly_equal_to_the_declare() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        limit_remaining(&f, 12).await;
+        let v = extract(&f, "/uploads/report.rar").await.unwrap();
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(remaining_storage(&f).await, 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_041_a_refused_storage_limit_leaves_the_p() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        limit_remaining(&f, 5).await;
+        project_refusal(&extract(&f, "/uploads/report.rar").await);
+        small_write(&f).await.unwrap();
+        assert_eq!(remaining_storage(&f).await, 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_073_overwrite_counts_net_growth_against() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        seed(&f, "/uploads/report/data/a.txt", b"0123456789").await;
+        seed(&f, "/uploads/report/data/b.txt", b"0123456789").await;
+        limit_remaining(&f, 5).await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        let v = extract_archive(&f.state, MOUNT, OWNER, "/uploads/report.rar", None, true, None)
+            .await
+            .unwrap();
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(remaining_storage(&f).await, 13);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_077_over_the_session_write_allowance() {
+        let f = fixture_with_allowance(5).await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        let v = extract(&f, "/uploads/report.rar").await;
+        session_refusal(&v, 5);
+        assert_absent(&f, &["/uploads/report"]).await;
+        assert_eq!(allowance(&f), 5);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_078_the_allowance_is_charged_the_full_de() {
+        let f = fixture_with_allowance(20).await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        seed(&f, "/uploads/report/data/a.txt", b"0123456789").await;
+        seed(&f, "/uploads/report/data/b.txt", b"0123456789").await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        let v = extract_archive(&f.state, MOUNT, OWNER, "/uploads/report.rar", None, true, None)
+            .await
+            .unwrap();
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(allowance(&f), 8);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_079_allowance_equal_to_the_declared_tota() {
+        let f = fixture_with_allowance(12).await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        let v = extract(&f, "/uploads/report.rar").await.unwrap();
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(allowance(&f), 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_080_a_refused_extraction_charges_nothing() {
+        let f = fixture_with_allowance(5).await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        session_refusal(&extract(&f, "/uploads/report.rar").await, 5);
+        small_write(&f).await.unwrap();
+        assert_eq!(allowance(&f), 2);
+    }
 }
