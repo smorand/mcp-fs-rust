@@ -38,7 +38,9 @@ PostgreSQL), aws-sdk-s3, jsonwebtoken + rsa, git2
 
 Cargo features, none in `default`: `postgres`, `rag`, `all-backends` (PostgreSQL plus `rag`). A default
 build is SQLite only and carries no network database driver. The `rag` feature enables pgvector (PostgreSQL)
-and sqlite-vec (SQLite) for vector search; it implies `postgres`.
+and sqlite-vec (SQLite) for vector search; it implies `postgres`. The `rar` feature (not in
+`all-backends`, but in `--all-features`) adds `.rar` to `fs.extract_archive` through the `unrar` crate
+(RARLAB's UnRAR source, non free licence, builds C++); its tests run only with it.
 
 ## Key commands
 ```
@@ -55,6 +57,7 @@ mcp-fs migrate --from a.yaml --to b.yaml  offline copy of relational state betwe
 mcp-fs purge [--project <id> [--on-demand]]  run the auto-purge sweep once; no --project runs
                                       every configured project plus the grace-period removal
 docker compose -f docker-compose.test.yml up -d  postgres for the opt-in suites
+cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extraction tests (feature `rar`, SPEC-0080)
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode

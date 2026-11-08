@@ -178,8 +178,9 @@ The full token is never logged, only its first 8 characters.
 | `fs.extract_archive` | extract a stored archive in place | `path`, `destination?`, `overwrite=false`, `password?` | `destination,files_written,dirs_created,bytes_written` | D,!RO,!I,!OW | member |
 
 (2026-10-09, SPEC-0015.) Formats by extension, case insensitive: `.zip`, `.7z`,
-`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, and a bare `.gz` or `.bz2`
-(see below); anything else (including `.rar`) is `ERR_NOT_SUPPORTED`. Default destination: the archive
+`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, a bare `.gz` or `.bz2`
+(see below), and `.rar` with the cargo feature `rar` (see below); anything else (including `.rar`
+on a build without the feature) is `ERR_NOT_SUPPORTED`. Default destination: the archive
 path minus its suffix. Stateless password retry: an encrypted zip or 7z with no
 or a wrong `password` is `ERR_PASSWORD_REQUIRED` (HTTP 428), the caller just
 retries with it; a password on a tar family archive is `ERR_INVALID_ARGUMENT`.
@@ -191,6 +192,30 @@ decoded size above the declared one (`ERR_INVALID_ARGUMENT`), or the declared
 total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
 untouched on failure). The password is never logged. REST twin: `POST
 /api/fs/{mount_id}/extract-archive`.
+
+(2026-11-08, SPEC-0080.) `.rar` (RAR 4 and RAR 5, case insensitive, cargo feature `rar`, decoder
+`tools/archive_rar.rs`) goes through the same pipeline as zip and 7z. Rules:
+- Passwords: the same `ERR_PASSWORD_REQUIRED` and the same two messages as zip and 7z (missing:
+  `password required to extract this archive; call again with the 'password' parameter`; wrong or
+  empty: `incorrect password for this archive; call again with the correct 'password' parameter`).
+  A password on an archive with no encrypted entry is ignored. Encrypted file names are read in a
+  listing pass, so a missing or wrong password is reported before anything else about the content.
+- Only a symbolic link is refused (`ERR_NOT_SUPPORTED`, naming the entry). A hard link cannot be
+  told from a file through the reader, so it extracts as an empty file (SPEC-0080 erratum 2).
+- A multi volume name (`name.partN.rar`) is `ERR_NOT_SUPPORTED`, decided on the name alone, before
+  the file is read.
+- An entry that decodes to a different size from the declared one is `ERR_INVALID_ARGUMENT` naming
+  the entry; a truncated archive is `ERR_INVALID_ARGUMENT` `archive is corrupt or not a valid rar
+  file: ...`. Truncation is detected for RAR 5 only (block walk in `ensure_rar5_complete`, BL-0131);
+  a truncated RAR 4 file is left to the reader.
+- Solid archives are decoded front to back. The archive is decoded fully in memory before the
+  admission, like zip and 7z (BL-0125).
+- Order of refusals (FR-NEW-015): membership, missing path or folder, multi volume name, encrypted
+  names with a missing or wrong password, corrupt, the first link or escaping name in archive
+  order, encrypted data with a missing or wrong password, oversized entry, a `destination` outside
+  the project (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination>`, a relative
+  `../../x` is refused for `.rar`, the other formats clamp it), collision, project storage limit,
+  session write allowance. The tests that pin each pair are `e2e_0080_047` to `e2e_0080_081`.
 
 (2026-11-05, SPEC-0081.) A bare gzip file (suffix `.gz` that is not `.tar.gz`, flow in
 `tools/archive_single.rs`) holds one file. Output name: the archive file name minus

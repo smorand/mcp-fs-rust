@@ -212,7 +212,15 @@ pub(crate) async fn extract_archive(
     // FR-NEW-016: caller-supplied destination normalized exactly like any
     // other `fs.*` destination parameter; otherwise the archive's own path
     // with its matched extension stripped, preserving the stem's case.
+    // `normalize_path` clamps a leading `..` at the root, so a RAR destination that climbs
+    // out of the project is checked on its raw form first (SPEC-0080 FR-NEW-015 item 9).
+    // The other formats keep the clamping they have always had.
+    #[cfg(feature = "rar")]
+    let rar = matches!(format, ArchiveFormat::Rar);
+    #[cfg(not(feature = "rar"))]
+    let rar = false;
     let dest = match destination {
+        Some(d) if rar => archive_single::normalize_destination(state, d)?,
         Some(d) => state.safety.normalize_path(d)?,
         None => normalized[..normalized.len() - suffix_len].to_string(),
     };

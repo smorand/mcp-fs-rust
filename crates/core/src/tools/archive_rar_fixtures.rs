@@ -23,6 +23,8 @@ const MODE_DIR: u64 = 0o040_755;
 const MODE_SYMLINK: u64 = 0o120_777;
 /// File extra record type: file system redirection (link).
 const EXTRA_REDIRECTION: u64 = 5;
+/// File extra record type: file encryption (what makes a reader call the entry encrypted).
+const EXTRA_FILE_ENCRYPTION: u64 = 1;
 const REDIR_UNIX_SYMLINK: u64 = 1;
 const REDIR_HARD_LINK: u64 = 4;
 
@@ -36,6 +38,9 @@ pub(crate) enum RarKind {
     /// A file whose header declares this unpacked size while the stored data is
     /// `RarEntry::data`, whatever its length (the oversize lie, FR-NEW-008).
     Declares(u64),
+    /// Like `Declares`, flagged as an encrypted entry. The stored bytes are plain: the
+    /// flag alone is what a listing reads, and no test of this kind may reach a decode.
+    EncryptedDeclares(u64),
 }
 
 /// One entry of the built archive, in archive order.
@@ -68,6 +73,14 @@ impl RarEntry {
             name: name.to_string(),
             kind: RarKind::HardLink(target.to_string()),
             data: Vec::new(),
+        }
+    }
+
+    pub(crate) fn encrypted_declaring(name: &str, declared: u64, data: &[u8]) -> Self {
+        Self {
+            name: name.to_string(),
+            kind: RarKind::EncryptedDeclares(declared),
+            data: data.to_vec(),
         }
     }
 
@@ -104,6 +117,10 @@ fn push_file(out: &mut Vec<u8>, entry: &RarEntry) {
             declared = Some(*size);
             (FHFL_CRC32, MODE_FILE, entry.data.as_slice(), Vec::new())
         }
+        RarKind::EncryptedDeclares(size) => {
+            declared = Some(*size);
+            (FHFL_CRC32, MODE_FILE, entry.data.as_slice(), file_encryption())
+        }
     };
     let mut fields = Vec::new();
     fields.extend(vint(file_flags));
@@ -125,6 +142,19 @@ fn push_file(out: &mut Vec<u8>, entry: &RarEntry) {
     pre.extend(vint(data.len() as u64));
     push_header(out, HEAD_FILE, flags, &pre, &fields, &extra);
     out.extend(data);
+}
+
+/// A file encryption extra record: size, type, version 0, flags 0 (no password check
+/// value), 15 key derivation iterations as a power of two, 16 bytes of salt and 16 of IV.
+fn file_encryption() -> Vec<u8> {
+    let mut body = vint(EXTRA_FILE_ENCRYPTION);
+    body.extend(vint(0));
+    body.extend(vint(0));
+    body.push(15);
+    body.extend([0u8; 32]);
+    let mut record = vint(body.len() as u64);
+    record.extend(body);
+    record
 }
 
 /// A redirection extra record: size, type, redirection type, flags, target.

@@ -292,7 +292,12 @@ is already stored in the project, with no download and re upload through the cli
 ```
 
 Formats, by extension: `.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`,
-`.tar.xz`/`.txz`, all decoded in pure Rust, plus `.gz` and `.bz2`. A bare gzip or bzip2 file (not a
+`.tar.xz`/`.txz`, all decoded in pure Rust, plus `.gz` and `.bz2`, plus `.rar` (RAR 4 and RAR 5,
+opt in cargo feature `rar`: build with `--features rar` or `--all-features`; without it `.rar` is
+refused as an unsupported extension). `.rar` is read by the `unrar` crate (MIT OR Apache-2.0), which
+wraps RARLAB's UnRAR source; that source is free of charge to use for reading RAR archives but its
+licence forbids using it to build a RAR compatible archiver or to re create the RAR compression
+algorithm, which is why the feature is off by default. A bare gzip or bzip2 file (not a
 `.tar.gz` or `.tar.bz2`) holds one file: it is decompressed next to the archive, or into
 `destination`, under the archive name minus `.gz` or `.bz2`; passwords are refused, several gzip
 members or bzip2 streams are decoded as one stream, bytes after a bzip2 stream are refused as

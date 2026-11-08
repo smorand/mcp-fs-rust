@@ -103,7 +103,7 @@ fn output_name(file_name: &str, suffix_len: usize) -> Result<&str> {
 /// `normalize_path` clamps a leading `..` at the root (`../../x` becomes
 /// `/x`), but a relative destination that climbs out of the project must be
 /// refused (FR-NEW-011 item 6), so check the raw form first.
-fn normalize_destination(state: &AppState, dest: &str) -> Result<String> {
+pub(crate) fn normalize_destination(state: &AppState, dest: &str) -> Result<String> {
     let climbs = !dest.starts_with('/')
         && crate::util::PosixPath::normpath(dest).split('/').next() == Some("..");
     if climbs {

@@ -38,6 +38,7 @@ means something went wrong.
 ./test.sh                                    # cargo test --workspace
 cargo test -p mcp-fs-core --lib              # the library, where every test lives
 cargo test -p mcp-fs-core --lib storage::     # one area
+cargo test -p mcp-fs-core --lib --features rar   # also the .rar tests (BL-0130)
 cargo test --workspace --all-features        # includes the postgres driver
 cargo clippy --all-targets --all-features -- -D warnings   # second half of the quality gate
 ```
@@ -430,3 +431,4 @@ refuses it anyway. `test_remote::Remote::start(repo_dir, Behavior)` serves a bar
   a closed loopback port; the wording takes its host from the URL alone (`dt_0078_009`).
 - (2026-11-05, SPEC-0081) `cargo test -p mcp-fs-core --lib -- e2e_0081_` runs the 57 bare gzip acceptance tests. The capped reader records its high water mark in a `cfg(test)` thread local (`LAST_HIGH_WATER` in `tools/archive_single.rs`), read by `assert_extraction_bounded`; the tokio test runtime is single threaded, so the value belongs to one test.
 - (2026-11-05, SPEC-0083) `cargo test -p mcp-fs-core --lib -- e2e_0083_` runs the 53 bare bzip2 acceptance tests; the limit tests reuse `assert_extraction_bounded` and the `LAST_HIGH_WATER` hook of the gzip suite.
+- (2026-11-08, SPEC-0080) The `.rar` tests (`e2e_0080_`, in `tools/archive_rar.rs`, `tools/archive_rar_fixtures.rs` and `api/dataplane.rs`) are compiled only with the feature `rar`: `cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_` (a plain `cargo test` skips them, BL-0130; `--all-features` includes them). Fixtures: the plain cases are built in tree by the test only RAR5 store builder `RarEntry`/`rar5_store` (`archive_rar_fixtures.rs`: stored entries, directories, symlinks, hard links, an entry declaring a size other than its data, and an entry flagged encrypted whose bytes are plain, enough for a listing but never decoded); every encrypted, RAR4, solid, link plus password and truncated case is a real archive in `crates/core/tests/fixtures/rar/` made by RARLAB `rar` 6.24 (RAR4) or 7.23 (RAR5) trial builds, commands in the README there. The truncated ones (`cut.rar`, `cuth.rar`) are cut with `head -c`. Only the order of refusals needs a mutation to be sure a test bites: moving `ensure_rar5_complete` after the listing does not fail E2E-048 (the reader itself reports a cut archive as corrupt), removing it does.

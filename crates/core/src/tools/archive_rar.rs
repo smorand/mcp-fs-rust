@@ -1143,6 +1143,218 @@ mod tests {
         assert_absent(&f, &["/uploads/v4secret"]).await;
     }
 
+    // Order of refusals (FR-NEW-015) and membership (FR-NEW-018).
+
+    const BOTH: &[u8] = include_bytes!("../../tests/fixtures/rar/both.rar");
+    const HL2: &[u8] = include_bytes!("../../tests/fixtures/rar/hl2.rar");
+    const CUT: &[u8] = include_bytes!("../../tests/fixtures/rar/cut.rar");
+    const CUTH: &[u8] = include_bytes!("../../tests/fixtures/rar/cuth.rar");
+    const CORRUPT_PREFIX: &str = "archive is corrupt or not a valid rar file:";
+
+    /// The caller is checked first, as both doors do, then the engine runs.
+    async fn extract_as(f: &Fixture, mount: &str, person: &str, path: &str) -> Result<Value> {
+        f.state.authorize(mount, person).await?;
+        extract_archive(&f.state, mount, person, path, None, false, None).await
+    }
+
+    /// Projects `alpha` (owner `OWNER`, holding `/uploads/<archive>`) and `beta` (owner
+    /// carol), with bob and root members of neither.
+    async fn two_projects(archive: Option<&str>) -> Fixture {
+        let f = Fixture::with_config(|_| {}).await;
+        f.seed_project("alpha", OWNER).await;
+        f.seed_project("beta", "carol@example.com").await;
+        let c = f.state.stores.client("alpha").await.unwrap();
+        c.makedirs("/uploads", true).await.unwrap();
+        if let Some(name) = archive {
+            c.write_bytes_atomic(name, &report()).await.unwrap();
+        }
+        f
+    }
+
+    fn assert_not_member(e: &crate::errors::ToolError, person: &str) {
+        assert_eq!(e.code, crate::errors::code::FORBIDDEN, "{e:?}");
+        assert_eq!(e.message, format!("'{person}' is not a member of 'alpha'"));
+    }
+
+    async fn assert_alpha_untouched(f: &Fixture) {
+        let c = f.state.stores.client("alpha").await.unwrap();
+        assert!(!c.exists("/uploads/report").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_047_link_entry_wins_over_a_missing_passw() {
+        let f = fixture().await;
+        seed(&f, "/uploads/both.rar", BOTH).await;
+        let e = extract(&f, "/uploads/both.rar").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NOT_SUPPORTED, "{e:?}");
+        assert!(e.message.contains("'l'") && e.message.contains("symlink"), "{}", e.message);
+        assert_absent(&f, &["/uploads/both"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_048_corrupt_wins_over_a_wrong_password_w() {
+        let f = fixture().await;
+        seed(&f, "/uploads/cut.rar", CUT).await;
+        let e = extract_pw(&f, "/uploads/cut.rar", Some("nope")).await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "{e:?}");
+        assert!(e.message.starts_with(CORRUPT_PREFIX), "{}", e.message);
+        assert_absent(&f, &["/uploads/cut"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_049_escaping_name_wins_over_a_collision() {
+        let f = fixture().await;
+        seed(
+            &f,
+            "/uploads/two.rar",
+            &rar5_store(&[RarEntry::file("a.txt", b"a"), RarEntry::file("../x.txt", b"x")]),
+        )
+        .await;
+        seed(&f, "/uploads/two/a.txt", b"old").await;
+        let e = extract(&f, "/uploads/two.rar").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PATH_OUT_OF_BOUNDS, "{e:?}");
+        assert_eq!(read(&f, "/uploads/two/a.txt").await, b"old");
+        assert_absent(&f, &["/uploads/x.txt"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_053_non_member() {
+        let f = two_projects(Some("/uploads/report.rar")).await;
+        let e = extract_as(&f, "alpha", "bob@example.com", "/uploads/report.rar").await;
+        assert_not_member(&e.unwrap_err(), "bob@example.com");
+        assert_alpha_untouched(&f).await;
+    }
+
+    /// Platform administration is not file access: root is no member of `alpha`.
+    #[tokio::test]
+    async fn e2e_0080_054_platform_administrator_without_membe() {
+        let f = two_projects(Some("/uploads/report.rar")).await;
+        let e = extract_as(&f, "alpha", "root@example.com", "/uploads/report.rar").await;
+        assert_not_member(&e.unwrap_err(), "root@example.com");
+        assert_alpha_untouched(&f).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_055_member_of_another_project() {
+        let f = two_projects(Some("/uploads/report.rar")).await;
+        let e = extract_as(&f, "alpha", "carol@example.com", "/uploads/report.rar").await;
+        assert_not_member(&e.unwrap_err(), "carol@example.com");
+        assert_alpha_untouched(&f).await;
+    }
+
+    /// The caller is refused before the path is looked at, so a missing archive does
+    /// not tell a stranger what the project holds.
+    #[tokio::test]
+    async fn e2e_0080_057_non_member_asking_for_a_missing_arch() {
+        let f = two_projects(None).await;
+        let e = extract_as(&f, "alpha", "bob@example.com", "/uploads/ghost.rar").await;
+        assert_not_member(&e.unwrap_err(), "bob@example.com");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_058_truncated_archive_with_encrypted_fil() {
+        let f = fixture().await;
+        seed(&f, "/uploads/cuth.rar", CUTH).await;
+        assert_password_refusal(extract_pw(&f, "/uploads/cuth.rar", Some("nope")).await, INCORRECT);
+        assert_absent(&f, &["/uploads/cuth"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_059_encrypted_file_names_right_password() {
+        let f = fixture().await;
+        seed(&f, "/uploads/hl2.rar", HL2).await;
+        let e = extract_pw(&f, "/uploads/hl2.rar", Some(PASSWORD)).await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NOT_SUPPORTED, "{e:?}");
+        assert!(e.message.contains("'l'") && e.message.contains("symlink"), "{}", e.message);
+        assert_absent(&f, &["/uploads/hl2"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_060_truncated_archive_with_readable_name() {
+        let f = fixture().await;
+        seed(&f, "/uploads/cut2.rar", CUT).await;
+        let e = extract(&f, "/uploads/cut2.rar").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "{e:?}");
+        assert!(e.message.starts_with(CORRUPT_PREFIX), "{}", e.message);
+        assert_absent(&f, &["/uploads/cut2"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_061_destination_outside_the_project() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        let e = extract_archive(
+            &f.state,
+            MOUNT,
+            OWNER,
+            "/uploads/report.rar",
+            Some("../../x"),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PATH_OUT_OF_BOUNDS, "{e:?}");
+        assert_eq!(e.message, "path escapes the volume root: ../../x");
+        assert_absent(&f, &["/uploads/report", "/x"]).await;
+    }
+
+    /// Encrypted data with readable names, the first entry declaring 10 bytes and
+    /// holding 1 000 000: the password is asked for before any entry is decoded.
+    #[tokio::test]
+    async fn e2e_0080_066_missing_password_wins_over_an_oversi() {
+        let f = fixture().await;
+        seed(
+            &f,
+            "/uploads/encbomb.rar",
+            &rar5_store(&[RarEntry::encrypted_declaring("big.bin", 10, &vec![7u8; 1_000_000])]),
+        )
+        .await;
+        assert_password_refusal(extract_pw(&f, "/uploads/encbomb.rar", None).await, NEEDED);
+        assert_absent(&f, &["/uploads/encbomb"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_067_oversized_entry_wins_over_a_collisio() {
+        let f = fixture().await;
+        seed(
+            &f,
+            "/uploads/bomb.rar",
+            &rar5_store(&[RarEntry::declaring("big.bin", 10, &vec![7u8; 1_000_000])]),
+        )
+        .await;
+        seed(&f, "/uploads/bomb/big.bin", b"old").await;
+        let e = extract(&f, "/uploads/bomb.rar").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "{e:?}");
+        assert!(e.message.contains("big.bin"), "{}", e.message);
+        assert_eq!(read(&f, "/uploads/bomb/big.bin").await, b"old");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_068_collision_wins_over_the_storage_limi() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        seed(&f, "/uploads/report/data/a.txt", b"old").await;
+        limit_remaining(&f, 5).await;
+        let e = extract(&f, "/uploads/report.rar").await.unwrap_err();
+        assert_eq!(e.code, crate::errors::code::NO_CLOBBER, "{e:?}");
+        assert_eq!(read(&f, "/uploads/report/data/a.txt").await, b"old");
+        assert_eq!(remaining_storage(&f).await, 5);
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_081_the_project_refusal_comes_first() {
+        let f = fixture_with_allowance(5).await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        limit_remaining(&f, 5).await;
+        let v = extract(&f, "/uploads/report.rar").await;
+        project_refusal(&v);
+        assert_eq!(remaining_storage(&f).await, 5);
+        assert_eq!(allowance(&f), 5);
+        assert_absent(&f, &["/uploads/report"]).await;
+    }
+
     #[test]
     fn multi_volume_name_edge_cases() {
         use crate::tools::archive::is_multi_volume_name as m;
