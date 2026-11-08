@@ -85,6 +85,7 @@ flate2 = "1"
 bzip2 = "0.6"
 # `.tar.xz`/`.txz` decompression, pure Rust.
 lzma-rs = "0.3"
+liblzma = "0.4.9"
 # `.7z` decompression. `sevenz-rust2`, not `sevenz-rust` (DEC-007: the latter has
 # an unmaintained advisory and its repository was deleted). Pinned under 0.21 to
 # stay within this workspace's MSRV (0.21+ requires a newer rustc than 1.94.1).

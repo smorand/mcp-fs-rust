@@ -59,6 +59,7 @@ const SUFFIXES: &[(&str, ArchiveFormat)] = &[
     // their tar row first.
     (".gz", ArchiveFormat::Single(SingleFormat::Gzip)),
     (".bz2", ArchiveFormat::Single(SingleFormat::Bzip2)),
+    (".xz", ArchiveFormat::Single(SingleFormat::Xz)),
 ];
 
 /// Detect the format of `path` from its filename, case insensitively
@@ -1043,7 +1044,7 @@ pub(crate) mod tests {
     #[test]
     fn detect_format_maps_every_suffix() {
         use ArchiveFormat::{SevenZ, Single, Tar, Zip};
-        use SingleFormat::{Bzip2 as Bz, Gzip as Gz};
+        use SingleFormat::{Bzip2 as Bz, Gzip as Gz, Xz as Xzf};
         use TarCompression::{Bzip2, Gzip, None as Plain, Xz};
         for (path, fmt, len) in [
             ("/a/x.zip", Zip, 4),
@@ -1061,6 +1062,8 @@ pub(crate) mod tests {
             ("/a/X.CSV.GZ", Single(Gz), 3),
             ("/a/x.bz2", Single(Bz), 4),
             ("/a/X.CSV.BZ2", Single(Bz), 4),
+            ("/a/x.xz", Single(Xzf), 3),
+            ("/a/X.CSV.XZ", Single(Xzf), 3),
         ] {
             assert_eq!(detect_format(path).unwrap(), (fmt, len), "{path}");
         }

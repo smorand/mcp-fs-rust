@@ -3793,6 +3793,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "jsonwebtoken",
+ "liblzma",
  "lzma-rs",
  "md-5 0.10.6",
  "parquet",

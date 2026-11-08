@@ -70,6 +70,7 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 bzip2 = { workspace = true }
 lzma-rs = { workspace = true }
+liblzma = { workspace = true }
 sevenz-rust2 = { workspace = true }
 unrar = { workspace = true, optional = true }
 

@@ -18,6 +18,7 @@ const CHUNK: usize = 65_536;
 pub(crate) enum SingleFormat {
     Gzip,
     Bzip2,
+    Xz,
 }
 
 impl SingleFormat {
@@ -26,6 +27,7 @@ impl SingleFormat {
         match self {
             Self::Gzip => "gz",
             Self::Bzip2 => "bz2",
+            Self::Xz => "xz",
         }
     }
 }
@@ -46,6 +48,8 @@ pub(crate) enum ReadError {
         high_water: u64,
     },
     Io(std::io::Error),
+    /// The decoder could not be created: a fault of the server, not of the file.
+    Init(std::io::Error),
 }
 
 #[cfg(test)]
@@ -61,11 +65,22 @@ thread_local! {
 /// the first member and ignore the rest. `MultiBzDecoder` does the same for
 /// bzip2: it decodes every stream and fails on bytes that are not another
 /// stream, where `BzDecoder` would stop after the first and ignore the rest.
-fn decoder(format: SingleFormat, bytes: &[u8]) -> Box<dyn Read + '_> {
-    match format {
+/// The xz decoder is built from an explicit xz stream decoder, not
+/// `new_multi_decoder`: that one is an auto decoder that also accepts a legacy
+/// `.lzma` file and decodes a check type it cannot verify without saying so.
+/// Fallible because liblzma can fail to allocate its state.
+fn decoder(format: SingleFormat, bytes: &[u8]) -> std::io::Result<Box<dyn Read + '_>> {
+    Ok(match format {
         SingleFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
         SingleFormat::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(bytes)),
-    }
+        SingleFormat::Xz => {
+            let stream = liblzma::stream::Stream::new_stream_decoder(
+                u64::MAX,
+                liblzma::stream::TELL_UNSUPPORTED_CHECK,
+            )?;
+            Box::new(liblzma::read::XzDecoder::new_stream(bytes, stream))
+        }
+    })
 }
 
 /// Read `reader` to its end in `CHUNK` pieces, stopping with `CapExceeded`
@@ -236,12 +251,17 @@ pub(crate) async fn extract_single(
     let bytes = client.read_bytes(normalized).await?;
     let label = format.label();
     let cap = caps.limit;
-    let read = tokio::task::spawn_blocking(move || read_capped(decoder(format, &bytes), cap))
-        .await
-        .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))?;
+    let read = tokio::task::spawn_blocking(move || {
+        decoder(format, &bytes).map_err(ReadError::Init).and_then(|r| read_capped(r, cap))
+    })
+    .await
+    .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))?;
     let decoded = match read {
         Ok(decoded) => decoded,
         Err(ReadError::Io(e)) => return Err(corrupt(label, e)),
+        Err(ReadError::Init(e)) => {
+            return Err(ToolError::internal(format!("cannot start the {label} decoder: {e}")));
+        }
         Err(ReadError::CapExceeded { high_water }) => {
             #[cfg(test)]
             LAST_HIGH_WATER.with(|c| c.set(Some(high_water)));
@@ -820,14 +840,17 @@ mod tests {
     /// The bomb is stopped by the decoder itself: it never holds more than
     /// the cap plus one chunk.
     fn assert_bomb_bounded(cap: u64) {
-        let err = super::read_capped(super::decoder(super::SingleFormat::Gzip, &bomb()), cap)
-            .expect_err("the bomb is over the cap");
+        let err =
+            super::read_capped(super::decoder(super::SingleFormat::Gzip, &bomb()).unwrap(), cap)
+                .expect_err("the bomb is over the cap");
         match err {
             super::ReadError::CapExceeded { high_water } => {
                 assert!(high_water <= cap + 65_536, "held {high_water} bytes");
                 assert!(high_water < 1_000_000, "held {high_water} bytes");
             }
-            super::ReadError::Io(e) => panic!("expected the cap error, got {e}"),
+            super::ReadError::Io(e) | super::ReadError::Init(e) => {
+                panic!("expected the cap error, got {e}")
+            }
         }
     }
 
@@ -1668,5 +1691,190 @@ mod tests {
         session_refusal(&v, 10);
         write_small(&f).await;
         assert_eq!(allowance(&f), 7);
+    }
+
+    // Bare xz files (SPEC-0082, US-0178).
+
+    fn xz(content: &[u8]) -> Vec<u8> {
+        let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(content).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// An xz file made with the given filter chain and integrity check.
+    fn xz_with(
+        content: &[u8],
+        filters: &liblzma::stream::Filters,
+        check: liblzma::stream::Check,
+    ) -> Vec<u8> {
+        let stream = liblzma::stream::Stream::new_stream_encoder(filters, check).unwrap();
+        let mut enc = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+        enc.write_all(content).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_001_xz_file_decompresses_next_to_the_arc() {
+        let f = fixture().await;
+        let archive = xz(CSV);
+        seed(&f, "/uploads/data.csv.xz", &archive).await;
+        let v = extract(&f, "/uploads/data.csv.xz", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/uploads", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 16})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/data.csv.xz").await, Some(archive));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_002_upper_case_suffix() {
+        let f = fixture().await;
+        seed(&f, "/uploads/DATA.CSV.XZ", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/DATA.CSV.XZ", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/DATA.CSV").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_003_explicit_existing_destination() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/out", true).await.unwrap();
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.xz", Some("/out")).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/out", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 16})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/out/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_015_a_file_with_an_x86_branch_filter_dec() {
+        use liblzma::stream::{Check, Filters, LzmaOptions};
+        let f = fixture().await;
+        let mut filters = Filters::new();
+        filters.x86();
+        filters.lzma2(&LzmaOptions::new_preset(6).unwrap());
+        seed(&f, "/uploads/bcj.xz", &xz_with(b"hello", &filters, Check::Crc64)).await;
+        let v = extract(&f, "/uploads/bcj.xz", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/uploads", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 5})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/uploads/bcj").await.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_026_xz_of_an_empty_file() {
+        let f = fixture().await;
+        seed(&f, "/uploads/empty.txt.xz", &xz(b"")).await;
+        let v = extract(&f, "/uploads/empty.txt.xz", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/uploads", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 0})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/uploads/empty.txt").await, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_034_accents_and_spaces() {
+        let f = fixture().await;
+        seed(&f, "/uploads/rapport été.txt.xz", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/rapport été.txt.xz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/rapport été.txt").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_035_several_dots_and_no_dot() {
+        let f = fixture().await;
+        seed(&f, "/uploads/a.b.c.xz", &xz(CSV)).await;
+        seed(&f, "/uploads/README.xz", &xz(CSV)).await;
+        for p in ["/uploads/a.b.c.xz", "/uploads/README.xz"] {
+            let v = extract(&f, p, None).await;
+            assert!(v.is_ok(), "{p}: {v:?}");
+        }
+        assert_eq!(read(&f, "/uploads/a.b.c").await.as_deref(), Some(CSV));
+        assert_eq!(read(&f, "/uploads/README").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_036_success_is_audited() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.xz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        let lines: Vec<_> = log.iter().filter(|e| e.op == "extract_archive").collect();
+        assert_eq!(lines.len(), 1, "{log:?}");
+        assert_eq!(lines[0].path, "/uploads/data.csv.xz");
+        assert_eq!(lines[0].detail, "destination=/uploads files_written=1 bytes_written=16");
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_039_missing_destination_is_created() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.xz", Some("/new/dir")).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/new/dir", "files_written": 1,
+                         "dirs_created": 1, "bytes_written": 16})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/new/dir/data.csv").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_040_trailing_slash_on_the_destination() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/out", true).await.unwrap();
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.xz", Some("/out/")).await;
+        assert_eq!(v.as_ref().ok().and_then(|v| v["destination"].as_str()), Some("/out"), "{v:?}");
+        assert_eq!(read(&f, "/out/data.csv").await.as_deref(), Some(CSV));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_056_a_file_with_a_sha_256_integrity_chec() {
+        use liblzma::stream::{Check, Filters, LzmaOptions};
+        let f = fixture().await;
+        let mut filters = Filters::new();
+        filters.lzma2(&LzmaOptions::new_preset(6).unwrap());
+        seed(&f, "/uploads/sha.xz", &xz_with(b"hello", &filters, Check::Sha256)).await;
+        let v = extract(&f, "/uploads/sha.xz", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/uploads", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 5})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/uploads/sha").await.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_057_archive_directly_under_the_project_r() {
+        let f = fixture().await;
+        seed(&f, "/a.xz", &xz(b"hello")).await;
+        let v = extract(&f, "/a.xz", None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": "/", "files_written": 1,
+                         "dirs_created": 0, "bytes_written": 5})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, "/a").await.as_deref(), Some(&b"hello"[..]));
     }
 }
