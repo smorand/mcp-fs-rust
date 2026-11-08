@@ -29,9 +29,19 @@ pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<Dec
 
     // Entry rules run over a listing pass first, so a link or an escaping name
     // anywhere in the archive is refused before one byte is decoded (FR-NEW-015).
-    for header in open(&path, password).open_for_listing().map_err(|e| corrupt("rar", e))? {
-        let header = header.map_err(|e| corrupt("rar", e))?;
+    // With encrypted file names the listing itself cannot be read without the right
+    // password, so the password codes here mean "ask for it", not "corrupt" (FR-NEW-004).
+    let list_err = |e: unrar::error::UnrarError| listing_error(e, password);
+    let mut any_encrypted = false;
+    for header in open(&path, password).open_for_listing().map_err(list_err)? {
+        let header = header.map_err(list_err)?;
         ensure_entry_allowed(&header)?;
+        any_encrypted |= header.is_encrypted();
+    }
+    // Decided before one byte is read, and after the entry rules (FR-NEW-015 item 7
+    // after 6), so a plain entry is never written next to an encrypted one (FR-NEW-002).
+    if any_encrypted && password.is_none() {
+        return Err(password_required_message(None));
     }
 
     let mut cursor = open(&path, password).open_for_processing().map_err(|e| corrupt("rar", e))?;
@@ -139,6 +149,18 @@ fn read_vint(input: &mut &[u8]) -> Result<u64> {
         Err(corrupt("rar", TRUNCATED))
     } else {
         Err(corrupt("rar", "variable length integer is too long"))
+    }
+}
+
+/// A password code from the listing pass means the names are encrypted and the password
+/// is missing or wrong; any other code is a damaged archive. The library's own text is
+/// only used for the latter, and never holds the password.
+fn listing_error(e: unrar::error::UnrarError, password: Option<&str>) -> ToolError {
+    use unrar::error::Code;
+    if matches!(e.code, Code::MissingPassword | Code::BadPassword) {
+        password_required_message(password)
+    } else {
+        corrupt("rar", e)
     }
 }
 
@@ -867,6 +889,138 @@ mod tests {
     const V5: &[u8] = include_bytes!("../../tests/fixtures/rar/v5.rar");
     const SOLID: &[u8] = include_bytes!("../../tests/fixtures/rar/solid.rar");
     const V4_SECRET: &[u8] = include_bytes!("../../tests/fixtures/rar/v4secret.rar");
+    const SECRET: &[u8] = include_bytes!("../../tests/fixtures/rar/secret.rar");
+    const HIDDEN: &[u8] = include_bytes!("../../tests/fixtures/rar/hidden.rar");
+    const PASSWORD: &str = "s3cret-Ünï";
+    const NEEDED: &str =
+        "password required to extract this archive; call again with the 'password' parameter";
+    const INCORRECT: &str =
+        "incorrect password for this archive; call again with the correct 'password' parameter";
+
+    async fn extract_pw(f: &Fixture, path: &str, password: Option<&str>) -> Result<Value> {
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        extract_archive(&f.state, MOUNT, OWNER, path, None, false, password).await
+    }
+
+    fn assert_password_refusal(r: Result<Value>, message: &str) {
+        let e = r.expect_err("the extraction must be refused");
+        assert_eq!(e.code, crate::errors::code::PASSWORD_REQUIRED, "{e:?}");
+        assert_eq!(e.message, message);
+    }
+
+    /// Capture state is per thread, so the whole body runs on one current thread runtime.
+    fn with_capture_lock<F: std::future::Future>(f: F) -> F::Output {
+        let _guard = crate::logging::capture::lock_for_test();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    /// No log event, span or audit line of this session holds `secret`.
+    fn assert_never_recorded(f: &Fixture, secret: &str) {
+        for ev in crate::logging::capture::events() {
+            for v in ev.fields.values() {
+                assert!(!v.contains(secret), "event field leaked the password: {v}");
+            }
+        }
+        for sp in crate::logging::capture::spans() {
+            for v in sp.fields.values() {
+                assert!(!v.contains(secret), "span field leaked the password: {v}");
+            }
+        }
+        for a in f.state.safety.audit(OWNER, MOUNT) {
+            assert!(
+                !a.path.contains(secret) && !a.detail.contains(secret),
+                "audit line leaked the password: {a:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_003_right_password_extracts() {
+        let f = fixture().await;
+        seed(&f, "/uploads/secret.rar", SECRET).await;
+        let v = extract_pw(&f, "/uploads/secret.rar", Some(PASSWORD)).await.unwrap();
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(v["bytes_written"], 10);
+        assert_eq!(read(&f, "/uploads/secret/note.txt").await, b"top secret");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_004_right_password_on_encrypted_file_nam() {
+        let f = fixture().await;
+        seed(&f, "/uploads/hidden.rar", HIDDEN).await;
+        extract_pw(&f, "/uploads/hidden.rar", Some(PASSWORD)).await.unwrap();
+        assert_eq!(read(&f, "/uploads/hidden/note.txt").await, b"top secret");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_005_no_password_on_an_encrypted_rar() {
+        let f = fixture().await;
+        seed(&f, "/uploads/secret.rar", SECRET).await;
+        assert_password_refusal(extract_pw(&f, "/uploads/secret.rar", None).await, NEEDED);
+        assert_absent(&f, &["/uploads/secret"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_006_no_password_on_encrypted_file_names() {
+        let f = fixture().await;
+        seed(&f, "/uploads/hidden.rar", HIDDEN).await;
+        assert_password_refusal(extract_pw(&f, "/uploads/hidden.rar", None).await, NEEDED);
+        assert_absent(&f, &["/uploads/hidden"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_007_wrong_password() {
+        let f = fixture().await;
+        seed(&f, "/uploads/secret.rar", SECRET).await;
+        assert_password_refusal(
+            extract_pw(&f, "/uploads/secret.rar", Some("nope")).await,
+            INCORRECT,
+        );
+        assert_absent(&f, &["/uploads/secret"]).await;
+    }
+
+    #[test]
+    fn e2e_0080_020_success_is_audited_without_the_passw() {
+        with_capture_lock(async {
+            let f = fixture().await;
+            seed(&f, "/uploads/secret.rar", SECRET).await;
+            crate::logging::capture::clear();
+            extract_pw(&f, "/uploads/secret.rar", Some(PASSWORD)).await.unwrap();
+            let log = f.state.safety.audit(OWNER, MOUNT);
+            let lines: Vec<_> = log.iter().filter(|e| e.op == "extract_archive").collect();
+            assert_eq!(lines.len(), 1, "{log:?}");
+            assert_eq!(lines[0].path, "/uploads/secret.rar");
+            assert!(lines[0].detail.contains("/uploads/secret"), "{}", lines[0].detail);
+            assert!(lines[0].detail.contains('1') && lines[0].detail.contains("10"));
+            assert_never_recorded(&f, PASSWORD);
+        });
+    }
+
+    #[test]
+    fn e2e_0080_021_wrong_password_is_not_logged() {
+        with_capture_lock(async {
+            let f = fixture().await;
+            seed(&f, "/uploads/secret.rar", SECRET).await;
+            crate::logging::capture::clear();
+            let r = extract_pw(&f, "/uploads/secret.rar", Some("nope-12345")).await;
+            assert_password_refusal(r, INCORRECT);
+            assert_never_recorded(&f, "nope-12345");
+            assert!(f.state.safety.audit(OWNER, MOUNT).iter().all(|e| e.op != "extract_archive"));
+        });
+    }
+
+    #[test]
+    fn e2e_0080_030_wrong_password_on_encrypted_file_nam() {
+        with_capture_lock(async {
+            let f = fixture().await;
+            seed(&f, "/uploads/hidden.rar", HIDDEN).await;
+            crate::logging::capture::clear();
+            let r = extract_pw(&f, "/uploads/hidden.rar", Some("nope-67890")).await;
+            assert_password_refusal(r, INCORRECT);
+            assert_absent(&f, &["/uploads/hidden"]).await;
+            assert_never_recorded(&f, "nope-67890");
+        });
+    }
 
     #[tokio::test]
     async fn e2e_0080_062_rar_version_4_extracts() {

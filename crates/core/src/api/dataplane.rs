@@ -3383,6 +3383,32 @@ mod tests {
         );
     }
 
+    /// SPEC-0080/E2E-022: an encrypted RAR gives the retry refusal with no password and
+    /// extracts with the right one, through the REST door.
+    #[cfg(feature = "rar")]
+    #[tokio::test]
+    async fn e2e_0080_022_the_http_api_gives_the_same_refusal() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let rar = include_bytes!("../../tests/fixtures/rar/secret.rar");
+        c.write_bytes_atomic("/uploads/secret.rar", rar).await.unwrap();
+        let (s, v) = h.post(&u("extract-archive"), json!({"path": "/uploads/secret.rar"})).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PASSWORD_REQUIRED);
+        assert!(
+            v["detail"].as_str().unwrap_or_default().contains(
+                "password required to extract this archive; call again with the 'password' parameter"
+            ),
+            "{v}"
+        );
+        let body = json!({"path": "/uploads/secret.rar", "password": "s3cret-Ünï"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(v["bytes_written"], 10);
+        assert_eq!(c.read_bytes("/uploads/secret/note.txt").await.unwrap(), b"top secret");
+    }
+
     /// SPEC-0080/E2E-045: an encrypted zip with no password is refused with the
     /// retry instruction through the REST door.
     #[tokio::test]
