@@ -3,7 +3,9 @@
 //! source licence is non free (DEC-001).
 
 use crate::errors::{Result, ToolError};
-use crate::tools::archive::{DecodedEntry, corrupt, ensure_entry_path_safe};
+use crate::tools::archive::{
+    DecodedEntry, corrupt, ensure_entry_path_safe, password_required_message,
+};
 
 /// Name the archive gets inside its per call temp dir; the extension is what the
 /// UnRAR library expects, the name itself never reaches the caller.
@@ -47,11 +49,22 @@ pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<Dec
         }
         // UnRAR stops at the declared size, so an entry whose data outgrows it
         // fails its CRC here instead of decoding further.
-        // An encrypted entry fails for other reasons too (password handling arrives with
-        // US-0175), so only a plain entry's read error is the oversize signal.
+        // On an encrypted entry UnRAR reports a wrong password as BadPassword (RAR5) or as
+        // BadData, a CRC error, (RAR4 has no password check value), so those two codes
+        // are the password signal; any other code stays corrupt. A plain entry's read
+        // error is the oversize signal.
         let encrypted = entry.is_encrypted();
         let (data, next) = header.read().map_err(|e| {
-            if encrypted { corrupt("rar", e) } else { oversized(&rel_path, declared_size) }
+            if !encrypted {
+                oversized(&rel_path, declared_size)
+            } else if matches!(
+                e.code,
+                unrar::error::Code::BadPassword | unrar::error::Code::BadData
+            ) {
+                password_required_message(password)
+            } else {
+                corrupt("rar", e)
+            }
         })?;
         if data.len() as u64 != declared_size {
             return Err(oversized(&rel_path, declared_size));
@@ -847,6 +860,67 @@ mod tests {
     #[tokio::test]
     async fn e2e_0080_075_folder_named_with_an_upper_case_suff() {
         assert_folder_refused("/uploads/DIR.RAR").await;
+    }
+
+    /// Real archives made by RARLAB `rar` (see tests/fixtures/rar/README.md).
+    const V4: &[u8] = include_bytes!("../../tests/fixtures/rar/v4.rar");
+    const V5: &[u8] = include_bytes!("../../tests/fixtures/rar/v5.rar");
+    const SOLID: &[u8] = include_bytes!("../../tests/fixtures/rar/solid.rar");
+    const V4_SECRET: &[u8] = include_bytes!("../../tests/fixtures/rar/v4secret.rar");
+
+    #[tokio::test]
+    async fn e2e_0080_062_rar_version_4_extracts() {
+        let f = fixture().await;
+        seed(&f, "/uploads/v4.rar", V4).await;
+        let v = extract(&f, "/uploads/v4.rar").await.unwrap();
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(v["bytes_written"], 5);
+        assert_eq!(read(&f, "/uploads/v4/a.txt").await, b"hello");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_063_rar_version_5_extracts() {
+        let f = fixture().await;
+        seed(&f, "/uploads/v5.rar", V5).await;
+        let v = extract(&f, "/uploads/v5.rar").await.unwrap();
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(v["bytes_written"], 5);
+        assert_eq!(read(&f, "/uploads/v5/a.txt").await, b"hello");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_064_solid_archive_extracts() {
+        let f = fixture().await;
+        seed(&f, "/uploads/solid.rar", SOLID).await;
+        let v = extract(&f, "/uploads/solid.rar").await.unwrap();
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(v["bytes_written"], 12);
+        assert_eq!(read(&f, "/uploads/solid/a.txt").await, b"hello");
+        assert_eq!(read(&f, "/uploads/solid/b.txt").await, b"goodbye");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_065_wrong_password_on_a_rar_version_4() {
+        let f = fixture().await;
+        seed(&f, "/uploads/v4secret.rar", V4_SECRET).await;
+        f.state.authorize(MOUNT, OWNER).await.unwrap();
+        let e = extract_archive(
+            &f.state,
+            MOUNT,
+            OWNER,
+            "/uploads/v4secret.rar",
+            None,
+            false,
+            Some("nope"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, crate::errors::code::PASSWORD_REQUIRED, "{e:?}");
+        assert_eq!(
+            e.message,
+            "incorrect password for this archive; call again with the correct 'password' parameter"
+        );
+        assert_absent(&f, &["/uploads/v4secret"]).await;
     }
 
     #[test]

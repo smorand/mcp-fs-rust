@@ -692,7 +692,7 @@ fn sevenz_special_type(entry: &sevenz_rust2::ArchiveEntry) -> Option<&'static st
     }
 }
 
-fn password_required_message(password: Option<&str>) -> ToolError {
+pub(crate) fn password_required_message(password: Option<&str>) -> ToolError {
     if password.is_none() {
         ToolError::password_required(
             "password required to extract this archive; call again with the 'password' parameter",
