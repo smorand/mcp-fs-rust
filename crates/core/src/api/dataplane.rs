@@ -3670,4 +3670,49 @@ mod tests {
         let c = h.state.stores.client(MOUNT).await.unwrap();
         assert!(!c.exists("/uploads/report").await.unwrap(), "nothing may be extracted");
     }
+
+    fn csv_xz() -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(b"id,name\n1,Alice\n").unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// SPEC-0082 E2E-037: the REST door answers what the engine answers for a
+    /// bare xz file, and a second call hits the no clobber refusal.
+    #[tokio::test]
+    async fn e2e_0082_037_the_http_api_gives_the_same_answer() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.xz", &csv_xz()).await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.xz", "overwrite": false});
+        let (s, v) = h.post(&u("extract-archive"), body.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"destination": "/uploads", "files_written": 1,
+                   "dirs_created": 0, "bytes_written": 16})
+        );
+        assert_eq!(c.read_bytes("/uploads/data.csv").await.unwrap(), b"id,name\n1,Alice\n");
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], code::NO_CLOBBER);
+        assert!(v["detail"].as_str().unwrap_or_default().contains("already exists"), "{v}");
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_046_password_through_the_http_api() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.xz", &csv_xz()).await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.xz", "password": "s3cret"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: password is not applicable to this archive format"
+        );
+        assert!(!c.exists("/uploads/data.csv").await.unwrap());
+    }
 }

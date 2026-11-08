@@ -2050,4 +2050,107 @@ mod tests {
         seed(&f, "/uploads/chk.xz", &file).await;
         refused_xz(&f, "/uploads/chk.xz", "/uploads/chk").await;
     }
+
+    // Password, output name, tar rows (SPEC-0082, US-0180).
+
+    async fn xz_password_refused(password: &str) {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        let e = extract_with(&f, "/uploads/data.csv.xz", None, false, Some(password)).await;
+        let e = e.expect_err("a password must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, NO_PASSWORD);
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_016_password_given() {
+        xz_password_refused("s3cret").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_045_empty_password() {
+        xz_password_refused("").await;
+    }
+
+    async fn refuses_xz_name(file: &str, shown: &str) {
+        let f = fixture().await;
+        let path = format!("/uploads/{file}");
+        seed(&f, &path, &xz(CSV)).await;
+        let e = extract(&f, &path, None).await;
+        let e = e.expect_err("a name with no stem must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(e.message, format!("cannot derive an output file name from '{shown}'"));
+        assert!(f.state.safety.audit(OWNER, MOUNT).iter().all(|a| a.op != "extract_archive"));
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        let names: Vec<String> =
+            c.list_dir("/uploads").await.unwrap().into_iter().map(|n| n.path).collect();
+        assert_eq!(names, vec![path.clone()], "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_017_file_named_xz() {
+        refuses_xz_name(".xz", ".xz").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_041_file_named_xz() {
+        refuses_xz_name("..xz", "..xz").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_042_upper_case_xz_alone() {
+        refuses_xz_name(".XZ", ".XZ").await;
+    }
+
+    async fn tar_xz_is_a_tar(archive: &str, folder: &str) {
+        let f = fixture().await;
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let mut h = tar::Header::new_gnu();
+            h.set_path("a.txt").unwrap();
+            h.set_size(5);
+            h.set_cksum();
+            b.append(&h, &b"hello"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        // The tar family still decodes with lzma-rs, so the fixture uses it too.
+        let mut packed = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut packed).unwrap();
+        seed(&f, archive, &packed).await;
+        let v = extract_with(&f, archive, None, false, None).await;
+        assert_eq!(
+            v.as_ref().ok(),
+            Some(&json!({"destination": folder, "files_written": 1,
+                         "dirs_created": 1, "bytes_written": 5})),
+            "{v:?}"
+        );
+        assert_eq!(read(&f, &format!("{folder}/a.txt")).await.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_005_tar_xz_is_still_a_tar() {
+        tar_xz_is_a_tar("/uploads/pack.tar.xz", "/uploads/pack").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_006_txz_is_still_a_tar() {
+        tar_xz_is_a_tar("/uploads/pack.txz", "/uploads/pack").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_047_tar_xz_is_still_a_tar() {
+        tar_xz_is_a_tar("/uploads/PACK.TAR.XZ", "/uploads/PACK").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_048_another_extension_is_still_refused() {
+        let f = fixture().await;
+        seed(&f, "/uploads/pack.lz", b"anything").await;
+        let e = extract(&f, "/uploads/pack.lz", None).await;
+        let e = e.expect_err("an unknown extension must be refused");
+        assert_eq!(e.code, code::NOT_SUPPORTED);
+        assert_eq!(e.message, "unsupported archive extension: '.lz'");
+    }
 }
