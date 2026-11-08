@@ -68,6 +68,8 @@ thread_local! {
 /// The xz decoder is built from an explicit xz stream decoder, not
 /// `new_multi_decoder`: that one is an auto decoder that also accepts a legacy
 /// `.lzma` file and decodes a check type it cannot verify without saying so.
+/// `CONCATENATED` makes liblzma read every stream, accept zero padding of a
+/// multiple of 4 bytes between and after them, and refuse any other trailing byte.
 /// Fallible because liblzma can fail to allocate its state.
 fn decoder(format: SingleFormat, bytes: &[u8]) -> std::io::Result<Box<dyn Read + '_>> {
     Ok(match format {
@@ -76,7 +78,7 @@ fn decoder(format: SingleFormat, bytes: &[u8]) -> std::io::Result<Box<dyn Read +
         SingleFormat::Xz => {
             let stream = liblzma::stream::Stream::new_stream_decoder(
                 u64::MAX,
-                liblzma::stream::TELL_UNSUPPORTED_CHECK,
+                liblzma::stream::CONCATENATED | liblzma::stream::TELL_UNSUPPORTED_CHECK,
             )?;
             Box::new(liblzma::read::XzDecoder::new_stream(bytes, stream))
         }
@@ -1876,5 +1878,176 @@ mod tests {
             "{v:?}"
         );
         assert_eq!(read(&f, "/a").await.as_deref(), Some(&b"hello"[..]));
+    }
+
+    // Several streams, padding and corrupt input (SPEC-0082, US-0179).
+
+    fn xz_streams(parts: &[&[u8]]) -> Vec<u8> {
+        parts.iter().flat_map(|p| xz(p)).collect()
+    }
+
+    const XZ_CORRUPT: &str = "archive is corrupt or not a valid xz file:";
+
+    fn assert_xz_corrupt(v: &Result<Value>) {
+        let e = v.as_ref().expect_err("a corrupt file must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+        assert!(e.message.starts_with(XZ_CORRUPT), "{}", e.message);
+    }
+
+    async fn refused_xz(f: &Fixture, archive: &str, output: &str) {
+        let v = extract(f, archive, None).await;
+        assert_xz_corrupt(&v);
+        assert_eq!(read(f, output).await, None);
+    }
+
+    async fn extracted_xz(archive_bytes: &[u8], archive: &str, output: &str, want: &[u8]) {
+        let f = fixture().await;
+        seed(&f, archive, archive_bytes).await;
+        let v = extract(&f, archive, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(v.unwrap_or_default()["bytes_written"], want.len());
+        assert_eq!(read(&f, output).await.as_deref(), Some(want));
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_004_two_xz_streams_back_to_back() {
+        extracted_xz(
+            &xz_streams(&[b"hello ", b"world"]),
+            "/uploads/two.txt.xz",
+            "/uploads/two.txt",
+            b"hello world",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_043_three_xz_streams() {
+        extracted_xz(
+            &xz_streams(&[b"a", b"b", b"c"]),
+            "/uploads/three.txt.xz",
+            "/uploads/three.txt",
+            b"abc",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_044_an_empty_xz_stream_between_two_other() {
+        extracted_xz(
+            &xz_streams(&[b"a", b"", b"b"]),
+            "/uploads/hole.txt.xz",
+            "/uploads/hole.txt",
+            b"ab",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_013_bytes_after_a_valid_stream() {
+        let f = fixture().await;
+        let mut junk = xz(CSV);
+        junk.extend_from_slice(b"JUNK");
+        seed(&f, "/uploads/tail.xz", &junk).await;
+        refused_xz(&f, "/uploads/tail.xz", "/uploads/tail").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_032_padding_of_4_bytes_between_two_strea() {
+        let mut gap = xz(b"a");
+        gap.extend_from_slice(&[0u8; 4]);
+        gap.extend_from_slice(&xz(b"b"));
+        extracted_xz(&gap, "/uploads/gap.txt.xz", "/uploads/gap.txt", b"ab").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_033_padding_of_3_bytes_is_refused() {
+        let f = fixture().await;
+        let mut pad = xz(CSV);
+        pad.extend_from_slice(&[0u8; 3]);
+        seed(&f, "/uploads/pad3.xz", &pad).await;
+        refused_xz(&f, "/uploads/pad3.xz", "/uploads/pad3").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_011_truncated_file() {
+        let f = fixture().await;
+        let whole = xz(CSV);
+        seed(&f, "/uploads/cut.xz", &whole[..whole.len() / 2]).await;
+        refused_xz(&f, "/uploads/cut.xz", "/uploads/cut").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_012_text_file_named_xz() {
+        let f = fixture().await;
+        seed(&f, "/uploads/fake.xz", b"not xz").await;
+        refused_xz(&f, "/uploads/fake.xz", "/uploads/fake").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_014_damaged_checksum() {
+        let f = fixture().await;
+        let mut bad = xz(CSV);
+        // Offset 24 is inside the compressed block of the 16 byte CSV fixture; every
+        // single byte flip of this file was measured as refused.
+        bad[24] ^= 0xFF;
+        seed(&f, "/uploads/bad.xz", &bad).await;
+        refused_xz(&f, "/uploads/bad.xz", "/uploads/bad").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_027_a_0_byte_file_named_zero_xz() {
+        let f = fixture().await;
+        seed(&f, "/uploads/zero.xz", b"").await;
+        refused_xz(&f, "/uploads/zero.xz", "/uploads/zero").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_028_zero_padding_after_a_stream_is_accep() {
+        let mut pad = xz(b"hello");
+        pad.extend_from_slice(&[0u8; 4]);
+        extracted_xz(&pad, "/uploads/pad.txt.xz", "/uploads/pad.txt", b"hello").await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_052_padding_of_8_bytes_after_a_stream() {
+        let mut pad = xz(b"hello");
+        pad.extend_from_slice(&[0u8; 8]);
+        extracted_xz(&pad, "/uploads/pad8.txt.xz", "/uploads/pad8.txt", b"hello").await;
+    }
+
+    /// The LZMA alone format is what `new_multi_decoder` would accept as xz.
+    #[tokio::test]
+    async fn xz_0082_lzma_alone_file_is_corrupt() {
+        use liblzma::stream::{LzmaOptions, Stream};
+        let f = fixture().await;
+        let stream = Stream::new_lzma_encoder(&LzmaOptions::new_preset(6).unwrap()).unwrap();
+        let mut enc = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+        enc.write_all(b"hello").unwrap();
+        seed(&f, "/uploads/old.xz", &enc.finish().unwrap()).await;
+        refused_xz(&f, "/uploads/old.xz", "/uploads/old").await;
+    }
+
+    /// Check type 0x02 is reserved: liblzma must refuse it rather than decode unverified.
+    #[tokio::test]
+    async fn xz_0082_unknown_check_type_is_corrupt() {
+        use liblzma::stream::{Check, Filters, LzmaOptions};
+        let f = fixture().await;
+        let mut filters = Filters::new();
+        filters.lzma2(&LzmaOptions::new_preset(6).unwrap());
+        let mut file = xz_with(b"hello", &filters, Check::Crc32);
+        let crc = |bytes: &[u8]| {
+            let mut c = flate2::Crc::new();
+            c.update(bytes);
+            c.sum().to_le_bytes()
+        };
+        let len = file.len();
+        file[7] = 0x02;
+        file[len - 3] = 0x02;
+        let header_crc = crc(&file[6..8]);
+        file[8..12].copy_from_slice(&header_crc);
+        let footer_crc = crc(&file[len - 8..len - 2]);
+        file[len - 12..len - 8].copy_from_slice(&footer_crc);
+        seed(&f, "/uploads/chk.xz", &file).await;
+        refused_xz(&f, "/uploads/chk.xz", "/uploads/chk").await;
     }
 }
