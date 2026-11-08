@@ -54,7 +54,7 @@ A project member can decompress a single file compressed with xz and stored in t
 
 - `.bz2` single files: BL-0113, its own increment.
 - A size limit for the tar family: BL-0124.
-- xz files that use a compression filter or an integrity check type the product's decoder cannot read (for example a SHA-256 check): they are refused as corrupt, the same as inside a tar archive today. Supporting more is not part of this increment.
+- The tar family (`.tar.xz`, `.txz`) keeps its current xz decoder, so a BCJ filter or a SHA-256 check inside a tar archive is still refused as corrupt there. Moving it to the new decoder is BL-0132.
 - Creating xz files: nothing in the product creates archives.
 
 ### 3.3 Constraints imposed by the context
@@ -167,7 +167,7 @@ None.
 - **Priority:** Must
 
 #### FR-NEW-008 [EARS-O]: Corrupt file
-> IF the file is empty, is truncated, is not xz, has a damaged checksum or index, uses a compression filter or an integrity check type the product cannot read, or has bytes after a valid stream that FR-NEW-013 does not accept as padding, THEN THE archive extraction SHALL refuse with `ERR_INVALID_ARGUMENT` and a message starting `archive is corrupt or not a valid xz file:`, and write nothing.
+> IF the file is empty, is truncated, is not xz, has a damaged checksum or index, uses a filter or an integrity check type the xz decoder does not support, or has bytes after a valid stream that FR-NEW-013 does not accept as padding, THEN THE archive extraction SHALL refuse with `ERR_INVALID_ARGUMENT` and a message starting `archive is corrupt or not a valid xz file:`, and write nothing.
 - **Scenario:** SC-003
 - **Priority:** Must
 
@@ -261,7 +261,7 @@ Performance: no new target. Decoding stops at the lower of the two limits, so th
 | E2E-012 | New | failure | SC-003 | FR-NEW-008 | High |
 | E2E-013 | New | failure | SC-003 | FR-NEW-008 | High |
 | E2E-014 | New | failure | SC-003 | FR-NEW-008 | High |
-| E2E-015 | New | failure | SC-003 | FR-NEW-008 | Medium |
+| E2E-015 | New | happy | SC-003 | FR-NEW-001 | Medium |
 | E2E-016 | New | failure | SC-004 | FR-NEW-009 | High |
 | E2E-017 | New | failure | SC-004 | FR-NEW-003 | Medium |
 | E2E-018 | New | failure | SC-003 | FR-NEW-012 | Low |
@@ -302,11 +302,11 @@ Performance: no new target. Decoding stops at the lower of the two limits, so th
 | E2E-053 | New | failure | SC-002 | FR-NEW-004 | Low |
 | E2E-054 | New | edge | SC-002 | FR-NEW-004 | Medium |
 | E2E-055 | New | failure | SC-003 | FR-NEW-012, FR-NEW-003 | Medium |
-| E2E-056 | New | failure | SC-003 | FR-NEW-008 | Medium |
+| E2E-056 | New | happy | SC-003 | FR-NEW-001 | Medium |
 | E2E-057 | New | edge | SC-001 | FR-NEW-001 | Medium |
 | E2E-058 | New | edge | SC-002 | FR-NEW-005, FR-NEW-006, FR-NEW-012 | Medium |
 
-Coverage (all 58 tests, 58 new and 0 modified): happy 8, failure 32, edge 15, side effect 3, security 2 (E2E-009, E2E-010), state transition 0 (no state machine). Failure to happy ratio 32:8, failure tests outnumber happy tests.
+Coverage (all 58 tests, 58 new and 0 modified): happy 10, failure 30, edge 15, side effect 3, security 2 (E2E-009, E2E-010), state transition 0 (no state machine). Failure to happy ratio 30:10, failure tests outnumber happy tests.
 
 Unless a test says otherwise, the session write allowance is large enough not to matter and the project has no storage limit; a figure for "remaining storage" sets a project storage limit, reached by filling the project with other files up to that remainder (the limit itself is set in whole megabytes); a figure for "session allowance" sets that allowance.
 
@@ -403,11 +403,11 @@ The plan approved before writing listed 37 new tests and a modified test. Two ch
 - **When** the member extracts it
 - **Then** the refusal is as E2E-011; `/uploads/bad` does not exist
 
-#### E2E-015: Compression filter the product cannot read
-- **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-008; **Priority:** Medium
-- **Given** `/uploads/bcj.xz`, a valid xz file made with an additional x86 branch filter
+#### E2E-015: A file with an x86 branch filter decodes
+- **Category:** happy; **Scenario:** SC-003; **Requirements:** FR-NEW-001; **Priority:** Medium
+- **Given** `/uploads/bcj.xz`, a valid xz file made with an additional x86 branch filter, holding `hello`
 - **When** the member extracts it
-- **Then** the refusal is as E2E-011; `/uploads/bcj` does not exist
+- **Then** `/uploads/bcj` reads `hello` and 1 file and 5 bytes are written
 
 #### E2E-016: Password given
 - **Category:** failure; **Scenario:** SC-004; **Requirements:** FR-NEW-009; **Priority:** High
@@ -649,11 +649,11 @@ The plan approved before writing listed 37 new tests and a modified test. Two ch
 - **When** the member extracts it
 - **Then** the message is `cannot derive an output file name from '.xz'`, not the corrupt refusal
 
-#### E2E-056: Integrity check type the product cannot verify
-- **Category:** failure; **Scenario:** SC-003; **Requirements:** FR-NEW-008; **Priority:** Medium
-- **Given** `/uploads/sha.xz`, a valid xz file made with a SHA-256 integrity check
+#### E2E-056: A file with a SHA-256 integrity check decodes
+- **Category:** happy; **Scenario:** SC-003; **Requirements:** FR-NEW-001; **Priority:** Medium
+- **Given** `/uploads/sha.xz`, a valid xz file made with a SHA-256 integrity check, holding `hello`
 - **When** the member extracts it
-- **Then** the refusal is as E2E-011; `/uploads/sha` does not exist
+- **Then** `/uploads/sha` reads `hello` and 1 file and 5 bytes are written
 
 #### E2E-057: Archive directly under the project root
 - **Category:** edge; **Scenario:** SC-001; **Requirements:** FR-NEW-001; **Priority:** Medium
@@ -701,7 +701,7 @@ SC-004 is a refusal scenario; its happy path is SC-001. SC-003 is a refusal scen
 | FR-NEW-005 | E2E-008, E2E-009, E2E-025, E2E-029, E2E-030, E2E-058 | 6 |
 | FR-NEW-006 | E2E-010, E2E-031, E2E-038, E2E-058 | 4 |
 | FR-NEW-007 | E2E-004, E2E-043, E2E-044 | 3 |
-| FR-NEW-008 | E2E-011, E2E-012, E2E-013, E2E-014, E2E-015, E2E-027, E2E-033, E2E-056 | 8 |
+| FR-NEW-008 | E2E-011, E2E-012, E2E-013, E2E-014, E2E-027, E2E-033 | 6 |
 | FR-NEW-009 | E2E-016, E2E-045, E2E-046 | 3 |
 | FR-NEW-010 | E2E-005, E2E-006, E2E-047, E2E-048 | 4 |
 | FR-NEW-011 | E2E-021, E2E-049, E2E-050, E2E-051 | 4 |
@@ -775,8 +775,12 @@ Not applicable (`--security` not set).
 
 - The decoder takes a writer: a capped writer that fails when the output exceeds the lower of two caps (the project's remaining storage plus the size of the file replaced under `overwrite`, only when the project has a limit, `crates/core/src/safety.rs:72-81`; the remaining session write allowance, `crates/core/src/safety.rs:136-147`) gives the bound. The refusal code follows the cap met first, a tie going to the project (FR-NEW-005, FR-NEW-006). With lzma-rs the writer cap sees bytes only after a whole block is decoded into memory (`xz.rs:226-285`), so a one block bomb (the usual output of the xz command line tool) is held whole: E2E-009 and E2E-010 need a decoder that stops mid block, or a bound on the block's decoded size. `liblzma` already appears in `Cargo.lock`. The memory observable needs a measurable hook. Signal: E2E-009, E2E-010 (red with lzma-rs). The caps are computed before decoding; the declared size admission (`archive.rs:183-205`) is then called with the real decoded size after a successful decode.
 - `decode_stream` rejects any byte after the stream (`lzma-rs-0.3.0/src/decode/xz.rs:86-90`). The design must split the input into streams itself, walking each footer and index, skip zero padding of a multiple of 4 bytes (FR-NEW-013), call the decoder per stream (FR-NEW-007), or use a decoder that supports multiple streams; any other trailing byte is refused (FR-NEW-008). Signal: E2E-004, E2E-013, E2E-028, E2E-033.
-- The decoder supports the LZMA2 filter only; a valid file with another filter fails in the decoder and takes the corrupt refusal (FR-NEW-008). Signal: E2E-015.
+- The decoder is `liblzma` 0.4.9 as a direct dependency (a streaming multi stream reader, MIT OR Apache-2.0, already in `Cargo.lock`): it stops mid block, so a bound on the writer holds the bomb tests, and it decodes the BCJ filters and every integrity check it knows. A file whose filter or check it does not support, or whose stream ends early, takes the corrupt refusal (FR-NEW-008). The tar family keeps `lzma-rs` (BL-0132). Signal: E2E-015, E2E-056, E2E-009, E2E-010.
 - The collision and destination checks run before decoding (FR-NEW-012), a reorder of the current flow (`archive.rs:154-181` decodes first). Signal: E2E-024, E2E-022.
 - A folder bearing the output name: today's `exists` probe covers files and folders alike (`archive.rs:172-181`) and `overwrite` true bypasses it. Signal: E2E-053.
 - The answer keys (`destination`, `files_written`, `dirs_created`, `bytes_written`) and the audit line are shared (`archive.rs:242-275`).
 - The same decoding flow serves SPEC-0081 (gzip) and BL-0113 (bzip2): one bounded decode with per format readers. Update `.agent_docs/tools.md:180-183` and `README.md`; `TOOL_CONTRACT.txt` changes only if a parameter description changes. BL-0124 records the tar family cap.
+
+## Erratum 1 (design issue of 2026-11-05)
+
+The only xz decoder in the tree, `lzma-rs` 0.3, decodes a whole block into memory and rejects any stream after the first, so E2E-009, E2E-010 and FR-NEW-007 could not hold. Decision: use `liblzma` as a direct dependency (the user's default, option (a) of `design-issues.md`). Consequences: E2E-015 (x86 branch filter) and E2E-056 (SHA-256 check) become happy tests; FR-NEW-008 and Section 3.2 lose the filter and check refusals; the tar family keeps its decoder (BL-0132). The total is 58 tests, happy 10, failure 30.

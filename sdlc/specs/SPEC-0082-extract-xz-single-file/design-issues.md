@@ -6,3 +6,7 @@
 - Evidence: `lzma-rs-0.3.0/src/decode/xz.rs:86-90` (data after the stream), `:226-285` (whole block in `tmpbuf`, written only after the block checks); `Cargo.toml:87` (lzma-rs), `Cargo.lock` (liblzma 0.4.9 via compression-codecs, async-compression, datafusion-datasource); spec `sdlc-spec.md` FR-NEW-008, E2E-015, E2E-056, 14.3.
 - Needed: choose one. (a) Add `liblzma` 0.4.9 as a direct dependency and amend SPEC-0082 so a BCJ filter and a SHA-256 check are decoded (E2E-015 and E2E-056 become happy tests; FR-NEW-008 and Section 3.2 lose the filter and check clauses). (b) Add `liblzma` and keep the refusals with a hand written xz structure parser. (c) Keep `lzma-rs` and bound memory with a hand written scan of the LZMA2 chunk headers plus a stream splitter.
 - Recommendation: (a). It is the best product (more real files decode), the least custom code, and the amendment is two tests and two clauses. Default applied by the run (user said "defaults", 2026-11-05): SPEC-0082 held, `Status: specified`, no story, no queue row. Once the spec is amended through `/sdlc-spec`, the stories reuse SPEC-0081's flow (US-0160 to US-0164) and SPEC-0083's pattern (US-0165 to US-0168).
+
+## Resolution 2026-11-05
+
+Option (a) applied: SPEC-0082 erratum 1 (`liblzma` as a direct dependency; E2E-015 and E2E-056 are happy tests; FR-NEW-008 and Section 3.2 amended). Tar family xz stays on `lzma-rs`, BL-0132. The spec is ready for `/sdlc-design`.
