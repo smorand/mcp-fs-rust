@@ -45,7 +45,8 @@ and sqlite-vec (SQLite) for vector search; it implies `postgres`. The `rar` feat
 ## Key commands
 ```
 make build | make test | make run       same as ./build.sh / ./test.sh / ./run.sh
-make check                            format-check + lint + typecheck + security + test
+make check                            clean-stale + format-check + lint + typecheck + security + test
+make clean-stale                      cargo sweep: drop target/ artifacts unused for STALE_DAYS (2) days
 make test-e2e-full                    real PostgreSQL + MinIO + git CLI, full lifecycle (mandatory infra, see .agent_docs/testing.md)
 make help                             list every target
 ./build.sh                            cargo build --release

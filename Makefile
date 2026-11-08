@@ -1,4 +1,4 @@
-.PHONY: sync build release test test-e2e-full lint lint-fix format format-check typecheck security check run run-dev clean help
+.PHONY: clean-stale sync build release test test-e2e-full lint lint-fix format format-check typecheck security check run run-dev clean help
 
 ## sync: Fetch dependencies and build the workspace
 sync:
@@ -48,7 +48,7 @@ security:
 	cargo deny check
 
 ## check: Full quality gate (format-check, lint, typecheck, security, test)
-check: format-check lint typecheck security test
+check: clean-stale format-check lint typecheck security test
 
 ## run: Boot the server for local development (delegates to run.sh, unmodified)
 run:
@@ -60,6 +60,15 @@ run-dev: run
 ## clean: Remove build artifacts
 clean:
 	cargo clean
+
+## clean-stale: Drop build artifacts unused for STALE_DAYS days (default 2), keeps the warm cache
+# Every feature set and branch switch leaves its own hashed artifacts in target/;
+# without a sweep they reached 186 GB and filled the disk (BL-0129). Needs
+# `cargo install cargo-sweep`; skipped with a notice when it is missing.
+STALE_DAYS ?= 2
+clean-stale:
+	@if cargo sweep --version >/dev/null 2>&1; then cargo sweep --time $(STALE_DAYS); \
+	else echo "cargo-sweep not installed: cargo install cargo-sweep (target/ is not pruned)"; fi
 
 ## help: Show this help message
 help:
