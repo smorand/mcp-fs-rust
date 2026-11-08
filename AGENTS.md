@@ -34,7 +34,7 @@ run. Lineage and design decisions: `.agent_docs/lineage.md`.
 Stack: Rust 2024, axum + tokio, rmcp 3.5.0 (`server` + `transport-streamable-http-server`
 features only, the one production MCP transport, SPEC-0013), rusqlite (bundled), sqlx (optional,
 PostgreSQL), aws-sdk-s3, jsonwebtoken + rsa, git2
-(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, reqwest, clap, tracing.
+(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, liblzma (bare `.xz`), reqwest, clap, tracing.
 
 Cargo features, none in `default`: `postgres`, `rag`, `all-backends` (PostgreSQL plus `rag`). A default
 build is SQLite only and carries no network database driver. The `rag` feature enables pgvector (PostgreSQL)
@@ -134,7 +134,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
   type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
   password retry via `ERR_PASSWORD_REQUIRED`. `archive_single.rs` holds the single file flow for a
-  bare gzip `.gz` (SPEC-0081) and bare bzip2 `.bz2` (SPEC-0083): refusals in a fixed order (membership, missing path, folder, password,
+  bare gzip `.gz` (SPEC-0081), bare bzip2 `.bz2` (SPEC-0083) and bare xz `.xz` (SPEC-0082, liblzma): refusals in a fixed order (membership, missing path, folder, password,
   output name, destination outside the project, destination is a file, collision, then corrupt or a
   limit, whichever decoding meets first), a capped reader that stops at the lower of the project's
   remaining storage and the session write allowance, nothing written before the decode succeeds.

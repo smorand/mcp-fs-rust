@@ -2313,4 +2313,117 @@ mod tests {
         let v = extract_with(&f, "/uploads/.xz", None, false, None).await;
         refused(&v, code::INVALID_ARGUMENT, "cannot derive an output file name from '.xz'");
     }
+
+    // Storage and session limits on bare xz files (SPEC-0082, US-0182).
+
+    fn xz_bomb() -> Vec<u8> {
+        xz(&vec![0u8; BOMB_LEN])
+    }
+
+    /// The xz bomb read straight through the decoder: liblzma streams, so the
+    /// cap stops it with at most one chunk held, whatever its dictionary size.
+    fn assert_xz_bomb_bounded(cap: u64) {
+        let err =
+            super::read_capped(super::decoder(super::SingleFormat::Xz, &xz_bomb()).unwrap(), cap)
+                .expect_err("the bomb is over the cap");
+        match err {
+            super::ReadError::CapExceeded { high_water } => {
+                assert!(high_water <= cap + 65_536, "held {high_water} bytes");
+                assert!(high_water < 1_000_000, "held {high_water} bytes");
+            }
+            super::ReadError::Io(e) | super::ReadError::Init(e) => {
+                panic!("expected the cap error, got {e}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_008_output_over_the_project_storage_limi() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        limit_remaining(&f, 10).await;
+        let v = extract(&f, "/uploads/data.csv.xz", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/data.csv").await, None);
+        assert_eq!(remaining_storage(&f).await, 10);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_009_decompression_bomb_against_the_stora() {
+        let f = fixture().await;
+        seed(&f, "/uploads/bomb.xz", &xz_bomb()).await;
+        limit_remaining(&f, 1000).await;
+        let v = extract(&f, "/uploads/bomb.xz", None).await;
+        project_refusal(&v);
+        assert_eq!(read(&f, "/uploads/bomb").await, None);
+        assert_eq!(remaining_storage(&f).await, 1000);
+        assert_extraction_bounded(1000);
+        assert_xz_bomb_bounded(1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_010_decompression_bomb_against_the_sessi() {
+        let f = fixture_allowance(1000).await;
+        seed(&f, "/uploads/bomb.xz", &xz_bomb()).await;
+        let v = extract(&f, "/uploads/bomb.xz", None).await;
+        session_refusal(&v, 1000);
+        assert_eq!(read(&f, "/uploads/bomb").await, None);
+        assert_eq!(allowance(&f), 1000);
+        assert_extraction_bounded(1000);
+        assert_xz_bomb_bounded(1000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_029_output_exactly_equal_to_the_remainin() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        limit_remaining(&f, 16).await;
+        let v = extract(&f, "/uploads/data.csv.xz", None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(remaining_storage(&f).await, 0);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_030_overwrite_counts_net_growth() {
+        let f = fixture().await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        seed(&f, "/uploads/data.csv", &[b'x'; 40]).await;
+        limit_remaining(&f, 5).await;
+        let v = extract_with(&f, "/uploads/data.csv.xz", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(read(&f, "/uploads/data.csv").await.as_deref(), Some(CSV));
+        assert_eq!(remaining_storage(&f).await, 29);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_031_the_allowance_is_charged_the_full_ou() {
+        let f = fixture_allowance(20).await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        seed(&f, "/uploads/data.csv", &[b'x'; 40]).await;
+        let v = extract_with(&f, "/uploads/data.csv.xz", None, true, None).await;
+        assert!(v.is_ok(), "{v:?}");
+        assert_eq!(allowance(&f), 4);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_038_a_refused_extraction_charges_nothing() {
+        let f = fixture_allowance(10).await;
+        seed(&f, "/uploads/data.csv.xz", &xz(CSV)).await;
+        let v = extract(&f, "/uploads/data.csv.xz", None).await;
+        session_refusal(&v, 10);
+        write_small(&f).await;
+        assert_eq!(allowance(&f), 7);
+    }
+
+    #[tokio::test]
+    async fn e2e_0082_058_both_limits_at_the_same_byte() {
+        let f = fixture_allowance(1000).await;
+        seed(&f, "/uploads/bomb.xz", &xz_bomb()).await;
+        limit_remaining(&f, 1000).await;
+        let v = extract(&f, "/uploads/bomb.xz", None).await;
+        project_refusal(&v);
+        assert_eq!(remaining_storage(&f).await, 1000);
+        assert_eq!(allowance(&f), 1000);
+    }
 }

@@ -178,7 +178,7 @@ The full token is never logged, only its first 8 characters.
 | `fs.extract_archive` | extract a stored archive in place | `path`, `destination?`, `overwrite=false`, `password?` | `destination,files_written,dirs_created,bytes_written` | D,!RO,!I,!OW | member |
 
 (2026-10-09, SPEC-0015.) Formats by extension, case insensitive: `.zip`, `.7z`,
-`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, a bare `.gz` or `.bz2`
+`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`, a bare `.gz`, `.bz2` or `.xz`
 (see below), and `.rar` with the cargo feature `rar` (see below); anything else (including `.rar`
 on a build without the feature) is `ERR_NOT_SUPPORTED`. Default destination: the archive
 path minus its suffix. Stateless password retry: an encrypted zip or 7z with no
@@ -241,6 +241,16 @@ the decoding meets first. Nothing is written, and no folder created, before the 
 (minus `.bz2`, case insensitive), limits and order of refusals as `.gz`. Several bzip2 streams are
 decoded as one stream; bytes after a stream that are not another stream are refused. A corrupt or non
 bzip2 file is `ERR_INVALID_ARGUMENT`, `archive is corrupt or not a valid bz2 file: <detail>`.
+
+(2026-11-08, SPEC-0082.) A bare `.xz` (not `.tar.xz`/`.txz`) follows the same flow, name rule
+(minus `.xz`, case insensitive), limits and order of refusals as `.gz` and `.bz2`. It is decoded by
+liblzma (C code) through its multi stream decoder, with no memory limit: memory follows the bytes
+decoded, which the cap bounds. Several xz streams are decoded as one stream; zero padding between
+or after streams is accepted only as a multiple of 4 bytes; other bytes after a stream are refused.
+BCJ filtered files and SHA-256 checks decode; an unknown check type is refused, and so is
+lzma-alone (`.lzma`) data, as corrupt. A corrupt or non xz file is `ERR_INVALID_ARGUMENT`,
+`archive is corrupt or not a valid xz file: <detail>`. `.tar.xz`/`.txz` is unchanged and still
+decoded by lzma-rs (BL-0132).
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,

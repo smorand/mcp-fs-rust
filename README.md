@@ -292,16 +292,17 @@ is already stored in the project, with no download and re upload through the cli
 ```
 
 Formats, by extension: `.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`,
-`.tar.xz`/`.txz`, all decoded in pure Rust, plus `.gz` and `.bz2`, plus `.rar` (RAR 4 and RAR 5,
+`.tar.xz`/`.txz`, all decoded in pure Rust, plus `.gz`, `.bz2` and `.xz`, plus `.rar` (RAR 4 and RAR 5,
 opt in cargo feature `rar`: build with `--features rar` or `--all-features`; without it `.rar` is
 refused as an unsupported extension). `.rar` is read by the `unrar` crate (MIT OR Apache-2.0), which
 wraps RARLAB's UnRAR source; that source is free of charge to use for reading RAR archives but its
 licence forbids using it to build a RAR compatible archiver or to re create the RAR compression
-algorithm, which is why the feature is off by default. A bare gzip or bzip2 file (not a
-`.tar.gz` or `.tar.bz2`) holds one file: it is decompressed next to the archive, or into
-`destination`, under the archive name minus `.gz` or `.bz2`; passwords are refused, several gzip
-members or bzip2 streams are decoded as one stream, bytes after a bzip2 stream are refused as
-corrupt, and decompression stops at the project's remaining storage or the session write allowance.
+algorithm, which is why the feature is off by default. A bare gzip, bzip2 or xz file (not a
+`.tar.gz`, `.tar.bz2` or `.tar.xz`) holds one file: it is decompressed next to the archive, or into
+`destination`, under the archive name minus `.gz`, `.bz2` or `.xz`; passwords are refused, several gzip
+members, bzip2 streams or xz streams are decoded as one stream, bytes after a bzip2 stream are
+refused as corrupt (an xz file accepts zero padding of a multiple of 4 bytes between and after its
+streams), a bare `.xz` is decoded by liblzma (C code, not pure Rust; the `.tar.xz` path stays pure Rust), and decompression stops at the project's remaining storage or the session write allowance.
 Otherwise `destination` defaults to the archive path minus
 its suffix; `overwrite` defaults to `false`. **Passwords are a plain retry**: an encrypted zip
 or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQUIRED` (HTTP
