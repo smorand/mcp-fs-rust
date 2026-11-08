@@ -180,5 +180,5 @@
 | US-0178 | SPEC-0082 | extract a bare xz file next to the archive | main | 2 | landed | story/US-0178-extract-a-bare-xz-file | main |
 | US-0179 | SPEC-0082 | decode several xz streams and padding, refuse corrupt input | US-0178 | 2 | landed | story/US-0179-xz-several-streams-and-corrupt | story/US-0178-extract-a-bare-xz-file |
 | US-0180 | SPEC-0082 | xz password, output name, tar rows and the HTTP answer | US-0179 | 2 | landed | story/US-0180-xz-password-output-name-tar-rows | story/US-0179-xz-several-streams-and-corrupt |
-| US-0181 | SPEC-0082 | check the xz collision, destination and order rules | US-0180 | 2 | todo | | |
+| US-0181 | SPEC-0082 | check the xz collision, destination and order rules | US-0180 | 2 | landed | story/US-0181-xz-collision-destination-order | story/US-0180-xz-password-output-name-tar-rows |
 | US-0182 | SPEC-0082 | check the xz storage and session limits and document the format | US-0181 | 2 | todo | | |

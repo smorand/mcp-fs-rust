@@ -3715,4 +3715,21 @@ mod tests {
         );
         assert!(!c.exists("/uploads/data.csv").await.unwrap());
     }
+
+    #[tokio::test]
+    async fn e2e_0082_049_destination_is_a_file_through_the_ht() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/data.csv.xz", &csv_xz()).await.unwrap();
+        c.write_bytes_atomic("/uploads/notes.txt", b"keep").await.unwrap();
+        let body = json!({"path": "/uploads/data.csv.xz", "destination": "/uploads/notes.txt"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: '/uploads/notes.txt' is a file, not a folder"
+        );
+        assert_eq!(c.read_bytes("/uploads/notes.txt").await.unwrap(), b"keep");
+    }
 }
