@@ -177,3 +177,8 @@
 | US-0175 | SPEC-0080 | ask for the password of an encrypted RAR and accept the right one | US-0170, US-0169 | 2 | landed | story/US-0175-rar-needs-the-right-password | story/US-0174-read-rar4-rar5-and-solid-rar-archives |
 | US-0176 | SPEC-0080 | handle partly encrypted RAR archives and empty or ignored passwords | US-0175 | 2 | landed | story/US-0176-rar-partial-encryption-and-odd-passwords | story/US-0175-rar-needs-the-right-password |
 | US-0177 | SPEC-0080 | pin the RAR order of refusals, check membership and document the format | US-0172, US-0173, US-0174, US-0176 | 2 | landed | story/US-0177-pin-the-rar-order-of-refusals-and-docume | story/US-0176-rar-partial-encryption-and-odd-passwords |
+| US-0178 | SPEC-0082 | extract a bare xz file next to the archive | main | 2 | todo | | |
+| US-0179 | SPEC-0082 | decode several xz streams and padding, refuse corrupt input | US-0178 | 2 | todo | | |
+| US-0180 | SPEC-0082 | xz password, output name, tar rows and the HTTP answer | US-0179 | 2 | todo | | |
+| US-0181 | SPEC-0082 | check the xz collision, destination and order rules | US-0180 | 2 | todo | | |
+| US-0182 | SPEC-0082 | check the xz storage and session limits and document the format | US-0181 | 2 | todo | | |
