@@ -4,6 +4,7 @@
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071", # rsa Marvin timing side channel, JWT signing keys, no fix released
+    "RUSTSEC-2026-0441", # pin-utils unmaintained (archived 2026-10-01), pulled by every released aws-smithy-* crate up to the latest; a macro crate with no code path to untrusted input; revisit when aws-smithy drops it (BL-0126)
     "RUSTSEC-2026-0192", # ttf-parser unmaintained, via pdf-extract 0.12.1, no newer release
     "RUSTSEC-2026-0367", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)
     "RUSTSEC-2026-0368", # zip 3.0.0, build dependency of utoipa-swagger-ui, unpacks only its vendored archive (until BL-0059)

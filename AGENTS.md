@@ -57,7 +57,7 @@ mcp-fs migrate --from a.yaml --to b.yaml  offline copy of relational state betwe
 mcp-fs purge [--project <id> [--on-demand]]  run the auto-purge sweep once; no --project runs
                                       every configured project plus the grace-period removal
 docker compose -f docker-compose.test.yml up -d  postgres for the opt-in suites
-cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extraction tests (feature `rar`, SPEC-0080)
+cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extraction tests (feature `rar`, SPEC-0080; ./test.sh runs them)
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode

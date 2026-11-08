@@ -160,6 +160,7 @@ fn accepted_advisories_are_recorded_once_with_a_reason() {
         "RUSTSEC-2026-0368",
         "RUSTSEC-2026-0369",
         "RUSTSEC-2026-0429",
+        "RUSTSEC-2026-0441",
     ];
     expected.sort_unstable();
     assert_eq!(ids, expected);
