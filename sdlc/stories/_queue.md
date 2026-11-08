@@ -175,5 +175,5 @@
 | US-0173 | SPEC-0080 | refuse multi volume names, corrupt files, a missing path and a folder | US-0172 | 2 | landed | story/US-0173-rar-multi-volume-corrupt-missing-path | story/US-0172-rar-storage-limit-and-session-allowance |
 | US-0174 | SPEC-0080 | read RAR4, RAR5 and solid RAR archives | US-0170 | 2 | landed | story/US-0174-read-rar4-rar5-and-solid-rar-archives | story/US-0173-rar-multi-volume-corrupt-missing-path |
 | US-0175 | SPEC-0080 | ask for the password of an encrypted RAR and accept the right one | US-0170, US-0169 | 2 | landed | story/US-0175-rar-needs-the-right-password | story/US-0174-read-rar4-rar5-and-solid-rar-archives |
-| US-0176 | SPEC-0080 | handle partly encrypted RAR archives and empty or ignored passwords | US-0175 | 2 | todo | | |
+| US-0176 | SPEC-0080 | handle partly encrypted RAR archives and empty or ignored passwords | US-0175 | 2 | landed | story/US-0176-rar-partial-encryption-and-odd-passwords | story/US-0175-rar-needs-the-right-password |
 | US-0177 | SPEC-0080 | pin the RAR order of refusals, check membership and document the format | US-0172, US-0173, US-0174, US-0176 | 2 | todo | | |

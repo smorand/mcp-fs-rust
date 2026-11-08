@@ -62,14 +62,18 @@ pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<Dec
         // On an encrypted entry UnRAR reports a wrong password as BadPassword (RAR5) or as
         // BadData, a CRC error, (RAR4 has no password check value), so those two codes
         // are the password signal; any other code stays corrupt. A plain entry's read
-        // error is the oversize signal.
+        // error is the oversize signal. An empty password reaches UnRAR as no password at
+        // all, so it answers MissingPassword: still a given password here, hence the wrong
+        // password message (FR-NEW-020).
         let encrypted = entry.is_encrypted();
         let (data, next) = header.read().map_err(|e| {
             if !encrypted {
                 oversized(&rel_path, declared_size)
             } else if matches!(
                 e.code,
-                unrar::error::Code::BadPassword | unrar::error::Code::BadData
+                unrar::error::Code::BadPassword
+                    | unrar::error::Code::BadData
+                    | unrar::error::Code::MissingPassword
             ) {
                 password_required_message(password)
             } else {
@@ -1051,6 +1055,68 @@ mod tests {
         assert_eq!(v["bytes_written"], 12);
         assert_eq!(read(&f, "/uploads/solid/a.txt").await, b"hello");
         assert_eq!(read(&f, "/uploads/solid/b.txt").await, b"goodbye");
+    }
+
+    const PART: &[u8] = include_bytes!("../../tests/fixtures/rar/part.rar");
+
+    /// The answer of E2E-001, for a plain archive whatever password rode along.
+    async fn assert_report_extracted(f: &Fixture, v: &Value) {
+        assert_eq!(v["destination"], "/uploads/report");
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(v["dirs_created"], 2);
+        assert_eq!(v["bytes_written"], 12);
+        assert_eq!(read(f, "/uploads/report/data/a.txt").await, b"hello");
+        assert_eq!(read(f, "/uploads/report/data/b.txt").await, b"goodbye");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_031_password_on_a_plain_rar_is_ignored() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        let v = extract_pw(&f, "/uploads/report.rar", Some("whatever")).await.unwrap();
+        assert_report_extracted(&f, &v).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_042_empty_password_on_a_plain_rar_is_ign() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        let v = extract_pw(&f, "/uploads/report.rar", Some("")).await.unwrap();
+        assert_report_extracted(&f, &v).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_050_one_encrypted_entry_among_plain_ones() {
+        let f = fixture().await;
+        seed(&f, "/uploads/part.rar", PART).await;
+        assert_password_refusal(extract_pw(&f, "/uploads/part.rar", None).await, NEEDED);
+        assert_absent(&f, &["/uploads/part", "/uploads/part/a.txt"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_051_empty_password_on_an_encrypted_rar() {
+        let f = fixture().await;
+        seed(&f, "/uploads/secret.rar", SECRET).await;
+        assert_password_refusal(extract_pw(&f, "/uploads/secret.rar", Some("")).await, INCORRECT);
+        assert_absent(&f, &["/uploads/secret"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_052_partly_encrypted_rar_with_the_right() {
+        let f = fixture().await;
+        seed(&f, "/uploads/part.rar", PART).await;
+        let v = extract_pw(&f, "/uploads/part.rar", Some(PASSWORD)).await.unwrap();
+        assert_eq!(v["files_written"], 2);
+        assert_eq!(read(&f, "/uploads/part/a.txt").await, b"hello");
+        assert_eq!(read(&f, "/uploads/part/b.txt").await, b"bee");
+    }
+
+    #[tokio::test]
+    async fn e2e_0080_069_empty_password_on_encrypted_file_nam() {
+        let f = fixture().await;
+        seed(&f, "/uploads/hidden.rar", HIDDEN).await;
+        assert_password_refusal(extract_pw(&f, "/uploads/hidden.rar", Some("")).await, INCORRECT);
+        assert_absent(&f, &["/uploads/hidden"]).await;
     }
 
     #[tokio::test]

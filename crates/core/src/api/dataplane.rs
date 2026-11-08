@@ -3409,6 +3409,64 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/secret/note.txt").await.unwrap(), b"top secret");
     }
 
+    const NEEDED_MSG: &str =
+        "password required to extract this archive; call again with the 'password' parameter";
+
+    /// SPEC-0080/E2E-043: a password for a plain RAR is ignored through the REST door.
+    #[cfg(feature = "rar")]
+    #[tokio::test]
+    async fn e2e_0080_043_ignored_password_through_the_http_ap() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let rar = include_bytes!("../../tests/fixtures/rar/v5.rar");
+        c.write_bytes_atomic("/uploads/v5.rar", rar).await.unwrap();
+        let body = json!({"path": "/uploads/v5.rar", "password": "whatever"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["destination"], "/uploads/v5");
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(c.read_bytes("/uploads/v5/a.txt").await.unwrap(), b"hello");
+    }
+
+    /// SPEC-0080/E2E-070: an empty password on an encrypted RAR is the wrong password
+    /// refusal through the REST door.
+    #[cfg(feature = "rar")]
+    #[tokio::test]
+    async fn e2e_0080_070_empty_password_through_the_http_api() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let rar = include_bytes!("../../tests/fixtures/rar/secret.rar");
+        c.write_bytes_atomic("/uploads/secret.rar", rar).await.unwrap();
+        let (s, v) = h
+            .post(&u("extract-archive"), json!({"path": "/uploads/secret.rar", "password": ""}))
+            .await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PASSWORD_REQUIRED);
+        assert!(
+            v["detail"].as_str().unwrap_or_default().contains(
+                "incorrect password for this archive; call again with the correct 'password' parameter"
+            ),
+            "{v}"
+        );
+        assert!(!c.exists("/uploads/secret").await.unwrap());
+    }
+
+    /// SPEC-0080/E2E-072: a partly encrypted RAR with no password writes nothing, through
+    /// the REST door.
+    #[cfg(feature = "rar")]
+    #[tokio::test]
+    async fn e2e_0080_072_partly_encrypted_rar_no_password_thr() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let rar = include_bytes!("../../tests/fixtures/rar/part.rar");
+        c.write_bytes_atomic("/uploads/part.rar", rar).await.unwrap();
+        let (s, v) = h.post(&u("extract-archive"), json!({"path": "/uploads/part.rar"})).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PASSWORD_REQUIRED);
+        assert!(v["detail"].as_str().unwrap_or_default().contains(NEEDED_MSG), "{v}");
+        assert!(!c.exists("/uploads/part").await.unwrap());
+    }
+
     /// SPEC-0080/E2E-045: an encrypted zip with no password is refused with the
     /// retry instruction through the REST door.
     #[tokio::test]
