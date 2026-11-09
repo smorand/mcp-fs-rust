@@ -34,7 +34,7 @@ run. Lineage and design decisions: `.agent_docs/lineage.md`.
 Stack: Rust 2024, axum + tokio, rmcp 3.5.0 (`server` + `transport-streamable-http-server`
 features only, the one production MCP transport, SPEC-0013), rusqlite (bundled), sqlx (optional,
 PostgreSQL), aws-sdk-s3, jsonwebtoken + rsa, git2
-(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, liblzma (bare `.xz`), reqwest, clap, tracing.
+(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, liblzma (every xz, bare or in a `.tar.xz`; `lzma-rs` removed), reqwest, clap, tracing.
 
 Cargo features, none in `default`: `postgres`, `rag`, `all-backends` (PostgreSQL plus `rag`). A default
 build is SQLite only and carries no network database driver. The `rag` feature enables pgvector (PostgreSQL)
@@ -134,7 +134,10 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `archive.rs` holds `fs.extract_archive` (SPEC-0015), also served by `POST
   /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
   type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
-  password retry via `ERR_PASSWORD_REQUIRED`. `archive_single.rs` holds the single file flow for a
+  password retry via `ERR_PASSWORD_REQUIRED`. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
+  under a bound (SPEC-0084): the lower of the project side (remaining storage plus the bytes stored under
+  the destination) and the session write allowance, plus `TAR_FRAMING` (1 048 576 bytes); a plain `.tar`
+  is unbounded. `archive_single.rs` holds the single file flow for a
   bare gzip `.gz` (SPEC-0081), bare bzip2 `.bz2` (SPEC-0083) and bare xz `.xz` (SPEC-0082, liblzma): refusals in a fixed order (membership, missing path, folder, password,
   output name, destination outside the project, destination is a file, collision, then corrupt or a
   limit, whichever decoding meets first), a capped reader that stops at the lower of the project's

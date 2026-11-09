@@ -249,8 +249,21 @@ decoded, which the cap bounds. Several xz streams are decoded as one stream; zer
 or after streams is accepted only as a multiple of 4 bytes; other bytes after a stream are refused.
 BCJ filtered files and SHA-256 checks decode; an unknown check type is refused, and so is
 lzma-alone (`.lzma`) data, as corrupt. A corrupt or non xz file is `ERR_INVALID_ARGUMENT`,
-`archive is corrupt or not a valid xz file: <detail>`. `.tar.xz`/`.txz` is unchanged and still
-decoded by lzma-rs (BL-0132).
+`archive is corrupt or not a valid xz file: <detail>`. `.tar.xz`/`.txz` is decoded by the same
+liblzma decoder since SPEC-0084 (several streams and 4 byte padding accepted, `lzma-rs` removed).
+
+(2026-11-09, SPEC-0084.) A compressed tar (`.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`) is
+decoded under a bound instead of fully in memory (`decode_bounded_tar` in `tools/archive.rs`, the
+capped reader of `archive_single.rs`). The bound is the lower of two sides plus `TAR_FRAMING`
+(1 048 576 bytes of tar headers and padding): the project side is the remaining storage plus the
+bytes already stored under the destination, no side when the project has no
+limit; the session side is the remaining write allowance. The decode stops there and the call is
+refused with the project storage or session allowance error of the limits, nothing written or
+charged. Order of refusals: membership, missing path, folder, password, corrupt data or the bound
+(whichever decoding meets first), the entry checks in archive order, destination outside the
+project, collision, project storage limit, session write allowance; the two limits are still
+checked on the files' sizes. A plain `.tar` is not decoded under this bound. `.tbz2` and every other
+extension stay `ERR_NOT_SUPPORTED`. The HTTP twin answers and audits the same.
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,

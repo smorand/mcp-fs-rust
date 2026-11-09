@@ -3700,6 +3700,35 @@ mod tests {
         assert!(v["detail"].as_str().unwrap_or_default().contains("already exists"), "{v}");
     }
 
+    /// SPEC-0084 E2E-007: the REST door answers what the engine answers for a
+    /// `.tar.xz`, and the session audit holds exactly one extraction line.
+    #[tokio::test]
+    async fn e2e_0084_007_audit_line_and_http_api_unchanged() {
+        use crate::tools::archive_testkit::{tar_bytes, xz};
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        let packed = xz(&tar_bytes(&[("a.txt", b"hello")]));
+        c.write_bytes_atomic("/uploads/pack.tar.xz", &packed).await.unwrap();
+        let body = json!({"path": "/uploads/pack.tar.xz"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"destination": "/uploads/pack", "files_written": 1,
+                   "dirs_created": 1, "bytes_written": 5})
+        );
+        assert_eq!(c.read_bytes("/uploads/pack/a.txt").await.unwrap(), b"hello");
+        let lines: Vec<_> = h
+            .state
+            .safety
+            .audit(OWNER, MOUNT)
+            .into_iter()
+            .filter(|e| e.op == "extract_archive" && e.path == "/uploads/pack.tar.xz")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].detail, "destination=/uploads/pack files_written=1 bytes_written=5");
+    }
+
     #[tokio::test]
     async fn e2e_0082_046_password_through_the_http_api() {
         let h = Harness::new().await;

@@ -292,7 +292,7 @@ is already stored in the project, with no download and re upload through the cli
 ```
 
 Formats, by extension: `.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`,
-`.tar.xz`/`.txz`, all decoded in pure Rust, plus `.gz`, `.bz2` and `.xz`, plus `.rar` (RAR 4 and RAR 5,
+`.tar.xz`/`.txz`, plus `.gz`, `.bz2` and `.xz`, plus `.rar` (RAR 4 and RAR 5,
 opt in cargo feature `rar`: build with `--features rar` or `--all-features`; without it `.rar` is
 refused as an unsupported extension). `.rar` is read by the `unrar` crate (MIT OR Apache-2.0), which
 wraps RARLAB's UnRAR source; that source is free of charge to use for reading RAR archives but its
@@ -302,7 +302,8 @@ algorithm, which is why the feature is off by default. A bare gzip, bzip2 or xz 
 `destination`, under the archive name minus `.gz`, `.bz2` or `.xz`; passwords are refused, several gzip
 members, bzip2 streams or xz streams are decoded as one stream, bytes after a bzip2 stream are
 refused as corrupt (an xz file accepts zero padding of a multiple of 4 bytes between and after its
-streams), a bare `.xz` is decoded by liblzma (C code, not pure Rust; the `.tar.xz` path stays pure Rust), and decompression stops at the project's remaining storage or the session write allowance.
+streams), every xz file, bare or inside a `.tar.xz`/`.txz`, is decoded by liblzma (C code, not pure Rust), and decompression stops at the project's remaining storage or the session write allowance.
+A compressed tar (`.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`) is bounded the same way: decoding stops at the lower of the project's remaining storage (plus the bytes already stored under the destination) and the session write allowance, plus 1 MiB of tar bookkeeping, so a small archive that expands enormously is refused instead of filling memory. A plain `.tar` is read as is, without that bound.
 Otherwise `destination` defaults to the archive path minus
 its suffix; `overwrite` defaults to `false`. **Passwords are a plain retry**: an encrypted zip
 or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQUIRED` (HTTP
