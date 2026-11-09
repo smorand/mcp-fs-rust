@@ -290,3 +290,89 @@ pub(crate) fn zip_declaring(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes());
     out
 }
+
+/// A zip of `zeros.bin`, 10 000 000 zero bytes: about 10 000 bytes once deflated.
+pub(crate) fn zip_bomb() -> Vec<u8> {
+    crate::tools::archive::tests::build_zip(&[("zeros.bin", &vec![0u8; 10_000_000])], None)
+}
+
+/// A 7z of `zeros.bin`, 10 000 000 zero bytes: a few hundred bytes once compressed.
+pub(crate) fn sevenz_bomb() -> Vec<u8> {
+    crate::tools::archive::tests::build_sevenz_ext(
+        &[("zeros.bin", &vec![0u8; 10_000_000], None)],
+        None,
+        false,
+    )
+}
+
+/// A 7z holding `entries` (name, content) in ONE compressed block (solid).
+pub(crate) fn sevenz_solid(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+    let mut buf = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(std::io::Cursor::new(&mut buf)).unwrap();
+        let metas = entries.iter().map(|(name, _)| ArchiveEntry::new_file(name)).collect();
+        let readers = entries
+            .iter()
+            .map(|(_, content)| SourceReader::from(std::io::Cursor::new(*content)))
+            .collect();
+        writer.push_archive_entries(metas, readers).unwrap();
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+/// A 7z number: one byte below 0x80, else 0xFF and eight little endian bytes.
+fn sevenz_number(n: u64) -> Vec<u8> {
+    if n < 0x80 {
+        return vec![n as u8];
+    }
+    let mut out = vec![0xFF];
+    out.extend_from_slice(&n.to_le_bytes());
+    out
+}
+
+/// A 7z with one entry `name` stored with the Copy coder, whose unpack size
+/// says `declared` while `data` is all it holds: no library writes a lying
+/// header (SPEC-0085 DEC-009). No CRC digest, plain header, valid start header CRC.
+pub(crate) fn sevenz_declaring(name: &str, declared: u64, data: &[u8]) -> Vec<u8> {
+    let crc = |bytes: &[u8]| {
+        let mut c = flate2::Crc::new();
+        c.update(bytes);
+        c.sum()
+    };
+    let mut header = vec![0x01, 0x04];
+    // PackInfo: pack position 0, one pack stream of data.len() bytes.
+    header.extend_from_slice(&[0x06, 0x00, 0x01, 0x09]);
+    header.extend(sevenz_number(data.len() as u64));
+    header.push(0x00);
+    // UnpackInfo: one folder, one simple Copy coder, the declared unpack size.
+    header.extend_from_slice(&[0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C]);
+    header.extend(sevenz_number(declared));
+    header.push(0x00);
+    // SubStreamsInfo with nothing in it: one stream per folder, no digest. The
+    // reader refuses a file with data and no such section.
+    header.extend_from_slice(&[0x08, 0x00]);
+    header.push(0x00); // end of the streams info
+    // FilesInfo: one file, its UTF-16 name.
+    let mut names = vec![0x00];
+    for unit in name.encode_utf16().chain(std::iter::once(0)) {
+        names.extend_from_slice(&unit.to_le_bytes());
+    }
+    header.extend_from_slice(&[0x05, 0x01, 0x11]);
+    header.extend(sevenz_number(names.len() as u64));
+    header.extend_from_slice(&names);
+    header.push(0x00);
+    header.push(0x00); // end of the header
+
+    let mut next = Vec::new();
+    next.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    next.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    next.extend_from_slice(&crc(&header).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+    out.extend_from_slice(&crc(&next).to_le_bytes());
+    out.extend_from_slice(&next);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&header);
+    out
+}

@@ -160,6 +160,61 @@ pub(crate) async fn admit_paths(
     Ok(Admission { _guard: guard })
 }
 
+/// The admission of [`admit_paths`] run on declared sizes alone, before any entry
+/// is decoded (SPEC-0085 DEC-002): same figures, same order (project first, the
+/// session after), but nothing is charged and the admission lock is held only
+/// inside [`used_bytes`]. `files` lists `(target path, declared size)` in archive
+/// order; only the last occurrence of a path counts. `count_stored` is false when
+/// the destination will be refused later, so no stored file is subtracted.
+///
+/// The total is a `u128` and the growth an `i128`, so no sum of `u64` sizes can
+/// wrap; a size, the total or the growth above `i64::MAX` is "too large" and is
+/// refused as a request of exactly `i64::MAX` bytes.
+///
+/// Time O(n) over `files`, plus one `meta.get` per distinct path; space O(n).
+pub(crate) async fn check_declared(
+    client: &VolumeClient,
+    safety: &SafetyManager,
+    person: &str,
+    mount_id: &str,
+    files: &[(String, u64)],
+    count_stored: bool,
+) -> Result<()> {
+    let cap = i128::from(i64::MAX);
+    let total: u128 = files.iter().map(|(_, size)| u128::from(*size)).sum();
+    let mut too_large = total > cap as u128;
+    let mut growth: i128 = 0;
+    let mut seen = std::collections::HashSet::with_capacity(files.len());
+    for (path, size) in files.iter().rev() {
+        if !seen.insert(path.as_str()) {
+            continue;
+        }
+        too_large |= i128::from(*size) > cap;
+        let stored = match client.meta.get(path).await? {
+            Some(node) if count_stored && node.is_file() => i128::from(node.size),
+            _ => 0,
+        };
+        growth += i128::from(*size) - stored;
+    }
+    too_large |= growth > cap;
+
+    if let Some(limit) = safety.project_limit(&client.project_id).await? {
+        let used = used_bytes(client).await?;
+        if too_large || (growth > 0 && i128::from(used) + growth > i128::from(limit)) {
+            let requested = i64::try_from(growth.min(cap)).unwrap_or(i64::MAX);
+            let requested = if too_large { i64::MAX } else { requested };
+            return Err(ToolError::project_quota_exceeded(limit, used, requested));
+        }
+    }
+    if total > safety.session_remaining(person, mount_id).max(0) as u128 {
+        let quota = safety.config().write_quota_bytes;
+        return Err(ToolError::write_quota_exceeded(format!(
+            "session write quota of {quota} bytes exceeded"
+        )));
+    }
+    Ok(())
+}
+
 /// Storage the project can still grow by, `None` when it has no limit.
 /// `replaced_size` is the size of a file the write replaces, since the check
 /// in [`check_and_charge`] counts net growth. Floor 0.

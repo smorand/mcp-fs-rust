@@ -220,6 +220,19 @@ pub(crate) async fn extract_archive(
             )
             .await?
         }
+        ArchiveFormat::Zip | ArchiveFormat::SevenZ => {
+            decode_listed(
+                state,
+                &client,
+                mount_id,
+                person,
+                &normalized,
+                (format, suffix_len),
+                destination,
+                password,
+            )
+            .await?
+        }
         _ => {
             let bytes = client.read_bytes(&normalized).await?;
             let owned_password = password.map(ToOwned::to_owned);
@@ -352,6 +365,66 @@ fn planned_destination(
         Some(d) => state.safety.normalize_path(d).ok(),
         None => Some(normalized[..normalized.len() - suffix_len].to_string()),
     }
+}
+
+/// A zip or 7z goes list, then [`quota::check_declared`], then decode, each
+/// blocking step off the async worker (SPEC-0085 DEC-001): the declared sizes
+/// are checked against the storage and session limits before one entry is
+/// decoded, so a bomb costs a header read. Nothing is written, charged or
+/// audited here; the destination refusal, the collision check and the final
+/// admission keep their place after decoding.
+/// Time O(n) over the entries to list and check, then O(decoded bytes).
+#[allow(clippy::too_many_arguments)]
+async fn decode_listed(
+    state: &AppState,
+    client: &crate::storage::volume::VolumeClient,
+    mount_id: &str,
+    person: &str,
+    normalized: &str,
+    (format, suffix_len): (ArchiveFormat, usize),
+    destination: Option<&str>,
+    password: Option<&str>,
+) -> Result<Vec<DecodedEntry>> {
+    let planned = planned_destination(state, format, normalized, suffix_len, destination);
+    let bytes = std::sync::Arc::new(client.read_bytes(normalized).await?);
+    let owned_password = password.map(ToOwned::to_owned);
+
+    let (list_bytes, list_password) = (bytes.clone(), owned_password.clone());
+    let listing = tokio::task::spawn_blocking(move || match format {
+        ArchiveFormat::Zip => list_zip(&list_bytes, list_password.as_deref()),
+        _ => list_sevenz(&list_bytes, list_password.as_deref()),
+    })
+    .await
+    .map_err(|e| ToolError::internal(format!("archive listing task panicked: {e}")))??;
+
+    // A refused destination is reported later; its paths are joined to `/` only
+    // so that the last occurrence of a repeated path still wins.
+    let base = planned.as_deref().unwrap_or("/");
+    let files: Vec<(String, u64)> = listing
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| (join_entry_destination(base, &e.rel_path), e.declared))
+        .collect();
+    quota::check_declared(client, &state.safety, person, mount_id, &files, planned.is_some())
+        .await?;
+
+    let (decoded, _held) = tokio::task::spawn_blocking(move || {
+        let mut held = 0u64;
+        let decoded = match format {
+            ArchiveFormat::Zip => {
+                decode_zip_listed(&bytes, owned_password.as_deref(), &listing, &mut held)
+            }
+            _ => decode_sevenz_listed(&bytes, owned_password.as_deref(), &mut held),
+        };
+        (decoded, held)
+    })
+    .await
+    .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))?;
+    // Set here, not in the blocking task: that one runs on another thread.
+    #[cfg(test)]
+    archive_single::LAST_HIGH_WATER.with(|c| c.set(Some(_held)));
+    decoded
 }
 
 /// Decode a compressed tar without ever holding more than the decoding bound:
@@ -506,14 +579,16 @@ fn join_entry_destination(dest: &str, rel_path: &str) -> String {
 /// `ZipFile::encrypted` (`zip-9.0.5/src/read/zipfile.rs:167`); only decoding an
 /// encrypted entry's bytes needs the password. `FR-NEW-009` holds as
 /// written; no new requirement was needed.
+#[cfg_attr(not(feature = "rar"), allow(unused_variables))]
 fn decode_archive(
     format: ArchiveFormat,
     bytes: &[u8],
     password: Option<&str>,
 ) -> Result<Vec<DecodedEntry>> {
     match format {
-        ArchiveFormat::Zip => decode_zip(bytes, password),
-        ArchiveFormat::SevenZ => decode_sevenz(bytes, password),
+        ArchiveFormat::Zip | ArchiveFormat::SevenZ => Err(ToolError::internal(
+            "a zip or 7z archive is listed, checked and then decoded, not decoded by decode_archive",
+        )),
         ArchiveFormat::Tar(TarCompression::None) => decode_tar("tar", bytes.to_vec()),
         ArchiveFormat::Tar(_) => Err(ToolError::internal(
             "a compressed tar is decoded under its bound, not by decode_archive",
@@ -612,10 +687,22 @@ pub(crate) fn ensure_entry_path_safe(raw: &str) -> Result<()> {
     Ok(())
 }
 
-/// `zip`: list every entry without a password (DRIFT-001), fail fast on a
-/// missing password if any entry is encrypted (FR-NEW-010), then fully
-/// decode every regular-file entry, surfacing a wrong password distinctly
-/// from a general corruption error (FR-NEW-011).
+/// What the headers of a zip or 7z archive say, read before any entry is decoded
+/// (SPEC-0085 DEC-001): the sizes the early limit check counts.
+struct Listing {
+    entries: Vec<ListedEntry>,
+}
+
+struct ListedEntry {
+    rel_path: String,
+    is_dir: bool,
+    declared: u64,
+}
+
+/// `zip`: list every entry without a password (DRIFT-001), applying every header
+/// refusal in this order: unreadable, per entry link, escaping name and
+/// duplicate name, missing password (FR-NEW-010), local header disagreement.
+/// Nothing is decoded. Time O(n) over the n entries, space O(n).
 ///
 /// DRIFT-002 (resolved): the pinned `zip` 9 crate exposes a native
 /// `ZipFile::is_symlink()` (`zip-9.0.5/src/read/zipfile.rs:191`), itself built
@@ -623,7 +710,7 @@ pub(crate) fn ensure_entry_path_safe(raw: &str) -> Result<()> {
 /// `external_attributes >> 16` for `System::Unix`). The native method is
 /// used directly per US-0002's resolution note, rather than re-deriving the
 /// `S_IFLNK` bit-mask by hand.
-fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>> {
+fn list_zip(bytes: &[u8], password: Option<&str>) -> Result<Listing> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| corrupt("zip", e))?;
 
     // FR-NEW-013/014/015: every entry is checked for type and path safety
@@ -654,11 +741,10 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
         if file.encrypted() {
             any_encrypted = true;
         }
-        entries.push(DecodedEntry {
+        entries.push(ListedEntry {
             rel_path: raw_path,
             is_dir: file.is_dir(),
-            declared_size: file.size(),
-            bytes: Vec::new(),
+            declared: file.size(),
         });
     }
 
@@ -674,11 +760,35 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
     if let Some(reason) = crate::docs::zip_check::header_inconsistency(&mut archive) {
         return Err(corrupt("zip", reason));
     }
+    Ok(Listing { entries })
+}
+
+/// Decode every regular file of a zip that [`list_zip`] accepted, surfacing a
+/// wrong password distinctly from a general corruption error (FR-NEW-011).
+/// `held` receives the running total of decoded entry bytes, also when the
+/// decoding fails (SPEC-0085 DEC-004). Time O(total decoded bytes), space O(same).
+fn decode_zip_listed(
+    bytes: &[u8],
+    password: Option<&str>,
+    listing: &Listing,
+    held: &mut u64,
+) -> Result<Vec<DecodedEntry>> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| corrupt("zip", e))?;
+    let mut entries: Vec<DecodedEntry> = listing
+        .entries
+        .iter()
+        .map(|e| DecodedEntry {
+            rel_path: e.rel_path.clone(),
+            is_dir: e.is_dir,
+            declared_size: e.declared,
+            bytes: Vec::new(),
+        })
+        .collect();
 
     // Indexed, not iterator-driven: `by_index`/`by_index_decrypt` need the
     // numeric index itself, not just `entries[i]`.
     #[allow(clippy::needless_range_loop)]
-    for i in 0..archive.len() {
+    for i in 0..archive.len().min(entries.len()) {
         let encrypted = archive.by_index_raw(i).map_err(|e| corrupt("zip", e))?.encrypted();
         let declared = entries[i].declared_size;
         if !encrypted {
@@ -690,23 +800,27 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
                 continue;
             }
             let mut buf = Vec::new();
-            file.read_to_end(&mut buf)
-                .map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
+            let read = file.read_to_end(&mut buf);
+            *held += buf.len() as u64;
+            read.map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
             ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
             entries[i].bytes = buf;
             continue;
         }
         // An explicitly supplied empty string is a supplied-but-wrong
-        // password, never the missing-password case above (FR-NEW-011).
-        let pw = password.expect("password presence checked above for any encrypted entry");
+        // password, never the missing-password case (FR-NEW-011).
+        let Some(pw) = password else {
+            return Err(password_required_message(None));
+        };
         match archive.by_index_decrypt(i, pw.as_bytes()) {
             Ok(mut file) => {
                 if file.is_dir() {
                     continue;
                 }
                 let mut buf = Vec::new();
-                file.read_to_end(&mut buf)
-                    .map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
+                let read = file.read_to_end(&mut buf);
+                *held += buf.len() as u64;
+                read.map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
                 ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
                 entries[i].bytes = buf;
             }
@@ -719,15 +833,17 @@ fn decode_zip(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>>
     Ok(entries)
 }
 
-/// `sevenz`: `sevenz_rust2::Archive::read` fails outright
+/// Open a 7z header. `sevenz_rust2::Archive::read` fails outright
 /// (`Error::PasswordRequired`) when the archive's own header is encrypted,
 /// which is the carve-out `FR-NEW-009` already describes: that failure is
 /// routed through the same password-required/incorrect messages rather than
-/// treated as a listing step (per US-0001's resolution). Otherwise entries
-/// are listed from the parsed header with no password, and any AES256
-/// content coder gates the same password rules before a full decode.
-fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>> {
-    use sevenz_rust2::{ArchiveReader, Password};
+/// treated as a listing step (per US-0001's resolution). Returns the archive and
+/// whether a content coder is AES256, the password gate of a full decode.
+fn open_sevenz(
+    bytes: &[u8],
+    password: Option<&str>,
+) -> Result<(sevenz_rust2::Archive, sevenz_rust2::Password, bool)> {
+    use sevenz_rust2::Password;
 
     let probe_password = password.map(Password::from).unwrap_or_else(Password::empty);
     let archive = match sevenz_rust2::Archive::read(&mut Cursor::new(bytes), &probe_password) {
@@ -751,38 +867,61 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
             .iter()
             .any(|coder| coder.encoder_method_id() == sevenz_rust2::EncoderMethod::ID_AES256_SHA256)
     });
+    Ok((archive, probe_password, header_encrypted))
+}
 
+/// `sevenz`: entries are listed from the parsed header with no password, and any
+/// AES256 content coder gates the same password rules before a full decode.
+/// FR-NEW-014 path safety applies to every entry, then entry type rejection
+/// (FR-NEW-013), best effort per DEC-008: 7z has no universal symlink
+/// representation, so only an entry whose unix extension attributes positively
+/// name a non regular type is refused; anything else is an ordinary file, still
+/// covered by the path check. Both run over `archive.files` in archive order,
+/// before any block is decoded (SPEC-0085 DEC-006).
+/// Time O(n) over the n entries, space O(n).
+fn list_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Listing> {
+    let (archive, _, header_encrypted) = open_sevenz(bytes, password)?;
     if header_encrypted && password.is_none() {
         return Err(password_required_message(None));
     }
+    let mut entries = Vec::with_capacity(archive.files.len());
+    for entry in &archive.files {
+        ensure_entry_path_safe(entry.name())?;
+        if let Some(label) = sevenz_special_type(entry) {
+            return Err(ToolError::not_supported(format!(
+                "archive entry '{}' is a {label}, which is not supported",
+                entry.name()
+            )));
+        }
+        entries.push(ListedEntry {
+            rel_path: entry.name().to_string(),
+            is_dir: entry.is_directory(),
+            declared: entry.size(),
+        });
+    }
+    Ok(Listing { entries })
+}
 
-    // FR-NEW-014 path safety applies to every entry. Entry type rejection
-    // (FR-NEW-013) is best effort per DEC-008: 7z has no universal symlink
-    // representation, so only an entry whose unix extension attributes
-    // positively name a non regular type is refused; anything else is an
-    // ordinary file, still covered by the path check.
-    //
+/// Decode every entry of a 7z that [`list_sevenz`] accepted. `held` receives the
+/// running total of decoded entry bytes, also when the decoding fails
+/// (SPEC-0085 DEC-004). Time O(total decoded bytes), space O(same).
+fn decode_sevenz_listed(
+    bytes: &[u8],
+    password: Option<&str>,
+    held: &mut u64,
+) -> Result<Vec<DecodedEntry>> {
+    use sevenz_rust2::ArchiveReader;
+
+    let (archive, probe_password, header_encrypted) = open_sevenz(bytes, password)?;
     // `entry_error` is a side channel: the closure's error type is
     // `sevenz_rust2::Error`, which cannot carry a `ToolError` through
-    // `for_each_entries`'s `?`. Without it a zip-slip, special entry or size
-    // mismatch (FR-NEW-020) would fall to the generic corrupt/password
-    // fallback below and surface with the wrong code.
+    // `for_each_entries`'s `?`. Without it a size mismatch (FR-NEW-020) would
+    // fall to the generic corrupt/password fallback below and surface with the
+    // wrong code.
     let mut entries = Vec::new();
     let mut entry_error: Option<ToolError> = None;
     let mut reader = ArchiveReader::from_archive(archive, Cursor::new(bytes), probe_password);
     let decode_result = reader.for_each_entries(|entry, read| {
-        let refusal = ensure_entry_path_safe(entry.name()).err().or_else(|| {
-            sevenz_special_type(entry).map(|label| {
-                ToolError::not_supported(format!(
-                    "archive entry '{}' is a {label}, which is not supported",
-                    entry.name()
-                ))
-            })
-        });
-        if let Some(e) = refusal {
-            entry_error = Some(e);
-            return Err(sevenz_rust2::Error::Other("entry refused".into()));
-        }
         let declared = entry.size();
         let rel_path = entry.name().to_string();
         if entry.is_directory() {
@@ -795,7 +934,9 @@ fn decode_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntr
             return Ok(true);
         }
         let mut buf = Vec::new();
-        read.read_to_end(&mut buf)?;
+        let read_result = read.read_to_end(&mut buf);
+        *held += buf.len() as u64;
+        read_result?;
         if let Err(e) = ensure_decoded_size_matches(&rel_path, declared, buf.len()) {
             entry_error = Some(e);
             return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
