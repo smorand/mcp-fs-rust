@@ -490,3 +490,180 @@ fn e2e_0087_048_the_password_stays_out_of_a_cut_refu() {
         }
     });
 }
+
+#[cfg(feature = "rar")]
+const CUT: &[u8] = include_bytes!("../../tests/fixtures/rar/cut.rar");
+
+#[cfg(feature = "rar")]
+fn password_refusal(v: &Result<Value>, message: &str) {
+    let e = v.as_ref().expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::PASSWORD_REQUIRED, "{e:?}");
+    assert_eq!(e.message, message);
+}
+
+#[cfg(feature = "rar")]
+const NEEDED: &str =
+    "password required to extract this archive; call again with the 'password' parameter";
+#[cfg(feature = "rar")]
+const INCORRECT: &str =
+    "incorrect password for this archive; call again with the correct 'password' parameter";
+
+#[cfg(feature = "rar")]
+fn password_needed(v: &Result<Value>) {
+    password_refusal(v, NEEDED);
+}
+
+#[cfg(feature = "rar")]
+fn password_incorrect(v: &Result<Value>) {
+    password_refusal(v, INCORRECT);
+}
+
+#[cfg(feature = "rar")]
+fn corrupt_any(v: &Result<Value>) {
+    corrupt_refusal(v, "rar");
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_025_version_4_encrypted_names_cut_no_pas() {
+    assert_refused_and_nothing_written("hp4half", &HP4[..108], None, password_needed).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_026_version_4_encrypted_names_cut_inside() {
+    assert_truncated("hp4short", &HP4[..16], None).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_027_version_4_encrypted_names_cut_wrong() {
+    // `nope` decrypts the first header to a size far past the end, which the walk reads
+    // as a shortfall. `w785` was found by search to decrypt it to a plausible size with a
+    // failing CRC16, the branch that must leave the answer to UnRAR (BL-0136).
+    for password in ["nope", "w785"] {
+        for (stem, bytes) in [("hp4half", &HP4[..108]), ("hp4", HP4)] {
+            assert_refused_and_nothing_written(stem, bytes, Some(password), corrupt_any).await;
+        }
+    }
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_031_version_5_encrypted_names_cut_wrong() {
+    assert_refused_and_nothing_written("cuth", CUTH, Some("nope"), password_incorrect).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_032_version_5_encrypted_names_cut_no_pas() {
+    assert_refused_and_nothing_written("cuth", CUTH, None, password_needed).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_033_version_5_cut_inside_the_encryption() {
+    assert_truncated("hid40", &HIDDEN[..40], None).await;
+    assert_truncated("hid40", &HIDDEN[..40], Some("nope")).await;
+}
+
+/// DEC-007: the right password half runs, per archive, every length up to the end of the
+/// leading part plus 1, the offsets spec 9.0 names and their two neighbours, and the last
+/// 8 lengths (each call pays two key derivations in a debug build); the no password half
+/// runs every length. A length below the whole marker is corrupt, not truncated. One
+/// fixture per archive, `/uploads/p` must never appear.
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_034_every_length_of_the_encrypted_names() {
+    // (archive, marker, whole leading part, offsets of spec 9.0 with their neighbours)
+    type Case = (&'static str, &'static [u8], usize, usize, &'static [usize]);
+    let archives: [Case; 3] = [
+        ("hidden", HIDDEN, 8, 62, &[168, 169, 170, 221, 222, 223]),
+        ("hp4", HP4, 7, 20, &[107, 108, 109, 179, 180, 181, 189, 190, 191, 194, 195, 196]),
+        ("hp5two", HP5TWO, 8, 62, &[205, 206, 207]),
+    ];
+    for (name, whole, marker, leading, offsets) in archives {
+        let f = fixture().await;
+        let size = whole.len();
+        let mut right: Vec<usize> = (0..=leading + 1).collect();
+        right.extend(offsets.iter().copied());
+        right.extend(size - 8..size);
+        right.retain(|n| *n < size);
+        right.sort_unstable();
+        right.dedup();
+        for len in right {
+            seed(&f, "/uploads/p.rar", &whole[..len]).await;
+            let v = extract(&f, "/uploads/p.rar", None, false, Some(PASSWORD)).await;
+            if len < marker {
+                corrupt_any(&v);
+            } else {
+                assert!(
+                    v.as_ref().is_err_and(|e| e.message == TRUNCATED),
+                    "{name} right password at {len}: {v:?}"
+                );
+                truncated_refusal(&v);
+            }
+            assert!(
+                !exists(&f, "/uploads/p").await,
+                "{name} right password {len} wrote /uploads/p"
+            );
+        }
+        for len in 0..size {
+            seed(&f, "/uploads/p.rar", &whole[..len]).await;
+            let v = extract(&f, "/uploads/p.rar", None, false, None).await;
+            if len < marker {
+                corrupt_any(&v);
+            } else if len < leading {
+                truncated_refusal(&v);
+            } else {
+                password_needed(&v);
+            }
+            assert!(!exists(&f, "/uploads/p").await, "{name} no password {len} wrote /uploads/p");
+        }
+    }
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_035_version_5_readable_names_encrypted_d() {
+    assert_truncated("cut", CUT, Some(PASSWORD)).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_049_a_whole_archive_whose_file_is_larger() {
+    use crate::tools::archive_rar_fixtures::{RarEntry, rar5_store};
+    let archive = rar5_store(&[RarEntry::declaring("big.bin", 10, &vec![7u8; 1_000_000])]);
+    let check = |v: &Result<Value>| {
+        let e = v.as_ref().expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+        assert_eq!(
+            e.message,
+            "archive entry 'big.bin' decompressed to more bytes than declared 10"
+        );
+    };
+    let f = fixture().await;
+    seed(&f, "/uploads/bomb.rar", &archive).await;
+    let v = extract(&f, "/uploads/bomb.rar", None, false, None).await;
+    check(&v);
+    assert!(!exists(&f, "/uploads/bomb").await);
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_050_version_5_encrypted_names_cut_empty() {
+    assert_refused_and_nothing_written("cuth", CUTH, Some(""), password_incorrect).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_051_version_5_encrypted_names_cut_betwee() {
+    assert_refused_and_nothing_written("hp5half", &HP5TWO[..206], Some("nope"), password_incorrect)
+        .await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_055_version_4_encrypted_names_cut_empty() {
+    assert_refused_and_nothing_written("hp4half", &HP4[..108], Some(""), password_incorrect).await;
+}

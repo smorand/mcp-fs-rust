@@ -375,6 +375,7 @@ const AES_BLOCK: usize = 16;
 fn walk_rar5_encrypted(mut crypt: &[u8], mut rest: &[u8], password: Option<&str>) -> Result<()> {
     use crate::tools::archive_rar_crypt::{aes256_cbc_decrypt, rar5_kdf};
     let Some(password) = password.filter(|p| !p.is_empty()) else {
+        rest.get(..AES_BLOCK).ok_or_else(|| corrupt("rar", TRUNCATED))?;
         return Ok(());
     };
     let truncated = || corrupt("rar", TRUNCATED);
