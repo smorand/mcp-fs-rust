@@ -784,3 +784,7 @@ Not applicable (`--security` not set).
 ## Erratum 1 (design issue of 2026-11-05)
 
 The only xz decoder in the tree, `lzma-rs` 0.3, decodes a whole block into memory and rejects any stream after the first, so E2E-009, E2E-010 and FR-NEW-007 could not hold. Decision: use `liblzma` as a direct dependency (the user's default, option (a) of `design-issues.md`). Consequences: E2E-015 (x86 branch filter) and E2E-056 (SHA-256 check) become happy tests; FR-NEW-008 and Section 3.2 lose the filter and check refusals; the tar family keeps its decoder (BL-0132). The total is 58 tests, happy 10, failure 30.
+
+## Erratum (BL-0128)
+
+In the order of refusals, "the destination is a file or sits under a file" (item 7) and "collision" (item 8) never apply to the same call: when the destination is a file, or lies below one, the output path is below that file and cannot exist, so no collision is possible. Their relative order is therefore not observable and is not required; the two items are one step for ordering purposes. E2E-051 pins the outcome (the destination refusal, never `ERR_NO_CLOBBER`), not a sequence. Nothing else in the list changes.

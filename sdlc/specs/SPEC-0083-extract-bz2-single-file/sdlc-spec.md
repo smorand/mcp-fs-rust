@@ -737,3 +737,7 @@ Not applicable (`--security` not set).
 - The answer keys (`destination`, `files_written`, `dirs_created`, `bytes_written`) and the audit line are shared (`archive.rs:242-275`).
 - The messages `'<path>' is a folder and cannot be replaced` and `'<path>' is a file, not a folder` do not exist in the code today (no match in `crates/core/src`); the design creates them for the bare `.bz2` path only.
 - The same bounded decoding flow serves SPEC-0081 (gzip), SPEC-0082 (xz) and this increment, with one reader per format. Update `.agent_docs/tools.md:180-183` and `README.md`; `TOOL_CONTRACT.txt` changes only if a parameter description changes. BL-0124 records the tar family cap.
+
+## Erratum (BL-0128)
+
+In the order of refusals, "the destination is a file or sits under a file" (item 7) and "collision" (item 8) never apply to the same call: when the destination is a file, or lies below one, the output path is below that file and cannot exist, so no collision is possible. Their relative order is therefore not observable and is not required; the two items are one step for ordering purposes. E2E-036 pins the outcome (the destination refusal, never `ERR_NO_CLOBBER`), not a sequence. Nothing else in the list changes.

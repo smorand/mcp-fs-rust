@@ -777,3 +777,7 @@ Not applicable (`--security` not set).
 - The audit line and the answer keys (`destination`, `files_written`, `dirs_created`, `bytes_written`) are shared (`archive.rs:242-275`).
 - The memory observable of E2E-017 needs a measurable hook (peak allocation or a capped reader counter); decide at design.
 - Update `.agent_docs/tools.md:180-183`, `README.md`, the E2E-NEW-034 test (`archive.rs:806-814`); `TOOL_CONTRACT.txt` changes only if a parameter description changes. BL-0124 records the tar family size cap; BL-0112 and BL-0113 reuse this flow for `.xz` and `.bz2`.
+
+## Erratum (BL-0128)
+
+In the order of refusals, "the destination is a file or sits under a file" (item 7) and "collision" (item 8) never apply to the same call: when the destination is a file, or lies below one, the output path is below that file and cannot exist, so no collision is possible. Their relative order is therefore not observable and is not required; the two items are one step for ordering purposes. its destination-is-a-file test pins the outcome (the destination refusal, never `ERR_NO_CLOBBER`), not a sequence. Nothing else in the list changes.
