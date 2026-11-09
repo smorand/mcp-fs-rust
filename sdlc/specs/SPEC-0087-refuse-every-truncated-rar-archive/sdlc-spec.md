@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (archive extraction, RAR only), 10 requirements, public behavior change (a truncated RAR version 4 archive, or a truncated archive whose file names or data are encrypted, extracted today with fewer files or refused with a misleading message, is refused as corrupt; an archive made of the RAR marker alone, or of the marker and the main header, is refused instead of extracting nothing), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-09
 > Project: existing
 > From backlog: BL-0131

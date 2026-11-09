@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (archive extraction), 13 requirements, public behavior change (a hostile compressed tar archive is refused with a limit error instead of being decoded whole; a `.tar.xz` the extraction refused now extracts), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-09
 > Project: existing
 > From backlog: BL-0124, BL-0132

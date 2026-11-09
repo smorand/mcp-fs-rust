@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (archive extraction, three formats), 12 requirements, public behavior change (an archive whose declared sizes exceed a limit is refused before any entry is decoded, which reorders some refusals; an entry declaring an uncountable size is refused instead of bypassing the limits), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-09
 > Project: existing
 > From backlog: BL-0125

@@ -182,3 +182,25 @@
 | US-0180 | SPEC-0082 | xz password, output name, tar rows and the HTTP answer | US-0179 | 2 | landed | story/US-0180-xz-password-output-name-tar-rows | story/US-0179-xz-several-streams-and-corrupt |
 | US-0181 | SPEC-0082 | check the xz collision, destination and order rules | US-0180 | 2 | landed | story/US-0181-xz-collision-destination-order | story/US-0180-xz-password-output-name-tar-rows |
 | US-0182 | SPEC-0082 | check the xz storage and session limits and document the format | US-0181 | 2 | landed | story/US-0182-xz-limits-and-documentation | story/US-0181-xz-collision-destination-order |
+| US-0183 | SPEC-0084 | decode a .tar.xz with the bare xz decoder | main | 2 | todo | | |
+| US-0184 | SPEC-0084 | stop a compressed tar bomb at the decoding bound | US-0183 | 2 | todo | | |
+| US-0185 | SPEC-0084 | order the bound among the tar refusals and re extract near the limit | US-0184 | 2 | todo | | |
+| US-0186 | SPEC-0084 | one xz library and the other formats unchanged | US-0185 | 2 | todo | | |
+| US-0187 | SPEC-0084 | tar bound through the HTTP door and documentation | US-0186 | 2 | todo | | |
+| US-0188 | SPEC-0085 | count declared archive sizes exactly, never negative | US-0187 | 1 | todo | | |
+| US-0189 | SPEC-0085 | refuse zip and 7z archives over a limit before decoding | US-0188 | 2 | todo | | |
+| US-0190 | SPEC-0085 | net growth with stored files and the order of refusals | US-0189 | 2 | todo | | |
+| US-0191 | SPEC-0085 | admit RAR declared sizes before decoding | US-0190 | 2 | todo | | |
+| US-0192 | SPEC-0085 | cap every entry at its declared size | US-0191 | 2 | todo | | |
+| US-0193 | SPEC-0085 | declared sizes through the HTTP door and documentation | US-0192 | 2 | todo | | |
+| US-0194 | SPEC-0086 | one destination rule: refuse a climb above the root for every format | US-0193 | 2 | todo | | |
+| US-0195 | SPEC-0086 | check the destination before the archive is read | US-0194 | 2 | todo | | |
+| US-0196 | SPEC-0086 | earlier refusals first and both doors alike | US-0195 | 2 | todo | | |
+| US-0197 | SPEC-0086 | destinations inside the project unchanged and documentation | US-0196 | 2 | todo | | |
+| US-0198 | SPEC-0087 | refuse a cut RAR4 archive with one message | US-0197 | 2 | todo | | |
+| US-0199 | SPEC-0087 | complete RAR archives unchanged, folders and solid cuts refused | US-0198 | 2 | todo | | |
+| US-0200 | SPEC-0087 | every block kind counts: stored data, recovery record, comment | US-0199 | 2 | todo | | |
+| US-0201 | SPEC-0087 | decrypt RAR5 headers to see a cut with the right password | US-0200 | 1 | todo | | |
+| US-0202 | SPEC-0087 | decrypt RAR4 headers to see a cut with the right password | US-0201 | 1 | todo | | |
+| US-0203 | SPEC-0087 | password questions first, every cut of an encrypted names archive | US-0202 | 2 | todo | | |
+| US-0204 | SPEC-0087 | cut RAR archives through the HTTP door and documentation | US-0203 | 2 | todo | | |
