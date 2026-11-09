@@ -34,6 +34,10 @@ pub(crate) mod archive_rar;
 #[cfg(all(test, feature = "rar"))]
 pub(crate) mod archive_rar_fixtures;
 pub(crate) mod archive_single;
+#[cfg(test)]
+mod archive_tar_bound_e2e;
+#[cfg(test)]
+pub(crate) mod archive_testkit;
 pub(crate) mod artifacts;
 #[cfg(test)]
 mod case_paths_e2e;

@@ -71,7 +71,7 @@ thread_local! {
 /// `CONCATENATED` makes liblzma read every stream, accept zero padding of a
 /// multiple of 4 bytes between and after them, and refuse any other trailing byte.
 /// Fallible because liblzma can fail to allocate its state.
-fn decoder(format: SingleFormat, bytes: &[u8]) -> std::io::Result<Box<dyn Read + '_>> {
+pub(crate) fn decoder(format: SingleFormat, bytes: &[u8]) -> std::io::Result<Box<dyn Read + '_>> {
     Ok(match format {
         SingleFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
         SingleFormat::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(bytes)),

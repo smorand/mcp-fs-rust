@@ -742,8 +742,10 @@ fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<Vec<DecodedEn
         }
         TarCompression::Xz => {
             let mut out = Vec::new();
-            lzma_rs::xz_decompress(&mut Cursor::new(bytes), &mut out)
-                .map_err(|e| corrupt(format_name, e.to_string()))?;
+            archive_single::decoder(SingleFormat::Xz, bytes)
+                .map_err(|e| ToolError::internal(format!("cannot start the tar.xz decoder: {e}")))?
+                .read_to_end(&mut out)
+                .map_err(|e| corrupt(format_name, e))?;
             out
         }
     };
