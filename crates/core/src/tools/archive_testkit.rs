@@ -84,6 +84,11 @@ pub(crate) fn held_reset() {
     LAST_HIGH_WATER.with(|c| c.set(None));
 }
 
+/// Bytes the last decode held, 0 when the capped decoder never ran.
+pub(crate) fn held() -> u64 {
+    LAST_HIGH_WATER.with(std::cell::Cell::get).unwrap_or(0)
+}
+
 /// Bytes the last decode held; fails when the capped decoder never ran.
 pub(crate) fn held_some() -> u64 {
     LAST_HIGH_WATER.with(std::cell::Cell::get).expect("no capped decode ran")
@@ -153,4 +158,46 @@ pub(crate) fn xz(bytes: &[u8]) -> Vec<u8> {
 /// A tar of `zeros.bin`, 10 000 000 zero bytes: a small file once compressed.
 pub(crate) fn tar_bomb() -> Vec<u8> {
     tar_bytes(&[("zeros.bin", &vec![0u8; 10_000_000])])
+}
+
+/// A tar whose first entry is the symbolic link `link_name` to `target`, then `then` as regular files.
+pub(crate) fn tar_with_symlink(link_name: &str, target: &str, then: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut out);
+        let mut h = tar::Header::new_gnu();
+        h.set_path(link_name).unwrap();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_link_name(target).unwrap();
+        h.set_cksum();
+        b.append(&h, std::io::empty()).unwrap();
+        for (path, content) in then {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(content.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append(&h, *content).unwrap();
+        }
+        b.finish().unwrap();
+    }
+    out
+}
+
+/// One GNU header declaring `declared` bytes, then `content` and nothing after: the entry lies.
+pub(crate) fn tar_lying(name: &str, declared: u64, content: &[u8]) -> Vec<u8> {
+    let mut h = tar::Header::new_gnu();
+    h.set_path(name).unwrap();
+    h.set_size(declared);
+    h.set_mode(0o644);
+    h.set_cksum();
+    let mut out = h.as_bytes().to_vec();
+    out.extend_from_slice(content);
+    out
+}
+
+/// `abc` repeated up to `n` bytes.
+pub(crate) fn abc_bytes(n: usize) -> Vec<u8> {
+    b"abc".iter().copied().cycle().take(n).collect()
 }

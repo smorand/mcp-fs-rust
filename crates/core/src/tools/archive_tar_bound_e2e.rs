@@ -1,9 +1,9 @@
 //! Tar family decoding (SPEC-0084): `.tar.xz` and `.txz` go through the bare xz decoder.
 
 use super::archive_testkit::{
-    allowance, bz2, corrupt_refusal, exists, extract, extraction_audit_lines, fixture,
+    abc_bytes, allowance, bz2, corrupt_refusal, exists, extract, extraction_audit_lines, fixture,
     fixture_allowance, gz, held_at_most, held_reset, limit_remaining, project_refusal, read, seed,
-    session_refusal, tar_bomb, xz,
+    session_refusal, tar_bomb, tar_bytes, tar_lying, tar_with_symlink, xz,
 };
 use liblzma::stream::{Check, Filters, LzmaOptions, Stream};
 use serde_json::json;
@@ -390,4 +390,145 @@ async fn e2e_0084_046_bytes_after_the_end_marker_count() {
     project_refusal(&v);
     held_at_most(1_049_576);
     assert!(!exists(&f, "/uploads/tail").await);
+}
+
+// Order of the refusals, re extraction near the limit, lying entries (US-0185).
+
+async fn bomb_fixture(name: &str, bytes: Vec<u8>) -> crate::tools::admin::test_support::Fixture {
+    let f = fixture().await;
+    seed_bomb(&f, name, bytes).await;
+    limit_remaining(&f, 1000).await;
+    f
+}
+
+#[tokio::test]
+async fn e2e_0084_016_the_bound_wins_over_a_collision() {
+    let f = bomb_fixture("/uploads/bomb.tar.gz", gz(&tar_bomb())).await;
+    seed(&f, "/uploads/bomb/zeros.bin", b"old").await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    assert_eq!(read(&f, "/uploads/bomb/zeros.bin").await.as_deref(), Some(&b"old"[..]));
+}
+
+#[tokio::test]
+async fn e2e_0084_017_the_bound_wins_over_an_unsupported_e() {
+    let t = tar_with_symlink("link", "/etc/passwd", &[("zeros.bin", &vec![0u8; 10_000_000])]);
+    let f = bomb_fixture("/uploads/bomb.tar.gz", gz(&t)).await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    assert!(!exists(&f, "/uploads/bomb").await);
+}
+
+#[tokio::test]
+async fn e2e_0084_018_password_wins_over_the_bound() {
+    let f = bomb_fixture("/uploads/bomb.tar.gz", gz(&tar_bomb())).await;
+    held_reset();
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, Some("s3cret")).await;
+    let e = v.as_ref().expect_err("refused");
+    assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, "password is not applicable to this archive format");
+    assert_eq!(super::archive_testkit::held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0084_019_corruption_met_first_wins_over_the_b() {
+    let mut bytes = gz(&tar_bomb());
+    bytes[0] = 0;
+    bytes[1] = 0;
+    let f = bomb_fixture("/uploads/bomb.tar.gz", bytes).await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    corrupt_refusal(&v, "tar.gz");
+}
+
+#[tokio::test]
+async fn e2e_0084_020_the_bound_met_first_wins_over_a_late() {
+    let mut bytes = gz(&tar_bomb());
+    let n = bytes.len();
+    for b in &mut bytes[n - 8..] {
+        *b = !*b;
+    }
+    let f = bomb_fixture("/uploads/bomb.tar.gz", bytes).await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    project_refusal(&v);
+}
+
+/// `pack.tar.gz` holding `big.bin` (3 000 000 bytes) with 100 000 bytes of room left once
+/// `stored_at` (if any) holds the same bytes.
+async fn pack_fixture(stored_at: &str) -> crate::tools::admin::test_support::Fixture {
+    let big = abc_bytes(3_000_000);
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar_bytes(&[("big.bin", &big)]))).await;
+    seed(&f, stored_at, &big).await;
+    limit_remaining(&f, 100_000).await;
+    f
+}
+
+#[tokio::test]
+async fn e2e_0084_022_re_extract_with_overwrite_near_the_l() {
+    let f = pack_fixture("/uploads/pack/big.bin").await;
+    let v = extract(&f, "/uploads/pack.tar.gz", None, true, None).await;
+    assert_eq!(
+        v.as_ref().ok(),
+        Some(&json!({"destination": "/uploads/pack", "files_written": 1,
+                     "dirs_created": 0, "bytes_written": 3_000_000})),
+        "{v:?}"
+    );
+    assert_eq!(remaining(&f).await, 100_000);
+}
+
+#[tokio::test]
+async fn e2e_0084_023_same_situation_without_overwrite() {
+    let f = pack_fixture("/uploads/pack/big.bin").await;
+    let v = extract(&f, "/uploads/pack.tar.gz", None, false, None).await;
+    let e = v.as_ref().expect_err("refused");
+    assert_eq!(e.code, crate::errors::code::NO_CLOBBER, "{e:?}");
+    assert_eq!(
+        e.message,
+        "'/uploads/pack/big.bin' already exists; pass overwrite=true to replace it"
+    );
+}
+
+#[tokio::test]
+async fn e2e_0084_024_files_stored_elsewhere_do_not_count() {
+    let f = pack_fixture("/elsewhere/big.bin").await;
+    held_reset();
+    let v = extract(&f, "/uploads/pack.tar.gz", None, true, None).await;
+    project_refusal(&v);
+    held_at_most(1_148_576);
+    assert!(!exists(&f, "/uploads/pack").await);
+}
+
+#[tokio::test]
+async fn e2e_0084_025_explicit_destination_holding_the_fil() {
+    let f = pack_fixture("/out/big.bin").await;
+    let v = extract(&f, "/uploads/pack.tar.gz", Some("/out"), true, None).await;
+    assert!(v.is_ok(), "{v:?}");
+    assert_eq!(read(&f, "/out/big.bin").await, Some(abc_bytes(3_000_000)));
+    assert_eq!(remaining(&f).await, 100_000);
+}
+
+async fn lying(name: &str, format: &str, bytes: Vec<u8>) {
+    let f = fixture().await;
+    seed(&f, name, &bytes).await;
+    limit_remaining(&f, 1000).await;
+    let v = extract(&f, name, None, false, None).await;
+    corrupt_refusal(&v, format);
+    assert!(!exists(&f, "/uploads/lie").await);
+    assert_eq!(remaining(&f).await, 1000);
+}
+
+#[tokio::test]
+async fn e2e_0084_043_tar_gz_entry_declaring_more_than_it() {
+    lying("/uploads/lie.tar.gz", "tar.gz", gz(&tar_lying("a.txt", 1_000_000_000, b"hello"))).await;
+}
+
+#[tokio::test]
+async fn e2e_0084_044_tar_bz2_entry_declaring_more_than_it() {
+    lying("/uploads/lie.tar.bz2", "tar.bz2", bz2(&tar_lying("a.txt", 1_000_000_000, b"hello")))
+        .await;
+}
+
+#[tokio::test]
+async fn e2e_0084_045_tar_xz_entry_declaring_more_than_it() {
+    lying("/uploads/lie.tar.xz", "tar.xz", xz(&tar_lying("a.txt", 1_000_000_000, b"hello"))).await;
 }
