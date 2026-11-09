@@ -626,11 +626,41 @@ fn zip_read_error(rel_path: &str, declared: u64, e: std::io::Error) -> ToolError
     if e.kind() == std::io::ErrorKind::InvalidData
         && e.to_string().contains("larger than its declared")
     {
-        return ToolError::invalid_argument(format!(
-            "archive entry '{rel_path}' decompressed to more bytes than declared {declared}"
-        ));
+        return declared_size_exceeded(rel_path, declared);
     }
     corrupt("zip", e)
+}
+
+/// The one size lie refusal of a zip, 7z or RAR entry (SPEC-0085 DEC-005).
+pub(crate) fn declared_size_exceeded(rel_path: &str, declared: u64) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "archive entry '{rel_path}' decompressed to more bytes than declared {declared}"
+    ))
+}
+
+/// Read one zip entry, never holding more than `declared` bytes: the cap holds
+/// whatever the zip library does with a lying header (SPEC-0085 DEC-005). `held`
+/// receives the bytes kept, also when the read fails.
+/// Time O(n) in the bytes read, space O(min(n, declared)) plus one chunk.
+fn read_zip_entry(
+    file: &mut impl Read,
+    rel_path: &str,
+    declared: u64,
+    held: &mut u64,
+) -> Result<Vec<u8>> {
+    match archive_single::read_capped(file, declared) {
+        Ok(decoded) => {
+            *held += decoded.high_water;
+            Ok(decoded.bytes)
+        }
+        Err(archive_single::ReadError::CapExceeded { high_water }) => {
+            *held += high_water;
+            Err(declared_size_exceeded(rel_path, declared))
+        }
+        Err(archive_single::ReadError::Io(e) | archive_single::ReadError::Init(e)) => {
+            Err(zip_read_error(rel_path, declared, e))
+        }
+    }
 }
 
 /// FR-NEW-020: an entry's decoded byte length must never exceed its
@@ -826,12 +856,7 @@ fn decode_zip_listed(
             if file.is_dir() {
                 continue;
             }
-            let mut buf = Vec::new();
-            let read = file.read_to_end(&mut buf);
-            *held += buf.len() as u64;
-            read.map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
-            ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
-            entries[i].bytes = buf;
+            entries[i].bytes = read_zip_entry(&mut file, &entries[i].rel_path, declared, held)?;
             continue;
         }
         // An explicitly supplied empty string is a supplied-but-wrong
@@ -844,12 +869,7 @@ fn decode_zip_listed(
                 if file.is_dir() {
                     continue;
                 }
-                let mut buf = Vec::new();
-                let read = file.read_to_end(&mut buf);
-                *held += buf.len() as u64;
-                read.map_err(|e| zip_read_error(&entries[i].rel_path, declared, e))?;
-                ensure_decoded_size_matches(&entries[i].rel_path, declared, buf.len())?;
-                entries[i].bytes = buf;
+                entries[i].bytes = read_zip_entry(&mut file, &entries[i].rel_path, declared, held)?;
             }
             Err(zip::result::ZipError::InvalidPassword) => {
                 return Err(password_required_message(password));
@@ -960,14 +980,20 @@ fn decode_sevenz_listed(
             });
             return Ok(true);
         }
-        let mut buf = Vec::new();
-        let read_result = read.read_to_end(&mut buf);
-        *held += buf.len() as u64;
-        read_result?;
-        if let Err(e) = ensure_decoded_size_matches(&rel_path, declared, buf.len()) {
-            entry_error = Some(e);
-            return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
-        }
+        let buf = match archive_single::read_capped(read, declared) {
+            Ok(decoded) => {
+                *held += decoded.high_water;
+                decoded.bytes
+            }
+            Err(archive_single::ReadError::CapExceeded { high_water }) => {
+                *held += high_water;
+                entry_error = Some(declared_size_exceeded(&rel_path, declared));
+                return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
+            }
+            Err(archive_single::ReadError::Io(e) | archive_single::ReadError::Init(e)) => {
+                return Err(e.into());
+            }
+        };
         entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared, bytes: buf });
         Ok(true)
     });
@@ -1099,6 +1125,25 @@ pub(crate) mod tests {
 
     async fn extract(f: &Fixture, path: &str) -> Result<Value> {
         extract_archive(&f.state, MOUNT, OWNER, path, None, false, None).await
+    }
+
+    /// A decoder that ignores the declared size does not lift the bound
+    /// (SPEC-0085 DEC-005): zip's own reader stops at the declared size today,
+    /// so only a reader that does not can reach the cap branch.
+    #[test]
+    fn read_zip_entry_caps_a_reader_that_ignores_the_declared_size() {
+        let mut held = 0u64;
+        let mut reader = Cursor::new(vec![7u8; 1_000_000]);
+        let e = read_zip_entry(&mut reader, "big.bin", 10, &mut held).unwrap_err();
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            e.message,
+            "archive entry 'big.bin' decompressed to more bytes than declared 10"
+        );
+        assert!(held <= 10, "held {held}");
+        let mut exact = Cursor::new(vec![7u8; 10]);
+        let ok = read_zip_entry(&mut exact, "big.bin", 10, &mut held).unwrap();
+        assert_eq!(ok, vec![7u8; 10]);
     }
 
     /// `path` points at a file that does not exist: `ERR_NOT_FOUND`.

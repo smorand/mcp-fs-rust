@@ -553,6 +553,153 @@ async fn e2e_0085_043_explicit_destination_holding_the_fil() {
     assert_eq!(remaining_storage(&f).await, 100_000);
 }
 
+/// A zip whose only entry `huge.bin` declares 5 000 000 000 bytes in its zip64 record and holds `hello`.
+async fn seed_big64(f: &Fixture) {
+    seed(f, "/uploads/big64.zip", &zip_declaring(&[("huge.bin", 5_000_000_000, b"hello")])).await;
+}
+
+#[tokio::test]
+async fn e2e_0085_017_zip64_size_against_the_storage_limit() {
+    let f = fixture().await;
+    seed_big64(&f).await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/big64.zip", None, false, None).await;
+
+    project_refusal(&v);
+    assert_eq!(
+        v.unwrap_err().message,
+        "project storage quota of 1 MB exceeded: 1047576 bytes used, 5000000000 bytes requested"
+    );
+    assert_eq!(held(), 0);
+    assert!(!exists(&f, "/uploads/big64").await);
+}
+
+#[tokio::test]
+async fn e2e_0085_018_zip64_size_against_the_default_allow() {
+    let f = fixture().await;
+    seed_big64(&f).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/big64.zip", None, false, None).await;
+
+    session_refusal(&v, 52_428_800);
+    assert_eq!(held(), 0);
+}
+
+fn assert_size_lie(v: &crate::errors::Result<serde_json::Value>, name: &str, declared: u64) {
+    let e = v.as_ref().expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        format!("archive entry '{name}' decompressed to more bytes than declared {declared}")
+    );
+}
+
+#[tokio::test]
+async fn e2e_0085_019_zip_entry_holding_more_than_it_decla() {
+    let f = fixture().await;
+    seed(&f, "/uploads/liar.zip", &zip_declaring(&[("big.bin", 10, &vec![7u8; 1_000_000])])).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/liar.zip", None, false, None).await;
+
+    assert_size_lie(&v, "big.bin", 10);
+    held_at_most(65_546);
+    assert!(!exists(&f, "/uploads/liar").await);
+}
+
+#[tokio::test]
+async fn e2e_0085_021_zip_entry_declared_0_holding_data() {
+    let f = fixture().await;
+    seed(&f, "/uploads/zero.zip", &zip_declaring(&[("a.txt", 0, b"hello")])).await;
+
+    let v = extract(&f, "/uploads/zero.zip", None, false, None).await;
+
+    assert_size_lie(&v, "a.txt", 0);
+    assert!(!exists(&f, "/uploads/zero").await);
+}
+
+#[tokio::test]
+async fn e2e_0085_023_entry_holding_exactly_its_declared_s() {
+    let f = fixture().await;
+    seed(&f, "/uploads/exact.zip", &zip_declaring(&[("exact.bin", 10, &[7u8; 10])])).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/exact.zip", None, false, None).await.unwrap();
+
+    assert_eq!(v["files_written"], 1);
+    assert_eq!(v["bytes_written"], 10);
+    assert_eq!(held_some(), 10);
+    assert_eq!(read(&f, "/uploads/exact/exact.bin").await.unwrap(), vec![7u8; 10]);
+}
+
+#[tokio::test]
+async fn e2e_0085_024_the_whole_call_is_bounded_by_the_dec() {
+    let f = fixture().await;
+    let zip = zip_declaring(&[
+        ("a.bin", 600_000, &vec![1u8; 600_000]),
+        ("b.bin", 10, &vec![7u8; 5_000_000]),
+    ]);
+    seed(&f, "/uploads/mixed.zip", &zip).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/mixed.zip", None, false, None).await;
+
+    assert_size_lie(&v, "b.bin", 10);
+    held_at_most(665_546);
+    assert!(!exists(&f, "/uploads/mixed").await);
+}
+
+#[tokio::test]
+async fn e2e_0085_037_plain_tar_over_the_storage_limit_unc() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar", &tar_bytes(&[("a.txt", b"hello")])).await;
+    limit_mb_remaining(&f, 4).await;
+
+    let v = extract(&f, "/uploads/pack.tar", None, false, None).await;
+
+    project_refusal(&v);
+    assert!(!exists(&f, "/uploads/pack").await);
+}
+
+#[tokio::test]
+async fn e2e_0085_038_tar_family_and_bare_files_unchanged() {
+    let f = fixture().await;
+    let tar = tar_bytes(&[("a.txt", b"hello")]);
+    seed(&f, "/t1/pack.tar", &tar).await;
+    seed(&f, "/t2/pack.tar.gz", &gz(&tar)).await;
+    seed(&f, "/t3/a.txt.gz", &gz(b"hello")).await;
+
+    for (archive, output) in [
+        ("/t1/pack.tar", "/t1/pack/a.txt"),
+        ("/t2/pack.tar.gz", "/t2/pack/a.txt"),
+        ("/t3/a.txt.gz", "/t3/a.txt"),
+    ] {
+        let v = extract(&f, archive, None, false, None).await.unwrap();
+        assert_eq!(v["files_written"], 1, "{archive}");
+        assert_eq!(v["bytes_written"], 5, "{archive}");
+        assert_eq!(read(&f, output).await.unwrap(), b"hello", "{archive}");
+    }
+}
+
+#[tokio::test]
+async fn e2e_0085_040_solid_7z_within_the_limits() {
+    let f = fixture().await;
+    let solid = sevenz_solid(&[("a.txt", b"hello"), ("b.txt", b"world"), ("c.txt", b"again")]);
+    seed(&f, "/uploads/solid.7z", &solid).await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/solid.7z", None, false, None).await.unwrap();
+
+    assert_eq!(v["files_written"], 3);
+    assert_eq!(v["bytes_written"], 15);
+    held_at_most(15);
+    assert_eq!(remaining_storage(&f).await, 985);
+}
+
 /// RAR tests sit in a module whose path contains `archive_rar`, the filter
 /// `test.sh` uses for the feature run (SPEC-0085 DEC-011).
 #[cfg(feature = "rar")]

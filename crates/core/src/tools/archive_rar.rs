@@ -247,9 +247,7 @@ fn refused_kind(file_attr: u32) -> Option<&'static str> {
 }
 
 fn oversized(rel_path: &str, declared: u64) -> ToolError {
-    ToolError::invalid_argument(format!(
-        "archive entry '{rel_path}' decompressed to more bytes than declared {declared}"
-    ))
+    crate::tools::archive::declared_size_exceeded(rel_path, declared)
 }
 
 #[cfg(test)]
