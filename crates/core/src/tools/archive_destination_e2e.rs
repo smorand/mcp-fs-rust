@@ -322,6 +322,147 @@ fn nul_refusal(v: &Result<Value>) {
     assert_eq!(e.message, "path contains a NUL byte");
 }
 
+/// A destination inside the project: the answer names the folder it resolves to.
+fn assert_destination(v: &Value, destination: &str) {
+    assert_eq!(v["destination"], destination);
+}
+
+#[tokio::test]
+async fn e2e_0086_001_relative_destination_inside_the_proj() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.zip", &build_zip(&[("a.txt", HELLO)], None)).await;
+
+    let v = extract(&f, "/uploads/pack.zip", Some("out"), false, None).await.unwrap();
+
+    assert_eq!(read(&f, "/out/a.txt").await.unwrap(), HELLO);
+    assert_eq!(v["files_written"], 1);
+    assert_eq!(v["bytes_written"], 5);
+    assert_destination(&v, "/out");
+    let log = f.state.safety.audit(OWNER, MOUNT);
+    let lines: Vec<_> =
+        log.iter().filter(|e| e.op == "extract_archive" && e.path == "/uploads/pack.zip").collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].detail.starts_with("destination=/out "), "{}", lines[0].detail);
+}
+
+#[tokio::test]
+async fn e2e_0086_002_absolute_destination_inside_the_proj() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.7z", &sevenz_solid(&[("a.txt", HELLO)])).await;
+
+    let v = extract(&f, "/uploads/pack.7z", Some("/out"), false, None).await.unwrap();
+
+    assert_eq!(read(&f, "/out/a.txt").await.unwrap(), HELLO);
+    assert_eq!(v["files_written"], 1);
+    assert_eq!(v["bytes_written"], 5);
+    assert_destination(&v, "/out");
+}
+
+#[tokio::test]
+async fn e2e_0086_003_a_climb_that_stays_inside_compressed() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar_bytes(&[("a.txt", HELLO)]))).await;
+
+    let v = extract(&f, "/uploads/pack.tar.gz", Some("a/../b"), false, None).await.unwrap();
+
+    assert_eq!(read(&f, "/b/a.txt").await.unwrap(), HELLO);
+    assert!(!exists(&f, "/a").await);
+    assert_destination(&v, "/b");
+}
+
+#[tokio::test]
+async fn e2e_0086_004_an_absolute_climb_that_stays_inside() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.zip", &build_zip(&[("a.txt", HELLO)], None)).await;
+    seed(&f, "/uploads/pack.tar", &tar_bytes(&[("a.txt", HELLO)])).await;
+    seed(&f, "/uploads/a.txt.gz", &gz(HELLO)).await;
+    let archives = ["/uploads/pack.zip", "/uploads/pack.tar", "/uploads/a.txt.gz"];
+
+    for archive in archives {
+        let v = extract(&f, archive, Some("/a/../b"), false, None).await.unwrap();
+
+        assert_eq!(v["destination"], "/b", "{archive}");
+        assert_eq!(read(&f, "/b/a.txt").await.unwrap(), HELLO, "{archive}");
+        assert!(!exists(&f, "/a").await, "{archive}");
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.delete_tree("/b").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn e2e_0086_005_no_destination_keeps_the_default() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.zip", &build_zip(&[("a.txt", HELLO)], None)).await;
+
+    let v = extract(&f, "/uploads/pack.zip", None, false, None).await.unwrap();
+
+    assert_eq!(read(&f, "/uploads/pack/a.txt").await.unwrap(), HELLO);
+    assert_destination(&v, "/uploads/pack");
+}
+
+#[tokio::test]
+async fn e2e_0086_006_back_to_the_root_exactly() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.7z", &sevenz_solid(&[("a.txt", HELLO)])).await;
+
+    let v = extract(&f, "/uploads/pack.7z", Some("a/.."), false, None).await.unwrap();
+
+    assert_eq!(read(&f, "/a.txt").await.unwrap(), HELLO);
+    assert_destination(&v, "/");
+}
+
+#[tokio::test]
+async fn e2e_0086_007_dot_segments_and_repeated_slashes() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar", &tar_bytes(&[("a.txt", HELLO)])).await;
+
+    let v = extract(&f, "/uploads/pack.tar", Some("./out/./x"), false, None).await.unwrap();
+    assert_destination(&v, "/out/x");
+    assert_eq!(read(&f, "/out/x/a.txt").await.unwrap(), HELLO);
+
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    c.delete_tree("/out").await.unwrap();
+    let v = extract(&f, "/uploads/pack.tar", Some("out//x"), false, None).await.unwrap();
+    assert_destination(&v, "/out/x");
+    assert_eq!(read(&f, "/out/x/a.txt").await.unwrap(), HELLO);
+}
+
+#[tokio::test]
+async fn e2e_0086_008_to_the_root_then_down() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.zip", &build_zip(&[("a.txt", HELLO)], None)).await;
+
+    let v = extract(&f, "/uploads/pack.zip", Some("a/b/../../c"), false, None).await.unwrap();
+
+    assert_eq!(read(&f, "/c/a.txt").await.unwrap(), HELLO);
+    assert_destination(&v, "/c");
+}
+
+#[tokio::test]
+async fn e2e_0086_033_refused_twice_then_corrected() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar", &tar_bytes(&[("a.txt", HELLO)])).await;
+    limit_mb_remaining(&f, 1000).await;
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let stored = crate::quota::used_bytes(&c).await.unwrap();
+    let allowance_before = allowance(&f);
+
+    for _ in 0..2 {
+        let v = extract(&f, "/uploads/pack.tar", Some("../../x"), false, None).await;
+        climb_refusal(&v, "../../x");
+        assert_eq!(crate::quota::used_bytes(&c).await.unwrap(), stored);
+        assert_eq!(allowance(&f), allowance_before);
+        assert_eq!(extraction_audit_lines(&f, "/uploads/pack.tar"), 0);
+    }
+
+    let v = extract(&f, "/uploads/pack.tar", Some("x"), false, None).await.unwrap();
+
+    assert_destination(&v, "/x");
+    assert_eq!(read(&f, "/x/a.txt").await.unwrap(), HELLO);
+    assert_eq!(crate::quota::used_bytes(&c).await.unwrap(), stored + 5);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/pack.tar"), 1);
+}
+
 /// RAR tests sit in a module whose path contains `archive_rar`, the filter
 /// `test.sh` uses for the feature run (SPEC-0085 DEC-011).
 #[cfg(feature = "rar")]
@@ -339,6 +480,18 @@ mod archive_rar {
 
         climb_refusal(&v, "/a/../../b");
         assert_nothing_written(&f, "/uploads/pack.rar", &["/b", "/a"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0086_004_an_absolute_climb_that_stays_inside() {
+        let f = fixture().await;
+        seed(&f, "/uploads/pack.rar", V5).await;
+
+        let v = extract(&f, "/uploads/pack.rar", Some("/a/../b"), false, None).await.unwrap();
+
+        assert_eq!(v["destination"], "/b");
+        assert_eq!(read(&f, "/b/a.txt").await.unwrap(), HELLO);
+        assert!(!exists(&f, "/a").await);
     }
 
     #[tokio::test]

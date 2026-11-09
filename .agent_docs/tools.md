@@ -210,12 +210,11 @@ untouched on failure; for zip, 7z and RAR the limits are checked before decoding
   a truncated RAR 4 file is left to the reader.
 - Solid archives are decoded front to back. Since SPEC-0085 the declared sizes are admitted before
   anything is decoded (see the SPEC-0085 paragraph).
-- Order of refusals (FR-NEW-015, reordered by SPEC-0085): membership, missing path or folder, multi
-  volume name, encrypted names with a missing or wrong password, corrupt, the first link or escaping
+- Order of refusals (FR-NEW-015, reordered by SPEC-0085 and SPEC-0086): membership, missing path or
+  folder, multi volume name, a `destination` climbing above the root (SPEC-0086, see its paragraph),
+  encrypted names with a missing or wrong password, corrupt, the first link or escaping
   name in archive order, encrypted data with a missing or wrong password, project storage limit,
-  session write allowance (both on declared sizes), oversized entry, a `destination` outside
-  the project (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination>`, a relative
-  `../../x` is refused for `.rar`, the other formats clamp it), collision, then the two limits again
+  session write allowance (both on declared sizes), oversized entry, collision, then the two limits again
   at the moment of writing. The tests that pin each pair are `e2e_0080_047` to `e2e_0080_081`,
   except the storage limit versus collision pair, now `e2e_0085_mod_001` (was `e2e_0080_068`).
 
@@ -234,8 +233,8 @@ holds more than the lower of two limits: the project's remaining storage
 (`ERR_PROJECT_QUOTA_EXCEEDED`) and the session write allowance (`ERR_WRITE_QUOTA_EXCEEDED`,
 charged the full output); a tie goes to the project. Order of refusals, first one wins:
 1. caller not a member (`ERR_FORBIDDEN`); 2. path missing (`ERR_NOT_FOUND`); 3. path is a folder
-(`ERR_INVALID_ARGUMENT`); 4. password given; 5. unusable output name; 6. relative destination
-climbing out of the project (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination>`);
+(`ERR_INVALID_ARGUMENT`); 4. password given; 5. unusable output name; 6. destination climbing above
+the root (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination as typed>`, SPEC-0086);
 7. destination is a file; 8. collision; 9. corrupt, project limit or session limit, whichever
 the decoding meets first. Nothing is written, and no folder created, before the decode succeeds.
 
@@ -261,9 +260,10 @@ capped reader of `archive_single.rs`). The bound is the lower of two sides plus 
 bytes already stored under the destination, no side when the project has no
 limit; the session side is the remaining write allowance. The decode stops there and the call is
 refused with the project storage or session allowance error of the limits, nothing written or
-charged. Order of refusals: membership, missing path, folder, password, corrupt data or the bound
-(whichever decoding meets first), the entry checks in archive order, destination outside the
-project, collision, project storage limit, session write allowance; the two limits are still
+charged. Order of refusals: membership, missing path, folder, password, destination climbing above the
+root (SPEC-0086), corrupt data or the bound
+(whichever decoding meets first), the entry checks in archive order,
+collision, project storage limit, session write allowance; the two limits are still
 checked on the files' sizes. A plain `.tar` is not decoded under this bound. `.tbz2` and every other
 extension stay `ERR_NOT_SUPPORTED`. The HTTP twin answers and audits the same.
 
@@ -277,15 +277,15 @@ occurrence per target path, minus the size of the file already stored there, wha
 says) goes against the remaining project storage. Same two refusals and messages as before, project
 first, session second; equality is accepted; a size, total or growth above `i64::MAX` counts as too
 large. Order of refusals per format, first one wins:
-- zip: membership, missing path, folder, unreadable archive, per entry in archive order a link, an
+- zip: membership, missing path, folder, destination climbing above the root, unreadable archive, per entry in archive order a link, an
   escaping name or a duplicate name, missing password, local header disagreeing with the
   directory, project limit, session limit, then what decoding finds (wrong password, damaged data,
-  entry past its declared size), destination outside the project, collision, final admission.
-- 7z: membership, missing path, folder, encrypted or unreadable header, missing password, per entry
+  entry past its declared size), collision, final admission.
+- 7z: membership, missing path, folder, destination climbing above the root, encrypted or unreadable header, missing password, per entry
   an escaping name then a link or special type (moved from the decode to the listing, so a hostile
   entry is no longer hidden behind an earlier entry's wrong password), then the same as zip from the
   project limit on.
-- RAR: membership, missing path, folder, multi volume name, SPEC-0080 items 4 to 6, missing
+- RAR: membership, missing path, folder, multi volume name, destination climbing above the root, SPEC-0080 items 4 to 6, missing
   password, then the same as zip from the project limit on.
 Every entry is read through `read_capped` at its declared size (RAR keeps UnRAR's own stop and the
 length check), so a lying header, including a zip64 or 7z one, stops at the declared size plus at
@@ -294,6 +294,25 @@ most one 64 KiB chunk and the call is `ERR_INVALID_ARGUMENT`
 decoded bytes (the `LAST_HIGH_WATER` hook). The final `admit_paths` still runs under the admission
 lock, so a concurrent write is caught. Plain `.tar`, compressed tar and bare `.gz`/`.bz2`/`.xz` are
 unchanged; the HTTP twin answers and audits the same.
+
+(2026-11-09, SPEC-0086.) One destination rule for every format, `resolve_destination` in
+`tools/archive_single.rs`, used by the archive flow (`tools/archive.rs`) and the bare file flow. The
+`destination` is judged on its own text: a NUL byte is refused (`path contains a NUL byte`), then the
+segments are walked on `/` with a depth counter; `.` and empty segments stay, a `..` met at depth 0 is
+refused with `ERR_PATH_OUT_OF_BOUNDS` and `path escapes the volume root: <destination as typed>`, any
+other segment goes down; then the text is collapsed from the root with `PosixPath::normpath`. Judging
+while walking refuses `a/../../x` and `/a/../../b` too, even though a clamp would land inside. It
+applies to zip, 7z, RAR, every tar and the bare `.gz`, `.bz2`, `.xz` alike: the old behaviour where
+the other formats clamped a climb to the root is gone. `..out` and `...` are plain folder names now
+(they were refused by `normalize_path`'s prefix test, which this rule does not call). Place in the
+order of refusals: right after membership, missing path, folder, unsupported extension, tar password
+and multi volume RAR name (for a bare file also after the unusable output name), and before the archive
+is read, so a refused call reads no byte, writes nothing, charges no quota and leaves no audit line.
+A destination inside the project resolves as before: `out`, `/out`, `./out/./x`, `out//x` and
+`a/../b` give `/out`, `/out`, `/out/x`, `/out/x`, `/b`; `a/..` gives `/`; no destination keeps its
+default. The answer and the audit line name the resolved folder. The other path taking tools still
+clamp a climb to the root (BL-0135). The tests are `e2e_0086_`; `e2e_0085_028` is replaced by
+`e2e_0086_mod_001`.
 
 Security note (2026-11-09, SPEC-0085): the signed cast bypass. The declared size of an entry was
 cast `as i64`, so a declared size of 2^63 or more counted as a negative number, lowered the sums

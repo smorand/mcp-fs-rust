@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (archive extraction, every format), 8 requirements, public behavior change (a destination that climbs above the project root, accepted and redirected to the root today by zip, 7z and the tar family, is refused; an absolute destination that climbs is refused for every format; the destination refusal moves before the archive is read), no persisted change. Override with --depth.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-09
 > Project: existing
 > From backlog: BL-0127

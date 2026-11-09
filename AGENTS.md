@@ -138,9 +138,12 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   collisions, one quota charge and the writes; stateless password retry via `ERR_PASSWORD_REQUIRED`. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
   under a bound (SPEC-0084): the lower of the project side (remaining storage plus the bytes stored under
   the destination) and the session write allowance, plus `TAR_FRAMING` (1 048 576 bytes); a plain `.tar`
-  is unbounded. `archive_single.rs` holds the single file flow for a
+  is unbounded. `archive_single.rs` holds `resolve_destination`, the one destination rule of every
+  format (SPEC-0086: a climb above the root is refused with `path escapes the volume root: <destination
+  as typed>`, `..out` is a valid folder name, it never calls `normalize_path`; the other tools still
+  clamp, BL-0135), and the single file flow for a
   bare gzip `.gz` (SPEC-0081), bare bzip2 `.bz2` (SPEC-0083) and bare xz `.xz` (SPEC-0082, liblzma): refusals in a fixed order (membership, missing path, folder, password,
-  output name, destination outside the project, destination is a file, collision, then corrupt or a
+  output name, destination climbing above the root, destination is a file, collision, then corrupt or a
   limit, whichever decoding meets first), a capped reader that stops at the lower of the project's
   remaining storage and the session write allowance, nothing written before the decode succeeds.
   `artifacts.rs` holds the five SPEC-0019 tools

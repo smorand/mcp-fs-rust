@@ -305,7 +305,15 @@ refused as corrupt (an xz file accepts zero padding of a multiple of 4 bytes bet
 streams), every xz file, bare or inside a `.tar.xz`/`.txz`, is decoded by liblzma (C code, not pure Rust), and decompression stops at the project's remaining storage or the session write allowance.
 A compressed tar (`.tar.gz`/`.tgz`, `.tar.bz2`/`.tb2`, `.tar.xz`/`.txz`) is bounded the same way: decoding stops at the lower of the project's remaining storage (plus the bytes already stored under the destination) and the session write allowance, plus 1 MiB of tar bookkeeping, so a small archive that expands enormously is refused instead of filling memory. A plain `.tar` is read as is, without that bound.
 Otherwise `destination` defaults to the archive path minus
-its suffix; `overwrite` defaults to `false`. **Passwords are a plain retry**: an encrypted zip
+its suffix; `overwrite` defaults to `false`. **One destination rule for every format**
+(`resolve_destination`): the `destination` is read from the project root, typed relative or absolute,
+and `.` segments and repeated slashes are collapsed, so `out`, `/out`, `./out//` and `a/../out` all
+mean `/out`. A `..` that climbs above the root is refused with `ERR_PATH_OUT_OF_BOUNDS` and
+`path escapes the volume root: <destination as typed>` for zip, 7z, RAR, tar and bare files alike
+(it is never clamped to the root), including a climb that would land back inside the project
+(`a/../../x`). A name that merely starts with two dots, such as `..out`, is an ordinary folder name.
+This is checked before the archive is read, so a refused call writes and charges nothing. The other
+tools that take a path still clamp such a climb to the root (BL-0135). **Passwords are a plain retry**: an encrypted zip
 or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQUIRED` (HTTP
 428) and the caller sends the same call again with `password`; nothing is stored between
 calls and the password is never logged. **All or nothing**: the whole archive is checked
