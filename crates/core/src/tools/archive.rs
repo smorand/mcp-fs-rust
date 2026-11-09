@@ -241,19 +241,11 @@ pub(crate) async fn extract_archive(
         }
     };
 
-    // FR-NEW-016: caller-supplied destination normalized exactly like any
-    // other `fs.*` destination parameter; otherwise the archive's own path
+    // FR-NEW-016: caller-supplied destination resolved by the one destination
+    // rule, which refuses a climb above the root; otherwise the archive's own path
     // with its matched extension stripped, preserving the stem's case.
-    // `normalize_path` clamps a leading `..` at the root, so a RAR destination that climbs
-    // out of the project is checked on its raw form first (SPEC-0080 FR-NEW-015 item 9).
-    // The other formats keep the clamping they have always had.
-    #[cfg(feature = "rar")]
-    let rar = matches!(format, ArchiveFormat::Rar);
-    #[cfg(not(feature = "rar"))]
-    let rar = false;
     let dest = match destination {
-        Some(d) if rar => archive_single::normalize_destination(state, d)?,
-        Some(d) => state.safety.normalize_path(d)?,
+        Some(d) => archive_single::resolve_destination(d)?,
         None => normalized[..normalized.len() - suffix_len].to_string(),
     };
 
@@ -347,19 +339,12 @@ pub(crate) async fn extract_archive(
 /// would refuse it. It only sizes the decoding bound: the refusal itself keeps
 /// its place after the entry checks.
 fn planned_destination(
-    state: &AppState,
-    format: ArchiveFormat,
     normalized: &str,
     suffix_len: usize,
     destination: Option<&str>,
 ) -> Option<String> {
-    #[cfg(feature = "rar")]
-    if let (Some(d), ArchiveFormat::Rar) = (destination, format) {
-        return archive_single::normalize_destination(state, d).ok();
-    }
-    let _ = format;
     match destination {
-        Some(d) => state.safety.normalize_path(d).ok(),
+        Some(d) => archive_single::resolve_destination(d).ok(),
         None => Some(normalized[..normalized.len() - suffix_len].to_string()),
     }
 }
@@ -382,7 +367,7 @@ async fn decode_listed(
     destination: Option<&str>,
     password: Option<&str>,
 ) -> Result<Vec<DecodedEntry>> {
-    let planned = planned_destination(state, format, normalized, suffix_len, destination);
+    let planned = planned_destination(normalized, suffix_len, destination);
     let bytes = std::sync::Arc::new(client.read_bytes(normalized).await?);
     let owned_password = password.map(ToOwned::to_owned);
 
@@ -443,11 +428,11 @@ async fn decode_bounded_tar(
     mount_id: &str,
     person: &str,
     normalized: &str,
-    (format, suffix_len): (ArchiveFormat, usize),
+    (_, suffix_len): (ArchiveFormat, usize),
     destination: Option<&str>,
     compression: TarCompression,
 ) -> Result<Vec<DecodedEntry>> {
-    let stored = match planned_destination(state, format, normalized, suffix_len, destination) {
+    let stored = match planned_destination(normalized, suffix_len, destination) {
         Some(dest) => quota::stored_under(client, &dest).await?,
         None => 0,
     };

@@ -31,6 +31,8 @@ pub mod all;
 pub(crate) mod archive;
 #[cfg(test)]
 mod archive_declared_e2e;
+#[cfg(test)]
+mod archive_destination_e2e;
 #[cfg(feature = "rar")]
 pub(crate) mod archive_rar;
 #[cfg(all(test, feature = "rar"))]

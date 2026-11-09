@@ -120,16 +120,31 @@ fn output_name(file_name: &str, suffix_len: usize) -> Result<&str> {
     Ok(stem)
 }
 
-/// `normalize_path` clamps a leading `..` at the root (`../../x` becomes
-/// `/x`), but a relative destination that climbs out of the project must be
-/// refused (FR-NEW-011 item 6), so check the raw form first.
-pub(crate) fn normalize_destination(state: &AppState, dest: &str) -> Result<String> {
-    let climbs = !dest.starts_with('/')
-        && crate::util::PosixPath::normpath(dest).split('/').next() == Some("..");
-    if climbs {
-        return Err(ToolError::path_out_of_bounds(format!("path escapes the volume root: {dest}")));
+/// The one destination rule of every archive format: the destination as the
+/// member typed it, resolved from the project root. A `..` met at the root is a
+/// climb out of the project and is refused, judged while walking so that
+/// `a/../../x` and `/a/../../b` are refused too (a clamp would land inside).
+/// It never calls `normalize_path`: that one refuses `..out` on a string prefix
+/// test and clamps a climb, and its callers stay as they are (BL-0135).
+/// Time O(n) and space O(n) in the length of `raw`.
+pub(crate) fn resolve_destination(raw: &str) -> Result<String> {
+    if raw.contains('\0') {
+        return Err(ToolError::path_out_of_bounds("path contains a NUL byte"));
     }
-    state.safety.normalize_path(dest)
+    let mut depth = 0usize;
+    for segment in raw.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." if depth == 0 => {
+                return Err(ToolError::path_out_of_bounds(format!(
+                    "path escapes the volume root: {raw}"
+                )));
+            }
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    Ok(crate::util::PosixPath::normpath(&format!("/{raw}")))
 }
 
 /// Refuse a destination that is a file or sits under one, naming the first
@@ -257,7 +272,7 @@ pub(crate) async fn extract_single(
     let name = output_name(file_name, suffix_len)?.to_string();
 
     let dest = match destination {
-        Some(d) => normalize_destination(state, d)?,
+        Some(d) => resolve_destination(d)?,
         None if parent.is_empty() => "/".to_string(),
         None => parent.to_string(),
     };
