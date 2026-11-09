@@ -29,7 +29,7 @@ pub(crate) struct RarListing {
 pub(crate) fn list_rar(bytes: &[u8], password: Option<&str>) -> Result<RarListing> {
     // UnRAR reads a truncated archive as a shorter one or as a CRC error, neither of
     // which says corrupt (FR-NEW-011), so the block layout is checked first.
-    ensure_rar5_complete(bytes)?;
+    ensure_rar_complete(bytes, password)?;
     // The crate only opens a path (DEC-003), so the bytes go to a private temp dir
     // that is removed when `dir` drops, on every return path.
     let dir = tempfile::tempdir()
@@ -119,9 +119,16 @@ pub(crate) fn decode_rar_listed(
     Ok(entries)
 }
 
-/// RAR5 marker block; RAR 1.5 to 4.x archives start with `Rar!\x1a\x07\x00`.
+/// The six bytes every RAR marker starts with; the seventh tells the version.
+const RAR_MARK: &[u8] = b"Rar!\x1a\x07";
+/// The RAR5 marker with its eighth byte, for the tests that build archives by hand.
+#[cfg(test)]
 const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
-/// Header type of the archive encryption block: every header after it is encrypted,
+/// UnRAR's `MAXSFXSIZE`: it looks for the marker this far into the file (less 16 bytes).
+const MAX_SFX_SIZE: usize = 0x20_0000;
+/// Bytes of the marker UnRAR reads first.
+const MARK_LEN: usize = 7;
+/// Header type of the RAR5 archive encryption block: every header after it is encrypted,
 /// so the walk cannot read further.
 const HEAD_CRYPT: u64 = 4;
 /// Header type of the end of archive block, the last block of a complete volume.
@@ -131,16 +138,144 @@ const HFL_DATA: u64 = 0x2;
 /// A vint carries 7 bits per byte, so 10 bytes hold any u64.
 const VINT_MAX_BYTES: usize = 10;
 const TRUNCATED: &str = "unexpected end of archive";
+/// RAR4 block types and flags (the base header is 7 bytes: CRC16, type, flags, size).
+const RAR4_BASE_HEADER: usize = 7;
+const RAR4_MAIN: u8 = 0x73;
+const RAR4_FILE: u8 = 0x74;
+const RAR4_SERVICE: u8 = 0x7a;
+const RAR4_END: u8 = 0x7b;
+/// The block is followed by `ADD_SIZE` bytes of data, declared at header offset 7.
+const RAR4_LONG_BLOCK: u16 = 0x8000;
+/// File and service blocks: the high 32 bits of the data size sit at header offset 32.
+const RAR4_LARGE: u16 = 0x0100;
+/// Main header flag: every later header is encrypted.
+const RAR4_MAIN_PASSWORD: u16 = 0x0080;
 
-/// Walk the RAR5 block chain and refuse an archive whose last block runs past the end
-/// of the input, or that ends before its end of archive block. Linear in the number of
-/// blocks, no copies. A non RAR5 input is left to UnRAR: RAR4 truncation is not
-/// detected (open limitation), and neither is a cut after an archive encryption
-/// header, whose following headers cannot be read without the password.
-fn ensure_rar5_complete(bytes: &[u8]) -> Result<()> {
-    let Some(mut rest) = bytes.strip_prefix(RAR5_SIGNATURE) else {
-        return Ok(());
+/// What the bytes at one position say they are, as UnRAR's `IsSignature` reads them.
+enum Signature {
+    None,
+    /// RAR 1.4, which UnRAR 7 reads and this walk leaves to it.
+    Rar14,
+    Rar4,
+    Rar5,
+    /// A marker version UnRAR refuses.
+    Future,
+}
+
+fn signature(d: &[u8]) -> Signature {
+    if d.first() != Some(&0x52) {
+        return Signature::None;
+    }
+    if d.starts_with(b"RE~^") {
+        return Signature::Rar14;
+    }
+    if d.len() >= MARK_LEN && d[1..6] == RAR_MARK[1..] {
+        return match d[6] {
+            0 => Signature::Rar4,
+            1 => Signature::Rar5,
+            2..=4 => Signature::Future,
+            _ => Signature::None,
+        };
+    }
+    Signature::None
+}
+
+/// Where the blocks start and which format they are; `None` when UnRAR will refuse the
+/// input or reads a format this walk leaves to it (RAR 1.4, no marker, a RAR5 marker
+/// without its eighth byte).
+fn find_marker(bytes: &[u8]) -> Option<(bool, &[u8])> {
+    if bytes.len() < MARK_LEN {
+        return None;
+    }
+    let (kind, at) = match signature(&bytes[..MARK_LEN]) {
+        Signature::None => {
+            // UnRAR searches from byte 7, so an archive behind an SFX stub is read from
+            // the same marker here (E2E-047). A marker cut by the window end is not seen.
+            let window = &bytes[MARK_LEN..bytes.len().min(MARK_LEN + MAX_SFX_SIZE - 16)];
+            let mut found = None;
+            for i in 0..window.len() {
+                match signature(&window[i..]) {
+                    Signature::None => {}
+                    // UnRAR keeps looking unless the SFX tag sits at byte 28 of the file.
+                    Signature::Rar14
+                        if i > 0 && window.len() > 31 && &window[21..25] != b"RSFX" => {}
+                    kind => {
+                        found = Some((kind, MARK_LEN + i));
+                        break;
+                    }
+                }
+            }
+            found?
+        }
+        kind => (kind, 0),
     };
+    match kind {
+        Signature::Rar4 => Some((false, &bytes[at + MARK_LEN..])),
+        Signature::Rar5 if bytes.get(at + MARK_LEN) == Some(&0) => {
+            Some((true, &bytes[at + MARK_LEN + 1..]))
+        }
+        _ => None,
+    }
+}
+
+/// Refuse a RAR archive that holds a whole marker and is not complete: a block whose
+/// header or declared data runs past the end, or an end of the input after a block that
+/// is not the end of archive block. Bytes after the end block are ignored. Input UnRAR
+/// refuses itself, or that this walk cannot read (RAR 1.4), is left to it. With encrypted
+/// headers the walk stops after the leading part; the password questions are UnRAR's.
+/// Time O(n) over the blocks, space O(1), no copies.
+pub(super) fn ensure_rar_complete(bytes: &[u8], password: Option<&str>) -> Result<()> {
+    match find_marker(bytes) {
+        None => Ok(()),
+        Some((false, rest)) => walk_rar4(rest, password),
+        Some((true, rest)) => walk_rar5(rest, password),
+    }
+}
+
+/// True when a non empty password was given and no byte follows the leading part, so
+/// the first encrypted header is missing. Without a password, or with an empty one, the
+/// answer is UnRAR's (needed, or incorrect).
+fn encrypted_headers_cut(rest: &[u8], password: Option<&str>) -> Result<()> {
+    if password.is_some_and(|p| !p.is_empty()) && rest.is_empty() {
+        return Err(corrupt("rar", TRUNCATED));
+    }
+    Ok(())
+}
+
+/// Walk the RAR4 blocks after the marker. Header CRCs are not checked: UnRAR does.
+fn walk_rar4(mut rest: &[u8], password: Option<&str>) -> Result<()> {
+    loop {
+        let base = rest.get(..RAR4_BASE_HEADER).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        let kind = base[2];
+        let flags = u16::from_le_bytes([base[3], base[4]]);
+        let size = usize::from(u16::from_le_bytes([base[5], base[6]]));
+        if size < RAR4_BASE_HEADER {
+            return Err(corrupt("rar", TRUNCATED));
+        }
+        let header = rest.get(..size).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        rest = &rest[size..];
+        if kind == RAR4_END {
+            return Ok(());
+        }
+        if kind == RAR4_MAIN && flags & RAR4_MAIN_PASSWORD != 0 {
+            return encrypted_headers_cut(rest, password);
+        }
+        let mut data = 0u64;
+        if flags & RAR4_LONG_BLOCK != 0 {
+            let low = header.get(7..11).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+            data = u64::from(u32::from_le_bytes([low[0], low[1], low[2], low[3]]));
+            if flags & RAR4_LARGE != 0 && (kind == RAR4_FILE || kind == RAR4_SERVICE) {
+                let high = header.get(32..36).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+                data |= u64::from(u32::from_le_bytes([high[0], high[1], high[2], high[3]])) << 32;
+            }
+        }
+        let data = usize::try_from(data).map_err(|_| corrupt("rar", TRUNCATED))?;
+        rest = rest.get(data..).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+    }
+}
+
+/// Walk the RAR5 blocks after the marker. Linear in the number of blocks, no copies.
+fn walk_rar5(mut rest: &[u8], password: Option<&str>) -> Result<()> {
     loop {
         // Header CRC32, not verified here: UnRAR checks it.
         rest = rest.get(4..).ok_or_else(|| corrupt("rar", TRUNCATED))?;
@@ -156,8 +291,11 @@ fn ensure_rar5_complete(bytes: &[u8]) -> Result<()> {
         let data_size = if flags & HFL_DATA != 0 { read_vint(&mut header)? } else { 0 };
         let data = usize::try_from(data_size).map_err(|_| corrupt("rar", TRUNCATED))?;
         rest = rest.get(data..).ok_or_else(|| corrupt("rar", TRUNCATED))?;
-        if kind == HEAD_END || kind == HEAD_CRYPT {
+        if kind == HEAD_END {
             return Ok(());
+        }
+        if kind == HEAD_CRYPT {
+            return encrypted_headers_cut(rest, password);
         }
     }
 }
@@ -768,9 +906,9 @@ mod tests {
     #[test]
     fn every_strict_prefix_of_a_rar5_archive_is_corrupt() {
         let full = rar5_store(&[RarEntry::file("a.txt", b"hello"), RarEntry::dir("d")]);
-        super::ensure_rar5_complete(&full).unwrap();
+        super::ensure_rar_complete(&full, None).unwrap();
         for len in super::RAR5_SIGNATURE.len()..full.len() {
-            let e = super::ensure_rar5_complete(&full[..len]).unwrap_err();
+            let e = super::ensure_rar_complete(&full[..len], None).unwrap_err();
             assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT, "len {len}");
             assert!(
                 e.message.starts_with("archive is corrupt or not a valid rar file:"),
@@ -780,10 +918,19 @@ mod tests {
     }
 
     #[test]
-    fn non_rar5_input_is_left_to_the_library() {
-        super::ensure_rar5_complete(b"Rar!\x1a\x07\x00").unwrap();
-        super::ensure_rar5_complete(b"").unwrap();
-        super::ensure_rar5_complete(b"Rar!\x1a\x07\x01").unwrap();
+    fn partial_markers_are_left_to_the_library() {
+        super::ensure_rar_complete(b"", None).unwrap();
+        super::ensure_rar_complete(b"Rar!\x1a\x07\x01", None).unwrap();
+    }
+
+    #[test]
+    fn rar4_marker_alone_is_truncated() {
+        let e = super::ensure_rar_complete(b"Rar!\x1a\x07\x00", None).unwrap_err();
+        assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
+        assert_eq!(
+            e.message,
+            "archive is corrupt or not a valid rar file: unexpected end of archive"
+        );
     }
 
     #[test]
@@ -795,7 +942,7 @@ mod tests {
         let mut archive = super::RAR5_SIGNATURE.to_vec();
         archive.extend([0; 4]);
         archive.extend(&input);
-        assert!(super::ensure_rar5_complete(&archive).is_err());
+        assert!(super::ensure_rar_complete(&archive, None).is_err());
     }
 
     #[test]
@@ -816,7 +963,7 @@ mod tests {
         archive.extend([0; 4]);
         archive.push(body.len() as u8);
         archive.extend(body);
-        let e = super::ensure_rar5_complete(&archive).unwrap_err();
+        let e = super::ensure_rar_complete(&archive, None).unwrap_err();
         assert!(e.message.ends_with("unexpected end of archive"), "{}", e.message);
     }
 

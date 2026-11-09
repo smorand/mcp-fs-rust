@@ -16,3 +16,4 @@ fixtures come from RAR 6.24 and the RAR5 ones from RAR 7.23. Every `a.txt` holds
 | `hl2.rar` | RAR 7.23 | `rar a -ma5 -ep -ol -hps3cret-Ünï hl2.rar a.txt l` (same files as `both.rar`) | data and file names encrypted, symbolic link `l`, password `s3cret-Ünï` |
 | `cut.rar` | `head` on `secret.rar` | `head -c 103 secret.rar > cut.rar` (2/3 of the 155 bytes, rounded down) | truncated RAR 5, data encrypted, readable file names |
 | `cuth.rar` | `head` on `hidden.rar` | `head -c 169 hidden.rar > cuth.rar` (2/3 of the 254 bytes, rounded down) | truncated RAR 5, data and file names encrypted, password `s3cret-Ünï` |
+| `two4.rar` | RAR 6.24 | `rar a -ma4 -ep two4.rar a.txt b.txt` | `a.txt` = `hello`, `b.txt` = `goodbye`, 123 bytes; `a.txt` ends at 67, `b.txt`'s header spans 67 to 109 |

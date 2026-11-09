@@ -36,6 +36,8 @@ mod archive_destination_e2e;
 #[cfg(feature = "rar")]
 pub(crate) mod archive_rar;
 #[cfg(all(test, feature = "rar"))]
+mod archive_rar_cut_e2e;
+#[cfg(all(test, feature = "rar"))]
 pub(crate) mod archive_rar_fixtures;
 pub(crate) mod archive_single;
 #[cfg(test)]
