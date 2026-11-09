@@ -82,7 +82,7 @@ fn query_on(conn: &Connection, query: &Query) -> Result<Vec<RowValues>> {
     let sql = Dialect::Sqlite.render_placeholders(&query.sql)?;
     let mut stmt = conn.prepare(&sql)?;
     let columns: Arc<[String]> =
-        stmt.column_names().iter().map(|c| (*c).to_string()).collect::<Vec<_>>().into();
+        stmt.column_names().map(|c| c.to_string()).collect::<Vec<_>>().into();
     let width = columns.len();
     let mut rows = stmt.query(rusqlite::params_from_iter(bound(query)))?;
     let mut out = Vec::new();

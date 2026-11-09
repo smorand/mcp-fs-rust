@@ -5,8 +5,8 @@
 //! recorded in
 //! `specs/SPEC-0013_.../drift/2026-10-03_00-38-28.md`, corrected again in
 //! `drift/2026-10-03_02-50-09.md`): under that configuration `initialize` is
-//! mandatory, a bare pre-`initialize` call gets HTTP 422 with a plain-text
-//! body containing `"initialize"` (not the hand-rolled transport's JSON-RPC
+//! mandatory, a bare pre-`initialize` call gets HTTP 400 (422 up to rmcp 3.5) with a plain-text
+//! body `"Bad Request: Session ID is required"` (it contained `"initialize"` up to 3.5) (not the hand-rolled transport's JSON-RPC
 //! envelope), and an established session answers a plain tool call with
 //! `text/event-stream`, same framing as before. Identity verification still
 //! happens in front of `rmcp`, as an axum middleware guarding only the MCP
@@ -544,9 +544,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         let body = body_string(r).await;
-        assert!(body.contains("initialize"), "body must mention initialize: {body}");
+        // rmcp 3.9 asks for the session id first; before 3.9 the body said "initialize".
+        assert!(body.contains("Session ID is required"), "unexpected body: {body}");
     }
 
     #[tokio::test]
@@ -558,9 +559,10 @@ mod tests {
             .oneshot(rpc(Some(&t), None, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         let body = body_string(r).await;
-        assert!(body.contains("initialize"), "body must mention initialize: {body}");
+        // rmcp 3.9 asks for the session id first; before 3.9 the body said "initialize".
+        assert!(body.contains("Session ID is required"), "unexpected body: {body}");
     }
 
     #[tokio::test]

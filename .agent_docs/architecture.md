@@ -297,8 +297,8 @@ Tests: `tools/tool_surface_e2e.rs`.
 with `LocalSessionManager` + `legacy_session_mode: true`. Two real, observed
 behaviors to know before touching this:
 * `initialize` is genuinely mandatory. A bare `tools/call`/`tools/list` with no
-  prior `initialize` on a fresh connection gets **HTTP 422**, plain-text body
-  `"Unexpected message, expect initialize request"` — not a JSON-RPC envelope.
+  prior `initialize` on a fresh connection gets **HTTP 400** (it was 422 up to rmcp 3.5, changed by rmcp 3.9, 2026-11-09, BL-0138), plain-text body
+  `"Bad Request: Session ID is required"` (`"Unexpected message, expect initialize request"` up to rmcp 3.5) — not a JSON-RPC envelope.
   This is rmcp's own behavior under this session-manager pairing, empirically
   verified against the real crate source (not assumed from docs); see the
   SPEC-0013 drift directory for the full investigation.

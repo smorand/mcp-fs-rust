@@ -96,7 +96,7 @@ fn select_json(conn: &Connection, sql: &str, raw_params: &[Value], limit: usize)
     let mut stmt =
         conn.prepare(sql).map_err(|e| ToolError::invalid_argument(format!("SQL error: {e}")))?;
 
-    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
 
     let sql_params: Vec<Box<dyn rusqlite::ToSql>> = raw_params
         .iter()

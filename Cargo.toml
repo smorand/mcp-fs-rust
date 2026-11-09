@@ -30,7 +30,7 @@ schemars = "1"
 etcetera = "0.11"
 
 # ── storage ────────────────────────────────────────────────────────────────────
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # PostgreSQL, optional and off by default: a default build carries neither the
 # dependency nor its TLS stack. `macros` is deliberately absent because every
 # statement here is built at runtime, so the compile time query checker and its

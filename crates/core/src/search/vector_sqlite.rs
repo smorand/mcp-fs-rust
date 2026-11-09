@@ -187,9 +187,9 @@ impl SearchBackend for SqliteVecBackend {
                 .query_row(
                     "SELECT COUNT(*) FROM search_vec_meta WHERE volume_id=?1 AND path=?2",
                     params![vol, path_owned],
-                    |row| row.get(0),
+                    |row| row.get::<_, i64>(0),
                 )
-                .unwrap_or(0);
+                .map_or(0, |n| usize::try_from(n).unwrap_or(0));
             guard
                 .conn
                 .execute(
@@ -223,9 +223,9 @@ impl SearchBackend for SqliteVecBackend {
                 .query_row(
                     "SELECT COUNT(*) FROM search_vec_meta WHERE volume_id=?1",
                     params![vol],
-                    |row| row.get(0),
+                    |row| row.get::<_, i64>(0),
                 )
-                .unwrap_or(0);
+                .map_or(0, |n| usize::try_from(n).unwrap_or(0));
             // The vec0 rows are keyed by the meta rowid, so they go first: once
             // the meta rows are gone the subquery can no longer find them.
             guard
