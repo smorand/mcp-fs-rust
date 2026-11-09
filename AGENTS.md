@@ -40,7 +40,8 @@ Cargo features, none in `default`: `postgres`, `rag`, `all-backends` (PostgreSQL
 build is SQLite only and carries no network database driver. The `rag` feature enables pgvector (PostgreSQL)
 and sqlite-vec (SQLite) for vector search; it implies `postgres`. The `rar` feature (not in
 `all-backends`, but in `--all-features`) adds `.rar` to `fs.extract_archive` through the `unrar` crate
-(RARLAB's UnRAR source, non free licence, builds C++); its tests run only with it.
+(RARLAB's UnRAR source, non free licence, builds C++) and the optional `aes`, `cbc`, `hmac` and `sha2`
+crates for RAR header decryption; its tests run only with it.
 
 ## Key commands
 ```
@@ -59,6 +60,7 @@ mcp-fs purge [--project <id> [--on-demand]]  run the auto-purge sweep once; no -
                                       every configured project plus the grace-period removal
 docker compose -f docker-compose.test.yml up -d  postgres for the opt-in suites
 cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extraction tests (feature `rar`, SPEC-0080; ./test.sh runs them)
+cargo test -p mcp-fs-core --lib --features rar -- e2e_0087_ api::dataplane tool_contract   the truncated RAR tests (SPEC-0087)
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
@@ -135,7 +137,12 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   /api/fs/{mount_id}/extract-archive`: format by extension; zip, 7z and RAR go list (headers
   only), check (declared total and declared net growth against the two limits, checked
   arithmetic, nothing decoded, SPEC-0085), decode (each entry capped at its declared size), then
-  collisions, one quota charge and the writes; stateless password retry via `ERR_PASSWORD_REQUIRED`. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
+  collisions, one quota charge and the writes; stateless password retry via `ERR_PASSWORD_REQUIRED`.
+  `archive_rar.rs` also walks a RAR archive block by block before the listing and refuses every cut,
+  RAR 4 and RAR 5, as `archive is corrupt or not a valid rar file: unexpected end of archive` (SPEC-0087,
+  complete means the end block was reached); `archive_rar_crypt.rs` decrypts the encrypted headers for that
+  walk when the password is right (RAR 5 PBKDF2 HMAC SHA-256 plus AES 256 CBC, RAR 4 SHA-1 key schedule plus
+  AES 128 CBC), safe Rust only. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
   under a bound (SPEC-0084): the lower of the project side (remaining storage plus the bytes stored under
   the destination) and the session write allowance, plus `TAR_FRAMING` (1 048 576 bytes); a plain `.tar`
   is unbounded. `archive_single.rs` holds `resolve_destination`, the one destination rule of every

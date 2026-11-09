@@ -206,17 +206,30 @@ untouched on failure; for zip, 7z and RAR the limits are checked before decoding
   the file is read.
 - An entry that decodes to a different size from the declared one is `ERR_INVALID_ARGUMENT` naming
   the entry; a truncated archive is `ERR_INVALID_ARGUMENT` `archive is corrupt or not a valid rar
-  file: ...`. Truncation is detected for RAR 5 only (block walk in `ensure_rar5_complete`, BL-0131);
-  a truncated RAR 4 file is left to the reader.
+  file: ...`. A truncated archive of either version is refused, see the SPEC-0087 paragraph.
 - Solid archives are decoded front to back. Since SPEC-0085 the declared sizes are admitted before
   anything is decoded (see the SPEC-0085 paragraph).
 - Order of refusals (FR-NEW-015, reordered by SPEC-0085 and SPEC-0086): membership, missing path or
   folder, multi volume name, a `destination` climbing above the root (SPEC-0086, see its paragraph),
-  encrypted names with a missing or wrong password, corrupt, the first link or escaping
+  encrypted names with a missing or wrong password, corrupt (a cut archive included, SPEC-0087), the first link or escaping
   name in archive order, encrypted data with a missing or wrong password, project storage limit,
   session write allowance (both on declared sizes), oversized entry, collision, then the two limits again
   at the moment of writing. The tests that pin each pair are `e2e_0080_047` to `e2e_0080_081`,
   except the storage limit versus collision pair, now `e2e_0085_mod_001` (was `e2e_0080_068`).
+
+(2026-11-09, SPEC-0087.) Every truncated RAR archive is refused, RAR 4 and RAR 5, with
+`ERR_INVALID_ARGUMENT` `archive is corrupt or not a valid rar file: unexpected end of archive`, through the
+tool and the REST twin alike, and nothing is written. `ensure_rar_complete` (`tools/archive_rar.rs`) walks the
+blocks from the marker and calls an archive complete only when it reaches the end block (RAR 4 included); an
+archive that ends anywhere else, between two blocks or inside one, is cut. An old RAR 1.5 style archive
+with no end block is therefore refused too. Stored data, a recovery record, a comment, a folder and
+a solid archive all count as blocks. With encrypted file names the walk needs the headers, so it decrypts
+them itself when `password` is the right one (`tools/archive_rar_crypt.rs`): RAR 5 with PBKDF2 HMAC SHA-256
+and AES 256 CBC, RAR 4 with its SHA-1 key schedule and AES 128 CBC; `aes`, `cbc`, `hmac` and `sha2` are
+optional dependencies behind the `rar` feature, and the code is safe Rust (no `unsafe`). The password
+questions keep their place before the truncation: a missing password, an empty one or a wrong one is
+answered as before, a cut archive with the right password is the corrupt refusal. A wrong password on RAR 4
+encrypted file names still reads as corrupt (BL-0136).
 
 (2026-11-05, SPEC-0081.) A bare gzip file (suffix `.gz` that is not `.tar.gz`, flow in
 `tools/archive_single.rs`) holds one file. Output name: the archive file name minus

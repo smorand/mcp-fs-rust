@@ -3637,6 +3637,56 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/notes.txt").await.unwrap(), b"keep");
     }
 
+    /// SPEC-0087: the REST door gives a cut RAR the refusal of the assistant tool. The
+    /// module name holds `archive_rar` so the `test.sh` filter runs it.
+    #[cfg(feature = "rar")]
+    mod archive_rar {
+        use super::*;
+
+        const TRUNCATED: &str =
+            "archive is corrupt or not a valid rar file: unexpected end of archive";
+
+        /// Posts the extraction of a cut archive and checks the refusal body and that
+        /// nothing was written.
+        async fn assert_cut_refused(stem: &str, bytes: &[u8], password: Option<&str>) {
+            let h = Harness::new().await;
+            let c = h.state.stores.client(MOUNT).await.unwrap();
+            let path = format!("/uploads/{stem}.rar");
+            c.write_bytes_atomic(&path, bytes).await.unwrap();
+            let mut body = json!({ "path": path });
+            if let Some(p) = password {
+                body["password"] = json!(p);
+            }
+            let (s, v) = h.post(&u("extract-archive"), body).await;
+            assert!(!s.is_success(), "{v}");
+            assert_eq!(v["error"], code::INVALID_ARGUMENT, "{v}");
+            assert!(v["detail"].as_str().unwrap_or_default().contains(TRUNCATED), "{v}");
+            assert!(!c.exists(&format!("/uploads/{stem}")).await.unwrap());
+        }
+
+        /// SPEC-0087/E2E-044: a version 4 archive cut between two files.
+        #[tokio::test]
+        async fn e2e_0087_044_the_http_api_refuses_a_version_4_cut() {
+            let two4 = include_bytes!("../../tests/fixtures/rar/two4.rar");
+            assert_cut_refused("half4", &two4[..67], None).await;
+        }
+
+        /// SPEC-0087/E2E-052: a version 5 archive with encrypted names cut at its end
+        /// block, with the right password.
+        #[tokio::test]
+        async fn e2e_0087_052_the_http_api_refuses_a_version_5_enc() {
+            let hidden = include_bytes!("../../tests/fixtures/rar/hidden.rar");
+            assert_cut_refused("hid222", &hidden[..222], Some("s3cret-Ünï")).await;
+        }
+
+        /// SPEC-0087/E2E-053: a version 4 archive with encrypted data, cut, right password.
+        #[tokio::test]
+        async fn e2e_0087_053_the_http_api_refuses_a_version_4_enc() {
+            let v4 = include_bytes!("../../tests/fixtures/rar/v4secret.rar");
+            assert_cut_refused("v4cut", &v4[..78], Some("s3cret-Ünï")).await;
+        }
+    }
+
     /// SPEC-0086/E2E-031: the REST door refuses a climb as the tool does.
     #[tokio::test]
     async fn e2e_0086_031_http_api_same_refusal() {

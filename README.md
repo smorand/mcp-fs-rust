@@ -297,7 +297,9 @@ opt in cargo feature `rar`: build with `--features rar` or `--all-features`; wit
 refused as an unsupported extension). `.rar` is read by the `unrar` crate (MIT OR Apache-2.0), which
 wraps RARLAB's UnRAR source; that source is free of charge to use for reading RAR archives but its
 licence forbids using it to build a RAR compatible archiver or to re create the RAR compression
-algorithm, which is why the feature is off by default. A bare gzip, bzip2 or xz file (not a
+algorithm, which is why the feature is off by default. A truncated `.rar` (version 4 or 5, encrypted
+file names included once the password is right) is refused as corrupt, `unexpected end of archive`, and nothing is
+written. A bare gzip, bzip2 or xz file (not a
 `.tar.gz`, `.tar.bz2` or `.tar.xz`) holds one file: it is decompressed next to the archive, or into
 `destination`, under the archive name minus `.gz`, `.bz2` or `.xz`; passwords are refused, several gzip
 members, bzip2 streams or xz streams are decoded as one stream, bytes after a bzip2 stream are
@@ -523,8 +525,8 @@ identical stored bytes.
 
 Audio and video extraction (needs a speech model) and legacy binary Office formats
 (`.doc`, `.xls`, `.ppt`). `object_format: sha256` is accepted and ignored: the bundled
-libgit2 is sha1 only. RAR archives are not extracted (no pure Rust decoder; out of scope
-by decision), nor multi volume archives (`.7z.001`, `.zip.001`).
+libgit2 is sha1 only. RAR archives are extracted only in a build with the cargo feature `rar`, and multi volume archives
+(`.rar` parts, `.7z.001`, `.zip.001`) are not extracted.
 
 On the relational side: there is no online migration (`mcp-fs migrate` is offline, run with
 the server stopped) and no automated downgrade, since a database written by the current
