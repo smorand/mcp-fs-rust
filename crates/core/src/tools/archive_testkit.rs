@@ -222,6 +222,18 @@ pub(crate) async fn limit_mb_remaining(f: &Fixture, n: i64) {
     f.state.admin.set_quota(MOUNT, Some(1_048_576)).await.unwrap();
 }
 
+/// Like [`limit_mb_remaining`] when the stored files exceed 1 MB: the limit is
+/// the next whole megabyte above them, so the figures in the message are not
+/// fixed and a test asserts only its prefix or its tail.
+pub(crate) async fn limit_whole_mb_remaining(f: &Fixture, n: i64) {
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let used = crate::quota::used_bytes(&c).await.unwrap();
+    let mb = 1_048_576;
+    let limit = (used + n + mb - 1) / mb * mb;
+    c.write_bytes_atomic("/filler.bin", &vec![b'f'; (limit - n - used) as usize]).await.unwrap();
+    f.state.admin.set_quota(MOUNT, Some(limit)).await.unwrap();
+}
+
 /// A zip whose entries (name, declared size, content) declare any size the
 /// format can carry: no library writes a lying header (SPEC-0085 DEC-009).
 /// The content is deflated with a checksum of the real bytes; a declared

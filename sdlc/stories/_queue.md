@@ -189,7 +189,7 @@
 | US-0187 | SPEC-0084 | tar bound through the HTTP door and documentation | US-0186 | 2 | landed | story/US-0187-tar-bound-through-the-http-door-and-docu | story/US-0186-one-xz-library-and-the-other-formats-unc |
 | US-0188 | SPEC-0085 | count declared archive sizes exactly, never negative | US-0187 | 1 | landed | story/US-0188-count-declared-archive-sizes-exactly-nev | story/US-0187-tar-bound-through-the-http-door-and-docu |
 | US-0189 | SPEC-0085 | refuse zip and 7z archives over a limit before decoding | US-0188 | 2 | landed | story/US-0189-refuse-zip-and-7z-archives-over-a-limit | story/US-0188-count-declared-archive-sizes-exactly-nev |
-| US-0190 | SPEC-0085 | net growth with stored files and the order of refusals | US-0189 | 2 | todo | | |
+| US-0190 | SPEC-0085 | net growth with stored files and the order of refusals | US-0189 | 2 | landed | story/US-0190-net-growth-with-stored-files-and-the-ord | story/US-0189-refuse-zip-and-7z-archives-over-a-limit |
 | US-0191 | SPEC-0085 | admit RAR declared sizes before decoding | US-0190 | 2 | todo | | |
 | US-0192 | SPEC-0085 | cap every entry at its declared size | US-0191 | 2 | todo | | |
 | US-0193 | SPEC-0085 | declared sizes through the HTTP door and documentation | US-0192 | 2 | todo | | |

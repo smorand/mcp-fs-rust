@@ -369,3 +369,186 @@ async fn e2e_0085_sec_005_7z_size_of_2_63() {
     assert_eq!(used(&f).await, 1_047_576);
     assert!(!exists(&f, "/uploads/free").await);
 }
+
+async fn pack_zip(f: &Fixture, stored: &[(&str, usize)], archived: usize) {
+    seed(f, "/uploads/pack.zip", &mid_zip("big.bin", archived)).await;
+    for (path, n) in stored {
+        seed(f, path, &abc_bytes(*n)).await;
+    }
+}
+
+#[tokio::test]
+async fn e2e_0085_014_re_extract_with_overwrite_near_the_l() {
+    let f = fixture().await;
+    pack_zip(&f, &[("/uploads/pack/big.bin", 3_000_000)], 3_000_000).await;
+    limit_whole_mb_remaining(&f, 100_000).await;
+
+    let v = extract(&f, "/uploads/pack.zip", None, true, None).await.unwrap();
+
+    assert_eq!(v["files_written"], 1);
+    assert_eq!(v["bytes_written"], 3_000_000);
+    assert_eq!(remaining_storage(&f).await, 100_000);
+}
+
+#[tokio::test]
+async fn e2e_0085_015_same_situation_without_overwrite() {
+    let f = fixture().await;
+    pack_zip(&f, &[("/uploads/pack/big.bin", 3_000_000)], 3_000_000).await;
+    limit_whole_mb_remaining(&f, 100_000).await;
+
+    let v = extract(&f, "/uploads/pack.zip", None, false, None).await;
+
+    let e = v.expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::NO_CLOBBER, "{e:?}");
+    assert_eq!(
+        e.message,
+        "'/uploads/pack/big.bin' already exists; pass overwrite=true to replace it"
+    );
+}
+
+#[tokio::test]
+async fn e2e_0085_016_files_stored_elsewhere_do_not_count() {
+    let f = fixture().await;
+    pack_zip(&f, &[("/elsewhere/big.bin", 3_000_000)], 3_000_000).await;
+    limit_whole_mb_remaining(&f, 100_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/pack.zip", None, true, None).await;
+
+    project_refusal(&v);
+    let e = v.unwrap_err();
+    assert!(e.message.ends_with("3000000 bytes requested"), "{}", e.message);
+    assert_eq!(held(), 0);
+    assert!(!exists(&f, "/uploads/pack").await);
+}
+
+#[tokio::test]
+async fn e2e_0085_025_the_limit_wins_over_a_collision() {
+    let f = fixture().await;
+    seed(&f, "/uploads/bomb.zip", &zip_bomb()).await;
+    seed(&f, "/uploads/bomb/zeros.bin", b"old").await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/bomb.zip", None, false, None).await;
+
+    project_refusal(&v);
+    let e = v.unwrap_err();
+    assert!(e.message.ends_with("9999997 bytes requested"), "{}", e.message);
+    assert_eq!(read(&f, "/uploads/bomb/zeros.bin").await.unwrap(), b"old");
+    assert_eq!(held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0085_026_the_limit_wins_over_a_wrong_password() {
+    let f = fixture().await;
+    let vault = crate::tools::archive::tests::build_zip(
+        &[("zeros.bin", &vec![0u8; 10_000_000])],
+        Some("s3cret"),
+    );
+    seed(&f, "/uploads/vault.zip", &vault).await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/vault.zip", None, false, Some("nope")).await;
+
+    project_refusal(&v);
+    assert_eq!(held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0085_027_the_limit_wins_over_damaged_data() {
+    let f = fixture().await;
+    let mut bomb = zip_bomb();
+    // Local header: 30 fixed bytes, the 9 byte name `zeros.bin`, then the extra field.
+    let extra = u16::from_le_bytes([bomb[28], bomb[29]]) as usize;
+    let start = 30 + 9 + extra;
+    for b in &mut bomb[start..start + 16] {
+        *b ^= 0xFF;
+    }
+    seed(&f, "/uploads/bomb.zip", &bomb).await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/bomb.zip", None, false, None).await;
+
+    project_refusal(&v);
+    assert_eq!(held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0085_031_a_missing_password_wins_over_the_lim() {
+    let f = fixture().await;
+    let bytes = crate::tools::archive::tests::build_sevenz_ext(
+        &[("zeros.bin", &vec![0u8; 10_000_000], None)],
+        Some("s3cret"),
+        true,
+    );
+    seed(&f, "/uploads/vault.7z", &bytes).await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/vault.7z", None, false, None).await;
+
+    let e = v.expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::PASSWORD_REQUIRED, "{e:?}");
+    assert_eq!(
+        e.message,
+        "password required to extract this archive; call again with the 'password' parameter"
+    );
+    assert_eq!(held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0085_032_an_unreadable_archive_wins_over_ever() {
+    let f = fixture().await;
+    seed(&f, "/uploads/cut.zip", &zip_bomb()[..100]).await;
+    limit_mb_remaining(&f, 1_000).await;
+
+    let v = extract(&f, "/uploads/cut.zip", None, false, None).await;
+
+    corrupt_refusal(&v, "zip");
+}
+
+#[tokio::test]
+async fn e2e_0085_035_membership_wins_over_the_limit() {
+    let f = fixture().await;
+    seed(&f, "/uploads/bomb.zip", &zip_bomb()).await;
+    limit_mb_remaining(&f, 1_000).await;
+    held_reset();
+    let eve = "eve@example.com";
+
+    let r = f.state.authorize(MOUNT, eve).await;
+
+    let e = r.expect_err("a non member is refused");
+    assert_eq!(e.code, code::FORBIDDEN, "{e:?}");
+    assert_eq!(e.message, "'eve@example.com' is not a member of 'atlas'");
+    assert_eq!(held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0085_042_replacement_one_byte_over() {
+    let f = fixture().await;
+    pack_zip(&f, &[("/uploads/pack/big.bin", 3_000_000)], 3_100_001).await;
+    limit_whole_mb_remaining(&f, 100_000).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/pack.zip", None, true, None).await;
+
+    project_refusal(&v);
+    let e = v.unwrap_err();
+    assert!(e.message.ends_with(" 100001 bytes requested"), "{}", e.message);
+    assert_eq!(held(), 0);
+    assert_eq!(read(&f, "/uploads/pack/big.bin").await.unwrap(), abc_bytes(3_000_000));
+}
+
+#[tokio::test]
+async fn e2e_0085_043_explicit_destination_holding_the_fil() {
+    let f = fixture().await;
+    pack_zip(&f, &[("/out/big.bin", 3_000_000)], 3_000_000).await;
+    limit_whole_mb_remaining(&f, 100_000).await;
+
+    extract(&f, "/uploads/pack.zip", Some("/out"), true, None).await.unwrap();
+
+    assert_eq!(remaining_storage(&f).await, 100_000);
+}
