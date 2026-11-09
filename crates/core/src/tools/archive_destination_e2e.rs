@@ -157,6 +157,147 @@ async fn e2e_0086_035_overwrite_does_not_lift_the_refusal() {
     assert_eq!(read(&f, "/x/a.txt").await.unwrap(), b"old");
 }
 
+const BROKEN: &[u8] = b"not a zip";
+
+#[tokio::test]
+async fn e2e_0086_019_the_destination_wins_over_a_damaged() {
+    let f = fixture().await;
+    seed(&f, "/uploads/broken.zip", BROKEN).await;
+
+    let v = extract(&f, "/uploads/broken.zip", Some("../../x"), false, None).await;
+
+    climb_refusal(&v, "../../x");
+    assert_nothing_written(&f, "/uploads/broken.zip", &["/x", "/uploads/broken"]).await;
+}
+
+#[tokio::test]
+async fn e2e_0086_020_the_destination_wins_over_the_limits() {
+    let f = fixture_allowance(1000).await;
+    seed(&f, "/uploads/bomb.tar.gz", &gz(&tar_bomb())).await;
+    held_reset();
+
+    let v = extract(&f, "/uploads/bomb.tar.gz", Some("../../x"), false, None).await;
+
+    climb_refusal(&v, "../../x");
+    assert_nothing_written(&f, "/uploads/bomb.tar.gz", &["/x", "/uploads/bomb"]).await;
+    assert_eq!(allowance(&f), 1000);
+    assert_eq!(held(), 0);
+}
+
+#[tokio::test]
+async fn e2e_0086_021_the_destination_wins_over_a_link_ent() {
+    let f = fixture().await;
+    let zip = crate::tools::archive::tests::build_zip_with_special_entry(
+        "ok.txt",
+        HELLO,
+        "l",
+        b"/etc/passwd",
+        true,
+    );
+    seed(&f, "/uploads/link.zip", &zip).await;
+
+    let v = extract(&f, "/uploads/link.zip", Some("../../x"), false, None).await;
+
+    climb_refusal(&v, "../../x");
+    assert_nothing_written(&f, "/uploads/link.zip", &["/x", "/uploads/link"]).await;
+}
+
+#[tokio::test]
+async fn e2e_0086_022_the_destination_wins_over_an_escapin() {
+    let f = fixture().await;
+    seed(
+        &f,
+        "/uploads/evil.tar",
+        &crate::tools::archive::tests::build_tar(&[("../../etc/passwd", b"pwned")]),
+    )
+    .await;
+
+    let v = extract(&f, "/uploads/evil.tar", Some("../../x"), false, None).await;
+
+    climb_refusal(&v, "../../x");
+    assert_nothing_written(&f, "/uploads/evil.tar", &["/x", "/etc/passwd"]).await;
+}
+
+#[tokio::test]
+async fn e2e_0086_023_the_destination_wins_over_a_missing() {
+    let f = fixture().await;
+    let sz = crate::tools::archive::tests::build_sevenz_ext(
+        &[("s.txt", HELLO, None)],
+        Some("s3cret"),
+        false,
+    );
+    seed(&f, "/uploads/secret.7z", &sz).await;
+
+    let v = extract(&f, "/uploads/secret.7z", Some("../../x"), false, None).await;
+
+    climb_refusal(&v, "../../x");
+    assert_nothing_written(&f, "/uploads/secret.7z", &["/x", "/uploads/secret"]).await;
+}
+
+#[tokio::test]
+async fn e2e_0086_024_membership_wins_over_the_destination() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.zip", &build_zip(&[("a.txt", HELLO)], None)).await;
+
+    let r = f.state.authorize(MOUNT, "eve@example.com").await;
+
+    let e = r.expect_err("a non member is refused");
+    assert_eq!(e.code, code::FORBIDDEN, "{e:?}");
+    assert_eq!(e.message, "'eve@example.com' is not a member of 'atlas'");
+}
+
+#[tokio::test]
+async fn e2e_0086_025_a_missing_path_wins_over_the_destina() {
+    let f = fixture().await;
+
+    let v = extract(&f, "/uploads/none.zip", Some("../../x"), false, None).await;
+
+    let e = v.expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::NOT_FOUND, "{e:?}");
+    assert_eq!(e.message, "'/uploads/none.zip' not found");
+}
+
+#[tokio::test]
+async fn e2e_0086_026_a_folder_path_wins_over_the_destinat() {
+    let f = fixture().await;
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    c.makedirs("/uploads/dir.zip", true).await.unwrap();
+
+    let v = extract(&f, "/uploads/dir.zip", Some("../../x"), false, None).await;
+
+    let e = v.expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, "'/uploads/dir.zip' is a directory, not an archive file");
+}
+
+#[tokio::test]
+async fn e2e_0086_030_a_nul_character_is_refused_before_th() {
+    let f = fixture().await;
+    seed(&f, "/uploads/broken.zip", BROKEN).await;
+
+    let v = extract(&f, "/uploads/broken.zip", Some("out\0x"), false, None).await;
+
+    nul_refusal(&v);
+    assert_nothing_written(&f, "/uploads/broken.zip", &["/out"]).await;
+}
+
+#[tokio::test]
+async fn e2e_0086_036_a_nul_character_in_an_otherwise_vali() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.7z", &sevenz_solid(&[("a.txt", HELLO)])).await;
+
+    let v = extract(&f, "/uploads/pack.7z", Some("out\0x"), false, None).await;
+
+    nul_refusal(&v);
+    assert_nothing_written(&f, "/uploads/pack.7z", &["/out"]).await;
+}
+
+fn nul_refusal(v: &Result<Value>) {
+    let e = v.as_ref().expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS, "{e:?}");
+    assert_eq!(e.message, "path contains a NUL byte");
+}
+
 /// RAR tests sit in a module whose path contains `archive_rar`, the filter
 /// `test.sh` uses for the feature run (SPEC-0085 DEC-011).
 #[cfg(feature = "rar")]

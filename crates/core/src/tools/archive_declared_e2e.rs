@@ -825,14 +825,16 @@ mod archive_rar {
     }
 
     #[tokio::test]
-    async fn e2e_0085_028_the_limit_wins_over_a_refused_destin() {
+    async fn e2e_0086_mod_001_the_destination_wins_over_the_declar() {
         let f = fixture().await;
         seed(&f, "/uploads/bomb.rar", &rar5_store(&[bomb_entry()])).await;
         limit_whole_mb_remaining(&f, 1_000).await;
 
         let v = extract(&f, "/uploads/bomb.rar", Some("../../x"), false, None).await;
 
-        project_refusal(&v);
+        let e = v.expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS, "{e:?}");
+        assert_eq!(e.message, "path escapes the volume root: ../../x");
         assert!(!exists(&f, "/x").await);
         assert!(!exists(&f, "/uploads/bomb").await);
     }

@@ -203,35 +203,24 @@ pub(crate) async fn extract_archive(
         .await;
     }
 
+    // SPEC-0086 DEC-002: the destination is judged on its own text, so it is
+    // refused before one byte of the archive is read or decoded.
+    let dest = match destination {
+        Some(d) => archive_single::resolve_destination(d)?,
+        None => normalized[..normalized.len() - suffix_len].to_string(),
+    };
+
     // CPU-bound (decompression, decryption): run off the async worker so one
     // large or hostile archive cannot stall the executor (rust skill, async
     // guidance on `spawn_blocking`).
     let entries = match format {
         ArchiveFormat::Tar(compression) if compression != TarCompression::None => {
-            decode_bounded_tar(
-                state,
-                &client,
-                mount_id,
-                person,
-                &normalized,
-                (format, suffix_len),
-                destination,
-                compression,
-            )
-            .await?
+            decode_bounded_tar(state, &client, mount_id, person, &normalized, &dest, compression)
+                .await?
         }
         format if lists_first(format) => {
-            decode_listed(
-                state,
-                &client,
-                mount_id,
-                person,
-                &normalized,
-                (format, suffix_len),
-                destination,
-                password,
-            )
-            .await?
+            decode_listed(state, &client, mount_id, person, &normalized, format, &dest, password)
+                .await?
         }
         _ => {
             let bytes = client.read_bytes(&normalized).await?;
@@ -241,14 +230,9 @@ pub(crate) async fn extract_archive(
         }
     };
 
-    // FR-NEW-016: caller-supplied destination resolved by the one destination
-    // rule, which refuses a climb above the root; otherwise the archive's own path
-    // with its matched extension stripped, preserving the stem's case.
-    let dest = match destination {
-        Some(d) => archive_single::resolve_destination(d)?,
-        None => normalized[..normalized.len() - suffix_len].to_string(),
-    };
-
+    // FR-NEW-016: `dest` is the caller's destination through the one destination
+    // rule, or the archive's own path with its matched extension stripped,
+    // preserving the stem's case.
     // FR-NEW-017/018: no-clobber scan in archive entry order, before any
     // write; `overwrite=true` bypasses this entirely (DEC-004).
     if !overwrite {
@@ -335,26 +319,12 @@ pub(crate) async fn extract_archive(
     )
 }
 
-/// The destination as the later checks will compute it, or `None` when they
-/// would refuse it. It only sizes the decoding bound: the refusal itself keeps
-/// its place after the entry checks.
-fn planned_destination(
-    normalized: &str,
-    suffix_len: usize,
-    destination: Option<&str>,
-) -> Option<String> {
-    match destination {
-        Some(d) => archive_single::resolve_destination(d).ok(),
-        None => Some(normalized[..normalized.len() - suffix_len].to_string()),
-    }
-}
-
 /// A zip, 7z or RAR goes list, then [`quota::check_declared`], then decode, each
 /// blocking step off the async worker (SPEC-0085 DEC-001): the declared sizes
 /// are checked against the storage and session limits before one entry is
 /// decoded, so a bomb costs a header read. Nothing is written, charged or
-/// audited here; the destination refusal, the collision check and the final
-/// admission keep their place after decoding.
+/// audited here; the collision check and the final admission keep their place
+/// after decoding.
 /// Time O(n) over the entries to list and check, then O(decoded bytes).
 #[allow(clippy::too_many_arguments)]
 async fn decode_listed(
@@ -363,11 +333,10 @@ async fn decode_listed(
     mount_id: &str,
     person: &str,
     normalized: &str,
-    (format, suffix_len): (ArchiveFormat, usize),
-    destination: Option<&str>,
+    format: ArchiveFormat,
+    dest: &str,
     password: Option<&str>,
 ) -> Result<Vec<DecodedEntry>> {
-    let planned = planned_destination(normalized, suffix_len, destination);
     let bytes = std::sync::Arc::new(client.read_bytes(normalized).await?);
     let owned_password = password.map(ToOwned::to_owned);
 
@@ -384,17 +353,13 @@ async fn decode_listed(
     .await
     .map_err(|e| ToolError::internal(format!("archive listing task panicked: {e}")))??;
 
-    // A refused destination is reported later; its paths are joined to `/` only
-    // so that the last occurrence of a repeated path still wins.
-    let base = planned.as_deref().unwrap_or("/");
     let files: Vec<(String, u64)> = listing
         .entries()
         .iter()
         .filter(|e| !e.is_dir)
-        .map(|e| (join_entry_destination(base, &e.rel_path), e.declared))
+        .map(|e| (join_entry_destination(dest, &e.rel_path), e.declared))
         .collect();
-    quota::check_declared(client, &state.safety, person, mount_id, &files, planned.is_some())
-        .await?;
+    quota::check_declared(client, &state.safety, person, mount_id, &files, true).await?;
 
     let (decoded, _held) = tokio::task::spawn_blocking(move || {
         let mut held = 0u64;
@@ -428,14 +393,10 @@ async fn decode_bounded_tar(
     mount_id: &str,
     person: &str,
     normalized: &str,
-    (_, suffix_len): (ArchiveFormat, usize),
-    destination: Option<&str>,
+    dest: &str,
     compression: TarCompression,
 ) -> Result<Vec<DecodedEntry>> {
-    let stored = match planned_destination(normalized, suffix_len, destination) {
-        Some(dest) => quota::stored_under(client, &dest).await?,
-        None => 0,
-    };
+    let stored = quota::stored_under(client, dest).await?;
     let project = quota::project_remaining_for(client, &state.safety, stored).await?;
     let session = state.safety.session_remaining(person, mount_id).max(0) as u64;
     let caps = archive_single::pick_caps(project.map(|p| p.max(0) as u64), session, TAR_FRAMING);
@@ -1647,7 +1608,7 @@ pub(crate) mod tests {
 
     /// Plain (uncompressed) tar with regular-file entries only. Names may
     /// contain `..` (raw name field, bypassing `set_path`'s validation).
-    fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_bytes);
@@ -1702,7 +1663,7 @@ pub(crate) mod tests {
     /// a plain file entry: `unix_permissions` alone cannot do this, since it
     /// masks its argument with `& 0o777` and discards the `S_IFLNK` type bit
     /// (`zip-9.0.5/src/write/options.rs:334-335`).
-    fn build_zip_with_special_entry(
+    pub(crate) fn build_zip_with_special_entry(
         good_name: &str,
         good_content: &[u8],
         special_name: &str,
