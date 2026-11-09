@@ -2090,8 +2090,9 @@ pub(crate) mod tests {
         let bz2_bytes = encoder.finish().unwrap();
         check(&f, "/u5/f.tb2", bz2_bytes, "/u5/f").await;
 
-        let mut xz_bytes = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(&plain_tar), &mut xz_bytes).unwrap();
+        let mut xz_encoder = liblzma::write::XzEncoder::new(Vec::new(), 6);
+        xz_encoder.write_all(&plain_tar).unwrap();
+        let xz_bytes = xz_encoder.finish().unwrap();
         check(&f, "/u6/f.txz", xz_bytes, "/u6/f").await;
     }
 

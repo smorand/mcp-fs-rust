@@ -532,3 +532,88 @@ async fn e2e_0084_044_tar_bz2_entry_declaring_more_than_it() {
 async fn e2e_0084_045_tar_xz_entry_declaring_more_than_it() {
     lying("/uploads/lie.tar.xz", "tar.xz", xz(&tar_lying("a.txt", 1_000_000_000, b"hello"))).await;
 }
+
+fn extracted_one_file(v: &crate::errors::Result<serde_json::Value>, destination: &str) {
+    assert_eq!(
+        v.as_ref().ok(),
+        Some(&json!({"destination": destination, "files_written": 1,
+                     "dirs_created": 1, "bytes_written": 5})),
+        "{v:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_0084_001_tar_gz_within_the_limits() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar())).await;
+    let v = extract(&f, "/uploads/pack.tar.gz", None, false, None).await;
+    extracted_one_file(&v, "/uploads/pack");
+    assert_hello(&f).await;
+}
+
+#[tokio::test]
+async fn e2e_0084_002_tar_bz2_and_tb2_within_the_limits() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.bz2", &bz2(&tar())).await;
+    seed(&f, "/u2/PACK.TB2", &bz2(&tar())).await;
+    let v = extract(&f, "/uploads/pack.tar.bz2", None, false, None).await;
+    extracted_one_file(&v, "/uploads/pack");
+    let v = extract(&f, "/u2/PACK.TB2", None, false, None).await;
+    extracted_one_file(&v, "/u2/PACK");
+    assert_hello(&f).await;
+    assert_eq!(read(&f, "/u2/PACK/a.txt").await.as_deref(), Some(&b"hello"[..]));
+}
+
+#[tokio::test]
+async fn e2e_0084_003_tar_xz_and_txz_within_the_limits() {
+    let f = fixture().await;
+    let packed = xz_with(&tar(), &lzma2(), Check::Crc64);
+    seed(&f, "/uploads/pack.tar.xz", &packed).await;
+    seed(&f, "/u3/pack.txz", &packed).await;
+    let v = extract(&f, "/uploads/pack.tar.xz", None, false, None).await;
+    extracted_one_file(&v, "/uploads/pack");
+    let v = extract(&f, "/u3/pack.txz", None, false, None).await;
+    extracted_one_file(&v, "/u3/pack");
+    assert_hello(&f).await;
+    assert_eq!(read(&f, "/u3/pack/a.txt").await.as_deref(), Some(&b"hello"[..]));
+}
+
+#[tokio::test]
+async fn e2e_0084_039_plain_tar_unchanged() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar", &tar()).await;
+    let v = extract(&f, "/uploads/pack.tar", None, false, None).await;
+    extracted_one_file(&v, "/uploads/pack");
+    assert_hello(&f).await;
+}
+
+#[tokio::test]
+async fn e2e_0084_040_plain_tar_files_equal_to_the_remaini() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar", &tar()).await;
+    limit_remaining(&f, 5).await;
+    let v = extract(&f, "/uploads/pack.tar", None, false, None).await;
+    extracted_one_file(&v, "/uploads/pack");
+    assert_eq!(remaining(&f).await, 0);
+}
+
+#[tokio::test]
+async fn e2e_0084_041_zip_over_the_remaining_storage_uncha() {
+    let f = fixture().await;
+    let zip = crate::tools::archive::tests::build_zip(&[("a.txt", b"hello")], None);
+    seed(&f, "/uploads/pack.zip", &zip).await;
+    limit_remaining(&f, 4).await;
+    let v = extract(&f, "/uploads/pack.zip", None, false, None).await;
+    project_refusal(&v);
+    assert!(!exists(&f, "/uploads/pack").await);
+}
+
+#[tokio::test]
+async fn e2e_0084_042_tbz2_still_unsupported() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tbz2", &bz2(&tar())).await;
+    let v = extract(&f, "/uploads/pack.tbz2", None, false, None).await;
+    let e = v.as_ref().expect_err("refused");
+    assert_eq!(e.code, crate::errors::code::NOT_SUPPORTED, "{e:?}");
+    assert_eq!(e.message, "unsupported archive extension: '.tbz2'");
+}

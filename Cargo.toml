@@ -83,8 +83,6 @@ flate2 = "1"
 # `.tar.bz2`/`.tb2` decompression. Default features (0.6+) use `libbz2-rs-sys`,
 # a pure-Rust port, so no system libbz2 dependency.
 bzip2 = "0.6"
-# `.tar.xz`/`.txz` decompression, pure Rust.
-lzma-rs = "0.3"
 liblzma = "0.4.9"
 # `.7z` decompression. `sevenz-rust2`, not `sevenz-rust` (DEC-007: the latter has
 # an unmaintained advisory and its repository was deleted). Pinned under 0.21 to
@@ -153,3 +151,9 @@ tree-sitter-ruby = "0.23"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# Fewer/smaller build artifacts: macOS (syspolicyd) scans every new binary and
+# every .dSYM bundle. Line tables keep backtraces readable.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "off"

@@ -2131,9 +2131,9 @@ mod tests {
             b.append(&h, &b"hello"[..]).unwrap();
             b.finish().unwrap();
         }
-        // The tar family still decodes with lzma-rs, so the fixture uses it too.
-        let mut packed = Vec::new();
-        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut packed).unwrap();
+        let mut encoder = liblzma::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar_bytes).unwrap();
+        let packed = encoder.finish().unwrap();
         seed(&f, archive, &packed).await;
         let v = extract_with(&f, archive, None, false, None).await;
         assert_eq!(
