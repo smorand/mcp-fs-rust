@@ -3637,6 +3637,63 @@ mod tests {
         assert_eq!(c.read_bytes("/uploads/notes.txt").await.unwrap(), b"keep");
     }
 
+    /// SPEC-0086/E2E-031: the REST door refuses a climb as the tool does.
+    #[tokio::test]
+    async fn e2e_0086_031_http_api_same_refusal() {
+        let h = Harness::new().await;
+        let bytes = crate::tools::archive::tests::build_zip(&[("a.txt", b"hello")], None);
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/pack.zip", &bytes).await.unwrap();
+        let body = json!({"path": "/uploads/pack.zip", "destination": "../../x"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PATH_OUT_OF_BOUNDS);
+        assert_eq!(v["detail"], "ERR_PATH_OUT_OF_BOUNDS: path escapes the volume root: ../../x");
+        assert!(!c.exists("/x").await.unwrap());
+        assert!(!c.exists("/x/a.txt").await.unwrap());
+    }
+
+    /// SPEC-0086/E2E-032: a climb that stays inside resolves from the root.
+    #[tokio::test]
+    async fn e2e_0086_032_http_api_a_climb_that_stays_inside() {
+        let h = Harness::new().await;
+        let bytes = crate::tools::archive::tests::build_sevenz_ext(
+            &[("a.txt", b"hello", None)],
+            None,
+            false,
+        );
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/pack.7z", &bytes).await.unwrap();
+        let body = json!({"path": "/uploads/pack.7z", "destination": "/a/../b"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["destination"], "/b");
+        assert_eq!(v["files_written"], 1);
+        assert_eq!(v["bytes_written"], 5);
+        assert_eq!(c.read_bytes("/b/a.txt").await.unwrap(), b"hello");
+    }
+
+    /// SPEC-0086/E2E-034: an absolute climb and a NUL on a bare file.
+    #[tokio::test]
+    async fn e2e_0086_034_http_api_absolute_climb_and_nul_on_a() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/a.txt.gz", &csv_gz()).await.unwrap();
+        let body = json!({"path": "/uploads/a.txt.gz", "destination": "/../x"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PATH_OUT_OF_BOUNDS);
+        assert_eq!(v["detail"], "ERR_PATH_OUT_OF_BOUNDS: path escapes the volume root: /../x");
+        let body = json!({"path": "/uploads/a.txt.gz", "destination": "out\0x"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert!(!s.is_success(), "{v}");
+        assert_eq!(v["error"], code::PATH_OUT_OF_BOUNDS);
+        assert_eq!(v["detail"], "ERR_PATH_OUT_OF_BOUNDS: path contains a NUL byte");
+        for p in ["/x", "/out", "/uploads/a.txt"] {
+            assert!(!c.exists(p).await.unwrap(), "{p}");
+        }
+    }
+
     /// E2E-NEW-032: missing `path` is 400; no bearer gets what `read` gets,
     /// cross checked through the router; a non member is 403. None writes.
     #[tokio::test]

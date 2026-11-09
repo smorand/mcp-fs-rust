@@ -195,7 +195,7 @@
 | US-0193 | SPEC-0085 | declared sizes through the HTTP door and documentation | US-0192 | 2 | landed | story/US-0193-declared-sizes-through-the-http-door-and | story/US-0192-cap-every-entry-at-its-declared-size |
 | US-0194 | SPEC-0086 | one destination rule: refuse a climb above the root for every format | US-0193 | 2 | landed | story/US-0194-one-destination-rule-refuse-a-climb-abov | story/US-0193-declared-sizes-through-the-http-door-and |
 | US-0195 | SPEC-0086 | check the destination before the archive is read | US-0194 | 2 | landed | story/US-0195-check-the-destination-before-the-archive | story/US-0194-one-destination-rule-refuse-a-climb-abov |
-| US-0196 | SPEC-0086 | earlier refusals first and both doors alike | US-0195 | 2 | todo | | |
+| US-0196 | SPEC-0086 | earlier refusals first and both doors alike | US-0195 | 2 | landed | story/US-0196-earlier-refusals-first-and-both-doors-al | story/US-0195-check-the-destination-before-the-archive |
 | US-0197 | SPEC-0086 | destinations inside the project unchanged and documentation | US-0196 | 2 | todo | | |
 | US-0198 | SPEC-0087 | refuse a cut RAR4 archive with one message | US-0197 | 2 | todo | | |
 | US-0199 | SPEC-0087 | complete RAR archives unchanged, folders and solid cuts refused | US-0198 | 2 | todo | | |

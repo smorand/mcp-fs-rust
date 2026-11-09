@@ -271,6 +271,30 @@ async fn e2e_0086_026_a_folder_path_wins_over_the_destinat() {
 }
 
 #[tokio::test]
+async fn e2e_0086_027_an_unsupported_extension_wins_over_t() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.lz", b"12345").await;
+
+    let v = extract(&f, "/uploads/pack.lz", Some("../../x"), false, None).await;
+
+    let e = v.expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::NOT_SUPPORTED, "{e:?}");
+    assert_eq!(e.message, "unsupported archive extension: '.lz'");
+}
+
+#[tokio::test]
+async fn e2e_0086_028_a_password_on_a_tar_archive_wins_ove() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar_bytes(&[("a.txt", HELLO)]))).await;
+
+    let v = extract(&f, "/uploads/pack.tar.gz", Some("../../x"), false, Some("x")).await;
+
+    let e = v.expect_err("the extraction must be refused");
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, "password is not applicable to this archive format");
+}
+
+#[tokio::test]
 async fn e2e_0086_030_a_nul_character_is_refused_before_th() {
     let f = fixture().await;
     seed(&f, "/uploads/broken.zip", BROKEN).await;
@@ -315,6 +339,21 @@ mod archive_rar {
 
         climb_refusal(&v, "/a/../../b");
         assert_nothing_written(&f, "/uploads/pack.rar", &["/b", "/a"]).await;
+    }
+
+    #[tokio::test]
+    async fn e2e_0086_029_a_multi_volume_rar_name_wins_over_th() {
+        let f = fixture().await;
+        seed(&f, "/uploads/pack.part1.rar", V5).await;
+
+        let v = extract(&f, "/uploads/pack.part1.rar", Some("../../x"), false, None).await;
+
+        let e = v.expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::NOT_SUPPORTED, "{e:?}");
+        assert_eq!(
+            e.message,
+            "multi volume RAR archives are not supported: extract a single file archive"
+        );
     }
 }
 
