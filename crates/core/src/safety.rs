@@ -136,12 +136,14 @@ impl SafetyManager {
     pub fn charge_write(&self, person: &str, project: &str, num_bytes: i64) -> Result<()> {
         let quota = self.config.write_quota_bytes;
         self.with_session(person, project, |s| {
-            if s.bytes_written + num_bytes > quota {
+            // Saturating, and a negative amount never lowers the used
+            // allowance: sizes may come from an archive header (SPEC-0085 DEC-003).
+            if s.bytes_written.saturating_add(num_bytes) > quota {
                 return Err(ToolError::write_quota_exceeded(format!(
                     "session write quota of {quota} bytes exceeded"
                 )));
             }
-            s.bytes_written += num_bytes;
+            s.bytes_written += num_bytes.max(0);
             Ok(())
         })
     }
@@ -213,6 +215,20 @@ mod tests {
         let err = m.project_limit("p").await.unwrap_err();
         assert_eq!(err.code, crate::errors::code::INTERNAL_ERROR);
         assert!(err.message.contains("limits"), "{}", err.message);
+    }
+
+    /// SPEC-0085 FR-NEW-006: a charge near `i64::MAX` refuses instead of wrapping
+    /// below the quota, and a negative charge never hands allowance back.
+    #[test]
+    fn charge_write_never_wraps_and_never_goes_negative() {
+        let m = mgr();
+        let before = m.session_remaining("p", "x");
+        m.charge_write("p", "x", -5).unwrap();
+        assert_eq!(m.session_remaining("p", "x"), before);
+        m.charge_write("p", "x", 1).unwrap();
+        let e = m.charge_write("p", "x", i64::MAX).unwrap_err();
+        assert_eq!(e.code, crate::errors::code::WRITE_QUOTA_EXCEEDED);
+        assert_eq!(m.session_remaining("p", "x"), before - 1);
     }
 
     #[tokio::test]

@@ -266,12 +266,18 @@ pub(crate) async fn extract_archive(
     // entry's destination at once; the session charge keeps the declared
     // total, unchanged from before SPEC-0020. A failed admission is
     // `admit_paths`'s own fail-closed behavior: nothing mutated.
+    // SPEC-0085 DEC-003: a declared size is attacker supplied; a plain cast
+    // turns 2^63 and above negative, which would lower the net change and the
+    // session charge, so it saturates at `i64::MAX`, as does the total.
     let entry_targets: Vec<(String, i64)> = entries
         .iter()
         .filter(|e| !e.is_dir)
-        .map(|e| (join_entry_destination(&dest, &e.rel_path), e.declared_size as i64))
+        .map(|e| {
+            let declared = i64::try_from(e.declared_size).unwrap_or(i64::MAX);
+            (join_entry_destination(&dest, &e.rel_path), declared)
+        })
         .collect();
-    let total_declared: i64 = entry_targets.iter().map(|(_, s)| *s).sum();
+    let total_declared = entry_targets.iter().map(|(_, s)| *s).fold(0i64, i64::saturating_add);
     let _admission = quota::admit_paths(
         &client,
         &state.safety,

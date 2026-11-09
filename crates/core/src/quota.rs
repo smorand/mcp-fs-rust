@@ -105,7 +105,8 @@ async fn check_and_charge(
         && let Some(limit) = safety.project_limit(&client.project_id).await?
     {
         let used = client.meta.used_bytes().await?;
-        if used + delta > limit {
+        // Saturating: a caller's size near `i64::MAX` must refuse, not wrap (SPEC-0085 DEC-003).
+        if used.saturating_add(delta) > limit {
             return Err(ToolError::project_quota_exceeded(limit, used, delta));
         }
     }
@@ -153,7 +154,7 @@ pub(crate) async fn admit_paths(
             Some(node) if node.is_file() => node.size,
             _ => 0,
         };
-        delta += new_size - previous;
+        delta = delta.saturating_add(new_size.saturating_sub(previous));
     }
     check_and_charge(client, safety, person, mount_id, session_bytes, delta).await?;
     Ok(Admission { _guard: guard })

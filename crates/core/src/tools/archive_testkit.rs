@@ -201,3 +201,92 @@ pub(crate) fn tar_lying(name: &str, declared: u64, content: &[u8]) -> Vec<u8> {
 pub(crate) fn abc_bytes(n: usize) -> Vec<u8> {
     b"abc".iter().copied().cycle().take(n).collect()
 }
+
+/// The second member of `atlas`, who reads what the extraction left behind.
+pub(crate) const SECOND: &str = "noa@example.com";
+
+/// Add [`SECOND`] to `atlas`.
+pub(crate) async fn add_second_member(f: &Fixture) -> &'static str {
+    f.state.admin.add_member(MOUNT, SECOND, OWNER).await.unwrap();
+    SECOND
+}
+
+/// A 1 048 576 byte limit with exactly `n` bytes left: `/filler.bin` takes
+/// what the files already stored (the archive included) leave over.
+pub(crate) async fn limit_mb_remaining(f: &Fixture, n: i64) {
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let used = crate::quota::used_bytes(&c).await.unwrap();
+    let filler = 1_048_576 - n - used;
+    assert!(filler >= 0, "the stored files already exceed 1 MB minus {n}");
+    c.write_bytes_atomic("/filler.bin", &vec![b'f'; filler as usize]).await.unwrap();
+    f.state.admin.set_quota(MOUNT, Some(1_048_576)).await.unwrap();
+}
+
+/// A zip whose entries (name, declared size, content) declare any size the
+/// format can carry: no library writes a lying header (SPEC-0085 DEC-009).
+/// The content is deflated with a checksum of the real bytes; a declared
+/// size of `0xFFFF_FFFF` or more puts `0xFFFF_FFFF` in both size fields of
+/// both headers plus a zip64 extra field (uncompressed then compressed size).
+pub(crate) fn zip_declaring(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, declared, content) in entries {
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(content).unwrap();
+        let data = e.finish().unwrap();
+        let mut crc = flate2::Crc::new();
+        crc.update(content);
+        let zip64 = *declared >= 0xFFFF_FFFF;
+        let (version, usize32, csize32, extra) = if zip64 {
+            let mut x = Vec::new();
+            x.extend_from_slice(&1u16.to_le_bytes());
+            x.extend_from_slice(&16u16.to_le_bytes());
+            x.extend_from_slice(&declared.to_le_bytes());
+            x.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            (45u16, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32, x)
+        } else {
+            (20u16, *declared as u32, data.len() as u32, Vec::new())
+        };
+        let offset = out.len() as u32;
+        // Shared fields: version needed, flags, deflate, time, date, crc, sizes, name and extra lengths.
+        let mut common = Vec::new();
+        common.extend_from_slice(&version.to_le_bytes());
+        common.extend_from_slice(&0u16.to_le_bytes());
+        common.extend_from_slice(&8u16.to_le_bytes());
+        common.extend_from_slice(&0u16.to_le_bytes());
+        common.extend_from_slice(&0x21u16.to_le_bytes());
+        common.extend_from_slice(&crc.sum().to_le_bytes());
+        common.extend_from_slice(&csize32.to_le_bytes());
+        common.extend_from_slice(&usize32.to_le_bytes());
+        common.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        common.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&common);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&extra);
+        out.extend_from_slice(&data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&45u16.to_le_bytes());
+        central.extend_from_slice(&common);
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
+        central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+        central.extend_from_slice(&extra);
+    }
+    let cd_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
