@@ -424,3 +424,69 @@ async fn e2e_0087_030_version_5_encrypted_names_cut_betwee() {
 async fn e2e_0087_037_a_cut_wins_over_a_link_entry() {
     assert_truncated("hl2cut", &HL2[..334], Some(PASSWORD)).await;
 }
+
+#[cfg(feature = "rar")]
+const HP4: &[u8] = include_bytes!("../../tests/fixtures/rar/hp4.rar");
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_003_version_4_with_encrypted_file_names() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    let v = extract(&f, "/uploads/hp4.rar", None, false, Some(PASSWORD)).await.unwrap();
+    assert_eq!(v["files_written"], 2, "{v}");
+    assert_eq!(v["bytes_written"], 12, "{v}");
+    assert_eq!(read(&f, "/uploads/hp4/a.txt").await.as_deref(), Some(&b"hello"[..]));
+    assert_eq!(read(&f, "/uploads/hp4/b.txt").await.as_deref(), Some(&b"goodbye"[..]));
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_022_version_4_encrypted_names_cut_betwee() {
+    assert_truncated("hp4half", &HP4[..108], Some(PASSWORD)).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_023_version_4_encrypted_names_cut_inside() {
+    assert_truncated("hp4data", &HP4[..190], Some(PASSWORD)).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_024_version_4_encrypted_names_leading_pa() {
+    assert_truncated("hp4lead", &HP4[..20], Some(PASSWORD)).await;
+}
+
+/// Log and span capture is per thread, so the call runs on one current thread runtime
+/// under the capture lock, as `archive_rar.rs`'s own leak tests do.
+#[cfg(feature = "rar")]
+#[test]
+fn e2e_0087_048_the_password_stays_out_of_a_cut_refu() {
+    let _guard = crate::logging::capture::lock_for_test();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let f = fixture().await;
+        seed(&f, "/uploads/hp4data.rar", &HP4[..190]).await;
+        crate::logging::capture::clear();
+        let v = extract(&f, "/uploads/hp4data.rar", None, false, Some(PASSWORD)).await;
+        truncated_refusal(&v);
+        assert!(!v.unwrap_err().message.contains(PASSWORD));
+        for ev in crate::logging::capture::events() {
+            for value in ev.fields.values() {
+                assert!(!value.contains(PASSWORD), "event field leaked the password: {value}");
+            }
+        }
+        for sp in crate::logging::capture::spans() {
+            for value in sp.fields.values() {
+                assert!(!value.contains(PASSWORD), "span field leaked the password: {value}");
+            }
+        }
+        for a in f.state.safety.audit(OWNER, MOUNT) {
+            assert!(
+                !a.path.contains(PASSWORD) && !a.detail.contains(PASSWORD),
+                "audit line leaked the password: {a:?}"
+            );
+        }
+    });
+}

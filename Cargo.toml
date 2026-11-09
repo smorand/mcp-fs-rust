@@ -49,7 +49,7 @@ rustls-native-certs = "0.8"
 rustls = { version = "0.23", default-features = false }
 sha2 = "0.10"
 md-5 = "0.10"
-sha1 = "0.10"
+sha1 = { version = "0.10", features = ["compress"] }
 hex = "0.4"
 
 # ── identity ───────────────────────────────────────────────────────────────────

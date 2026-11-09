@@ -223,7 +223,7 @@ fn find_marker(bytes: &[u8]) -> Option<(bool, &[u8])> {
 /// is not the end of archive block. Bytes after the end block are ignored. Input UnRAR
 /// refuses itself, or that this walk cannot read (RAR 1.4), is left to it. With encrypted
 /// headers and no password, or an empty one, the walk stops after the leading part and the
-/// password questions are UnRAR's; RAR5 headers are decrypted with a given password.
+/// password questions are UnRAR's; headers are decrypted with a given password.
 /// Time O(n) over the blocks, space O(1), no copies.
 pub(super) fn ensure_rar_complete(bytes: &[u8], password: Option<&str>) -> Result<()> {
     match find_marker(bytes) {
@@ -231,16 +231,6 @@ pub(super) fn ensure_rar_complete(bytes: &[u8], password: Option<&str>) -> Resul
         Some((false, rest)) => walk_rar4(rest, password),
         Some((true, rest)) => walk_rar5(rest, password),
     }
-}
-
-/// True when a non empty password was given and no byte follows the leading part, so
-/// the first encrypted header is missing. Without a password, or with an empty one, the
-/// answer is UnRAR's (needed, or incorrect).
-fn encrypted_headers_cut(rest: &[u8], password: Option<&str>) -> Result<()> {
-    if password.is_some_and(|p| !p.is_empty()) && rest.is_empty() {
-        return Err(corrupt("rar", TRUNCATED));
-    }
-    Ok(())
 }
 
 /// Walk the RAR4 blocks after the marker. Header CRCs are not checked: UnRAR does.
@@ -259,19 +249,87 @@ fn walk_rar4(mut rest: &[u8], password: Option<&str>) -> Result<()> {
             return Ok(());
         }
         if kind == RAR4_MAIN && flags & RAR4_MAIN_PASSWORD != 0 {
-            return encrypted_headers_cut(rest, password);
+            return walk_rar4_encrypted(rest, password);
         }
-        let mut data = 0u64;
-        if flags & RAR4_LONG_BLOCK != 0 {
-            let low = header.get(7..11).ok_or_else(|| corrupt("rar", TRUNCATED))?;
-            data = u64::from(u32::from_le_bytes([low[0], low[1], low[2], low[3]]));
-            if flags & RAR4_LARGE != 0 && (kind == RAR4_FILE || kind == RAR4_SERVICE) {
-                let high = header.get(32..36).ok_or_else(|| corrupt("rar", TRUNCATED))?;
-                data |= u64::from(u32::from_le_bytes([high[0], high[1], high[2], high[3]])) << 32;
+        rest = skip_rar4_data(header, rest)?;
+    }
+}
+
+/// Skip the data a RAR4 block declares after its header: `ADD_SIZE` when the block is
+/// long, plus the high 32 bits of file and service blocks marked large.
+fn skip_rar4_data<'a>(header: &[u8], rest: &'a [u8]) -> Result<&'a [u8]> {
+    let (kind, flags) = (header[2], u16::from_le_bytes([header[3], header[4]]));
+    let mut data = 0u64;
+    if flags & RAR4_LONG_BLOCK != 0 {
+        let low = header.get(7..11).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        data = u64::from(u32::from_le_bytes([low[0], low[1], low[2], low[3]]));
+        if flags & RAR4_LARGE != 0 && (kind == RAR4_FILE || kind == RAR4_SERVICE) {
+            let high = header.get(32..36).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+            data |= u64::from(u32::from_le_bytes([high[0], high[1], high[2], high[3]])) << 32;
+        }
+    }
+    let data = usize::try_from(data).map_err(|_| corrupt("rar", TRUNCATED))?;
+    rest.get(data..).ok_or_else(|| corrupt("rar", TRUNCATED))
+}
+
+/// RAR4 salt before each encrypted header (`SIZE_SALT30`).
+const RAR4_SALT: usize = 8;
+
+/// Walk the RAR4 blocks after a main header that declares encrypted headers. Without a
+/// password, or with an empty one, the answer is UnRAR's (needed, or incorrect). With one,
+/// each block is an 8 byte salt then its header in whole AES 128 CBC blocks, then its
+/// data, which the walk skips without decrypting (RAR already padded it). Keys are derived once
+/// per distinct salt; RAR writes one salt for the whole archive, so a call pays one
+/// derivation. A header whose CRC16 fails after decryption, a wrong password as likely as
+/// damage since RAR4 has no check value, is left to UnRAR, so its answer stays today's
+/// (BL-0136). Time O(0x40000) SHA-1 rounds per salt plus O(n) over the header bytes;
+/// space O(largest header).
+fn walk_rar4_encrypted(mut rest: &[u8], password: Option<&str>) -> Result<()> {
+    use crate::tools::archive_rar_crypt::{aes128_cbc_decrypt, rar3_kdf};
+    let Some(password) = password.filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let truncated = || corrupt("rar", TRUNCATED);
+    let mut cached: Option<([u8; RAR4_SALT], [u8; 16], [u8; 16])> = None;
+    loop {
+        let salt: [u8; RAR4_SALT] =
+            rest.get(..RAR4_SALT).and_then(|s| s.try_into().ok()).ok_or_else(truncated)?;
+        rest = &rest[RAR4_SALT..];
+        let (key, iv) = match cached {
+            Some((s, key, iv)) if s == salt => (key, iv),
+            _ => {
+                let (key, iv) = rar3_kdf(password, &salt);
+                cached = Some((salt, key, iv));
+                (key, iv)
             }
+        };
+        // CBC decrypts one block from its IV alone, so the first block gives the header
+        // size before the rest of the header is touched.
+        let mut first = [0u8; AES_BLOCK];
+        first.copy_from_slice(rest.get(..AES_BLOCK).ok_or_else(truncated)?);
+        aes128_cbc_decrypt(&key, &iv, &mut first);
+        let size = usize::from(u16::from_le_bytes([first[5], first[6]]));
+        // At least one block, which is already known to be present.
+        let padded = size.div_ceil(AES_BLOCK).max(1) * AES_BLOCK;
+        let mut plain = rest.get(..padded).ok_or_else(truncated)?.to_vec();
+        rest = &rest[padded..];
+        aes128_cbc_decrypt(&key, &iv, &mut plain);
+        // CRC16 is the low half of the CRC32 of the header after its CRC field. A size
+        // below the base header cannot be a header, so it fails the same way.
+        let crc_matches = size >= RAR4_BASE_HEADER && {
+            let mut crc = flate2::Crc::new();
+            crc.update(&plain[2..size]);
+            crc.sum().to_le_bytes()[..2] == plain[..2]
+        };
+        if !crc_matches {
+            return Ok(());
         }
-        let data = usize::try_from(data).map_err(|_| corrupt("rar", TRUNCATED))?;
-        rest = rest.get(data..).ok_or_else(|| corrupt("rar", TRUNCATED))?;
+        let header = &plain[..size];
+        // As in the clear walk, the end block closes the archive before any data.
+        if header[2] == RAR4_END {
+            return Ok(());
+        }
+        rest = skip_rar4_data(header, rest)?;
     }
 }
 
@@ -1658,5 +1716,62 @@ mod tests {
         let mut crc = flate2::Crc::new();
         crc.update(&plain[4..5 + size]);
         assert_eq!(crc.sum().to_le_bytes(), plain[..4]);
+    }
+
+    /// Decrypts the first encrypted header of a RAR4 archive made with `-hp`: marker and
+    /// main header (20 bytes), then the 8 byte salt and the ciphertext of a 50 byte file
+    /// header (4 AES blocks). Checks the CRC16 and the name `a.txt`.
+    fn assert_rar3_key_decrypts_first_header(archive: &[u8], password: &str) {
+        use crate::tools::archive_rar_crypt::{aes128_cbc_decrypt, rar3_kdf};
+        assert_eq!(&archive[7..14], &[0xce, 0x99, 0x73, 0x80, 0x00, 0x0d, 0x00]);
+        let salt: [u8; 8] = archive[20..28].try_into().unwrap();
+        let (key, iv) = rar3_kdf(password, &salt);
+        let mut plain = archive[28..92].to_vec();
+        aes128_cbc_decrypt(&key, &iv, &mut plain);
+        assert_eq!(plain[2], 0x74, "a file header");
+        let size = usize::from(u16::from_le_bytes([plain[5], plain[6]]));
+        assert_eq!(size, 50);
+        let mut crc = flate2::Crc::new();
+        crc.update(&plain[2..size]);
+        assert_eq!(crc.sum().to_le_bytes()[..2], plain[..2]);
+        assert_eq!(&plain[32..37], b"a.txt");
+    }
+
+    /// Pins `rar3_kdf` on `hp4.rar` (RAR 6.24): its password is too short for UnRAR's
+    /// schedule write back, so this is the plain RAR 3 derivation.
+    #[test]
+    fn rar3_key_decrypts_the_first_header_of_hp4() {
+        let hp4: &[u8] = include_bytes!("../../tests/fixtures/rar/hp4.rar");
+        assert_eq!(&hp4[20..28], &[0xf3, 0x68, 0x27, 0x2b, 0x78, 0xec, 0xe5, 0x69]);
+        assert_rar3_key_decrypts_first_header(hp4, "s3cret-Ünï");
+    }
+
+    /// A RAR4 header that fails its CRC once decrypted is UnRAR's to answer, and so is an
+    /// archive read with no password or an empty one: the 108 byte cut of `hp4.rar`,
+    /// refused with the right password, passes the walk in each case. Flipping a byte of
+    /// the second AES block of the first header garbles it without touching its size.
+    #[test]
+    fn rar4_encrypted_headers_left_to_the_library() {
+        let hp4: &[u8] = include_bytes!("../../tests/fixtures/rar/hp4.rar");
+        let cut = &hp4[..108];
+        let e = super::ensure_rar_complete(cut, Some("s3cret-Ünï")).unwrap_err();
+        assert_eq!(
+            e.message,
+            "archive is corrupt or not a valid rar file: unexpected end of archive"
+        );
+        let mut garbled = cut.to_vec();
+        garbled[50] ^= 1;
+        super::ensure_rar_complete(&garbled, Some("s3cret-Ünï")).unwrap();
+        super::ensure_rar_complete(cut, None).unwrap();
+        super::ensure_rar_complete(cut, Some("")).unwrap();
+    }
+
+    /// Pins the write back of `sha1_process_rar29` on `hp4long.rar` (RAR 6.24): 80 bytes
+    /// of UTF-16 password plus 8 of salt span a whole block read straight from the
+    /// password buffer, so a plain SHA-1 derivation gives another key here.
+    #[test]
+    fn rar3_key_with_a_long_password_decrypts_hp4long() {
+        let hp4long: &[u8] = include_bytes!("../../tests/fixtures/rar/hp4long.rar");
+        assert_rar3_key_decrypts_first_header(hp4long, "CorrectHorseBatteryStapleÜnï0123456789ab");
     }
 }

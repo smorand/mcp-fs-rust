@@ -201,6 +201,6 @@
 | US-0199 | SPEC-0087 | complete RAR archives unchanged, folders and solid cuts refused | US-0198 | 2 | landed | story/US-0199-complete-rar-archives-unchanged-folders | story/US-0198-refuse-a-cut-rar4-archive-with-one-messa |
 | US-0200 | SPEC-0087 | every block kind counts: stored data, recovery record, comment | US-0199 | 2 | landed | story/US-0200-every-block-kind-counts-stored-data-reco | story/US-0199-complete-rar-archives-unchanged-folders |
 | US-0201 | SPEC-0087 | decrypt RAR5 headers to see a cut with the right password | US-0200 | 1 | landed | story/US-0201-decrypt-rar5-headers-to-see-a-cut-with-t | story/US-0200-every-block-kind-counts-stored-data-reco |
-| US-0202 | SPEC-0087 | decrypt RAR4 headers to see a cut with the right password | US-0201 | 1 | todo | | |
+| US-0202 | SPEC-0087 | decrypt RAR4 headers to see a cut with the right password | US-0201 | 1 | landed | story/US-0202-decrypt-rar4-headers-to-see-a-cut-with-t | story/US-0201-decrypt-rar5-headers-to-see-a-cut-with-t |
 | US-0203 | SPEC-0087 | password questions first, every cut of an encrypted names archive | US-0202 | 2 | todo | | |
 | US-0204 | SPEC-0087 | cut RAR archives through the HTTP door and documentation | US-0203 | 2 | todo | | |
