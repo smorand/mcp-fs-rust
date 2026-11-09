@@ -220,7 +220,7 @@ pub(crate) async fn extract_archive(
             )
             .await?
         }
-        ArchiveFormat::Zip | ArchiveFormat::SevenZ => {
+        format if lists_first(format) => {
             decode_listed(
                 state,
                 &client,
@@ -235,12 +235,9 @@ pub(crate) async fn extract_archive(
         }
         _ => {
             let bytes = client.read_bytes(&normalized).await?;
-            let owned_password = password.map(ToOwned::to_owned);
-            tokio::task::spawn_blocking(move || {
-                decode_archive(format, &bytes, owned_password.as_deref())
-            })
-            .await
-            .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??
+            tokio::task::spawn_blocking(move || decode_archive(format, &bytes))
+                .await
+                .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??
         }
     };
 
@@ -367,7 +364,7 @@ fn planned_destination(
     }
 }
 
-/// A zip or 7z goes list, then [`quota::check_declared`], then decode, each
+/// A zip, 7z or RAR goes list, then [`quota::check_declared`], then decode, each
 /// blocking step off the async worker (SPEC-0085 DEC-001): the declared sizes
 /// are checked against the storage and session limits before one entry is
 /// decoded, so a bomb costs a header read. Nothing is written, charged or
@@ -391,8 +388,13 @@ async fn decode_listed(
 
     let (list_bytes, list_password) = (bytes.clone(), owned_password.clone());
     let listing = tokio::task::spawn_blocking(move || match format {
-        ArchiveFormat::Zip => list_zip(&list_bytes, list_password.as_deref()),
-        _ => list_sevenz(&list_bytes, list_password.as_deref()),
+        ArchiveFormat::Zip => list_zip(&list_bytes, list_password.as_deref()).map(Listed::Zip),
+        #[cfg(feature = "rar")]
+        ArchiveFormat::Rar => {
+            crate::tools::archive_rar::list_rar(&list_bytes, list_password.as_deref())
+                .map(Listed::Rar)
+        }
+        _ => list_sevenz(&list_bytes, list_password.as_deref()).map(Listed::SevenZ),
     })
     .await
     .map_err(|e| ToolError::internal(format!("archive listing task panicked: {e}")))??;
@@ -401,7 +403,7 @@ async fn decode_listed(
     // so that the last occurrence of a repeated path still wins.
     let base = planned.as_deref().unwrap_or("/");
     let files: Vec<(String, u64)> = listing
-        .entries
+        .entries()
         .iter()
         .filter(|e| !e.is_dir)
         .map(|e| (join_entry_destination(base, &e.rel_path), e.declared))
@@ -411,11 +413,12 @@ async fn decode_listed(
 
     let (decoded, _held) = tokio::task::spawn_blocking(move || {
         let mut held = 0u64;
-        let decoded = match format {
-            ArchiveFormat::Zip => {
-                decode_zip_listed(&bytes, owned_password.as_deref(), &listing, &mut held)
-            }
-            _ => decode_sevenz_listed(&bytes, owned_password.as_deref(), &mut held),
+        let password = owned_password.as_deref();
+        let decoded = match &listing {
+            Listed::Zip(l) => decode_zip_listed(&bytes, password, l, &mut held),
+            Listed::SevenZ(_) => decode_sevenz_listed(&bytes, password, &mut held),
+            #[cfg(feature = "rar")]
+            Listed::Rar(l) => crate::tools::archive_rar::decode_rar_listed(l, password, &mut held),
         };
         (decoded, held)
     })
@@ -579,12 +582,7 @@ fn join_entry_destination(dest: &str, rel_path: &str) -> String {
 /// `ZipFile::encrypted` (`zip-9.0.5/src/read/zipfile.rs:167`); only decoding an
 /// encrypted entry's bytes needs the password. `FR-NEW-009` holds as
 /// written; no new requirement was needed.
-#[cfg_attr(not(feature = "rar"), allow(unused_variables))]
-fn decode_archive(
-    format: ArchiveFormat,
-    bytes: &[u8],
-    password: Option<&str>,
-) -> Result<Vec<DecodedEntry>> {
+fn decode_archive(format: ArchiveFormat, bytes: &[u8]) -> Result<Vec<DecodedEntry>> {
     match format {
         ArchiveFormat::Zip | ArchiveFormat::SevenZ => Err(ToolError::internal(
             "a zip or 7z archive is listed, checked and then decoded, not decoded by decode_archive",
@@ -594,7 +592,9 @@ fn decode_archive(
             "a compressed tar is decoded under its bound, not by decode_archive",
         )),
         #[cfg(feature = "rar")]
-        ArchiveFormat::Rar => crate::tools::archive_rar::decode_rar(bytes, password),
+        ArchiveFormat::Rar => Err(ToolError::internal(
+            "a rar archive is listed, checked and then decoded, not decoded by decode_archive",
+        )),
         ArchiveFormat::Single(_) => Err(ToolError::internal(
             "a single file format is extracted by archive_single, not decode_archive",
         )),
@@ -693,10 +693,37 @@ struct Listing {
     entries: Vec<ListedEntry>,
 }
 
-struct ListedEntry {
-    rel_path: String,
-    is_dir: bool,
-    declared: u64,
+pub(crate) struct ListedEntry {
+    pub(crate) rel_path: String,
+    pub(crate) is_dir: bool,
+    pub(crate) declared: u64,
+}
+
+/// A zip, a 7z or (with the `rar` feature) a RAR goes list, check, decode.
+fn lists_first(format: ArchiveFormat) -> bool {
+    #[cfg(feature = "rar")]
+    if matches!(format, ArchiveFormat::Rar) {
+        return true;
+    }
+    matches!(format, ArchiveFormat::Zip | ArchiveFormat::SevenZ)
+}
+
+/// What a listing step returns, per format.
+enum Listed {
+    Zip(Listing),
+    SevenZ(Listing),
+    #[cfg(feature = "rar")]
+    Rar(crate::tools::archive_rar::RarListing),
+}
+
+impl Listed {
+    fn entries(&self) -> &[ListedEntry] {
+        match self {
+            Listed::Zip(l) | Listed::SevenZ(l) => &l.entries,
+            #[cfg(feature = "rar")]
+            Listed::Rar(l) => &l.entries,
+        }
+    }
 }
 
 /// `zip`: list every entry without a password (DRIFT-001), applying every header

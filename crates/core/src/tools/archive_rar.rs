@@ -4,18 +4,29 @@
 
 use crate::errors::{Result, ToolError};
 use crate::tools::archive::{
-    DecodedEntry, corrupt, ensure_entry_path_safe, password_required_message,
+    DecodedEntry, ListedEntry, corrupt, ensure_entry_path_safe, password_required_message,
 };
 
 /// Name the archive gets inside its per call temp dir; the extension is what the
 /// UnRAR library expects, the name itself never reaches the caller.
 const TEMP_NAME: &str = "archive.rar";
 
-/// Decode every entry of a RAR archive held in `bytes`, in archive order. Blocking:
-/// the caller runs it inside `spawn_blocking`. Time is linear in the archive plus the
-/// unpacked size; memory is the archive on disk once plus every decoded entry in memory,
-/// as for zip and 7z, because the admission runs after the decode (BL-0125).
-pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<DecodedEntry>> {
+/// A RAR archive written to its private temp dir and listed: the entries as the
+/// headers declare them, every header refusal already applied (SPEC-0085 DEC-007).
+/// The temp dir is removed when this drops, after decoding or on any refusal.
+pub(crate) struct RarListing {
+    /// Held for its `Drop`: UnRAR opens a path only (SPEC-0080 DEC-003), so the
+    /// file is written once and read by both passes.
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    pub(crate) entries: Vec<ListedEntry>,
+}
+
+/// List a RAR archive held in `bytes` without decoding one entry, applying the
+/// header refusals in SPEC-0080 FR-NEW-015 order (completeness, entry rules, then a
+/// missing password). Blocking: the caller runs it inside `spawn_blocking`.
+/// Time O(n) over the archive bytes written and the n headers, space O(n).
+pub(crate) fn list_rar(bytes: &[u8], password: Option<&str>) -> Result<RarListing> {
     // UnRAR reads a truncated archive as a shorter one or as a CRC error, neither of
     // which says corrupt (FR-NEW-011), so the block layout is checked first.
     ensure_rar5_complete(bytes)?;
@@ -33,18 +44,36 @@ pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<Dec
     // password, so the password codes here mean "ask for it", not "corrupt" (FR-NEW-004).
     let list_err = |e: unrar::error::UnrarError| listing_error(e, password);
     let mut any_encrypted = false;
+    let mut entries = Vec::new();
     for header in open(&path, password).open_for_listing().map_err(list_err)? {
         let header = header.map_err(list_err)?;
         ensure_entry_allowed(&header)?;
         any_encrypted |= header.is_encrypted();
+        entries.push(ListedEntry {
+            rel_path: entry_name(&header),
+            is_dir: header.is_directory(),
+            declared: header.unpacked_size,
+        });
     }
     // Decided before one byte is read, and after the entry rules (FR-NEW-015 item 7
     // after 6), so a plain entry is never written next to an encrypted one (FR-NEW-002).
     if any_encrypted && password.is_none() {
         return Err(password_required_message(None));
     }
+    Ok(RarListing { _dir: dir, path, entries })
+}
 
-    let mut cursor = open(&path, password).open_for_processing().map_err(|e| corrupt("rar", e))?;
+/// Decode every entry of a listed RAR archive, in archive order. Blocking. `held`
+/// receives the running total of decoded entry bytes, also when decoding fails
+/// (SPEC-0085 DEC-004). Time O(unpacked size), space O(same): the admission ran
+/// on the declared sizes, so a size lie is stopped by UnRAR's own CRC check.
+pub(crate) fn decode_rar_listed(
+    listing: &RarListing,
+    password: Option<&str>,
+    held: &mut u64,
+) -> Result<Vec<DecodedEntry>> {
+    let path = &listing.path;
+    let mut cursor = open(path, password).open_for_processing().map_err(|e| corrupt("rar", e))?;
     let mut entries = Vec::new();
     // Entries are read in archive order, because a solid archive can only be
     // decoded front to back.
@@ -83,6 +112,7 @@ pub(crate) fn decode_rar(bytes: &[u8], password: Option<&str>) -> Result<Vec<Dec
         if data.len() as u64 != declared_size {
             return Err(oversized(&rel_path, declared_size));
         }
+        *held += data.len() as u64;
         entries.push(DecodedEntry { rel_path, is_dir: false, declared_size, bytes: data });
         cursor = next;
     }
@@ -281,7 +311,7 @@ mod tests {
     /// Bytes that are not a RAR archive surface as the shared corrupt message.
     #[test]
     fn garbage_is_a_corrupt_rar() {
-        let e = super::decode_rar(b"not a rar archive", None).unwrap_err();
+        let e = super::list_rar(b"not a rar archive", None).err().expect("a refusal");
         assert_eq!(e.code, crate::errors::code::INVALID_ARGUMENT);
         assert!(
             e.message.starts_with("archive is corrupt or not a valid rar file:"),
@@ -1332,13 +1362,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_0080_068_collision_wins_over_the_storage_limi() {
+    async fn e2e_0085_mod_001_the_storage_limit_wins_over_a_collis() {
         let f = fixture().await;
         seed(&f, "/uploads/report.rar", &report()).await;
         seed(&f, "/uploads/report/data/a.txt", b"old").await;
         limit_remaining(&f, 5).await;
         let e = extract(&f, "/uploads/report.rar").await.unwrap_err();
-        assert_eq!(e.code, crate::errors::code::NO_CLOBBER, "{e:?}");
+        assert_eq!(e.code, crate::errors::code::PROJECT_QUOTA_EXCEEDED, "{e:?}");
+        assert!(e.message.ends_with("9 bytes requested"), "{}", e.message);
         assert_eq!(read(&f, "/uploads/report/data/a.txt").await, b"old");
         assert_eq!(remaining_storage(&f).await, 5);
     }

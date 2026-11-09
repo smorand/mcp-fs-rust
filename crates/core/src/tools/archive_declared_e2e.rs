@@ -552,3 +552,174 @@ async fn e2e_0085_043_explicit_destination_holding_the_fil() {
 
     assert_eq!(remaining_storage(&f).await, 100_000);
 }
+
+/// RAR tests sit in a module whose path contains `archive_rar`, the filter
+/// `test.sh` uses for the feature run (SPEC-0085 DEC-011).
+#[cfg(feature = "rar")]
+mod archive_rar {
+    use super::*;
+    use crate::tools::archive_rar_fixtures::{RarEntry, rar5_store};
+
+    /// A folder `data`, `data/a.txt` (`hello`) and `data/b.txt` (`goodbye`): 12 bytes declared.
+    fn report() -> Vec<u8> {
+        rar5_store(&[
+            RarEntry::dir("data"),
+            RarEntry::file("data/a.txt", b"hello"),
+            RarEntry::file("data/b.txt", b"goodbye"),
+        ])
+    }
+
+    /// `zeros.bin`, 10 000 000 zero bytes, stored (RAR here has no compressor).
+    fn bomb_entry() -> RarEntry {
+        RarEntry::file("zeros.bin", &vec![0u8; 10_000_000])
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_002_7z_and_rar_within_the_limits_upper_c() {
+        let f = fixture().await;
+        let c = f.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/u1", true).await.unwrap();
+        c.makedirs("/u2", true).await.unwrap();
+        let sevenz = crate::tools::archive::tests::build_sevenz_ext(
+            &[("a.txt", b"hello".as_slice(), None)],
+            None,
+            true,
+        );
+        seed(&f, "/u1/PACK.7Z", &sevenz).await;
+        seed(&f, "/u2/pack.RAR", &rar5_store(&[RarEntry::file("a.txt", b"hello")])).await;
+
+        let a = extract(&f, "/u1/PACK.7Z", None, false, None).await.unwrap();
+        let b = extract(&f, "/u2/pack.RAR", None, false, None).await.unwrap();
+
+        for v in [&a, &b] {
+            assert_eq!(v["files_written"], 1, "{v}");
+            assert_eq!(v["bytes_written"], 5, "{v}");
+        }
+        assert_eq!(read(&f, "/u1/PACK/a.txt").await.unwrap(), b"hello");
+        assert_eq!(read(&f, "/u2/pack/a.txt").await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_004_declared_total_equal_to_the_session() {
+        let f = fixture_allowance(12).await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+
+        let v = extract(&f, "/uploads/report.rar", None, false, None).await.unwrap();
+
+        assert_eq!(v["files_written"], 2, "{v}");
+        assert_eq!(v["bytes_written"], 12, "{v}");
+        session_refusal(&write(&f, "/uploads/one.bin", 1).await, 12);
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_008_rar_bomb_against_the_storage_limit() {
+        let f = fixture().await;
+        seed(&f, "/uploads/bomb.rar", &rar5_store(&[bomb_entry()])).await;
+        limit_whole_mb_remaining(&f, 1_000).await;
+        held_reset();
+
+        let v = extract(&f, "/uploads/bomb.rar", None, false, None).await;
+
+        project_refusal(&v);
+        assert_eq!(held(), 0);
+        assert!(!exists(&f, "/uploads/bomb").await);
+        assert_eq!(remaining_storage(&f).await, 1_000);
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_013_repeated_entry_names_net_for_storage() {
+        let f = fixture_allowance(1_000).await;
+        let dup = rar5_store(&[
+            RarEntry::file("a.txt", &vec![b'x'; 600]),
+            RarEntry::file("a.txt", &vec![b'y'; 600]),
+        ]);
+        seed(&f, "/uploads/dup.rar", &dup).await;
+        limit_remaining(&f, 1_000).await;
+        held_reset();
+
+        let v = extract(&f, "/uploads/dup.rar", None, false, None).await;
+
+        session_refusal(&v, 1_000);
+        assert_eq!(held(), 0);
+        assert!(!exists(&f, "/uploads/dup").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_020_rar_entry_holding_more_than_it_decla() {
+        let f = fixture().await;
+        let liar = rar5_store(&[RarEntry::declaring("big.bin", 10, &vec![7u8; 1_000_000])]);
+        seed(&f, "/uploads/liar.rar", &liar).await;
+        held_reset();
+
+        let v = extract(&f, "/uploads/liar.rar", None, false, None).await;
+
+        let e = v.expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+        assert_eq!(
+            e.message,
+            "archive entry 'big.bin' decompressed to more bytes than declared 10"
+        );
+        held_at_most(65_546);
+        assert!(!exists(&f, "/uploads/liar").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_022_rar_entry_declared_0_holding_data() {
+        let f = fixture().await;
+        let zero = rar5_store(&[RarEntry::declaring("a.txt", 0, b"hello")]);
+        seed(&f, "/uploads/zero.rar", &zero).await;
+
+        let v = extract(&f, "/uploads/zero.rar", None, false, None).await;
+
+        let e = v.expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+        assert_eq!(e.message, "archive entry 'a.txt' decompressed to more bytes than declared 0");
+        assert!(!exists(&f, "/uploads/zero").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_028_the_limit_wins_over_a_refused_destin() {
+        let f = fixture().await;
+        seed(&f, "/uploads/bomb.rar", &rar5_store(&[bomb_entry()])).await;
+        limit_whole_mb_remaining(&f, 1_000).await;
+
+        let v = extract(&f, "/uploads/bomb.rar", Some("../../x"), false, None).await;
+
+        project_refusal(&v);
+        assert!(!exists(&f, "/x").await);
+        assert!(!exists(&f, "/uploads/bomb").await);
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_030_a_rar_escaping_name_wins_over_the_li() {
+        let f = fixture().await;
+        let escaping = rar5_store(&[bomb_entry(), RarEntry::file("../../etc/passwd", b"x")]);
+        seed(&f, "/uploads/bomb.rar", &escaping).await;
+        limit_whole_mb_remaining(&f, 1_000).await;
+
+        let v = extract(&f, "/uploads/bomb.rar", None, false, None).await;
+
+        let e = v.expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::PATH_OUT_OF_BOUNDS, "{e:?}");
+        assert_eq!(e.message, "archive entry path escapes the destination: '../../etc/passwd'");
+    }
+
+    #[tokio::test]
+    async fn e2e_0085_036_a_collision_still_wins_when_the_net() {
+        let f = fixture().await;
+        seed(&f, "/uploads/report.rar", &report()).await;
+        seed(&f, "/uploads/report/data/a.txt", b"old").await;
+        limit_remaining(&f, 9).await;
+
+        let v = extract(&f, "/uploads/report.rar", None, false, None).await;
+
+        let e = v.expect_err("the extraction must be refused");
+        assert_eq!(e.code, code::NO_CLOBBER, "{e:?}");
+        assert_eq!(
+            e.message,
+            "'/uploads/report/data' already exists; pass overwrite=true to replace it"
+        );
+        assert_eq!(read(&f, "/uploads/report/data/a.txt").await.unwrap(), b"old");
+        assert_eq!(remaining_storage(&f).await, 9);
+    }
+}
