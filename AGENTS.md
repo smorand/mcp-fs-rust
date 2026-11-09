@@ -132,9 +132,10 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `fs.export_zip` (SPEC-0012), also served by `POST /api/fs/{mount_id}/export-zip`: zip a
   selection into blob key `export:{token}` plus an `export_links` row, return the URL.
   `archive.rs` holds `fs.extract_archive` (SPEC-0015), also served by `POST
-  /api/fs/{mount_id}/extract-archive`: format by extension, one fully buffered pre scan (entry
-  type, zip slip, collisions, one quota charge, decoded size) before any write, stateless
-  password retry via `ERR_PASSWORD_REQUIRED`. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
+  /api/fs/{mount_id}/extract-archive`: format by extension; zip, 7z and RAR go list (headers
+  only), check (declared total and declared net growth against the two limits, checked
+  arithmetic, nothing decoded, SPEC-0085), decode (each entry capped at its declared size), then
+  collisions, one quota charge and the writes; stateless password retry via `ERR_PASSWORD_REQUIRED`. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
   under a bound (SPEC-0084): the lower of the project side (remaining storage plus the bytes stored under
   the destination) and the session write allowance, plus `TAR_FRAMING` (1 048 576 bytes); a plain `.tar`
   is unbounded. `archive_single.rs` holds the single file flow for a

@@ -184,13 +184,13 @@ on a build without the feature) is `ERR_NOT_SUPPORTED`. Default destination: the
 path minus its suffix. Stateless password retry: an encrypted zip or 7z with no
 or a wrong `password` is `ERR_PASSWORD_REQUIRED` (HTTP 428), the caller just
 retries with it; a password on a tar family archive is `ERR_INVALID_ARGUMENT`.
-All or nothing: one pre scan decodes everything in memory and rejects the whole
+All or nothing: one pre scan rejects the whole
 call, before any write, on a symlink/hardlink/device entry (`ERR_NOT_SUPPORTED`),
 an entry escaping the destination (`ERR_PATH_OUT_OF_BOUNDS`), a collision with
 `overwrite=false` (`ERR_NO_CLOBBER`, first collision in archive order), a
-decoded size above the declared one (`ERR_INVALID_ARGUMENT`), or the declared
-total over the write quota (`ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
-untouched on failure). The password is never logged. REST twin: `POST
+decoded size above the declared one (`ERR_INVALID_ARGUMENT`), or a declared size
+over a limit (`ERR_PROJECT_QUOTA_EXCEEDED`, `ERR_WRITE_QUOTA_EXCEEDED`, charged once, counter
+untouched on failure; for zip, 7z and RAR the limits are checked before decoding, see SPEC-0085). The password is never logged. REST twin: `POST
 /api/fs/{mount_id}/extract-archive`.
 
 (2026-11-08, SPEC-0080.) `.rar` (RAR 4 and RAR 5, case insensitive, cargo feature `rar`, decoder
@@ -208,14 +208,16 @@ untouched on failure). The password is never logged. REST twin: `POST
   the entry; a truncated archive is `ERR_INVALID_ARGUMENT` `archive is corrupt or not a valid rar
   file: ...`. Truncation is detected for RAR 5 only (block walk in `ensure_rar5_complete`, BL-0131);
   a truncated RAR 4 file is left to the reader.
-- Solid archives are decoded front to back. The archive is decoded fully in memory before the
-  admission, like zip and 7z (BL-0125).
-- Order of refusals (FR-NEW-015): membership, missing path or folder, multi volume name, encrypted
-  names with a missing or wrong password, corrupt, the first link or escaping name in archive
-  order, encrypted data with a missing or wrong password, oversized entry, a `destination` outside
+- Solid archives are decoded front to back. Since SPEC-0085 the declared sizes are admitted before
+  anything is decoded (see the SPEC-0085 paragraph).
+- Order of refusals (FR-NEW-015, reordered by SPEC-0085): membership, missing path or folder, multi
+  volume name, encrypted names with a missing or wrong password, corrupt, the first link or escaping
+  name in archive order, encrypted data with a missing or wrong password, project storage limit,
+  session write allowance (both on declared sizes), oversized entry, a `destination` outside
   the project (`ERR_PATH_OUT_OF_BOUNDS`, `path escapes the volume root: <destination>`, a relative
-  `../../x` is refused for `.rar`, the other formats clamp it), collision, project storage limit,
-  session write allowance. The tests that pin each pair are `e2e_0080_047` to `e2e_0080_081`.
+  `../../x` is refused for `.rar`, the other formats clamp it), collision, then the two limits again
+  at the moment of writing. The tests that pin each pair are `e2e_0080_047` to `e2e_0080_081`,
+  except the storage limit versus collision pair, now `e2e_0085_mod_001` (was `e2e_0080_068`).
 
 (2026-11-05, SPEC-0081.) A bare gzip file (suffix `.gz` that is not `.tar.gz`, flow in
 `tools/archive_single.rs`) holds one file. Output name: the archive file name minus
@@ -264,6 +266,43 @@ charged. Order of refusals: membership, missing path, folder, password, corrupt 
 project, collision, project storage limit, session write allowance; the two limits are still
 checked on the files' sizes. A plain `.tar` is not decoded under this bound. `.tbz2` and every other
 extension stay `ERR_NOT_SUPPORTED`. The HTTP twin answers and audits the same.
+
+(2026-11-09, SPEC-0085.) `.zip`, `.7z` and `.rar` admit their declared sizes before any entry is
+decoded. Three steps in `tools/archive.rs` (`tools/archive_rar.rs` for RAR): a listing in
+`spawn_blocking` that reads headers only and applies the header refusals; `quota::check_declared`,
+which charges nothing and holds no lock across decoding; then the decode, each entry read through
+the capped reader at its declared size. `check_declared` sums the declared sizes in `u128`/`i128`:
+the declared total goes against the session write allowance, the declared net growth (last
+occurrence per target path, minus the size of the file already stored there, whatever `overwrite`
+says) goes against the remaining project storage. Same two refusals and messages as before, project
+first, session second; equality is accepted; a size, total or growth above `i64::MAX` counts as too
+large. Order of refusals per format, first one wins:
+- zip: membership, missing path, folder, unreadable archive, per entry in archive order a link, an
+  escaping name or a duplicate name, missing password, local header disagreeing with the
+  directory, project limit, session limit, then what decoding finds (wrong password, damaged data,
+  entry past its declared size), destination outside the project, collision, final admission.
+- 7z: membership, missing path, folder, encrypted or unreadable header, missing password, per entry
+  an escaping name then a link or special type (moved from the decode to the listing, so a hostile
+  entry is no longer hidden behind an earlier entry's wrong password), then the same as zip from the
+  project limit on.
+- RAR: membership, missing path, folder, multi volume name, SPEC-0080 items 4 to 6, missing
+  password, then the same as zip from the project limit on.
+Every entry is read through `read_capped` at its declared size (RAR keeps UnRAR's own stop and the
+length check), so a lying header, including a zip64 or 7z one, stops at the declared size plus at
+most one 64 KiB chunk and the call is `ERR_INVALID_ARGUMENT`
+`archive entry '<name>' decompressed to more bytes than declared <n>`. A refused archive holds 0
+decoded bytes (the `LAST_HIGH_WATER` hook). The final `admit_paths` still runs under the admission
+lock, so a concurrent write is caught. Plain `.tar`, compressed tar and bare `.gz`/`.bz2`/`.xz` are
+unchanged; the HTTP twin answers and audits the same.
+
+Security note (2026-11-09, SPEC-0085): the signed cast bypass. The declared size of an entry was
+cast `as i64`, so a declared size of 2^63 or more counted as a negative number, lowered the sums
+(the project admission, the session counter in `safety.rs`) and passed both limits; the archive
+then decoded in memory with no bound. Fixed: sizes convert with `i64::try_from(..).unwrap_or(i64::MAX)`,
+the sums saturate (`admit_paths`, `check_and_charge`, `charge_write`, which never charges a negative
+number), and the early check computes in `u128`/`i128`. The exploit tests are `e2e_0085_sec_001` to
+`e2e_0085_sec_005`. Known remaining gap: text extraction of Office documents (`.docx`, `.xlsx`,
+`.pptx`, `docs/extract.rs`) still decodes each part whole with no bound, BL-0134.
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,

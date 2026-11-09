@@ -952,6 +952,37 @@ fn list_sevenz(bytes: &[u8], password: Option<&str>) -> Result<Listing> {
 /// Decode every entry of a 7z that [`list_sevenz`] accepted. `held` receives the
 /// running total of decoded entry bytes, also when the decoding fails
 /// (SPEC-0085 DEC-004). Time O(total decoded bytes), space O(same).
+/// Why one 7z entry read stopped: a size lie (carried as the final refusal) or
+/// a decoder failure (left to the corrupt/password fallback).
+enum SevenzEntryFailure {
+    Size(ToolError),
+    Io(std::io::Error),
+}
+
+/// Read one 7z entry, never holding more than `declared` bytes (SPEC-0085
+/// DEC-005); `held` receives the bytes kept, also when the read fails.
+/// Time O(n) in the bytes read, space O(min(n, declared)) plus one chunk.
+fn read_sevenz_entry(
+    read: &mut (impl Read + ?Sized),
+    rel_path: &str,
+    declared: u64,
+    held: &mut u64,
+) -> std::result::Result<Vec<u8>, SevenzEntryFailure> {
+    match archive_single::read_capped(read, declared) {
+        Ok(decoded) => {
+            *held += decoded.high_water;
+            Ok(decoded.bytes)
+        }
+        Err(archive_single::ReadError::CapExceeded { high_water }) => {
+            *held += high_water;
+            Err(SevenzEntryFailure::Size(declared_size_exceeded(rel_path, declared)))
+        }
+        Err(archive_single::ReadError::Io(e) | archive_single::ReadError::Init(e)) => {
+            Err(SevenzEntryFailure::Io(e))
+        }
+    }
+}
+
 fn decode_sevenz_listed(
     bytes: &[u8],
     password: Option<&str>,
@@ -980,19 +1011,13 @@ fn decode_sevenz_listed(
             });
             return Ok(true);
         }
-        let buf = match archive_single::read_capped(read, declared) {
-            Ok(decoded) => {
-                *held += decoded.high_water;
-                decoded.bytes
-            }
-            Err(archive_single::ReadError::CapExceeded { high_water }) => {
-                *held += high_water;
-                entry_error = Some(declared_size_exceeded(&rel_path, declared));
+        let buf = match read_sevenz_entry(read, &rel_path, declared, held) {
+            Ok(bytes) => bytes,
+            Err(SevenzEntryFailure::Size(e)) => {
+                entry_error = Some(e);
                 return Err(sevenz_rust2::Error::Other("decoded size mismatch".into()));
             }
-            Err(archive_single::ReadError::Io(e) | archive_single::ReadError::Init(e)) => {
-                return Err(e.into());
-            }
+            Err(SevenzEntryFailure::Io(e)) => return Err(e.into()),
         };
         entries.push(DecodedEntry { rel_path, is_dir: false, declared_size: declared, bytes: buf });
         Ok(true)
@@ -1143,6 +1168,30 @@ pub(crate) mod tests {
         assert!(held <= 10, "held {held}");
         let mut exact = Cursor::new(vec![7u8; 10]);
         let ok = read_zip_entry(&mut exact, "big.bin", 10, &mut held).unwrap();
+        assert_eq!(ok, vec![7u8; 10]);
+    }
+
+    /// The 7z leg of the same bound: a reader that ignores the declared size
+    /// still cannot make the entry hold more than the cap (SPEC-0085 DEC-005).
+    #[test]
+    fn read_sevenz_entry_caps_a_reader_that_ignores_the_declared_size() {
+        let mut held = 0u64;
+        let mut reader = Cursor::new(vec![7u8; 1_000_000]);
+        let Err(SevenzEntryFailure::Size(e)) =
+            read_sevenz_entry(&mut reader, "big.bin", 10, &mut held)
+        else {
+            panic!("expected the size refusal");
+        };
+        assert_eq!(e.code, code::INVALID_ARGUMENT);
+        assert_eq!(
+            e.message,
+            "archive entry 'big.bin' decompressed to more bytes than declared 10"
+        );
+        assert!(held <= 10, "held {held}");
+        let mut exact = Cursor::new(vec![7u8; 10]);
+        let Ok(ok) = read_sevenz_entry(&mut exact, "big.bin", 10, &mut held) else {
+            panic!("an exact entry must be read");
+        };
         assert_eq!(ok, vec![7u8; 10]);
     }
 

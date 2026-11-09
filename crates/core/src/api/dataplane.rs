@@ -3729,6 +3729,43 @@ mod tests {
         assert_eq!(lines[0].detail, "destination=/uploads/pack files_written=1 bytes_written=5");
     }
 
+    /// SPEC-0085 E2E-005: the REST door answers what the engine answers for a zip
+    /// within the limits (E2E-001), and the session audit holds exactly one
+    /// extraction line.
+    #[tokio::test]
+    async fn e2e_0085_005_http_api_and_audit_line_unchanged() {
+        use crate::tools::archive::tests::build_zip;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.write_bytes_atomic("/uploads/pack.zip", &build_zip(&[("a.txt", b"hello")], None))
+            .await
+            .unwrap();
+        // The situation of E2E-001: a 1 MB limit with exactly 1 000 bytes left.
+        let used = crate::quota::used_bytes(&c).await.unwrap();
+        c.write_bytes_atomic("/filler.bin", &vec![b'f'; (1_048_576 - 1_000 - used) as usize])
+            .await
+            .unwrap();
+        h.state.admin.set_quota(MOUNT, Some(1_048_576)).await.unwrap();
+        let body = json!({"path": "/uploads/pack.zip"});
+        let (s, v) = h.post(&u("extract-archive"), body).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"destination": "/uploads/pack", "files_written": 1,
+                   "dirs_created": 1, "bytes_written": 5})
+        );
+        assert_eq!(c.read_bytes("/uploads/pack/a.txt").await.unwrap(), b"hello");
+        let lines: Vec<_> = h
+            .state
+            .safety
+            .audit(OWNER, MOUNT)
+            .into_iter()
+            .filter(|e| e.op == "extract_archive" && e.path == "/uploads/pack.zip")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].detail, "destination=/uploads/pack files_written=1 bytes_written=5");
+    }
+
     #[tokio::test]
     async fn e2e_0082_046_password_through_the_http_api() {
         let h = Harness::new().await;

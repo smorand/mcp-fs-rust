@@ -192,7 +192,7 @@
 | US-0190 | SPEC-0085 | net growth with stored files and the order of refusals | US-0189 | 2 | landed | story/US-0190-net-growth-with-stored-files-and-the-ord | story/US-0189-refuse-zip-and-7z-archives-over-a-limit |
 | US-0191 | SPEC-0085 | admit RAR declared sizes before decoding | US-0190 | 2 | landed | story/US-0191-admit-rar-declared-sizes-before-decoding | story/US-0190-net-growth-with-stored-files-and-the-ord |
 | US-0192 | SPEC-0085 | cap every entry at its declared size | US-0191 | 2 | landed | story/US-0192-cap-every-entry-at-its-declared-size | story/US-0191-admit-rar-declared-sizes-before-decoding |
-| US-0193 | SPEC-0085 | declared sizes through the HTTP door and documentation | US-0192 | 2 | todo | | |
+| US-0193 | SPEC-0085 | declared sizes through the HTTP door and documentation | US-0192 | 2 | landed | story/US-0193-declared-sizes-through-the-http-door-and | story/US-0192-cap-every-entry-at-its-declared-size |
 | US-0194 | SPEC-0086 | one destination rule: refuse a climb above the root for every format | US-0193 | 2 | todo | | |
 | US-0195 | SPEC-0086 | check the destination before the archive is read | US-0194 | 2 | todo | | |
 | US-0196 | SPEC-0086 | earlier refusals first and both doors alike | US-0195 | 2 | todo | | |

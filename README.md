@@ -308,10 +308,17 @@ Otherwise `destination` defaults to the archive path minus
 its suffix; `overwrite` defaults to `false`. **Passwords are a plain retry**: an encrypted zip
 or 7z answered without (or with a wrong) `password` fails with `ERR_PASSWORD_REQUIRED` (HTTP
 428) and the caller sends the same call again with `password`; nothing is stored between
-calls and the password is never logged. **All or nothing**: the whole archive is decoded and
-checked before the first write, so a symlink or device entry, an entry escaping the
-destination (zip slip), a collision without `overwrite`, or a declared total above the write
-quota rejects the call with nothing written. A zip whose entry headers disagree with its central directory
+calls and the password is never logged. **All or nothing**: the whole archive is checked
+before the first write, so a symlink or device entry, an entry escaping the
+destination (zip slip), a collision without `overwrite`, or a declared size above a limit
+rejects the call with nothing written. **Limits are checked on declared sizes before decoding**
+(`.zip`, `.7z` and `.rar`): the headers are listed first, the declared total is checked against the
+session write allowance and the declared net growth (the declared sizes minus the files already
+stored at the target paths) against the project's remaining storage, and only then is any entry
+decoded, so a small archive that expands enormously is refused with zero bytes decoded. Sums use
+checked arithmetic and a declared size of 2^63 or more is refused at the limit. An entry that
+holds more than it declares stops at its declared size plus at most 64 KiB and the call is refused
+(`ERR_INVALID_ARGUMENT`). Office documents read for their text are not bounded yet (BL-0134). A zip whose entry headers disagree with its central directory
 (name, sizes, checksum, compression, encryption, modification time), that holds two entries of
 the same name, or whose entries share bytes is refused the same way (`ERR_INVALID_ARGUMENT`,
 `archive is corrupt or not a valid zip file: header inconsistency detected: ...`), after the
