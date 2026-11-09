@@ -129,7 +129,7 @@ const MAX_SFX_SIZE: usize = 0x20_0000;
 /// Bytes of the marker UnRAR reads first.
 const MARK_LEN: usize = 7;
 /// Header type of the RAR5 archive encryption block: every header after it is encrypted,
-/// so the walk cannot read further.
+/// so the walk reads further only with the password.
 const HEAD_CRYPT: u64 = 4;
 /// Header type of the end of archive block, the last block of a complete volume.
 const HEAD_END: u64 = 5;
@@ -222,7 +222,8 @@ fn find_marker(bytes: &[u8]) -> Option<(bool, &[u8])> {
 /// header or declared data runs past the end, or an end of the input after a block that
 /// is not the end of archive block. Bytes after the end block are ignored. Input UnRAR
 /// refuses itself, or that this walk cannot read (RAR 1.4), is left to it. With encrypted
-/// headers the walk stops after the leading part; the password questions are UnRAR's.
+/// headers and no password, or an empty one, the walk stops after the leading part and the
+/// password questions are UnRAR's; RAR5 headers are decrypted with a given password.
 /// Time O(n) over the blocks, space O(1), no copies.
 pub(super) fn ensure_rar_complete(bytes: &[u8], password: Option<&str>) -> Result<()> {
     match find_marker(bytes) {
@@ -295,7 +296,91 @@ fn walk_rar5(mut rest: &[u8], password: Option<&str>) -> Result<()> {
             return Ok(());
         }
         if kind == HEAD_CRYPT {
-            return encrypted_headers_cut(rest, password);
+            return walk_rar5_encrypted(header, rest, password);
+        }
+    }
+}
+
+/// UnRAR's `CRYPT5_KDF_LG2_COUNT_MAX`: a larger iteration count is a damaged header.
+const RAR5_KDF_LG2_MAX: u8 = 24;
+/// Encryption header flag: an 8 byte password check value and its 4 byte sum follow.
+const RAR5_CHECK_PRESENT: u64 = 0x1;
+const AES_BLOCK: usize = 16;
+
+/// Walk the RAR5 blocks after the encryption header, whose body (after its type and
+/// flags) is `crypt`. Without a password, or with an empty one, the answer is UnRAR's
+/// (needed, or incorrect). With one, the keys are derived once; a check value that
+/// disagrees is the wrong password, whether the rest is cut or not (FR-NEW-005). Each
+/// later header is a 16 byte IV then whole AES blocks; a header whose CRC fails after
+/// decryption is left to UnRAR, so its answer stays today's. Time O(2^lg2_count) for the
+/// derivation plus O(n) over the header bytes; space O(largest header).
+fn walk_rar5_encrypted(mut crypt: &[u8], mut rest: &[u8], password: Option<&str>) -> Result<()> {
+    use crate::tools::archive_rar_crypt::{aes256_cbc_decrypt, rar5_kdf};
+    let Some(password) = password.filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let truncated = || corrupt("rar", TRUNCATED);
+    read_vint(&mut crypt)?;
+    let flags = read_vint(&mut crypt)?;
+    let (&lg2_count, crypt) = crypt.split_first().ok_or_else(truncated)?;
+    if lg2_count > RAR5_KDF_LG2_MAX {
+        return Err(corrupt("rar", "key derivation count is too large"));
+    }
+    let salt: &[u8; 16] = crypt.get(..16).and_then(|s| s.try_into().ok()).ok_or_else(truncated)?;
+    let (key, derived_check) = rar5_kdf(password, salt, lg2_count);
+    if flags & RAR5_CHECK_PRESENT != 0 {
+        let check = crypt.get(16..24).ok_or_else(truncated)?;
+        let sum = crypt.get(24..28).ok_or_else(truncated)?;
+        // A check value whose own sum fails is damaged, so it says nothing about the
+        // password, as in UnRAR.
+        let valid = {
+            use sha2_v011::Digest;
+            sha2_v011::Sha256::digest(check)[..4] == *sum
+        };
+        if valid && check != derived_check {
+            return Err(password_required_message(Some(password)));
+        }
+    }
+    loop {
+        let iv: &[u8; 16] =
+            rest.get(..AES_BLOCK).and_then(|s| s.try_into().ok()).ok_or_else(truncated)?;
+        rest = &rest[AES_BLOCK..];
+        // CBC decrypts one block from its IV alone, so the first block gives the CRC and
+        // the header size before the rest of the header is touched.
+        let mut first = [0u8; AES_BLOCK];
+        first.copy_from_slice(rest.get(..AES_BLOCK).ok_or_else(truncated)?);
+        aes256_cbc_decrypt(&key, iv, &mut first);
+        let mut size_field = &first[4..];
+        // Undecodable plaintext cannot be told from a wrong key without a check value;
+        // UnRAR answers it.
+        let Ok(header_size) = read_vint(&mut size_field) else {
+            return Ok(());
+        };
+        let vint_len = AES_BLOCK - 4 - size_field.len();
+        let total = usize::try_from(header_size)
+            .ok()
+            .and_then(|s| s.checked_add(4 + vint_len))
+            .ok_or_else(truncated)?;
+        let padded = total.div_ceil(AES_BLOCK).checked_mul(AES_BLOCK).ok_or_else(truncated)?;
+        let mut plain = rest.get(..padded).ok_or_else(truncated)?.to_vec();
+        rest = &rest[padded..];
+        aes256_cbc_decrypt(&key, iv, &mut plain);
+        let mut crc = flate2::Crc::new();
+        crc.update(&plain[4..total]);
+        if crc.sum().to_le_bytes() != plain[..4] {
+            return Ok(());
+        }
+        let mut header = &plain[4 + vint_len..total];
+        let kind = read_vint(&mut header)?;
+        let flags = read_vint(&mut header)?;
+        if flags & HFL_EXTRA != 0 {
+            read_vint(&mut header)?;
+        }
+        let data_size = if flags & HFL_DATA != 0 { read_vint(&mut header)? } else { 0 };
+        let data = usize::try_from(data_size).map_err(|_| truncated())?;
+        rest = rest.get(data..).ok_or_else(truncated)?;
+        if kind == HEAD_END {
+            return Ok(());
         }
     }
 }
@@ -1545,5 +1630,33 @@ mod tests {
         assert!(!m("part1.rar"));
         assert!(!m("a.part1.rar.zip"));
         assert!(!m("a.part1"));
+    }
+
+    /// Pins `rar5_kdf` on an archive RAR 7.23 made: the derived check value equals the
+    /// one stored in `hidden.rar`, and the key decrypts its first header to a matching CRC.
+    #[test]
+    fn rar5_check_value_of_hidden_rar_matches() {
+        use crate::tools::archive_rar_crypt::{aes256_cbc_decrypt, rar5_kdf};
+        let hidden: &[u8] = include_bytes!("../../tests/fixtures/rar/hidden.rar");
+        // Encryption header at 8: CRC32, size 33, type 4, flags 0, version 0, check
+        // value present, lg2_count, salt, check value, its sum.
+        assert_eq!(&hidden[12..17], &[0x21, 0x04, 0x00, 0x00, 0x01]);
+        let lg2_count = hidden[17];
+        let salt: [u8; 16] = hidden[18..34].try_into().unwrap();
+        let (key, check) = rar5_kdf("s3cret-Ünï", &salt, lg2_count);
+        assert_eq!(check, hidden[34..42]);
+        assert_ne!(rar5_kdf("s3cret-Üni", &salt, lg2_count).1, check);
+
+        let iv: [u8; 16] = hidden[46..62].try_into().unwrap();
+        let mut first = hidden[62..78].to_vec();
+        aes256_cbc_decrypt(&key, &iv, &mut first);
+        let size = usize::from(first[4]);
+        assert!(size < 0x80, "a one byte vint");
+        let padded = (5 + size).div_ceil(16) * 16;
+        let mut plain = hidden[62..62 + padded].to_vec();
+        aes256_cbc_decrypt(&key, &iv, &mut plain);
+        let mut crc = flate2::Crc::new();
+        crc.update(&plain[4..5 + size]);
+        assert_eq!(crc.sum().to_le_bytes(), plain[..4]);
     }
 }

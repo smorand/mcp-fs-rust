@@ -3760,6 +3760,7 @@ dependencies = [
 name = "mcp-fs-core"
 version = "0.1.0"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "anyhow",
  "arrow",
@@ -3772,6 +3773,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "bzip2",
+ "cbc",
  "chrono",
  "clap",
  "datafusion",
@@ -3781,6 +3783,7 @@ dependencies = [
  "git2",
  "globset",
  "hex",
+ "hmac",
  "http 1.5.0",
  "jsonwebtoken",
  "liblzma",
@@ -3803,6 +3806,7 @@ dependencies = [
  "sevenz-rust2",
  "sha1 0.10.7",
  "sha2 0.10.9",
+ "sha2 0.11.0",
  "similar",
  "sqlite-vec",
  "sqlx",

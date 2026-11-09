@@ -91,6 +91,12 @@ sevenz-rust2 = { version = "0.20", features = ["util", "aes256"] }
 # `.rar` decompression (SPEC-0080). A wrapper of RARLAB's UnRAR, whose source licence is
 # non free: it forbids recreating the RAR compression algorithm. Opt in feature only.
 unrar = "0.5.8"
+# RAR header decryption (SPEC-0087), all already compiled through zip, 7z and S3 signing.
+# `sha2` 0.11 is renamed because `hmac` 0.13 needs `digest` 0.11, which `sha2` 0.10 is not.
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.13"
+sha2_v011 = { package = "sha2", version = "0.11" }
 tantivy = "0.27"
 # sqlite-vec is pre-v1: pinned exactly so an upstream breaking change cannot sneak in.
 sqlite-vec = "=0.1.9"

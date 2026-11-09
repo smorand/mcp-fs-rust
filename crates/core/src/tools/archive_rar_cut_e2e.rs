@@ -379,3 +379,48 @@ async fn e2e_0087_046_repeating_a_refused_cut() {
         assert!(!exists(&f, "/uploads/half4").await);
     }
 }
+
+#[cfg(feature = "rar")]
+const HP5TWO: &[u8] = include_bytes!("../../tests/fixtures/rar/hp5two.rar");
+#[cfg(feature = "rar")]
+const HIDDEN: &[u8] = include_bytes!("../../tests/fixtures/rar/hidden.rar");
+#[cfg(feature = "rar")]
+const CUTH: &[u8] = include_bytes!("../../tests/fixtures/rar/cuth.rar");
+#[cfg(feature = "rar")]
+const HL2: &[u8] = include_bytes!("../../tests/fixtures/rar/hl2.rar");
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_004_version_5_with_encrypted_file_names() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp5two.rar", HP5TWO).await;
+    let v = extract(&f, "/uploads/hp5two.rar", None, false, Some(PASSWORD)).await.unwrap();
+    assert_eq!(v["files_written"], 2, "{v}");
+    assert_eq!(v["bytes_written"], 12, "{v}");
+    assert_eq!(read(&f, "/uploads/hp5two/a.txt").await.as_deref(), Some(&b"hello"[..]));
+    assert_eq!(read(&f, "/uploads/hp5two/b.txt").await.as_deref(), Some(&b"goodbye"[..]));
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_028_version_5_encrypted_names_end_block() {
+    assert_truncated("hid222", &HIDDEN[..222], Some(PASSWORD)).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_029_version_5_encrypted_names_cut_inside() {
+    assert_truncated("cuth", CUTH, Some(PASSWORD)).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_030_version_5_encrypted_names_cut_betwee() {
+    assert_truncated("hp5half", &HP5TWO[..206], Some(PASSWORD)).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_037_a_cut_wins_over_a_link_entry() {
+    assert_truncated("hl2cut", &HL2[..334], Some(PASSWORD)).await;
+}
