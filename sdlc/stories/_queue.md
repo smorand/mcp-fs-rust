@@ -199,7 +199,7 @@
 | US-0197 | SPEC-0086 | destinations inside the project unchanged and documentation | US-0196 | 2 | landed | story/US-0197-destinations-inside-the-project-unchange | story/US-0196-earlier-refusals-first-and-both-doors-al |
 | US-0198 | SPEC-0087 | refuse a cut RAR4 archive with one message | US-0197 | 2 | landed | story/US-0198-refuse-a-cut-rar4-archive-with-one-messa | story/US-0197-destinations-inside-the-project-unchange |
 | US-0199 | SPEC-0087 | complete RAR archives unchanged, folders and solid cuts refused | US-0198 | 2 | landed | story/US-0199-complete-rar-archives-unchanged-folders | story/US-0198-refuse-a-cut-rar4-archive-with-one-messa |
-| US-0200 | SPEC-0087 | every block kind counts: stored data, recovery record, comment | US-0199 | 2 | todo | | |
+| US-0200 | SPEC-0087 | every block kind counts: stored data, recovery record, comment | US-0199 | 2 | landed | story/US-0200-every-block-kind-counts-stored-data-reco | story/US-0199-complete-rar-archives-unchanged-folders |
 | US-0201 | SPEC-0087 | decrypt RAR5 headers to see a cut with the right password | US-0200 | 1 | todo | | |
 | US-0202 | SPEC-0087 | decrypt RAR4 headers to see a cut with the right password | US-0201 | 1 | todo | | |
 | US-0203 | SPEC-0087 | password questions first, every cut of an encrypted names archive | US-0202 | 2 | todo | | |

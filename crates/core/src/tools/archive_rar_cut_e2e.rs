@@ -266,3 +266,116 @@ async fn e2e_0087_054_a_cut_with_a_destination_inside_the() {
     truncated_refusal(&v);
     assert!(!exists(&f, "/out").await);
 }
+
+#[cfg(feature = "rar")]
+const BIG4: &[u8] = include_bytes!("../../tests/fixtures/rar/big4.rar");
+#[cfg(feature = "rar")]
+const EXTRAS4: &[u8] = include_bytes!("../../tests/fixtures/rar/extras4.rar");
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_002_recovery_record_comment_and_lock() {
+    assert_extracts("extras4", EXTRAS4, &[("a.txt", b"hello"), ("b.txt", b"goodbye")]).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_010_version_4_cut_inside_a_file_s_data() {
+    // 1 562 lies inside `r.bin`'s 3 000 data bytes (they span 62 to 3 062).
+    assert_truncated("big4cut", &BIG4[..1562], None).await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_016_every_length_of_the_plain_version_4() {
+    for (name, whole, files) in [
+        ("v4", V4, vec![("a.txt", &b"hello"[..])]),
+        ("two4", TWO4, vec![("a.txt", &b"hello"[..]), ("b.txt", &b"goodbye"[..])]),
+        ("dir4", DIR4, vec![("a.txt", &b"hello"[..])]),
+        ("solid4", SOLID4, vec![("a.txt", &b"hello"[..]), ("b.txt", &b"goodbye"[..])]),
+        ("extras4", EXTRAS4, vec![("a.txt", &b"hello"[..]), ("b.txt", &b"goodbye"[..])]),
+    ] {
+        let f = fixture().await;
+        for len in 0..whole.len() {
+            seed(&f, "/uploads/p.rar", &whole[..len]).await;
+            let v = extract(&f, "/uploads/p.rar", None, false, None).await;
+            if len < 7 {
+                corrupt_refusal(&v, "rar");
+            } else {
+                truncated_refusal(&v);
+            }
+            assert!(!exists(&f, "/uploads/p").await, "{name} cut at {len} wrote /uploads/p");
+        }
+        assert_extracts(name, whole, &files).await;
+    }
+}
+
+#[cfg(feature = "rar")]
+async fn seeded_half4_with_old(f: &crate::tools::admin::test_support::Fixture) {
+    seed(f, "/uploads/half4.rar", &TWO4[..67]).await;
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    c.makedirs("/uploads/half4", true).await.unwrap();
+    seed(f, "/uploads/half4/a.txt", b"old").await;
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_038_a_cut_wins_over_a_collision() {
+    let f = fixture().await;
+    seeded_half4_with_old(&f).await;
+    let v = extract(&f, "/uploads/half4.rar", None, false, None).await;
+    truncated_refusal(&v);
+    assert_eq!(read(&f, "/uploads/half4/a.txt").await.as_deref(), Some(&b"old"[..]));
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_039_a_cut_with_overwrite_replaces_nothin() {
+    let f = fixture_allowance(10_000).await;
+    seeded_half4_with_old(&f).await;
+    limit_remaining(&f, 10_000).await;
+    let (storage, session) = (remaining_storage(&f).await, allowance(&f));
+    let v = extract(&f, "/uploads/half4.rar", None, true, None).await;
+    truncated_refusal(&v);
+    assert_eq!(read(&f, "/uploads/half4/a.txt").await.as_deref(), Some(&b"old"[..]));
+    assert_eq!(remaining_storage(&f).await, storage);
+    assert_eq!(allowance(&f), session);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/half4.rar"), 0);
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_040_a_cut_wins_over_the_storage_limit() {
+    let f = fixture().await;
+    seed(&f, "/uploads/big4cut.rar", &BIG4[..1562]).await;
+    limit_remaining(&f, 1000).await;
+    let v = extract(&f, "/uploads/big4cut.rar", None, false, None).await;
+    truncated_refusal(&v);
+    assert_eq!(remaining_storage(&f).await, 1000);
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_045_a_refused_cut_leaves_no_trace() {
+    let f = fixture_allowance(10_000).await;
+    seed(&f, "/uploads/half4.rar", &TWO4[..67]).await;
+    limit_remaining(&f, 10_000).await;
+    let v = extract(&f, "/uploads/half4.rar", None, false, None).await;
+    truncated_refusal(&v);
+    assert_eq!(remaining_storage(&f).await, 10_000);
+    assert_eq!(allowance(&f), 10_000);
+    assert!(!exists(&f, "/uploads/half4").await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/half4.rar"), 0);
+}
+
+#[cfg(feature = "rar")]
+#[tokio::test]
+async fn e2e_0087_046_repeating_a_refused_cut() {
+    let f = fixture().await;
+    seed(&f, "/uploads/half4.rar", &TWO4[..67]).await;
+    for _ in 0..2 {
+        let v = extract(&f, "/uploads/half4.rar", None, false, None).await;
+        truncated_refusal(&v);
+        assert!(!exists(&f, "/uploads/half4").await);
+    }
+}

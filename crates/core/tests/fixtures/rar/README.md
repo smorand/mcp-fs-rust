@@ -19,3 +19,5 @@ fixtures come from RAR 6.24 and the RAR5 ones from RAR 7.23. Every `a.txt` holds
 | `two4.rar` | RAR 6.24 | `rar a -ma4 -ep two4.rar a.txt b.txt` | `a.txt` = `hello`, `b.txt` = `goodbye`, 123 bytes; `a.txt` ends at 67, `b.txt`'s header spans 67 to 109 |
 | `dir4.rar` | RAR 6.24 | `rar a -ma4 dir4.rar d a.txt`, `d` holding the empty folder `d/e` | `a.txt` = `hello`, folders `d/e` and `d`, 152 bytes; folder `d/e` ends at 107 |
 | `solid4.rar` | RAR 6.24 | `rar a -ma4 -ep -s solid4.rar a.txt b.txt` | solid, `a.txt` = `hello`, `b.txt` = `goodbye`, 133 bytes; `a.txt`'s block ends at 80, `b.txt`'s at 126 |
+| `big4.rar` | RAR 6.24 | `rar a -ma4 -ep -m0 big4.rar r.bin a.txt`, `r.bin` = 3 000 bytes of `x` | stored `r.bin` then `a.txt` = `hello`, 3 116 bytes; `r.bin`'s data spans 62 to 3 062 |
+| `extras4.rar` | RAR 6.24 | `rar a -ma4 -ep -rr5% -zc.txt -k extras4.rar a.txt b.txt`, `c.txt` = `a comment` | `a.txt` = `hello`, `b.txt` = `goodbye`, locked, with an archive comment (block 20 to 74) and a recovery record (block 170 to 738), 745 bytes |
