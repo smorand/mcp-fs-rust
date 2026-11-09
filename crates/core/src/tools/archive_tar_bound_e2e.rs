@@ -1,6 +1,10 @@
 //! Tar family decoding (SPEC-0084): `.tar.xz` and `.txz` go through the bare xz decoder.
 
-use super::archive_testkit::{corrupt_refusal, exists, extract, fixture, read, seed};
+use super::archive_testkit::{
+    allowance, bz2, corrupt_refusal, exists, extract, extraction_audit_lines, fixture,
+    fixture_allowance, gz, held_at_most, held_reset, limit_remaining, project_refusal, read, seed,
+    session_refusal, tar_bomb, xz,
+};
 use liblzma::stream::{Check, Filters, LzmaOptions, Stream};
 use serde_json::json;
 use std::io::Write as _;
@@ -31,10 +35,6 @@ fn lzma2() -> Filters {
     let mut filters = Filters::new();
     filters.lzma2(&LzmaOptions::new_preset(6).unwrap());
     filters
-}
-
-fn xz(content: &[u8]) -> Vec<u8> {
-    xz_with(content, &lzma2(), Check::Crc64)
 }
 
 /// The tar cut after its first 512 bytes, as two xz streams.
@@ -199,4 +199,195 @@ async fn e2e_0084_038_damaged_compressed_byte() {
     // Inside the LZMA2 payload, past the 12 byte stream header and the block header.
     bytes[30] ^= 0xFF;
     refused_corrupt(&bytes).await;
+}
+
+// Decoding bound (US-0184).
+
+/// The decompressed archive length at which the bound sits for 1 000 bytes of room.
+const FIT: usize = 1_049_576;
+
+/// `tar()` followed by zero bytes up to `len` bytes.
+fn tar_padded(len: usize) -> Vec<u8> {
+    let mut t = tar();
+    t.resize(len, 0);
+    t
+}
+
+async fn remaining(f: &crate::tools::admin::test_support::Fixture) -> i64 {
+    super::archive_testkit::remaining_storage(f).await
+}
+
+#[tokio::test]
+async fn e2e_0084_004_files_equal_to_the_remaining_storage() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar())).await;
+    limit_remaining(&f, 5).await;
+    let v = extract(&f, "/uploads/pack.tar.gz", None, false, None).await;
+    assert_eq!(
+        v.as_ref().ok(),
+        Some(&json!({"destination": "/uploads/pack", "files_written": 1,
+                     "dirs_created": 1, "bytes_written": 5})),
+        "{v:?}"
+    );
+    assert_eq!(remaining(&f).await, 0);
+}
+
+#[tokio::test]
+async fn e2e_0084_005_files_over_the_remaining_storage_arc() {
+    let f = fixture().await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar())).await;
+    limit_remaining(&f, 4).await;
+    let v = extract(&f, "/uploads/pack.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    assert!(!exists(&f, "/uploads/pack").await);
+    assert_eq!(remaining(&f).await, 4);
+}
+
+#[tokio::test]
+async fn e2e_0084_006_files_over_the_session_allowance_arc() {
+    let f = fixture_allowance(4).await;
+    seed(&f, "/uploads/pack.tar.xz", &xz(&tar())).await;
+    let v = extract(&f, "/uploads/pack.tar.xz", None, false, None).await;
+    session_refusal(&v, 4);
+    assert!(!exists(&f, "/uploads/pack").await);
+}
+
+/// Seed a bomb under `path` and check its size stays a small file.
+async fn seed_bomb(f: &crate::tools::admin::test_support::Fixture, path: &str, bytes: Vec<u8>) {
+    assert!(bytes.len() <= 20_000, "the bomb is {} bytes", bytes.len());
+    seed(f, path, &bytes).await;
+}
+
+#[tokio::test]
+async fn e2e_0084_008_tar_gz_bomb_against_the_storage_limi() {
+    let f = fixture().await;
+    seed_bomb(&f, "/uploads/bomb.tar.gz", gz(&tar_bomb())).await;
+    limit_remaining(&f, 1000).await;
+    held_reset();
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    held_at_most(1_049_576);
+    assert!(!exists(&f, "/uploads/bomb").await);
+    assert_eq!(remaining(&f).await, 1000);
+}
+
+#[tokio::test]
+async fn e2e_0084_009_tar_bz2_bomb_against_the_session_all() {
+    let f = fixture_allowance(1000).await;
+    seed_bomb(&f, "/uploads/bomb.tar.bz2", bz2(&tar_bomb())).await;
+    held_reset();
+    let v = extract(&f, "/uploads/bomb.tar.bz2", None, false, None).await;
+    session_refusal(&v, 1000);
+    held_at_most(1_049_576);
+    assert!(!exists(&f, "/uploads/bomb").await);
+    let c = f.state.stores.client(super::archive_testkit::MOUNT).await.unwrap();
+    let w = crate::core::fs_ops::write_bytes(
+        &c,
+        &f.state.safety,
+        super::archive_testkit::OWNER,
+        super::archive_testkit::MOUNT,
+        "/uploads/small.bin",
+        &[7u8; 1000],
+        false,
+        true,
+    )
+    .await;
+    assert!(w.is_ok(), "{w:?}");
+}
+
+#[tokio::test]
+async fn e2e_0084_010_tar_xz_bomb_against_the_storage_limi() {
+    let f = fixture().await;
+    seed_bomb(&f, "/uploads/bomb.tar.xz", xz(&tar_bomb())).await;
+    limit_remaining(&f, 1000).await;
+    held_reset();
+    let v = extract(&f, "/uploads/bomb.tar.xz", None, false, None).await;
+    project_refusal(&v);
+    held_at_most(1_049_576);
+    assert!(!exists(&f, "/uploads/bomb").await);
+    assert_eq!(remaining(&f).await, 1000);
+}
+
+#[tokio::test]
+async fn e2e_0084_011_txz_bomb_against_the_session_allowan() {
+    let f = fixture_allowance(1000).await;
+    seed_bomb(&f, "/uploads/BOMB.TXZ", xz(&tar_bomb())).await;
+    held_reset();
+    let v = extract(&f, "/uploads/BOMB.TXZ", None, false, None).await;
+    session_refusal(&v, 1000);
+    held_at_most(1_049_576);
+    assert!(!exists(&f, "/uploads/BOMB").await);
+}
+
+#[tokio::test]
+async fn e2e_0084_012_tie_between_the_two_sides() {
+    let f = fixture_allowance(1000).await;
+    seed_bomb(&f, "/uploads/bomb.tar.gz", gz(&tar_bomb())).await;
+    limit_remaining(&f, 1000).await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    assert_eq!(remaining(&f).await, 1000);
+    assert_eq!(allowance(&f), 1000);
+}
+
+#[tokio::test]
+async fn e2e_0084_013_the_session_side_is_lower() {
+    let f = fixture_allowance(1000).await;
+    seed_bomb(&f, "/uploads/bomb.tar.gz", gz(&tar_bomb())).await;
+    limit_remaining(&f, 2_000_000).await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    session_refusal(&v, 1000);
+    assert_eq!(remaining(&f).await, 2_000_000);
+}
+
+#[tokio::test]
+async fn e2e_0084_014_decompressed_archive_exactly_at_the() {
+    let f = fixture().await;
+    seed(&f, "/uploads/fit.tar.gz", &gz(&tar_padded(FIT))).await;
+    limit_remaining(&f, 1000).await;
+    let v = extract(&f, "/uploads/fit.tar.gz", None, false, None).await;
+    assert_eq!(
+        v.as_ref().ok(),
+        Some(&json!({"destination": "/uploads/fit", "files_written": 1,
+                     "dirs_created": 1, "bytes_written": 5})),
+        "{v:?}"
+    );
+    assert_eq!(remaining(&f).await, 995);
+}
+
+#[tokio::test]
+async fn e2e_0084_015_one_byte_over_the_bound() {
+    let f = fixture().await;
+    seed(&f, "/uploads/fit.tar.gz", &gz(&tar_padded(FIT + 1))).await;
+    limit_remaining(&f, 1000).await;
+    let v = extract(&f, "/uploads/fit.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    assert!(!exists(&f, "/uploads/fit").await);
+    assert_eq!(remaining(&f).await, 1000);
+}
+
+#[tokio::test]
+async fn e2e_0084_021_a_refusal_at_the_bound_is_not_audite() {
+    let f = fixture().await;
+    seed_bomb(&f, "/uploads/bomb.tar.gz", gz(&tar_bomb())).await;
+    seed(&f, "/uploads/pack.tar.gz", &gz(&tar())).await;
+    limit_remaining(&f, 1000).await;
+    let v = extract(&f, "/uploads/bomb.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/bomb.tar.gz"), 0);
+    let v = extract(&f, "/uploads/pack.tar.gz", None, false, None).await;
+    assert!(v.is_ok(), "{v:?}");
+    assert_eq!(remaining(&f).await, 995);
+}
+
+#[tokio::test]
+async fn e2e_0084_046_bytes_after_the_end_marker_count() {
+    let f = fixture().await;
+    seed_bomb(&f, "/uploads/tail.tar.gz", gz(&tar_padded(10_000_000))).await;
+    limit_remaining(&f, 1000).await;
+    held_reset();
+    let v = extract(&f, "/uploads/tail.tar.gz", None, false, None).await;
+    project_refusal(&v);
+    held_at_most(1_049_576);
+    assert!(!exists(&f, "/uploads/tail").await);
 }

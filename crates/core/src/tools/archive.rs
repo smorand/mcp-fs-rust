@@ -17,7 +17,11 @@ use crate::state::AppState;
 use crate::tools::archive_single::{self, SingleFormat};
 use crate::util::PosixPath;
 use serde_json::{Value, json};
-use std::io::{Cursor, Read as _};
+use std::io::{Cursor, Read};
+
+/// Bytes a tar spends on its own structure (headers, padding, end marker) that
+/// the decoding bound allows on top of the storage the files may take.
+pub(crate) const TAR_FRAMING: u64 = 1_048_576;
 
 /// Compression wrapped around a tar stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,13 +206,30 @@ pub(crate) async fn extract_archive(
     // CPU-bound (decompression, decryption): run off the async worker so one
     // large or hostile archive cannot stall the executor (rust skill, async
     // guidance on `spawn_blocking`).
-    let bytes = client.read_bytes(&normalized).await?;
-    let owned_password = password.map(ToOwned::to_owned);
-    let entries = tokio::task::spawn_blocking(move || {
-        decode_archive(format, &bytes, owned_password.as_deref())
-    })
-    .await
-    .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??;
+    let entries = match format {
+        ArchiveFormat::Tar(compression) if compression != TarCompression::None => {
+            decode_bounded_tar(
+                state,
+                &client,
+                mount_id,
+                person,
+                &normalized,
+                (format, suffix_len),
+                destination,
+                compression,
+            )
+            .await?
+        }
+        _ => {
+            let bytes = client.read_bytes(&normalized).await?;
+            let owned_password = password.map(ToOwned::to_owned);
+            tokio::task::spawn_blocking(move || {
+                decode_archive(format, &bytes, owned_password.as_deref())
+            })
+            .await
+            .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??
+        }
+    };
 
     // FR-NEW-016: caller-supplied destination normalized exactly like any
     // other `fs.*` destination parameter; otherwise the archive's own path
@@ -306,6 +327,112 @@ pub(crate) async fn extract_archive(
     )
 }
 
+/// The destination as the later checks will compute it, or `None` when they
+/// would refuse it. It only sizes the decoding bound: the refusal itself keeps
+/// its place after the entry checks.
+fn planned_destination(
+    state: &AppState,
+    format: ArchiveFormat,
+    normalized: &str,
+    suffix_len: usize,
+    destination: Option<&str>,
+) -> Option<String> {
+    #[cfg(feature = "rar")]
+    if let (Some(d), ArchiveFormat::Rar) = (destination, format) {
+        return archive_single::normalize_destination(state, d).ok();
+    }
+    let _ = format;
+    match destination {
+        Some(d) => state.safety.normalize_path(d).ok(),
+        None => Some(normalized[..normalized.len() - suffix_len].to_string()),
+    }
+}
+
+/// Decode a compressed tar without ever holding more than the decoding bound:
+/// the lower of the project's room under the destination and the session
+/// allowance, plus `TAR_FRAMING`. Decompressing and parsing run in one blocking
+/// task, so a damaged stream and an oversized one are told apart by whichever
+/// the decoder meets first. Nothing is written, charged or audited here.
+/// Time O(n) in the decompressed bytes read, space O(min(n, bound)).
+#[allow(clippy::too_many_arguments)]
+async fn decode_bounded_tar(
+    state: &AppState,
+    client: &crate::storage::volume::VolumeClient,
+    mount_id: &str,
+    person: &str,
+    normalized: &str,
+    (format, suffix_len): (ArchiveFormat, usize),
+    destination: Option<&str>,
+    compression: TarCompression,
+) -> Result<Vec<DecodedEntry>> {
+    let stored = match planned_destination(state, format, normalized, suffix_len, destination) {
+        Some(dest) => quota::stored_under(client, &dest).await?,
+        None => 0,
+    };
+    let project = quota::project_remaining_for(client, &state.safety, stored).await?;
+    let session = state.safety.session_remaining(person, mount_id).max(0) as u64;
+    let caps = archive_single::pick_caps(project.map(|p| p.max(0) as u64), session, TAR_FRAMING);
+
+    let bytes = client.read_bytes(normalized).await?;
+    let label = tar_label(compression);
+    let limit = caps.limit;
+    // `Ok(Err(high_water))` is the bound being met, `Err` a damaged or unreadable stream.
+    let read = tokio::task::spawn_blocking(
+        move || -> Result<std::result::Result<(Vec<DecodedEntry>, u64), u64>> {
+            let reader = tar_decoder(compression, &bytes).map_err(|e| {
+                ToolError::internal(format!("cannot start the {label} decoder: {e}"))
+            })?;
+            match archive_single::read_capped(reader, limit) {
+                Ok(decoded) => {
+                    let high_water = decoded.high_water;
+                    Ok(Ok((decode_tar(label, decoded.bytes)?, high_water)))
+                }
+                Err(archive_single::ReadError::CapExceeded { high_water }) => Ok(Err(high_water)),
+                Err(archive_single::ReadError::Io(e)) => Err(corrupt(label, e)),
+                Err(archive_single::ReadError::Init(e)) => {
+                    Err(ToolError::internal(format!("cannot start the {label} decoder: {e}")))
+                }
+            }
+        },
+    )
+    .await
+    .map_err(|e| ToolError::internal(format!("archive decode task panicked: {e}")))??;
+    // Set here, not in the blocking task: that one runs on another thread.
+    match read {
+        Ok((entries, _high_water)) => {
+            #[cfg(test)]
+            archive_single::LAST_HIGH_WATER.with(|c| c.set(Some(_high_water)));
+            Ok(entries)
+        }
+        Err(_high_water) => {
+            #[cfg(test)]
+            archive_single::LAST_HIGH_WATER.with(|c| c.set(Some(_high_water)));
+            tracing::debug!(path = %normalized, "tar decode stopped at the bound");
+            Err(caps.refusal(state, client).await?)
+        }
+    }
+}
+
+/// The name of a compressed tar in the corrupt archive message.
+fn tar_label(compression: TarCompression) -> &'static str {
+    match compression {
+        TarCompression::None => "tar",
+        TarCompression::Gzip => "tar.gz",
+        TarCompression::Bzip2 => "tar.bz2",
+        TarCompression::Xz => "tar.xz",
+    }
+}
+
+/// Decoder of a compressed tar over `bytes`.
+fn tar_decoder(compression: TarCompression, bytes: &[u8]) -> std::io::Result<Box<dyn Read + '_>> {
+    Ok(match compression {
+        TarCompression::None => Box::new(Cursor::new(bytes)),
+        TarCompression::Gzip => Box::new(flate2::read::GzDecoder::new(Cursor::new(bytes))),
+        TarCompression::Bzip2 => Box::new(bzip2::read::BzDecoder::new(Cursor::new(bytes))),
+        TarCompression::Xz => archive_single::decoder(SingleFormat::Xz, bytes)?,
+    })
+}
+
 /// The audit line, the tracing event and the answer of a successful
 /// extraction, shared by the archive flow and the single file flow so the
 /// answer shape has one implementation.
@@ -381,7 +508,10 @@ fn decode_archive(
     match format {
         ArchiveFormat::Zip => decode_zip(bytes, password),
         ArchiveFormat::SevenZ => decode_sevenz(bytes, password),
-        ArchiveFormat::Tar(compression) => decode_tar(compression, bytes),
+        ArchiveFormat::Tar(TarCompression::None) => decode_tar("tar", bytes.to_vec()),
+        ArchiveFormat::Tar(_) => Err(ToolError::internal(
+            "a compressed tar is decoded under its bound, not by decode_archive",
+        )),
         #[cfg(feature = "rar")]
         ArchiveFormat::Rar => crate::tools::archive_rar::decode_rar(bytes, password),
         ArchiveFormat::Single(_) => Err(ToolError::internal(
@@ -717,39 +847,7 @@ pub(crate) fn password_required_message(password: Option<&str>) -> ToolError {
 /// themselves (the password gate above already refused any `password` for
 /// these), so this step is pure corruption detection plus the full decode
 /// `FR-NEW-012` mandates.
-fn decode_tar(compression: TarCompression, bytes: &[u8]) -> Result<Vec<DecodedEntry>> {
-    let format_name = match compression {
-        TarCompression::None => "tar",
-        TarCompression::Gzip => "tar.gz",
-        TarCompression::Bzip2 => "tar.bz2",
-        TarCompression::Xz => "tar.xz",
-    };
-    let decompressed = match compression {
-        TarCompression::None => bytes.to_vec(),
-        TarCompression::Gzip => {
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(Cursor::new(bytes))
-                .read_to_end(&mut out)
-                .map_err(|e| corrupt(format_name, e))?;
-            out
-        }
-        TarCompression::Bzip2 => {
-            let mut out = Vec::new();
-            bzip2::read::BzDecoder::new(Cursor::new(bytes))
-                .read_to_end(&mut out)
-                .map_err(|e| corrupt(format_name, e))?;
-            out
-        }
-        TarCompression::Xz => {
-            let mut out = Vec::new();
-            archive_single::decoder(SingleFormat::Xz, bytes)
-                .map_err(|e| ToolError::internal(format!("cannot start the tar.xz decoder: {e}")))?
-                .read_to_end(&mut out)
-                .map_err(|e| corrupt(format_name, e))?;
-            out
-        }
-    };
-
+fn decode_tar(format_name: &str, decompressed: Vec<u8>) -> Result<Vec<DecodedEntry>> {
     let mut tar = tar::Archive::new(Cursor::new(decompressed));
     let tar_entries = tar.entries().map_err(|e| corrupt(format_name, e))?;
     let mut entries = Vec::new();

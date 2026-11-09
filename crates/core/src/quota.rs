@@ -174,6 +174,13 @@ pub(crate) async fn project_remaining_for(
     Ok(Some((limit - used + replaced_size).max(0)))
 }
 
+/// The bytes of the files held by `folder` and everything below it, 0 when it
+/// does not exist. Time O(m) over the m nodes of the subtree, space O(m).
+pub(crate) async fn stored_under(client: &VolumeClient, folder: &str) -> Result<i64> {
+    let nodes = client.meta.subtree(folder).await?;
+    Ok(nodes.iter().filter(|n| n.is_file()).map(|n| n.size).sum())
+}
+
 /// The bytes `client`'s project uses right now: every file's declared size,
 /// trashed files included (FR-NEW-002). A volume whose counter row is missing
 /// is backfilled from its nodes, under the lock.

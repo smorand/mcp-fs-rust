@@ -183,7 +183,7 @@
 | US-0181 | SPEC-0082 | check the xz collision, destination and order rules | US-0180 | 2 | landed | story/US-0181-xz-collision-destination-order | story/US-0180-xz-password-output-name-tar-rows |
 | US-0182 | SPEC-0082 | check the xz storage and session limits and document the format | US-0181 | 2 | landed | story/US-0182-xz-limits-and-documentation | story/US-0181-xz-collision-destination-order |
 | US-0183 | SPEC-0084 | decode a .tar.xz with the bare xz decoder | main | 2 | landed | story/US-0183-decode-a-tar-xz-with-the-bare-xz-decoder | main |
-| US-0184 | SPEC-0084 | stop a compressed tar bomb at the decoding bound | US-0183 | 2 | todo | | |
+| US-0184 | SPEC-0084 | stop a compressed tar bomb at the decoding bound | US-0183 | 2 | landed | story/US-0184-stop-a-compressed-tar-bomb-at-the-decodi | story/US-0183-decode-a-tar-xz-with-the-bare-xz-decoder |
 | US-0185 | SPEC-0084 | order the bound among the tar refusals and re extract near the limit | US-0184 | 2 | todo | | |
 | US-0186 | SPEC-0084 | one xz library and the other formats unchanged | US-0185 | 2 | todo | | |
 | US-0187 | SPEC-0084 | tar bound through the HTTP door and documentation | US-0186 | 2 | todo | | |

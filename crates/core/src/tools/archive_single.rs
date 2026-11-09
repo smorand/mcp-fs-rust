@@ -89,7 +89,10 @@ pub(crate) fn decoder(format: SingleFormat, bytes: &[u8]) -> std::io::Result<Box
 /// once the output would pass `cap` bytes (equal is accepted); at most `cap`
 /// bytes are held, plus the fixed chunk. Time O(n) in the output read, memory O(min(n, cap)):
 /// the output is held once and the chunk buffer is fixed.
-fn read_capped(mut reader: impl Read, cap: u64) -> std::result::Result<CappedRead, ReadError> {
+pub(crate) fn read_capped(
+    mut reader: impl Read,
+    cap: u64,
+) -> std::result::Result<CappedRead, ReadError> {
     let mut bytes = Vec::new();
     let mut chunk = vec![0u8; CHUNK];
     loop {
@@ -165,21 +168,25 @@ async fn check_collision(client: &VolumeClient, out: &str, overwrite: bool) -> R
 
 /// Which limit a cap comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CapKind {
+pub(crate) enum CapKind {
     Project,
     Session,
 }
 
 /// The most output bytes the extraction may produce, and the limit that sets it.
 #[derive(Debug, Clone, Copy)]
-struct Caps {
-    limit: u64,
-    which: CapKind,
+pub(crate) struct Caps {
+    pub(crate) limit: u64,
+    pub(crate) which: CapKind,
 }
 
 impl Caps {
     /// The refusal for the limit that was met first.
-    async fn refusal(self, state: &AppState, client: &VolumeClient) -> Result<ToolError> {
+    pub(crate) async fn refusal(
+        self,
+        state: &AppState,
+        client: &VolumeClient,
+    ) -> Result<ToolError> {
         match self.which {
             CapKind::Project => {
                 let limit = state.safety.project_limit(&client.project_id).await?.unwrap_or(0);
@@ -215,10 +222,19 @@ async fn caps(
     };
     let session = state.safety.session_remaining(person, mount_id).max(0) as u64;
     let project = quota::project_remaining_for(client, &state.safety, replaced).await?;
-    Ok(match project.map(|p| p.max(0) as u64) {
-        Some(p) if p <= session => Caps { limit: p, which: CapKind::Project },
-        _ => Caps { limit: session, which: CapKind::Session },
-    })
+    Ok(pick_caps(project.map(|p| p.max(0) as u64), session, 0))
+}
+
+/// The cap rule shared by the single file flow (`framing` 0) and the tar flow:
+/// the lower of the project side and the session side, a tie going to the
+/// project, plus `framing` bytes the format spends on its own structure.
+pub(crate) fn pick_caps(project: Option<u64>, session: u64, framing: u64) -> Caps {
+    match project {
+        Some(p) if p <= session => {
+            Caps { limit: p.saturating_add(framing), which: CapKind::Project }
+        }
+        _ => Caps { limit: session.saturating_add(framing), which: CapKind::Session },
+    }
 }
 
 /// Extract the one file held by `normalized` next to it, or into
