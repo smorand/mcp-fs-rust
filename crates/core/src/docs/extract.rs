@@ -25,6 +25,7 @@
 use crate::docs::ocr::OcrProvider;
 use crate::errors::{Result, ToolError};
 use crate::storage::VolumeClient;
+use crate::tools::archive_single::ReadError;
 use serde_json::{Map, Value, json};
 
 /// Extensions decoded as plain text.
@@ -588,6 +589,13 @@ pub(crate) const PART_LIMIT: u64 = 104_857_600;
 /// Most declared bytes the parts read in one call may total.
 pub(crate) const CALL_LIMIT: u64 = 268_435_456;
 
+/// The refusal of a part that decodes to more bytes than it declares.
+fn size_lie(name: &str, declared: u64) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "document part '{name}' decodes to more bytes than declared {declared}"
+    ))
+}
+
 /// The one reader of Office parts and what one call has decoded through it.
 struct OfficeBudget {
     decoded: u64,
@@ -626,8 +634,20 @@ impl OfficeBudget {
         }
         self.declared += u128::from(declared);
         let Ok(file) = zip.by_index(index) else { return Ok(None) };
-        let Ok(read) = crate::tools::archive_single::read_capped(file, declared) else {
-            return Ok(None);
+        // Only a part holding more than it declares is a refusal; a bad
+        // checksum, a damaged stream or any other read error stays absent
+        // (BL-0144). Zip enforces the declared size itself, so its own error
+        // is the same lie as the cap (SPEC-0088 DEC-004).
+        let read = match crate::tools::archive_single::read_capped(file, declared) {
+            Ok(read) => read,
+            Err(ReadError::CapExceeded { .. }) => return Err(size_lie(name, declared)),
+            Err(ReadError::Io(e))
+                if e.kind() == std::io::ErrorKind::InvalidData
+                    && e.to_string().contains("larger than its declared") =>
+            {
+                return Err(size_lie(name, declared));
+            }
+            Err(_) => return Ok(None),
         };
         self.decoded += read.bytes.len() as u64;
         // A valid part becomes its text without a copy (SPEC-0088 DEC-009).

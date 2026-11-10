@@ -417,3 +417,141 @@ async fn e2e_0088_012_many_small_slides_within_the_limits() {
     assert_eq!(v["meta"]["slides"], serde_json::json!(500), "{v}");
     assert!(v["preview"].as_str().unwrap().starts_with("## Slide 1\n\nSlide text 1"), "{v}");
 }
+
+/// The size lie refusal of `part` in `doc`, declaring `declared` bytes.
+fn lie_refusal(v: &Result<Value>, doc: &str, part: &str, declared: u64) {
+    let Err(e) = v else { panic!("the extraction must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        format!(
+            "could not extract {doc}: document part '{part}' decodes to more bytes than declared {declared}"
+        )
+    );
+}
+
+#[tokio::test]
+async fn e2e_0088_013_word_main_part_larger_than_it_declare() {
+    let f = office_fixture().await;
+    let doc = zip_declaring(&[("word/document.xml", 10, &vec![b'a'; 1_000_000])]);
+    seed(&f, "/docs/liar.docx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/liar.docx", false).await;
+
+    lie_refusal(&v, "/docs/liar.docx", "word/document.xml", 10);
+    let held = parts_held("/docs/liar.docx");
+    assert!(held <= 65_546, "the extraction held {held} decoded bytes");
+    nothing_left(&f, "/docs/liar.docx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_015_slide_declared_0_holding_data() {
+    let f = office_fixture().await;
+    let slide = r#"<p:sld xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>hello</a:t></a:r></a:p></p:sld>"#;
+    let doc = zip_declaring(&[("ppt/slides/slide1.xml", 0, slide.as_bytes())]);
+    seed(&f, "/docs/zero.pptx", &doc).await;
+
+    let v = extract_text(&f, OWNER, "/docs/zero.pptx", false).await;
+
+    lie_refusal(&v, "/docs/zero.pptx", "ppt/slides/slide1.xml", 0);
+}
+
+#[tokio::test]
+async fn e2e_0088_016_part_holding_exactly_its_declared_siz() {
+    let f = office_fixture().await;
+    let (open, close) =
+        ("<w:document><w:body><w:p><w:r><w:t>exact", "</w:t></w:r></w:p></w:body></w:document>");
+    let xml = format!("{open}{}{close}", " ".repeat(5_000 - open.len() - close.len()));
+    assert_eq!(xml.len(), 5_000);
+    seed(&f, "/docs/exact.docx", &office_zip(&[("word/document.xml", xml.as_bytes())])).await;
+
+    let v = extract_text(&f, OWNER, "/docs/exact.docx", false).await.expect("declared size held");
+
+    assert_eq!(v["preview"].as_str().unwrap().trim(), "exact", "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0088_022_header_inconsistency_wins_over_a_bomb() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let doc = zip_raw(&[bomb_part("word/document.xml")]);
+    let doc =
+        crate::docs::zip_check::craft::rename_local(&doc, "word/document.xml", "word/documenX.xml");
+    seed(&f, "/docs/twice.docx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/twice.docx", false).await;
+
+    let Err(e) = &v else { panic!("must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert!(
+        e.message.starts_with(
+            "could not extract /docs/twice.docx: not a valid OOXML package: header inconsistency detected"
+        ),
+        "{}",
+        e.message
+    );
+    assert_eq!(parts_held("/docs/twice.docx"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0088_023_shared_strings_named_before_a_sheet() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let doc = zip_raw(&[
+        bomb_part("xl/sharedStrings.xml"),
+        raw_part("xl/workbook.xml", WORKBOOK.as_bytes()),
+        raw_part("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.as_bytes()),
+        bomb_part("xl/worksheets/sheet1.xml"),
+    ]);
+    seed(&f, "/docs/two.xlsx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/two.xlsx", false).await;
+
+    part_refusal(&v, "/docs/two.xlsx", "xl/sharedStrings.xml", 200_000_000, 0);
+}
+
+#[tokio::test]
+async fn e2e_0088_024_first_slide_lies_second_is_a_bomb() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let doc = zip_raw(&[
+        raw_part("ppt/presentation.xml", PRESENTATION.as_bytes()),
+        raw_part("ppt/_rels/presentation.xml.rels", PRESENTATION_RELS.as_bytes()),
+        RawPart { declared: 10, ..raw_part("ppt/slides/slide1.xml", &[b' '; 1_000]) },
+        bomb_part("ppt/slides/slide2.xml"),
+    ]);
+    seed(&f, "/docs/order.pptx", &doc).await;
+
+    let v = extract_text(&f, OWNER, "/docs/order.pptx", false).await;
+
+    lie_refusal(&v, "/docs/order.pptx", "ppt/slides/slide1.xml", 10);
+}
+
+#[tokio::test]
+async fn e2e_0088_025_not_a_member() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.docx", &zip_raw(&[bomb_part("word/document.xml")])).await;
+    office_held_reset();
+
+    let denied = f.state.authorize(MOUNT, "eve@example.com").await;
+
+    let Err(e) = &denied else { panic!("a non member must be refused") };
+    assert_eq!(e.code, code::FORBIDDEN, "{e:?}");
+    assert_eq!(e.message, "'eve@example.com' is not a member of 'atlas'");
+    assert_eq!(parts_held("/docs/bomb.docx"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0088_026_missing_path() {
+    let f = office_fixture().await;
+
+    let v = extract_text(&f, OWNER, "/docs/none.docx", false).await;
+
+    let Err(e) = &v else { panic!("must be refused: {v:?}") };
+    assert_eq!(e.code, code::NOT_FOUND, "{e:?}");
+    assert_eq!(e.message, "not a file: /docs/none.docx");
+}
