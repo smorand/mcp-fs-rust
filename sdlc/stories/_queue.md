@@ -211,3 +211,13 @@
 | US-0209 | SPEC-0088 | unread parts, cached companions and other formats unchanged | US-0208 | 2 | landed | story/US-0209-unread-parts-cached-companions-and-other | story/US-0208-bound-the-extracted-content |
 | US-0210 | SPEC-0088 | a refusal leaves no trace and one log line | US-0209 | 2 | landed | story/US-0210-a-refusal-leaves-no-trace-and-one-log-li | story/US-0209-unread-parts-cached-companions-and-other |
 | US-0211 | SPEC-0088 | Office limits through the HTTP door and documentation | US-0210 | 2 | landed | story/US-0211-office-limits-through-the-http-door-and | story/US-0210-a-refusal-leaves-no-trace-and-one-log-li |
+| US-0212 | SPEC-0089 | bound every PDF stream the text pass decodes | US-0211 | 1 | todo | | |
+| US-0213 | SPEC-0089 | encrypted PDFs, cross reference, LZW and ASCII85 streams under the same limit | US-0212 | 1 | todo | | |
+| US-0214 | SPEC-0089 | the load total and the object limit | US-0213 | 2 | todo | | |
+| US-0215 | SPEC-0089 | the page total, repeats and saved states | US-0214 | 2 | todo | | |
+| US-0216 | SPEC-0089 | the content limit for a PDF | US-0215 | 2 | todo | | |
+| US-0217 | SPEC-0089 | PDF refusals in order, without trace, at both doors | US-0216 | 2 | todo | | |
+| US-0218 | SPEC-0089 | cap the converter's text answer and stop it | US-0217 | 2 | todo | | |
+| US-0219 | SPEC-0089 | diagnostic and bundle mode outputs held small | US-0218 | 2 | todo | | |
+| US-0220 | SPEC-0089 | cap the web converter's answer | US-0219 | 2 | todo | | |
+| US-0221 | SPEC-0089 | converter refusals through the HTTP door and documentation | US-0220 | 2 | todo | | |

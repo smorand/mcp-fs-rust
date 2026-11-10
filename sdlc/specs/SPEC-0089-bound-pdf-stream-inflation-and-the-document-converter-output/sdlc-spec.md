@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 2 bounded contexts (document text extraction for PDF, document conversion through the external converter), 14 requirements, public behavior change (a PDF whose streams, objects or text pass fixed limits is refused instead of being decoded whole; a converter answer past the converter limit is refused instead of being read whole), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-10
 > Project: existing
 > From backlog: BL-0142, BL-0143
