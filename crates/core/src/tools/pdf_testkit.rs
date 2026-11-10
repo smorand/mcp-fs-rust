@@ -83,6 +83,14 @@ pub(crate) fn bomb(dict_extra: &str) -> PdfObj {
     PdfObj::Stream(dict, stored)
 }
 
+/// `data` as one zlib stream, compressed for real (a few megabytes at most).
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(data).expect("a vector takes every write");
+    encoder.finish().expect("a vector takes every write")
+}
+
 /// The content of an object stream holding `objects`: the `n off` pairs, the
 /// objects, then `padding` spaces; returns the text before the padding and `/First`.
 fn object_stream_head(objects: &[(u32, &str)]) -> (String, usize) {
@@ -141,6 +149,50 @@ impl PdfWriter {
         self.objects.insert(number, PdfObj::Stream(dict, stored));
         for (index, (n, _)) in objects.iter().enumerate() {
             self.compressed.insert(*n, (number, index as u16));
+        }
+        self
+    }
+
+    /// Object stream `number` holding `count` copies of the pair `pair` (all at
+    /// offset 0 of the one object `object`), deflated. The pairs are not listed
+    /// in the cross reference: the stream is the attacker's claim of objects.
+    pub(crate) fn object_stream_pairs(
+        &mut self,
+        number: u32,
+        pair: (u32, u32),
+        count: usize,
+        object: &str,
+    ) -> &mut Self {
+        let unit = format!("{} {} ", pair.0, pair.1);
+        let content = format!("{}{object}", unit.repeat(count));
+        let dict = |len: usize| {
+            format!(
+                "<< /Type /ObjStm /N {count} /First {} /Filter /FlateDecode /Length {len} >>",
+                unit.len() * count
+            )
+        };
+        let stored = zlib(content.as_bytes());
+        self.objects.insert(number, PdfObj::Stream(dict(stored.len()), stored));
+        self
+    }
+
+    /// Object stream `number` holding `count` `null` objects numbered `first`
+    /// upwards, each listed in the cross reference.
+    pub(crate) fn object_stream_nulls(&mut self, number: u32, first: u32, count: u32) -> &mut Self {
+        let mut pairs = String::new();
+        for i in 0..count {
+            pairs.push_str(&format!("{} {} ", first + i, 5 * i));
+        }
+        let content = format!("{pairs}{}", "null ".repeat(count as usize));
+        let stored = zlib(content.as_bytes());
+        let dict = format!(
+            "<< /Type /ObjStm /N {count} /First {} /Filter /FlateDecode /Length {} >>",
+            pairs.len(),
+            stored.len()
+        );
+        self.objects.insert(number, PdfObj::Stream(dict, stored));
+        for i in 0..count {
+            self.compressed.insert(first + i, (number, i as u16));
         }
         self
     }
@@ -567,6 +619,53 @@ pub(crate) fn old_filters_pdf() -> Vec<u8> {
         ],
         "",
     );
+    small(w.finish())
+}
+
+/// Most decoded bytes a call may hold: the load total, one measuring chunk
+/// past it, and 10 000 bytes of small streams (SPEC-0089 section 9).
+pub(crate) const LOAD_HELD: u64 = 268_500_992;
+
+/// A document of one page reading `text`, whose objects 30, 31 and 32 sit in
+/// object streams 20, 21 and 22 inflating to `totals` bytes each (E2E-009,
+/// E2E-010, E2E-SEC-009); the objects are padded with spaces.
+pub(crate) fn object_streams_pdf(text: &str, totals: [usize; 3]) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain(&format!("BT /F1 12 Tf 72 700 Td ({text}) Tj ET"))], "");
+    for (i, total) in totals.into_iter().enumerate() {
+        let objects = [(30 + i as u32, "<< /Pad 1 >>")];
+        let (head, _) = object_stream_head(&objects);
+        w.object_stream(20 + i as u32, &objects, total - head.len());
+    }
+    w.finish()
+}
+
+/// Objects the load counts outside the padding of [`many_pdf`]: the catalog,
+/// the page tree, the page, its content and its font, the padding's object
+/// stream and the cross reference stream.
+const MANY_OUTSIDE: u32 = 7;
+
+/// E2E-011 and E2E-012: one page reading `Many`, and `null` objects with
+/// distinct numbers in one object stream, so that the document holds exactly
+/// 1 000 000 objects when `over` is 0 and 1 000 001 when it is 1.
+pub(crate) fn many_pdf(over: u32) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain("BT /F1 12 Tf 72 700 Td (Many) Tj ET")], "");
+    w.object_stream_nulls(20, 100, 1_000_000 - MANY_OUTSIDE + over);
+    w.finish()
+}
+
+/// E2E-026: object stream 5 holds 1 000 001 pairs `1 0` over one `null`
+/// (within 10 000 000 decoded bytes), object stream 9 is a PDF bomb stream.
+pub(crate) fn order_pdf() -> Vec<u8> {
+    let mut w = pages_writer(vec![plain("BT /F1 12 Tf 72 700 Td (Hi) Tj ET")], "");
+    w.object_stream_pairs(5, (1, 0), 1_000_001, "null");
+    w.object(9, bomb("/Type /ObjStm /N 1 /First 4"));
+    small(w.finish())
+}
+
+/// E2E-SEC-010: object stream 20 holds 2 000 000 pairs `1 0` over one `null`.
+pub(crate) fn nulls_pdf() -> Vec<u8> {
+    let mut w = pages_writer(vec![plain("BT /F1 12 Tf 72 700 Td (Hi) Tj ET")], "");
+    w.object_stream_pairs(20, (1, 0), 2_000_000, "null");
     small(w.finish())
 }
 

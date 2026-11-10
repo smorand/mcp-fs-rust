@@ -26,6 +26,13 @@ use std::rc::Rc;
 /// Largest decoded size of one PDF stream (SPEC-0089 FR-NEW-002).
 pub(crate) const STREAM_LIMIT: u64 = 104_857_600;
 
+/// Largest total decoded size of the compressed object streams of one PDF
+/// (SPEC-0089 FR-NEW-003).
+pub(crate) const LOAD_LIMIT: u64 = 268_435_456;
+
+/// Most objects one PDF may hold (SPEC-0089 FR-NEW-001).
+pub(crate) const OBJECT_LIMIT: u64 = 1_000_000;
+
 /// Bytes the measurer inflates at a time: the only decoded data it holds.
 const CHUNK: usize = 65_536;
 
@@ -50,6 +57,18 @@ fn over_stream_limit() -> ToolError {
     ToolError::invalid_argument("a PDF stream decodes to more than 104857600 bytes")
 }
 
+/// The refusal of FR-NEW-003, before `prepare_extraction` names the path.
+fn over_load_limit() -> ToolError {
+    ToolError::invalid_argument(
+        "the PDF object streams decode to more than 268435456 bytes together",
+    )
+}
+
+/// The refusal of FR-NEW-001, before `prepare_extraction` names the path.
+fn over_object_limit() -> ToolError {
+    ToolError::invalid_argument("the PDF holds more than 1000000 objects")
+}
+
 /// What the text pass gives back: page texts (trimmed, in order, empty pages
 /// included), the body assembled as before, and the title.
 pub(crate) struct PdfText {
@@ -68,6 +87,10 @@ struct PdfBudget {
     held: u64,
     page: u64,
     content: u64,
+    /// Decoded bytes of the object streams measured so far by the load.
+    load: u64,
+    /// Objects counted so far by the load.
+    objects: u64,
 }
 
 impl PdfBudget {
@@ -588,9 +611,19 @@ fn load(data: &[u8], budget: &mut PdfBudget) -> Result<Document> {
         .filter(|(_, o)| o.as_stream().is_ok_and(|s| s.dict.has_type(DEFERRED)))
         .map(|(id, _)| *id)
         .collect();
+    // The objects outside the object streams, before any stream is decoded.
+    budget.objects = doc.objects.len() as u64;
+    if budget.objects > OBJECT_LIMIT {
+        return Err(over_object_limit());
+    }
     for id in deferred {
         let Some(Object::Stream(stream)) = doc.objects.get(&id) else { continue };
         let mut plain = plain_object_stream(stream, budget)?;
+        // Counted from the index block, before `ObjectStream::new` parses a member.
+        budget.objects = budget.objects.saturating_add(pair_count(&plain));
+        if budget.objects > OBJECT_LIMIT {
+            return Err(over_object_limit());
+        }
         match ObjectStream::new(&mut plain) {
             Ok(parsed) => {
                 drop(plain);
@@ -663,6 +696,18 @@ fn plain_object_stream(stream: &Stream, budget: &mut PdfBudget) -> Result<Stream
     dict.remove(b"Filter");
     dict.remove(b"DecodeParms");
     Ok(Stream::new(dict, decoded.unwrap_or_else(|| stream.content.clone())))
+}
+
+/// The pairs in the index block of the plain object stream `stream`, counted as
+/// `ObjectStream::new` splits them (`lopdf-0.42.0/src/object_stream.rs:60-70`):
+/// whitespace separated numbers, two to a pair, whatever the numbers are. A
+/// block it would refuse (no readable `First`, not UTF-8) holds no pair.
+/// O(First) time, no allocation.
+fn pair_count(stream: &Stream) -> u64 {
+    let first = stream.dict.get(b"First").and_then(Object::as_i64).ok();
+    let block = first.and_then(|f| usize::try_from(f).ok()).and_then(|f| stream.content.get(..f));
+    let text = block.and_then(|b| std::str::from_utf8(b).ok());
+    text.map_or(0, |t| t.split_whitespace().count() as u64 / 2)
 }
 
 /// Move every stream's `Filter` aside, so the reader inflates nothing it was
@@ -1000,6 +1045,9 @@ fn inflate_some(
 /// predictor's row buffers and output, checked against the stream limit.
 struct Count<'b> {
     total: u64,
+    /// Bytes the load has measured before this stream, when this one is an
+    /// object stream: its running sum is the load total.
+    load_base: Option<u64>,
     /// The last step runs the predictor: its output is counted twice.
     predicted_last: Option<usize>,
     budget: &'b mut PdfBudget,
@@ -1016,6 +1064,10 @@ impl Count<'_> {
         // the limit; equal is accepted.
         if self.total > STREAM_LIMIT {
             return Err(over_stream_limit());
+        }
+        // The load total, on the running sum, after the stream limit.
+        if self.load_base.is_some_and(|base| base.saturating_add(self.total) > LOAD_LIMIT) {
+            return Err(over_load_limit());
         }
         Ok(())
     }
@@ -1071,6 +1123,7 @@ fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64>
     let mut count = Count {
         total: if predicted_last.is_some() { rows.unwrap_or(0) } else { 0 },
         predicted_last,
+        load_base: matches!(scope, Scope::Load).then_some(budget.load),
         budget,
     };
     if count.total > STREAM_LIMIT {
@@ -1095,8 +1148,10 @@ fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64>
         }
     }
     let total = count.total;
-    if let Scope::Page = scope {
-        budget.page = budget.page.saturating_add(total);
+    match scope {
+        Scope::Page => budget.page = budget.page.saturating_add(total),
+        Scope::Load => budget.load = budget.load.saturating_add(total),
+        Scope::Guard => {}
     }
     Ok(total)
 }

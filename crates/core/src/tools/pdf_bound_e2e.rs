@@ -208,3 +208,89 @@ async fn pdf_lzw_and_ascii85_text_is_unchanged() {
     let expected = "---\n*[Page 1]*\n\nOld LZW\n\n---\n*[Page 2]*\n\nOld A85";
     unchanged_on("/docs/old.pdf", &old_filters_pdf(), expected).await;
 }
+
+/// The refusal of `doc` with `message`, and the decoded bytes held at most `cap`.
+async fn refused_with(doc: &str, bytes: &[u8], message: &str, cap: u64) {
+    let f = office_fixture().await;
+    seed(&f, doc, bytes).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, doc, false).await;
+
+    let held = decoded_held(doc);
+    assert!(held <= cap, "the extraction held {held} decoded bytes, more than {cap}");
+    let Err(e) = &v else { panic!("the extraction must be refused; it held {held} bytes: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, format!("could not extract {doc}: {message}"));
+    nothing_left(&f, doc, None).await;
+}
+
+const LOAD_MESSAGE: &str = "the PDF object streams decode to more than 268435456 bytes together";
+const OBJECTS_MESSAGE: &str = "the PDF holds more than 1000000 objects";
+
+/// Store `bytes` at `doc`, extract it, and check the preview is `expected`.
+async fn accepted_with(doc: &str, bytes: &[u8], expected: &str) {
+    let f = office_fixture().await;
+    seed(&f, doc, bytes).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, doc, false).await.expect("at the limit");
+
+    let held = decoded_held(doc);
+    assert!(held <= LOAD_HELD, "the extraction held {held} decoded bytes, more than {LOAD_HELD}");
+    assert_eq!(v["preview"], json!(expected), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_009_three_object_streams_over_the_loa() {
+    let _heavy = heavy().await;
+    let bytes = small(object_streams_pdf("Fine", [100_000_000; 3]));
+    refused_with("/docs/objs3.pdf", &bytes, LOAD_MESSAGE, LOAD_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_010_two_million_objects() {
+    let _heavy = heavy().await;
+    refused_with("/docs/nulls.pdf", &nulls_pdf(), OBJECTS_MESSAGE, LOAD_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_009_object_streams_totalling_exactly_the() {
+    let _heavy = heavy().await;
+    let bytes = object_streams_pdf("Fine", [100_000_000, 100_000_000, 68_435_456]);
+    accepted_with("/docs/objs.pdf", &bytes, "---\n*[Page 1]*\n\nFine").await;
+}
+
+#[tokio::test]
+async fn e2e_0089_010_object_streams_one_byte_over_the_load() {
+    let _heavy = heavy().await;
+    let bytes = object_streams_pdf("Fine", [100_000_000, 100_000_000, 68_435_457]);
+    refused_with("/docs/objs.pdf", &bytes, LOAD_MESSAGE, LOAD_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_011_exactly_1_000_000_objects() {
+    let _heavy = heavy().await;
+    accepted_with("/docs/many.pdf", &many_pdf(0), "---\n*[Page 1]*\n\nMany").await;
+}
+
+#[tokio::test]
+async fn e2e_0089_012_1_000_001_objects() {
+    let _heavy = heavy().await;
+    refused_with("/docs/many.pdf", &many_pdf(1), OBJECTS_MESSAGE, LOAD_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_026_object_count_met_before_a_later_objec() {
+    let _heavy = heavy().await;
+    refused_with("/docs/order1.pdf", &order_pdf(), OBJECTS_MESSAGE, LOAD_HELD).await;
+}
+
+/// The load total is met inside a third object stream that is also a bomb:
+/// decoding stops at the load total, 68 435 456 bytes in, not at the stream limit.
+#[tokio::test]
+async fn e2e_0089_sec_009_load_total_met_inside_a_bomb_stream() {
+    let _heavy = heavy().await;
+    let bytes = small(object_streams_pdf("Fine", [100_000_000, 100_000_000, PDF_BOMB]));
+    refused_with("/docs/objs3.pdf", &bytes, LOAD_MESSAGE, LOAD_HELD).await;
+}
