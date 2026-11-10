@@ -118,7 +118,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `conformance.rs` (one suite, every engine), `mod.rs` (factories, `RelationalRegistry`
   pool cache, StoreManager).
 - `core/` : `fs_ops.rs` (every filesystem operation, the engine the tools call), `diff.rs`.
-- `docs/` : `extract.rs`, `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
+- `docs/` : `extract.rs` (the Office readers go through `OfficeBudget`: part limit 104857600 decoded
+  bytes, call limit 268435456 declared bytes, content limit 268435456 bytes, SPEC-0088),
+  `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
   `ocr.rs` (pluggable, null by default), `mime.rs`, `service.rs` (the external
   document to Markdown converter, cli or api, off by default), `artifacts/` (parse,
   capture and render of the images and tables a conversion keeps; meta rows, never `nodes`).

@@ -333,8 +333,16 @@ cast `as i64`, so a declared size of 2^63 or more counted as a negative number, 
 then decoded in memory with no bound. Fixed: sizes convert with `i64::try_from(..).unwrap_or(i64::MAX)`,
 the sums saturate (`admit_paths`, `check_and_charge`, `charge_write`, which never charges a negative
 number), and the early check computes in `u128`/`i128`. The exploit tests are `e2e_0085_sec_001` to
-`e2e_0085_sec_005`. Known remaining gap: text extraction of Office documents (`.docx`, `.xlsx`,
-`.pptx`, `docs/extract.rs`) still decodes each part whole with no bound, BL-0134.
+`e2e_0085_sec_005`. The Office text extraction gap this note
+left open is closed by SPEC-0088 (below).
+
+Security note (2026-11-10, SPEC-0088): memory exhaustion in Office text extraction, the same class as
+the SPEC-0085 note. `docs/extract.rs` decoded every part of a `.docx`, `.xlsx` or `.pptx` whole with no
+bound, so a document of under 1 MB holding a part that inflates to hundreds of megabytes (or a
+part that lies about its size) exhausted the memory of the server. Fixed: `OfficeBudget` checks the
+declared size before decoding, caps the decode at the declared size and bounds the content. The exploit
+tests are `e2e_0088_sec_001` to `e2e_0088_sec_013`. Known gaps of the class: the converter output is
+read whole (BL-0142), PDF streams are inflated without a bound (BL-0143).
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,
@@ -410,6 +418,26 @@ mismatch, duplicate part names, overlapping parts) is refused with `could not ex
 <path>: not a valid OOXML package: <reason>` (`ERR_INVALID_ARGUMENT`), even when an up to
 date companion exists: the cached branch re reads the source bytes for those extensions
 (one extra blob read per cached OOXML call) and leaves the companion untouched.
+
+(2026-11-10, SPEC-0088.) The Office readers (`.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.pptm`, `.potx`,
+`.ppsx`, any letter case) are bounded by three limits: a part of at most 104857600 bytes decoded
+(checked on the declared size, before decoding), at most 268435456 declared bytes of parts per call
+(a part read twice counts twice), and at most 268435456 bytes of extracted content. A refusal is
+`ERR_INVALID_ARGUMENT` (HTTP 400 on `POST /api/fs/{mount_id}/extract-text`, same code and message)
+and its message starts `could not extract <path>: ` followed by one of:
+`document part '<part>' is <n> bytes once decoded, over the limit of 104857600 bytes`,
+`the document parts read total more than 268435456 bytes once decoded`,
+`the extracted content exceeds 268435456 bytes`,
+`document part '<part>' decodes to more bytes than declared <n>`.
+Parts are read in reading order, so the first refusal wins. A part holding more than it declares
+is now refused; before, it was read as absent and a lying sheet or slide vanished from the text.
+Parts never read (images, embedded files, nested archives) are not counted, and an up to date cached
+companion is answered without reading the document. A refusal writes no companion, artifact, charge
+or audit line and logs one INFO line; `log_tool_failure` is wired at both doors (`mcp/server.rs`,
+`api/dataplane.rs`). The tool description is unchanged (`TOOL_CONTRACT.txt` does not name the limits).
+Known gaps: BL-0142 (converter output read whole), BL-0143 (PDF streams unbounded), BL-0144 (a damaged
+part is read as absent), BL-0145 (uncounted transient copies), BL-0146 (readers run on the async
+worker thread).
 
 ## admin (17)
 

@@ -610,6 +610,23 @@ fn size_lie(name: &str, declared: u64) -> ToolError {
     ))
 }
 
+/// A reader that counts the bytes it hands out, for the test hook: the bytes
+/// a refused part yielded were held even though no text came out of them.
+#[cfg(test)]
+struct CountingReader<R> {
+    inner: R,
+    read: u64,
+}
+
+#[cfg(test)]
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+
 /// The one reader of Office parts and what one call has decoded through it.
 struct OfficeBudget {
     decoded: u64,
@@ -671,17 +688,33 @@ impl OfficeBudget {
         }
         self.declared += u128::from(declared);
         let Ok(file) = zip.by_index(index) else { return Ok(None) };
+        // The bytes a lying part yields are dropped with its refusal, so the
+        // test hook counts them at the reader (SPEC-0088 FR-NEW-006).
+        #[cfg(test)]
+        let mut file = CountingReader { inner: file, read: 0 };
+        #[cfg(not(test))]
+        let mut file = file;
         // Only a part holding more than it declares is a refusal; a bad
         // checksum, a damaged stream or any other read error stays absent
         // (BL-0144). Zip enforces the declared size itself, so its own error
         // is the same lie as the cap (SPEC-0088 DEC-004).
-        let read = match crate::tools::archive_single::read_capped(file, declared) {
+        let read = match crate::tools::archive_single::read_capped(&mut file, declared) {
             Ok(read) => read,
-            Err(ReadError::CapExceeded { .. }) => return Err(size_lie(name, declared)),
+            Err(ReadError::CapExceeded { .. }) => {
+                #[cfg(test)]
+                {
+                    self.decoded += file.read;
+                }
+                return Err(size_lie(name, declared));
+            }
             Err(ReadError::Io(e))
                 if e.kind() == std::io::ErrorKind::InvalidData
                     && e.to_string().contains("larger than its declared") =>
             {
+                #[cfg(test)]
+                {
+                    self.decoded += file.read;
+                }
                 return Err(size_lie(name, declared));
             }
             Err(_) => return Ok(None),

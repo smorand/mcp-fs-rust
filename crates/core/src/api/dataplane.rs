@@ -3860,6 +3860,101 @@ mod tests {
         assert_eq!(lines[0].detail, "destination=/uploads/pack files_written=1 bytes_written=5");
     }
 
+    /// Nothing a refused Office extraction could leave is there: no companion at
+    /// `md`, no audit line for an extraction. Read with the harness's own client.
+    async fn office_nothing_left(h: &Harness, doc: &str, md: &str) {
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        assert!(c.exists(doc).await.unwrap());
+        assert!(!c.exists(md).await.unwrap());
+        let log = h.state.safety.audit(OWNER, MOUNT);
+        assert!(!log.iter().any(|e| e.op == "extract_text"), "{log:?}");
+    }
+
+    /// SPEC-0088/E2E-004: the REST door answers what the engine answers for a
+    /// Word document within the limits (E2E-001), with one extraction audit line.
+    #[tokio::test]
+    async fn e2e_0088_004_http_api_within_the_limits() {
+        use crate::tools::archive_testkit::office_zip;
+        let h = Harness::new().await;
+        let body = r#"<w:document xmlns:w="w"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Results</w:t></w:r></w:p><w:p><w:r><w:t>Quarterly results</w:t></w:r></w:p></w:body></w:document>"#;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        let doc = office_zip(&[("word/document.xml", body.as_bytes())]);
+        c.write_bytes_atomic("/docs/memo.docx", &doc).await.unwrap();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/memo.docx"})).await;
+
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["md_path"], "/docs/memo.md", "{v}");
+        assert_eq!(v["format"], "docx", "{v}");
+        assert_eq!(v["cached"], false, "{v}");
+        assert_eq!(v["preview"], "# Results\n\nQuarterly results", "{v}");
+        let lines: Vec<_> = h
+            .state
+            .safety
+            .audit(OWNER, MOUNT)
+            .into_iter()
+            .filter(|e| e.op == "extract_text")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].path, "/docs/memo.md");
+    }
+
+    /// SPEC-0088/E2E-014: a sheet larger than it declares is refused through the
+    /// REST door with the tool's code and message, and nothing is left.
+    #[tokio::test]
+    async fn e2e_0088_014_excel_sheet_larger_than_it_declares_t() {
+        use crate::tools::archive_testkit::{RawPart, raw_part, zip_raw};
+        let h = Harness::new().await;
+        let workbook = r#"<workbook xmlns:r="r"><sheets><sheet name="Good" sheetId="1" r:id="rId1"/><sheet name="Bad" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let rels = r#"<Relationships xmlns="x"><Relationship Id="rId1" Type="http://x/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://x/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let good = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>ok</t></is></c></row></sheetData></worksheet>"#;
+        let doc = zip_raw(&[
+            raw_part("xl/workbook.xml", workbook.as_bytes()),
+            raw_part("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            raw_part("xl/worksheets/sheet1.xml", good.as_bytes()),
+            RawPart { declared: 100, ..raw_part("xl/worksheets/sheet2.xml", &[b' '; 500_000]) },
+        ]);
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/liar.xlsx", &doc).await.unwrap();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/liar.xlsx"})).await;
+
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: could not extract /docs/liar.xlsx: document part 'xl/worksheets/sheet2.xml' decodes to more bytes than declared 100"
+        );
+        office_nothing_left(&h, "/docs/liar.xlsx", "/docs/liar.md").await;
+    }
+
+    /// SPEC-0088/E2E-029: a bomb part is refused through the REST door with the
+    /// tool's code and message, no decoded byte held, nothing left.
+    #[tokio::test]
+    async fn e2e_0088_029_the_http_api_refuses_a_bomb_alike() {
+        use crate::tools::archive_testkit::{bomb_part, heavy, zip_raw};
+        let _heavy = heavy().await;
+        let h = Harness::new().await;
+        let doc = zip_raw(&[bomb_part("word/document.xml")]);
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/bomb.docx", &doc).await.unwrap();
+        crate::tools::archive_testkit::office_held_reset();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/bomb.docx"})).await;
+
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: could not extract /docs/bomb.docx: document part 'word/document.xml' is 200000000 bytes once decoded, over the limit of 104857600 bytes"
+        );
+        assert_eq!(crate::tools::archive_testkit::parts_held("/docs/bomb.docx"), 0);
+        office_nothing_left(&h, "/docs/bomb.docx", "/docs/bomb.md").await;
+    }
+
     /// SPEC-0085 E2E-005: the REST door answers what the engine answers for a zip
     /// within the limits (E2E-001), and the session audit holds exactly one
     /// extraction line.

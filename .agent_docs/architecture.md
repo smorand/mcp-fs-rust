@@ -402,7 +402,7 @@ the loader on every platform. Gotcha: `--ignored --exact` skips a non ignored te
 `fs.extract_text` on a Word, Excel or PowerPoint document (`.docx`, `.xlsx`, `.xlsm`, `.pptx`,
 `.pptm`, `.potx`, `.ppsx`, any letter case) refuses, with `ERR_INVALID_ARGUMENT`, a part that
 declares more than 104 857 600 bytes once decoded, before decoding it; a part holding more than it
-declares is refused too. One call holds at most 268 435 456 bytes of decoded parts and 373 293 056
+declares is refused too. One call holds at most 268 435 456 bytes of decoded parts and 268 435 456
 bytes of extracted content. Parts are read in reading order, so the first refusal wins. A refused call
 leaves no companion change, artifact, charge or audit line, and logs one INFO line. Test only
 measurement hook: the thread local `OFFICE_HELD` in `docs/extract.rs`, read through `parts_held` and

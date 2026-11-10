@@ -328,11 +328,38 @@ stored at the target paths) against the project's remaining storage, and only th
 decoded, so a small archive that expands enormously is refused with zero bytes decoded. Sums use
 checked arithmetic and a declared size of 2^63 or more is refused at the limit. An entry that
 holds more than it declares stops at its declared size plus at most 64 KiB and the call is refused
-(`ERR_INVALID_ARGUMENT`). Office documents read for their text are not bounded yet (BL-0134). A zip whose entry headers disagree with its central directory
+(`ERR_INVALID_ARGUMENT`). A zip whose entry headers disagree with its central directory
 (name, sizes, checksum, compression, encryption, modification time), that holds two entries of
 the same name, or whose entries share bytes is refused the same way (`ERR_INVALID_ARGUMENT`,
 `archive is corrupt or not a valid zip file: header inconsistency detected: ...`), after the
 password answer for an encrypted one.
+
+## Office text extraction limits
+
+`fs.extract_text` (and `POST /api/fs/{mount_id}/extract-text`) on a Word, Excel or PowerPoint
+document (`.docx`, `.xlsx`, `.xlsm`, `.pptx`, `.pptm`, `.potx`, `.ppsx`, any letter case) is
+bounded by three limits, none configurable:
+
+* one part: at most 104857600 bytes once decoded, checked on the size the part declares before
+  anything is decoded;
+* one call: the parts read declare at most 268435456 bytes together (a part read twice counts
+  twice);
+* the extracted content (Markdown and table cells) is at most 268435456 bytes.
+
+A refusal is `ERR_INVALID_ARGUMENT` (HTTP 400) with one of four messages, each starting
+`could not extract <path>: `: `document part '<part>' is <n> bytes once decoded, over the limit of
+104857600 bytes`, `the document parts read total more than 268435456 bytes once decoded`, `the
+extracted content exceeds 268435456 bytes`, and `document part '<part>' decodes to more bytes than
+declared <n>`. The last one is new: a part holding more than it declares was read as absent
+(a sheet or slide silently dropped); it is refused now. Parts that are never read (images,
+embedded files, nested archives) do not count, and an up to date cached companion is answered
+without reading the document. A refusal writes no companion, artifact, charge or audit line, and
+logs one INFO line; both the assistant tool and the REST door log it. Both doors give the same
+code and message. A damaged part that does not exceed its size is still read as absent (BL-0144).
+
+Known gaps, not fixed by this limit: the document converter output is read whole (BL-0142), PDF
+streams are inflated without a bound (BL-0143), a damaged part is read as absent (BL-0144),
+transient copies are not counted (BL-0145), the readers run on the async worker thread (BL-0146).
 
 ## Project quota enforcement
 
