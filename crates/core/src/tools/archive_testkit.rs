@@ -511,6 +511,11 @@ pub(crate) fn parts_held(path: &str) -> u64 {
     crate::docs::extract::OFFICE_HELD.with(|m| m.borrow().get(path).map_or(0, |h| h.parts))
 }
 
+/// Bytes of extracted content the extraction of `path` built, 0 when it read no part.
+pub(crate) fn content_held(path: &str) -> u64 {
+    crate::docs::extract::OFFICE_HELD.with(|m| m.borrow().get(path).map_or(0, |h| h.content))
+}
+
 /// Nothing the refused extraction of `doc` could leave is there: no companion
 /// (or `companion_before` byte for byte), no artifact, no audit line, and the
 /// whole default session allowance is still free.

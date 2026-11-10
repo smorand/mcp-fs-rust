@@ -471,30 +471,39 @@ fn capped(rows: &[Vec<String>]) -> &[Vec<String>] {
 }
 
 /// Render rows as a GitHub Markdown table. Port of the C# `MdTable`: newlines
-/// collapse to spaces, pipes are escaped, short rows are padded.
-fn md_table(rows: &[Vec<String>]) -> String {
-    let mut cleaned: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            r.iter().map(|c| c.replace('\n', " ").replace('|', "\\|").trim().to_string()).collect()
-        })
-        .collect();
-    if cleaned.is_empty() {
-        return String::new();
+/// collapse to spaces, pipes are escaped, short rows are padded. Each cell and
+/// its ` | ` separator is charged to `budget` before it is appended, so the
+/// table never grows more than one cell past the content limit. Time and space
+/// O(total cell bytes).
+fn md_table(rows: &[Vec<String>], budget: &mut OfficeBudget) -> Result<String> {
+    if rows.is_empty() {
+        return Ok(String::new());
     }
-    let width = cleaned.iter().map(Vec::len).max().unwrap_or(0);
-    for row in &mut cleaned {
-        while row.len() < width {
-            row.push(String::new());
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        out.push_str(if index == 0 { "| " } else { "\n| " });
+        for column in 0..width {
+            let cell = row
+                .get(column)
+                .map(|c| c.replace('\n', " ").replace('|', "\\|").trim().to_string())
+                .unwrap_or_default();
+            budget.add_content(cell.len() + SEPARATOR.len())?;
+            if column > 0 {
+                out.push_str(SEPARATOR);
+            }
+            out.push_str(&cell);
+        }
+        out.push_str(" |");
+        if index == 0 {
+            out.push_str(&format!("\n| {} |", vec!["---"; width].join(SEPARATOR)));
         }
     }
-    let mut out = format!("| {} |\n", cleaned[0].join(" | "));
-    out.push_str(&format!("| {} |", vec!["---"; width].join(" | ")));
-    for row in cleaned.iter().skip(1) {
-        out.push_str(&format!("\n| {} |", row.join(" | ")));
-    }
-    out
+    Ok(out)
 }
+
+/// Between two cells of a Markdown table row.
+const SEPARATOR: &str = " | ";
 
 // ── PDF ──────────────────────────────────────────────────────────────────────
 
@@ -572,6 +581,8 @@ fn open_zip(data: &[u8]) -> Result<Zip> {
 pub(crate) struct OfficeHeld {
     /// Sum of the decoded part bytes of the call: an upper bound of what was held at once.
     pub(crate) parts: u64,
+    /// The content counter's final value: Markdown and kept table cells built.
+    pub(crate) content: u64,
 }
 
 #[cfg(test)]
@@ -586,6 +597,9 @@ thread_local! {
 /// Largest decoded size of one Office part (SPEC-0088 FR-NEW-001).
 pub(crate) const PART_LIMIT: u64 = 104_857_600;
 
+/// Most bytes of extracted content (Markdown and kept table cells) one call may build.
+pub(crate) const CONTENT_LIMIT: u64 = 268_435_456;
+
 /// Most declared bytes the parts read in one call may total.
 pub(crate) const CALL_LIMIT: u64 = 268_435_456;
 
@@ -599,6 +613,11 @@ fn size_lie(name: &str, declared: u64) -> ToolError {
 /// The one reader of Office parts and what one call has decoded through it.
 struct OfficeBudget {
     decoded: u64,
+    /// Bytes of extracted content built so far: Markdown lines, kept table
+    /// cells and rendered table cells (SPEC-0088 DEC-007). Only grows.
+    content: u64,
+    /// Most content one call may build; `None` never refuses (CSV).
+    content_limit: Option<u64>,
     /// Declared sizes of the parts read so far in this call, a `u128` so two
     /// sizes near `u64::MAX` never wrap.
     declared: u128,
@@ -606,7 +625,25 @@ struct OfficeBudget {
 
 impl OfficeBudget {
     fn office() -> Self {
-        Self { decoded: 0, declared: 0 }
+        Self { decoded: 0, content: 0, content_limit: Some(CONTENT_LIMIT), declared: 0 }
+    }
+
+    /// A budget that counts content and never refuses, for CSV.
+    fn unbounded() -> Self {
+        Self { content_limit: None, ..Self::office() }
+    }
+
+    /// Charge `bytes` of content about to be kept; over the limit refuses (equal
+    /// is accepted). The piece is charged after it exists, so the content held
+    /// is at most one piece, itself at most one part, past the limit.
+    fn add_content(&mut self, bytes: usize) -> Result<()> {
+        self.content = self.content.saturating_add(bytes as u64);
+        match self.content_limit {
+            Some(limit) if self.content > limit => Err(ToolError::invalid_argument(format!(
+                "the extracted content exceeds {limit} bytes"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// One part as text: `Ok(None)` when it is absent, unreadable or damaged
@@ -664,7 +701,8 @@ fn office(
     let mut budget = OfficeBudget::office();
     let outcome = open_zip(data).and_then(|mut zip| read(&mut zip, &mut budget));
     #[cfg(test)]
-    LAST_OFFICE_HELD.with(|c| c.set(Some(OfficeHeld { parts: budget.decoded })));
+    LAST_OFFICE_HELD
+        .with(|c| c.set(Some(OfficeHeld { parts: budget.decoded, content: budget.content })));
     outcome
 }
 
@@ -892,6 +930,7 @@ fn docx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult>
                         if let DocxMode::Paragraph { style, text } = &mode {
                             para_count += 1;
                             if let Some(line) = docx_paragraph_line(style, text.trim()) {
+                                budget.add_content(line.len())?;
                                 lines.push(line);
                             }
                             mode = DocxMode::Idle;
@@ -901,6 +940,7 @@ fn docx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult>
                         if let DocxMode::Table { depth, row, cell, in_cell, .. } = &mut mode
                             && *depth == 1
                         {
+                            budget.add_content(cell.len())?;
                             row.push(std::mem::take(cell));
                             *in_cell = false;
                         }
@@ -921,7 +961,7 @@ fn docx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult>
                                 let rows = std::mem::take(rows);
                                 if !rows.is_empty() {
                                     lines.push(String::new());
-                                    lines.push(md_table(capped(&rows)));
+                                    lines.push(md_table(capped(&rows), budget)?);
                                     grids.push((lines.len() - 1, String::new(), rows));
                                 }
                                 mode = DocxMode::Idle;
@@ -977,9 +1017,12 @@ fn pptx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult>
     let mut lines: Vec<String> = Vec::new();
     for (index, slide_part) in slides.iter().enumerate() {
         let Some(xml) = budget.read_part(zip, slide_part)? else { continue };
-        lines.push(format!("## Slide {}", index + 1));
+        let heading = format!("## Slide {}", index + 1);
+        budget.add_content(heading.len())?;
+        lines.push(heading);
         for para in drawing_paragraphs(&xml) {
             if !para.is_empty() {
+                budget.add_content(para.len())?;
                 lines.push(para);
             }
         }
@@ -988,7 +1031,9 @@ fn pptx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult>
         {
             let notes = all_text_of(&notes_xml, "t").trim().to_string();
             if !notes.is_empty() {
-                lines.push(format!("> Notes: {notes}"));
+                let line = format!("> Notes: {notes}");
+                budget.add_content(line.len())?;
+                lines.push(line);
             }
         }
     }
@@ -1113,12 +1158,14 @@ fn xlsx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult>
     let mut grids = Vec::new();
     for (name, part) in &sheets {
         let Some(xml) = budget.read_part(zip, part)? else { continue };
-        let rows = xlsx_rows(&xml, &shared);
+        let rows = xlsx_rows(&xml, &shared, budget)?;
         if rows.is_empty() {
             continue;
         }
-        lines.push(format!("## Sheet: {name}"));
-        lines.push(md_table(capped(&rows)));
+        let heading = format!("## Sheet: {name}");
+        budget.add_content(heading.len())?;
+        lines.push(heading);
+        lines.push(md_table(capped(&rows), budget)?);
         grids.push((lines.len() - 1, name.clone(), rows));
     }
     Ok(ExtractResult::of_blocks("xlsx", &lines, grids).with_meta("sheets", json!(sheets.len())))
@@ -1194,7 +1241,7 @@ fn xlsx_sheets(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<Vec<(String, 
 }
 
 /// Non empty rows of a worksheet, uncapped: the caller caps the rendering.
-fn xlsx_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
+fn xlsx_rows(xml: &str, shared: &[String], budget: &mut OfficeBudget) -> Result<Vec<Vec<String>>> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -1221,7 +1268,9 @@ fn xlsx_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
                 "v" | "t" => capture = false,
                 "c" => {
                     in_cell = false;
-                    row.push(xlsx_cell_text(&cell_type, &value, shared));
+                    let text = xlsx_cell_text(&cell_type, &value, shared);
+                    budget.add_content(text.len())?;
+                    row.push(text);
                 }
                 "row" if row.iter().any(|c| !c.trim().is_empty()) => {
                     rows.push(std::mem::take(&mut row));
@@ -1232,7 +1281,7 @@ fn xlsx_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
             Ok(_) => {}
         }
     }
-    rows
+    Ok(rows)
 }
 
 fn xlsx_cell_text(cell_type: &str, value: &str, shared: &[String]) -> String {
@@ -1352,7 +1401,8 @@ fn csv(data: &[u8]) -> ExtractResult {
     let rows = parse_csv(&decode(data));
     let shown = capped(&rows);
     let count = shown.len();
-    let md = md_table(shown);
+    // The unbounded budget never refuses, so the empty default is unreachable.
+    let md = md_table(shown, &mut OfficeBudget::unbounded()).unwrap_or_default();
     if md.is_empty() {
         return ExtractResult::of("csv", md).with_meta("rows", json!(count));
     }
@@ -1474,9 +1524,9 @@ pub(crate) mod tests {
     #[test]
     fn md_table_pads_escapes_and_flattens() {
         let rows = vec![vec!["a".into(), "b|c".into(), "d\ne".into()], vec!["1".into()]];
-        let table = md_table(&rows);
+        let table = md_table(&rows, &mut OfficeBudget::unbounded()).unwrap();
         assert_eq!(table, "| a | b\\|c | d e |\n| --- | --- | --- |\n| 1 |  |  |");
-        assert_eq!(md_table(&[]), "");
+        assert_eq!(md_table(&[], &mut OfficeBudget::unbounded()).unwrap(), "");
     }
 
     #[test]

@@ -555,3 +555,184 @@ async fn e2e_0088_026_missing_path() {
     assert_eq!(e.code, code::NOT_FOUND, "{e:?}");
     assert_eq!(e.message, "not a file: /docs/none.docx");
 }
+
+/// The content limit of SPEC-0088 FR-NEW-005.
+const CONTENT_LIMIT: u64 = 268_435_456;
+
+/// Most content a call may hold: the content limit plus one part.
+const CONTENT_HELD_MAX: u64 = 373_293_056;
+
+const WORKBOOK_S: &str = r#"<workbook xmlns:r="r"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+
+/// A workbook whose one shared text is 1 000 000 times `letter` and whose sheet
+/// `S` has `rows` rows, each a single cell referring to that text.
+fn repeated_text(letter: u8, rows: usize) -> Vec<u8> {
+    let (data, crc) = deflate_run("<sst><si><t>", letter, 1_000_000, "</t></si></sst>");
+    let strings = RawPart {
+        name: "xl/sharedStrings.xml".to_string(),
+        declared: 12 + 1_000_000 + 15,
+        crc: crc.sum(),
+        data,
+    };
+    let row = r#"<row><c t="s"><v>0</v></c></row>"#;
+    let sheet = format!("<worksheet><sheetData>{}</sheetData></worksheet>", row.repeat(rows));
+    let doc = zip_raw(&[
+        strings,
+        raw_part("xl/workbook.xml", WORKBOOK_S.as_bytes()),
+        raw_part("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.as_bytes()),
+        raw_part("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ]);
+    assert!(doc.len() < 100_000, "the workbook is stored in under 100 000 bytes: {}", doc.len());
+    doc
+}
+
+/// The content limit refusal of `doc`.
+fn content_refusal(v: &Result<Value>, doc: &str) {
+    let Err(e) = v else { panic!("the extraction must be refused") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        format!("could not extract {doc}: the extracted content exceeds 268435456 bytes")
+    );
+}
+
+#[tokio::test]
+async fn e2e_0088_sec_011_one_shared_text_multiplied_by_400() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/mult.xlsx", &repeated_text(b'a', 400)).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/mult.xlsx", false).await;
+
+    let held = content_held("/docs/mult.xlsx");
+    assert!(held <= CONTENT_HELD_MAX, "the extraction held {held} content bytes");
+    content_refusal(&v, "/docs/mult.xlsx");
+    assert!(held > CONTENT_LIMIT, "the counter saw the limit pass: {held}");
+    nothing_left(&f, "/docs/mult.xlsx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_020_content_just_under_the_content_limit() {
+    let _heavy = heavy().await;
+    let f = office_fixture_allowance(1_000_000_000).await;
+    seed(&f, "/docs/long.xlsx", &repeated_text(b'd', 100)).await;
+    office_held_reset();
+
+    // The default 200 000 character cut would drop the table from the artifact
+    // set (SPEC-0019 FR-NEW-034), so the whole text is asked for.
+    f.state.authorize(MOUNT, OWNER).await.unwrap();
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let v = crate::core::fs_ops::extract_document(
+        &c,
+        &f.state.safety,
+        &f.state.config.extract.ocr,
+        OWNER,
+        MOUNT,
+        "/docs/long.xlsx",
+        300_000_000,
+        4_000,
+        true,
+        false,
+    )
+    .await
+    .expect("within the limit");
+
+    assert_eq!(v["format"], "xlsx", "{v}");
+    assert!(content_held("/docs/long.xlsx") <= CONTENT_HELD_MAX);
+    let tables =
+        crate::tools::artifacts::list_tables(&f.state, MOUNT, "/docs/long.xlsx", None).await;
+    let tables = tables.unwrap();
+    let tables = tables["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 1, "{tables:?}");
+    // The artifact counts the rows under the header row.
+    assert_eq!(tables[0]["rows"], 99, "{tables:?}");
+}
+
+#[tokio::test]
+async fn e2e_0088_021_content_over_the_content_limit() {
+    let _heavy = heavy().await;
+    let f = office_fixture_allowance(1_000_000_000).await;
+    seed(&f, "/docs/long.xlsx", &repeated_text(b'd', 140)).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/long.xlsx", false).await;
+
+    let held = content_held("/docs/long.xlsx");
+    assert!(held <= CONTENT_HELD_MAX, "the extraction held {held} content bytes");
+    content_refusal(&v, "/docs/long.xlsx");
+    nothing_left(&f, "/docs/long.xlsx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_001_word_document_within_the_limits() {
+    let f = office_fixture().await;
+    let body = r#"<w:document xmlns:w="w"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Results</w:t></w:r></w:p><w:p><w:r><w:t>Quarterly results</w:t></w:r></w:p></w:body></w:document>"#;
+    seed(&f, "/docs/memo.docx", &office_zip(&[("word/document.xml", body.as_bytes())])).await;
+
+    let v = extract_text(&f, OWNER, "/docs/memo.docx", false).await.unwrap();
+
+    assert_eq!(v["md_path"], "/docs/memo.md", "{v}");
+    assert_eq!(v["format"], "docx", "{v}");
+    assert_eq!(v["cached"], false, "{v}");
+    assert_eq!(v["preview"], "# Results\n\nQuarterly results", "{v}");
+    assert_eq!(read(&f, "/docs/memo.md").await.unwrap(), b"# Results\n\nQuarterly results");
+    let log = f.state.safety.audit(OWNER, MOUNT);
+    let lines: Vec<_> = log.iter().filter(|e| e.op == "extract_text").collect();
+    assert_eq!(lines.len(), 1, "{log:?}");
+    assert_eq!(lines[0].path, "/docs/memo.md");
+}
+
+#[tokio::test]
+async fn e2e_0088_002_excel_workbook_within_the_limits_acce() {
+    let f = office_fixture().await;
+    let sheet = r#"<worksheet><sheetData><row><c t="inlineStr"><is><t>Poste</t></is></c><c t="inlineStr"><is><t>Montant</t></is></c></row><row><c t="s"><v>0</v></c><c><v>12</v></c></row></sheetData></worksheet>"#;
+    let workbook = r#"<workbook xmlns:r="r"><sheets><sheet name="Q1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+    let doc = office_zip(&[
+        ("xl/sharedStrings.xml", "<sst><si><t>Caf\u{e9}</t></si></sst>".as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ]);
+    seed(&f, "/docs/budget.xlsx", &doc).await;
+
+    let v = extract_text(&f, OWNER, "/docs/budget.xlsx", false).await.unwrap();
+
+    let preview = v["preview"].as_str().unwrap();
+    assert_eq!(
+        preview, "## Sheet: Q1\n\n| Poste | Montant |\n| --- | --- |\n| Caf\u{e9} | 12 |",
+        "{v}"
+    );
+    let tables = crate::tools::artifacts::list_tables(&f.state, MOUNT, "/docs/budget.xlsx", None)
+        .await
+        .unwrap();
+    let tables = tables["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 1, "{tables:?}");
+    assert_eq!(tables[0]["caption"], "Q1", "{tables:?}");
+}
+
+#[tokio::test]
+async fn e2e_0088_003_powerpoint_deck_within_the_limits_wit() {
+    let f = office_fixture().await;
+    let slide = |t: &str| {
+        format!(r#"<p:sld xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#)
+    };
+    let notes =
+        r#"<p:notes xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>Say hello</a:t></a:r></a:p></p:notes>"#;
+    let doc = office_zip(&[
+        ("ppt/presentation.xml", PRESENTATION.as_bytes()),
+        ("ppt/_rels/presentation.xml.rels", PRESENTATION_RELS.as_bytes()),
+        ("ppt/slides/slide1.xml", slide("Welcome").as_bytes()),
+        ("ppt/slides/_rels/slide1.xml.rels", SLIDE_RELS.as_bytes()),
+        ("ppt/notesSlides/notesSlide1.xml", notes.as_bytes()),
+        ("ppt/slides/slide2.xml", slide("Plan").as_bytes()),
+    ]);
+    seed(&f, "/docs/deck.pptx", &doc).await;
+
+    let v = extract_text(&f, OWNER, "/docs/deck.pptx", false).await.unwrap();
+
+    assert_eq!(
+        v["preview"], "## Slide 1\n\nWelcome\n\n> Notes: Say hello\n\n## Slide 2\n\nPlan",
+        "{v}"
+    );
+}
