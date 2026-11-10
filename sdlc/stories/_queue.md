@@ -204,3 +204,10 @@
 | US-0202 | SPEC-0087 | decrypt RAR4 headers to see a cut with the right password | US-0201 | 1 | landed | story/US-0202-decrypt-rar4-headers-to-see-a-cut-with-t | story/US-0201-decrypt-rar5-headers-to-see-a-cut-with-t |
 | US-0203 | SPEC-0087 | password questions first, every cut of an encrypted names archive | US-0202 | 2 | landed | story/US-0203-password-questions-first-every-cut-of-an | story/US-0202-decrypt-rar4-headers-to-see-a-cut-with-t |
 | US-0204 | SPEC-0087 | cut RAR archives through the HTTP door and documentation | US-0203 | 2 | landed | story/US-0204-cut-rar-archives-through-the-http-door-a | story/US-0203-password-questions-first-every-cut-of-an |
+| US-0205 | SPEC-0088 | refuse an Office part declared over the part limit | US-0204 | 1 | todo | | |
+| US-0206 | SPEC-0088 | count the parts read together | US-0205 | 2 | todo | | |
+| US-0207 | SPEC-0088 | refuse a part larger than it declares, in reading order | US-0206 | 2 | todo | | |
+| US-0208 | SPEC-0088 | bound the extracted content | US-0207 | 2 | todo | | |
+| US-0209 | SPEC-0088 | unread parts, cached companions and other formats unchanged | US-0208 | 2 | todo | | |
+| US-0210 | SPEC-0088 | a refusal leaves no trace and one log line | US-0209 | 2 | todo | | |
+| US-0211 | SPEC-0088 | Office limits through the HTTP door and documentation | US-0210 | 2 | todo | | |

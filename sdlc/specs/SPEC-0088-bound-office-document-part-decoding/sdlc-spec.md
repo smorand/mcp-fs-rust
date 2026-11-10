@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (document text extraction, its Word, Excel and PowerPoint readers), 11 requirements, public behavior change (a document whose parts decode past a fixed limit is refused instead of being read whole; a part larger than it declares is refused instead of being read as absent), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-10
 > Project: existing
 > From backlog: BL-0134
