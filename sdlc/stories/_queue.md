@@ -208,6 +208,6 @@
 | US-0206 | SPEC-0088 | count the parts read together | US-0205 | 2 | landed | story/US-0206-count-the-parts-read-together | story/US-0205-refuse-an-office-part-declared-over-the |
 | US-0207 | SPEC-0088 | refuse a part larger than it declares, in reading order | US-0206 | 2 | landed | story/US-0207-refuse-a-part-larger-than-it-declares-in | story/US-0206-count-the-parts-read-together |
 | US-0208 | SPEC-0088 | bound the extracted content | US-0207 | 2 | landed | story/US-0208-bound-the-extracted-content | story/US-0207-refuse-a-part-larger-than-it-declares-in |
-| US-0209 | SPEC-0088 | unread parts, cached companions and other formats unchanged | US-0208 | 2 | todo | | |
+| US-0209 | SPEC-0088 | unread parts, cached companions and other formats unchanged | US-0208 | 2 | landed | story/US-0209-unread-parts-cached-companions-and-other | story/US-0208-bound-the-extracted-content |
 | US-0210 | SPEC-0088 | a refusal leaves no trace and one log line | US-0209 | 2 | todo | | |
 | US-0211 | SPEC-0088 | Office limits through the HTTP door and documentation | US-0210 | 2 | todo | | |

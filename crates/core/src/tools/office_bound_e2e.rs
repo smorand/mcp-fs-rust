@@ -736,3 +736,131 @@ async fn e2e_0088_003_powerpoint_deck_within_the_limits_wit() {
         "{v}"
     );
 }
+
+#[tokio::test]
+async fn e2e_0088_005_up_to_date_companion_answers_without() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.docx", &zip_raw(&[bomb_part("word/document.xml")])).await;
+    seed(&f, "/docs/bomb.md", b"kept text").await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/bomb.docx", false).await.unwrap();
+
+    assert_eq!(v["cached"], true, "{v}");
+    assert_eq!(v["md_path"], "/docs/bomb.md", "{v}");
+    assert_eq!(v["preview"], "kept text", "{v}");
+    assert_eq!(parts_held("/docs/bomb.docx"), 0);
+}
+
+/// A `deflate_run` part of 200 000 000 bytes named `name`, which no reader may open.
+fn unread_bomb(name: &str) -> RawPart {
+    let (data, crc) = deflate_run("", b'a', BOMB as usize, "");
+    RawPart { name: name.to_string(), declared: BOMB, crc: crc.sum(), data }
+}
+
+#[tokio::test]
+async fn e2e_0088_017_huge_embedded_image_is_not_read() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let body = r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>See photo</w:t></w:r></w:p></w:body></w:document>"#;
+    let doc = zip_raw(&[
+        raw_part("word/document.xml", body.as_bytes()),
+        unread_bomb("word/media/image1.png"),
+    ]);
+    seed(&f, "/docs/photo.docx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/photo.docx", false).await.unwrap();
+
+    assert_eq!(v["preview"], "See photo", "{v}");
+    let held = parts_held("/docs/photo.docx");
+    assert!(held <= 65_536, "the extraction held {held} decoded bytes");
+}
+
+#[tokio::test]
+async fn e2e_0088_018_nested_archive_is_not_opened() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let inner = zip_raw(&[unread_bomb("big.bin")]);
+    let body = r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>Outer</w:t></w:r></w:p></w:body></w:document>"#;
+    let doc = zip_raw(&[
+        raw_part("word/document.xml", body.as_bytes()),
+        raw_part("word/embeddings/inner.zip", &inner),
+    ]);
+    seed(&f, "/docs/nested.docx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/nested.docx", false).await.unwrap();
+
+    assert_eq!(v["preview"], "Outer", "{v}");
+    assert!(!exists(&f, "/docs/nested").await);
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let listing = crate::core::fs_ops::list_dir(&c, "/docs", true, "name", false).await.unwrap();
+    assert!(!listing.to_string().contains("\"nested\""), "{listing}");
+    let held = parts_held("/docs/nested.docx");
+    assert!(held <= 65_536, "the extraction held {held} decoded bytes");
+}
+
+#[tokio::test]
+async fn e2e_0088_019_huge_unread_part_in_a_workbook() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let sheet = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>fine</t></is></c></row></sheetData></worksheet>"#;
+    let doc = zip_raw(&[
+        raw_part("xl/workbook.xml", WORKBOOK_S.as_bytes()),
+        raw_part("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.as_bytes()),
+        raw_part("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        unread_bomb("xl/media/video.bin"),
+    ]);
+    seed(&f, "/docs/media.xlsx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/media.xlsx", false).await.unwrap();
+
+    assert!(v["preview"].as_str().unwrap().contains("fine"), "{v}");
+    let held = parts_held("/docs/media.xlsx");
+    assert!(held <= 65_536, "the extraction held {held} decoded bytes");
+}
+
+#[tokio::test]
+async fn e2e_0088_027_not_a_zip_unchanged() {
+    let f = office_fixture().await;
+    seed(&f, "/docs/fake.docx", b"plain words").await;
+
+    let v = extract_text(&f, OWNER, "/docs/fake.docx", false).await;
+
+    let Err(e) = &v else { panic!("must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert!(
+        e.message.starts_with("could not extract /docs/fake.docx: not a valid OOXML package:"),
+        "{}",
+        e.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_0088_028_word_document_without_its_main_part_u() {
+    let f = office_fixture().await;
+    seed(&f, "/docs/empty.docx", &office_zip(&[("word/styles.xml", b"<styles/>")])).await;
+
+    let v = extract_text(&f, OWNER, "/docs/empty.docx", false).await;
+
+    let Err(e) = &v else { panic!("must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, "could not extract /docs/empty.docx: docx: word/document.xml is missing");
+}
+
+#[tokio::test]
+async fn e2e_0088_037_a_docm_file_is_not_read_as_a_word_doc() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/macro.docm", &zip_raw(&[bomb_part("word/document.xml")])).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/macro.docm", false).await.unwrap();
+
+    assert_eq!(v["format"], "text", "{v}");
+    assert_eq!(v["note"], "unknown extension .docm; decoded as text", "{v}");
+    assert_eq!(parts_held("/docs/macro.docm"), 0);
+}
