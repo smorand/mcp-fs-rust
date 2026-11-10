@@ -259,6 +259,9 @@ fn unauthorized(err: &ToolError) -> Response {
 fn error_response(err: &ToolError) -> Response {
     let status =
         StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // The one place a REST refusal is logged: INFO for a 4xx, ERROR for a 5xx. The line
+    // carries the error's display only, never the request body.
+    crate::logging::log_tool_failure("rest", err);
     // `detail` repeats the code, matching the reference server exactly.
     (status, Json(json!({"error": err.code, "detail": err.to_string()}))).into_response()
 }
@@ -2399,6 +2402,27 @@ mod tests {
         let (status, v) = h.post(&u("extract-text"), json!({"path": "/nope.pdf"})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(v["error"], code::NOT_FOUND);
+    }
+
+    /// A refused request is logged once, at the informational level: the caller caused it.
+    /// The capture records on the thread that took the lock, so the runtime is built here.
+    #[test]
+    fn rest_refusal_logs_one_info_line() {
+        let _capture = crate::logging::capture::lock_for_test();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+            async {
+                let h = Harness::new().await;
+                crate::logging::capture::clear();
+
+                let (status, _) = h.post(&u("extract-text"), json!({"path": "/nope.pdf"})).await;
+
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                let events = crate::logging::capture::events();
+                assert_eq!(events.len(), 1, "{events:?}");
+                assert_eq!(events[0].fields["level"], "INFO", "{events:?}");
+                assert!(events[0].fields["message"].contains("ERR_NOT_FOUND"), "{events:?}");
+            },
+        );
     }
 
     /// The route calls `fs_ops::apply_patch` directly. It used to dispatch through the

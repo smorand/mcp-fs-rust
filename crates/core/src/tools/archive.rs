@@ -1972,6 +1972,8 @@ pub(crate) mod tests {
                 "files_written".to_string(),
                 "bytes_written".to_string(),
                 "message".to_string(),
+                // Added by the capture itself (SPEC-0088), not a field of the event.
+                "level".to_string(),
             ]
             .into_iter()
             .collect();

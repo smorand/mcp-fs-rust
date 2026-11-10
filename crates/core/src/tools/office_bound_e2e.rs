@@ -864,3 +864,145 @@ async fn e2e_0088_037_a_docm_file_is_not_read_as_a_word_doc() {
     assert_eq!(v["note"], "unknown extension .docm; decoded as text", "{v}");
     assert_eq!(parts_held("/docs/macro.docm"), 0);
 }
+
+#[tokio::test]
+async fn e2e_0088_030_a_refusal_leaves_a_stale_companion_an() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/report.md", b"old text").await;
+    seed(&f, "/docs/report.docx", &with_bomb(&[("word/document.xml", "")], "word/document.xml"))
+        .await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/report.docx", false).await;
+
+    part_refusal(
+        &v,
+        "/docs/report.docx",
+        "word/document.xml",
+        BOMB,
+        parts_held("/docs/report.docx"),
+    );
+    assert_eq!(read(&f, "/docs/report.md").await.as_deref(), Some(&b"old text"[..]));
+    nothing_left(&f, "/docs/report.docx", Some(b"old text")).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_031_refresh_on_a_bomb_with_an_up_to_date() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.docx", &zip_raw(&[bomb_part("word/document.xml")])).await;
+    seed(&f, "/docs/bomb.md", b"kept text").await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/bomb.docx", true).await;
+
+    part_refusal(&v, "/docs/bomb.docx", "word/document.xml", BOMB, parts_held("/docs/bomb.docx"));
+    assert_eq!(read(&f, "/docs/bomb.md").await.as_deref(), Some(&b"kept text"[..]));
+    nothing_left(&f, "/docs/bomb.docx", Some(b"kept text")).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_032_repeating_a_refused_call() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.docx", &zip_raw(&[bomb_part("word/document.xml")])).await;
+    office_held_reset();
+
+    let first = extract_text(&f, OWNER, "/docs/bomb.docx", false).await;
+    let second = extract_text(&f, OWNER, "/docs/bomb.docx", false).await;
+
+    part_refusal(&first, "/docs/bomb.docx", "word/document.xml", BOMB, 0);
+    part_refusal(&second, "/docs/bomb.docx", "word/document.xml", BOMB, 0);
+    assert_eq!(first.unwrap_err().message, second.unwrap_err().message);
+    nothing_left(&f, "/docs/bomb.docx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_033_upper_case_suffix() {
+    let _heavy = heavy().await;
+    let doc = with_bomb(&[("word/document.xml", "")], "word/document.xml");
+    refused_on("/docs/BOMB.DOCX", &doc, "word/document.xml", BOMB, 0).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_034_the_four_other_suffixes() {
+    let _heavy = heavy().await;
+    let sheet = "xl/worksheets/sheet1.xml";
+    refused_on("/docs/b.xlsm", &book(sheet), sheet, BOMB, 65_536).await;
+    let slide = "ppt/slides/slide1.xml";
+    for doc in ["/docs/b.pptm", "/docs/b.potx", "/docs/b.ppsx"] {
+        refused_on(doc, &deck(slide), slide, BOMB, 65_536).await;
+    }
+}
+
+/// What the operator reads for a refusal: one informational line naming the
+/// code and the part, no error line, and no audit line. The capture records on
+/// the thread that took the lock, so the whole body runs on that one thread.
+#[test]
+fn e2e_0088_035_what_the_operator_sees_for_a_refusal() {
+    use crate::mcp::server::{ExtractTextArgs, McpServer};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let _capture = crate::logging::capture::lock_for_test();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let _heavy = heavy().await;
+        let f = office_fixture().await;
+        seed(&f, "/docs/bomb.docx", &zip_raw(&[bomb_part("word/document.xml")])).await;
+        let server = McpServer::new(f.state.clone(), OWNER.to_string());
+        let args = ExtractTextArgs {
+            mount_id: MOUNT.into(),
+            path: "/docs/bomb.docx".into(),
+            max_chars: 200_000,
+            preview_chars: 4_000,
+            ocr: true,
+            refresh: false,
+        };
+        crate::logging::capture::clear();
+
+        let out = server.fs_extract_text(Parameters(args)).await.unwrap();
+
+        assert_eq!(out.is_error, Some(true), "{out:?}");
+        let events = crate::logging::capture::events();
+        let level = |e: &crate::logging::capture::CapturedEvent| e.fields["level"].clone();
+        let message = |e: &crate::logging::capture::CapturedEvent| e.fields["message"].clone();
+        let info: Vec<_> = events
+            .iter()
+            .filter(|e| level(e) == "INFO" && message(e).contains("ERR_INVALID_ARGUMENT"))
+            .collect();
+        assert_eq!(info.len(), 1, "{events:?}");
+        assert!(message(info[0]).contains("document part 'word/document.xml'"), "{events:?}");
+        assert!(!events.iter().any(|e| level(e) == "ERROR"), "{events:?}");
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        assert!(!log.iter().any(|e| e.path.contains("bomb")), "{log:?}");
+    });
+}
+
+/// The third member of `atlas`, who asks for an ordinary memo while two bombs go off.
+const THIRD: &str = "ola@example.com";
+
+#[tokio::test]
+async fn e2e_0088_036_two_bombs_and_a_normal_document_at_on() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let second = add_second_member(&f).await;
+    f.state.admin.add_member(MOUNT, THIRD, OWNER).await.unwrap();
+    let bomb = zip_raw(&[bomb_part("word/document.xml")]);
+    seed(&f, "/docs/m.docx", &bomb).await;
+    seed(&f, "/docs/n.docx", &bomb).await;
+    let body = r#"<w:document xmlns:w="w"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Results</w:t></w:r></w:p><w:p><w:r><w:t>Quarterly results</w:t></w:r></w:p></w:body></w:document>"#;
+    seed(&f, "/docs/memo.docx", &office_zip(&[("word/document.xml", body.as_bytes())])).await;
+    office_held_reset();
+
+    let (m, n, memo) = tokio::join!(
+        extract_text(&f, OWNER, "/docs/m.docx", false),
+        extract_text(&f, second, "/docs/n.docx", false),
+        extract_text(&f, THIRD, "/docs/memo.docx", false),
+    );
+
+    part_refusal(&m, "/docs/m.docx", "word/document.xml", BOMB, 0);
+    part_refusal(&n, "/docs/n.docx", "word/document.xml", BOMB, 0);
+    assert_eq!(memo.unwrap()["preview"], "# Results\n\nQuarterly results");
+    assert_eq!(parts_held("/docs/m.docx"), 0);
+    assert_eq!(parts_held("/docs/n.docx"), 0);
+}

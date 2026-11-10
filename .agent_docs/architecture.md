@@ -357,6 +357,12 @@ stays at ERROR with the full message. A misbehaving client therefore cannot floo
 the log, and an ERROR line is always worth reading. Logs go to stderr so stdout
 stays usable for `mcp-fs token`.
 
+Wired at both doors (SPEC-0088, 2026-11-10): `mcp::server::to_call_result` calls
+`logging::log_tool_failure(tool, &e)` for every failed tool call and `api::dataplane::error_response`
+calls `log_tool_failure("rest", err)`, so a refusal leaves one INFO line (a 5xx stays ERROR). The line
+carries the error display only, never an argument, token or password. Before this the classifier had
+no production caller and nothing was logged.
+
 Every `ERR_*` code has an explicit HTTP status (see `ToolError::http_status`). The
 reference mapped six codes and defaulted the rest to a generic 400, so a spent
 quota, an edit without a prior read, an ambiguous match and an unsupported format
@@ -390,3 +396,15 @@ Certificate verification is never switched off. Tests run each case in a child p
 because the SDK loads the roots once per process; `SSL_CERT_FILE` and `SSL_CERT_DIR` steer
 the loader on every platform. Gotcha: `--ignored --exact` skips a non ignored test, use
 `--include-ignored`.
+
+## Office extraction bound (SPEC-0088, 2026-11-10)
+
+`fs.extract_text` on a Word, Excel or PowerPoint document (`.docx`, `.xlsx`, `.xlsm`, `.pptx`,
+`.pptm`, `.potx`, `.ppsx`, any letter case) refuses, with `ERR_INVALID_ARGUMENT`, a part that
+declares more than 104 857 600 bytes once decoded, before decoding it; a part holding more than it
+declares is refused too. One call holds at most 268 435 456 bytes of decoded parts and 373 293 056
+bytes of extracted content. Parts are read in reading order, so the first refusal wins. A refused call
+leaves no companion change, artifact, charge or audit line, and logs one INFO line. Test only
+measurement hook: the thread local `OFFICE_HELD` in `docs/extract.rs`, read through `parts_held` and
+`content_held` in `tools/archive_testkit.rs`; tests are in `tools/office_bound_e2e.rs`
+(filter `e2e_0088_`, take `heavy()` first).

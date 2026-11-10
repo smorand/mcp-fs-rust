@@ -249,6 +249,9 @@ pub(crate) mod capture {
             }
             let mut fields = FieldMap::default();
             event.record(&mut fields);
+            // The level is metadata, not a field: recorded under `level` so a test
+            // can tell the informational refusal line from an error one.
+            fields.0.insert("level".to_string(), event.metadata().level().to_string());
             events_store()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

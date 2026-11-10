@@ -51,9 +51,14 @@ fn to_call_result(
         Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&v).expect("tool result must serialize"),
         )])),
-        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "An error occurred invoking '{tool}': {e}"
-        ))])),
+        Err(e) => {
+            // The one place a refused tool call is logged (INFO for a 4xx, ERROR for a
+            // 5xx); the line carries the error's display only, never the arguments.
+            crate::logging::log_tool_failure(tool, &e);
+            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "An error occurred invoking '{tool}': {e}"
+            ))]))
+        }
     }
 }
 
