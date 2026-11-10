@@ -104,6 +104,7 @@ which = { workspace = true }
 
 # ── document extraction / code symbols (docs module) ───────────────────────────
 pdf-extract = { workspace = true }
+weezl = { workspace = true }
 quick-xml = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-python = { workspace = true }

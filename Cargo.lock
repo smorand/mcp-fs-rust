@@ -3836,6 +3836,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "weezl",
  "which",
  "zerocopy 0.7.35",
  "zip 9.0.5",

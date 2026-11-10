@@ -146,6 +146,16 @@ impl PdfWriter {
     }
 
     pub(crate) fn finish(&self) -> Vec<u8> {
+        self.finish_as(self.compressed.is_empty())
+    }
+
+    /// The document with a classic cross reference whatever it holds: the
+    /// compressed objects are listed as free, as before a later section adds them.
+    fn finish_classic(&self) -> Vec<u8> {
+        self.finish_as(true)
+    }
+
+    fn finish_as(&self, classic: bool) -> Vec<u8> {
         let mut out = b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n".to_vec();
         let mut offsets = std::collections::BTreeMap::new();
         for (n, obj) in &self.objects {
@@ -164,7 +174,7 @@ impl PdfWriter {
         }
         let info = self.info.map(|i| format!(" /Info {i} 0 R")).unwrap_or_default();
         let last = self.objects.keys().chain(self.compressed.keys()).max().copied().unwrap_or(0);
-        if self.compressed.is_empty() {
+        if classic {
             let size = last + 1;
             let xref = out.len();
             out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
@@ -266,6 +276,300 @@ pub(crate) fn small(doc: Vec<u8>) -> Vec<u8> {
     doc
 }
 
+/// The zlib stream of the bytes `head`, then `n` copies of `letter`: `head` in
+/// a stored deflate block (it may be binary), then the cached run.
+fn zlib_head_run(head: &[u8], letter: u8, n: usize) -> Vec<u8> {
+    let (run, _) = deflate_run("", letter, n, "");
+    let len = u16::try_from(head.len()).expect("a stored block holds at most 65 535 bytes");
+    let mut out = vec![0x78, 0x9C, 0x00];
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(head);
+    out.extend_from_slice(&run);
+    out.extend_from_slice(&adler32(head, letter, n, b"").to_be_bytes());
+    out
+}
+
+/// The LZW code of `data` as lopdf decodes it by default (`EarlyChange` 1).
+pub(crate) fn lzw(data: &[u8]) -> Vec<u8> {
+    weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8).encode(data).unwrap()
+}
+
+/// The LZW code of `n` copies of `letter`: weezl's encoder fed a 1 000 000 byte
+/// buffer repeated, computed once per process and arguments.
+pub(crate) fn lzw_run(letter: u8, n: usize) -> Vec<u8> {
+    use std::io::Read as _;
+    type Codes = Vec<((u8, usize), Vec<u8>)>;
+    static CACHE: std::sync::Mutex<Codes> = std::sync::Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((_, code)) = cache.iter().find(|(k, _)| *k == (letter, n)) {
+        return code.clone();
+    }
+    let source = std::io::repeat(letter).take(n as u64);
+    let reader = std::io::BufReader::with_capacity(1_000_000, source);
+    let mut code = Vec::new();
+    let mut encoder = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
+    encoder.into_stream(&mut code).encode_all(reader).status.unwrap();
+    cache.push(((letter, n), code.clone()));
+    code
+}
+
+/// The ASCII85 form of `data`, ended by `~>`.
+pub(crate) fn ascii85(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 4 * 5 + 8);
+    for group in data.chunks(4) {
+        let mut word = [0u8; 4];
+        word[..group.len()].copy_from_slice(group);
+        let mut value = u32::from_be_bytes(word);
+        if group.len() == 4 && value == 0 {
+            out.push(b'z');
+            continue;
+        }
+        let mut digits = [0u8; 5];
+        for d in digits.iter_mut().rev() {
+            *d = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        out.extend_from_slice(&digits[..group.len() + 1]);
+    }
+    out.extend_from_slice(b"~>");
+    out
+}
+
+/// A one page document whose only cross reference is a stream of its six
+/// entries followed by spaces up to [`PDF_BOMB`] decoded bytes.
+pub(crate) fn xref_stream_bomb_pdf() -> Vec<u8> {
+    let w = pages_writer(vec![plain("BT /F1 12 Tf 72 700 Td (Hi) Tj ET")], "");
+    // The classic form gives the objects' offsets; its cross reference is cut off.
+    let classic = w.finish_classic();
+    let body_end = find(&classic, b"xref\n");
+    let mut out = classic[..body_end].to_vec();
+    let mut entries = vec![0u8, 0, 0, 0, 0, 0xFF, 0xFF];
+    for n in 1..6u32 {
+        let off = find(&classic, format!("\n{n} 0 obj\n").as_bytes()) + 1;
+        entries.push(1);
+        entries.extend_from_slice(&(off as u32).to_be_bytes());
+        entries.extend_from_slice(&0u16.to_be_bytes());
+    }
+    let stored = zlib_head_run(&entries, b' ', PDF_BOMB - entries.len());
+    let xref = out.len();
+    out.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 6 /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /Length {} >>\nstream\n",
+            stored.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&stored);
+    out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    small(out)
+}
+
+fn find(data: &[u8], needle: &[u8]) -> usize {
+    data.windows(needle.len()).position(|w| w == needle).expect("present")
+}
+
+/// The load filter of the fixture builder: object streams kept whole.
+fn keep_object_streams(
+    id: pdf_extract::ObjectId,
+    object: &mut pdf_extract::Object,
+) -> Option<(pdf_extract::ObjectId, pdf_extract::Object)> {
+    if let pdf_extract::Object::Stream(stream) = object
+        && stream.dict.has_type(b"ObjStm")
+    {
+        stream.dict.set("Type", pdf_extract::Object::Name(b"FixtureObjStm".to_vec()));
+    }
+    Some((id, pdf_extract::Object::Null))
+}
+
+/// `w` encrypted by lopdf (`EncryptionVersion::V1`, user password empty), then
+/// a cross reference stream appended that lists the objects of its object
+/// streams as compressed, `/Prev` the classic section lopdf wrote. The new
+/// main trailer names the encryption dictionary with `encrypt_key`, the
+/// spelling of `/Encrypt` to write (SPEC-0089 DEC-019).
+pub(crate) fn encrypted(w: &PdfWriter, encrypt_key: &str) -> Vec<u8> {
+    encrypted_with(w, encrypt_key, "", false, |_| {})
+}
+
+/// [`encrypted`] with `user_password` as the user password, AES 128
+/// (`EncryptionVersion::V4`) when `aes`, and `tamper` applied to the
+/// document once encrypted, before it is written.
+fn encrypted_with(
+    w: &PdfWriter,
+    encrypt_key: &str,
+    user_password: &str,
+    aes: bool,
+    tamper: fn(&mut pdf_extract::Document),
+) -> Vec<u8> {
+    use pdf_extract::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
+    use pdf_extract::{Document, EncryptionState, EncryptionVersion, LoadOptions, Object};
+    let options = LoadOptions { filter: Some(keep_object_streams), ..Default::default() };
+    let mut doc = Document::load_mem_with_options(&w.finish_classic(), options).unwrap();
+    let id = b"0123456789abcdef".to_vec();
+    doc.trailer.set(
+        "ID",
+        Object::Array(vec![
+            Object::String(id.clone(), pdf_extract::StringFormat::Hexadecimal),
+            Object::String(id.clone(), pdf_extract::StringFormat::Hexadecimal),
+        ]),
+    );
+    let version = if aes {
+        let filter: std::sync::Arc<dyn CryptFilter> = std::sync::Arc::new(Aes128CryptFilter);
+        EncryptionVersion::V4 {
+            document: &doc,
+            encrypt_metadata: true,
+            crypt_filters: std::collections::BTreeMap::from([(b"StdCF".to_vec(), filter)]),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: "owner",
+            user_password,
+            permissions: Default::default(),
+        }
+    } else {
+        EncryptionVersion::V1 {
+            document: &doc,
+            owner_password: "owner",
+            user_password,
+            permissions: Default::default(),
+        }
+    };
+    let state = EncryptionState::try_from(version).unwrap();
+    doc.encrypt(&state).unwrap();
+    tamper(&mut doc);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    // lopdf's writer leaves object streams out, so they wear another type until
+    // written; names are not encrypted, and spaces keep every offset.
+    let renamed = b"/FixtureObjStm";
+    while let Some(at) = out.windows(renamed.len()).position(|w| w == renamed) {
+        out[at..at + renamed.len()].copy_from_slice(b"/ObjStm       ");
+    }
+
+    let at = out.windows(9).rposition(|w| w == b"startxref").unwrap() + 9;
+    let tail = std::str::from_utf8(&out[at..]).unwrap();
+    let prev: usize = tail.split_whitespace().next().unwrap().parse().unwrap();
+    let reference = |key: &[u8]| {
+        doc.trailer.get(key).and_then(Object::as_reference).map(|(n, g)| format!("{n} {g} R"))
+    };
+    let encrypt = reference(b"Encrypt").unwrap();
+    let root = reference(b"Root").unwrap();
+    let info = reference(b"Info").map(|i| format!(" /Info {i}")).unwrap_or_default();
+    let number = doc.max_id + 1;
+    let mut index = String::new();
+    let mut entries = Vec::new();
+    for (n, (container, i)) in &w.compressed {
+        index.push_str(&format!("{n} 1 "));
+        entries.push(2u8);
+        entries.extend_from_slice(&container.to_be_bytes());
+        entries.extend_from_slice(&i.to_be_bytes());
+    }
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    out.push(b'\n');
+    let xref = out.len();
+    out.extend_from_slice(
+        format!(
+            "{number} 0 obj\n<< /Type /XRef /Size {} /W [1 4 2] /Index [{}] /Prev {prev} /Root {root}{info} {encrypt_key} {encrypt} /ID [<{hex}> <{hex}>] /Length {} >>\nstream\n",
+            number + 1,
+            index.trim_end(),
+            entries.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&entries);
+    out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// The writer of SEC-002: object 1 `<< /Pad true >>` sits in object stream 9,
+/// padded with spaces to exactly `total` decoded bytes.
+fn object_stream_writer(total: usize) -> PdfWriter {
+    let mut w = pages_writer(vec![plain("BT /F1 12 Tf 72 700 Td (Hi) Tj ET")], "");
+    // The catalog moves to 8 so that object 1 can be the compressed one.
+    w.objects.remove(&1);
+    w.root = 8;
+    w.object(8, PdfObj::Body("<< /Type /Catalog /Pages 2 0 R >>".into()));
+    let objects = [(1, "<< /Pad true >>")];
+    let (head, _) = object_stream_head(&objects);
+    w.object_stream(9, &objects, total - head.len());
+    w
+}
+
+/// The document of SEC-002 encrypted with an empty user password.
+pub(crate) fn locked_bomb_pdf() -> Vec<u8> {
+    small(encrypted(&object_stream_writer(PDF_BOMB), "/Encrypt"))
+}
+
+/// The two pages of E2E-001 with `/Info` (title `Report 2026`) in object stream 9.
+fn titled_writer(padding_to: usize) -> PdfWriter {
+    let mut w = pages_writer(
+        vec![
+            plain("BT /F1 12 Tf 72 700 Td (Quarterly results) Tj ET"),
+            plain("BT /F1 12 Tf 72 700 Td (Outlook) Tj ET"),
+        ],
+        "",
+    );
+    let objects = [(8, "<< /Title (Report 2026) >>")];
+    let (head, _) = object_stream_head(&objects);
+    w.object_stream(9, &objects, padding_to.saturating_sub(head.len()));
+    w.info(8);
+    w
+}
+
+/// The two page titled document encrypted with an empty user password, its
+/// main trailer naming the encryption dictionary `encrypt_key`.
+pub(crate) fn secret_pdf(encrypt_key: &str) -> Vec<u8> {
+    encrypted(&titled_writer(0), encrypt_key)
+}
+
+/// The two page titled document encrypted with the user password `user`.
+pub(crate) fn passworded_pdf() -> Vec<u8> {
+    encrypted_with(&titled_writer(0), "/Encrypt", "user", false, |_| {})
+}
+
+/// The two page titled document encrypted with AES 128 and an empty user
+/// password; when `bad_string`, the page tree (object 2) also holds a string
+/// of 5 bytes, which no AES decryption accepts.
+pub(crate) fn aes_secret_pdf(bad_string: bool) -> Vec<u8> {
+    let tamper: fn(&mut pdf_extract::Document) = if bad_string {
+        |doc| {
+            let pages = doc.get_dictionary_mut((2, 0)).unwrap();
+            pages.set("Junk", pdf_extract::Object::string_literal("short"));
+        }
+    } else {
+        |_| {}
+    };
+    encrypted_with(&titled_writer(0), "/Encrypt", "", true, tamper)
+}
+
+/// Page 1's content is the LZW code of [`PDF_BOMB`] spaces.
+pub(crate) fn lzw_bomb_pdf() -> Vec<u8> {
+    let code = lzw_run(b' ', PDF_BOMB);
+    let dict = format!("<< /Filter /LZWDecode /Length {} >>", code.len());
+    page_pdf(PdfObj::Stream(dict, code), "", vec![])
+}
+
+/// Page 1's content is the ASCII85 form of the zlib bomb stream.
+pub(crate) fn ascii85_bomb_pdf() -> Vec<u8> {
+    let stored = ascii85(&zlib_run("", b' ', PDF_BOMB, ""));
+    let dict = format!("<< /Filter [/ASCII85Decode /FlateDecode] /Length {} >>", stored.len());
+    page_pdf(PdfObj::Stream(dict, stored), "", vec![])
+}
+
+/// Two pages: `Old LZW` under `/LZWDecode`, `Old A85` under `/ASCII85Decode`.
+pub(crate) fn old_filters_pdf() -> Vec<u8> {
+    let page = |text: &str| format!("BT /F1 12 Tf 72 700 Td ({text}) Tj ET");
+    let one = lzw(page("Old LZW").as_bytes());
+    let two = ascii85(page("Old A85").as_bytes());
+    let w = pages_writer(
+        vec![
+            PdfObj::Stream(format!("<< /Filter /LZWDecode /Length {} >>", one.len()), one),
+            PdfObj::Stream(format!("<< /Filter /ASCII85Decode /Length {} >>", two.len()), two),
+        ],
+        "",
+    );
+    small(w.finish())
+}
+
 /// SEC-001: page 1's content is the bomb stream.
 pub(crate) fn content_bomb_pdf() -> Vec<u8> {
     page_pdf(bomb(""), "", vec![])
@@ -274,15 +578,7 @@ pub(crate) fn content_bomb_pdf() -> Vec<u8> {
 /// SEC-002: object 1 `<< /Pad true >>` sits in object stream 5, padded with
 /// spaces to exactly [`PDF_BOMB`] bytes.
 pub(crate) fn object_stream_bomb_pdf() -> Vec<u8> {
-    let mut w = pages_writer(vec![plain("BT /F1 12 Tf 72 700 Td (Hi) Tj ET")], "");
-    // The catalog moves to 8 so that object 1 can be the compressed one.
-    w.objects.remove(&1);
-    w.root = 8;
-    w.object(8, PdfObj::Body("<< /Type /Catalog /Pages 2 0 R >>".into()));
-    let objects = [(1, "<< /Pad true >>")];
-    let (head, _) = object_stream_head(&objects);
-    w.object_stream(9, &objects, PDF_BOMB - head.len());
-    small(w.finish())
+    small(object_stream_writer(PDF_BOMB).finish())
 }
 
 /// SEC-003: `/F1` is a Type 1 font whose descriptor's `/FontFile` is the bomb.
@@ -345,18 +641,7 @@ pub(crate) fn image_bomb_pdf() -> Vec<u8> {
 /// `Outlook`) whose `/Info` (object 8, title `Report 2026`) sits in object
 /// stream 9, padded to exactly [`PDF_BOMB`] bytes.
 pub(crate) fn titled_bomb_pdf() -> Vec<u8> {
-    let mut w = pages_writer(
-        vec![
-            plain("BT /F1 12 Tf 72 700 Td (Quarterly results) Tj ET"),
-            plain("BT /F1 12 Tf 72 700 Td (Outlook) Tj ET"),
-        ],
-        "",
-    );
-    let objects = [(8, "<< /Title (Report 2026) >>")];
-    let (head, _) = object_stream_head(&objects);
-    w.object_stream(9, &objects, PDF_BOMB - head.len());
-    w.info(8);
-    small(w.finish())
+    small(titled_writer(PDF_BOMB).finish())
 }
 
 /// E2E-007 and E2E-008: page 1 shows 250 000 letters `b`, its content padded

@@ -141,6 +141,9 @@ parquet = { version = "60", features = ["arrow"] }
 
 # ── document extraction / code symbols (docs module) ───────────────────────────
 pdf-extract = "0.12"
+# The LZW decoder lopdf itself uses, so a measured LZW stream decodes exactly as
+# the reader decodes it (SPEC-0089 DEC-021); already locked for lopdf.
+weezl = "0.1"
 quick-xml = "0.41"
 tree-sitter = "0.26"
 tree-sitter-python = "0.25"

@@ -212,7 +212,7 @@
 | US-0210 | SPEC-0088 | a refusal leaves no trace and one log line | US-0209 | 2 | landed | story/US-0210-a-refusal-leaves-no-trace-and-one-log-li | story/US-0209-unread-parts-cached-companions-and-other |
 | US-0211 | SPEC-0088 | Office limits through the HTTP door and documentation | US-0210 | 2 | landed | story/US-0211-office-limits-through-the-http-door-and | story/US-0210-a-refusal-leaves-no-trace-and-one-log-li |
 | US-0212 | SPEC-0089 | bound every PDF stream the text pass decodes | US-0211 | 1 | landed | story/US-0212-bound-every-pdf-stream-the-text-pass-dec | main |
-| US-0213 | SPEC-0089 | encrypted PDFs, cross reference, LZW and ASCII85 streams under the same limit | US-0212 | 1 | todo | | |
+| US-0213 | SPEC-0089 | encrypted PDFs, cross reference, LZW and ASCII85 streams under the same limit | US-0212 | 1 | landed | story/US-0213-encrypted-pdfs-cross-reference-lzw-and-a | story/US-0212-bound-every-pdf-stream-the-text-pass-dec |
 | US-0214 | SPEC-0089 | the load total and the object limit | US-0213 | 2 | todo | | |
 | US-0215 | SPEC-0089 | the page total, repeats and saved states | US-0214 | 2 | todo | | |
 | US-0216 | SPEC-0089 | the content limit for a PDF | US-0215 | 2 | todo | | |

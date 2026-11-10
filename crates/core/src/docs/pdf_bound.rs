@@ -15,8 +15,11 @@
 
 use crate::errors::{Result, ToolError};
 use pdf_extract::content::{Content, Operation};
+use pdf_extract::encryption::decrypt_object;
 use pdf_extract::xref::XrefEntry;
-use pdf_extract::{Dictionary, Document, LoadOptions, Object, ObjectId, ObjectStream, Stream};
+use pdf_extract::{
+    Dictionary, Document, EncryptionState, LoadOptions, Object, ObjectId, ObjectStream, Stream,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -92,6 +95,8 @@ enum Scope {
     Load,
     /// A stream the reader may decode for the current page.
     Page,
+    /// A cross reference stream lopdf inflates while reading the cross reference.
+    Guard,
 }
 
 /// The text of `data`, every stream decoded under [`STREAM_LIMIT`]. Order of
@@ -152,6 +157,367 @@ fn title(doc: &Document) -> Option<String> {
     Some(crate::docs::extract::decode_pdf_text(raw))
 }
 
+// ── Cross reference and encryption, before the load (DEC-005) ───────────────
+
+/// The refusal of an encrypted document whose `/Encrypt` key could not be
+/// renamed in a copy: it is never handed to lopdf's encrypted loader, which
+/// inflates object streams with no filter (`reader.rs:889`).
+fn not_isolated() -> ToolError {
+    ToolError::invalid_argument("pdf: the encryption dictionary could not be isolated")
+}
+
+/// The refusal of a cross reference stream the measurer cannot follow exactly
+/// (a predictor between two steps, more than [`MAX_FILTERS`] filters): lopdf
+/// would decode it whole while reading the cross reference, and it cannot be
+/// left stored as a page stream is.
+fn unmeasurable_xref() -> ToolError {
+    ToolError::invalid_argument("pdf: the cross reference stream could not be measured")
+}
+
+/// lopdf's whitespace (`parser/mod.rs` `is_whitespace`).
+fn is_space(c: u8) -> bool {
+    b" \t\n\r\0\x0C".contains(&c)
+}
+
+fn is_delimiter(c: u8) -> bool {
+    b"()<>[]{}/%".contains(&c)
+}
+
+/// One token of the minimal tokenizer: enough to find where a dictionary ends
+/// and which of its names are `Encrypt`, never to read a value.
+enum Token {
+    Open,
+    Close,
+    /// A name, decoded as lopdf decodes `#xx` escapes, and its bytes in the input.
+    Name(Vec<u8>, std::ops::Range<usize>),
+    /// A run of regular characters: a number, `R`, a keyword.
+    Word(std::ops::Range<usize>),
+    /// `[`, `]`, a string, a hex string, `{`, `}`.
+    Other(u8),
+}
+
+/// The tokenizer: skips whitespace and comments, and strings, hex strings and
+/// names whole, so a `>>` or a `/Encrypt` inside them is not taken for one.
+struct Lexer<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl Lexer<'_> {
+    fn skip_space(&mut self) {
+        while let Some(&c) = self.data.get(self.at) {
+            if is_space(c) {
+                self.at += 1;
+            } else if c == b'%' {
+                while self.data.get(self.at).is_some_and(|c| !b"\r\n".contains(c)) {
+                    self.at += 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// The next token, `None` at the end or on an unterminated string.
+    /// O(token length) time.
+    fn next_token(&mut self) -> Option<Token> {
+        self.skip_space();
+        let data = self.data;
+        let start = self.at;
+        let c = *data.get(start)?;
+        self.at += 1;
+        match c {
+            b'<' if data.get(self.at) == Some(&b'<') => {
+                self.at += 1;
+                Some(Token::Open)
+            }
+            b'>' if data.get(self.at) == Some(&b'>') => {
+                self.at += 1;
+                Some(Token::Close)
+            }
+            b'<' => {
+                self.at += data[self.at..].iter().position(|&c| c == b'>')? + 1;
+                Some(Token::Other(c))
+            }
+            b'(' => {
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match *data.get(self.at)? {
+                        b'\\' => self.at += 1,
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    self.at += 1;
+                }
+                Some(Token::Other(c))
+            }
+            b'/' => {
+                // As lopdf's `name`: `#` and two hex digits is one byte; a `#`
+                // without them ends the name.
+                let mut name = Vec::new();
+                while let Some(&c) = data.get(self.at) {
+                    let hex = |i: usize| data.get(i).copied().filter(u8::is_ascii_hexdigit);
+                    if c == b'#' {
+                        let (Some(h), Some(l)) = (hex(self.at + 1), hex(self.at + 2)) else {
+                            break;
+                        };
+                        let digit = |d: u8| (d as char).to_digit(16).unwrap_or(0) as u8;
+                        name.push(digit(h) << 4 | digit(l));
+                        self.at += 3;
+                    } else if !is_space(c) && !is_delimiter(c) {
+                        name.push(c);
+                        self.at += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Some(Token::Name(name, start..self.at))
+            }
+            c if is_delimiter(c) => Some(Token::Other(c)),
+            _ => {
+                while data.get(self.at).is_some_and(|&c| !is_space(c) && !is_delimiter(c)) {
+                    self.at += 1;
+                }
+                Some(Token::Word(start..self.at))
+            }
+        }
+    }
+}
+
+/// The end of the dictionary opening at `start` (just past its `>>`), and the
+/// names at its first level that decode to `Encrypt`. O(dictionary bytes).
+fn dictionary_span(data: &[u8], start: usize) -> Option<(usize, Vec<std::ops::Range<usize>>)> {
+    let mut lexer = Lexer { data, at: start };
+    if !matches!(lexer.next_token()?, Token::Open) {
+        return None;
+    }
+    let (mut depth, mut arrays) = (1usize, 0usize);
+    let mut names = Vec::new();
+    while depth > 0 {
+        match lexer.next_token()? {
+            Token::Open => depth += 1,
+            Token::Close => depth -= 1,
+            Token::Other(b'[') => arrays += 1,
+            Token::Other(b']') => arrays = arrays.saturating_sub(1),
+            Token::Name(name, range) if depth == 1 && arrays == 0 && name == b"Encrypt" => {
+                names.push(range);
+            }
+            _ => {}
+        }
+    }
+    Some((lexer.at, names))
+}
+
+/// Whether a name decoding to `Encrypt` appears anywhere in `data`, strings and
+/// stream bytes included: the fail closed test when the trailer cannot be found.
+fn mentions_encrypt(data: &[u8]) -> bool {
+    data.iter().enumerate().filter(|(_, c)| **c == b'/').any(|(at, _)| {
+        matches!(Lexer { data, at }.next_token(), Some(Token::Name(name, _)) if name == b"Encrypt")
+    })
+}
+
+/// A reader over `buffer` whose cross reference places object `id` at `offset`
+/// and nothing else, as lopdf's own reader is while it reads the cross
+/// reference: an indirect `Length` does not resolve, so its stream is read empty.
+fn object_at(buffer: &[u8], id: ObjectId, offset: usize) -> Option<Object> {
+    let mut reader = pdf_extract::Reader {
+        buffer,
+        document: Document::new(),
+        encryption_state: None,
+        raw_objects: BTreeMap::new(),
+        password: None,
+        strict: false,
+    };
+    let offset = u32::try_from(offset).ok()?;
+    reader.document.reference_table.insert(id.0, XrefEntry::Normal { offset, generation: id.1 });
+    reader.get_object(id, &mut HashSet::new()).ok()
+}
+
+/// The dictionary `bytes` hold, read by lopdf's own parser.
+fn parse_dictionary(bytes: &[u8]) -> Option<Dictionary> {
+    let mut object = b"0 0 obj\n".to_vec();
+    object.extend_from_slice(bytes);
+    object.extend_from_slice(b"\nendobj\n");
+    match object_at(&object, (0, 0), 0)? {
+        Object::Dictionary(dict) => Some(dict),
+        _ => None,
+    }
+}
+
+/// `N G obj` at `at`, as lopdf's `object_id` reads it; returns the id and
+/// where the object's value starts.
+fn object_header(data: &[u8], at: usize) -> Option<(ObjectId, usize)> {
+    let mut lexer = Lexer { data, at };
+    let word = |lexer: &mut Lexer<'_>| match lexer.next_token()? {
+        Token::Word(range) => std::str::from_utf8(&data[range]).ok().map(str::to_string),
+        _ => None,
+    };
+    let number = word(&mut lexer)?.parse().ok()?;
+    let generation = word(&mut lexer)?.parse().ok()?;
+    (word(&mut lexer)? == "obj").then_some(((number, generation), lexer.at))
+}
+
+/// One cross reference section: its trailer (or stream dictionary) as lopdf
+/// parses it, and that dictionary's span with its `Encrypt` names.
+struct Section {
+    trailer: Dictionary,
+    span: std::ops::Range<usize>,
+    names: Vec<std::ops::Range<usize>>,
+}
+
+/// The section at `offset` of `buffer`: a classic table and its trailer, or a
+/// cross reference stream, measured here as lopdf will inflate it while
+/// reading (`parser/mod.rs:547`, `parser_aux.rs:487-490`). `None` when it
+/// cannot be read the way lopdf reads it.
+fn section(buffer: &[u8], offset: usize, budget: &mut PdfBudget) -> Result<Option<Section>> {
+    let Some(at) = buffer.get(offset..) else { return Ok(None) };
+    if at.starts_with(b"xref") {
+        // Between `xref` and `trailer` lopdf accepts only entries, then
+        // whitespace and comments.
+        let mut lexer = Lexer { data: buffer, at: offset + 4 };
+        loop {
+            match lexer.next_token() {
+                Some(Token::Word(range)) if &buffer[range.clone()] == b"trailer" => break,
+                Some(Token::Word(_)) => {}
+                _ => return Ok(None),
+            }
+        }
+        lexer.skip_space();
+        let start = lexer.at;
+        let Some((end, names)) = dictionary_span(buffer, start) else { return Ok(None) };
+        let Some(trailer) = parse_dictionary(&buffer[start..end]) else { return Ok(None) };
+        return Ok(Some(Section { trailer, span: start..end, names }));
+    }
+    let Some((id, value)) = object_header(buffer, offset) else { return Ok(None) };
+    let Some(Object::Stream(stream)) = object_at(buffer, id, offset) else { return Ok(None) };
+    if !measurable(&stream) {
+        return Err(unmeasurable_xref());
+    }
+    measure(&stream, budget, Scope::Guard)?;
+    let mut lexer = Lexer { data: buffer, at: value };
+    lexer.skip_space();
+    let start = lexer.at;
+    let Some((end, names)) = dictionary_span(buffer, start) else { return Ok(None) };
+    Ok(Some(Section { trailer: stream.dict, span: start..end, names }))
+}
+
+/// Where lopdf starts reading the cross reference (`reader.rs:1262-1286`):
+/// `startxref` in the 25 bytes before the last `%%EOF` of the last 512 bytes,
+/// then the offset, an end of line and `%%EOF`.
+fn xref_start(buffer: &[u8]) -> Option<usize> {
+    let rfind = |hay: &[u8], needle: &[u8], from: usize| {
+        hay.get(from..)?.windows(needle.len()).rposition(|w| w == needle).map(|p| from + p)
+    };
+    let eof = rfind(buffer, b"%%EOF", buffer.len() - buffer.len().min(512))?;
+    if eof <= 25 {
+        return None;
+    }
+    let at = rfind(&buffer[..eof], b"startxref", eof - 25)? + 9;
+    let rest = &buffer[at..];
+    let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+    let eol = |r: &[u8]| -> Option<usize> {
+        [&b"\r\n"[..], b"\n", b"\r"].iter().find(|e| r.starts_with(e)).map(|e| e.len())
+    };
+    let rest = &rest[eol(rest)?..];
+    let spaces = |r: &[u8]| r.iter().take_while(|c| **c == b' ').count();
+    let rest = &rest[spaces(rest)..];
+    let signed = usize::from(rest.first().is_some_and(|c| b"+-".contains(c)));
+    let digits = signed + rest[signed..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let value: i64 = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+    let rest = &rest[digits..];
+    let rest = &rest[spaces(rest)..];
+    if !rest[eol(rest)?..].starts_with(b"%%EOF") {
+        return None;
+    }
+    usize::try_from(value).ok().filter(|v| *v <= buffer.len())
+}
+
+/// The main trailer of a PDF: its span in the file, the spans of its first
+/// level names that decode to `Encrypt`, and its dictionary as lopdf parses it.
+struct TrailerSpan {
+    span: std::ops::Range<usize>,
+    names: Vec<std::ops::Range<usize>>,
+    trailer: Dictionary,
+}
+
+impl TrailerSpan {
+    /// lopdf would load the document with its encrypted loader.
+    fn encrypted(&self) -> bool {
+        self.trailer.get(b"Encrypt").is_ok()
+    }
+}
+
+/// Locate the cross reference sections as lopdf does (the main one, then the
+/// `Prev` chain with a seen set and the main trailer's `XRefStm`,
+/// `reader.rs:765-791`) and measure every cross reference stream under the
+/// stream limit before anything is loaded. A section lopdf could not read
+/// ends the walk: lopdf then fails as today. When the main trailer cannot be
+/// read at all but the file names `Encrypt` past `startxref`, or when no
+/// cross reference can be located and the file names `Encrypt` anywhere, the
+/// document is refused rather than risk the encrypted loader on a reading of
+/// the file this module did not share. O(file) time.
+fn xref_guard(data: &[u8], budget: &mut PdfBudget) -> Result<Option<TrailerSpan>> {
+    let base = data.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+    let buffer = &data[base..];
+    let Some(start) = xref_start(buffer) else {
+        return if mentions_encrypt(buffer) { Err(not_isolated()) } else { Ok(None) };
+    };
+    let Some(main) = section(buffer, start, budget)? else {
+        return if mentions_encrypt(&buffer[start..]) { Err(not_isolated()) } else { Ok(None) };
+    };
+    let mut seen = HashSet::new();
+    let mut stream_section = main.trailer.get(b"XRefStm").and_then(Object::as_i64).ok();
+    let mut prev = main.trailer.get(b"Prev").and_then(Object::as_i64).ok();
+    while let Some(offset) = prev {
+        if !seen.insert(offset) {
+            break;
+        }
+        let Some(offset) = usize::try_from(offset).ok().filter(|o| *o <= buffer.len()) else {
+            break;
+        };
+        let Some(older) = section(buffer, offset, budget)? else { break };
+        if let Some(at) = stream_section.take().and_then(|a| usize::try_from(a).ok()) {
+            section(buffer, at, budget)?;
+        }
+        prev = older.trailer.get(b"Prev").and_then(Object::as_i64).ok();
+    }
+    let shift = |r: std::ops::Range<usize>| r.start + base..r.end + base;
+    Ok(Some(TrailerSpan {
+        span: shift(main.span),
+        names: main.names.into_iter().map(shift).collect(),
+        trailer: main.trailer,
+    }))
+}
+
+/// A copy of `data` whose main trailer no longer names `Encrypt`, so lopdf
+/// loads it with the filter: each first level name decoding to `Encrypt` is
+/// replaced by `/NoCrypt`, padded to the same length, so no offset moves. The
+/// copy's trailer is parsed again by lopdf; when it still holds `Encrypt` the
+/// document fails closed. O(file) time and one copy of the file.
+fn unlock_encrypted(data: &[u8], span: &TrailerSpan) -> Result<Vec<u8>> {
+    let mut copy = data.to_vec();
+    for range in &span.names {
+        let mut name = b"/NoCrypt".to_vec();
+        name.resize(range.len(), b'X');
+        copy[range.clone()].copy_from_slice(&name);
+    }
+    match parse_dictionary(&copy[span.span.clone()]) {
+        Some(trailer) if trailer.get(b"Encrypt").is_err() => Ok(copy),
+        _ => Err(not_isolated()),
+    }
+}
+
+/// The trailer lopdf's own load would have left: the main trailer without
+/// `Prev`, and without `XRefStm` when `Prev` was followed (`reader.rs:767-778`).
+fn loaded_trailer(span: &TrailerSpan) -> Dictionary {
+    let mut trailer = span.trailer.clone();
+    if trailer.remove(b"Prev").is_some_and(|p| p.as_i64().is_ok()) {
+        trailer.remove(b"XRefStm");
+    }
+    trailer
+}
+
 /// The load filter: a non empty object stream is renamed so that lopdf keeps
 /// it whole (DEC-004). An empty one is left alone: lopdf reads its content later
 /// from an indirect `Length` and treats it as today. lopdf ignores what this
@@ -178,16 +544,34 @@ fn pdf_error(e: pdf_extract::Error) -> ToolError {
 }
 
 /// Load `data` with its object streams deferred, then expand them one at a
-/// time, in increasing object number, each measured before it is decoded.
+/// time, in increasing object number, each measured before it is decoded. The
+/// cross reference streams are measured first; an encrypted document is loaded
+/// from a copy whose trailer does not name `Encrypt`, so the filter applies,
+/// then decrypted by lopdf (DEC-005).
 fn load(data: &[u8], budget: &mut PdfBudget) -> Result<Document> {
+    let main = xref_guard(data, budget)?.filter(TrailerSpan::encrypted);
+    let unlocked = main.as_ref().map(|span| unlock_encrypted(data, span)).transpose()?;
     let options = LoadOptions { filter: Some(defer_object_streams), ..Default::default() };
-    let mut doc = Document::load_mem_with_options(data, options).map_err(pdf_error)?;
-    // An encrypted document goes through lopdf's encrypted loader, which ignores
-    // the filter; its decryption with the empty password is the reader's
-    // `maybe_decrypt` (SPEC-0089 DEC-027, US-0213 bounds it).
-    if doc.is_encrypted() {
-        doc.decrypt("").map_err(pdf_error)?;
+    let mut doc = Document::load_mem_with_options(unlocked.as_deref().unwrap_or(data), options)
+        .map_err(pdf_error)?;
+    drop(unlocked);
+    if let Some(span) = &main {
+        doc.trailer = loaded_trailer(span);
+        // What lopdf's encrypted loader leaves when the empty password is
+        // refused: the encryption dictionary alone (`reader.rs:832-856`).
+        // The reader's `maybe_decrypt` then fails as today on the password.
+        if doc.authenticate_password("").is_err() {
+            let keep = doc.trailer.get(b"Encrypt").and_then(Object::as_reference).ok();
+            doc.objects.retain(|id, _| Some(*id) == keep);
+            if doc.is_encrypted() {
+                doc.decrypt("").map_err(pdf_error)?;
+            }
+        } else if doc.is_encrypted() {
+            // The object streams still deferred are expanded below once decrypted.
+            decrypt_each(&mut doc)?;
+        }
     }
+    let encrypted = main.is_some();
 
     let containers: BTreeMap<u32, u32> = doc
         .reference_table
@@ -211,9 +595,16 @@ fn load(data: &[u8], budget: &mut PdfBudget) -> Result<Document> {
             Ok(parsed) => {
                 drop(plain);
                 for (member, object) in parsed.objects {
-                    // As lopdf: a member the cross reference places in another
-                    // container is a stale copy, and nothing loaded is replaced.
-                    if containers.get(&member.0).is_none_or(|c| *c == id.0) {
+                    if encrypted {
+                        // As the encrypted loader: only the numbers the cross
+                        // reference places in this container, replacing
+                        // (`reader.rs:887-897`).
+                        if id.1 == 0 && member.1 == 0 && containers.get(&member.0) == Some(&id.0) {
+                            doc.objects.insert(member, object);
+                        }
+                    } else if containers.get(&member.0).is_none_or(|c| *c == id.0) {
+                        // As lopdf: a member the cross reference places in another
+                        // container is a stale copy, and nothing loaded is replaced.
                         doc.objects.entry(member).or_insert(object);
                     }
                 }
@@ -230,6 +621,29 @@ fn load(data: &[u8], budget: &mut PdfBudget) -> Result<Document> {
         }
     }
     Ok(doc)
+}
+
+/// Decrypt every object with the empty password as the encrypted loader does
+/// (`reader.rs:856-866`): an object that fails to decrypt is kept as it is and
+/// the next one is tried, where `Document::decrypt` stops at the first failure
+/// (`document.rs:469`) and would refuse a file read today. The encryption
+/// dictionary is skipped, then removed with the trailer's `Encrypt`, as both
+/// do. O(objects) time.
+fn decrypt_each(doc: &mut Document) -> Result<()> {
+    let state = EncryptionState::decode(&*doc, "").map_err(pdf_error)?;
+    let dictionary = doc.trailer.get(b"Encrypt").and_then(Object::as_reference).ok();
+    for (id, object) in doc.objects.iter_mut() {
+        if Some(*id) != dictionary {
+            // Ignored per object, as the loader ignores it.
+            let _ = decrypt_object(&state, *id, object);
+        }
+    }
+    if let Some(id) = dictionary {
+        doc.objects.remove(&id);
+    }
+    doc.trailer.remove(b"Encrypt");
+    doc.encryption_state = Some(state);
+    Ok(())
 }
 
 /// The object stream `stream` decoded as `ObjectStream::new` would decode it,
@@ -328,17 +742,31 @@ fn predictor_rows(stream: &Stream) -> Option<u64> {
     Some(u64::try_from(row.saturating_mul(2)).unwrap_or(u64::MAX))
 }
 
+/// Whether a filter name is one lopdf decodes (`object.rs:807-812`).
+fn known(name: &[u8]) -> bool {
+    matches!(name, b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode")
+}
+
+/// Whether lopdf runs the predictor of `DecodeParms` after this step: it does
+/// after an inflation and after an LZW decode, not after ASCII85.
+fn predicting(name: &[u8]) -> bool {
+    matches!(name, b"FlateDecode" | b"LZWDecode")
+}
+
 /// Whether [`measure`] counts exactly what the reader would produce. A predictor
-/// on a chain of several inflations reshapes the bytes between two steps, which
-/// the streaming measurer does not reproduce: such a stream is left stored.
-/// A chain longer than [`MAX_FILTERS`] is left stored too.
+/// reshapes the bytes between two steps, which the streaming measurer does not
+/// reproduce: a stream whose predictor runs before another step, or more than
+/// once, is left stored. A chain longer than [`MAX_FILTERS`] is left stored too.
 fn measurable(stream: &Stream) -> bool {
     let Some(names) = filters(stream) else { return true };
     if names.len() > MAX_FILTERS {
         return false;
     }
-    let flates = names.iter().take_while(|n| *n == b"FlateDecode").count();
-    flates <= 1 || predictor_rows(stream).is_none()
+    let chain: Vec<&[u8]> = names.into_iter().take_while(|n| known(n)).collect();
+    let predicted = chain.iter().filter(|n| predicting(n)).count();
+    predicted == 0
+        || predictor_rows(stream).is_none()
+        || (predicted == 1 && chain.last().is_some_and(|n| predicting(n)))
 }
 
 #[cfg(test)]
@@ -369,16 +797,183 @@ struct Inflate {
     skip: usize,
 }
 
-/// A piece of a step's input: the stored bytes for the first step, an inflated
+/// One ASCII85 step, a streaming copy of `decode_ascii85` (`object.rs:874-920`).
+/// A trailing `~>` needs no special case: `~` is outside `!` to `u`, so it ends
+/// the input as its removal would, and the partial group before it counts.
+struct Ascii85 {
+    buffer: u32,
+    count: usize,
+    /// A byte outside the alphabet ended the input; the partial group still counts.
+    ended: bool,
+    /// lopdf fails the whole decode: nothing more is output.
+    failed: bool,
+}
+
+/// One step of the chain, decoding as lopdf decodes it.
+enum Step {
+    Flate(Box<Inflate>),
+    /// The decoder is configured as lopdf configures it (`EarlyChange`,
+    /// `object.rs:818-846`); `None` once it ended or failed.
+    Lzw(Option<weezl::decode::Decoder>),
+    Ascii85(Ascii85),
+}
+
+impl Step {
+    fn new(name: &[u8], early_change: bool) -> Self {
+        use weezl::{BitOrder, decode::Decoder};
+        match name {
+            b"LZWDecode" if early_change => {
+                Step::Lzw(Some(Decoder::with_tiff_size_switch(BitOrder::Msb, 8)))
+            }
+            b"LZWDecode" => Step::Lzw(Some(Decoder::new(BitOrder::Msb, 8))),
+            b"ASCII85Decode" => {
+                Step::Ascii85(Ascii85 { buffer: 0, count: 0, ended: false, failed: false })
+            }
+            _ => Step::Flate(Box::new(Inflate {
+                started: false,
+                zlib: None,
+                raw: None,
+                zlib_out: 0,
+                skip: 2,
+            })),
+        }
+    }
+
+    /// Decode some of `frame` into `out`: `None` when this step can take
+    /// nothing more from the frame, else the bytes produced (0 when it only
+    /// consumed input).
+    fn feed(&mut self, frame: &mut Frame<'_>, out: &mut [u8]) -> Option<usize> {
+        let len = frame.data.len();
+        match self {
+            Step::Flate(step) => {
+                if !step.started {
+                    step.started = true;
+                    step.zlib = Some(new_decoder(true));
+                    step.raw = Some(new_decoder(false));
+                }
+                if step.zlib.is_some() && (frame.at < len || frame.full) {
+                    let (used, made) = inflate_some(&mut step.zlib, &frame.data[frame.at..], out);
+                    frame.at += used;
+                    frame.full = made == CHUNK;
+                    step.zlib_out += made as u64;
+                    Some(made)
+                } else if step.zlib_out == 0
+                    && step.raw.is_some()
+                    && (frame.raw_at < len || frame.raw_full)
+                {
+                    let skip = step.skip.min(len - frame.raw_at);
+                    step.skip -= skip;
+                    frame.raw_at += skip;
+                    let (used, made) =
+                        inflate_some(&mut step.raw, &frame.data[frame.raw_at..], out);
+                    frame.raw_at += used;
+                    frame.raw_full = made == CHUNK;
+                    Some(made)
+                } else {
+                    None
+                }
+            }
+            Step::Lzw(decoder) => {
+                let d = decoder.as_mut()?;
+                if frame.at >= len && !frame.full {
+                    return None;
+                }
+                let result = d.decode_bytes(&frame.data[frame.at..], out);
+                frame.at += result.consumed_in;
+                frame.full = result.consumed_out == out.len();
+                // lopdf's `decode_all` stops at the end code, an error or no
+                // progress; the output of the call that failed is over counted,
+                // which is safe. No progress here only means the frame is spent.
+                match result.status {
+                    Ok(weezl::LzwStatus::Ok) => {}
+                    Ok(weezl::LzwStatus::NoProgress) => return None,
+                    Ok(weezl::LzwStatus::Done) | Err(_) => *decoder = None,
+                }
+                if result.consumed_in == 0 && result.consumed_out == 0 {
+                    return None;
+                }
+                Some(result.consumed_out)
+            }
+            Step::Ascii85(step) => {
+                if step.ended || frame.at >= len {
+                    return None;
+                }
+                let mut made = 0;
+                while frame.at < len && made + 4 <= out.len() {
+                    let ch = frame.data[frame.at];
+                    frame.at += 1;
+                    if ch == b'z' {
+                        if step.count != 0 {
+                            // lopdf fails the whole decode here; what was
+                            // counted is an over count, which is safe.
+                            (step.ended, step.failed) = (true, true);
+                            break;
+                        }
+                        out[made..made + 4].fill(0);
+                        made += 4;
+                        continue;
+                    }
+                    if ch.is_ascii_whitespace() {
+                        continue;
+                    }
+                    if !(b'!'..=b'u').contains(&ch) {
+                        step.ended = true;
+                        break;
+                    }
+                    let Some(next) = step.buffer.checked_mul(85) else {
+                        (step.ended, step.failed) = (true, true);
+                        break;
+                    };
+                    step.buffer = next.wrapping_add(u32::from(ch - b'!'));
+                    step.count += 1;
+                    if step.count == 5 {
+                        out[made..made + 4].copy_from_slice(&step.buffer.to_be_bytes());
+                        made += 4;
+                        step.buffer = 0;
+                        step.count = 0;
+                    }
+                }
+                Some(made)
+            }
+        }
+    }
+
+    /// The bytes this step still outputs once its input is complete: a final
+    /// partial ASCII85 group gives `count - 1` bytes, padded as lopdf pads it.
+    /// Where lopdf fails instead, nothing (the bytes before were counted).
+    fn finish(&mut self) -> Vec<u8> {
+        let Step::Ascii85(step) = self else { return Vec::new() };
+        if step.failed || step.count == 0 {
+            return Vec::new();
+        }
+        (step.ended, step.failed) = (true, true);
+        let mut buffer = step.buffer;
+        for _ in step.count..5 {
+            let Some(next) = buffer.checked_mul(85) else { return Vec::new() };
+            buffer = next.wrapping_add(84);
+        }
+        buffer.to_be_bytes()[..step.count - 1].to_vec()
+    }
+}
+
+/// A piece of a step's input: the stored bytes for the first step, a decoded
 /// chunk of the step before for the others.
 struct Frame<'s> {
     step: usize,
     data: std::borrow::Cow<'s, [u8]>,
-    zlib_at: usize,
+    /// Bytes of `data` consumed by the step (the zlib pass for an inflation).
+    at: usize,
+    /// Bytes of `data` consumed by the raw pass of an inflation.
     raw_at: usize,
     /// The last call filled the chunk, so the decoder may hold more output.
-    zlib_full: bool,
+    full: bool,
     raw_full: bool,
+}
+
+impl<'s> Frame<'s> {
+    fn new(step: usize, data: std::borrow::Cow<'s, [u8]>) -> Self {
+        Self { step, data, at: 0, raw_at: 0, full: false, raw_full: false }
+    }
 }
 
 /// Feed `input` to `decoder`, at most one chunk out; returns the bytes consumed
@@ -401,97 +996,105 @@ fn inflate_some(
     (consumed, produced)
 }
 
-/// The decoded size of `stream` as the reader would produce it, inflating one
-/// [`CHUNK`] at a time and keeping none of it (DEC-003): the sum of what each
-/// step outputs, plus a predictor's row buffers and output. A chain whose first
-/// filter is unknown counts 0 (the reader copies the stored bytes); an unknown
-/// filter later ends the chain, the steps before it counted. Until US-0213 a
-/// chain holding `LZWDecode` or `ASCII85Decode` counts 0 (DEC-027).
-///
-/// Steps are fed depth first from an explicit stack, so the held data is one
-/// chunk per step and no recursion. O(decoded bytes) time.
-fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64> {
-    let Some(names) = filters(stream) else { return Ok(0) };
-    if names.len() > MAX_FILTERS {
-        return Ok(0);
-    }
-    if names.iter().any(|n| *n == b"LZWDecode" || *n == b"ASCII85Decode") {
-        return Ok(0);
-    }
-    let steps = names.iter().take_while(|n| *n == b"FlateDecode").count();
-    let rows = predictor_rows(stream);
-    let mut total = if steps > 0 { rows.unwrap_or(0) } else { 0 };
-    if total > STREAM_LIMIT {
-        return Err(over_stream_limit());
-    }
-    let last = steps.saturating_sub(1);
-    let mut inflates: Vec<Inflate> = (0..steps)
-        .map(|_| Inflate { started: false, zlib: None, raw: None, zlib_out: 0, skip: 2 })
-        .collect();
-    let mut out = vec![0u8; CHUNK];
-    let mut stack = Vec::new();
-    if steps > 0 && !stream.content.is_empty() {
-        stack.push(Frame {
-            step: 0,
-            data: std::borrow::Cow::Borrowed(stream.content.as_slice()),
-            zlib_at: 0,
-            raw_at: 0,
-            zlib_full: false,
-            raw_full: false,
-        });
-    }
-    while let Some(frame) = stack.last_mut() {
-        let step = &mut inflates[frame.step];
-        if !step.started {
-            step.started = true;
-            step.zlib = Some(new_decoder(true));
-            step.raw = Some(new_decoder(false));
+/// The running count of one measure: what each step output, plus a
+/// predictor's row buffers and output, checked against the stream limit.
+struct Count<'b> {
+    total: u64,
+    /// The last step runs the predictor: its output is counted twice.
+    predicted_last: Option<usize>,
+    budget: &'b mut PdfBudget,
+}
+
+impl Count<'_> {
+    fn add(&mut self, step: usize, produced: usize) -> Result<()> {
+        // The predictor's output, at most its input, is counted as its input.
+        let counted = if self.predicted_last == Some(step) { 2 * produced } else { produced };
+        self.total = self.total.saturating_add(counted as u64);
+        // The bytes really decoded so far, so a refusal records what it cost.
+        self.budget.hold(self.total);
+        // Checked after every chunk, so decoding stops at most one chunk past
+        // the limit; equal is accepted.
+        if self.total > STREAM_LIMIT {
+            return Err(over_stream_limit());
         }
-        let len = frame.data.len();
-        let produced = if step.zlib.is_some() && (frame.zlib_at < len || frame.zlib_full) {
-            let (used, made) = inflate_some(&mut step.zlib, &frame.data[frame.zlib_at..], &mut out);
-            frame.zlib_at += used;
-            frame.zlib_full = made == CHUNK;
-            step.zlib_out += made as u64;
-            made
-        } else if step.zlib_out == 0 && step.raw.is_some() && (frame.raw_at < len || frame.raw_full)
-        {
-            let skip = step.skip.min(len - frame.raw_at);
-            step.skip -= skip;
-            frame.raw_at += skip;
-            let (used, made) = inflate_some(&mut step.raw, &frame.data[frame.raw_at..], &mut out);
-            frame.raw_at += used;
-            frame.raw_full = made == CHUNK;
-            made
-        } else {
+        Ok(())
+    }
+}
+
+/// Run the frames on `stack` depth first until it is empty: each chunk a step
+/// outputs is counted, then pushed as the next step's input.
+fn drain(
+    steps: &mut [Step],
+    stack: &mut Vec<Frame<'_>>,
+    out: &mut [u8],
+    count: &mut Count<'_>,
+) -> Result<()> {
+    while let Some(frame) = stack.last_mut() {
+        let at = frame.step;
+        let Some(produced) = steps[at].feed(frame, out) else {
             stack.pop();
             continue;
         };
         if produced == 0 {
             continue;
         }
-        let at = frame.step;
-        // The predictor's output, at most its input, is counted as its input.
-        let counted = if at == last && rows.is_some() { 2 * produced } else { produced };
-        total = total.saturating_add(counted as u64);
-        // The bytes really decoded so far, so a refusal records what it cost.
-        budget.hold(total);
-        // Checked after every chunk, so decoding stops at most one chunk past
-        // the limit; equal is accepted.
-        if total > STREAM_LIMIT {
-            return Err(over_stream_limit());
-        }
-        if at < last {
-            stack.push(Frame {
-                step: at + 1,
-                data: std::borrow::Cow::Owned(out[..produced].to_vec()),
-                zlib_at: 0,
-                raw_at: 0,
-                zlib_full: false,
-                raw_full: false,
-            });
+        count.add(at, produced)?;
+        if at + 1 < steps.len() {
+            stack.push(Frame::new(at + 1, std::borrow::Cow::Owned(out[..produced].to_vec())));
         }
     }
+    Ok(())
+}
+
+/// The decoded size of `stream` as the reader would produce it, decoding one
+/// [`CHUNK`] at a time and keeping none of it (DEC-003): the sum of what each
+/// step outputs, plus a predictor's row buffers and output. A chain whose first
+/// filter is unknown counts 0 (the reader copies the stored bytes); an unknown
+/// filter later ends the chain, the steps before it counted.
+///
+/// Steps are fed depth first from an explicit stack, so the held data is one
+/// chunk per step and no recursion. Once a step's input is complete its tail
+/// (a final ASCII85 group) goes to the next step. O(decoded bytes) time.
+fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64> {
+    let Some(names) = filters(stream) else { return Ok(0) };
+    if names.len() > MAX_FILTERS {
+        return Ok(0);
+    }
+    let chain: Vec<&[u8]> = names.into_iter().take_while(|n| known(n)).collect();
+    let params = stream.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
+    let early_change = params
+        .and_then(|p| p.get(b"EarlyChange").and_then(Object::as_i64).ok())
+        .is_none_or(|v| v != 0);
+    let rows = predictor_rows(stream);
+    let predicted_last =
+        chain.last().filter(|n| rows.is_some() && predicting(n)).map(|_| chain.len() - 1);
+    let mut count = Count {
+        total: if predicted_last.is_some() { rows.unwrap_or(0) } else { 0 },
+        predicted_last,
+        budget,
+    };
+    if count.total > STREAM_LIMIT {
+        return Err(over_stream_limit());
+    }
+    let mut steps: Vec<Step> = chain.iter().map(|n| Step::new(n, early_change)).collect();
+    let mut out = vec![0u8; CHUNK];
+    let mut stack = Vec::new();
+    if !steps.is_empty() && !stream.content.is_empty() {
+        stack.push(Frame::new(0, std::borrow::Cow::Borrowed(stream.content.as_slice())));
+    }
+    drain(&mut steps, &mut stack, &mut out, &mut count)?;
+    for at in 0..steps.len() {
+        let tail = steps[at].finish();
+        if tail.is_empty() {
+            continue;
+        }
+        count.add(at, tail.len())?;
+        if at + 1 < steps.len() {
+            stack.push(Frame::new(at + 1, std::borrow::Cow::Owned(tail)));
+            drain(&mut steps, &mut stack, &mut out, &mut count)?;
+        }
+    }
+    let total = count.total;
     if let Scope::Page = scope {
         budget.page = budget.page.saturating_add(total);
     }
@@ -850,5 +1453,264 @@ mod tests {
             extract(&marked).expect("answered").body,
             extract(&neutral).expect("answered").body
         );
+    }
+
+    /// The sum over the steps of what lopdf outputs for `stream`: each prefix
+    /// of the chain decoded by lopdf itself.
+    fn lopdf_steps(stream: &Stream) -> u64 {
+        let names: Vec<Object> = match stream.dict.get(b"Filter").unwrap() {
+            Object::Array(a) => a.clone(),
+            name => vec![name.clone()],
+        };
+        (1..=names.len())
+            .map(|n| {
+                let mut prefix = stream.clone();
+                prefix.dict.set("Filter", Object::Array(names[..n].to_vec()));
+                prefix.decompressed_content().unwrap().len() as u64
+            })
+            .sum()
+    }
+
+    fn filtered(filters: &[&str], params: Option<Dictionary>, content: Vec<u8>) -> Stream {
+        let names = filters.iter().map(|f| Object::Name(f.as_bytes().to_vec())).collect();
+        let mut dict = Dictionary::from_iter(vec![("Filter", Object::Array(names))]);
+        if let Some(params) = params {
+            dict.set("DecodeParms", Object::Dictionary(params));
+        }
+        Stream::new(dict, content)
+    }
+
+    #[test]
+    fn measure_counts_what_lopdf_decodes_at_every_step() {
+        let text: Vec<u8> = (0..300_000u32).map(|i| b"abcz \x00"[(i % 6) as usize]).collect();
+        let mut zeros = vec![0u8; 10];
+        zeros.extend_from_slice(b"tail");
+        let late = Dictionary::from_iter(vec![("EarlyChange", Object::Integer(0))]);
+        let late_code = weezl::encode::Encoder::new(weezl::BitOrder::Msb, 8).encode(&text).unwrap();
+        let cases = [
+            filtered(&["LZWDecode"], None, lzw(&text)),
+            filtered(&["LZWDecode"], Some(late), late_code),
+            filtered(&["ASCII85Decode"], None, ascii85(&zeros)),
+            filtered(&["ASCII85Decode"], None, ascii85(b"abcdefg")),
+            filtered(&["ASCII85Decode", "LZWDecode"], None, ascii85(&lzw(&text))),
+            filtered(
+                &["ASCII85Decode", "FlateDecode"],
+                None,
+                ascii85(&zlib_run("x", b' ', 1_000_000, "y")),
+            ),
+            filtered(
+                &["FlateDecode", "ASCII85Decode"],
+                None,
+                zlib_run(&String::from_utf8(ascii85(&text)).unwrap(), b' ', 0, ""),
+            ),
+        ];
+        for (i, stream) in cases.iter().enumerate() {
+            let measured = measure(stream, &mut PdfBudget::default(), Scope::Load).unwrap();
+            assert_eq!(measured, lopdf_steps(stream), "case {i}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_empty_password_gives_the_error_of_today() {
+        let bytes = passworded_pdf();
+        let today = pdf_extract::extract_text_from_mem_by_pages(&bytes).unwrap_err();
+
+        let Err(e) = extract(&bytes) else { panic!("an empty password must not open it") };
+
+        assert_eq!(e.message, format!("pdf: {today}"));
+    }
+
+    #[test]
+    fn an_encrypt_key_left_in_the_copy_fails_closed() {
+        let bytes = secret_pdf("/Encrypt");
+        let mut span = xref_guard(&bytes, &mut PdfBudget::default()).unwrap().unwrap();
+        assert!(span.encrypted() && span.names.len() == 1);
+        span.names.clear();
+
+        let e = unlock_encrypted(&bytes, &span).unwrap_err();
+
+        assert_eq!(e.message, "pdf: the encryption dictionary could not be isolated");
+    }
+
+    #[test]
+    fn an_unreadable_main_trailer_naming_encrypt_fails_closed() {
+        let mut bytes = secret_pdf("/Encrypt");
+        // The last section now starts with a word lopdf cannot read as an object.
+        let at = bytes.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let xref: usize = std::str::from_utf8(&bytes[at + 10..])
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        bytes[xref] = b'x';
+
+        let e = extract(&bytes).map(|_| ()).unwrap_err();
+
+        assert_eq!(e.message, "pdf: the encryption dictionary could not be isolated");
+    }
+
+    /// What the reader of today answers for `bytes`, as `extract` words it.
+    fn today(bytes: &[u8]) -> std::result::Result<String, String> {
+        pdf_extract::extract_text_from_mem_by_pages(bytes)
+            .map(|pages| pages.concat())
+            .map_err(|e| format!("pdf: {e}"))
+    }
+
+    /// The number of pages of `bytes` today and now, when both read it.
+    fn page_counts(bytes: &[u8]) -> Option<(usize, usize)> {
+        let today = pdf_extract::extract_text_from_mem_by_pages(bytes).ok()?.len();
+        Some((today, extract(bytes).ok()?.pages.len()))
+    }
+
+    #[test]
+    fn an_object_aes_cannot_decrypt_is_skipped_as_today() {
+        let bytes = aes_secret_pdf(true);
+        let clean = extract(&aes_secret_pdf(false)).expect("answered").body;
+        assert!(today(&bytes).unwrap().contains("Quarterly results"), "today extracts it");
+
+        let text = extract(&bytes).expect("answered").body;
+
+        assert!(text.contains("Quarterly results") && text.contains("Outlook"), "{text}");
+        assert_eq!(text, clean);
+    }
+
+    /// The main trailer's `/Encrypt N 0 R` of `bytes` and object N's dictionary.
+    fn encrypt_reference(bytes: &[u8]) -> (std::ops::Range<usize>, Vec<u8>) {
+        let at = bytes.windows(9).rposition(|w| w == b"/Encrypt ").unwrap();
+        let tail = String::from_utf8_lossy(&bytes[at..at + 40]);
+        let words: Vec<&str> = tail.split_whitespace().take(4).collect();
+        let reference = words[..4].join(" ");
+        let header = format!("\n{} {} obj\n", words[1], words[2]);
+        let start = bytes.windows(header.len()).position(|w| w == header.as_bytes()).unwrap();
+        let body = &bytes[start + header.len()..];
+        let end = body.windows(7).position(|w| w == b"\nendobj").unwrap();
+        (at..at + reference.len(), body[..end].to_vec())
+    }
+
+    #[test]
+    fn an_inline_encryption_dictionary_answers_as_today() {
+        let mut bytes = secret_pdf("/Encrypt");
+        let (reference, dict) = encrypt_reference(&bytes);
+        let mut inline = b"/Encrypt ".to_vec();
+        inline.extend_from_slice(&dict);
+        // The main trailer is the last object: its offset does not move.
+        bytes.splice(reference, inline);
+        let today = today(&bytes);
+        // lopdf cannot authenticate an inline dictionary: its loader keeps no object.
+        assert_eq!(today, Ok(String::new()));
+
+        let now = extract(&bytes).map(|e| e.body).map_err(|e| e.message);
+
+        assert_eq!(now, today);
+        let (today, now) = page_counts(&bytes).unwrap();
+        assert_eq!(now, today);
+    }
+
+    #[test]
+    fn an_unreadable_start_naming_encrypt_fails_closed() {
+        let mut bytes = secret_pdf("/Encrypt");
+        // `startxref` followed by a tab: no cross reference can be located.
+        let at = bytes.windows(10).rposition(|w| w == b"startxref\n").unwrap();
+        bytes[at + 9] = b'\t';
+
+        let e = extract(&bytes).map(|_| ()).unwrap_err();
+
+        assert_eq!(e.message, "pdf: the encryption dictionary could not be isolated");
+    }
+
+    /// The secret document whose main trailer reads `key` where `/Encrypt` was:
+    /// its guard span, its unlocked copy and its text.
+    fn unlocked_with(key: &str) -> (TrailerSpan, Vec<u8>, String) {
+        let bytes = secret_pdf(key);
+        let span = xref_guard(&bytes, &mut PdfBudget::default()).unwrap().unwrap();
+        let copy = unlock_encrypted(&bytes, &span).unwrap();
+        (span, copy, extract(&bytes).expect("answered").body)
+    }
+
+    #[test]
+    fn an_encrypt_name_in_a_trailer_string_is_kept() {
+        let clean = unlocked_with("/Encrypt").2;
+        let (span, copy, text) = unlocked_with("/Note (/Encrypt) /Encrypt");
+
+        assert_eq!(span.names.len(), 1);
+        assert!(copy.windows(10).any(|w| w == b"(/Encrypt)"), "the string was renamed");
+        assert_eq!(text, clean);
+    }
+
+    #[test]
+    fn an_encrypt_name_in_a_trailer_comment_is_kept() {
+        let clean = unlocked_with("/Encrypt").2;
+        let (span, copy, text) = unlocked_with("% /Encrypt\n/Encrypt");
+
+        assert_eq!(span.names.len(), 1);
+        assert!(copy.windows(10).any(|w| w == b"% /Encrypt"), "the comment was renamed");
+        assert_eq!(text, clean);
+    }
+
+    #[test]
+    fn an_encrypt_name_nested_in_the_trailer_is_kept() {
+        let clean = unlocked_with("/Encrypt").2;
+        let (span, copy, text) = unlocked_with("/Extra << /Encrypt 1 0 R >> /Encrypt");
+
+        assert_eq!(span.names.len(), 1);
+        assert!(copy.windows(17).any(|w| w == b"<< /Encrypt 1 0 R"), "the nested name was renamed");
+        assert_eq!(text, clean);
+    }
+
+    #[test]
+    fn an_encrypt_key_only_in_a_previous_trailer_answers_as_today() {
+        // The classic section lopdf wrote names `Encrypt`; the main one does not.
+        let bytes = secret_pdf("/Unused");
+        assert!(!xref_guard(&bytes, &mut PdfBudget::default()).unwrap().unwrap().encrypted());
+
+        let now = extract(&bytes).map(|e| e.body).map_err(|e| e.message);
+
+        assert_eq!(now, today(&bytes));
+        let (today, now) = page_counts(&bytes).unwrap();
+        assert_eq!(now, today);
+    }
+
+    #[test]
+    fn a_hybrid_cross_reference_stream_is_measured() {
+        let mut doc = page_pdf(plain(HELLO), "", vec![]);
+        let classic = doc.windows(6).rposition(|w| w == b"\nxref\n").unwrap() + 1;
+        let stored = zlib_run("", b' ', PDF_BOMB, "");
+        let stream = doc.len();
+        doc.extend_from_slice(
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size 10 /W [1 4 2] /Filter /FlateDecode /Length {} >>\nstream\n",
+                stored.len()
+            )
+            .as_bytes(),
+        );
+        doc.extend_from_slice(&stored);
+        doc.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref = doc.len();
+        doc.extend_from_slice(
+            format!("xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 10 /Root 1 0 R /Prev {classic} /XRefStm {stream} >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let e = extract(&small(doc)).map(|_| ()).unwrap_err();
+
+        assert_eq!(e.message, "a PDF stream decodes to more than 104857600 bytes");
+    }
+
+    #[test]
+    fn a_cross_reference_stream_with_a_predictor_between_two_steps_is_refused() {
+        let mut doc = page_pdf(plain(HELLO), "", vec![]);
+        // The classic cross reference gives way to a stream whose two
+        // inflations have a predictor between them.
+        let classic = doc.windows(5).rposition(|w| w == b"xref\n").unwrap();
+        doc.truncate(classic);
+        let dict = "<< /Type /XRef /Size 6 /W [1 4 2] /Filter [/FlateDecode /FlateDecode] /DecodeParms << /Predictor 12 /Columns 7 >> /Length 0 >>";
+        doc.extend_from_slice(format!("9 0 obj\n{dict}\nstream\n\nendstream\nendobj\n").as_bytes());
+        doc.extend_from_slice(format!("startxref\n{classic}\n%%EOF\n").as_bytes());
+
+        let e = extract(&doc).map(|_| ()).unwrap_err();
+
+        assert_eq!(e.message, "pdf: the cross reference stream could not be measured");
     }
 }

@@ -135,3 +135,76 @@ async fn e2e_0089_032_title_read_under_the_same_limits() {
     stream_refusal(&v, "/docs/titled.pdf", decoded_held("/docs/titled.pdf"));
     assert!(!format!("{v:?}").contains("Report 2026"), "no title is reported: {v:?}");
 }
+
+/// The body the library's own pass gives for `bytes`: its pages trimmed, each
+/// non empty one behind its page marker, as the extraction assembles them.
+fn library_preview(bytes: &[u8]) -> String {
+    let pages = pdf_extract::extract_text_from_mem_by_pages(bytes).expect("the library reads it");
+    let mut body = String::new();
+    for (i, text) in pages.iter().enumerate() {
+        if !text.trim().is_empty() {
+            body.push_str(&format!("\n\n---\n*[Page {}]*\n\n{}", i + 1, text.trim()));
+        }
+    }
+    body.trim().to_string()
+}
+
+/// Store `bytes` at `doc`, extract it, and check the preview is `expected`
+/// and the library's own pass over the same bytes.
+async fn unchanged_on(doc: &str, bytes: &[u8], expected: &str) -> Value {
+    let f = office_fixture().await;
+    seed(&f, doc, bytes).await;
+
+    let v = extract_text(&f, OWNER, doc, false).await.expect("answered");
+
+    assert_eq!(v["preview"], json!(expected), "{v}");
+    assert_eq!(library_preview(bytes), expected);
+    v
+}
+
+const SECRET_PREVIEW: &str = "---\n*[Page 1]*\n\nQuarterly results\n\n---\n*[Page 2]*\n\nOutlook";
+
+#[tokio::test]
+async fn pdf_cross_reference_stream_bomb_is_refused() {
+    let _heavy = heavy().await;
+    refused_on("/docs/xref.pdf", &xref_stream_bomb_pdf()).await;
+}
+
+#[tokio::test]
+async fn pdf_encrypted_object_stream_bomb_is_refused() {
+    let _heavy = heavy().await;
+    refused_on("/docs/locked.pdf", &locked_bomb_pdf()).await;
+}
+
+#[tokio::test]
+async fn pdf_encrypted_document_text_is_unchanged() {
+    let v = unchanged_on("/docs/secret.pdf", &secret_pdf("/Encrypt"), SECRET_PREVIEW).await;
+    assert_eq!(v["meta"]["pages"], json!(2), "{v}");
+    assert_eq!(v["meta"]["title"], json!("Report 2026"), "{v}");
+}
+
+#[tokio::test]
+async fn pdf_escaped_encrypt_key_is_found() {
+    let bytes = secret_pdf("/Encr#79pt");
+    assert!(bytes.windows(10).any(|w| w == b"/Encr#79pt"), "the key is escaped");
+    let v = unchanged_on("/docs/escaped.pdf", &bytes, SECRET_PREVIEW).await;
+    assert_eq!(v["meta"]["title"], json!("Report 2026"), "{v}");
+}
+
+#[tokio::test]
+async fn pdf_lzw_content_bomb_is_refused() {
+    let _heavy = heavy().await;
+    refused_on("/docs/lzw.pdf", &lzw_bomb_pdf()).await;
+}
+
+#[tokio::test]
+async fn pdf_ascii85_then_flate_bomb_is_refused() {
+    let _heavy = heavy().await;
+    refused_on("/docs/a85.pdf", &ascii85_bomb_pdf()).await;
+}
+
+#[tokio::test]
+async fn pdf_lzw_and_ascii85_text_is_unchanged() {
+    let expected = "---\n*[Page 1]*\n\nOld LZW\n\n---\n*[Page 2]*\n\nOld A85";
+    unchanged_on("/docs/old.pdf", &old_filters_pdf(), expected).await;
+}
