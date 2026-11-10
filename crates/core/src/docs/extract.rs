@@ -26,7 +26,6 @@ use crate::docs::ocr::OcrProvider;
 use crate::errors::{Result, ToolError};
 use crate::storage::VolumeClient;
 use serde_json::{Map, Value, json};
-use std::io::Read;
 
 /// Extensions decoded as plain text.
 const TEXT_EXTS: &[&str] = &[".txt", ".md", ".markdown", ".rst", ".log", ".text"];
@@ -162,7 +161,7 @@ impl<'a> Extractor<'a> {
             )));
         }
 
-        let mut result = match ext.as_str() {
+        let outcome = match ext.as_str() {
             ".pdf" => pdf(data),
             ".docx" => docx(data),
             ".pptx" | ".pptm" | ".potx" | ".ppsx" => pptx(data),
@@ -176,7 +175,14 @@ impl<'a> Extractor<'a> {
             }
             e => Ok(ExtractResult::of("text", decode(data))
                 .with_note(format!("unknown extension {e}; decoded as text"))),
-        }?;
+        };
+        // No await since the Office reader returned, so the slot still holds
+        // this call's figures (SPEC-0088 DEC-008).
+        #[cfg(test)]
+        if let Some(held) = LAST_OFFICE_HELD.with(std::cell::Cell::take) {
+            OFFICE_HELD.with(|m| m.borrow_mut().insert(filename.to_string(), held));
+        }
+        let mut result = outcome?;
 
         let (text, truncated) = truncate_chars(&result.text, max_chars);
         result.text = text;
@@ -559,12 +565,73 @@ fn open_zip(data: &[u8]) -> Result<Zip> {
     Ok(zip)
 }
 
-/// Read one zip entry as text, or `None` when the entry is absent.
-fn entry_text(zip: &mut Zip, name: &str) -> Option<String> {
-    let mut file = zip.by_name(name).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    Some(decode(&buf))
+/// What one Office extraction decoded, measured for the tests (SPEC-0088 DEC-008).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OfficeHeld {
+    /// Sum of the decoded part bytes of the call: an upper bound of what was held at once.
+    pub(crate) parts: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Figures of the last Office reader that ran on this thread.
+    static LAST_OFFICE_HELD: std::cell::Cell<Option<OfficeHeld>> = const { std::cell::Cell::new(None) };
+    /// Figures per file name given to `Extractor::extract`, so concurrent calls do not overwrite each other.
+    pub(crate) static OFFICE_HELD: std::cell::RefCell<std::collections::HashMap<String, OfficeHeld>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Largest decoded size of one Office part (SPEC-0088 FR-NEW-001).
+pub(crate) const PART_LIMIT: u64 = 104_857_600;
+
+/// The one reader of Office parts and what one call has decoded through it.
+struct OfficeBudget {
+    decoded: u64,
+}
+
+impl OfficeBudget {
+    fn office() -> Self {
+        Self { decoded: 0 }
+    }
+
+    /// One part as text: `Ok(None)` when it is absent, unreadable or damaged
+    /// (BL-0144). The size the central directory declares is checked before a
+    /// decompressor is built, so a part over [`PART_LIMIT`] is refused having
+    /// decoded nothing; the decode is then capped at that declared size. Time
+    /// O(declared), memory O(declared) plus one fixed chunk.
+    fn read_part(&mut self, zip: &mut Zip, name: &str) -> Result<Option<String>> {
+        let Some(index) = zip.index_for_name(name) else { return Ok(None) };
+        let declared = match zip.by_index_raw(index) {
+            Ok(file) => file.size(),
+            Err(_) => return Ok(None),
+        };
+        if declared > PART_LIMIT {
+            return Err(ToolError::invalid_argument(format!(
+                "document part '{name}' is {declared} bytes once decoded, over the limit of {PART_LIMIT} bytes"
+            )));
+        }
+        let Ok(file) = zip.by_index(index) else { return Ok(None) };
+        let Ok(read) = crate::tools::archive_single::read_capped(file, declared) else {
+            return Ok(None);
+        };
+        self.decoded += read.bytes.len() as u64;
+        // A valid part becomes its text without a copy (SPEC-0088 DEC-009).
+        Ok(Some(String::from_utf8(read.bytes).unwrap_or_else(|e| decode(e.as_bytes()))))
+    }
+}
+
+/// Open the package and run `read` with a fresh budget; the test hook records
+/// the figures whatever the outcome.
+fn office(
+    data: &[u8],
+    read: impl FnOnce(&mut Zip, &mut OfficeBudget) -> Result<ExtractResult>,
+) -> Result<ExtractResult> {
+    let mut budget = OfficeBudget::office();
+    let outcome = open_zip(data).and_then(|mut zip| read(&mut zip, &mut budget));
+    #[cfg(test)]
+    LAST_OFFICE_HELD.with(|c| c.set(Some(OfficeHeld { parts: budget.decoded })));
+    outcome
 }
 
 fn entry_names(zip: &Zip) -> Vec<String> {
@@ -712,8 +779,12 @@ enum DocxMode {
 }
 
 fn docx(data: &[u8]) -> Result<ExtractResult> {
-    let mut zip = open_zip(data)?;
-    let xml = entry_text(&mut zip, "word/document.xml")
+    office(data, docx_parts)
+}
+
+fn docx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult> {
+    let xml = budget
+        .read_part(zip, "word/document.xml")?
         .ok_or_else(|| ToolError::invalid_argument("docx: word/document.xml is missing"))?;
 
     let mut reader = quick_xml::Reader::from_str(&xml);
@@ -864,19 +935,22 @@ fn docx_paragraph_line(style: &str, text: &str) -> Option<String> {
 // ── PPTX ─────────────────────────────────────────────────────────────────────
 
 fn pptx(data: &[u8]) -> Result<ExtractResult> {
-    let mut zip = open_zip(data)?;
-    let slides = pptx_slide_order(&mut zip);
+    office(data, pptx_parts)
+}
+
+fn pptx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult> {
+    let slides = pptx_slide_order(zip, budget)?;
     let mut lines: Vec<String> = Vec::new();
     for (index, slide_part) in slides.iter().enumerate() {
-        let Some(xml) = entry_text(&mut zip, slide_part) else { continue };
+        let Some(xml) = budget.read_part(zip, slide_part)? else { continue };
         lines.push(format!("## Slide {}", index + 1));
         for para in drawing_paragraphs(&xml) {
             if !para.is_empty() {
                 lines.push(para);
             }
         }
-        if let Some(notes_part) = pptx_notes_part(&mut zip, slide_part)
-            && let Some(notes_xml) = entry_text(&mut zip, &notes_part)
+        if let Some(notes_part) = pptx_notes_part(zip, budget, slide_part)?
+            && let Some(notes_xml) = budget.read_part(zip, &notes_part)?
         {
             let notes = all_text_of(&notes_xml, "t").trim().to_string();
             if !notes.is_empty() {
@@ -891,34 +965,16 @@ fn pptx(data: &[u8]) -> Result<ExtractResult> {
 /// Presentation order of the slide parts. Read from `p:sldIdLst` plus the
 /// presentation relationships, because zip entry order and file numbering both
 /// lie about the real order after slides are reordered in PowerPoint.
-fn pptx_slide_order(zip: &mut Zip) -> Vec<String> {
-    let ordered = (|| {
-        let presentation = entry_text(zip, "ppt/presentation.xml")?;
-        let rels = parse_rels(&entry_text(zip, "ppt/_rels/presentation.xml.rels")?);
-        let mut reader = quick_xml::Reader::from_str(&presentation);
-        let mut ids = Vec::new();
-        loop {
-            match reader.read_event() {
-                Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
-                    if local_name(&e) == "sldId"
-                        && let Some(id) = rel_id_attr(&e)
-                    {
-                        ids.push(id);
-                    }
-                }
-                Ok(quick_xml::events::Event::Eof) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-        let parts: Vec<String> = ids
-            .iter()
-            .filter_map(|id| rels.iter().find(|r| &r.id == id))
-            .map(|r| resolve_target("ppt", &r.target))
-            .collect();
-        if parts.is_empty() { None } else { Some(parts) }
-    })();
+/// A refusal of either part propagates: it must not fall back to the numeric order.
+fn pptx_slide_order(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<Vec<String>> {
+    let ordered = match budget.read_part(zip, "ppt/presentation.xml")? {
+        None => None,
+        Some(presentation) => budget
+            .read_part(zip, "ppt/_rels/presentation.xml.rels")?
+            .and_then(|rels| pptx_ordered_parts(&presentation, &parse_rels(&rels))),
+    };
     if let Some(parts) = ordered {
-        return parts;
+        return Ok(parts);
     }
     // Fallback: numeric order of slideN.xml.
     let mut names: Vec<String> = entry_names(zip)
@@ -926,19 +982,49 @@ fn pptx_slide_order(zip: &mut Zip) -> Vec<String> {
         .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
         .collect();
     names.sort_by_key(|n| slide_number(n));
-    names
+    Ok(names)
+}
+
+/// The slide parts `p:sldIdLst` lists, through the relationships; `None` when none resolves.
+fn pptx_ordered_parts(presentation: &str, rels: &[Rel]) -> Option<Vec<String>> {
+    let mut reader = quick_xml::Reader::from_str(presentation);
+    let mut ids = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if local_name(&e) == "sldId"
+                    && let Some(id) = rel_id_attr(&e)
+                {
+                    ids.push(id);
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    let parts: Vec<String> = ids
+        .iter()
+        .filter_map(|id| rels.iter().find(|r| &r.id == id))
+        .map(|r| resolve_target("ppt", &r.target))
+        .collect();
+    if parts.is_empty() { None } else { Some(parts) }
 }
 
 fn slide_number(name: &str) -> u32 {
     name.chars().filter(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0)
 }
 
-fn pptx_notes_part(zip: &mut Zip, slide_part: &str) -> Option<String> {
-    let (dir, file) = slide_part.rsplit_once('/')?;
+fn pptx_notes_part(
+    zip: &mut Zip,
+    budget: &mut OfficeBudget,
+    slide_part: &str,
+) -> Result<Option<String>> {
+    let Some((dir, file)) = slide_part.rsplit_once('/') else { return Ok(None) };
     let rels_path = format!("{dir}/_rels/{file}.rels");
-    let rels = parse_rels(&entry_text(zip, &rels_path)?);
-    let rel = rels.iter().find(|r| r.rel_type.ends_with("notesSlide"))?;
-    Some(resolve_target(dir, &rel.target))
+    let Some(rels) = budget.read_part(zip, &rels_path)? else { return Ok(None) };
+    let rels = parse_rels(&rels);
+    let rel = rels.iter().find(|r| r.rel_type.ends_with("notesSlide"));
+    Ok(rel.map(|rel| resolve_target(dir, &rel.target)))
 }
 
 /// Text of each `a:p` in a DrawingML part, one string per paragraph.
@@ -983,13 +1069,16 @@ fn drawing_paragraphs(xml: &str) -> Vec<String> {
 // ── XLSX ─────────────────────────────────────────────────────────────────────
 
 fn xlsx(data: &[u8]) -> Result<ExtractResult> {
-    let mut zip = open_zip(data)?;
-    let shared = xlsx_shared_strings(&mut zip);
-    let sheets = xlsx_sheets(&mut zip);
+    office(data, xlsx_parts)
+}
+
+fn xlsx_parts(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<ExtractResult> {
+    let shared = xlsx_shared_strings(zip, budget)?;
+    let sheets = xlsx_sheets(zip, budget)?;
     let mut lines: Vec<String> = Vec::new();
     let mut grids = Vec::new();
     for (name, part) in &sheets {
-        let Some(xml) = entry_text(&mut zip, part) else { continue };
+        let Some(xml) = budget.read_part(zip, part)? else { continue };
         let rows = xlsx_rows(&xml, &shared);
         if rows.is_empty() {
             continue;
@@ -1002,8 +1091,8 @@ fn xlsx(data: &[u8]) -> Result<ExtractResult> {
 }
 
 /// The shared string table, one entry per `si` (concatenating its rich text runs).
-fn xlsx_shared_strings(zip: &mut Zip) -> Vec<String> {
-    let Some(xml) = entry_text(zip, "xl/sharedStrings.xml") else { return Vec::new() };
+fn xlsx_shared_strings(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<Vec<String>> {
+    let Some(xml) = budget.read_part(zip, "xl/sharedStrings.xml")? else { return Ok(Vec::new()) };
     let mut reader = quick_xml::Reader::from_str(&xml);
     let mut out = Vec::new();
     let mut current: Option<String> = None;
@@ -1038,14 +1127,17 @@ fn xlsx_shared_strings(zip: &mut Zip) -> Vec<String> {
             Ok(_) => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// `(sheet name, part path)` in workbook order.
-fn xlsx_sheets(zip: &mut Zip) -> Vec<(String, String)> {
-    let Some(workbook) = entry_text(zip, "xl/workbook.xml") else { return Vec::new() };
-    let rels =
-        entry_text(zip, "xl/_rels/workbook.xml.rels").map(|x| parse_rels(&x)).unwrap_or_default();
+/// A refusal of the relationships propagates instead of reading as no sheet.
+fn xlsx_sheets(zip: &mut Zip, budget: &mut OfficeBudget) -> Result<Vec<(String, String)>> {
+    let Some(workbook) = budget.read_part(zip, "xl/workbook.xml")? else { return Ok(Vec::new()) };
+    let rels = budget
+        .read_part(zip, "xl/_rels/workbook.xml.rels")?
+        .map(|x| parse_rels(&x))
+        .unwrap_or_default();
     let mut reader = quick_xml::Reader::from_str(&workbook);
     let mut out = Vec::new();
     loop {
@@ -1064,7 +1156,7 @@ fn xlsx_sheets(zip: &mut Zip) -> Vec<(String, String)> {
             Ok(_) => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// Non empty rows of a worksheet, uncapped: the caller caps the rendering.

@@ -240,14 +240,41 @@ pub(crate) async fn limit_whole_mb_remaining(f: &Fixture, n: i64) {
 /// size of `0xFFFF_FFFF` or more puts `0xFFFF_FFFF` in both size fields of
 /// both headers plus a zip64 extra field (uncompressed then compressed size).
 pub(crate) fn zip_declaring(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
+    let parts: Vec<RawPart> = entries
+        .iter()
+        .map(|(name, declared, content)| RawPart { declared: *declared, ..raw_part(name, content) })
+        .collect();
+    zip_raw(&parts)
+}
+
+/// One zip entry as written: deflated `data`, its checksum and the size it declares.
+pub(crate) struct RawPart {
+    pub(crate) name: String,
+    pub(crate) declared: u64,
+    pub(crate) crc: u32,
+    pub(crate) data: Vec<u8>,
+}
+
+/// `content` deflated, declaring its real size.
+pub(crate) fn raw_part(name: &str, content: &[u8]) -> RawPart {
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(content).unwrap();
+    let mut crc = flate2::Crc::new();
+    crc.update(content);
+    RawPart {
+        name: name.to_string(),
+        declared: content.len() as u64,
+        crc: crc.sum(),
+        data: e.finish().unwrap(),
+    }
+}
+
+/// A zip of `entries` written byte for byte as given (SPEC-0088 DEC-011), so a
+/// header can declare any size and carry any compressed stream.
+pub(crate) fn zip_raw(entries: &[RawPart]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
-    for (name, declared, content) in entries {
-        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        e.write_all(content).unwrap();
-        let data = e.finish().unwrap();
-        let mut crc = flate2::Crc::new();
-        crc.update(content);
+    for RawPart { name, declared, crc, data } in entries {
         let zip64 = *declared >= 0xFFFF_FFFF;
         let (version, usize32, csize32, extra) = if zip64 {
             let mut x = Vec::new();
@@ -267,7 +294,7 @@ pub(crate) fn zip_declaring(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
         common.extend_from_slice(&8u16.to_le_bytes());
         common.extend_from_slice(&0u16.to_le_bytes());
         common.extend_from_slice(&0x21u16.to_le_bytes());
-        common.extend_from_slice(&crc.sum().to_le_bytes());
+        common.extend_from_slice(&crc.to_le_bytes());
         common.extend_from_slice(&csize32.to_le_bytes());
         common.extend_from_slice(&usize32.to_le_bytes());
         common.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -277,7 +304,7 @@ pub(crate) fn zip_declaring(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
         out.extend_from_slice(&common);
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(&extra);
-        out.extend_from_slice(&data);
+        out.extend_from_slice(data);
 
         central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
         central.extend_from_slice(&45u16.to_le_bytes());
@@ -301,6 +328,203 @@ pub(crate) fn zip_declaring(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
     out.extend_from_slice(&cd_offset.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out
+}
+
+/// Letters per cached deflate segment of [`deflate_run`].
+const SEGMENT: usize = 1_000_000;
+
+/// Raw deflate of `data`. A full flush ends the output on a byte boundary with
+/// no reference to anything before it, so independently compressed pieces
+/// concatenate into one valid stream; `finish` closes it with the final block.
+fn deflate_piece(data: &[u8], finish: bool) -> Vec<u8> {
+    use flate2::{Compress, Compression, FlushCompress, Status};
+    let mut c = Compress::new(Compression::default(), false);
+    let mut out = Vec::with_capacity(data.len() / 4 + 4_096);
+    let flush = if finish { FlushCompress::Finish } else { FlushCompress::Full };
+    loop {
+        if out.capacity() - out.len() < 4_096 {
+            out.reserve(out.capacity());
+        }
+        let consumed = c.total_in() as usize;
+        let status = c.compress_vec(&data[consumed..], &mut out, flush).unwrap();
+        let all_in = c.total_in() as usize == data.len();
+        let done =
+            if finish { status == Status::StreamEnd } else { all_in && out.len() < out.capacity() };
+        if done {
+            return out;
+        }
+    }
+}
+
+/// The deflated segment of [`SEGMENT`] copies of `letter`, compressed once per
+/// process and letter, and its checksum (`Crc` cannot be cloned, so it is
+/// recomputed: one pass over 1 000 000 bytes).
+fn segment(letter: u8) -> (Vec<u8>, flate2::Crc) {
+    static CACHE: std::sync::Mutex<Vec<(u8, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    let letters = vec![letter; SEGMENT];
+    let mut crc = flate2::Crc::new();
+    crc.update(&letters);
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((_, data)) = cache.iter().find(|(l, _)| *l == letter) {
+        return (data.clone(), crc);
+    }
+    let data = deflate_piece(&letters, false);
+    cache.push((letter, data.clone()));
+    (data, crc)
+}
+
+/// The deflate stream of `prefix`, then `n` copies of `letter`, then `suffix`,
+/// and its checksum: whole cached segments repeated, so a 200 000 000 byte part
+/// costs about 200 KB and no 200 MB compression (SPEC-0088 DEC-011).
+pub(crate) fn deflate_run(
+    prefix: &str,
+    letter: u8,
+    n: usize,
+    suffix: &str,
+) -> (Vec<u8>, flate2::Crc) {
+    let mut out = deflate_piece(prefix.as_bytes(), false);
+    let mut crc = flate2::Crc::new();
+    crc.update(prefix.as_bytes());
+    let (seg, seg_crc) = segment(letter);
+    for _ in 0..n / SEGMENT {
+        out.extend_from_slice(&seg);
+        crc.combine(&seg_crc);
+    }
+    let rest = vec![letter; n % SEGMENT];
+    out.extend(deflate_piece(&rest, false));
+    crc.update(&rest);
+    out.extend(deflate_piece(suffix.as_bytes(), true));
+    crc.update(suffix.as_bytes());
+    (out, crc)
+}
+
+/// Size of a bomb part, markup included (SPEC-0088 section 9).
+pub(crate) const BOMB: u64 = 200_000_000;
+
+/// The markup around the letters of a bomb part named `name`: the letters are
+/// the text where the part has text, else the value of a root attribute `x`.
+fn bomb_markup(name: &str) -> (String, String) {
+    let text = |open: &str, close: &str| (open.to_string(), close.to_string());
+    let attribute = |root: &str| (format!("<{root} x=\""), "\"/>".to_string());
+    if name == "word/document.xml" {
+        text(
+            r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>"#,
+            "</w:t></w:r></w:p></w:body></w:document>",
+        )
+    } else if name.starts_with("ppt/slides/slide") || name.starts_with("ppt/notesSlides/") {
+        text(r#"<p:sld xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>"#, "</a:t></a:r></a:p></p:sld>")
+    } else if name == "xl/sharedStrings.xml" {
+        text("<sst><si><t>", "</t></si></sst>")
+    } else if name.ends_with(".rels") {
+        attribute("Relationships")
+    } else if name == "ppt/presentation.xml" {
+        attribute("p:presentation")
+    } else if name == "xl/workbook.xml" {
+        attribute("workbook")
+    } else {
+        attribute("worksheet")
+    }
+}
+
+/// A part named `name` declaring and holding exactly [`BOMB`] bytes, the
+/// letter `a` filling what its markup leaves.
+pub(crate) fn bomb_part(name: &str) -> RawPart {
+    let (open, close) = bomb_markup(name);
+    let n = BOMB as usize - open.len() - close.len();
+    let (data, crc) = deflate_run(&open, b'a', n, &close);
+    RawPart { name: name.to_string(), declared: BOMB, crc: crc.sum(), data }
+}
+
+/// A process wide lock taken first by every test that builds or decodes a part
+/// of 10 MB or more: each can hold about 1 GB, so they must run one at a time.
+pub(crate) async fn heavy() -> tokio::sync::MutexGuard<'static, ()> {
+    static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    HEAVY.lock().await
+}
+
+/// A project with an empty `/docs` folder (SPEC-0088).
+pub(crate) async fn office_fixture() -> Fixture {
+    let f = Fixture::with_config(|_| {}).await;
+    f.seed_project(MOUNT, OWNER).await;
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    c.makedirs("/docs", true).await.unwrap();
+    f
+}
+
+/// Authorizes then extracts the text with the assistant tool's defaults, as both doors do.
+pub(crate) async fn extract_text(
+    f: &Fixture,
+    person: &str,
+    path: &str,
+    refresh: bool,
+) -> Result<Value> {
+    f.state.authorize(MOUNT, person).await.unwrap();
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    crate::core::fs_ops::extract_document(
+        &c,
+        &f.state.safety,
+        &f.state.config.extract.ocr,
+        person,
+        MOUNT,
+        path,
+        200_000,
+        4_000,
+        true,
+        refresh,
+    )
+    .await
+}
+
+/// Forget every Office call measured on this thread.
+pub(crate) fn office_held_reset() {
+    crate::docs::extract::OFFICE_HELD.with(|m| m.borrow_mut().clear());
+}
+
+/// Decoded part bytes the extraction of `path` held, 0 when it read no part.
+pub(crate) fn parts_held(path: &str) -> u64 {
+    crate::docs::extract::OFFICE_HELD.with(|m| m.borrow().get(path).map_or(0, |h| h.parts))
+}
+
+/// Nothing the refused extraction of `doc` could leave is there: no companion
+/// (or `companion_before` byte for byte), no artifact, no audit line, and the
+/// whole default session allowance is still free.
+pub(crate) async fn nothing_left(f: &Fixture, doc: &str, companion_before: Option<&[u8]>) {
+    let md = crate::docs::extract::companion_md_path(doc);
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    match companion_before {
+        None => {
+            let listing =
+                crate::core::fs_ops::list_dir(&c, "/docs", true, "name", false).await.unwrap();
+            let name = |p: &str| format!("\"{}\"", p.rsplit('/').next().unwrap());
+            assert!(listing.to_string().contains(&name(doc)), "{listing}");
+            assert!(!listing.to_string().contains(&name(&md)), "{listing}");
+        }
+        Some(before) => assert_eq!(read(f, &md).await.as_deref(), Some(before)),
+    }
+    for listed in [
+        crate::tools::artifacts::list_tables(&f.state, MOUNT, doc, None).await,
+        crate::tools::artifacts::list_images(&f.state, MOUNT, doc, None).await,
+    ] {
+        let e = listed.expect_err("no artifact may be listed");
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            (code::NOT_FOUND, crate::docs::artifacts::NO_ARTIFACTS)
+        );
+    }
+    let log = f.state.safety.audit(OWNER, MOUNT);
+    assert!(!log.iter().any(|e| e.op == "extract_text"), "{log:?}");
+    crate::core::fs_ops::write_bytes(
+        &c,
+        &f.state.safety,
+        OWNER,
+        MOUNT,
+        "/docs/fill.bin",
+        &vec![b'w'; 52_428_800],
+        true,
+        true,
+    )
+    .await
+    .expect("nothing was charged");
 }
 
 /// A zip of `zeros.bin`, 10 000 000 zero bytes: about 10 000 bytes once deflated.
