@@ -16,6 +16,7 @@ pub mod docx;
 pub mod extract;
 pub mod mime;
 pub mod ocr;
+pub(crate) mod pdf_bound;
 pub mod service;
 pub mod symbols;
 pub(crate) mod zip_check;

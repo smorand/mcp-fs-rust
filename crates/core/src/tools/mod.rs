@@ -81,6 +81,10 @@ pub(crate) mod metadata;
 #[cfg(test)]
 mod office_bound_e2e;
 #[cfg(test)]
+mod pdf_bound_e2e;
+#[cfg(test)]
+pub(crate) mod pdf_testkit;
+#[cfg(test)]
 mod pg_null_e2e;
 #[cfg(test)]
 mod pg_open_e2e;

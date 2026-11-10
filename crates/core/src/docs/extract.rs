@@ -183,6 +183,11 @@ impl<'a> Extractor<'a> {
         if let Some(held) = LAST_OFFICE_HELD.with(std::cell::Cell::take) {
             OFFICE_HELD.with(|m| m.borrow_mut().insert(filename.to_string(), held));
         }
+        // The PDF text pass is synchronous too (SPEC-0089 DEC-012).
+        #[cfg(test)]
+        if let Some(held) = LAST_PDF_HELD.with(std::cell::Cell::take) {
+            PDF_HELD.with(|m| m.borrow_mut().insert(filename.to_string(), held));
+        }
         let mut result = outcome?;
 
         let (text, truncated) = truncate_chars(&result.text, max_chars);
@@ -510,19 +515,15 @@ const SEPARATOR: &str = " | ";
 fn pdf(data: &[u8]) -> Result<ExtractResult> {
     // pdf-extract panics on some malformed content streams, and a panic in a
     // request handler would take down the whole worker, so it is contained here.
-    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(data))
-        .map_err(|_| ToolError::invalid_argument("pdf parser failed on this document"))?
-        .map_err(|e| ToolError::invalid_argument(format!("pdf: {e}")))?;
+    // Every stream is decoded under the limits of `pdf_bound` (SPEC-0089).
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::docs::pdf_bound::extract(data)
+    }))
+    .map_err(|_| ToolError::invalid_argument("pdf parser failed on this document"))??;
 
-    let mut parts = String::new();
-    for (i, text) in pages.iter().enumerate() {
-        if !text.trim().is_empty() {
-            parts.push_str(&format!("\n\n---\n*[Page {}]*\n\n{}", i + 1, text.trim()));
-        }
-    }
-    let body = parts.trim().to_string();
-    let mut result = ExtractResult::of("pdf", body).with_meta("pages", json!(pages.len()));
-    if let Some(title) = pdf_title(data).filter(|t| !t.is_empty()) {
+    let mut result =
+        ExtractResult::of("pdf", text.body).with_meta("pages", json!(text.pages.len()));
+    if let Some(title) = text.title.filter(|t| !t.is_empty()) {
         result = result.with_meta("title", json!(title));
     }
     if result.text.is_empty() {
@@ -533,23 +534,9 @@ fn pdf(data: &[u8]) -> Result<ExtractResult> {
     Ok(result)
 }
 
-/// Best effort `/Info /Title`. Absent or unreadable metadata is not an error:
-/// the C# also just omits the key.
-fn pdf_title(data: &[u8]) -> Option<String> {
-    let doc = std::panic::catch_unwind(|| pdf_extract::Document::load_mem(data)).ok()?.ok()?;
-    let info = doc.trailer.get(b"Info").ok()?;
-    let dict = match info {
-        pdf_extract::Object::Reference(id) => doc.get_dictionary(*id).ok()?,
-        pdf_extract::Object::Dictionary(d) => d,
-        _ => return None,
-    };
-    let raw = dict.get(b"Title").ok()?.as_str().ok()?;
-    Some(decode_pdf_text(raw))
-}
-
 /// PDF text strings are either UTF-16BE with a BOM or PDFDocEncoding, which
 /// coincides with Latin-1 for everything we care about.
-fn decode_pdf_text(raw: &[u8]) -> String {
+pub(crate) fn decode_pdf_text(raw: &[u8]) -> String {
     if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
         // A trailing odd byte cannot form a code unit, so the remainder is dropped.
         let units: Vec<u16> =
@@ -591,6 +578,29 @@ thread_local! {
     static LAST_OFFICE_HELD: std::cell::Cell<Option<OfficeHeld>> = const { std::cell::Cell::new(None) };
     /// Figures per file name given to `Extractor::extract`, so concurrent calls do not overwrite each other.
     pub(crate) static OFFICE_HELD: std::cell::RefCell<std::collections::HashMap<String, OfficeHeld>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// What one PDF extraction held, measured for the tests (SPEC-0089 DEC-012).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PdfHeld {
+    /// Largest decoded stream data held at once: an object stream being parsed,
+    /// a content or form buffer the walk parses, or a page's decode count while
+    /// the reader runs it, or the running output of the measurer's inflation.
+    /// Logical bytes: a transient copy lopdf makes inside `ObjectStream::new`
+    /// is not counted, so the real peak may be up to twice this figure.
+    pub(crate) decoded: u64,
+    /// Largest length of the content buffer.
+    pub(crate) content: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Figures of the last PDF text pass that ran on this thread.
+    pub(crate) static LAST_PDF_HELD: std::cell::Cell<Option<PdfHeld>> = const { std::cell::Cell::new(None) };
+    /// Figures per file name given to `Extractor::extract`.
+    pub(crate) static PDF_HELD: std::cell::RefCell<std::collections::HashMap<String, PdfHeld>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
