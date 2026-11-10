@@ -435,6 +435,17 @@ pub(crate) fn bomb_part(name: &str) -> RawPart {
     RawPart { name: name.to_string(), declared: BOMB, crc: crc.sum(), data }
 }
 
+/// A part named `name` of exactly `total` bytes: `xml_head` (one complete
+/// document) with the letter `a` added as the value of an attribute `x` on its
+/// root element, so the padding is never text (SPEC-0088 DEC-011).
+pub(crate) fn padded_part(name: &str, xml_head: &str, total: usize) -> RawPart {
+    let at = xml_head[1..].find([' ', '>', '/']).expect("a root element") + 1;
+    let (open, close) = (format!("{} x=\"", &xml_head[..at]), format!("\"{}", &xml_head[at..]));
+    let n = total.checked_sub(open.len() + close.len()).expect("total holds the markup");
+    let (data, crc) = deflate_run(&open, b'a', n, &close);
+    RawPart { name: name.to_string(), declared: total as u64, crc: crc.sum(), data }
+}
+
 /// A process wide lock taken first by every test that builds or decodes a part
 /// of 10 MB or more: each can hold about 1 GB, so they must run one at a time.
 pub(crate) async fn heavy() -> tokio::sync::MutexGuard<'static, ()> {
@@ -449,6 +460,21 @@ pub(crate) async fn office_fixture() -> Fixture {
     let c = f.state.stores.client(MOUNT).await.unwrap();
     c.makedirs("/docs", true).await.unwrap();
     f
+}
+
+/// [`office_fixture`] with a session write allowance of `n` bytes.
+pub(crate) async fn office_fixture_allowance(n: i64) -> Fixture {
+    let f = Fixture::with_config(move |c| c.safety.write_quota_bytes = n).await;
+    f.seed_project(MOUNT, OWNER).await;
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    c.makedirs("/docs", true).await.unwrap();
+    f
+}
+
+/// A zip of `parts` (name, content), each deflated and declaring its real size.
+pub(crate) fn office_zip(parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let raw: Vec<RawPart> = parts.iter().map(|(name, content)| raw_part(name, content)).collect();
+    zip_raw(&raw)
 }
 
 /// Authorizes then extracts the text with the assistant tool's defaults, as both doors do.

@@ -585,14 +585,20 @@ thread_local! {
 /// Largest decoded size of one Office part (SPEC-0088 FR-NEW-001).
 pub(crate) const PART_LIMIT: u64 = 104_857_600;
 
+/// Most declared bytes the parts read in one call may total.
+pub(crate) const CALL_LIMIT: u64 = 268_435_456;
+
 /// The one reader of Office parts and what one call has decoded through it.
 struct OfficeBudget {
     decoded: u64,
+    /// Declared sizes of the parts read so far in this call, a `u128` so two
+    /// sizes near `u64::MAX` never wrap.
+    declared: u128,
 }
 
 impl OfficeBudget {
     fn office() -> Self {
-        Self { decoded: 0 }
+        Self { decoded: 0, declared: 0 }
     }
 
     /// One part as text: `Ok(None)` when it is absent, unreadable or damaged
@@ -611,6 +617,14 @@ impl OfficeBudget {
                 "document part '{name}' is {declared} bytes once decoded, over the limit of {PART_LIMIT} bytes"
             )));
         }
+        // The size counts at its check, before decoding, so a part read twice
+        // counts twice and one that then reads as absent still counted.
+        if self.declared + u128::from(declared) > u128::from(CALL_LIMIT) {
+            return Err(ToolError::invalid_argument(format!(
+                "the document parts read total more than {CALL_LIMIT} bytes once decoded"
+            )));
+        }
+        self.declared += u128::from(declared);
         let Ok(file) = zip.by_index(index) else { return Ok(None) };
         let Ok(read) = crate::tools::archive_single::read_capped(file, declared) else {
             return Ok(None);

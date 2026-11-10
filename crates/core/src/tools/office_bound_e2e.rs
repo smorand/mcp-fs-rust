@@ -246,3 +246,174 @@ async fn bomb_part_decodes_to_exactly_its_declared_size() {
     assert_eq!(out.len() as u64, BOMB);
     assert!(out.starts_with(b"<p:sld") && out.ends_with(b"</p:sld>"));
 }
+
+/// The call limit of SPEC-0088 FR-NEW-003.
+const CALL_LIMIT: u64 = 268_435_456;
+
+/// What the call limit refusal of `doc` says.
+fn call_refusal(v: &Result<Value>, doc: &str) {
+    let Err(e) = v else { panic!("the extraction must be refused") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        format!(
+            "could not extract {doc}: the document parts read total more than 268435456 bytes once decoded"
+        )
+    );
+}
+
+/// One worksheet row of 10 numeric cells.
+const TEN_CELLS: &str = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c><c r="D1"><v>4</v></c><c r="E1"><v>5</v></c><c r="F1"><v>6</v></c><c r="G1"><v>7</v></c><c r="H1"><v>8</v></c><c r="I1"><v>9</v></c><c r="J1"><v>10</v></c></row></sheetData></worksheet>"#;
+
+/// A workbook of three sheets whose six parts declare `CALL_LIMIT + extra`
+/// bytes together, the extra byte on the third sheet.
+fn wide(extra: usize) -> Vec<u8> {
+    let workbook = r#"<workbook xmlns:r="r"><sheets><sheet name="A" sheetId="1" r:id="rId1"/><sheet name="B" sheetId="2" r:id="rId2"/><sheet name="C" sheetId="3" r:id="rId3"/></sheets></workbook>"#;
+    let rels = r#"<Relationships xmlns="x"><Relationship Id="rId1" Type="http://x/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://x/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://x/worksheet" Target="worksheets/sheet3.xml"/></Relationships>"#;
+    let strings = "<sst><si><t>s</t></si></sst>";
+    let small = strings.len() + workbook.len() + rels.len();
+    let rest = CALL_LIMIT as usize - small;
+    let each = rest / 3;
+    let parts = vec![
+        raw_part("xl/sharedStrings.xml", strings.as_bytes()),
+        raw_part("xl/workbook.xml", workbook.as_bytes()),
+        raw_part("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        padded_part("xl/worksheets/sheet1.xml", TEN_CELLS, each),
+        padded_part("xl/worksheets/sheet2.xml", TEN_CELLS, each),
+        padded_part("xl/worksheets/sheet3.xml", TEN_CELLS, rest - 2 * each + extra),
+    ];
+    let total: u64 = parts.iter().map(|p| p.declared).sum();
+    assert_eq!(total, CALL_LIMIT + extra as u64);
+    assert!(parts.iter().all(|p| p.declared < 100_000_000));
+    zip_raw(&parts)
+}
+
+#[tokio::test]
+async fn e2e_0088_008_parts_read_totalling_exactly_the_call() {
+    let _heavy = heavy().await;
+    let f = office_fixture_allowance(1_000_000_000).await;
+    seed(&f, "/docs/wide.xlsx", &wide(0)).await;
+
+    let v = extract_text(&f, OWNER, "/docs/wide.xlsx", false).await.expect("within the call limit");
+
+    assert_eq!(v["meta"]["sheets"], serde_json::json!(3), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0088_009_parts_read_one_byte_over_the_call_lim() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/wide.xlsx", &wide(1)).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/wide.xlsx", false).await;
+
+    call_refusal(&v, "/docs/wide.xlsx");
+    let held = parts_held("/docs/wide.xlsx");
+    assert!(held <= CALL_LIMIT + 65_536, "the extraction held {held} decoded bytes");
+    nothing_left(&f, "/docs/wide.xlsx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_010_many_slides_together_over_the_call_li() {
+    let _heavy = heavy().await;
+    let ids: String =
+        (1..=30).map(|n| format!(r#"<p:sldId id="{}" r:id="rId{n}"/>"#, 255 + n)).collect();
+    let rels: String = (1..=30)
+        .map(|n| {
+            format!(
+                r#"<Relationship Id="rId{n}" Type="http://x/slide" Target="slides/slide{n}.xml"/>"#
+            )
+        })
+        .collect();
+    let mut parts = vec![
+        raw_part(
+            "ppt/presentation.xml",
+            format!(r#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>"#)
+                .as_bytes(),
+        ),
+        raw_part(
+            "ppt/_rels/presentation.xml.rels",
+            format!(r#"<Relationships xmlns="x">{rels}</Relationships>"#).as_bytes(),
+        ),
+    ];
+    for n in 1..=30 {
+        parts.push(padded_part(
+            &format!("ppt/slides/slide{n}.xml"),
+            r#"<p:sld xmlns:p="p" xmlns:a="a"/>"#,
+            10_000_000,
+        ));
+    }
+    let f = office_fixture().await;
+    seed(&f, "/docs/many.pptx", &zip_raw(&parts)).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/many.pptx", false).await;
+
+    call_refusal(&v, "/docs/many.pptx");
+    let held = parts_held("/docs/many.pptx");
+    assert!(held <= CALL_LIMIT + 65_536, "the extraction held {held} decoded bytes");
+    nothing_left(&f, "/docs/many.pptx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_011_one_sheet_listed_three_times() {
+    let _heavy = heavy().await;
+    let workbook = r#"<workbook xmlns:r="r"><sheets><sheet name="A" sheetId="1" r:id="rId1"/><sheet name="B" sheetId="2" r:id="rId2"/><sheet name="C" sheetId="3" r:id="rId3"/></sheets></workbook>"#;
+    let target = r#"Type="http://x/worksheet" Target="worksheets/sheet1.xml""#;
+    let rels = format!(
+        r#"<Relationships xmlns="x"><Relationship Id="rId1" {target}/><Relationship Id="rId2" {target}/><Relationship Id="rId3" {target}/></Relationships>"#
+    );
+    let doc = zip_raw(&[
+        raw_part("xl/workbook.xml", workbook.as_bytes()),
+        raw_part("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        padded_part("xl/worksheets/sheet1.xml", TEN_CELLS, 100_000_000),
+    ]);
+    let f = office_fixture().await;
+    seed(&f, "/docs/repeat.xlsx", &doc).await;
+    office_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/repeat.xlsx", false).await;
+
+    call_refusal(&v, "/docs/repeat.xlsx");
+    nothing_left(&f, "/docs/repeat.xlsx", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0088_012_many_small_slides_within_the_limits() {
+    let ids: String =
+        (1..=500).map(|n| format!(r#"<p:sldId id="{}" r:id="rId{n}"/>"#, 255 + n)).collect();
+    let rels: String = (1..=500)
+        .map(|n| {
+            format!(
+                r#"<Relationship Id="rId{n}" Type="http://x/slide" Target="slides/slide{n}.xml"/>"#
+            )
+        })
+        .collect();
+    let presentation = format!(
+        r#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>"#
+    );
+    let rels = format!(r#"<Relationships xmlns="x">{rels}</Relationships>"#);
+    let slides: Vec<(String, String)> = (1..=500)
+        .map(|n| {
+            (
+                format!("ppt/slides/slide{n}.xml"),
+                format!(
+                    r#"<p:sld xmlns:p="p" xmlns:a="a"><a:p><a:r><a:t>Slide text {n}</a:t></a:r></a:p></p:sld>"#
+                ),
+            )
+        })
+        .collect();
+    let mut entries: Vec<(&str, &[u8])> = vec![
+        ("ppt/presentation.xml", presentation.as_bytes()),
+        ("ppt/_rels/presentation.xml.rels", rels.as_bytes()),
+    ];
+    entries.extend(slides.iter().map(|(n, x)| (n.as_str(), x.as_bytes())));
+    let f = office_fixture().await;
+    seed(&f, "/docs/talk.pptx", &office_zip(&entries)).await;
+
+    let v = extract_text(&f, OWNER, "/docs/talk.pptx", false).await.expect("within the limits");
+
+    assert_eq!(v["meta"]["slides"], serde_json::json!(500), "{v}");
+    assert!(v["preview"].as_str().unwrap().starts_with("## Slide 1\n\nSlide text 1"), "{v}");
+}
