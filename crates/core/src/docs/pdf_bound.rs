@@ -1345,20 +1345,42 @@ fn dict_at<'d>(doc: &'d Document, dict: &'d Dictionary, key: &[u8]) -> Option<&'
     resolve(doc, dict.get(key).ok()?)?.1.as_dict().ok()
 }
 
-/// A page's resources, inherited through `Parent` as the reader looks them up.
-fn inherited_resources<'d>(doc: &'d Document, page: &'d Dictionary) -> Option<&'d Dictionary> {
+/// Deepest chain of page groups above a page the reader is allowed to climb for
+/// its resources or its page size (SPEC-0092 DEC-002). The reader climbs by
+/// recursion with no memory of the nodes seen, so a loop never ends.
+pub(crate) const CLIMB_LIMIT: usize = 256;
+
+/// The value of `key` the reader's `get_inherited` takes for `page`: the first
+/// node, the page itself then each `Parent`, whose `key` (resolved one step) is
+/// `usable`. A missing, non reference or unresolvable `Parent` ends the climb
+/// with `None`. Level `CLIMB_LIMIT + 1` is refused, so a loop counts as passing
+/// the limit; there is deliberately no `seen` set. O(CLIMB_LIMIT) time, O(1) space.
+fn climb<'d>(
+    doc: &'d Document,
+    page: &'d Dictionary,
+    key: &[u8],
+    usable: fn(&Object) -> bool,
+    page_no: u32,
+) -> Result<Option<&'d Object>> {
     let mut node = page;
-    let mut seen = HashSet::new();
-    loop {
-        if let Some(found) = dict_at(doc, node, b"Resources") {
-            return Some(found);
+    for level in 0..=CLIMB_LIMIT + 1 {
+        if level > CLIMB_LIMIT {
+            return Err(ToolError::invalid_argument(format!(
+                "page {page_no} inherits from more than {CLIMB_LIMIT} levels of the PDF page tree"
+            )));
         }
-        let parent = node.get(b"Parent").and_then(Object::as_reference).ok()?;
-        if !seen.insert(parent) {
-            return None;
+        if let Some(found) = node.get(key).ok().and_then(|o| resolve(doc, o)).map(|(_, o)| o)
+            && usable(found)
+        {
+            return Ok(Some(found));
         }
-        node = doc.get_dictionary(parent).ok()?;
+        let Some(parent) = node.get(b"Parent").and_then(Object::as_reference).ok() else {
+            return Ok(None);
+        };
+        let Ok(next) = doc.get_dictionary(parent) else { return Ok(None) };
+        node = next;
     }
+    Ok(None)
 }
 
 /// The bytes the reader gets from `stream`: when `armed`, decoded if its
@@ -1467,7 +1489,11 @@ fn walk(
     let mut invalid = BTreeSet::new();
     let Ok(page_dict) = doc.get_dictionary(page_id) else { return Ok(page.into_walked(invalid)) };
     let empty = Dictionary::new();
-    let resources = inherited_resources(doc, page_dict).unwrap_or(&empty);
+    let resources = climb(doc, page_dict, b"Resources", |o| o.as_dict().is_ok(), budget.page_no)?
+        .and_then(|o| o.as_dict().ok())
+        .unwrap_or(&empty);
+    // The reader climbs again for the page size; its value is not used here.
+    climb(doc, page_dict, b"MediaBox", |o| o.as_array().is_ok(), budget.page_no)?;
 
     let mut size = 0u64;
     let mut ids = Vec::new();

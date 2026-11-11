@@ -155,3 +155,110 @@ async fn form_depth_is_checked_before_the_form_is_measured() {
     let held = decoded_held("/docs/deepbomb.pdf");
     assert!(held < STREAM_LIMIT as u64, "the bomb was measured: {held} bytes held");
 }
+
+/// The page tree refusal of page 1 of `doc`.
+fn climb_refusal(v: &Result<Value>, doc: &str) {
+    let Err(e) = v else { panic!("the extraction must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        format!(
+            "could not extract {doc}: page 1 inherits from more than 256 levels of the PDF page tree"
+        )
+    );
+}
+
+/// As [`exploit`], for a refusal of the climb.
+async fn climb_exploit(doc: &str, bytes: Vec<u8>) {
+    let f = nesting_fixture().await;
+    seed(&f, doc, &bytes).await;
+    let pid_before = std::process::id();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let bystander = tokio::spawn(bystander_loop(f.state.clone(), rx));
+
+    let start = Instant::now();
+    let v = extract_text(&f, OWNER, doc, false).await;
+    let took = start.elapsed();
+
+    stop.send(true).expect("the bystander listens");
+    let reads = bystander.await.expect("every bystander read answered hello");
+    assert!(reads >= 1, "the bystander never read");
+    climb_refusal(&v, doc);
+    assert!(took < refusal_bound(), "the refusal took {took:?}");
+    nothing_left(&f, doc, None).await;
+    still_up(&f, pid_before).await;
+}
+
+#[test]
+fn e2e_0092_sec_005_a_page_whose_parent_is_itself_a_l() {
+    in_child(MODULE, "e2e_0092_sec_005_a_page_whose_parent_is_itself_a_l", || {
+        climb_exploit("/docs/parentloop.pdf", parent_loop_pdf(false, true, HELLO_TEXT))
+    });
+}
+
+#[test]
+fn e2e_0092_sec_006_a_parent_chain_of_10_000_page_gro() {
+    in_child(MODULE, "e2e_0092_sec_006_a_parent_chain_of_10_000_page_gro", || {
+        climb_exploit("/docs/parents.pdf", parent_chain_pdf(10_000))
+    });
+}
+
+#[tokio::test]
+async fn e2e_0092_006_resources_and_page_size_256_page_grou() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/tall.pdf", &parent_chain_pdf(256)).await;
+
+    let v = extract_text(&f, OWNER, "/docs/tall.pdf", false).await.expect("256 groups extract");
+
+    assert!(v["preview"].as_str().unwrap().contains("Hello"), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0092_009_looping_parent_chain_above_a_self_suf() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/selfloop.pdf", &parent_loop_pdf(true, true, HELLO_TEXT)).await;
+
+    let v =
+        extract_text(&f, OWNER, "/docs/selfloop.pdf", false).await.expect("a self sufficient page");
+
+    assert!(v["preview"].as_str().unwrap().contains("Hello"), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0092_013_resources_257_page_groups_up() {
+    let f = nesting_fixture().await;
+    let pid_before = std::process::id();
+    seed(&f, "/docs/taller.pdf", &parent_chain_pdf(257)).await;
+
+    let v = extract_text(&f, OWNER, "/docs/taller.pdf", false).await;
+
+    climb_refusal(&v, "/docs/taller.pdf");
+    nothing_left(&f, "/docs/taller.pdf", None).await;
+    still_up(&f, pid_before).await;
+}
+
+#[test]
+fn e2e_0092_017_page_size_missing_along_a_looping_cha() {
+    in_child(MODULE, "e2e_0092_017_page_size_missing_along_a_looping_cha", || async {
+        let f = nesting_fixture().await;
+        let pid_before = std::process::id();
+        seed(&f, "/docs/nosize.pdf", &parent_loop_pdf(true, false, HELLO_TEXT)).await;
+
+        let v = extract_text(&f, OWNER, "/docs/nosize.pdf", false).await;
+
+        climb_refusal(&v, "/docs/nosize.pdf");
+        still_up(&f, pid_before).await;
+    });
+}
+
+#[test]
+fn e2e_0092_021_page_tree_climb_before_the_page_s_dra() {
+    in_child(MODULE, "e2e_0092_021_page_tree_climb_before_the_page_s_dra", || async {
+        let f = nesting_fixture().await;
+        seed(&f, "/docs/climbloop.pdf", &parent_loop_pdf(false, false, "/A Do")).await;
+
+        let v = extract_text(&f, OWNER, "/docs/climbloop.pdf", false).await;
+
+        climb_refusal(&v, "/docs/climbloop.pdf");
+    });
+}

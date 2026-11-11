@@ -230,3 +230,41 @@ pub(crate) fn repeat_pdf(times: usize) -> Vec<u8> {
 pub(crate) fn deep_bomb_pdf() -> Vec<u8> {
     chain_writer(65, bomb("")).finish()
 }
+
+const HELLO: &str = "BT /F1 12 Tf 72 700 Td (Hello) Tj ET";
+const OWN_RESOURCES: &str = "/Resources << /Font << /F1 5 0 R >> >>";
+
+/// E2E-006, E2E-013, E2E-SEC-006: a page with neither resources nor page size, under
+/// `groups` page groups (objects 100 up), the last holding both.
+pub(crate) fn parent_chain_pdf(groups: u32) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain(HELLO)], "");
+    w.object(3, PdfObj::Body("<< /Type /Page /Parent 100 0 R /Contents 4 0 R >>".to_string()));
+    for n in 100..100 + groups - 1 {
+        w.object(n, PdfObj::Body(format!("<< /Type /Pages /Parent {} 0 R >>", n + 1)));
+    }
+    w.object(
+        100 + groups - 1,
+        PdfObj::Body(
+            "<< /Type /Pages /Resources << /Font << /F1 5 0 R >> >> /MediaBox [0 0 612 792] >>"
+                .to_string(),
+        ),
+    );
+    w.finish()
+}
+
+/// E2E-009, E2E-017, E2E-021, E2E-SEC-005: the page's parent (object 100) is its own parent.
+/// The page keeps its own resources when `resources`, its own page size when `media_box`.
+pub(crate) fn parent_loop_pdf(resources: bool, media_box: bool, content: &str) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain(content)], "");
+    let res = if resources { format!(" {OWN_RESOURCES}") } else { String::new() };
+    let size = if media_box { " /MediaBox [0 0 612 792]" } else { "" };
+    w.object(
+        3,
+        PdfObj::Body(format!("<< /Type /Page /Parent 100 0 R /Contents 4 0 R{res}{size} >>")),
+    );
+    w.object(100, PdfObj::Body("<< /Type /Pages /Parent 100 0 R >>".to_string()));
+    w.finish()
+}
+
+/// The text the climb tests show.
+pub(crate) const HELLO_TEXT: &str = HELLO;
