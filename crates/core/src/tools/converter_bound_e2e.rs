@@ -18,19 +18,63 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The converter limit of every test here, the figure the refusals name.
-const CAP: u64 = 1_048_576;
+pub(crate) const CAP: u64 = 1_048_576;
 /// The cap plus one 65 536 byte chunk: the most an answer may be held at.
 const HELD_MAX: u64 = 1_114_112;
 /// The refusal of an answer over [`CAP`].
-const OVER: &str =
+pub(crate) const OVER: &str =
     "document service output is over the doc_service.max_input_bytes limit of 1048576";
-/// The flood of SEC-013 and E2E-046: 1 073 741 824 letters `a`.
-const FLOOD: &str = "exec perl -e 'my $s = \"a\" x 65536; print $s for 1..16384'\n";
+/// The flood of SEC-013 and E2E-046: 1 073 741 824 letters `a`. After every
+/// chunk the stand in rewrites `probe.<pid>` beside the script with the bytes it
+/// has written so far, a channel independent of the server's own hook: a server
+/// that read the answer whole would let it reach 1 073 741 824. The probe is
+/// written aside then renamed, so a kill never leaves it half written.
+const FLOOD: &str = "exec perl -e '$| = 1; my $s = \"a\" x 65536; my $n = 0; \
+                     for (1..16384) { print $s; $n += 65536; \
+                     open(my $p, \">\", \"$ARGV[0].t\") or die; print $p $n; close $p; \
+                     rename(\"$ARGV[0].t\", $ARGV[0]) }' \
+                     \"$(dirname \"$0\")/probe.$$\"\n";
+/// The most the stand in may have written before it is stopped: far below the
+/// 1 073 741 824 byte flood (the cap, one chunk and the pipe buffer, with room).
+const WRITTEN_MAX: u64 = 16_777_216;
+
+/// The bytes each flooding stand in managed to write before it was stopped.
+fn written(home: &Path) -> Vec<u64> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(home).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("probe.") && !name.ends_with(".t") {
+            out.push(std::fs::read_to_string(entry.path()).unwrap().trim().parse().unwrap());
+        }
+    }
+    out
+}
+
+/// Every flood was stopped soon after the cap: each stand in wrote at least
+/// [`CAP`] less one chunk (the answer really flowed; the probe of the chunk the
+/// kill interrupted may be missing) and at most [`WRITTEN_MAX`].
+fn stopped_soon(home: &Path, calls: usize) {
+    let all = written(home);
+    assert_eq!(all.len(), calls, "one probe per start: {all:?}");
+    for n in all {
+        assert!(
+            (CAP - 65_536..=WRITTEN_MAX).contains(&n),
+            "the stand in wrote {n} bytes before it was stopped"
+        );
+    }
+}
+
+/// The answer was read chunk by chunk up to the cap, inside the helper: more
+/// than [`CAP`] and at most [`HELD_MAX`]. A read made whole elsewhere records 0.
+fn held_past_cap(held: u64) {
+    assert!(held > CAP, "the answer held {held} bytes: it was not read up to the cap");
+    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+}
 
 /// An executable `sh` script in `home` that first writes `started`, its pid and
 /// its working folder to `home/marker` (outside the sandbox), then runs `body`.
 /// A flood ends in `exec perl` so the flooding process is the one killed.
-fn stand_in(home: &Path, body: &str) -> PathBuf {
+pub(crate) fn stand_in(home: &Path, body: &str) -> PathBuf {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     let path = home.join("conv.sh");
@@ -45,7 +89,7 @@ fn stand_in(home: &Path, body: &str) -> PathBuf {
     path
 }
 
-fn cli(command: &Path, cap: u64, timeout_secs: u64) -> CliDocService {
+pub(crate) fn cli(command: &Path, cap: u64, timeout_secs: u64) -> CliDocService {
     CliDocService::new(
         crate::config::DocServiceCliConfig {
             command: vec![command.display().to_string(), crate::config::DOC_PLACEHOLDER.into()],
@@ -59,7 +103,7 @@ fn cli(command: &Path, cap: u64, timeout_secs: u64) -> CliDocService {
 /// `(pid, working folder)` of every start the stand in recorded. Each start
 /// writes its own `marker.<pid>` file, because two calls sharing one script that
 /// appended to one file could interleave their lines.
-fn markers(home: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn markers(home: &Path) -> Vec<(String, PathBuf)> {
     let Ok(dir) = std::fs::read_dir(home) else { return Vec::new() };
     let mut out = Vec::new();
     for entry in dir.flatten() {
@@ -91,7 +135,7 @@ fn alive(pid: &str) -> bool {
 }
 
 /// The stand in started, its process is gone and its working folder is absent.
-fn stopped_and_cleaned(home: &Path) -> usize {
+pub(crate) fn stopped_and_cleaned(home: &Path) -> usize {
     let all = markers(home);
     assert!(!all.is_empty(), "the stand in started");
     for (pid, cwd) in &all {
@@ -163,10 +207,10 @@ async fn e2e_0089_sec_013_text_answer_flood() {
 
     let v = ask(&f, &svc, OWNER, "/docs/bomb.docx", false).await;
 
-    let held = answer_held();
-    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    held_past_cap(answer_held());
     refused(&v, OVER);
     stopped_and_cleaned(home.path());
+    stopped_soon(home.path(), 1);
     clean(&f, "/docs/bomb.docx").await;
 }
 
@@ -193,7 +237,7 @@ async fn e2e_0089_003_text_mode_conversion_within_the_limit() {
 }
 
 /// A stand in answering `#` then `n` letters `d`.
-fn hashes(home: &Path, n: u64) -> PathBuf {
+pub(crate) fn hashes(home: &Path, n: u64) -> PathBuf {
     stand_in(home, &format!("printf '#'\nexec perl -e 'print \"d\" x {n}'\n"))
 }
 
@@ -220,8 +264,7 @@ async fn e2e_0089_034_text_answer_one_byte_over_the_convert() {
     let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await;
 
     refused(&v, OVER);
-    let held = answer_held();
-    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    held_past_cap(answer_held());
     clean(&f, "/docs/deck.pptx").await;
 }
 
@@ -367,7 +410,7 @@ fn e2e_0089_046_two_converter_floods_at_once() {
         let all = holds();
         assert_eq!(all.len(), 2, "{all:?}");
         for h in &all {
-            assert!(h.answer <= HELD_MAX, "the answer held {} bytes: {all:?}", h.answer);
+            held_past_cap(h.answer);
         }
         let events = crate::logging::capture::events();
         let level = |e: &crate::logging::capture::CapturedEvent| e.fields["level"].clone();
@@ -381,6 +424,7 @@ fn e2e_0089_046_two_converter_floods_at_once() {
             );
         }
         assert_eq!(stopped_and_cleaned(home.path()), 2, "both calls started the stand in");
+        stopped_soon(home.path(), 2);
         clean(&f, "/docs/deck.pptx").await;
         for mount in [MOUNT, "orbit"] {
             let c = f.state.stores.client(mount).await.unwrap();
@@ -410,13 +454,26 @@ async fn e2e_0089_047_empty_answer_unchanged() {
 async fn e2e_0089_048_not_a_member_converter_flood() {
     let f = converter_fixture().await;
     let home = tempfile::tempdir().unwrap();
-    let _svc = cli(&stand_in(home.path(), FLOOD), CAP, 120);
+    let svc = Arc::new(cli(&stand_in(home.path(), FLOOD), CAP, 120));
+    let eve = server_with(&f, svc, "eve@example.com");
 
-    let e = f.state.authorize(MOUNT, "eve@example.com").await.unwrap_err();
+    let out = eve
+        .fs_documentize(rmcp::handler::server::wrapper::Parameters(
+            crate::mcp::server::DocumentizeArgs {
+                mount_id: MOUNT.into(),
+                path: "/docs/deck.pptx".into(),
+                overwrite: false,
+            },
+        ))
+        .await
+        .unwrap();
 
-    assert_eq!(e.code, code::FORBIDDEN);
-    assert_eq!(e.message, "'eve@example.com' is not a member of 'atlas'");
+    assert_eq!(out.is_error, Some(true), "{out:?}");
+    let text = text_of(&out);
+    assert!(text.contains(code::FORBIDDEN), "{text}");
+    assert!(text.contains("'eve@example.com' is not a member of 'atlas'"), "{text}");
     assert!(marker(home.path()).is_none(), "the converter must never start");
+    assert!(!exists(&f, "/docs/deck.md").await);
 }
 
 #[tokio::test]
@@ -483,6 +540,9 @@ async fn e2e_0089_sec_014_diagnostic_output_flood() {
     assert!(e.message.len() <= 8_320, "message of {} bytes", e.message.len());
     let held = held_one().diagnostic;
     assert!(held <= DIAGNOSTIC_MAX, "the diagnostic held {held} bytes, more than {DIAGNOSTIC_MAX}");
+    // The tail really was kept by the chunked reader: a read made whole
+    // elsewhere records 0.
+    assert!(held >= 8_192, "the diagnostic held {held} bytes: it was not read by the tail reader");
     stopped_and_cleaned(home.path());
     clean(&f, "/docs/bomb.docx").await;
 }
@@ -506,6 +566,8 @@ async fn e2e_0089_sec_017_standard_output_flood_in_bundle_m() {
         held <= BUNDLE_STDOUT_MAX,
         "the stdout held {held} bytes, more than {BUNDLE_STDOUT_MAX}"
     );
+    // The discarded output really went through the draining reader.
+    assert!(held > 0, "the stdout was not read by the draining reader");
     stopped_and_cleaned(home.path());
 }
 
@@ -650,8 +712,7 @@ async fn e2e_0089_sec_015_web_answer_flood() {
 
     let v = ask(&f, &svc, OWNER, "/docs/bomb.docx", false).await;
 
-    let held = answer_held();
-    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    held_past_cap(answer_held());
     assert!(
         sent_of(&sent) < GIB,
         "the server sent {} bytes: the body was read whole",
@@ -672,8 +733,7 @@ async fn e2e_0089_sec_016_web_bundle_answer_flood() {
 
     let v = ask(&f, &svc, OWNER, "/docs/bomb.docx", false).await;
 
-    let held = answer_held();
-    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    held_past_cap(answer_held());
     assert!(
         sent_of(&sent) < GIB,
         "the server sent {} bytes: the body was read whole",
@@ -717,8 +777,7 @@ async fn e2e_0089_036_web_answer_one_byte_over_the_converte() {
 
     let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await;
 
-    let held = answer_held();
-    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    held_past_cap(answer_held());
     refused(&v, OVER);
     clean(&f, "/docs/deck.pptx").await;
 }
@@ -742,8 +801,7 @@ async fn e2e_0089_043_web_failure_status_with_a_huge_body() {
     );
     let quoted = e.message.strip_prefix("document service returned HTTP 500: ").unwrap();
     assert!(quoted.chars().count() <= 2_048, "{} characters quoted", quoted.chars().count());
-    let held = answer_held();
-    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    held_past_cap(answer_held());
     assert!(
         sent_of(&sent) < GIB,
         "the server sent {} bytes: the body was read whole",

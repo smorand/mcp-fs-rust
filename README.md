@@ -357,9 +357,50 @@ without reading the document. A refusal writes no companion, artifact, charge or
 logs one INFO line; both the assistant tool and the REST door log it. Both doors give the same
 code and message. A damaged part that does not exceed its size is still read as absent (BL-0144).
 
-Known gaps, not fixed by this limit: the document converter output is read whole (BL-0142), PDF
-streams are inflated without a bound (BL-0143), a damaged part is read as absent (BL-0144),
+Known gaps, not fixed by this limit: a damaged part is read as absent (BL-0144),
 transient copies are not counted (BL-0145), the readers run on the async worker thread (BL-0146).
+
+## PDF text extraction limits
+
+(2026-11-11, SPEC-0089.) `fs.extract_text` (and `POST /api/fs/{mount_id}/extract-text`) on a PDF
+measures every stream before the reader decodes it, so a file of a few kilobytes cannot inflate to
+gigabytes in memory. Design in one paragraph: the file is scanned and each stream is measured
+(Flate, LZW and ASCII85 chains included; a stream with more than 8 filters is left stored, not
+decoded); a stream that would pass its limit is defused (its filter is renamed so the reader sees
+raw bytes) and the call is refused; an encrypted file has its `/Encrypt` entry renamed for the
+measure and is then decrypted by lopdf; cross reference streams are measured before the load; the
+text of each page is written into a sink that stops at its limit. The limits, none configurable:
+
+* 1 000 000 objects in the file;
+* 104 857 600 bytes for one decoded stream;
+* 268 435 456 bytes for the compressed object streams together, at load;
+* 268 435 456 bytes of decoded streams per page;
+* 268 435 456 bytes of extracted text.
+
+A refusal is `ERR_INVALID_ARGUMENT` (HTTP 400), message starting `could not extract <path>: `, one of:
+`the PDF holds more than 1000000 objects`, `a PDF stream decodes to more than 104857600 bytes`,
+`the PDF object streams decode to more than 268435456 bytes together`, `page <n> decodes more than
+268435456 bytes of PDF streams`, `the extracted content exceeds 268435456 bytes`, and, new,
+`pdf: the cross reference stream could not be measured` (also `pdf: the encryption dictionary could
+not be isolated`). A refusal leaves no trace: no companion, artifact, charge or audit line. Both
+doors give the same code and message. PDFs within the limits are answered as before.
+
+Known gaps: form recursion without a depth limit (BL-0147), web fetch tools read the whole body
+(BL-0148), the page list is quadratic (BL-0149), a growing bundle file is read while it grows
+(BL-0150), parsed structures can be larger than their bytes (BL-0151), the converter's own
+children survive the kill (BL-0152), no total across cross reference streams (BL-0153).
+
+## Document converter output limit
+
+(2026-11-11, SPEC-0089.) `doc_service.max_input_bytes` also caps what the converter sends back:
+the text on standard output (cli), the response body (api, text and JSON bundle) and the files of a
+bundle. The answer is read in chunks; the call stops reading as soon as the cap is passed, the child
+is killed and reaped before its working folder is removed, and the call is refused with
+`ERR_INTERNAL_ERROR` and `document service output is over the doc_service.max_input_bytes limit of
+<cap>`. The same message is the `documentation.error` of an upload with the conversion flag (the
+source file is kept, no companion) and the answer of `POST /api/fs/{mount_id}/documentize`
+(HTTP 500). Diagnostic output (stderr) keeps only its last 8 192 bytes; in bundle mode standard
+output is discarded. An answer within the cap is unchanged, as are the failure messages.
 
 ## Project quota enforcement
 

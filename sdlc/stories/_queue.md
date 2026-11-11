@@ -220,4 +220,4 @@
 | US-0218 | SPEC-0089 | cap the converter's text answer and stop it | US-0217 | 2 | landed | story/US-0218-cap-the-converter-s-text-answer-and-stop | story/US-0217-pdf-refusals-in-order-without-trace-at-b |
 | US-0219 | SPEC-0089 | diagnostic and bundle mode outputs held small | US-0218 | 2 | landed | story/US-0219-diagnostic-and-bundle-mode-outputs-held | story/US-0218-cap-the-converter-s-text-answer-and-stop |
 | US-0220 | SPEC-0089 | cap the web converter's answer | US-0219 | 2 | landed | story/US-0220-cap-the-web-converter-s-answer | story/US-0219-diagnostic-and-bundle-mode-outputs-held |
-| US-0221 | SPEC-0089 | converter refusals through the HTTP door and documentation | US-0220 | 2 | todo | | |
+| US-0221 | SPEC-0089 | converter refusals through the HTTP door and documentation | US-0220 | 2 | landed | story/US-0221-converter-refusals-through-the-http-door | story/US-0220-cap-the-web-converter-s-answer |

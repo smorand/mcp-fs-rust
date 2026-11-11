@@ -868,6 +868,16 @@ pub(crate) fn states_pdf(saves: usize) -> Vec<u8> {
     )
 }
 
+/// `/CS0` (an ICC profile of 1 000 000 bytes) selected once, then 300 `q`, then
+/// the text `Kept`: the reader copies the profile into every saved state.
+pub(crate) fn saved_states_text_pdf() -> Vec<u8> {
+    page_pdf(
+        plain(&format!("/CS0 cs {}BT /F1 12 Tf 72 700 Td (Kept) Tj ET", "q ".repeat(300))),
+        "/ColorSpace << /CS0 [/ICCBased 7 0 R] >>",
+        vec![(7, flate("/N 1", zlib_run("", b' ', 1_000_000, "")))],
+    )
+}
+
 /// E2E-SEC-008: `/CS0 cs q` written 300 times over a 1 000 000 byte profile.
 pub(crate) fn selected_states_pdf() -> Vec<u8> {
     page_pdf(

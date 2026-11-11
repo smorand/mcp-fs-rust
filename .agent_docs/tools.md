@@ -341,8 +341,15 @@ the SPEC-0085 note. `docs/extract.rs` decoded every part of a `.docx`, `.xlsx` o
 bound, so a document of under 1 MB holding a part that inflates to hundreds of megabytes (or a
 part that lies about its size) exhausted the memory of the server. Fixed: `OfficeBudget` checks the
 declared size before decoding, caps the decode at the declared size and bounds the content. The exploit
-tests are `e2e_0088_sec_001` to `e2e_0088_sec_013`. Known gaps of the class: the converter output is
-read whole (BL-0142), PDF streams are inflated without a bound (BL-0143).
+tests are `e2e_0088_sec_001` to `e2e_0088_sec_013`. The two gaps this note left open (converter output,
+PDF streams) are closed by SPEC-0089 (below).
+
+Security note (2026-11-10, SPEC-0089; documented 2026-11-11): memory exhaustion in PDF extraction and in
+the document converter's answer, the same class. The PDF reader inflated every stream whole, so a file of
+a few kilobytes exhausted the memory of the server, and the converter's standard output, web body and
+bundle were read whole. Fixed: `docs/pdf_bound.rs` measures every stream before the reader decodes it
+and the converter answer is capped at `doc_service.max_input_bytes` (details below). The exploit tests
+are `e2e_0089_sec_001` to `e2e_0089_sec_017`. Known gaps of the class: BL-0147 to BL-0153 (below).
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,
@@ -435,9 +442,38 @@ Parts never read (images, embedded files, nested archives) are not counted, and 
 companion is answered without reading the document. A refusal writes no companion, artifact, charge
 or audit line and logs one INFO line; `log_tool_failure` is wired at both doors (`mcp/server.rs`,
 `api/dataplane.rs`). The tool description is unchanged (`TOOL_CONTRACT.txt` does not name the limits).
-Known gaps: BL-0142 (converter output read whole), BL-0143 (PDF streams unbounded), BL-0144 (a damaged
+Known gaps: BL-0144 (a damaged
 part is read as absent), BL-0145 (uncounted transient copies), BL-0146 (readers run on the async
 worker thread).
+
+(2026-11-11, SPEC-0089.) PDF limits of `fs.extract_text` (`docs/pdf_bound.rs`, none configurable).
+Measure, defuse, arm: every stream is measured before the reader decodes it (Flate, LZW through `weezl`
+and ASCII85 chains; a stream with more than 8 filters is left stored); one that passes its limit is
+defused by renaming its filter so lopdf sees raw bytes; the reader is armed with a sink that stops at
+the limit. An encrypted file has its `/Encrypt` renamed for the measure, then lopdf decrypts it; cross
+reference streams are measured before the load. Limits: 1 000 000 objects; 104857600 bytes per decoded
+stream; 268435456 bytes for the compressed object streams together at load, per page, and for the
+extracted text. Refusals (`ERR_INVALID_ARGUMENT`, prefix `could not extract <path>: `): `the PDF holds
+more than 1000000 objects`, `a PDF stream decodes to more than 104857600 bytes`, `the PDF object streams
+decode to more than 268435456 bytes together`, `page <n> decodes more than 268435456 bytes of PDF
+streams`, `the extracted content exceeds 268435456 bytes`, `pdf: the cross reference stream could not be
+measured` (new), `pdf: the encryption dictionary could not be isolated`. A refusal leaves no trace (no
+companion, artifact, charge, audit line). The test only hook `PDF_HELD` records the bytes held; the heavy
+tests take `heavy()`. The REST door answers the same code and message (`e2e_0089_002`, `023`).
+Accepted test limits (2026-11-11, audit G3 and G5): E2E-SEC-012/032 cannot isolate a reintroduced second
+unbounded load of the title; the held figures are logical bytes and the real peak can reach about twice
+that; parsed operations of 100 MB of tiny operators are not counted (BL-0151); the e2e with one colour profile in 300 saved states proves the page still extracts, not that the reader's copies are empty stand ins (that needs an allocation counter, so only the structural unit test guards DEC-009).
+
+(2026-11-11, SPEC-0089.) `fs.documentize` and the documented `fs.write_bytes` / upload: the converter's
+answer is capped by `doc_service.max_input_bytes` on every channel (cli stdout, web body, bundle files).
+Past the cap the read stops, the child is killed and reaped before its working folder is removed, and the
+call is refused with `ERR_INTERNAL_ERROR` `document service output is over the doc_service.max_input_bytes
+limit of <cap>` (an upload keeps the source and reports it in `documentation.error`; documentize over
+HTTP answers 500). No companion, artifact, charge or audit line. Diagnostic output keeps the last 8 192
+bytes; in bundle mode stdout is discarded. Known gaps: BL-0147 (form recursion without depth limit),
+BL-0148 (web fetch tools read whole), BL-0149 (quadratic page list), BL-0150 (growing bundle file),
+BL-0151 (parsed structures larger than their bytes), BL-0152 (converter's own children survive the kill),
+BL-0153 (no total across cross reference streams).
 
 ## admin (17)
 

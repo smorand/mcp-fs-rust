@@ -34,7 +34,7 @@ run. Lineage and design decisions: `.agent_docs/lineage.md`.
 Stack: Rust 2024, axum + tokio, rmcp 3.5.0 (`server` + `transport-streamable-http-server`
 features only, the one production MCP transport, SPEC-0013), rusqlite (bundled), sqlx (optional,
 PostgreSQL), aws-sdk-s3, jsonwebtoken + rsa, git2
-(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, liblzma (every xz, bare or in a `.tar.xz`; `lzma-rs` removed), reqwest, clap, tracing.
+(libgit2), tree-sitter, pdf-extract, quick-xml, zip, aes-gcm, liblzma (every xz, bare or in a `.tar.xz`; `lzma-rs` removed), weezl (LZW, PDF bound), reqwest, clap, tracing.
 
 Cargo features, none in `default`: `postgres`, `rag`, `all-backends` (PostgreSQL plus `rag`). A default
 build is SQLite only and carries no network database driver. The `rag` feature enables pgvector (PostgreSQL)
@@ -61,6 +61,7 @@ mcp-fs purge [--project <id> [--on-demand]]  run the auto-purge sweep once; no -
 docker compose -f docker-compose.test.yml up -d  postgres for the opt-in suites
 cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extraction tests (feature `rar`, SPEC-0080; ./test.sh runs them)
 cargo test -p mcp-fs-core --lib --features rar -- e2e_0087_ api::dataplane tool_contract   the truncated RAR tests (SPEC-0087)
+env -u MCPFS_TEST_PG_DSN cargo test -p mcp-fs-core --lib -- e2e_0089_ api::dataplane tool_contract --test-threads=1   the PDF and converter bound tests (SPEC-0089)
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
@@ -122,7 +123,13 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   bytes, call limit 268435456 declared bytes, content limit 268435456 bytes, SPEC-0088),
   `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
   `ocr.rs` (pluggable, null by default), `mime.rs`, `service.rs` (the external
-  document to Markdown converter, cli or api, off by default), `artifacts/` (parse,
+  document to Markdown converter, cli or api, off by default; its answer is capped by
+  `doc_service.max_input_bytes` on every channel: stdout, web body, bundle files; the child is killed
+  and reaped before its folder goes; diagnostic output keeps its last 8 192 bytes; SPEC-0089),
+  `pdf_bound.rs` (PDF text extraction, measured then decoded: every stream is measured before the
+  reader decodes it, an over limit stream is defused; limits 1 000 000 objects, 104857600 bytes per
+  decoded stream, 268435456 bytes for the object streams at load, per page and for the extracted text;
+  LZW and ASCII85 chains, `weezl`; SPEC-0089), `artifacts/` (parse,
   capture and render of the images and tables a conversion keeps; meta rows, never `nodes`).
 - `tools/` : one module per family. Every family exposes typed `pub(crate)` async functions
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the

@@ -4017,6 +4017,63 @@ mod tests {
         office_nothing_left(&h, "/docs/bomb.pdf", "/docs/bomb.md").await;
     }
 
+    /// SPEC-0089/E2E-039: an upload with the conversion flag keeps the document
+    /// when the converter's answer is over the limit, reports the refusal for
+    /// that file, and leaves no companion, process or working folder.
+    #[tokio::test]
+    async fn e2e_0089_039_upload_with_conversion_answer_over_th() {
+        use crate::tools::archive_testkit::heavy;
+        use crate::tools::converter_bound_e2e::{CAP, OVER, cli, hashes, stopped_and_cleaned};
+        let _heavy = heavy().await;
+        let home = tempfile::tempdir().unwrap();
+        let svc = cli(&hashes(home.path(), CAP), CAP, 120);
+        let h = Harness::with_doc_service(Some(Arc::new(svc))).await;
+        let boundary = "OVER-BOUNDARY";
+        let mut body = upload_body(boundary, &[], Some("true"));
+        body.truncate(body.len() - format!("--{boundary}--\r\n").len());
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"directory\"\r\n\r\n/docs\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"files\"; \
+             filename=\"deck.pptx\"\r\n\r\nPK\r\n--{boundary}--\r\n"
+        ));
+
+        let (s, v) = upload(&h, body, boundary).await;
+
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["documentation"][0]["error"]["code"], code::INTERNAL_ERROR, "{v}");
+        assert_eq!(v["documentation"][0]["error"]["message"], OVER, "{v}");
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        assert_eq!(c.read_bytes("/docs/deck.pptx").await.unwrap(), b"PK");
+        assert!(!c.exists("/docs/deck.md").await.unwrap());
+        assert_eq!(stopped_and_cleaned(home.path()), 1);
+    }
+
+    /// SPEC-0089/E2E-041: documentize through the REST door refuses an answer
+    /// over the limit with the tool's code and message, nothing left.
+    #[tokio::test]
+    async fn e2e_0089_041_documentize_through_the_http_api_answ() {
+        use crate::tools::archive_testkit::heavy;
+        use crate::tools::converter_bound_e2e::{CAP, OVER, cli, hashes, stopped_and_cleaned};
+        let _heavy = heavy().await;
+        let home = tempfile::tempdir().unwrap();
+        let svc = cli(&hashes(home.path(), CAP), CAP, 120);
+        let h = Harness::with_doc_service(Some(Arc::new(svc))).await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/deck.pptx", b"PK").await.unwrap();
+
+        let (s, v) = h.post(&u("documentize"), json!({"path": "/docs/deck.pptx"})).await;
+
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(v["error"], code::INTERNAL_ERROR, "{v}");
+        assert_eq!(v["detail"], format!("{}: {OVER}", code::INTERNAL_ERROR), "{v}");
+        assert!(c.exists("/docs/deck.pptx").await.unwrap());
+        assert!(!c.exists("/docs/deck.md").await.unwrap());
+        let log = h.state.safety.audit(OWNER, MOUNT);
+        assert!(!log.iter().any(|e| e.op == "doc_service"), "{log:?}");
+        assert_eq!(stopped_and_cleaned(home.path()), 1);
+    }
+
     /// SPEC-0085 E2E-005: the REST door answers what the engine answers for a zip
     /// within the limits (E2E-001), and the session audit holds exactly one
     /// extraction line.

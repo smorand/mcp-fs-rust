@@ -313,6 +313,32 @@ async fn e2e_0089_sec_008_a_colour_profile_kept_in_300_save() {
     refused_with("/docs/states.pdf", &selected_states_pdf(), &page_message(1), PAGE_HELD).await;
 }
 
+/// One profile of 1 000 000 bytes selected once and kept in 300 saved states:
+/// the page succeeds with its original text and the held figure counts the
+/// profile once. This does NOT prove the stand ins of DEC-009 are installed: the
+/// held figure comes from our own walk, which counts the profile once either way,
+/// and seeing the reader's 300 copies would need an allocation counter (no
+/// unsafe, no new dependency). The structural unit test
+/// `pdf_one_profile_kept_in_300_saved_states_holds_nothing` is the guard.
+#[tokio::test]
+async fn e2e_0089_sec_008_one_profile_kept_in_300_saved_states_succeeds() {
+    let _heavy = heavy().await;
+    let bytes = saved_states_text_pdf();
+    let f = office_fixture().await;
+    seed(&f, "/docs/kept.pdf", &bytes).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/kept.pdf", false).await.expect("answered");
+
+    assert_eq!(v["preview"], json!("---\n*[Page 1]*\n\nKept"), "{v}");
+    assert_eq!(library_preview(&bytes), "---\n*[Page 1]*\n\nKept");
+    let held = decoded_held("/docs/kept.pdf");
+    assert!(
+        (1_000_000..=1_100_000).contains(&held),
+        "the profile copies held {held} decoded bytes, not about 1 000 000"
+    );
+}
+
 #[tokio::test]
 async fn e2e_0089_013_a_page_decoding_exactly_the_page_tota() {
     let _heavy = heavy().await;
@@ -556,11 +582,26 @@ async fn e2e_0089_024_not_a_member_pdf_bomb() {
     let f = office_fixture().await;
     seed(&f, "/docs/bomb.pdf", &content_bomb_pdf()).await;
     pdf_held_reset();
+    let server = crate::mcp::server::McpServer::new(f.state.clone(), "eve@example.com".into());
 
-    let denied = f.state.authorize(MOUNT, "eve@example.com").await.unwrap_err();
+    let out = server
+        .fs_extract_text(rmcp::handler::server::wrapper::Parameters(
+            crate::mcp::server::ExtractTextArgs {
+                mount_id: MOUNT.into(),
+                path: "/docs/bomb.pdf".into(),
+                max_chars: 200_000,
+                preview_chars: 4_000,
+                ocr: true,
+                refresh: false,
+            },
+        ))
+        .await
+        .unwrap();
 
-    assert_eq!(denied.code, code::FORBIDDEN, "{denied:?}");
-    assert_eq!(denied.message, "'eve@example.com' is not a member of 'atlas'");
+    assert_eq!(out.is_error, Some(true), "{out:?}");
+    let text = out.content.iter().find_map(|c| c.as_text().map(|t| t.text.clone())).unwrap();
+    assert!(text.contains(code::FORBIDDEN), "{text}");
+    assert!(text.contains("'eve@example.com' is not a member of 'atlas'"), "{text}");
     let held = crate::docs::extract::PDF_HELD
         .with(|m| m.borrow().get("/docs/bomb.pdf").map_or(0, |h| h.decoded));
     assert_eq!(held, 0);
