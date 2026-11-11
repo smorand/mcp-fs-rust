@@ -217,6 +217,41 @@ async fn read_capped_async(
     }
 }
 
+/// The last [`STDERR_CAP`] bytes `reader` yields, the part a failure quotes.
+///
+/// Each chunk is appended and the buffer then cut back to its tail, so at most
+/// `STDERR_CAP` plus one chunk is ever held; `peak` receives that high water
+/// mark for the test hook. Time O(n) in the bytes read (the cut moves at most
+/// `STDERR_CAP` bytes per chunk); space O(STDERR_CAP + CHUNK).
+async fn read_tail(mut reader: impl AsyncRead + Unpin, peak: &mut u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        *peak = (*peak).max(buf.len() as u64);
+        if buf.len() > STDERR_CAP {
+            buf.drain(..buf.len() - STDERR_CAP);
+        }
+    }
+}
+
+/// Reads `reader` to its end and keeps nothing; `peak` receives the largest
+/// chunk read. Time O(n) in the bytes read; space O(CHUNK).
+async fn drain(mut reader: impl AsyncRead + Unpin, peak: &mut u64) -> std::io::Result<()> {
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        *peak = (*peak).max(n as u64);
+    }
+}
+
 /// The refusal of a converter answer or bundle over the converter limit.
 fn over_cap(cap: u64) -> ToolError {
     ToolError::internal(format!(
@@ -362,19 +397,24 @@ impl DocService for CliDocService {
         let text_mode = outdir.is_none();
         let cap = self.max_input_bytes;
         let mut peak = 0u64;
+        let mut diagnostic = 0u64;
         let mut stderr = Vec::new();
         let waited = tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), async {
             let read_out = async {
                 if text_mode {
                     read_capped_async(&mut child_stdout, cap, &mut peak).await
                 } else {
-                    let mut out = Vec::new();
-                    child_stdout.read_to_end(&mut out).await.map_err(Capped::Io)?;
-                    Ok(out)
+                    // The bundle is on disk: standard output carries nothing we keep.
+                    drain(&mut child_stdout, &mut peak).await.map_err(Capped::Io)?;
+                    Ok(Vec::new())
                 }
             };
-            let read_err =
-                async { child_stderr.read_to_end(&mut stderr).await.map_err(Capped::Io) };
+            let read_err = async {
+                read_tail(&mut child_stderr, &mut diagnostic)
+                    .await
+                    .map(|tail| stderr = tail)
+                    .map_err(Capped::Io)
+            };
             let (stdout, _) = tokio::try_join!(read_out, read_err)?;
             let status = child.wait().await.map_err(Capped::Io)?;
             Ok::<_, Capped>((status, stdout))
@@ -382,8 +422,12 @@ impl DocService for CliDocService {
         .await;
         #[cfg(test)]
         {
-            held.answer = peak;
-            held.diagnostic = stderr.len() as u64;
+            if text_mode {
+                held.answer = peak
+            } else {
+                held.bundle_stdout = peak
+            }
+            held.diagnostic = diagnostic;
         }
 
         let (status, stdout) = match waited {

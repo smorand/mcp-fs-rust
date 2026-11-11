@@ -34,7 +34,7 @@ fn stand_in(home: &Path, body: &str) -> PathBuf {
     let path = home.join("conv.sh");
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(
-        b"#!/bin/sh\nm=\"$(dirname \"$0\")/marker\"\nprintf 'started\\n%s\\n%s\\n' \"$$\" \"$(pwd)\" >> \"$m\"\n",
+        b"#!/bin/sh\nm=\"$(dirname \"$0\")/marker\"\nprintf 'started\\n%s\\n%s\\n' \"$$\" \"$(pwd)\" > \"$m.$$\"\n",
     )
     .unwrap();
     f.write_all(body.as_bytes()).unwrap();
@@ -54,18 +54,24 @@ fn cli(command: &Path, cap: u64, timeout_secs: u64) -> CliDocService {
     )
 }
 
-/// `(pid, working folder)` of every start the stand in recorded (the marker is
-/// appended to, so two calls sharing one script leave two records).
+/// `(pid, working folder)` of every start the stand in recorded. Each start
+/// writes its own `marker.<pid>` file, because two calls sharing one script that
+/// appended to one file could interleave their lines.
 fn markers(home: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(text) = std::fs::read_to_string(home.join("marker")) else { return Vec::new() };
-    let lines: Vec<&str> = text.lines().collect();
-    lines
-        .chunks(3)
-        .map(|c| {
-            assert_eq!(c[0], "started");
-            (c[1].to_string(), PathBuf::from(c[2]))
-        })
-        .collect()
+    let Ok(dir) = std::fs::read_dir(home) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in dir.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("marker.") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() == 3 {
+            assert_eq!(lines[0], "started");
+            out.push((lines[1].to_string(), PathBuf::from(lines[2])));
+        }
+    }
+    out
 }
 
 fn marker(home: &Path) -> Option<(String, PathBuf)> {
@@ -425,4 +431,132 @@ async fn e2e_0089_049_companion_exists_without_overwrite_co() {
     assert_eq!(e.message, "'/docs/deck.md' exists (pass overwrite=true)");
     assert_eq!(read(&f, "/docs/deck.md").await.as_deref(), Some(b"old".as_slice()));
     assert!(marker(home.path()).is_none(), "the converter must never start");
+}
+
+/// The most the diagnostic output may be held at: the 8 192 byte tail plus one chunk.
+const DIAGNOSTIC_MAX: u64 = 73_728;
+/// The most the discarded standard output of bundle mode may be held at: one chunk.
+const BUNDLE_STDOUT_MAX: u64 = 65_536;
+
+/// Like [`cli`], with `{outdir}` so the converter answers by a bundle.
+fn cli_bundle(command: &Path, cap: u64, timeout_secs: u64) -> CliDocService {
+    CliDocService::new(
+        crate::config::DocServiceCliConfig {
+            command: vec![
+                command.display().to_string(),
+                crate::config::OUTDIR_PLACEHOLDER.into(),
+                crate::config::DOC_PLACEHOLDER.into(),
+            ],
+            timeout_secs,
+        },
+        Vec::new(),
+        cap,
+    )
+}
+
+/// The single record of the call.
+fn held_one() -> ConverterHeld {
+    let all = holds();
+    assert_eq!(all.len(), 1, "one record per call: {all:?}");
+    all[0]
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_014_diagnostic_output_flood() {
+    let _heavy = heavy().await;
+    let f = converter_fixture().await;
+    seed(&f, "/docs/bomb.docx", b"PK").await;
+    let home = tempfile::tempdir().unwrap();
+    let body = "exec perl -e 'my $s = \"n\" x 65536; print STDERR $s for 1..16384; \
+                print STDERR \"the real cause\"; exit 3'\n";
+    let svc = cli(&stand_in(home.path(), body), CAP, 300);
+    held_reset();
+
+    let v = ask(&f, &svc, OWNER, "/docs/bomb.docx", false).await;
+
+    let Err(e) = &v else { panic!("the conversion must be refused: {v:?}") };
+    assert_eq!(e.code, code::INTERNAL_ERROR, "{e:?}");
+    assert!(e.message.starts_with("document service exited with exit code 3: "), "{}", e.message);
+    assert!(e.message.ends_with("the real cause"), "{}", e.message);
+    assert!(e.message.len() <= 8_320, "message of {} bytes", e.message.len());
+    let held = held_one().diagnostic;
+    assert!(held <= DIAGNOSTIC_MAX, "the diagnostic held {held} bytes, more than {DIAGNOSTIC_MAX}");
+    stopped_and_cleaned(home.path());
+    clean(&f, "/docs/bomb.docx").await;
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_017_standard_output_flood_in_bundle_m() {
+    let _heavy = heavy().await;
+    let f = converter_fixture().await;
+    let home = tempfile::tempdir().unwrap();
+    let body = "printf '# Deck' > \"$1/document.md\"\n\
+                exec perl -e 'my $s = \"p\" x 65536; print $s for 1..16384'\n";
+    let svc = cli_bundle(&stand_in(home.path(), body), CAP, 300);
+    held_reset();
+
+    let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await.unwrap();
+
+    assert_eq!(v["md_path"], json!("/docs/deck.md"));
+    assert_eq!(read(&f, "/docs/deck.md").await.as_deref(), Some(b"# Deck".as_slice()));
+    let held = held_one().bundle_stdout;
+    assert!(
+        held <= BUNDLE_STDOUT_MAX,
+        "the stdout held {held} bytes, more than {BUNDLE_STDOUT_MAX}"
+    );
+    stopped_and_cleaned(home.path());
+}
+
+#[tokio::test]
+async fn e2e_0089_004_bundle_mode_conversion_within_the_lim() {
+    let f = converter_fixture().await;
+    let home = tempfile::tempdir().unwrap();
+    let body = "mkdir -p \"$1/figures\"\n\
+                printf '# Deck\\n\\n![Chart](figures/f1.png)\\n' > \"$1/document.md\"\n\
+                perl -e 'print \"x\" x 500' > \"$1/figures/f1.png\"\n\
+                printf '{\"pictures\": {\"figures/f1.png\": {\"caption\": \"Chart\"}}}' > \"$1/artifacts.json\"\n";
+    let svc = cli_bundle(&stand_in(home.path(), body), CAP, 120);
+
+    ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await.unwrap();
+
+    assert_eq!(
+        read(&f, "/docs/deck.md").await.as_deref(),
+        Some(b"# Deck\n\n![Chart](figures/f1.png)\n".as_slice())
+    );
+    let images = crate::tools::artifacts::list_images(&f.state, MOUNT, "/docs/deck.pptx", None)
+        .await
+        .unwrap();
+    let text = images.to_string();
+    assert_eq!(text.matches("\"Chart\"").count(), 1, "one image captioned Chart: {images}");
+}
+
+/// A bundle of `document.md` (6 bytes) and `big.bin` of `n` bytes.
+fn big_bundle(home: &Path, n: u64) -> CliDocService {
+    let body = format!(
+        "printf '# Deck' > \"$1/document.md\"\nperl -e 'print \"b\" x {n}' > \"$1/big.bin\"\n"
+    );
+    cli_bundle(&stand_in(home, &body), CAP, 120)
+}
+
+#[tokio::test]
+async fn e2e_0089_037_bundle_of_exactly_the_converter_limit() {
+    let f = converter_fixture().await;
+    let home = tempfile::tempdir().unwrap();
+    let svc = big_bundle(home.path(), 1_048_570);
+
+    ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await.unwrap();
+
+    assert_eq!(read(&f, "/docs/deck.md").await.as_deref(), Some(b"# Deck".as_slice()));
+}
+
+#[tokio::test]
+async fn e2e_0089_038_bundle_one_byte_over_the_converter_li() {
+    let f = converter_fixture().await;
+    let home = tempfile::tempdir().unwrap();
+    let svc = big_bundle(home.path(), 1_048_571);
+
+    let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await;
+
+    refused(&v, OVER);
+    clean(&f, "/docs/deck.pptx").await;
 }
