@@ -294,3 +294,80 @@ async fn e2e_0089_sec_009_load_total_met_inside_a_bomb_stream() {
     let bytes = small(object_streams_pdf("Fine", [100_000_000, 100_000_000, PDF_BOMB]));
     refused_with("/docs/objs3.pdf", &bytes, LOAD_MESSAGE, LOAD_HELD).await;
 }
+
+const PAGE_HELD: u64 = 268_500_992;
+
+fn page_message(n: u32) -> String {
+    format!("page {n} decodes more than 268435456 bytes of PDF streams")
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_007_one_form_drawn_300_times() {
+    let _heavy = heavy().await;
+    refused_with("/docs/forms.pdf", &forms_pdf(), &page_message(1), PAGE_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_008_a_colour_profile_kept_in_300_save() {
+    let _heavy = heavy().await;
+    refused_with("/docs/states.pdf", &selected_states_pdf(), &page_message(1), PAGE_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_013_a_page_decoding_exactly_the_page_tota() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/form.pdf", &form_total_pdf(0)).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/form.pdf", false).await.expect("at the page total");
+
+    let held = decoded_held("/docs/form.pdf");
+    assert!(held <= PAGE_HELD, "the extraction held {held} decoded bytes, more than {PAGE_HELD}");
+    assert!(v["preview"].as_str().unwrap().contains("Hi"), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0089_014_a_page_one_byte_over_the_page_total() {
+    let _heavy = heavy().await;
+    refused_with("/docs/form.pdf", &form_total_pdf(1), &page_message(1), PAGE_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_018_page_2_over_the_page_total_page_1_fin() {
+    let _heavy = heavy().await;
+    refused_with("/docs/two.pdf", &two_pages_pdf(), &page_message(2), PAGE_HELD).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_027_load_total_met_before_a_page_bomb() {
+    let _heavy = heavy().await;
+    refused_with("/docs/order2.pdf", &order2_pdf(), LOAD_MESSAGE, LOAD_HELD).await;
+}
+
+/// The page total is met inside the third inflation of a form: decoding stops one
+/// chunk past it, not at the end of the form (300 000 000 bytes).
+#[tokio::test]
+async fn e2e_0089_page_total_met_inside_a_stream() {
+    let _heavy = heavy().await;
+    let doc = "/docs/big.pdf";
+    refused_with(doc, &big_forms_pdf(300_000_000), &page_message(1), PAGE_HELD).await;
+    let held = decoded_held(doc);
+    assert!(held > PAGE_LIMIT as u64, "the refusal decoded only {held} bytes");
+}
+
+/// The page total reached exactly by a first inflation, not by a repeat.
+#[tokio::test]
+async fn e2e_0089_page_total_exactly_met_by_a_stream() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let third = PAGE_LIMIT - 2 * STREAM_LIMIT;
+    seed(&f, "/docs/big.pdf", &big_forms_pdf(third)).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/big.pdf", false).await.expect("at the page total");
+
+    let held = decoded_held("/docs/big.pdf");
+    assert!(held <= PAGE_HELD, "the extraction held {held} decoded bytes, more than {PAGE_HELD}");
+    assert!(v["preview"].as_str().unwrap().contains("Hi"), "{v}");
+}

@@ -30,6 +30,10 @@ pub(crate) const STREAM_LIMIT: u64 = 104_857_600;
 /// (SPEC-0089 FR-NEW-003).
 pub(crate) const LOAD_LIMIT: u64 = 268_435_456;
 
+/// Largest total decoded size of the streams one page decodes, repeats counted
+/// (SPEC-0089 FR-NEW-004).
+pub(crate) const PAGE_LIMIT: u64 = 268_435_456;
+
 /// Most objects one PDF may hold (SPEC-0089 FR-NEW-001).
 pub(crate) const OBJECT_LIMIT: u64 = 1_000_000;
 
@@ -64,6 +68,13 @@ fn over_load_limit() -> ToolError {
     )
 }
 
+/// The refusal of FR-NEW-004, before `prepare_extraction` names the path.
+fn over_page_limit(page_no: u32) -> ToolError {
+    ToolError::invalid_argument(format!(
+        "page {page_no} decodes more than 268435456 bytes of PDF streams"
+    ))
+}
+
 /// The refusal of FR-NEW-001, before `prepare_extraction` names the path.
 fn over_object_limit() -> ToolError {
     ToolError::invalid_argument("the PDF holds more than 1000000 objects")
@@ -86,6 +97,8 @@ pub(crate) struct PdfText {
 struct PdfBudget {
     held: u64,
     page: u64,
+    /// The page being walked, from 1.
+    page_no: u32,
     content: u64,
     /// Decoded bytes of the object streams measured so far by the load.
     load: u64,
@@ -129,17 +142,27 @@ pub(crate) fn extract(data: &[u8]) -> Result<PdfText> {
     let mut figures = Figures(PdfBudget::default());
     let budget = &mut figures.0;
     let mut doc = load(data, budget)?;
+    let stand_ins = install_stand_ins(&mut doc);
+    let originals: HashMap<ObjectId, ObjectId> = stand_ins.iter().map(|(o, s)| (*s, *o)).collect();
     defuse(&mut doc);
 
     let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
     let mut texts = Vec::new();
     for (index, page_id) in pages.into_iter().enumerate() {
-        let walked = walk(&doc, page_id, budget)?;
-        budget.hold(budget.page);
         let n = index as u32 + 1;
+        budget.page_no = n;
+        let walked = walk(&doc, page_id, &originals, budget)?;
+        budget.hold(budget.page);
+        // A tint transform pdf-extract would format from invalid UTF-8 keeps
+        // doing so (DEC-009): its stand in holds the one invalid byte.
+        for id in &walked.invalid {
+            if let Some(Object::Stream(stand_in)) = doc.objects.get_mut(id) {
+                stand_in.set_plain_content(vec![0xFF]);
+            }
+        }
         let mut text = String::new();
         let page = {
-            let armed = Armed::new(&mut doc, walked);
+            let armed = Armed::new(&mut doc, walked.armed);
             pdf_extract::output_doc_page(
                 armed.doc,
                 &mut pdf_extract::PlainTextOutput::new(&mut text),
@@ -710,6 +733,63 @@ fn pair_count(stream: &Stream) -> u64 {
     text.map_or(0, |t| t.split_whitespace().count() as u64 / 2)
 }
 
+/// Hand the reader empty stand ins for the colour profiles and tint transforms
+/// it keeps (DEC-009): the reader copies a profile into every saved drawing
+/// state, so a profile selected once and saved 300 times would be held 300
+/// times. Every array opening with `/ICCBased` gets its stream reference
+/// replaced, and every `/Separation` its tint transform's. A stand in is a new
+/// object: the original dictionary without `Filter`, `DecodeParms` and
+/// `Length`, and no content. The walk counts the original on every selection.
+/// Returns original to stand in. O(objects) time.
+fn install_stand_ins(doc: &mut Document) -> HashMap<ObjectId, ObjectId> {
+    let mut wanted = BTreeSet::new();
+    for object in doc.objects.values_mut() {
+        visit_spaces(object, &mut |id| {
+            wanted.insert(*id);
+        });
+    }
+    let mut stand_ins = HashMap::new();
+    for id in wanted {
+        let Some(Object::Stream(original)) = doc.objects.get(&id) else { continue };
+        let mut dict = original.dict.clone();
+        for key in [&b"Filter"[..], b"DecodeParms", b"Length"] {
+            dict.remove(key);
+        }
+        stand_ins.insert(id, doc.add_object(Stream::new(dict, Vec::new())));
+    }
+    for object in doc.objects.values_mut() {
+        visit_spaces(object, &mut |id| {
+            if let Some(stand_in) = stand_ins.get(id) {
+                *id = *stand_in;
+            }
+        });
+    }
+    stand_ins
+}
+
+/// Call `f` on the stream reference of every `/ICCBased` profile and
+/// `/Separation` tint transform inside `object`, however deep.
+fn visit_spaces(object: &mut Object, f: &mut dyn FnMut(&mut ObjectId)) {
+    match object {
+        Object::Array(items) => {
+            let at = match items.first().and_then(|o| o.as_name().ok()) {
+                Some(b"ICCBased") => Some(1),
+                Some(b"Separation") => Some(3),
+                _ => None,
+            };
+            if let Some(Object::Reference(id)) = at.and_then(|i| items.get_mut(i)) {
+                f(id);
+            }
+            for item in items {
+                visit_spaces(item, f);
+            }
+        }
+        Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, v)| visit_spaces(v, f)),
+        Object::Stream(stream) => stream.dict.iter_mut().for_each(|(_, v)| visit_spaces(v, f)),
+        _ => {}
+    }
+}
+
 /// Move every stream's `Filter` aside, so the reader inflates nothing it was
 /// not handed (DEC-006). A `McpFsFilter` key the file itself wrote on a stream
 /// without `Filter` is dropped, so arming can never give it a filter it lacked.
@@ -1048,6 +1128,8 @@ struct Count<'b> {
     /// Bytes the load has measured before this stream, when this one is an
     /// object stream: its running sum is the load total.
     load_base: Option<u64>,
+    /// Bytes this page has decoded before this stream, when it is a page stream.
+    page_base: Option<u64>,
     /// The last step runs the predictor: its output is counted twice.
     predicted_last: Option<usize>,
     budget: &'b mut PdfBudget,
@@ -1060,6 +1142,9 @@ impl Count<'_> {
         self.total = self.total.saturating_add(counted as u64);
         // The bytes really decoded so far, so a refusal records what it cost.
         self.budget.hold(self.total);
+        if let Some(base) = self.page_base {
+            self.budget.hold(base.saturating_add(self.total));
+        }
         // Checked after every chunk, so decoding stops at most one chunk past
         // the limit; equal is accepted.
         if self.total > STREAM_LIMIT {
@@ -1068,6 +1153,10 @@ impl Count<'_> {
         // The load total, on the running sum, after the stream limit.
         if self.load_base.is_some_and(|base| base.saturating_add(self.total) > LOAD_LIMIT) {
             return Err(over_load_limit());
+        }
+        // The page total, on the running sum, after the stream limit (DEC-003).
+        if self.page_base.is_some_and(|base| base.saturating_add(self.total) > PAGE_LIMIT) {
+            return Err(over_page_limit(self.budget.page_no));
         }
         Ok(())
     }
@@ -1124,6 +1213,7 @@ fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64>
         total: if predicted_last.is_some() { rows.unwrap_or(0) } else { 0 },
         predicted_last,
         load_base: matches!(scope, Scope::Load).then_some(budget.load),
+        page_base: matches!(scope, Scope::Page).then_some(budget.page),
         budget,
     };
     if count.total > STREAM_LIMIT {
@@ -1156,8 +1246,14 @@ fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64>
     Ok(total)
 }
 
-/// What the walk of one page found: the streams to arm.
-type Walked = BTreeSet<ObjectId>;
+/// What the walk of one page found.
+#[derive(Default)]
+struct Walked {
+    /// The streams to arm.
+    armed: BTreeSet<ObjectId>,
+    /// The stand ins of tint transforms whose original is not valid UTF-8.
+    invalid: BTreeSet<ObjectId>,
+}
 
 /// The object `obj` leads to, with the id of the last reference followed.
 fn resolve<'d>(doc: &'d Document, obj: &'d Object) -> Option<(Option<ObjectId>, &'d Object)> {
@@ -1222,7 +1318,7 @@ fn reader_bytes(stream: &Stream, armed: bool) -> std::borrow::Cow<'_, [u8]> {
 /// One page's walk state: the streams armed, their sizes measured once.
 struct PageWalk<'d> {
     doc: &'d Document,
-    armed: Walked,
+    armed: BTreeSet<ObjectId>,
     sizes: HashMap<ObjectId, u64>,
 }
 
@@ -1232,6 +1328,12 @@ impl PageWalk<'_> {
     fn decode(&mut self, id: ObjectId, budget: &mut PdfBudget) -> Result<u64> {
         if let Some(size) = self.sizes.get(&id) {
             budget.page = budget.page.saturating_add(*size);
+            // A repeat adds its cached size at once and is checked right after;
+            // it decodes nothing, so a refused sum is never recorded as held.
+            if budget.page > PAGE_LIMIT {
+                return Err(over_page_limit(budget.page_no));
+            }
+            budget.hold(budget.page);
             return Ok(*size);
         }
         let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { return Ok(0) };
@@ -1244,6 +1346,24 @@ impl PageWalk<'_> {
         };
         self.sizes.insert(id, size);
         Ok(size)
+    }
+}
+
+impl PageWalk<'_> {
+    /// The walk's result: the streams to arm and the stand ins to fill.
+    fn into_walked(self, invalid: BTreeSet<ObjectId>) -> Walked {
+        Walked { armed: self.armed, invalid }
+    }
+
+    /// Whether tint transform `id`, of `FunctionType` 4, decodes to bytes that
+    /// are not valid UTF-8, which pdf-extract would format with an `unwrap`
+    /// (DEC-009). O(decoded bytes) time; holds the decoded transform, counted
+    /// by the caller.
+    fn invalid_text(&self, id: ObjectId) -> bool {
+        let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { return false };
+        let typed = stream.dict.get(b"FunctionType").and_then(Object::as_i64);
+        typed.is_ok_and(|t| t == 4)
+            && std::str::from_utf8(&reader_bytes(stream, self.armed.contains(&id))).is_err()
     }
 }
 
@@ -1264,10 +1384,16 @@ struct Drawing<'d> {
 /// operations held are the page's and those of the forms on the drawing stack:
 /// a form's are dropped when it is popped, and parsed again if drawn again, as
 /// the reader does.
-fn walk(doc: &Document, page_id: ObjectId, budget: &mut PdfBudget) -> Result<Walked> {
+fn walk(
+    doc: &Document,
+    page_id: ObjectId,
+    originals: &HashMap<ObjectId, ObjectId>,
+    budget: &mut PdfBudget,
+) -> Result<Walked> {
     budget.page = 0;
     let mut page = PageWalk { doc, armed: BTreeSet::new(), sizes: HashMap::new() };
-    let Ok(page_dict) = doc.get_dictionary(page_id) else { return Ok(page.armed) };
+    let mut invalid = BTreeSet::new();
+    let Ok(page_dict) = doc.get_dictionary(page_id) else { return Ok(page.into_walked(invalid)) };
     let empty = Dictionary::new();
     let resources = inherited_resources(doc, page_dict).unwrap_or(&empty);
 
@@ -1287,7 +1413,7 @@ fn walk(doc: &Document, page_id: ObjectId, budget: &mut PdfBudget) -> Result<Wal
             content.push(b'\n');
         }
     }
-    let Ok(parsed) = Content::decode(&content) else { return Ok(page.armed) };
+    let Ok(parsed) = Content::decode(&content) else { return Ok(page.into_walked(invalid)) };
     drop(content);
 
     let mut fonts: HashSet<Vec<u8>> = HashSet::new();
@@ -1334,7 +1460,15 @@ fn walk(doc: &Document, page_id: ObjectId, budget: &mut PdfBudget) -> Result<Wal
                     break;
                 };
                 for id in colour_streams(doc, space.1) {
-                    page.decode(id, budget)?;
+                    // The reader holds the stand in; the original is what it would decode.
+                    let original = originals.get(&id).copied().unwrap_or(id);
+                    let size = page.decode(original, budget)?;
+                    if original != id && !invalid.contains(&id) {
+                        budget.hold(size);
+                        if page.invalid_text(original) {
+                            invalid.insert(id);
+                        }
+                    }
                 }
             }
             "Do" => {
@@ -1364,7 +1498,7 @@ fn walk(doc: &Document, page_id: ObjectId, budget: &mut PdfBudget) -> Result<Wal
             _ => {}
         }
     }
-    Ok(page.armed)
+    Ok(page.into_walked(invalid))
 }
 
 /// The streams `make_font` decodes for `font`, by its `Subtype` (`lib.rs:322-332`).
@@ -1767,5 +1901,66 @@ mod tests {
         let e = extract(&doc).map(|_| ()).unwrap_err();
 
         assert_eq!(e.message, "pdf: the cross reference stream could not be measured");
+    }
+
+    #[test]
+    fn pdf_one_profile_kept_in_300_saved_states_holds_nothing() {
+        let bytes = states_pdf(300);
+        let mut figures = Figures(PdfBudget::default());
+        let mut doc = load(&bytes, &mut figures.0).expect("loaded");
+        let profile = ObjectId::from((7, 0));
+        let stored = doc.get_object(profile).and_then(Object::as_stream).expect("stream").clone();
+
+        let stand_ins = install_stand_ins(&mut doc);
+
+        let stand_in = *stand_ins.get(&profile).expect("object 7 has a stand in");
+        let stand = doc.get_object(stand_in).and_then(Object::as_stream).expect("stream");
+        assert!(stand.content.is_empty());
+        assert!(stand.dict.get(b"Filter").is_err());
+        // `Stream::new` writes the length of the empty content.
+        assert_eq!(stand.dict.get(b"Length").and_then(Object::as_i64).ok(), Some(0));
+        // The colour space array now points at the stand in, the only reference left.
+        let mut seen = Vec::new();
+        for object in doc.objects.values_mut() {
+            visit_spaces(object, &mut |id| seen.push(*id));
+        }
+        assert_eq!(seen, vec![stand_in]);
+        let original = doc.get_object(profile).and_then(Object::as_stream).expect("stream");
+        assert_eq!(original.content, stored.content);
+        assert!(original.dict.get(b"Filter").is_ok());
+
+        extract(&bytes).expect("extracted");
+        let held = crate::docs::extract::LAST_PDF_HELD.with(std::cell::Cell::take);
+        assert_eq!(held.expect("recorded").decoded, 1_000_000);
+    }
+
+    /// Walk page 1 of a document selecting a `Separation` whose tint transform
+    /// is object 7, `FunctionType` `kind`, holding `body`; the ids marked invalid.
+    fn invalid_tints(kind: u8, body: &[u8]) -> (usize, HashMap<ObjectId, ObjectId>) {
+        let function = PdfObj::Stream(
+            format!("<< /FunctionType {kind} /Domain [0 1] /Range [0 1] /Length {} >>", body.len()),
+            body.to_vec(),
+        );
+        let bytes = page_pdf(
+            plain("/CS0 cs"),
+            "/ColorSpace << /CS0 [/Separation /Spot /DeviceGray 7 0 R] >>",
+            vec![(7, function)],
+        );
+        let mut budget = PdfBudget::default();
+        let mut doc = load(&bytes, &mut budget).expect("loaded");
+        let stand_ins = install_stand_ins(&mut doc);
+        let originals = stand_ins.iter().map(|(o, s)| (*s, *o)).collect();
+        defuse(&mut doc);
+        let page = doc.get_pages().into_values().next().expect("a page");
+        let walked = walk(&doc, page, &originals, &mut budget).expect("walked");
+        (walked.invalid.len(), stand_ins)
+    }
+
+    #[test]
+    fn a_type_4_tint_transform_that_is_not_utf_8_is_flagged_for_its_stand_in() {
+        let (flagged, stand_ins) = invalid_tints(4, b"{ \xFF\xFE }");
+        assert_eq!((flagged, stand_ins.len()), (1, 1));
+        assert_eq!(invalid_tints(4, b"{ 0.5 mul }").0, 0);
+        assert_eq!(invalid_tints(0, b"\xFF\xFE").0, 0);
     }
 }

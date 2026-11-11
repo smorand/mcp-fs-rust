@@ -772,6 +772,105 @@ pub(crate) fn photo_pdf() -> Vec<u8> {
     )
 }
 
+/// The page total of SPEC-0089 FR-NEW-004.
+pub(crate) const PAGE_LIMIT: usize = 268_435_456;
+
+/// A form object (a `/Subtype /Form` stream, `/FlateDecode`) whose content is
+/// `head` then spaces, `total` decoded bytes in all.
+fn form_object(head: &str, total: usize) -> PdfObj {
+    flate(
+        "/Type /XObject /Subtype /Form /BBox [0 0 612 792]",
+        zlib_run(head, b' ', total - head.len(), ""),
+    )
+}
+
+/// A page content stream of `head` then spaces, `total` decoded bytes in all.
+fn padded_content(head: &str, total: usize) -> PdfObj {
+    flate("", zlib_run(head, b' ', total - head.len(), ""))
+}
+
+/// E2E-013 and E2E-014: page 1 draws form `/Fm0` (object 7, `Hi`) four times;
+/// the page content and the four draws decode to exactly `PAGE_LIMIT + over`.
+pub(crate) fn form_total_pdf(over: usize) -> Vec<u8> {
+    const FORM: usize = 67_108_000;
+    let page = PAGE_LIMIT + over - 4 * FORM;
+    let form = form_object("BT /F1 12 Tf 72 700 Td (Hi) Tj ET", FORM);
+    page_pdf(
+        padded_content(&"/Fm0 Do ".repeat(4), page),
+        "/XObject << /Fm0 7 0 R >>",
+        vec![(7, form)],
+    )
+}
+
+/// Page 1 draws three different forms (objects 7, 8 and 9): two of exactly the
+/// stream limit each and a third of `third` bytes: with `PAGE_LIMIT - 2 *
+/// STREAM_LIMIT + 1` the page total is met 1 byte past the end of a first
+/// inflation, with 300 000 000 it is met 58 720 256 bytes into it.
+pub(crate) fn big_forms_pdf(third: usize) -> Vec<u8> {
+    let form = |total| form_object("BT /F1 12 Tf 72 700 Td (Hi) Tj ET", total);
+    page_pdf(
+        plain("/Fm0 Do /Fm1 Do /Fm2 Do"),
+        "/XObject << /Fm0 7 0 R /Fm1 8 0 R /Fm2 9 0 R >>",
+        vec![(7, form(STREAM_LIMIT)), (8, form(STREAM_LIMIT)), (9, form(third))],
+    )
+}
+
+/// A form decoding to 1 000 000 bytes, drawn 300 times by one page content.
+fn drawn_300_times() -> (PdfObj, PdfObj) {
+    (plain(&"/Fm0 Do ".repeat(300)), form_object("BT /F1 12 Tf 72 700 Td (Hi) Tj ET", 1_000_000))
+}
+
+/// E2E-SEC-007: page 1 draws one 1 000 000 byte form 300 times.
+pub(crate) fn forms_pdf() -> Vec<u8> {
+    let (content, form) = drawn_300_times();
+    page_pdf(content, "/XObject << /Fm0 7 0 R >>", vec![(7, form)])
+}
+
+/// E2E-018: page 1 reads `One`, page 2 draws a 1 000 000 byte form (object 8)
+/// 300 times.
+pub(crate) fn two_pages_pdf() -> Vec<u8> {
+    let (content, form) = drawn_300_times();
+    let mut w = pages_writer(
+        vec![plain("BT /F1 12 Tf 72 700 Td (One) Tj ET"), content],
+        "/XObject << /Fm0 8 0 R >>",
+    );
+    w.object(8, form);
+    small(w.finish())
+}
+
+/// E2E-027: the object streams of E2E-010 (one byte over the load total) and a
+/// page 1 drawing a 1 000 000 byte form 300 times.
+pub(crate) fn order2_pdf() -> Vec<u8> {
+    let (content, form) = drawn_300_times();
+    let mut w = pages_writer(vec![content], "/XObject << /Fm0 8 0 R >>");
+    w.object(8, form);
+    for (i, total) in [100_000_000, 100_000_000, 68_435_457].into_iter().enumerate() {
+        let objects = [(30 + i as u32, "<< /Pad 1 >>")];
+        let (head, _) = object_stream_head(&objects);
+        w.object_stream(20 + i as u32, &objects, total - head.len());
+    }
+    small(w.finish())
+}
+
+/// A page selecting `/CS0` (an ICC profile of 1 000 000 bytes, object 7) once,
+/// then `q` `saves` times.
+pub(crate) fn states_pdf(saves: usize) -> Vec<u8> {
+    page_pdf(
+        plain(&format!("/CS0 cs {}", "q ".repeat(saves))),
+        "/ColorSpace << /CS0 [/ICCBased 7 0 R] >>",
+        vec![(7, flate("/N 1", zlib_run("", b' ', 1_000_000, "")))],
+    )
+}
+
+/// E2E-SEC-008: `/CS0 cs q` written 300 times over a 1 000 000 byte profile.
+pub(crate) fn selected_states_pdf() -> Vec<u8> {
+    page_pdf(
+        plain(&"/CS0 cs q ".repeat(300)),
+        "/ColorSpace << /CS0 [/ICCBased 7 0 R] >>",
+        vec![(7, flate("/N 1", zlib_run("", b' ', 1_000_000, "")))],
+    )
+}
+
 /// Forget every PDF call measured on this thread.
 pub(crate) fn pdf_held_reset() {
     crate::docs::extract::PDF_HELD.with(|m| m.borrow_mut().clear());
