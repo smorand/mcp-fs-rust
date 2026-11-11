@@ -2163,6 +2163,106 @@ mod tests {
         assert_eq!(v["references"][0]["path"], "/src/app.py");
     }
 
+    // ── SPEC-0092 DEC-007: code search over deeply nested sources ───────────
+
+    const NESTING: &str = "api::dataplane::tests::";
+
+    /// The text of the first block of an MCP tool answer.
+    fn mcp_text(r: &rmcp::model::CallToolResult) -> String {
+        r.content
+            .iter()
+            .find_map(|c| match c {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text block")
+    }
+
+    fn deep(head: &str, open: char, middle: &str, close: char, n: usize, tail: &str) -> String {
+        crate::tools::nesting_testkit::deep_source(head, open, middle, close, n, tail)
+    }
+
+    #[test]
+    fn e2e_0092_sec_013_reference_search_through_the_http() {
+        crate::tools::nesting_testkit::in_child(
+            NESTING,
+            "e2e_0092_sec_013_reference_search_through_the_http",
+            || async {
+                let h = Harness::new().await;
+                h.seed("/src/deep.js", &deep("const g = ", '[', "g", ']', 100_000, ";")).await;
+                let pid_before = std::process::id();
+                let (status, v) = h.get(&u("find-references?root=/src&name=g")).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let lines: Vec<_> = v["references"]
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .map(|r| (r["path"].as_str().unwrap().to_string(), r["line"].as_u64().unwrap()))
+                    .collect();
+                assert_eq!(
+                    lines,
+                    vec![("/src/deep.js".to_string(), 1), ("/src/deep.js".to_string(), 1)],
+                    "{v}"
+                );
+                assert_eq!(std::process::id(), pid_before);
+                let (status, _) = h.get(&u("stat?path=/src/deep.js")).await;
+                assert_eq!(status, StatusCode::OK, "the server is still up");
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_0092_004_references_in_a_moderately_nested_fil() {
+        use crate::mcp::server::{FindReferencesArgs, McpServer};
+        use rmcp::handler::server::wrapper::Parameters;
+        let h = Harness::new().await;
+        h.seed("/src/mid.py", &deep("def f():\n    return ", '(', "1", ')', 1_000, "\nf()\n"))
+            .await;
+        let (status, http) = h.get(&u("find-references?root=/src&name=f")).await;
+        assert_eq!(status, StatusCode::OK, "{http}");
+        let server = McpServer::new(h.state.clone(), OWNER.to_string());
+        let args =
+            FindReferencesArgs { mount_id: MOUNT.into(), name: "f".into(), root: "/src".into() };
+        let r = server.fs_find_references(Parameters(args)).await.expect("a tool result");
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let mcp: Value = serde_json::from_str(&mcp_text(&r)).expect("json");
+        assert_eq!(http, mcp);
+        let lines: Vec<u64> = http["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["line"].as_u64().unwrap())
+            .collect();
+        assert!(lines.contains(&3), "{http}");
+    }
+
+    #[tokio::test]
+    async fn e2e_0092_026_empty_name_over_a_deep_source_through() {
+        use crate::mcp::server::{FindReferencesArgs, McpServer};
+        use rmcp::handler::server::wrapper::Parameters;
+        let h = Harness::new().await;
+        h.seed("/src/deep.py", &deep("def f():\n    return ", '(', "1", ')', 100_000, "\n")).await;
+        let (status, http) = h.get(&u("find-references?root=/src&name=")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{http}");
+        assert_eq!(http["error"], code::INVALID_ARGUMENT);
+        // The route reads an empty query value as a missing one, so its wording differs from
+        // the tool's `name is required`; the code and the refusal itself are the same.
+        assert!(
+            http["detail"].as_str().unwrap().contains("missing required argument 'name'"),
+            "{http}"
+        );
+        let server = McpServer::new(h.state.clone(), OWNER.to_string());
+        let args =
+            FindReferencesArgs { mount_id: MOUNT.into(), name: String::new(), root: "/src".into() };
+        let r = server.fs_find_references(Parameters(args)).await.expect("a tool result");
+        assert_eq!(r.is_error, Some(true), "{r:?}");
+        let text = mcp_text(&r);
+        assert!(
+            text.contains(code::INVALID_ARGUMENT) && text.contains("name is required"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn the_audit_log_reports_rest_mutations() {
         let h = Harness::new().await;

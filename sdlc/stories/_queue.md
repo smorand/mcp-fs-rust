@@ -224,7 +224,7 @@
 | US-0222 | SPEC-0092 | refuse PDF forms nested past 64, loops included | US-0221 | 2 | landed | story/US-0222-refuse-pdf-forms-nested-past-64-loops-in | main |
 | US-0223 | SPEC-0092 | refuse a page tree climb past 256 levels | US-0222 | 2 | landed | story/US-0223-refuse-a-page-tree-climb-past-256-levels | story/US-0222-refuse-pdf-forms-nested-past-64-loops-in |
 | US-0224 | SPEC-0092 | refuse character and code maps nested past 64 | US-0223 | 2 | landed | story/US-0224-refuse-character-and-code-maps-nested-pa | story/US-0223-refuse-a-page-tree-climb-past-256-levels |
-| US-0225 | SPEC-0092 | code search answers source of any nesting | US-0224 | 2 | todo | | |
+| US-0225 | SPEC-0092 | code search answers source of any nesting | US-0224 | 2 | landed | story/US-0225-code-search-answers-source-of-any-nestin | story/US-0224-refuse-character-and-code-maps-nested-pa |
 | US-0226 | SPEC-0092 | nesting refusals in order, without trace, walk and reader in step | US-0225 | 2 | todo | | |
 | US-0227 | SPEC-0092 | nesting refusals through the HTTP door and documentation | US-0226 | 2 | todo | | |
 | US-0228 | SPEC-0091 | decode documents apart from the request threads, behind today's ceiling | US-0227 | 2 | todo | | |

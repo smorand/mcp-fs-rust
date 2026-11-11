@@ -5,6 +5,7 @@
 //! `nothing_left`, the bystander reading `hello`, the same pid.
 
 use crate::errors::{Result, code};
+use crate::tools::admin::test_support::Fixture;
 use crate::tools::archive_testkit::*;
 use crate::tools::nesting_testkit::*;
 use crate::tools::pdf_testkit::{
@@ -389,4 +390,127 @@ async fn map_nesting_is_checked_after_the_stream_limit() {
         e.message,
         "could not extract /docs/mapbomb.pdf: a PDF stream decodes to more than 104857600 bytes"
     );
+}
+
+// ── code search over deeply nested sources (SPEC-0092 DEC-007) ───────────────
+
+const PY_HEAD: &str = "def f():\n    return ";
+
+fn deep_py(n: usize) -> String {
+    deep_source(PY_HEAD, '(', "1", ')', n, "\n")
+}
+
+/// Authorize, then ask the engine for the definitions of `name` under `/src`, as both doors do.
+async fn definitions(f: &Fixture, name: &str) -> Value {
+    f.state.authorize(MOUNT, OWNER).await.expect("the owner is a member");
+    let c = f.state.stores.client(MOUNT).await.expect("atlas volume");
+    crate::core::fs_ops::find_definitions(&c, "/src", name, None).await.expect("an answer")
+}
+
+async fn references(f: &Fixture, name: &str) -> Value {
+    f.state.authorize(MOUNT, OWNER).await.expect("the owner is a member");
+    let c = f.state.stores.client(MOUNT).await.expect("atlas volume");
+    crate::core::fs_ops::find_references(&c, "/src", name).await.expect("an answer")
+}
+
+async fn seed_src(f: &Fixture, path: &str, source: &str) {
+    let c = f.state.stores.client(MOUNT).await.expect("atlas volume");
+    c.makedirs("/src", true).await.expect("src folder");
+    seed(f, path, source.as_bytes()).await;
+}
+
+fn one_definition(v: &Value, path: &str) {
+    assert_eq!(
+        v["definitions"],
+        serde_json::json!([{"path": path, "name": "f", "kind": "function_definition", "line": 1}]),
+        "{v}"
+    );
+}
+
+#[test]
+fn e2e_0092_sec_011_definition_search_over_100_000_ne() {
+    in_child(MODULE, "e2e_0092_sec_011_definition_search_over_100_000_ne", || async {
+        let f = nesting_fixture().await;
+        seed_src(&f, "/src/deep.py", &deep_py(100_000)).await;
+        let pid_before = std::process::id();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let bystander = tokio::spawn(bystander_loop(f.state.clone(), rx));
+
+        let start = Instant::now();
+        let v = definitions(&f, "f").await;
+        let took = start.elapsed();
+
+        stop.send(true).expect("the bystander listens");
+        let reads = bystander.await.expect("every bystander read answered hello");
+        assert!(reads >= 1, "the bystander never read");
+        one_definition(&v, "/src/deep.py");
+        let limit =
+            if cfg!(debug_assertions) { Duration::from_secs(30) } else { Duration::from_secs(10) };
+        assert!(took < limit, "the search took {took:?}, more than {limit:?}");
+        still_up(&f, pid_before).await;
+    });
+}
+
+#[test]
+fn e2e_0092_sec_012_c_definition_whose_name_hides_in() {
+    in_child(MODULE, "e2e_0092_sec_012_c_definition_whose_name_hides_in", || async {
+        let f = nesting_fixture().await;
+        let src = deep_source("int f(void) { return ", '(', "1", ')', 100_000, "; }");
+        seed_src(&f, "/src/deep.c", &src).await;
+        let pid_before = std::process::id();
+        let v = definitions(&f, "f").await;
+        one_definition(&v, "/src/deep.c");
+        still_up(&f, pid_before).await;
+    });
+}
+
+#[tokio::test]
+async fn e2e_0092_003_definition_in_a_moderately_nested_pyt() {
+    let f = nesting_fixture().await;
+    seed_src(&f, "/src/mid.py", &deep_py(1_000)).await;
+    one_definition(&definitions(&f, "f").await, "/src/mid.py");
+}
+
+#[tokio::test]
+async fn e2e_0092_010_references_keep_their_order() {
+    let f = nesting_fixture().await;
+    seed_src(&f, "/src/order.py", "total = 1\nprint(total)\ntotal += 2\n").await;
+    let v = references(&f, "total").await;
+    assert_eq!(
+        v["references"],
+        serde_json::json!([
+            {"path": "/src/order.py", "line": 1, "kind": "identifier"},
+            {"path": "/src/order.py", "line": 2, "kind": "identifier"},
+            {"path": "/src/order.py", "line": 3, "kind": "identifier"},
+        ]),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_0092_025_not_a_member_deep_source() {
+    use crate::mcp::server::{FindDefinitionArgs, McpServer};
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::ContentBlock;
+    let f = nesting_fixture().await;
+    seed_src(&f, "/src/deep.py", &deep_py(100_000)).await;
+    let server = McpServer::new(f.state.clone(), "eve@example.com".to_string());
+    let args = FindDefinitionArgs {
+        mount_id: MOUNT.into(),
+        name: "f".into(),
+        root: "/src".into(),
+        kind: None,
+    };
+    let r = server.fs_find_definition(Parameters(args)).await.expect("a tool result");
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    let text = r
+        .content
+        .iter()
+        .find_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .expect("a text block");
+    assert!(text.contains(code::FORBIDDEN), "{text}");
+    assert!(text.contains("'eve@example.com' is not a member of 'atlas'"), "{text}");
 }

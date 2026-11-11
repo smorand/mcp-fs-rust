@@ -327,3 +327,22 @@ pub(crate) fn order_pdf() -> Vec<u8> {
     w.object(10, form(Some("/XObject << /A 10 0 R >>"), "/A Do"));
     w.finish()
 }
+
+/// A source file of `head`, then `open` written `n` times, `middle`, `close` written `n`
+/// times and `tail` (E2E-003 to E2E-SEC-013). Time and space: O(n).
+pub(crate) fn deep_source(
+    head: &str,
+    open: char,
+    middle: &str,
+    close: char,
+    n: usize,
+    tail: &str,
+) -> String {
+    let mut s = String::with_capacity(head.len() + 2 * n + middle.len() + tail.len());
+    s.push_str(head);
+    s.extend(std::iter::repeat_n(open, n));
+    s.push_str(middle);
+    s.extend(std::iter::repeat_n(close, n));
+    s.push_str(tail);
+    s
+}

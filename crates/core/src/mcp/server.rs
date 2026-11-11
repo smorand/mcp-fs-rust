@@ -2031,7 +2031,7 @@ impl McpServer {
     }
 
     #[tool(name = "fs.find_definition", description = "Find a symbol definition (language-aware).")]
-    async fn fs_find_definition(
+    pub(crate) async fn fs_find_definition(
         &self,
         Parameters(a): Parameters<FindDefinitionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -2048,7 +2048,7 @@ impl McpServer {
         name = "fs.find_references",
         description = "Find identifier references (language-aware)."
     )]
-    async fn fs_find_references(
+    pub(crate) async fn fs_find_references(
         &self,
         Parameters(a): Parameters<FindReferencesArgs>,
     ) -> Result<CallToolResult, ErrorData> {

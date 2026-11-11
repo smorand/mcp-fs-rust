@@ -203,13 +203,23 @@ fn parse(language: &Language, source: &str) -> Option<tree_sitter::Tree> {
 }
 
 /// Visit the root and every NAMED descendant, exactly like the C# `Walk`
-/// (anonymous tokens such as punctuation carry no symbol information).
+/// (anonymous tokens such as punctuation carry no symbol information). An explicit
+/// stack, not recursion: a source nested 100 000 levels would overflow the 2 MiB
+/// thread stack (SPEC-0092 DEC-007). Children are pushed reversed so the leftmost
+/// pops next, which is the pre order of the recursive walk.
+/// Time O(n) in the nodes, space O(depth + widest fan out) on the heap.
 fn walk<'t, F: FnMut(Node<'t>)>(root: Node<'t>, visit: &mut F) {
-    visit(root);
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        walk(child, visit);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        visit(node);
+        push_named_children(node, &mut stack);
     }
+}
+
+fn push_named_children<'t>(node: Node<'t>, stack: &mut Vec<Node<'t>>) {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+    stack.extend(children.into_iter().rev());
 }
 
 /// Name of a definition node: the `name` field when the grammar has one,
@@ -223,26 +233,28 @@ fn name_of(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
     let mut found = None;
     walk_descendants(node, &mut |d| {
-        if found.is_some() {
-            return;
-        }
         if matches!(d.kind(), "identifier" | "field_identifier" | "type_identifier")
             && let Ok(text) = d.utf8_text(source)
         {
             found = Some(text.to_string());
+            return false;
         }
+        true
     });
     found
 }
 
-/// Depth first over named descendants, excluding the node itself. Order matches
-/// the C# `Descendants` iterator so "first identifier" means the same thing.
-fn walk_descendants<'t, F: FnMut(Node<'t>)>(node: Node<'t>, visit: &mut F) {
-    let mut cursor = node.walk();
-    let children: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
-    for child in children {
-        visit(child);
-        walk_descendants(child, visit);
+/// Depth first over named descendants, excluding the node itself, in the pre order of
+/// the C# `Descendants` iterator so "first identifier" means the same thing. `visit`
+/// returns `false` to stop. Time O(visited), space as [`walk`].
+fn walk_descendants<'t>(node: Node<'t>, visit: &mut impl FnMut(Node<'t>) -> bool) {
+    let mut stack = Vec::new();
+    push_named_children(node, &mut stack);
+    while let Some(next) = stack.pop() {
+        if !visit(next) {
+            return;
+        }
+        push_named_children(next, &mut stack);
     }
 }
 
@@ -675,5 +687,193 @@ mod tests {
         // build_lex_patterns panics on a bad regex, so simply forcing the lazy
         // init is the assertion
         assert_eq!(lex_patterns().len(), DEFINITION_KINDS.len());
+    }
+
+    // ── SPEC-0092 DEC-007 parity: the explicit stacks visit what the recursion visited ──
+
+    /// The recursive walks and name search of before DEC-007, kept as the oracle.
+    fn old_walk<'t, F: FnMut(Node<'t>)>(root: Node<'t>, visit: &mut F) {
+        visit(root);
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            old_walk(child, visit);
+        }
+    }
+
+    fn old_walk_descendants<'t, F: FnMut(Node<'t>)>(node: Node<'t>, visit: &mut F) {
+        let mut cursor = node.walk();
+        let children: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+        for child in children {
+            visit(child);
+            old_walk_descendants(child, visit);
+        }
+    }
+
+    fn old_name_of(node: Node<'_>, source: &[u8]) -> Option<String> {
+        if let Some(named) = node.child_by_field_name("name")
+            && let Ok(text) = named.utf8_text(source)
+        {
+            return Some(text.to_string());
+        }
+        let mut found = None;
+        old_walk_descendants(node, &mut |d| {
+            if found.is_some() {
+                return;
+            }
+            if matches!(d.kind(), "identifier" | "field_identifier" | "type_identifier")
+                && let Ok(text) = d.utf8_text(source)
+            {
+                found = Some(text.to_string());
+            }
+        });
+        found
+    }
+
+    type Visit = (&'static str, usize, usize);
+
+    fn visit_of(n: Node<'_>) -> Visit {
+        (n.kind(), n.start_byte(), n.end_byte())
+    }
+
+    fn old_definitions(
+        path: &str,
+        source: &str,
+        name: &str,
+        kind: Option<&str>,
+    ) -> Vec<Definition> {
+        let language = language_for(path).expect("a mapped language");
+        let kinds = definition_kinds(language).expect("kinds");
+        let tree = parse(&grammar(language).expect("grammar"), source).expect("a tree");
+        let mut out = Vec::new();
+        old_walk(tree.root_node(), &mut |node| {
+            let node_kind = node.kind();
+            if !kinds.contains(&node_kind) {
+                return;
+            }
+            let Some(found) = old_name_of(node, source.as_bytes()) else { return };
+            let name_ok = name.is_empty() || found == name;
+            let kind_ok = kind.is_none_or(|k| node_kind.contains(k));
+            if name_ok && kind_ok {
+                out.push(Definition {
+                    path: path.to_string(),
+                    name: found,
+                    kind: node_kind.to_string(),
+                    line: node.start_position().row + 1,
+                });
+            }
+        });
+        out
+    }
+
+    fn old_references(path: &str, source: &str, name: &str) -> Vec<Reference> {
+        let language = language_for(path).expect("a mapped language");
+        let tree = parse(&grammar(language).expect("grammar"), source).expect("a tree");
+        let mut out = Vec::new();
+        old_walk(tree.root_node(), &mut |node| {
+            if node.kind().ends_with("identifier")
+                && node.utf8_text(source.as_bytes()).ok() == Some(name)
+            {
+                out.push(Reference {
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    kind: node.kind().to_string(),
+                    line: node.start_position().row + 1,
+                });
+            }
+        });
+        out
+    }
+
+    /// Normal sources of every mapped language, then 1 000 deep nestings of each.
+    fn parity_corpus() -> Vec<(String, String)> {
+        let deep = |head: &str, tail: &str| {
+            crate::tools::nesting_testkit::deep_source(head, '(', "1", ')', 1_000, tail)
+        };
+        let mut corpus: Vec<(&str, String)> = vec![
+            ("/a.py", "class Store:\n    def put(self, k):\n        return k\n\ndef helper():\n    total = 1\n    return helper(total)\n".into()),
+            ("/a.js", "class A { m(x) { return x; } }\nfunction g(a) { const h = [a, [a]]; return h; }\n".into()),
+            ("/a.jsx", "const C = () => <div id={a}>{a}</div>;\nfunction g(a) { return a; }\n".into()),
+            ("/a.ts", "interface I { m(): void }\nclass A { m(x: number) { return x; } }\nfunction g(a: I) { return a; }\n".into()),
+            ("/a.tsx", "interface P { a: number }\nfunction C(p: P) { return <b>{p.a}</b>; }\n".into()),
+            ("/a.go", "package p\ntype T struct{ a int }\nfunc (t T) m() int { return t.a }\nfunc g(a int) int { return a }\n".into()),
+            ("/a.rs", "pub struct Volume;\nenum E { X }\ntrait T { fn t(&self); }\npub fn open(id: &str) -> Volume {\n    Volume\n}\n".into()),
+            ("/a.java", "interface I { void m(); }\nclass A implements I { public void m() { int a = 1; a++; } }\n".into()),
+            ("/a.c", "struct S { int a; };\nint f(int a) { return a; }\nstatic char *g(void) { return 0; }\n".into()),
+            ("/a.h", "int f(int a);\nstruct S { int a; };\n".into()),
+            ("/a.cpp", "class K { public: int m(int a) { return a; } };\nstruct S { int a; };\nint f(int a) { return a; }\n".into()),
+            ("/a.rb", "module M\n  class C\n    def m(a)\n      a\n    end\n  end\nend\n".into()),
+            ("/broken.rs", "fn good() {}\nfn broken(\n".into()),
+            ("/empty.py", String::new()),
+        ];
+        corpus.extend([
+            ("/n.py", deep("def f():\n    return ", "\n")),
+            (
+                "/n.js",
+                crate::tools::nesting_testkit::deep_source("const g = ", '[', "g", ']', 1_000, ";"),
+            ),
+            ("/n.ts", deep("function f(): number { return ", "; }\n")),
+            ("/n.tsx", deep("function f(): number { return ", "; }\n")),
+            ("/n.go", deep("package p\nfunc f() int { return ", " }\n")),
+            ("/n.rs", deep("fn f() -> i32 { ", " }\n")),
+            ("/n.java", deep("class A { int f() { return ", "; } }\n")),
+            ("/n.c", deep("int f(void) { return ", "; }")),
+            ("/n.cpp", deep("int f(void) { return ", "; }")),
+            ("/n.rb", deep("def f\n  ", "\nend\n")),
+        ]);
+        corpus.into_iter().map(|(p, s)| (p.to_string(), s)).collect()
+    }
+
+    #[test]
+    fn explicit_stack_walks_match_the_recursive_walks_on_every_language() {
+        let corpus = parity_corpus();
+        let mut visited = 0;
+        for (path, source) in &corpus {
+            let language = language_for(path).expect("a mapped language");
+            let tree = parse(&grammar(language).expect("grammar"), source).expect("a tree");
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            old_walk(tree.root_node(), &mut |n| old.push(visit_of(n)));
+            walk(tree.root_node(), &mut |n| new.push(visit_of(n)));
+            assert_eq!(old, new, "walk order differs on {path}");
+            visited += old.len();
+
+            // Every node's descendants, in order: what `name_of` scans.
+            let mut roots = Vec::new();
+            old_walk(tree.root_node(), &mut |n| roots.push(n));
+            for node in roots {
+                let (mut o, mut n2) = (Vec::new(), Vec::new());
+                old_walk_descendants(node, &mut |d| o.push(visit_of(d)));
+                walk_descendants_all(node, &mut |d| n2.push(visit_of(d)));
+                assert_eq!(o, n2, "descendant order differs under {} on {path}", node.kind());
+            }
+
+            for name in ["", "f", "g", "total", "helper", "a", "Store", "m", "T", "S"] {
+                assert_eq!(
+                    find_definitions(path, source, name, None),
+                    old_definitions(path, source, name, None),
+                    "definitions of {name:?} differ on {path}"
+                );
+                assert_eq!(
+                    find_definitions(path, source, name, Some("struct")),
+                    old_definitions(path, source, name, Some("struct")),
+                    "struct definitions of {name:?} differ on {path}"
+                );
+                if !name.is_empty() {
+                    assert_eq!(
+                        find_references(path, source, name),
+                        old_references(path, source, name),
+                        "references to {name:?} differ on {path}"
+                    );
+                }
+            }
+        }
+        assert!(visited > 10_000, "the corpus is too small to prove anything: {visited}");
+    }
+
+    /// The new descendants visit run to the end, like the old one.
+    fn walk_descendants_all<'t>(node: Node<'t>, visit: &mut impl FnMut(Node<'t>)) {
+        walk_descendants(node, &mut |d| {
+            visit(d);
+            true
+        });
     }
 }
