@@ -371,3 +371,75 @@ async fn e2e_0089_page_total_exactly_met_by_a_stream() {
     assert!(held <= PAGE_HELD, "the extraction held {held} decoded bytes, more than {PAGE_HELD}");
     assert!(v["preview"].as_str().unwrap().contains("Hi"), "{v}");
 }
+
+const CONTENT_HELD: u64 = 268_500_992;
+const CONTENT_MESSAGE: &str = "the extracted content exceeds 268435456 bytes";
+
+/// The content limit refusal of `doc`, the content held between the limit and
+/// [`CONTENT_HELD`] (the extraction really built up to the limit), nothing left.
+async fn content_refused(doc: &str, bytes: &[u8]) {
+    let f = office_fixture().await;
+    seed(&f, doc, bytes).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, doc, false).await;
+
+    let content = pdf_content_held(doc);
+    assert!(content <= CONTENT_HELD, "the extraction held {content} content bytes");
+    assert!(
+        content >= 268_435_456,
+        "the refusal built only {content} content bytes: {:?}",
+        v.as_ref().err()
+    );
+    let Err(e) = &v else { panic!("the extraction must be refused; it held {content} bytes") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, format!("could not extract {doc}: {CONTENT_MESSAGE}"));
+    nothing_left(&f, doc, None).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_011_one_code_mapped_to_a_long_text_sh() {
+    let _heavy = heavy().await;
+    content_refused("/docs/expand.pdf", &one_code_long_text_pdf()).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_015_content_of_exactly_the_content_limit() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/text.pdf", &expanding_pdf(240)).await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/text.pdf", false).await.expect("at the limit");
+
+    assert_eq!(pdf_content_held("/docs/text.pdf"), 268_435_456);
+    assert_eq!(v["truncated"], json!(true), "{}", v["meta"]);
+    assert!(v["preview"].as_str().unwrap().starts_with("---\n*[Page 1]*\n\neee"));
+}
+
+#[tokio::test]
+async fn e2e_0089_016_content_one_byte_over_the_content_lim() {
+    let _heavy = heavy().await;
+    content_refused("/docs/text.pdf", &expanding_pdf(241)).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_028_content_limit_on_page_1_before_a_page() {
+    let _heavy = heavy().await;
+    content_refused("/docs/order3.pdf", &expanding_then_bomb_pdf()).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_006_pdf_without_a_text_layer() {
+    let f = office_fixture().await;
+    seed(&f, "/docs/scan.pdf", &scan_pdf()).await;
+
+    let v = extract_text(&f, OWNER, "/docs/scan.pdf", false).await.expect("answered");
+
+    assert_eq!(v["preview"], json!(""), "{v}");
+    assert_eq!(v["meta"]["pages"], json!(1), "{v}");
+    assert_eq!(
+        v["note"],
+        json!("no extractable text layer (scanned PDF?); enable a multimodal OCR provider")
+    );
+}

@@ -215,7 +215,7 @@
 | US-0213 | SPEC-0089 | encrypted PDFs, cross reference, LZW and ASCII85 streams under the same limit | US-0212 | 1 | landed | story/US-0213-encrypted-pdfs-cross-reference-lzw-and-a | story/US-0212-bound-every-pdf-stream-the-text-pass-dec |
 | US-0214 | SPEC-0089 | the load total and the object limit | US-0213 | 2 | landed | story/US-0214-the-load-total-and-the-object-limit | story/US-0213-encrypted-pdfs-cross-reference-lzw-and-a |
 | US-0215 | SPEC-0089 | the page total, repeats and saved states | US-0214 | 2 | landed | story/US-0215-the-page-total-repeats-and-saved-states | story/US-0214-the-load-total-and-the-object-limit |
-| US-0216 | SPEC-0089 | the content limit for a PDF | US-0215 | 2 | todo | | |
+| US-0216 | SPEC-0089 | the content limit for a PDF | US-0215 | 2 | landed | story/US-0216-the-content-limit-for-a-pdf | story/US-0215-the-page-total-repeats-and-saved-states |
 | US-0217 | SPEC-0089 | PDF refusals in order, without trace, at both doors | US-0216 | 2 | todo | | |
 | US-0218 | SPEC-0089 | cap the converter's text answer and stop it | US-0217 | 2 | todo | | |
 | US-0219 | SPEC-0089 | diagnostic and bundle mode outputs held small | US-0218 | 2 | todo | | |

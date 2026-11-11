@@ -871,6 +871,71 @@ pub(crate) fn selected_states_pdf() -> Vec<u8> {
     )
 }
 
+/// A font whose `/ToUnicode` (object 9) maps each code of `map` to its text:
+/// every width is 0, so `PlainTextOutput` never inserts a space between two
+/// codes. Returns the font object (5) and the character map object (9).
+pub(crate) fn expanding_font(map: &[(u8, &str)]) -> Vec<(u32, PdfObj)> {
+    let utf16 = |text: &str| text.encode_utf16().map(|u| format!("{u:04X}")).collect::<String>();
+    let chars: String = map.iter().map(|(c, t)| format!("<{c:02X}> <{}>\n", utf16(t))).collect();
+    let cmap = format!(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Adobe-Identity-UCS def /CMapType 2 def 1 begincodespacerange <00> <FF> endcodespacerange {} beginbfchar\n{chars}endbfchar endcmap CMapName currentdict /CMap defineresource pop end end",
+        map.len()
+    );
+    vec![
+        (
+            5,
+            PdfObj::Body(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 1 /LastChar 3 /Widths [0 0 0] /ToUnicode 9 0 R >>"
+                    .into(),
+            ),
+        ),
+        (9, plain(&cmap)),
+    ]
+}
+
+/// A page content stream showing `<01>` `ones` times then `last` (a hex
+/// code), compressed for real (a few kilobytes).
+fn expanding_content(ones: usize, last: &str) -> PdfObj {
+    let text = format!("BT /F1 12 Tf 72 700 Td <{}{last}> Tj ET", "01".repeat(ones));
+    flate("", zlib(text.as_bytes()))
+}
+
+/// The letters `e`, `n` of them.
+fn letters(n: usize) -> String {
+    "e".repeat(n)
+}
+
+/// E2E-015 and E2E-016: one page whose text, once the marker's leading
+/// newlines are trimmed, is 16 + 268 435 200 + `last` bytes (`<02>` is mapped
+/// to `last` letters `e`): 268 435 456 with 240.
+pub(crate) fn expanding_pdf(last: usize) -> Vec<u8> {
+    let map = [(1u8, letters(256)), (2u8, letters(last))];
+    let map: Vec<(u8, &str)> = map.iter().map(|(c, t)| (*c, t.as_str())).collect();
+    page_pdf(expanding_content(1_048_575, "02"), "", expanding_font(&map))
+}
+
+/// E2E-028: page 1 as [`expanding_pdf`] one byte over, page 2 a PDF bomb stream.
+pub(crate) fn expanding_then_bomb_pdf() -> Vec<u8> {
+    let map = [(1u8, letters(256)), (2u8, letters(241))];
+    let map: Vec<(u8, &str)> = map.iter().map(|(c, t)| (*c, t.as_str())).collect();
+    let mut w = pages_writer(vec![expanding_content(1_048_575, "02"), bomb("")], "");
+    for (n, obj) in expanding_font(&map) {
+        w.object(n, obj);
+    }
+    small(w.finish())
+}
+
+/// E2E-SEC-011: `<01>` is mapped to 128 letters `é` (256 bytes), shown 2 000 000 times.
+pub(crate) fn one_code_long_text_pdf() -> Vec<u8> {
+    let long = "é".repeat(128);
+    page_pdf(expanding_content(1_999_999, "01"), "", expanding_font(&[(1, long.as_str())]))
+}
+
+/// E2E-006: one page whose content draws nothing.
+pub(crate) fn scan_pdf() -> Vec<u8> {
+    page_pdf(plain("q Q"), "", vec![])
+}
+
 /// Forget every PDF call measured on this thread.
 pub(crate) fn pdf_held_reset() {
     crate::docs::extract::PDF_HELD.with(|m| m.borrow_mut().clear());
@@ -885,7 +950,6 @@ pub(crate) fn decoded_held(path: &str) -> u64 {
 }
 
 /// Largest content buffer the extraction of `path` built, 0 when it built none.
-#[allow(dead_code)] // read by the content limit tests of US-0216
 pub(crate) fn pdf_content_held(path: &str) -> u64 {
     crate::docs::extract::PDF_HELD.with(|m| m.borrow().get(path).map_or(0, |h| h.content))
 }

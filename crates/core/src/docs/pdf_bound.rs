@@ -13,6 +13,7 @@
 //! Anything the walk does not reach is handed to the reader as its stored bytes,
 //! the way an undecodable stream is today: a missed site costs text, never the bound.
 
+use crate::docs::extract::CONTENT_LIMIT;
 use crate::errors::{Result, ToolError};
 use pdf_extract::content::{Content, Operation};
 use pdf_extract::encryption::decrypt_object;
@@ -80,10 +81,65 @@ fn over_object_limit() -> ToolError {
     ToolError::invalid_argument("the PDF holds more than 1000000 objects")
 }
 
-/// What the text pass gives back: page texts (trimmed, in order, empty pages
-/// included), the body assembled as before, and the title.
+/// Bytes a page may write past [`CONTENT_LIMIT`] before the sink refuses: room
+/// for the whitespace the page trim removes (DEC-010).
+const SINK_SLACK: u64 = 65_536;
+
+/// The refusal of FR-NEW-005, before `prepare_extraction` names the path.
+fn over_content_limit() -> ToolError {
+    ToolError::invalid_argument(format!("the extracted content exceeds {CONTENT_LIMIT} bytes"))
+}
+
+/// The one buffer the extracted content is built in. A write that would bring
+/// it past `threshold` is refused before it lands, so the content held stays
+/// under the limit plus the slack whatever one character code maps to.
+struct ContentSink {
+    buf: Vec<u8>,
+    threshold: u64,
+    tripped: bool,
+}
+
+impl std::io::Write for ContentSink {
+    fn write(&mut self, piece: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() as u64 + piece.len() as u64 > self.threshold {
+            self.tripped = true;
+            return Err(std::io::Error::other("the extracted content exceeds its limit"));
+        }
+        self.buf.extend_from_slice(piece);
+        Ok(piece.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ContentSink {
+    /// Trim the page written after `text_at` the way `str::trim` does, in place:
+    /// leading bytes drained, trailing truncated; an empty page is removed with
+    /// its marker (from `marker_at`). Returns the trimmed length. O(page bytes)
+    /// time, no extra space.
+    fn trim_page(&mut self, marker_at: usize, text_at: usize) -> Result<usize> {
+        let page = std::str::from_utf8(&self.buf[text_at..]).map_err(|_| {
+            ToolError::invalid_argument("pdf: the extracted text is not valid UTF-8")
+        })?;
+        let lead = page.len() - page.trim_start().len();
+        let end = page.trim_end().len();
+        if end == lead {
+            self.buf.truncate(marker_at);
+            return Ok(0);
+        }
+        self.buf.truncate(text_at + end);
+        self.buf.drain(text_at..text_at + lead);
+        Ok(end - lead)
+    }
+}
+
+/// What the text pass gives back: the trimmed length in bytes of each page's
+/// text (in order, empty pages included; only the page count is read, so no
+/// second copy of the text is kept), the body assembled as before, and the title.
 pub(crate) struct PdfText {
-    pub(crate) pages: Vec<String>,
+    pub(crate) pages: Vec<usize>,
     pub(crate) body: String,
     pub(crate) title: Option<String>,
 }
@@ -146,9 +202,11 @@ pub(crate) fn extract(data: &[u8]) -> Result<PdfText> {
     let originals: HashMap<ObjectId, ObjectId> = stand_ins.iter().map(|(o, s)| (*s, *o)).collect();
     defuse(&mut doc);
 
-    let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
-    let mut texts = Vec::new();
-    for (index, page_id) in pages.into_iter().enumerate() {
+    let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
+    let mut pages = Vec::new();
+    let mut sink =
+        ContentSink { buf: Vec::new(), threshold: CONTENT_LIMIT + SINK_SLACK, tripped: false };
+    for (index, page_id) in page_ids.into_iter().enumerate() {
         let n = index as u32 + 1;
         budget.page_no = n;
         let walked = walk(&doc, page_id, &originals, budget)?;
@@ -160,33 +218,43 @@ pub(crate) fn extract(data: &[u8]) -> Result<PdfText> {
                 stand_in.set_plain_content(vec![0xFF]);
             }
         }
-        let mut text = String::new();
+        // The marker goes in before the page so the page is built in place: one
+        // buffer holds the content, no second copy is made (DEC-010).
+        let marker_at = sink.buf.len();
+        sink.buf.extend_from_slice(format!("\n\n---\n*[Page {n}]*\n\n").as_bytes());
+        let text_at = sink.buf.len();
         let page = {
             let armed = Armed::new(&mut doc, walked.armed);
             pdf_extract::output_doc_page(
                 armed.doc,
-                &mut pdf_extract::PlainTextOutput::new(&mut text),
+                &mut pdf_extract::PlainTextOutput::new(&mut sink as &mut dyn std::io::Write),
                 n,
             )
         };
+        if sink.tripped {
+            budget.content = budget.content.max(sink.buf.len() as u64);
+            return Err(over_content_limit());
+        }
         // The reader's own loop stops at the first page error, the error itself
-        // dropped (`extract_text_from_mem_by_pages`).
+        // dropped (`extract_text_from_mem_by_pages`), and so does its text.
         if page.is_err() {
+            sink.buf.truncate(marker_at);
             break;
         }
-        texts.push(text);
-    }
-
-    let mut body = String::new();
-    for (i, text) in texts.iter().enumerate() {
-        if !text.trim().is_empty() {
-            body.push_str(&format!("\n\n---\n*[Page {}]*\n\n{}", i + 1, text.trim()));
+        let kept = sink.trim_page(marker_at, text_at)?;
+        pages.push(kept);
+        // The final trim drops the two newlines that open the first marker.
+        let content = (sink.buf.len() as u64).saturating_sub(2);
+        budget.content = budget.content.max(content);
+        if content > CONTENT_LIMIT {
+            return Err(over_content_limit());
         }
     }
-    let body = body.trim().to_string();
-    budget.content = body.len() as u64;
+
+    let mut body = String::from_utf8(sink.buf)
+        .map_err(|_| ToolError::invalid_argument("pdf: the extracted text is not valid UTF-8"))?;
+    body.drain(..body.len().min(2));
     let title = title(&doc);
-    let pages = texts.iter().map(|t| t.trim().to_string()).collect();
     Ok(PdfText { pages, body, title })
 }
 
