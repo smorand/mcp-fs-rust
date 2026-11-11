@@ -514,3 +514,275 @@ async fn e2e_0092_025_not_a_member_deep_source() {
     assert!(text.contains(code::FORBIDDEN), "{text}");
     assert!(text.contains("'eve@example.com' is not a member of 'atlas'"), "{text}");
 }
+
+// ── order of refusals, no trace, walk and reader in step (US-0226) ──────────
+
+/// Store `bytes` as `/docs/loop.pdf` and ask for its text as the owner.
+async fn loop_extract(f: &Fixture, doc: &str, refresh: bool) -> Result<Value> {
+    seed(f, doc, &loop_pdf()).await;
+    extract_text(f, OWNER, doc, refresh).await
+}
+
+#[tokio::test]
+async fn e2e_0092_011_up_to_date_companion_without_refresh() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/loop.pdf", &loop_pdf()).await;
+    seed(&f, "/docs/loop.md", b"kept").await;
+    let pid_before = std::process::id();
+
+    let v = extract_text(&f, OWNER, "/docs/loop.pdf", false).await.expect("the companion answers");
+
+    assert_eq!(v["cached"], true, "{v}");
+    assert_eq!(v["preview"], "kept", "{v}");
+    still_up(&f, pid_before).await;
+}
+
+#[test]
+fn e2e_0092_016_upper_case_suffix() {
+    in_child(MODULE, "e2e_0092_016_upper_case_suffix", || async {
+        let f = nesting_fixture().await;
+
+        let v = loop_extract(&f, "/docs/LOOP.PDF", false).await;
+
+        depth_refusal(&v, "/docs/LOOP.PDF");
+    });
+}
+
+#[tokio::test]
+async fn e2e_0092_018_not_a_member_self_drawing_form() {
+    use crate::mcp::server::{ExtractTextArgs, McpServer};
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::ContentBlock;
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/loop.pdf", &loop_pdf()).await;
+    let server = McpServer::new(f.state.clone(), "eve@example.com".to_string());
+    let args = ExtractTextArgs {
+        mount_id: MOUNT.into(),
+        path: "/docs/loop.pdf".into(),
+        max_chars: 200_000,
+        preview_chars: 4_000,
+        ocr: true,
+        refresh: false,
+    };
+
+    let r = server.fs_extract_text(Parameters(args)).await.expect("a tool result");
+
+    assert_eq!(r.is_error, Some(true), "{r:?}");
+    let text = r
+        .content
+        .iter()
+        .find_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .expect("a text block");
+    assert!(text.contains(code::FORBIDDEN), "{text}");
+    assert!(text.contains("'eve@example.com' is not a member of 'atlas'"), "{text}");
+    assert!(!text.contains("nested more than"), "{text}");
+}
+
+#[tokio::test]
+async fn e2e_0092_019_load_refusal_before_a_form_loop() {
+    let _heavy = heavy().await;
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/both.pdf", &both_pdf()).await;
+
+    let v = extract_text(&f, OWNER, "/docs/both.pdf", false).await;
+
+    let Err(e) = v else { panic!("the extraction must be refused") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        "could not extract /docs/both.pdf: the PDF holds more than 1000000 objects"
+    );
+}
+
+#[tokio::test]
+async fn e2e_0092_020_page_1_stream_limit_before_a_page_2_f() {
+    let _heavy = heavy().await;
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/two.pdf", &two_pages_bomb_then_loop_pdf()).await;
+
+    let v = extract_text(&f, OWNER, "/docs/two.pdf", false).await;
+
+    let Err(e) = v else { panic!("the extraction must be refused") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        "could not extract /docs/two.pdf: a PDF stream decodes to more than 104857600 bytes"
+    );
+}
+
+#[test]
+fn e2e_0092_023_refusal_repeated() {
+    in_child(MODULE, "e2e_0092_023_refusal_repeated", || async {
+        let f = nesting_fixture().await;
+        seed(&f, "/docs/loop.pdf", &loop_pdf()).await;
+
+        let first = extract_text(&f, OWNER, "/docs/loop.pdf", false).await;
+        let second = extract_text(&f, OWNER, "/docs/loop.pdf", false).await;
+
+        depth_refusal(&first, "/docs/loop.pdf");
+        depth_refusal(&second, "/docs/loop.pdf");
+        nothing_left(&f, "/docs/loop.pdf", None).await;
+    });
+}
+
+#[test]
+fn e2e_0092_024_refresh_with_an_existing_companion() {
+    in_child(MODULE, "e2e_0092_024_refresh_with_an_existing_companion", || async {
+        let f = nesting_fixture().await;
+        let pid_before = std::process::id();
+        seed(&f, "/docs/loop.pdf", &loop_pdf()).await;
+        seed(&f, "/docs/loop.md", b"kept").await;
+
+        let v = extract_text(&f, OWNER, "/docs/loop.pdf", true).await;
+
+        depth_refusal(&v, "/docs/loop.pdf");
+        nothing_left(&f, "/docs/loop.pdf", Some(b"kept")).await;
+        still_up(&f, pid_before).await;
+    });
+}
+
+/// What the operator reads for a refusal: one informational line naming the code and the
+/// reason, and no audit line. The capture records on the thread that took the lock, and the
+/// body of `in_child` is polled on the calling thread, so the lock is taken inside it.
+#[test]
+fn e2e_0092_027_operator_trail_of_a_refusal() {
+    in_child(MODULE, "e2e_0092_027_operator_trail_of_a_refusal", || async {
+        use crate::mcp::server::{ExtractTextArgs, McpServer};
+        use rmcp::handler::server::wrapper::Parameters;
+        let _capture = crate::logging::capture::lock_for_test();
+        let f = nesting_fixture().await;
+        seed(&f, "/docs/loop.pdf", &loop_pdf()).await;
+        let server = McpServer::new(f.state.clone(), OWNER.to_string());
+        let args = ExtractTextArgs {
+            mount_id: MOUNT.into(),
+            path: "/docs/loop.pdf".into(),
+            max_chars: 200_000,
+            preview_chars: 4_000,
+            ocr: true,
+            refresh: false,
+        };
+        crate::logging::capture::clear();
+
+        let out = server.fs_extract_text(Parameters(args)).await.expect("a tool result");
+
+        assert_eq!(out.is_error, Some(true), "{out:?}");
+        let events = crate::logging::capture::events();
+        let level = |e: &crate::logging::capture::CapturedEvent| e.fields["level"].clone();
+        let message = |e: &crate::logging::capture::CapturedEvent| e.fields["message"].clone();
+        let info: Vec<_> = events
+            .iter()
+            .filter(|e| level(e) == "INFO" && message(e).contains("ERR_INVALID_ARGUMENT"))
+            .collect();
+        assert_eq!(info.len(), 1, "{events:?}");
+        assert!(
+            message(info[0]).contains(
+                "could not extract /docs/loop.pdf: page 1 draws PDF forms nested more than 64 deep"
+            ),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| level(e) == "ERROR"), "{events:?}");
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        assert!(!log.iter().any(|e| e.path.contains("loop")), "{log:?}");
+    });
+}
+
+#[test]
+fn e2e_0092_028_two_attacks_and_a_normal_extraction_a() {
+    in_child(MODULE, "e2e_0092_028_two_attacks_and_a_normal_extraction_a", || async {
+        let f = nesting_fixture().await;
+        let pid_before = std::process::id();
+        seed(&f, "/docs/loop.pdf", &loop_pdf()).await;
+        seed(&f, "/docs/pair.pdf", &pair_pdf()).await;
+        seed(&f, "/docs/forms.pdf", &forms_pdf()).await;
+
+        let (a, b, c) = tokio::join!(
+            extract_text(&f, OWNER, "/docs/loop.pdf", false),
+            extract_text(&f, OWNER, "/docs/pair.pdf", false),
+            extract_text(&f, OWNER, "/docs/forms.pdf", false),
+        );
+
+        depth_refusal(&a, "/docs/loop.pdf");
+        depth_refusal(&b, "/docs/pair.pdf");
+        let c = c.expect("the ordinary document extracts");
+        assert!(c["preview"].as_str().unwrap().contains("Deep text"), "{c}");
+        still_up(&f, pid_before).await;
+    });
+}
+
+// ── walk and reader parity at each stop of the walk (DEC-013) ───────────────
+
+/// The child extracts `/docs/parity.pdf` and must get the reader's contained failure: the
+/// reader panics at the defect, so a walk that went on to the self drawing form would
+/// answer the form depth message instead.
+async fn parity(bytes: Vec<u8>) {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/parity.pdf", &bytes).await;
+
+    let v = extract_text(&f, OWNER, "/docs/parity.pdf", false).await;
+
+    let Err(e) = v else { panic!("the extraction must fail: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(e.message, "could not extract /docs/parity.pdf: pdf parser failed on this document");
+}
+
+#[test]
+fn parity_tf_without_name() {
+    in_child(MODULE, "parity_tf_without_name", || parity(parity_pdf("12 Tf", PARITY_A, vec![])));
+}
+
+#[test]
+fn parity_tf_missing_font() {
+    in_child(MODULE, "parity_tf_missing_font", || {
+        parity(parity_pdf("/F9 12 Tf", PARITY_A, vec![]))
+    });
+}
+
+#[test]
+fn parity_cs_without_name() {
+    in_child(MODULE, "parity_cs_without_name", || parity(parity_pdf("cs", PARITY_A, vec![])));
+}
+
+#[test]
+fn parity_cs_missing_space() {
+    in_child(MODULE, "parity_cs_missing_space", || parity(parity_pdf("/CS9 cs", PARITY_A, vec![])));
+}
+
+#[test]
+fn parity_do_without_name() {
+    in_child(MODULE, "parity_do_without_name", || parity(parity_pdf("Do", PARITY_A, vec![])));
+}
+
+#[test]
+fn parity_do_missing_xobject() {
+    in_child(MODULE, "parity_do_missing_xobject", || {
+        parity(parity_pdf("/X9 Do", PARITY_A, vec![]))
+    });
+}
+
+#[test]
+fn parity_do_not_a_stream() {
+    in_child(MODULE, "parity_do_not_a_stream", || {
+        parity(parity_pdf(
+            "/N Do",
+            "/XObject << /A 10 0 R /N 12 0 R >>",
+            vec![(12, PdfObj::Body("<< /Type /XObject /Subtype /Form >>".to_string()))],
+        ))
+    });
+}
+
+/// The story names `(unclosed` as the unparsable content, but the content parser reads it
+/// leniently (it decodes), so the walk never stops there; `BI ID`, an inline image with no
+/// data, is the smallest content `Content::decode` refuses.
+#[test]
+fn parity_do_unparsable_form() {
+    in_child(MODULE, "parity_do_unparsable_form", || {
+        parity(parity_pdf(
+            "/G Do",
+            "/XObject << /A 10 0 R /G 13 0 R >>",
+            vec![(13, form(Some(""), "BI ID"))],
+        ))
+    });
+}

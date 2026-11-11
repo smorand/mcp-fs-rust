@@ -435,3 +435,20 @@ existing `log_tool_failure` wiring, no new call). Test only measurement hook: th
 `PDF_HELD` in `docs/extract.rs`, keyed by path (so three joined calls keep three figures; a cached call
 leaves no entry), read through `decoded_held` and `pdf_content_held` in `tools/pdf_testkit.rs`; tests
 are in `tools/pdf_bound_e2e.rs` and `api/dataplane.rs` (filter `e2e_0089_`, take `heavy()` first).
+
+### Nesting refusals (SPEC-0092, 2026-11-11)
+
+The walk of `docs/pdf_bound.rs` also refuses three nestings that would overflow the reader's stack,
+each as `ERR_INVALID_ARGUMENT` before the reader runs: forms drawn more than 64 deep (`page <N> draws
+PDF forms nested more than 64 deep`, a self drawing form included), a page tree climb past 256 page
+groups for `Resources` or `MediaBox`, and a character map or code map nested more than 64 levels. They
+come in the order of the page walk: the load first (SPEC-0089 limits), then per page the climb, then
+each decode and draw in drawing order (a draw checks the form depth before its stream is measured; a map
+is scanned after its stream limit). Membership and a cached companion still come first. A refusal leaves
+no companion change (a stored companion is kept byte for byte on refresh), artifact, charge or audit
+line, and logs one INFO line. The walk stops where the reader would panic (a `Tf`, `cs` or `Do` with no
+name or no entry in the resources, a `Do` on a non stream, a form whose content does not parse) and the
+reader then fails, contained, as `pdf parser failed on this document`; eight child process parity tests
+pin each stop. The code search scan (`docs/symbols.rs`) uses an explicit stack, so a deeply nested source
+is searched, never refused. Tests: `tools/nesting_e2e.rs` (filter `e2e_0092_`, `parity_`), builders in
+`tools/nesting_testkit.rs`; each case that could abort runs in a child process (`in_child`).

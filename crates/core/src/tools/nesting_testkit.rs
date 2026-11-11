@@ -190,15 +190,49 @@ fn chain_writer(forms: u32, last: PdfObj) -> crate::tools::pdf_testkit::PdfWrite
     w
 }
 
-/// E2E-SEC-001: object 10 draws itself through its own resources.
-pub(crate) fn loop_pdf() -> Vec<u8> {
+/// The objects of E2E-SEC-001: object 10 draws itself through its own resources.
+fn loop_writer() -> crate::tools::pdf_testkit::PdfWriter {
     let mut w = pages_writer(
         vec![plain("BT /F1 12 Tf 72 700 Td (Hello) Tj ET /A Do")],
         "/XObject << /A 10 0 R >>",
     );
     w.object(10, form(Some("/XObject << /A 10 0 R >>"), "/A Do"));
+    w
+}
+
+/// E2E-SEC-001: object 10 draws itself through its own resources.
+pub(crate) fn loop_pdf() -> Vec<u8> {
+    loop_writer().finish()
+}
+
+/// E2E-019: [`loop_pdf`] plus an object stream (number 20) of 2 000 000 pairs `1 0` over one
+/// `null`, stored in under 1 000 000 bytes: the load refuses it before any page is walked.
+pub(crate) fn both_pdf() -> Vec<u8> {
+    let mut w = loop_writer();
+    w.object_stream_pairs(20, (1, 0), 2_000_000, "null");
+    crate::tools::pdf_testkit::small(w.finish())
+}
+
+/// E2E-020: page 1 is a PDF bomb stream, page 2 draws the self drawing form (object 10).
+pub(crate) fn two_pages_bomb_then_loop_pdf() -> Vec<u8> {
+    let mut w = pages_writer(vec![bomb(""), plain("/A Do")], "/XObject << /A 10 0 R >>");
+    w.object(10, form(Some("/XObject << /A 10 0 R >>"), "/A Do"));
+    crate::tools::pdf_testkit::small(w.finish())
+}
+
+/// DEC-013: the page content is `defect` then `/A Do` (the self drawing form, object 10);
+/// `resources` is the page's extra resource entries, `extra` the objects the defect needs.
+pub(crate) fn parity_pdf(defect: &str, resources: &str, extra: Vec<(u32, PdfObj)>) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain(&format!("{defect} /A Do"))], resources);
+    w.object(10, form(Some("/XObject << /A 10 0 R >>"), "/A Do"));
+    for (n, obj) in extra {
+        w.object(n, obj);
+    }
     w.finish()
 }
+
+/// The page resources of every parity document that needs no more than `/A`.
+pub(crate) const PARITY_A: &str = "/XObject << /A 10 0 R >>";
 
 /// E2E-SEC-002: as [`loop_pdf`] but the form has no resources and takes the page's.
 pub(crate) fn inherit_pdf() -> Vec<u8> {
