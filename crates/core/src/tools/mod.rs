@@ -53,6 +53,8 @@ pub mod catalog;
 pub mod context7;
 #[cfg(test)]
 pub(crate) mod contract_golden;
+#[cfg(test)]
+mod converter_bound_e2e;
 pub mod db;
 pub(crate) mod diff_files;
 #[cfg(test)]

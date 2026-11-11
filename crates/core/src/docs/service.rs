@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 /// The extensions the service accepts unless `doc_service.extensions` narrows it.
 ///
@@ -179,6 +179,95 @@ fn resolve_extensions(configured: &[String]) -> Vec<String> {
     }
 }
 
+/// How many bytes one read from the converter's pipe asks for, and so the most
+/// a capped read holds beyond its limit.
+const CHUNK: usize = 65_536;
+
+/// Why a capped read stopped before the end of the stream.
+enum Capped {
+    /// The stream is longer than the limit.
+    Over,
+    Io(std::io::Error),
+}
+
+/// Everything `reader` yields, refusing a stream longer than `cap` bytes.
+///
+/// A read that would bring the buffer past `cap` returns [`Capped::Over`] with
+/// the buffer left as it was, so at most `cap` plus one chunk is ever held.
+/// `peak` receives that high water mark (buffer plus the chunk just read), which
+/// the test hook reports. Time O(n) in the bytes read, at most `cap` plus one
+/// chunk; space O(cap + CHUNK).
+async fn read_capped_async(
+    mut reader: impl AsyncRead + Unpin,
+    cap: u64,
+    peak: &mut u64,
+) -> std::result::Result<Vec<u8>, Capped> {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await.map_err(Capped::Io)?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        *peak = (*peak).max((buf.len() + n) as u64);
+        if (buf.len() + n) as u64 > cap {
+            return Err(Capped::Over);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// The refusal of a converter answer or bundle over the converter limit.
+fn over_cap(cap: u64) -> ToolError {
+    ToolError::internal(format!(
+        "document service output is over the doc_service.max_input_bytes limit of {cap}"
+    ))
+}
+
+/// What one conversion held of the converter's output (SPEC-0089 DEC-017),
+/// read by the exploit tests as the second channel for the memory bound.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConverterHeld {
+    pub(crate) answer: u64,
+    pub(crate) diagnostic: u64,
+    pub(crate) bundle_stdout: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One record per `convert` call on this thread, pushed on every outcome.
+    pub(crate) static CONVERTER_HELD: std::cell::RefCell<Vec<ConverterHeld>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pushes its record when the call ends, whichever way it ends.
+#[cfg(test)]
+#[derive(Default)]
+struct HeldRecord(ConverterHeld);
+
+#[cfg(test)]
+impl std::ops::Deref for HeldRecord {
+    type Target = ConverterHeld;
+    fn deref(&self) -> &ConverterHeld {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for HeldRecord {
+    fn deref_mut(&mut self) -> &mut ConverterHeld {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeldRecord {
+    fn drop(&mut self) {
+        CONVERTER_HELD.with(|v| v.borrow_mut().push(self.0));
+    }
+}
+
 /// A converter run as a child process in a per call temporary directory.
 pub struct CliDocService {
     config: DocServiceCliConfig,
@@ -251,6 +340,8 @@ impl DocService for CliDocService {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        #[cfg(test)]
+        let mut held = HeldRecord::default();
         let mut child = command.spawn().map_err(|e| {
             ToolError::internal(format!("document service: cannot start '{program}': {e}"))
         })?;
@@ -265,24 +356,47 @@ impl DocService for CliDocService {
 
         // The pipes are drained concurrently with the wait: a converter that fills
         // its stderr buffer would otherwise block forever on a write nobody reads.
+        // Text mode reads the answer under the converter limit, and `try_join!`
+        // returns the moment that read says `Over`, so a converter still writing
+        // is stopped below instead of being waited for (SPEC-0089 DEC-015).
+        let text_mode = outdir.is_none();
+        let cap = self.max_input_bytes;
+        let mut peak = 0u64;
+        let mut stderr = Vec::new();
         let waited = tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), async {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let (read_out, read_err) = tokio::join!(
-                child_stdout.read_to_end(&mut out),
-                child_stderr.read_to_end(&mut err)
-            );
-            read_out?;
-            read_err?;
-            let status = child.wait().await?;
-            Ok::<_, std::io::Error>((status, out, err))
+            let read_out = async {
+                if text_mode {
+                    read_capped_async(&mut child_stdout, cap, &mut peak).await
+                } else {
+                    let mut out = Vec::new();
+                    child_stdout.read_to_end(&mut out).await.map_err(Capped::Io)?;
+                    Ok(out)
+                }
+            };
+            let read_err =
+                async { child_stderr.read_to_end(&mut stderr).await.map_err(Capped::Io) };
+            let (stdout, _) = tokio::try_join!(read_out, read_err)?;
+            let status = child.wait().await.map_err(Capped::Io)?;
+            Ok::<_, Capped>((status, stdout))
         })
         .await;
+        #[cfg(test)]
+        {
+            held.answer = peak;
+            held.diagnostic = stderr.len() as u64;
+        }
 
-        let (status, stdout, stderr) = match waited {
-            Ok(Ok(triple)) => triple,
-            Ok(Err(e)) => {
+        let (status, stdout) = match waited {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(Capped::Io(e))) => {
                 return Err(ToolError::internal(format!("document service I/O error: {e}")));
+            }
+            Ok(Err(Capped::Over)) => {
+                // Same order as the timeout: kill and reap BEFORE `dir` is dropped at
+                // the return below, so the converter is not left flooding a pipe
+                // nobody reads or writing into a directory being deleted.
+                let _ = child.kill().await;
+                return Err(over_cap(cap));
             }
             Err(_) => {
                 // Rule 7: kill and reap BEFORE `dir` is dropped at the return below,
@@ -512,17 +626,13 @@ fn read_bundle_blocking(out: &std::path::Path, cap: u64) -> Result<Conversion> {
             // never pulled into memory.
             let len = entry.metadata().map_err(io)?.len();
             if len > cap - total {
-                return Err(ToolError::internal(format!(
-                    "document service output is over the doc_service.max_input_bytes limit of {cap}"
-                )));
+                return Err(over_cap(cap));
             }
             let bytes = std::fs::read(&path).map_err(io)?;
             // The file may have grown since its length was taken.
             total += bytes.len() as u64;
             if total > cap {
-                return Err(ToolError::internal(format!(
-                    "document service output is over the doc_service.max_input_bytes limit of {cap}"
-                )));
+                return Err(over_cap(cap));
             }
             files.insert(key.join("/"), bytes);
         }
@@ -573,9 +683,7 @@ fn parse_api_bundle(body: &str, cap: u64) -> Result<Conversion> {
             })?;
         total += bytes.len() as u64;
         if total > cap {
-            return Err(ToolError::internal(format!(
-                "document service output is over the doc_service.max_input_bytes limit of {cap}"
-            )));
+            return Err(over_cap(cap));
         }
         files.insert(key, bytes);
     }

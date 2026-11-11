@@ -217,7 +217,7 @@
 | US-0215 | SPEC-0089 | the page total, repeats and saved states | US-0214 | 2 | landed | story/US-0215-the-page-total-repeats-and-saved-states | story/US-0214-the-load-total-and-the-object-limit |
 | US-0216 | SPEC-0089 | the content limit for a PDF | US-0215 | 2 | landed | story/US-0216-the-content-limit-for-a-pdf | story/US-0215-the-page-total-repeats-and-saved-states |
 | US-0217 | SPEC-0089 | PDF refusals in order, without trace, at both doors | US-0216 | 2 | landed | story/US-0217-pdf-refusals-in-order-without-trace-at-b | story/US-0216-the-content-limit-for-a-pdf |
-| US-0218 | SPEC-0089 | cap the converter's text answer and stop it | US-0217 | 2 | todo | | |
+| US-0218 | SPEC-0089 | cap the converter's text answer and stop it | US-0217 | 2 | landed | story/US-0218-cap-the-converter-s-text-answer-and-stop | story/US-0217-pdf-refusals-in-order-without-trace-at-b |
 | US-0219 | SPEC-0089 | diagnostic and bundle mode outputs held small | US-0218 | 2 | todo | | |
 | US-0220 | SPEC-0089 | cap the web converter's answer | US-0219 | 2 | todo | | |
 | US-0221 | SPEC-0089 | converter refusals through the HTTP door and documentation | US-0220 | 2 | todo | | |
