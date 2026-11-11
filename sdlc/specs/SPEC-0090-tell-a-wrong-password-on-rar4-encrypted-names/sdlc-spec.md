@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 module (archive extraction, RAR version 4 with encrypted file names only), 10 requirements (8 new, 2 modified), public behavior change (a wrong password, today refused as a cut or damaged archive, is refused as a wrong password), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-11
 > Project: existing
 > From backlog: BL-0136

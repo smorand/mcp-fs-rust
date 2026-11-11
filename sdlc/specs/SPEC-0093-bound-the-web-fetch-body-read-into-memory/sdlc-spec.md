@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 3 bounded contexts (web lookup, library documentation lookup, project storage), 10 requirements, public behavior change on two optional tool families (an answer past a limit is refused instead of being read whole), no persisted change. Override with --depth.
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-11
 > Project: existing
 > From backlog: BL-0148
