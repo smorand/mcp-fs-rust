@@ -1440,10 +1440,14 @@ struct Drawing<'d> {
     ops: Rc<Vec<Operation>>,
     at: usize,
     resources: &'d Dictionary,
-    form: Option<ObjectId>,
     /// Decoded size of the form, 0 for the page content.
     size: u64,
 }
+
+/// Deepest chain of forms the reader is allowed to recurse through; the page
+/// content is level 0. Measured: 200 nested forms still run on a 2 MiB stack,
+/// about 400 abort the process (SPEC-0092 DEC-002).
+pub(crate) const FORM_DEPTH_LIMIT: usize = 64;
 
 /// Walk page `page_id` the way pdf-extract will run it (DEC-007), measuring
 /// every stream it may decode in drawing order; returns the streams to arm.
@@ -1487,8 +1491,7 @@ fn walk(
     let mut fonts: HashSet<Vec<u8>> = HashSet::new();
     // Decoded size of the forms on the stack, whose operations are held.
     let mut retained = 0u64;
-    let mut stack =
-        vec![Drawing { ops: Rc::new(parsed.operations), at: 0, resources, form: None, size: 0 }];
+    let mut stack = vec![Drawing { ops: Rc::new(parsed.operations), at: 0, resources, size: 0 }];
     while let Some(top) = stack.last_mut() {
         // A shared handle, so an operation is borrowed in place, never copied.
         let ops = Rc::clone(&top.ops);
@@ -1546,10 +1549,17 @@ fn walk(
                 else {
                     break;
                 };
-                let size = page.decode(id, budget)?;
-                if stack.iter().any(|d| d.form == Some(id)) {
-                    continue;
+                // The stack is the reader's recursion (one `process_stream` per level),
+                // so its length is the depth of the form about to be drawn. Refused
+                // before the form is measured, and a self draw is walked, not skipped:
+                // it reaches the limit like any chain (SPEC-0092 DEC-003).
+                if stack.len() > FORM_DEPTH_LIMIT {
+                    return Err(ToolError::invalid_argument(format!(
+                        "page {} draws PDF forms nested more than {FORM_DEPTH_LIMIT} deep",
+                        budget.page_no
+                    )));
                 }
+                let size = page.decode(id, budget)?;
                 let Ok(Object::Stream(xobject)) = doc.get_object(id) else { break };
                 let inner = dict_at(doc, &xobject.dict, b"Resources").unwrap_or(resources);
                 budget.hold(size);
@@ -1561,7 +1571,7 @@ fn walk(
                 #[cfg(test)]
                 FORMS_PEAK.with(|c| c.set(c.get().max(retained)));
                 let ops = Rc::new(parsed.operations);
-                stack.push(Drawing { ops, at: 0, resources: inner, form: Some(id), size });
+                stack.push(Drawing { ops, at: 0, resources: inner, size });
             }
             _ => {}
         }

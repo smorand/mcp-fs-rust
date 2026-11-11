@@ -81,6 +81,10 @@ pub(crate) mod listing;
 #[cfg(test)]
 pub(crate) mod metadata;
 #[cfg(test)]
+mod nesting_e2e;
+#[cfg(test)]
+pub(crate) mod nesting_testkit;
+#[cfg(test)]
 mod office_bound_e2e;
 #[cfg(test)]
 mod pdf_bound_e2e;

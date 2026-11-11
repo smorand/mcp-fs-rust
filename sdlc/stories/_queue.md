@@ -221,7 +221,7 @@
 | US-0219 | SPEC-0089 | diagnostic and bundle mode outputs held small | US-0218 | 2 | landed | story/US-0219-diagnostic-and-bundle-mode-outputs-held | story/US-0218-cap-the-converter-s-text-answer-and-stop |
 | US-0220 | SPEC-0089 | cap the web converter's answer | US-0219 | 2 | landed | story/US-0220-cap-the-web-converter-s-answer | story/US-0219-diagnostic-and-bundle-mode-outputs-held |
 | US-0221 | SPEC-0089 | converter refusals through the HTTP door and documentation | US-0220 | 2 | landed | story/US-0221-converter-refusals-through-the-http-door | story/US-0220-cap-the-web-converter-s-answer |
-| US-0222 | SPEC-0092 | refuse PDF forms nested past 64, loops included | US-0221 | 2 | todo | | |
+| US-0222 | SPEC-0092 | refuse PDF forms nested past 64, loops included | US-0221 | 2 | landed | story/US-0222-refuse-pdf-forms-nested-past-64-loops-in | main |
 | US-0223 | SPEC-0092 | refuse a page tree climb past 256 levels | US-0222 | 2 | todo | | |
 | US-0224 | SPEC-0092 | refuse character and code maps nested past 64 | US-0223 | 2 | todo | | |
 | US-0225 | SPEC-0092 | code search answers source of any nesting | US-0224 | 2 | todo | | |
