@@ -217,6 +217,37 @@ async fn read_capped_async(
     }
 }
 
+/// The body of `response` read chunk by chunk, and whether it is longer than
+/// `cap` bytes.
+///
+/// A chunk that would bring the buffer past `cap` is not appended and ends the
+/// read, so at most `cap` plus one chunk is ever held; the bytes read before it
+/// are returned either way, because a failure status quotes the head of them. A
+/// transport error mid body yields an empty body, as `text().await.unwrap_or_default()`
+/// did. `peak` receives the high water mark (buffer plus the chunk just read)
+/// for the test hook. Time O(n) in the bytes read, at most `cap` plus one chunk;
+/// space O(cap + chunk).
+async fn read_body_capped(
+    response: &mut reqwest::Response,
+    cap: u64,
+    peak: &mut u64,
+) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                *peak = (*peak).max(buf.len() as u64 + chunk.len() as u64);
+                if buf.len() as u64 + chunk.len() as u64 > cap {
+                    return (buf, true);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => return (buf, false),
+            Err(_) => return (Vec::new(), false),
+        }
+    }
+}
+
 /// The last [`STDERR_CAP`] bytes `reader` yields, the part a failure quotes.
 ///
 /// Each chunk is appended and the buffer then cut back to its tail, so at most
@@ -511,6 +542,8 @@ impl ApiDocService {
 impl DocService for ApiDocService {
     #[tracing::instrument(skip(self, bytes), fields(doc.mode = "api", doc.file = file_name))]
     async fn convert(&self, bytes: &[u8], file_name: &str) -> Result<Conversion> {
+        #[cfg(test)]
+        let mut held = HeldRecord::default();
         let mime = crate::docs::mime::guess(file_name).unwrap_or("application/octet-stream");
         let part = reqwest::multipart::Part::bytes(bytes.to_vec())
             .file_name(file_name.to_string())
@@ -542,13 +575,29 @@ impl DocService for ApiDocService {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim_start().starts_with("application/json"));
-        let body = response.text().await.unwrap_or_default();
+        let mut response = response;
+        let mut peak = 0u64;
+        let (raw, over) = read_body_capped(&mut response, self.max_input_bytes, &mut peak).await;
+        // Dropping the response closes the connection, so a server still sending
+        // is cut off instead of being waited for (SPEC-0089 DEC-016).
+        drop(response);
+        #[cfg(test)]
+        {
+            held.answer = peak
+        }
+        // reqwest is built without its `charset` feature, so its `text()` was a
+        // lossy UTF-8 decode; this is the same text without a copy when valid.
+        let body = String::from_utf8(raw)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         if !status.is_success() {
             return Err(ToolError::internal(format!(
                 "document service returned HTTP {}: {}",
                 status.as_u16(),
                 head_of(&body, BODY_CAP)
             )));
+        }
+        if over {
+            return Err(over_cap(self.max_input_bytes));
         }
 
         // A configured `response_field` keeps its meaning; otherwise a JSON

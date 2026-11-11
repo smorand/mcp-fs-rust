@@ -7,7 +7,9 @@
 //! the audit trail and a following 52 428 800 byte write. Every flood test
 //! takes `heavy()` first: before the fix the answer is read whole.
 
-use crate::docs::service::{CONVERTER_HELD, CliDocService, ConverterHeld};
+use crate::docs::service::{
+    ApiDocService, CONVERTER_HELD, CliDocService, ConverterHeld, DocService,
+};
 use crate::errors::{Result, code};
 use crate::tools::admin::test_support::Fixture;
 use crate::tools::archive_testkit::*;
@@ -110,7 +112,7 @@ async fn converter_fixture() -> Fixture {
 /// Authorizes then converts, as both doors do.
 async fn ask(
     f: &Fixture,
-    svc: &CliDocService,
+    svc: &dyn DocService,
     person: &str,
     path: &str,
     overwrite: bool,
@@ -558,5 +560,194 @@ async fn e2e_0089_038_bundle_one_byte_over_the_converter_li() {
     let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await;
 
     refused(&v, OVER);
+    clean(&f, "/docs/deck.pptx").await;
+}
+
+/// Bytes of the letter in each chunk the web stand in streams.
+const WEB_CHUNK: usize = 65_536;
+/// The payload of the flood tests: 1 073 741 824 bytes.
+const GIB: u64 = 1_073_741_824;
+
+/// A web stand in converter on `POST /convert`: status `status`, content type
+/// `content_type`, and a body of `prefix`, then `n` times `letter`, then
+/// `suffix`, streamed in 65 536 byte chunks. `sent` is the second channel: the
+/// bytes the server pulled from its own stream, so it stops growing when the
+/// client closes the connection (the stream is then no longer polled).
+async fn web(
+    status: u16,
+    content_type: &'static str,
+    prefix: &'static str,
+    letter: u8,
+    n: u64,
+    suffix: &'static str,
+) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Response, StatusCode, header::CONTENT_TYPE};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let sent = Arc::new(AtomicU64::new(0));
+    let counter = sent.clone();
+    let handler = move || {
+        let counter = counter.clone();
+        async move {
+            let full = Bytes::from(vec![letter; WEB_CHUNK]);
+            // (stage, letters left): 0 prefix, 1 letters, 2 suffix, 3 done.
+            let stream = futures::stream::unfold((0u8, n), move |(stage, left)| {
+                let counter = counter.clone();
+                let full = full.clone();
+                async move {
+                    let (chunk, next) = match stage {
+                        0 => (Bytes::from_static(prefix.as_bytes()), (1, left)),
+                        1 if left > 0 => {
+                            let take = left.min(WEB_CHUNK as u64) as usize;
+                            (full.slice(..take), (1, left - take as u64))
+                        }
+                        1 => (Bytes::from_static(suffix.as_bytes()), (3, 0)),
+                        _ => return None,
+                    };
+                    counter.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                    Some((Ok::<_, std::convert::Infallible>(chunk), next))
+                }
+            });
+            let mut response = Response::new(Body::from_stream(stream));
+            *response.status_mut() = StatusCode::from_u16(status).unwrap();
+            response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            response
+        }
+    };
+    let app = axum::Router::new().route("/convert", axum::routing::post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/convert"), sent)
+}
+
+/// A real `ApiDocService` on `url` with the converter limit [`CAP`].
+fn api(url: String) -> ApiDocService {
+    ApiDocService::new(
+        &crate::config::DocServiceApiConfig { url, timeout_secs: 600, ..Default::default() },
+        vec![".pptx".into(), ".docx".into()],
+        CAP,
+    )
+    .unwrap()
+}
+
+fn sent_of(sent: &Arc<std::sync::atomic::AtomicU64>) -> u64 {
+    sent.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_015_web_answer_flood() {
+    let _heavy = heavy().await;
+    let f = converter_fixture().await;
+    seed(&f, "/docs/bomb.docx", b"PK").await;
+    let (url, sent) = web(200, "text/markdown", "", b'a', GIB, "").await;
+    let svc = api(url);
+    held_reset();
+
+    let v = ask(&f, &svc, OWNER, "/docs/bomb.docx", false).await;
+
+    let held = answer_held();
+    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    assert!(
+        sent_of(&sent) < GIB,
+        "the server sent {} bytes: the body was read whole",
+        sent_of(&sent)
+    );
+    refused(&v, OVER);
+    clean(&f, "/docs/bomb.docx").await;
+}
+
+#[tokio::test]
+async fn e2e_0089_sec_016_web_bundle_answer_flood() {
+    let _heavy = heavy().await;
+    let f = converter_fixture().await;
+    seed(&f, "/docs/bomb.docx", b"PK").await;
+    let (url, sent) = web(200, "application/json", "{\"markdown\":\"", b'a', GIB, "\"}").await;
+    let svc = api(url);
+    held_reset();
+
+    let v = ask(&f, &svc, OWNER, "/docs/bomb.docx", false).await;
+
+    let held = answer_held();
+    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    assert!(
+        sent_of(&sent) < GIB,
+        "the server sent {} bytes: the body was read whole",
+        sent_of(&sent)
+    );
+    refused(&v, OVER);
+    clean(&f, "/docs/bomb.docx").await;
+}
+
+#[tokio::test]
+async fn e2e_0089_005_web_endpoint_conversion_within_the_li() {
+    let f = converter_fixture().await;
+    let (url, _sent) = web(200, "application/json", "{\"markdown\":\"# Deck\"}", b'x', 0, "").await;
+    let svc = api(url);
+
+    let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await.unwrap();
+
+    assert_eq!(v["md_path"], json!("/docs/deck.md"));
+    assert_eq!(v["bytes_written"], json!(6), "{v}");
+    assert_eq!(read(&f, "/docs/deck.md").await.as_deref(), Some(b"# Deck".as_slice()));
+}
+
+#[tokio::test]
+async fn e2e_0089_035_web_answer_of_exactly_the_converter_l() {
+    let f = converter_fixture().await;
+    let (url, _sent) = web(200, "text/markdown", "#", b'd', CAP - 1, "").await;
+    let svc = api(url);
+
+    ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await.unwrap();
+
+    let md = read(&f, "/docs/deck.md").await.unwrap();
+    assert_eq!(md.len() as u64, CAP);
+}
+
+#[tokio::test]
+async fn e2e_0089_036_web_answer_one_byte_over_the_converte() {
+    let f = converter_fixture().await;
+    let (url, _sent) = web(200, "text/markdown", "#", b'd', CAP, "").await;
+    let svc = api(url);
+    held_reset();
+
+    let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await;
+
+    let held = answer_held();
+    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    refused(&v, OVER);
+    clean(&f, "/docs/deck.pptx").await;
+}
+
+#[tokio::test]
+async fn e2e_0089_043_web_failure_status_with_a_huge_body() {
+    let _heavy = heavy().await;
+    let f = converter_fixture().await;
+    let (url, sent) = web(500, "text/plain", "upstream broke", b'x', GIB, "").await;
+    let svc = api(url);
+    held_reset();
+
+    let v = ask(&f, &svc, OWNER, "/docs/deck.pptx", false).await;
+
+    let Err(e) = &v else { panic!("the conversion must be refused: {v:?}") };
+    assert_eq!(e.code, code::INTERNAL_ERROR, "{e:?}");
+    assert!(
+        e.message.starts_with("document service returned HTTP 500: upstream broke"),
+        "{}",
+        e.message
+    );
+    let quoted = e.message.strip_prefix("document service returned HTTP 500: ").unwrap();
+    assert!(quoted.chars().count() <= 2_048, "{} characters quoted", quoted.chars().count());
+    let held = answer_held();
+    assert!(held <= HELD_MAX, "the answer held {held} bytes, more than {HELD_MAX}");
+    assert!(
+        sent_of(&sent) < GIB,
+        "the server sent {} bytes: the body was read whole",
+        sent_of(&sent)
+    );
     clean(&f, "/docs/deck.pptx").await;
 }
