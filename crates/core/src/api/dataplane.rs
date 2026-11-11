@@ -4089,6 +4089,69 @@ mod tests {
         assert_eq!(lines[0].path, "/docs/report.md");
     }
 
+    /// SPEC-0092/E2E-002: three nested forms are answered through the REST door
+    /// as through the tool, with one extraction audit line for the companion.
+    #[tokio::test]
+    async fn e2e_0092_002_nested_forms_through_the_http_api() {
+        use crate::tools::nesting_testkit::forms_pdf;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/forms.pdf", &forms_pdf()).await.unwrap();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/forms.pdf"})).await;
+
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["md_path"], "/docs/forms.md", "{v}");
+        assert_eq!(v["format"], "pdf", "{v}");
+        assert_eq!(v["cached"], false, "{v}");
+        assert_eq!(v["meta"]["pages"], 1, "{v}");
+        let preview = v["preview"].as_str().unwrap_or_default();
+        assert!(preview.contains("*[Page 1]*") && preview.contains("Deep text"), "{v}");
+        let lines: Vec<_> = h
+            .state
+            .safety
+            .audit(OWNER, MOUNT)
+            .into_iter()
+            .filter(|e| e.op == "extract_text")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].path, "/docs/forms.md");
+    }
+
+    /// SPEC-0092/E2E-015: a form that draws itself is refused through the REST
+    /// door with the tool's code and message, nothing is left, the process lives.
+    /// In a child: on code without the bound the walk overflows the stack.
+    #[test]
+    fn e2e_0092_015_self_drawing_form_through_the_http_ap() {
+        use crate::tools::nesting_testkit::{in_child, loop_pdf};
+        in_child(
+            "api::dataplane::tests::",
+            "e2e_0092_015_self_drawing_form_through_the_http_ap",
+            || async {
+                let h = Harness::new().await;
+                let c = h.state.stores.client(MOUNT).await.unwrap();
+                c.makedirs("/docs", true).await.unwrap();
+                c.write_bytes_atomic("/docs/loop.pdf", &loop_pdf()).await.unwrap();
+
+                let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/loop.pdf"})).await;
+
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+                assert_eq!(v["error"], code::INVALID_ARGUMENT, "{v}");
+                assert_eq!(
+                    v["detail"],
+                    "ERR_INVALID_ARGUMENT: could not extract /docs/loop.pdf: page 1 draws PDF forms nested more than 64 deep",
+                    "{v}"
+                );
+                assert!(!c.exists("/docs/loop.md").await.unwrap());
+                let log = h.state.safety.audit(OWNER, MOUNT);
+                assert!(!log.iter().any(|e| e.op == "extract_text"), "{log:?}");
+                let (s, _) = h.post(&u("extract-text"), json!({"path": "/docs/loop.pdf"})).await;
+                assert_eq!(s, StatusCode::BAD_REQUEST);
+            },
+        );
+    }
+
     /// SPEC-0089/E2E-023: a PDF bomb is refused through the REST door with the
     /// tool's code and message, at most 104 933 136 decoded bytes held, nothing left.
     #[tokio::test]

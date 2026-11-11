@@ -300,6 +300,26 @@ pub(crate) fn parent_loop_pdf(resources: bool, media_box: bool, content: &str) -
     w.finish()
 }
 
+/// E2E-021: the page has neither resources nor page size; its parent (object 100) gives it
+/// the resources that draw `/A`, the self drawing form (object 10), and object 100's parent
+/// (object 101) is its own parent. The resources climb succeeds at level 1, the page size
+/// climb loops: only a walk that climbs for the page size before it draws answers the
+/// climb refusal, a walk that draws first answers the form depth refusal.
+pub(crate) fn climb_order_pdf() -> Vec<u8> {
+    let mut w = pages_writer(vec![plain("/A Do")], "");
+    w.object(3, PdfObj::Body("<< /Type /Page /Parent 100 0 R /Contents 4 0 R >>".to_string()));
+    w.object(
+        100,
+        PdfObj::Body(
+            "<< /Type /Pages /Parent 101 0 R /Resources << /XObject << /A 10 0 R >> >> >>"
+                .to_string(),
+        ),
+    );
+    w.object(101, PdfObj::Body("<< /Type /Pages /Parent 101 0 R >>".to_string()));
+    w.object(10, form(Some("/XObject << /A 10 0 R >>"), "/A Do"));
+    w.finish()
+}
+
 /// The text the climb tests show.
 pub(crate) const HELLO_TEXT: &str = HELLO;
 
@@ -309,7 +329,12 @@ const CMAP_TAIL: &str = " def endcmap end";
 /// The body of a character map: `open` written `n` times, `close` written `n` times, between
 /// the head and the tail of a code map.
 pub(crate) fn nested_map(open: &str, close: &str, n: usize) -> String {
-    format!("{CMAP_HEAD}{}{}{CMAP_TAIL}", open.repeat(n), close.repeat(n))
+    nested_map_around(open, "", close, n)
+}
+
+/// As [`nested_map`], with `middle` at the deepest level (a dictionary needs a value there).
+pub(crate) fn nested_map_around(open: &str, middle: &str, close: &str, n: usize) -> String {
+    format!("{CMAP_HEAD}{}{middle}{}{CMAP_TAIL}", open.repeat(n), close.repeat(n))
 }
 
 /// E2E-007, E2E-014, E2E-SEC-007 to SEC-009: font 5 is a Type1 font whose `ToUnicode` is object 9,

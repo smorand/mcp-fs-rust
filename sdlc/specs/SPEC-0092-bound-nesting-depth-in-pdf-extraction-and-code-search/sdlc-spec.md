@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 2 bounded contexts (document text extraction for PDF, code search), 9 requirements, public behavior change (a PDF whose forms, page tree or character maps nest past fixed depths is refused instead of ending the server; code search answers on deeply nested source instead of ending the server), no persisted change. Override with --depth.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-11
 > Project: existing
 > From backlog: BL-0147

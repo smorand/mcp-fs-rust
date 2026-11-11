@@ -3760,6 +3760,7 @@ dependencies = [
 name = "mcp-fs-core"
 version = "0.1.0"
 dependencies = [
+ "adobe-cmap-parser",
  "aes 0.8.4",
  "aes-gcm",
  "anyhow",

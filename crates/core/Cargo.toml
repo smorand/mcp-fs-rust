@@ -132,3 +132,6 @@ tokio-tungstenite = "0.30.0"
 # dependency edges, so this only ever grows what `cargo test` compiles, not
 # a release build without tests.
 sevenz-rust2 = { workspace = true, features = ["compress"] }
+# Test only: the real cmap parser pdf-extract runs, the oracle `map_nesting` is cross
+# checked against (SPEC-0092); pinned to the version pdf-extract already pulls in.
+adobe-cmap-parser = "=0.4.1"

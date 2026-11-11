@@ -226,7 +226,7 @@
 | US-0224 | SPEC-0092 | refuse character and code maps nested past 64 | US-0223 | 2 | landed | story/US-0224-refuse-character-and-code-maps-nested-pa | story/US-0223-refuse-a-page-tree-climb-past-256-levels |
 | US-0225 | SPEC-0092 | code search answers source of any nesting | US-0224 | 2 | landed | story/US-0225-code-search-answers-source-of-any-nestin | story/US-0224-refuse-character-and-code-maps-nested-pa |
 | US-0226 | SPEC-0092 | nesting refusals in order, without trace, walk and reader in step | US-0225 | 2 | landed | story/US-0226-nesting-refusals-in-order-without-trace | story/US-0225-code-search-answers-source-of-any-nestin |
-| US-0227 | SPEC-0092 | nesting refusals through the HTTP door and documentation | US-0226 | 2 | todo | | |
+| US-0227 | SPEC-0092 | nesting refusals through the HTTP door and documentation | US-0226 | 2 | landed | story/US-0227-nesting-refusals-through-the-http-door-a | story/US-0226-nesting-refusals-in-order-without-trace |
 | US-0228 | SPEC-0091 | decode documents apart from the request threads, behind today's ceiling | US-0227 | 2 | todo | | |
 | US-0229 | SPEC-0091 | a reader that stops and a requester who gives up | US-0228 | 2 | todo | | |
 | US-0230 | SPEC-0091 | extraction latency through the HTTP door and documentation | US-0229 | 2 | todo | | |

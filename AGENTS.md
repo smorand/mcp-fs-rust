@@ -62,6 +62,7 @@ docker compose -f docker-compose.test.yml up -d  postgres for the opt-in suites
 cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extraction tests (feature `rar`, SPEC-0080; ./test.sh runs them)
 cargo test -p mcp-fs-core --lib --features rar -- e2e_0087_ api::dataplane tool_contract   the truncated RAR tests (SPEC-0087)
 env -u MCPFS_TEST_PG_DSN cargo test -p mcp-fs-core --lib -- e2e_0089_ api::dataplane tool_contract --test-threads=1   the PDF and converter bound tests (SPEC-0089)
+env -u MCPFS_TEST_PG_DSN cargo test -p mcp-fs-core --lib -- e2e_0092_ api::dataplane tool_contract --test-threads=1   the nesting tests (SPEC-0092; the exploit cases re run the binary in a child process)
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
@@ -121,7 +122,8 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
 - `core/` : `fs_ops.rs` (every filesystem operation, the engine the tools call), `diff.rs`.
 - `docs/` : `extract.rs` (the Office readers go through `OfficeBudget`: part limit 104857600 decoded
   bytes, call limit 268435456 declared bytes, content limit 268435456 bytes, SPEC-0088),
-  `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback),
+  `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback; the scan walks the syntax tree with an explicit
+  stack, so a source of any nesting is searched, SPEC-0092),
   `ocr.rs` (pluggable, null by default), `mime.rs`, `service.rs` (the external
   document to Markdown converter, cli or api, off by default; its answer is capped by
   `doc_service.max_input_bytes` on every channel: stdout, web body, bundle files; the child is killed
@@ -129,7 +131,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `pdf_bound.rs` (PDF text extraction, measured then decoded: every stream is measured before the
   reader decodes it, an over limit stream is defused; limits 1 000 000 objects, 104857600 bytes per
   decoded stream, 268435456 bytes for the object streams at load, per page and for the extracted text;
-  LZW and ASCII85 chains, `weezl`; SPEC-0089), `artifacts/` (parse,
+  LZW and ASCII85 chains, `weezl`; SPEC-0089; the same walk refuses forms nested more than 64 deep, a page
+  tree climb past 256 page groups, and a character or code map nested more than 64 levels, as
+  `ERR_INVALID_ARGUMENT`, no trace on refusal, SPEC-0092), `artifacts/` (parse,
   capture and render of the images and tables a conversion keeps; meta rows, never `nodes`).
 - `tools/` : one module per family. Every family exposes typed `pub(crate)` async functions
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the

@@ -259,7 +259,7 @@ fn e2e_0092_017_page_size_missing_along_a_looping_cha() {
 fn e2e_0092_021_page_tree_climb_before_the_page_s_dra() {
     in_child(MODULE, "e2e_0092_021_page_tree_climb_before_the_page_s_dra", || async {
         let f = nesting_fixture().await;
-        seed(&f, "/docs/climbloop.pdf", &parent_loop_pdf(false, false, "/A Do")).await;
+        seed(&f, "/docs/climbloop.pdf", &climb_order_pdf()).await;
 
         let v = extract_text(&f, OWNER, "/docs/climbloop.pdf", false).await;
 
@@ -366,6 +366,192 @@ fn e2e_0092_022_form_depth_before_a_later_character_m() {
     });
 }
 
+#[tokio::test]
+async fn e2e_0092_007_strings_nested_exactly_64_deep() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/str64.pdf", &cmap_pdf(&nested_map("(", ")", 64))).await;
+
+    let v = extract_text(&f, OWNER, "/docs/str64.pdf", false).await.expect("64 strings extract");
+
+    assert!(v["preview"].as_str().unwrap().contains("Hello"), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0092_007_dictionaries_nested_exactly_64_deep() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/dict64.pdf", &cmap_pdf(&nested_map_around("<< /K ", "1", " >>", 64))).await;
+
+    let v =
+        extract_text(&f, OWNER, "/docs/dict64.pdf", false).await.expect("64 dictionaries extract");
+
+    assert!(v["preview"].as_str().unwrap().contains("Hello"), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0092_014_dictionaries_nested_65_deep() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/dict65.pdf", &cmap_pdf(&nested_map_around("<< /K ", "1", " >>", 65))).await;
+
+    let v = extract_text(&f, OWNER, "/docs/dict65.pdf", false).await;
+
+    map_refusal(&v, "/docs/dict65.pdf");
+    nothing_left(&f, "/docs/dict65.pdf", None).await;
+}
+
+/// Every level is a string holding a `%` (text inside a string, not a comment) and an
+/// escaped `\)` (text, not a close): 65 real levels, refused.
+#[tokio::test]
+async fn e2e_0092_014_comment_and_escape_do_not_hide_a_level() {
+    let f = nesting_fixture().await;
+    seed(&f, "/docs/evade.pdf", &cmap_pdf(&nested_map("(% \\) ", ")", 65))).await;
+
+    let v = extract_text(&f, OWNER, "/docs/evade.pdf", false).await;
+
+    map_refusal(&v, "/docs/evade.pdf");
+    nothing_left(&f, "/docs/evade.pdf", None).await;
+}
+
+// ── `map_nesting` against the real cmap parser (adobe-cmap-parser 0.4.1) ─────
+
+/// The shape the real parser gives `v`: strings by length, scalars as one mark.
+fn shape(v: &adobe_cmap_parser::Value) -> String {
+    use adobe_cmap_parser::Value as V;
+    match v {
+        V::Array(xs) => format!("[{}]", xs.iter().map(shape).collect::<Vec<_>>().join(",")),
+        V::Dictionary(d) => {
+            let mut e: Vec<_> = d.iter().map(|(k, v)| format!("{k}:{}", shape(v))).collect();
+            e.sort();
+            format!("<{}>", e.join(","))
+        }
+        V::LiteralString(b) => format!("s{}", b.len()),
+        _ => "x".to_string(),
+    }
+}
+
+/// Levels the real parser recursed through to build `v`: a list or a dictionary is one,
+/// a string is one plus the nesting of the strings it returned with their parentheses.
+/// A hexadecimal string also comes back as a string, so the corpus keeps them above
+/// the deepest level, where the extra count changes nothing.
+fn tree_depth(v: &adobe_cmap_parser::Value) -> u32 {
+    use adobe_cmap_parser::Value as V;
+    match v {
+        V::Array(xs) => 1 + xs.iter().map(tree_depth).max().unwrap_or(0),
+        V::Dictionary(d) => 1 + d.values().map(tree_depth).max().unwrap_or(0),
+        V::LiteralString(b) => {
+            let (mut depth, mut max) = (0u32, 0u32);
+            for c in b {
+                match c {
+                    b'(' => {
+                        depth += 1;
+                        max = max.max(depth);
+                    }
+                    b')' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            1 + max
+        }
+        _ => 0,
+    }
+}
+
+/// The depth the real parser reaches on `input`, run on a 64 MiB stack so it never
+/// overflows on the corpus (at most 4.6 KB per level in a debug build, measured).
+/// An escape returns a bare parenthesis, which `tree_depth` would count, so the depth
+/// is read on a twin where every escape is `\n` (same length); the twin must parse to
+/// the same shape, which shows the escapes changed no level.
+fn real_depth(input: &str) -> u32 {
+    let mut twin = input.as_bytes().to_vec();
+    let mut at = 0;
+    while at + 1 < twin.len() {
+        if twin[at] == b'\\' {
+            twin[at + 1] = b'n';
+            at += 2;
+        } else {
+            at += 1;
+        }
+    }
+    let input = input.as_bytes().to_vec();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let real = adobe_cmap_parser::parse(&input).expect("the real parser accepts the input");
+            let twin = adobe_cmap_parser::parse(&twin).expect("the real parser accepts the twin");
+            let shapes = |vs: &[adobe_cmap_parser::Value]| vs.iter().map(shape).collect::<Vec<_>>();
+            assert_eq!(shapes(&real), shapes(&twin), "an escape changed the structure");
+            twin.iter().map(tree_depth).max().unwrap_or(0)
+        })
+        .expect("the oracle thread")
+        .join()
+        .expect("the oracle did not panic")
+}
+
+/// Maps nested `n` levels, one per construct and mixes, each wrapped as a map value.
+fn map_corpus(n: usize) -> Vec<String> {
+    let wrap = |body: String| format!("% head [[[[ (((( <<<<\n/X {body} def");
+    let around = |open: &str, middle: &str, close: &str| {
+        wrap(format!("{}{middle}{}", open.repeat(n), close.repeat(n)))
+    };
+    let half = n / 2;
+    // A hexadecimal string at every level but the deepest.
+    let hex = |open: &str, last: &str, middle: &str, close: &str| {
+        wrap(format!("{}{last}{middle}{}", open.repeat(n - 1), close.repeat(n)))
+    };
+    vec![
+        around("[", "", "]"),
+        around("<< /K ", "1", " >>"),
+        around("(", "", ")"),
+        hex("[ <0A0B> ", "[", "", "]"),
+        hex("<< /H <0A> /K ", "<< /K ", "1", " >>"),
+        around("(\\) \\( ", "", ")"),
+        // An escaped close at every level: read as a close, it would hide every level.
+        around("(\\) ", "", ")"),
+        around("(\\( ", "", ")"),
+        around("(\\\\", "", ")"),
+        around("(% ", "", ")"),
+        // Lists and dictionaries in turn.
+        wrap(format!(
+            "{}1{}",
+            (0..n).map(|i| if i % 2 == 0 { "[ " } else { "<< /K " }).collect::<String>(),
+            (0..n).rev().map(|i| if i % 2 == 0 { " ]" } else { " >>" }).collect::<String>()
+        )),
+        wrap(format!(
+            "{}{}{}{}",
+            "[".repeat(n - half),
+            "(".repeat(half),
+            ")".repeat(half),
+            "]".repeat(n - half)
+        )),
+        wrap(format!(
+            "{}{}1{}{}",
+            "[".repeat(n - half),
+            "<< /K ".repeat(half),
+            " >>".repeat(half),
+            "]".repeat(n - half)
+        )),
+    ]
+}
+
+/// `map_nesting` never undercounts the real parser: for every corpus map at 63, 64 and 65
+/// levels it reports the depth the real parser reached (capped past the limit, where it
+/// returns early), so a map the real parser takes past 64 levels is reported past 64.
+#[test]
+fn map_nesting_matches_the_real_cmap_parser() {
+    use crate::docs::pdf_bound::{MAP_NESTING_LIMIT, map_nesting};
+    for n in [1, 2, 63, 64, 65] {
+        for map in map_corpus(n) {
+            let real = real_depth(&map);
+            let counted = map_nesting(map.as_bytes());
+            assert_eq!(real, n as u32, "the corpus map is {n} deep: {map}");
+            let cap = MAP_NESTING_LIMIT + 1;
+            assert_eq!(counted.min(cap), real.min(cap), "{map}");
+            if real > MAP_NESTING_LIMIT {
+                assert!(counted > MAP_NESTING_LIMIT, "undercount {counted} < {real}: {map}");
+            }
+        }
+    }
+}
+
 /// DEC-005: a map is scanned after its stream limit, not while it is measured.
 #[tokio::test]
 async fn map_nesting_is_checked_after_the_stream_limit() {
@@ -447,6 +633,41 @@ fn e2e_0092_sec_011_definition_search_over_100_000_ne() {
         let limit =
             if cfg!(debug_assertions) { Duration::from_secs(30) } else { Duration::from_secs(10) };
         assert!(took < limit, "the search took {took:?}, more than {limit:?}");
+        still_up(&f, pid_before).await;
+    });
+}
+
+/// SEC-011 through the MCP handler as the owner: the scan the handler reaches is the one
+/// that walks with an explicit stack.
+#[test]
+fn e2e_0092_sec_011_definition_search_through_the_handler() {
+    in_child(MODULE, "e2e_0092_sec_011_definition_search_through_the_handler", || async {
+        use crate::mcp::server::{FindDefinitionArgs, McpServer};
+        use rmcp::handler::server::wrapper::Parameters;
+        use rmcp::model::ContentBlock;
+        let f = nesting_fixture().await;
+        seed_src(&f, "/src/deep.py", &deep_py(100_000)).await;
+        let pid_before = std::process::id();
+        let server = McpServer::new(f.state.clone(), OWNER.to_string());
+        let args = FindDefinitionArgs {
+            mount_id: MOUNT.into(),
+            name: "f".into(),
+            root: "/src".into(),
+            kind: None,
+        };
+
+        let r = server.fs_find_definition(Parameters(args)).await.expect("a tool result");
+
+        let text = r
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text block");
+        assert_ne!(r.is_error, Some(true), "{text}");
+        one_definition(&serde_json::from_str(&text).expect("a json answer"), "/src/deep.py");
         still_up(&f, pid_before).await;
     });
 }

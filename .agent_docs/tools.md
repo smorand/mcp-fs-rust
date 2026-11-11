@@ -349,7 +349,22 @@ the document converter's answer, the same class. The PDF reader inflated every s
 a few kilobytes exhausted the memory of the server, and the converter's standard output, web body and
 bundle were read whole. Fixed: `docs/pdf_bound.rs` measures every stream before the reader decodes it
 and the converter answer is capped at `doc_service.max_input_bytes` (details below). The exploit tests
-are `e2e_0089_sec_001` to `e2e_0089_sec_017`. Known gaps of the class: BL-0147 to BL-0153 (below).
+are `e2e_0089_sec_001` to `e2e_0089_sec_017`. Known gaps of the class: BL-0148 to BL-0153 (below); BL-0147
+(form recursion) is closed by SPEC-0092.
+
+Security note (2026-11-11, SPEC-0092): uncontrolled recursion (CWE-674) in PDF extraction and in the code
+search. Seven kinds of small file aborted the whole server with `fatal runtime error: stack overflow`
+(signal 6, the abort ends every project served by the process): a form that draws itself or two forms
+drawing each other (862 B and 1 025 B), a chain of 400 or more distinct forms (165 KB for 1 000), a page
+whose `Parent` is a loop (2.5 KB), a parent chain of 10 000 page groups (740 KB), a character map nested
+1 000 lists or 100 000 strings or dictionaries, a composite font code map nested 10 000 lists, and a
+Python, C or JavaScript source nested 10 000 parentheses or lists (the code search). Reproduced
+before the fix on a 2 MiB thread (the worker default), the loops also on 8 and 64 MiB threads.
+Fixed: the walk of `docs/pdf_bound.rs` refuses the three PDF nestings before the reader runs, and
+`docs/symbols.rs` scans with explicit stacks. The exploit tests are `e2e_0092_sec_001` to
+`e2e_0092_sec_013`, each in a child process. Accepted limits: folder trees and git trees nested deeply
+are not covered by this fix; the limits were measured in a debug build (a release build has other
+thresholds, the loops overflow in both).
 
 (2026-10-19, SPEC-0041 US-0048.) A zip whose local headers disagree with the
 central directory (name, alternate name, compression, encryption, AES settings,
@@ -460,6 +475,14 @@ streams`, `the extracted content exceeds 268435456 bytes`, `pdf: the cross refer
 measured` (new), `pdf: the encryption dictionary could not be isolated`. A refusal leaves no trace (no
 companion, artifact, charge, audit line). The test only hook `PDF_HELD` records the bytes held; the heavy
 tests take `heavy()`. The REST door answers the same code and message (`e2e_0089_002`, `023`).
+(2026-11-11, SPEC-0092.) Nesting refusals of `fs.extract_text` (same walk, `ERR_INVALID_ARGUMENT`, prefix
+`could not extract <path>: `): forms nested more than 64 deep (`page <N> draws PDF forms nested more than
+64 deep`, loops included), a page tree climb past 256 page groups for `Resources` or `MediaBox` (`page <N>
+inherits from more than 256 levels of the PDF page tree`), a character or code map nested more than 64
+levels (`a PDF character map is nested more than 64 deep`). A refusal leaves no trace (no companion
+change, artifact, charge, audit line); an up to date companion still answers without reading the PDF. The
+REST door answers the same code and message (`e2e_0092_002`, `015`). `fs.find_definition` and
+`fs.find_references` answer a source of any nesting (explicit stacks, never refused for depth).
 Accepted test limits (2026-11-11, audit G3 and G5): E2E-SEC-012/032 cannot isolate a reintroduced second
 unbounded load of the title; the held figures are logical bytes and the real peak can reach about twice
 that; parsed operations of 100 MB of tiny operators are not counted (BL-0151); the e2e with one colour profile in 300 saved states proves the page still extracts, not that the reader's copies are empty stand ins (that needs an allocation counter, so only the structural unit test guards DEC-009).
@@ -470,8 +493,7 @@ Past the cap the read stops, the child is killed and reaped before its working f
 call is refused with `ERR_INTERNAL_ERROR` `document service output is over the doc_service.max_input_bytes
 limit of <cap>` (an upload keeps the source and reports it in `documentation.error`; documentize over
 HTTP answers 500). No companion, artifact, charge or audit line. Diagnostic output keeps the last 8 192
-bytes; in bundle mode stdout is discarded. Known gaps: BL-0147 (form recursion without depth limit),
-BL-0148 (web fetch tools read whole), BL-0149 (quadratic page list), BL-0150 (growing bundle file),
+bytes; in bundle mode stdout is discarded. Known gaps: BL-0148 (web fetch tools read whole), BL-0149 (quadratic page list), BL-0150 (growing bundle file),
 BL-0151 (parsed structures larger than their bytes), BL-0152 (converter's own children survive the kill),
 BL-0153 (no total across cross reference streams).
 
@@ -667,6 +689,7 @@ the checks that authorize, so a reported flag can never contradict the gate.
 Observed while hardening the extraction paths; none is a reported defect, all are accepted as they are.
 * Office extraction holds copies the SPEC-0088 figures do not count: a part repaired from invalid UTF-8, the joined and trimmed content, and an empty grid cell costing a 24 byte `String` for 4 bytes of markup. The real heap of a call is a small multiple of the stated limits.
 * The PDF text pass rebuilds the page map on every page (`output_doc_page`), so time grows with the square of the page count, within SPEC-0089's object limit.
+* Folder trees and git trees nested deeply are not covered by the SPEC-0092 nesting bounds (2026-11-11); the nesting limits were measured in a debug build.
 * PDF parsed structures (content operations, cross reference entries, object tables) can be much larger than the bytes they come from; SPEC-0089 bounds decoded bytes, not parsed structures. This is also why the held figures are logical bytes.
 * No total limit across the cross reference streams of a PDF `/Prev` chain: each is held to the stream limit, the work grows with the chain, the peak stays near one stream.
 * A converter bundle file that keeps growing between the size check and the read is read at its new size; a converter's own child processes survive the kill on the cap or the timeout. Both need an operator-chosen, misbehaving converter.

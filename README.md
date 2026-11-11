@@ -385,7 +385,18 @@ A refusal is `ERR_INVALID_ARGUMENT` (HTTP 400), message starting `could not extr
 not be isolated`). A refusal leaves no trace: no companion, artifact, charge or audit line. Both
 doors give the same code and message. PDFs within the limits are answered as before.
 
-Known gaps: form recursion without a depth limit (BL-0147), web fetch tools read the whole body
+(2026-11-11, SPEC-0092.) Three nestings are refused too, each as `ERR_INVALID_ARGUMENT` before the
+reader runs, so a file of a few kilobytes can no longer end the server with a stack overflow: forms
+drawn more than 64 deep, a self drawing form or two forms drawing each other included
+(`could not extract <path>: page <N> draws PDF forms nested more than 64 deep`); a page tree climb past
+256 page groups for `Resources` or `MediaBox` (`could not extract <path>: page <N> inherits from more than
+256 levels of the PDF page tree`); a character map or composite font code map nested more than 64 levels
+(`could not extract <path>: a PDF character map is nested more than 64 deep`). A refusal leaves no
+companion, artifact, charge or audit line. The REST door answers the same code and message. The code
+search (`fs.find_definition`, `fs.find_references`, `GET` routes alike) scans with explicit stacks and
+answers a source of any nesting; it is never refused for depth.
+
+Known gaps: web fetch tools read the whole body
 (BL-0148), the page list is quadratic (BL-0149), a growing bundle file is read while it grows
 (BL-0150), parsed structures can be larger than their bytes (BL-0151), the converter's own
 children survive the kill (BL-0152), no total across cross reference streams (BL-0153).
