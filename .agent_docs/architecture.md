@@ -408,3 +408,30 @@ leaves no companion change, artifact, charge or audit line, and logs one INFO li
 measurement hook: the thread local `OFFICE_HELD` in `docs/extract.rs`, read through `parts_held` and
 `content_held` in `tools/archive_testkit.rs`; tests are in `tools/office_bound_e2e.rs`
 (filter `e2e_0088_`, take `heavy()` first).
+
+## PDF extraction bound (SPEC-0089, 2026-11-11)
+
+`fs.extract_text` on a `.pdf` (any letter case, also `POST /api/fs/{mount}/extract-text`) runs
+`docs/pdf_bound.rs::extract` instead of handing the file to the reader. Every stream is measured
+first (inflated chunk by chunk, nothing kept), then decoded only if it fits: a stream over
+104 857 600 bytes is refused with `ERR_INVALID_ARGUMENT`, `could not extract <path>: a PDF stream
+decodes to more than 104857600 bytes`. Five limits, met in this order: (1) more than 1 000 000
+objects; (2) one stream over 104 857 600 bytes; (3) compressed object streams over 268 435 456 bytes
+in total (the load); (4) the streams one page decodes, repeats counted, over 268 435 456 bytes;
+(5) extracted content over 268 435 456 bytes. The load comes first (object streams in increasing
+object number), then pages in page order, then the title read, under the same limits. Membership and
+`not a file` come before any of it (`prepare_extraction` is unchanged, and the cached companion
+answers without reading the PDF).
+
+How: after the load every `Filter` is moved aside ("defuse") and put back, page by page, only on the
+streams the walk measured within the limits ("arm"; `Armed` defuses again on every exit, a panic
+included). A colour profile or other stream the reader would inflate without needing it is replaced
+by a stand in. A cross reference stream lopdf would inflate itself is measured the same way, and an
+encrypted document is followed on its own path (a `/Encrypt` key that cannot be read is refused,
+`pdf: ...`). A load error stays `pdf: PDF error: <e>`, a panic `pdf parser failed on this document`.
+
+A refused call leaves no companion change, artifact, charge or audit line, and logs one INFO line (the
+existing `log_tool_failure` wiring, no new call). Test only measurement hook: the thread local
+`PDF_HELD` in `docs/extract.rs`, keyed by path (so three joined calls keep three figures; a cached call
+leaves no entry), read through `decoded_held` and `pdf_content_held` in `tools/pdf_testkit.rs`; tests
+are in `tools/pdf_bound_e2e.rs` and `api/dataplane.rs` (filter `e2e_0089_`, take `heavy()` first).

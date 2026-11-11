@@ -443,3 +443,213 @@ async fn e2e_0089_006_pdf_without_a_text_layer() {
         json!("no extractable text layer (scanned PDF?); enable a multimodal OCR provider")
     );
 }
+
+/// The answer fields every door gives for the report.
+fn report_answer(v: &Value) {
+    assert_eq!(v["md_path"], "/docs/report.md", "{v}");
+    assert_eq!(v["format"], "pdf", "{v}");
+    assert_eq!(v["cached"], false, "{v}");
+    assert_eq!(v["meta"]["pages"], json!(2), "{v}");
+    assert_eq!(v["meta"]["title"], "Report 2026", "{v}");
+    let preview = v["preview"].as_str().unwrap();
+    let at = |needle: &str| preview.find(needle).unwrap_or_else(|| panic!("{needle}: {preview}"));
+    assert!(
+        at("*[Page 1]*") < at("Quarterly results")
+            && at("Quarterly results") < at("*[Page 2]*")
+            && at("*[Page 2]*") < at("Outlook"),
+        "{preview}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_0089_001_pdf_within_the_limits() {
+    let f = office_fixture().await;
+    seed(&f, "/docs/report.pdf", &report_pdf()).await;
+
+    let v = extract_text(&f, OWNER, "/docs/report.pdf", false).await.expect("within the limits");
+
+    report_answer(&v);
+    let companion = read(&f, "/docs/report.md").await.expect("the companion is written");
+    let companion = String::from_utf8(companion).unwrap();
+    assert!(v["preview"].as_str().unwrap().len() <= companion.len(), "{companion}");
+    for needle in ["*[Page 1]*", "Quarterly results", "*[Page 2]*", "Outlook"] {
+        assert!(companion.contains(needle), "{companion}");
+    }
+    let lines: Vec<_> =
+        f.state.safety.audit(OWNER, MOUNT).into_iter().filter(|e| e.op == "extract_text").collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].path, "/docs/report.md");
+}
+
+#[tokio::test]
+async fn e2e_0089_019_a_pdf_that_cannot_be_read() {
+    let f = office_fixture().await;
+    seed(&f, "/docs/bad.pdf", b"%PDF-1.4\ngarbage").await;
+
+    let v = extract_text(&f, OWNER, "/docs/bad.pdf", false).await;
+
+    let Err(e) = &v else { panic!("must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert!(e.message.starts_with("could not extract /docs/bad.pdf: "), "{}", e.message);
+    nothing_left(&f, "/docs/bad.pdf", None).await;
+}
+
+/// `/docs/bomb.pdf` then, written after it, `/docs/bomb.md` holding `kept text`.
+async fn bomb_with_companion() -> crate::tools::admin::test_support::Fixture {
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.pdf", &content_bomb_pdf()).await;
+    seed(&f, "/docs/bomb.md", b"kept text").await;
+    f
+}
+
+#[tokio::test]
+async fn e2e_0089_020_up_to_date_companion_answers_without() {
+    let _heavy = heavy().await;
+    let f = bomb_with_companion().await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/bomb.pdf", false).await.expect("answered from cache");
+
+    assert_eq!(v["cached"], true, "{v}");
+    assert_eq!(v["md_path"], "/docs/bomb.md", "{v}");
+    assert_eq!(v["preview"], "kept text", "{v}");
+    assert_eq!(pdf_content_held("/docs/bomb.pdf"), 0);
+    assert_eq!(
+        crate::docs::extract::PDF_HELD
+            .with(|m| m.borrow().get("/docs/bomb.pdf").map_or(0, |h| h.decoded)),
+        0
+    );
+}
+
+#[tokio::test]
+async fn e2e_0089_021_refresh_on_a_pdf_bomb_keeps_the_compa() {
+    let _heavy = heavy().await;
+    let f = bomb_with_companion().await;
+    pdf_held_reset();
+
+    let v = extract_text(&f, OWNER, "/docs/bomb.pdf", true).await;
+
+    stream_refusal(&v, "/docs/bomb.pdf", decoded_held("/docs/bomb.pdf"));
+    assert_eq!(read(&f, "/docs/bomb.md").await.as_deref(), Some(&b"kept text"[..]));
+    nothing_left(&f, "/docs/bomb.pdf", Some(b"kept text")).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_022_repeating_a_refused_pdf_call() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.pdf", &content_bomb_pdf()).await;
+    pdf_held_reset();
+
+    let first = extract_text(&f, OWNER, "/docs/bomb.pdf", false).await;
+    let second = extract_text(&f, OWNER, "/docs/bomb.pdf", false).await;
+
+    stream_refusal(&first, "/docs/bomb.pdf", 0);
+    stream_refusal(&second, "/docs/bomb.pdf", 0);
+    assert_eq!(first.unwrap_err().message, second.unwrap_err().message);
+    nothing_left(&f, "/docs/bomb.pdf", None).await;
+}
+
+#[tokio::test]
+async fn e2e_0089_024_not_a_member_pdf_bomb() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    seed(&f, "/docs/bomb.pdf", &content_bomb_pdf()).await;
+    pdf_held_reset();
+
+    let denied = f.state.authorize(MOUNT, "eve@example.com").await.unwrap_err();
+
+    assert_eq!(denied.code, code::FORBIDDEN, "{denied:?}");
+    assert_eq!(denied.message, "'eve@example.com' is not a member of 'atlas'");
+    let held = crate::docs::extract::PDF_HELD
+        .with(|m| m.borrow().get("/docs/bomb.pdf").map_or(0, |h| h.decoded));
+    assert_eq!(held, 0);
+}
+
+#[tokio::test]
+async fn e2e_0089_025_missing_path() {
+    let f = office_fixture().await;
+
+    let v = extract_text(&f, OWNER, "/docs/none.pdf", false).await;
+
+    let Err(e) = &v else { panic!("must be refused: {v:?}") };
+    assert_eq!(e.code, code::NOT_FOUND, "{e:?}");
+    assert_eq!(e.message, "not a file: /docs/none.pdf");
+}
+
+#[tokio::test]
+async fn e2e_0089_029_upper_case_suffix() {
+    let _heavy = heavy().await;
+    refused_on("/docs/BOMB.PDF", &content_bomb_pdf()).await;
+}
+
+/// What the operator reads for a PDF refusal: one informational line naming the
+/// code and the limit, no error line, no audit line. The capture records on the
+/// thread that took the lock, so the whole body runs on that one thread.
+#[test]
+fn e2e_0089_030_what_the_operator_sees_for_a_pdf_refu() {
+    use crate::mcp::server::{ExtractTextArgs, McpServer};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let _capture = crate::logging::capture::lock_for_test();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let _heavy = heavy().await;
+        let f = office_fixture().await;
+        seed(&f, "/docs/bomb.pdf", &content_bomb_pdf()).await;
+        let server = McpServer::new(f.state.clone(), OWNER.to_string());
+        let args = ExtractTextArgs {
+            mount_id: MOUNT.into(),
+            path: "/docs/bomb.pdf".into(),
+            max_chars: 200_000,
+            preview_chars: 4_000,
+            ocr: true,
+            refresh: false,
+        };
+        crate::logging::capture::clear();
+
+        let out = server.fs_extract_text(Parameters(args)).await.unwrap();
+
+        assert_eq!(out.is_error, Some(true), "{out:?}");
+        let events = crate::logging::capture::events();
+        let level = |e: &crate::logging::capture::CapturedEvent| e.fields["level"].clone();
+        let message = |e: &crate::logging::capture::CapturedEvent| e.fields["message"].clone();
+        let info: Vec<_> = events
+            .iter()
+            .filter(|e| level(e) == "INFO" && message(e).contains("ERR_INVALID_ARGUMENT"))
+            .collect();
+        assert_eq!(info.len(), 1, "{events:?}");
+        assert!(
+            message(info[0]).contains("a PDF stream decodes to more than 104857600 bytes"),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| level(e) == "ERROR"), "{events:?}");
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        assert!(!log.iter().any(|e| e.path.contains("bomb")), "{log:?}");
+    });
+}
+
+#[tokio::test]
+async fn e2e_0089_031_two_pdf_bombs_and_a_normal_pdf_at_onc() {
+    let _heavy = heavy().await;
+    let f = office_fixture().await;
+    let second = add_second_member(&f).await;
+    f.state.admin.add_member(MOUNT, "ola@example.com", OWNER).await.unwrap();
+    seed(&f, "/docs/m.pdf", &content_bomb_pdf()).await;
+    seed(&f, "/docs/n.pdf", &content_bomb_pdf()).await;
+    seed(&f, "/docs/report.pdf", &report_pdf()).await;
+    pdf_held_reset();
+
+    let (m, n, report) = tokio::join!(
+        extract_text(&f, OWNER, "/docs/m.pdf", false),
+        extract_text(&f, second, "/docs/n.pdf", false),
+        extract_text(&f, "ola@example.com", "/docs/report.pdf", false),
+    );
+
+    stream_refusal(&m, "/docs/m.pdf", 0);
+    stream_refusal(&n, "/docs/n.pdf", 0);
+    report_answer(&report.expect("the report is answered"));
+    for path in ["/docs/m.pdf", "/docs/n.pdf"] {
+        let held = decoded_held(path);
+        assert!(held <= BOMB_HELD && held > STREAM_LIMIT as u64, "{path} held {held}");
+    }
+}

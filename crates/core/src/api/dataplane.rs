@@ -3955,6 +3955,68 @@ mod tests {
         office_nothing_left(&h, "/docs/bomb.docx", "/docs/bomb.md").await;
     }
 
+    /// SPEC-0089/E2E-002: the REST door answers a PDF within the limits as the
+    /// engine does (E2E-001), with one extraction audit line.
+    #[tokio::test]
+    async fn e2e_0089_002_pdf_through_the_http_api() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/report.pdf", &crate::tools::pdf_testkit::report_pdf())
+            .await
+            .unwrap();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/report.pdf"})).await;
+
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["md_path"], "/docs/report.md", "{v}");
+        assert_eq!(v["format"], "pdf", "{v}");
+        assert_eq!(v["cached"], false, "{v}");
+        assert_eq!(v["meta"]["pages"], 2, "{v}");
+        assert_eq!(v["meta"]["title"], "Report 2026", "{v}");
+        assert_eq!(
+            v["preview"], "---\n*[Page 1]*\n\nQuarterly results\n\n---\n*[Page 2]*\n\nOutlook",
+            "{v}"
+        );
+        let lines: Vec<_> = h
+            .state
+            .safety
+            .audit(OWNER, MOUNT)
+            .into_iter()
+            .filter(|e| e.op == "extract_text")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].path, "/docs/report.md");
+    }
+
+    /// SPEC-0089/E2E-023: a PDF bomb is refused through the REST door with the
+    /// tool's code and message, at most 104 933 136 decoded bytes held, nothing left.
+    #[tokio::test]
+    async fn e2e_0089_023_pdf_bomb_through_the_http_api() {
+        use crate::tools::archive_testkit::heavy;
+        use crate::tools::pdf_testkit::{
+            BOMB_HELD, content_bomb_pdf, decoded_held, pdf_held_reset,
+        };
+        let _heavy = heavy().await;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/bomb.pdf", &content_bomb_pdf()).await.unwrap();
+        pdf_held_reset();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/bomb.pdf"})).await;
+
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT);
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: could not extract /docs/bomb.pdf: a PDF stream decodes to more than 104857600 bytes"
+        );
+        let held = decoded_held("/docs/bomb.pdf");
+        assert!(held <= BOMB_HELD, "held {held} decoded bytes");
+        office_nothing_left(&h, "/docs/bomb.pdf", "/docs/bomb.md").await;
+    }
+
     /// SPEC-0085 E2E-005: the REST door answers what the engine answers for a zip
     /// within the limits (E2E-001), and the session audit holds exactly one
     /// extraction line.

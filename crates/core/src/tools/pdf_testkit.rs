@@ -555,8 +555,8 @@ pub(crate) fn locked_bomb_pdf() -> Vec<u8> {
 fn titled_writer(padding_to: usize) -> PdfWriter {
     let mut w = pages_writer(
         vec![
-            plain("BT /F1 12 Tf 72 700 Td (Quarterly results) Tj ET"),
-            plain("BT /F1 12 Tf 72 700 Td (Outlook) Tj ET"),
+            flate("", zlib(b"BT /F1 12 Tf 72 700 Td (Quarterly results) Tj ET")),
+            flate("", zlib(b"BT /F1 12 Tf 72 700 Td (Outlook) Tj ET")),
         ],
         "",
     );
@@ -565,6 +565,12 @@ fn titled_writer(padding_to: usize) -> PdfWriter {
     w.object_stream(9, &objects, padding_to.saturating_sub(head.len()));
     w.info(8);
     w
+}
+
+/// E2E-001: the two pages `Quarterly results` and `Outlook`, title `Report 2026`,
+/// every stream compressed, the `/Info` dictionary in an object stream.
+pub(crate) fn report_pdf() -> Vec<u8> {
+    small(titled_writer(0).finish())
 }
 
 /// The two page titled document encrypted with an empty user password, its
