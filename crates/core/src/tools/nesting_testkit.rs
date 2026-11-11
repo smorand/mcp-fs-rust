@@ -268,3 +268,62 @@ pub(crate) fn parent_loop_pdf(resources: bool, media_box: bool, content: &str) -
 
 /// The text the climb tests show.
 pub(crate) const HELLO_TEXT: &str = HELLO;
+
+const CMAP_HEAD: &str = "/CIDInit /ProcSet findresource begin begincmap /X ";
+const CMAP_TAIL: &str = " def endcmap end";
+
+/// The body of a character map: `open` written `n` times, `close` written `n` times, between
+/// the head and the tail of a code map.
+pub(crate) fn nested_map(open: &str, close: &str, n: usize) -> String {
+    format!("{CMAP_HEAD}{}{}{CMAP_TAIL}", open.repeat(n), close.repeat(n))
+}
+
+/// E2E-007, E2E-014, E2E-SEC-007 to SEC-009: font 5 is a Type1 font whose `ToUnicode` is object 9,
+/// a plain stream holding `body`; the page shows `Hello`.
+pub(crate) fn cmap_pdf(body: &str) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain(HELLO)], "");
+    w.object(
+        5,
+        PdfObj::Body(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 9 0 R >>".to_string(),
+        ),
+    );
+    w.object(9, plain(body));
+    w.finish()
+}
+
+/// E2E-SEC-010: font 5 is a composite font whose `Encoding` is object 9, a plain stream holding `body`.
+pub(crate) fn type0_pdf(body: &str) -> Vec<u8> {
+    let mut w = pages_writer(vec![plain(HELLO)], "");
+    w.object(
+        5,
+        PdfObj::Body(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 9 0 R /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>] >>"
+                .to_string(),
+        ),
+    );
+    w.object(9, plain(body));
+    w.finish()
+}
+
+/// E2E-022: the page draws the self drawing form `/A` (object 10) before it selects `/F2`
+/// (font 6), whose `ToUnicode` map nests 1 000 lists.
+pub(crate) fn order_pdf() -> Vec<u8> {
+    let mut w = pages_writer(vec![plain("/A Do BT /F2 12 Tf (x) Tj ET")], "");
+    w.object(
+        3,
+        PdfObj::Body(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /A 10 0 R >> /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>"
+                .to_string(),
+        ),
+    );
+    w.object(
+        6,
+        PdfObj::Body(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 9 0 R >>".to_string(),
+        ),
+    );
+    w.object(9, plain(&nested_map("[", "]", 1_000)));
+    w.object(10, form(Some("/XObject << /A 10 0 R >>"), "/A Do"));
+    w.finish()
+}

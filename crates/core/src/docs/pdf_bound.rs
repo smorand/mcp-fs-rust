@@ -1541,8 +1541,19 @@ fn walk(
                 else {
                     break;
                 };
-                for id in font_streams(doc, font) {
+                for (id, is_map) in font_streams(doc, font) {
                     page.decode(id, budget)?;
+                    // Scanned after the stream limit and the page total (both in `decode`),
+                    // so a map that is too big is refused for its size first (DEC-005).
+                    if is_map && let Ok(Object::Stream(map)) = doc.get_object(id) {
+                        let bytes = reader_bytes(map, page.armed.contains(&id));
+                        budget.hold(bytes.len() as u64);
+                        if map_nesting(&bytes) > MAP_NESTING_LIMIT {
+                            return Err(ToolError::invalid_argument(format!(
+                                "a PDF character map is nested more than {MAP_NESTING_LIMIT} deep"
+                            )));
+                        }
+                    }
                 }
             }
             "cs" | "CS" => {
@@ -1605,28 +1616,103 @@ fn walk(
     Ok(page.into_walked(invalid))
 }
 
-/// The streams `make_font` decodes for `font`, by its `Subtype` (`lib.rs:322-332`).
-fn font_streams(doc: &Document, font: &Dictionary) -> Vec<ObjectId> {
+/// Deepest nesting of lists, dictionaries and bracketed strings the cmap parser
+/// is allowed to recurse through; it goes one stack frame deeper per level
+/// (SPEC-0092 DEC-002).
+pub(crate) const MAP_NESTING_LIMIT: u32 = 64;
+
+/// The deepest level the cmap parser would recurse to on `bytes`, lexed as it
+/// lexes (`adobe-cmap-parser` `lib.rs:28-150`): outside a string `[` and `<<`
+/// open a level, `]` and `>>` close one, a lone `<` starts a hexadecimal string
+/// skipped to `>`, `%` a comment skipped to the end of the line, `(` a string
+/// level; inside a string `\` skips the next byte, `(` opens and `)` closes a
+/// level, every other byte is text. Levels of the three kinds are counted
+/// together, unclosed ones included. Returns as soon as the depth passes
+/// [`MAP_NESTING_LIMIT`]. Iterative, O(n) time, O(1) space.
+pub(crate) fn map_nesting(bytes: &[u8]) -> u32 {
+    let (mut depth, mut max, mut string) = (0u32, 0u32, 0u32);
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if string > 0 {
+            match byte {
+                b'\\' => at += 1,
+                b'(' => {
+                    string += 1;
+                    depth += 1;
+                }
+                b')' => {
+                    string -= 1;
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'[' | b'(' => {
+                    depth += 1;
+                    string = u32::from(byte == b'(');
+                }
+                b']' => depth = depth.saturating_sub(1),
+                b'<' if bytes.get(at) == Some(&b'<') => {
+                    at += 1;
+                    depth += 1;
+                }
+                b'>' if bytes.get(at) == Some(&b'>') => {
+                    at += 1;
+                    depth = depth.saturating_sub(1);
+                }
+                b'<' => {
+                    while at < bytes.len() && bytes[at] != b'>' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                b'%' => {
+                    while at < bytes.len() && !matches!(bytes[at], b'\n' | b'\r') {
+                        at += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        max = max.max(depth);
+        if max > MAP_NESTING_LIMIT {
+            return max;
+        }
+    }
+    max
+}
+
+/// The streams `make_font` decodes for `font`, by its `Subtype` (`lib.rs:322-332`),
+/// each with whether it is a character map or code map the reader parses
+/// (`ToUnicode`, a composite font's `Encoding`); font files are not.
+fn font_streams(doc: &Document, font: &Dictionary) -> Vec<(ObjectId, bool)> {
     let subtype =
         font.get(b"Subtype").ok().and_then(|o| resolve(doc, o)).and_then(|o| o.1.as_name().ok());
     let mut ids = Vec::new();
     match subtype {
-        Some(b"Type0") => ids.extend(stream_at(doc, font, b"Encoding")),
+        Some(b"Type0") => ids.extend(stream_at(doc, font, b"Encoding").map(|id| (id, true))),
         // The reader panics on a font without `Subtype`: nothing is decoded.
         None => return ids,
         Some(b"Type3") => {}
         Some(other) => {
             if let Some(descriptor) = dict_at(doc, font, b"FontDescriptor") {
                 match other {
-                    b"Type1" => ids.extend(stream_at(doc, descriptor, b"FontFile")),
-                    b"TrueType" => ids.extend(stream_at(doc, descriptor, b"FontFile2")),
+                    b"Type1" => {
+                        ids.extend(stream_at(doc, descriptor, b"FontFile").map(|i| (i, false)))
+                    }
+                    b"TrueType" => {
+                        ids.extend(stream_at(doc, descriptor, b"FontFile2").map(|i| (i, false)))
+                    }
                     _ => {}
                 }
-                ids.extend(stream_at(doc, descriptor, b"FontFile3"));
+                ids.extend(stream_at(doc, descriptor, b"FontFile3").map(|i| (i, false)));
             }
         }
     }
-    ids.extend(stream_at(doc, font, b"ToUnicode"));
+    ids.extend(stream_at(doc, font, b"ToUnicode").map(|id| (id, true)));
     ids
 }
 
@@ -2066,5 +2152,21 @@ mod tests {
         assert_eq!((flagged, stand_ins.len()), (1, 1));
         assert_eq!(invalid_tints(4, b"{ 0.5 mul }").0, 0);
         assert_eq!(invalid_tints(0, b"\xFF\xFE").0, 0);
+    }
+
+    #[test]
+    fn map_nesting_counts_lists_dictionaries_and_strings() {
+        assert_eq!(map_nesting(b"[[<< /K (()) >>]]"), 5);
+        assert_eq!(map_nesting(&b"[".repeat(64)), 64);
+        assert_eq!(map_nesting(&b"[".repeat(65)), 65);
+        assert_eq!(map_nesting(b"((("), 3);
+    }
+
+    #[test]
+    fn map_nesting_skips_escapes_hex_strings_and_comments() {
+        assert_eq!(map_nesting(b"(\\( \\( [)"), 1);
+        assert_eq!(map_nesting(b"<0A0B> [ ]"), 1);
+        assert_eq!(map_nesting(b"% [[[[\n[ ]"), 1);
+        assert_eq!(map_nesting(b"<< >>"), 1);
     }
 }

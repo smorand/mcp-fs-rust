@@ -7,7 +7,10 @@
 use crate::errors::{Result, code};
 use crate::tools::archive_testkit::*;
 use crate::tools::nesting_testkit::*;
-use crate::tools::pdf_testkit::{STREAM_LIMIT, decoded_held, pdf_held_reset};
+use crate::tools::pdf_testkit::{
+    PDF_BOMB, PdfObj, STREAM_LIMIT, decoded_held, flate, pages_writer, pdf_held_reset, plain,
+    zlib_run,
+};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -261,4 +264,129 @@ fn e2e_0092_021_page_tree_climb_before_the_page_s_dra() {
 
         climb_refusal(&v, "/docs/climbloop.pdf");
     });
+}
+
+/// The character map refusal of page 1 of `doc`.
+fn map_refusal(v: &Result<Value>, doc: &str) {
+    let Err(e) = v else { panic!("the extraction must be refused: {v:?}") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        format!("could not extract {doc}: a PDF character map is nested more than 64 deep")
+    );
+}
+
+/// As [`exploit`], for a refusal of a character map.
+async fn map_exploit(doc: &str, bytes: Vec<u8>) {
+    let f = nesting_fixture().await;
+    seed(&f, doc, &bytes).await;
+    let pid_before = std::process::id();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let bystander = tokio::spawn(bystander_loop(f.state.clone(), rx));
+
+    let start = Instant::now();
+    let v = extract_text(&f, OWNER, doc, false).await;
+    let took = start.elapsed();
+
+    stop.send(true).expect("the bystander listens");
+    let reads = bystander.await.expect("every bystander read answered hello");
+    assert!(reads >= 1, "the bystander never read");
+    map_refusal(&v, doc);
+    assert!(took < refusal_bound(), "the refusal took {took:?}");
+    nothing_left(&f, doc, None).await;
+    still_up(&f, pid_before).await;
+}
+
+#[test]
+fn e2e_0092_sec_007_character_map_of_10_000_nested_li() {
+    in_child(MODULE, "e2e_0092_sec_007_character_map_of_10_000_nested_li", || {
+        map_exploit("/docs/cmapdeep.pdf", cmap_pdf(&nested_map("[", "]", 10_000)))
+    });
+}
+
+#[test]
+fn e2e_0092_sec_008_character_map_with_100_000_nested() {
+    in_child(MODULE, "e2e_0092_sec_008_character_map_with_100_000_nested", || {
+        map_exploit("/docs/cmapparen.pdf", cmap_pdf(&nested_map("(", ")", 100_000)))
+    });
+}
+
+#[test]
+fn e2e_0092_sec_009_character_map_with_100_000_nested() {
+    in_child(MODULE, "e2e_0092_sec_009_character_map_with_100_000_nested", || {
+        map_exploit("/docs/cmapdict.pdf", cmap_pdf(&nested_map("<< /K ", ">> ", 100_000)))
+    });
+}
+
+#[test]
+fn e2e_0092_sec_010_composite_font_code_map_of_10_000() {
+    in_child(MODULE, "e2e_0092_sec_010_composite_font_code_map_of_10_000", || {
+        map_exploit("/docs/type0.pdf", type0_pdf(&nested_map("[", "]", 10_000)))
+    });
+}
+
+#[tokio::test]
+async fn e2e_0092_007_character_map_nested_exactly_64_deep() {
+    let f = nesting_fixture().await;
+    let body = format!(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /X {}{} def endcmap end end",
+        "[".repeat(64),
+        "]".repeat(64)
+    );
+    seed(&f, "/docs/cmap64.pdf", &cmap_pdf(&body)).await;
+
+    let v = extract_text(&f, OWNER, "/docs/cmap64.pdf", false).await.expect("64 levels extract");
+
+    assert!(v["preview"].as_str().unwrap().contains("Hello"), "{v}");
+}
+
+#[tokio::test]
+async fn e2e_0092_014_character_map_nested_65_deep() {
+    let f = nesting_fixture().await;
+    let pid_before = std::process::id();
+    seed(&f, "/docs/cmap65.pdf", &cmap_pdf(&nested_map("[", "]", 65))).await;
+
+    let v = extract_text(&f, OWNER, "/docs/cmap65.pdf", false).await;
+
+    map_refusal(&v, "/docs/cmap65.pdf");
+    nothing_left(&f, "/docs/cmap65.pdf", None).await;
+    still_up(&f, pid_before).await;
+}
+
+#[test]
+fn e2e_0092_022_form_depth_before_a_later_character_m() {
+    in_child(MODULE, "e2e_0092_022_form_depth_before_a_later_character_m", || async {
+        let f = nesting_fixture().await;
+        seed(&f, "/docs/order.pdf", &order_pdf()).await;
+
+        let v = extract_text(&f, OWNER, "/docs/order.pdf", false).await;
+
+        depth_refusal(&v, "/docs/order.pdf");
+    });
+}
+
+/// DEC-005: a map is scanned after its stream limit, not while it is measured.
+#[tokio::test]
+async fn map_nesting_is_checked_after_the_stream_limit() {
+    let _heavy = heavy().await;
+    let f = nesting_fixture().await;
+    let stored = zlib_run(&"[".repeat(100), b' ', PDF_BOMB, "");
+    let mut w = pages_writer(vec![plain(HELLO_TEXT)], "");
+    w.object(
+        5,
+        PdfObj::Body(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 9 0 R >>".to_string(),
+        ),
+    );
+    w.object(9, flate("", stored));
+    seed(&f, "/docs/mapbomb.pdf", &w.finish()).await;
+
+    let v = extract_text(&f, OWNER, "/docs/mapbomb.pdf", false).await;
+
+    let Err(e) = v else { panic!("the extraction must be refused") };
+    assert_eq!(e.code, code::INVALID_ARGUMENT, "{e:?}");
+    assert_eq!(
+        e.message,
+        "could not extract /docs/mapbomb.pdf: a PDF stream decodes to more than 104857600 bytes"
+    );
 }
