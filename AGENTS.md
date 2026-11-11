@@ -210,6 +210,7 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   review the diff (`tools/contract_golden.rs`).
 
 ## Conventions
+- **Backlog rule:** no backlog entry (`sdlc/backlog/BL-*.md`) is created without the owner's explicit validation. A side finding goes into one line of the end-of-work report, never into the backlog. A review or audit fixes what it finds inside the story, or says so in the report.
 - `mount_id` is a required parameter on every `fs.*` and `git.*` tool. Errors are
   `ToolError::<code>(msg)` carrying a stable `ERR_*`.
 - Tool parameter names are snake_case, which is what the generated JSON schema exposes.

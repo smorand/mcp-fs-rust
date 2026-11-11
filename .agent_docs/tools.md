@@ -662,3 +662,14 @@ trail. The same rule holds on the REST plane and on the git HTTP routes.
 
 `is_owner` and `is_admin` in tool output are computed caselessly, exactly like
 the checks that authorize, so a reported flag can never contradict the gate.
+
+## Known limits (2026-11, accepted, not tracked as backlog)
+Observed while hardening the extraction paths; none is a reported defect, all are accepted as they are.
+* Office extraction holds copies the SPEC-0088 figures do not count: a part repaired from invalid UTF-8, the joined and trimmed content, and an empty grid cell costing a 24 byte `String` for 4 bytes of markup. The real heap of a call is a small multiple of the stated limits.
+* The PDF text pass rebuilds the page map on every page (`output_doc_page`), so time grows with the square of the page count, within SPEC-0089's object limit.
+* PDF parsed structures (content operations, cross reference entries, object tables) can be much larger than the bytes they come from; SPEC-0089 bounds decoded bytes, not parsed structures. This is also why the held figures are logical bytes.
+* No total limit across the cross reference streams of a PDF `/Prev` chain: each is held to the stream limit, the work grows with the chain, the peak stays near one stream.
+* A converter bundle file that keeps growing between the size check and the read is read at its new size; a converter's own child processes survive the kill on the cap or the timeout. Both need an operator-chosen, misbehaving converter.
+* A damaged Office part reads as absent ("main part is missing", a sheet or slide silently left out) instead of being reported as damaged.
+* Other tools and REST routes clamp a path climbing above the project root to the root (SPEC-0018); only `extract_archive` refuses it (SPEC-0086).
+* The debug test profile does not optimize the RAR crypto crates, so SPEC-0087 E2E-034 runs a reduced set of right-password lengths (`[profile.dev]` in `Cargo.toml` helps).
