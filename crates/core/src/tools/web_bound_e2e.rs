@@ -910,3 +910,233 @@ async fn e2e_0093_037_compressed_download_saved_as_received() {
     let client = state.stores.client("atlas").await.unwrap();
     assert_eq!(client.read_bytes("/downloads/packed.gz").await.unwrap(), body);
 }
+
+// ── SPEC-0093/US-0239: the project side of the write limit ──────────────────
+
+const OLD_PATH: &str = "/downloads/old.bin";
+
+/// Give `atlas` exactly `used` stored bytes and the storage `limit`. With `old`,
+/// that many of the used bytes are `OLD_PATH`, already read by the member so an
+/// overwrite passes the read before write check.
+async fn project_with(state: &crate::state::AppState, used: i64, old: Option<i64>, limit: i64) {
+    let client = state.stores.client("atlas").await.unwrap();
+    let mut kept = 0;
+    if let Some(n) = old {
+        client.write_bytes_atomic(OLD_PATH, &vec![b'o'; n as usize]).await.unwrap();
+        state.safety.record_read(MEMBER, "atlas", OLD_PATH);
+        kept = n;
+    }
+    let stored = crate::quota::used_bytes(&client).await.unwrap();
+    let filler = used - stored;
+    assert!(filler >= 0, "the project already holds {stored} bytes, wanted {used} with {kept}");
+    client.write_bytes_atomic("/docs/filler.bin", &vec![b'f'; filler as usize]).await.unwrap();
+    state.admin.set_quota("atlas", Some(limit)).await.unwrap();
+}
+
+/// A refused call left the project as it was: no file at `path` (or `before` in
+/// it), no write line, the usage unchanged. Unlike `nothing_left` it writes
+/// nothing, since the project has a small limit.
+async fn project_untouched(
+    state: &crate::state::AppState,
+    path: &str,
+    before: Option<&[u8]>,
+    used: i64,
+) {
+    let client = state.stores.client("atlas").await.unwrap();
+    match before {
+        None => assert!(!client.exists(path).await.unwrap(), "{path} must not exist"),
+        Some(bytes) => assert_eq!(client.read_bytes(path).await.unwrap(), bytes, "{path} changed"),
+    }
+    assert_eq!(crate::quota::used_bytes(&client).await.unwrap(), used, "the usage moved");
+    assert_eq!(write_lines(state, path), 0, "a write line was audited for {path}");
+}
+
+fn assert_project_refusal(v: &Value, message: &str) {
+    let text = refusal_text(v);
+    assert!(text.contains("ERR_PROJECT_QUOTA_EXCEEDED"), "{text}");
+    assert!(text.contains(message), "{text}");
+}
+
+const TWO_MB: i64 = 2_097_152;
+
+// ── SPEC-0093/E2E-009 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_009_download_of_exactly_the_project_side() {
+    let (app, token, state, _d) = served(true, None).await;
+    project_with(&state, 1_000_000, None, TWO_MB).await;
+    let (port, _rec) =
+        stand_in(vec![("/fit", Script::Letters { letter: b'z', n: 1_097_152, chunked: true })])
+            .await;
+    let (_url, args) = download_args(port, "/fit", "/downloads/fit.bin");
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_eq!(success_payload(&v)["bytes_written"], 1_097_152);
+    let client = state.stores.client("atlas").await.unwrap();
+    assert_eq!(crate::quota::used_bytes(&client).await.unwrap(), TWO_MB);
+}
+
+// ── SPEC-0093/E2E-010 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_010_overwrite_counts_the_replaced_file() {
+    let (app, token, state, _d) = served(true, None).await;
+    project_with(&state, 1_000_000, Some(500_000), TWO_MB).await;
+    let (port, _rec) =
+        stand_in(vec![("/fit", Script::Letters { letter: b'z', n: 1_597_152, chunked: true })])
+            .await;
+    let (_url, args) = download_args(port, "/fit", OLD_PATH);
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    let payload = success_payload(&v);
+    assert_eq!(payload["bytes_written"], 1_597_152);
+    assert_eq!(payload["overwritten"], true);
+    let client = state.stores.client("atlas").await.unwrap();
+    assert_eq!(crate::quota::used_bytes(&client).await.unwrap(), TWO_MB);
+}
+
+// ── SPEC-0093/E2E-019 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_019_download_over_the_project_side_chunke() {
+    let (app, token, state, _d) = served(true, None).await;
+    project_with(&state, 1_000_000, None, TWO_MB).await;
+    let (port, rec) =
+        stand_in(vec![("/over", Script::Letters { letter: b'z', n: 5_000_000, chunked: true })])
+            .await;
+    let (url, args) = download_args(port, "/over", "/downloads/over.bin");
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_project_refusal(
+        &v,
+        "project storage quota of 2 MB exceeded: 1000000 bytes used, 1097153 bytes requested",
+    );
+    let held = answer_held(&url);
+    assert!(held.iter().all(|h| *h <= 2_145_728), "the answer held {held:?}");
+    assert!(held.iter().any(|h| *h > 1_097_152), "the refusal must count what it read: {held:?}");
+    wait_closed_early(&rec).await;
+    project_untouched(&state, "/downloads/over.bin", None, 1_000_000).await;
+}
+
+// ── SPEC-0093/E2E-020 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_020_download_declaring_a_length_over_the() {
+    let (app, token, state, _d) = served(true, None).await;
+    project_with(&state, 1_000_000, None, TWO_MB).await;
+    let (port, rec) = stand_in(vec![(
+        "/over",
+        Script::Declared {
+            length: 5_000_000,
+            pause: Duration::from_secs(10),
+            then: Box::new(Script::Letters { letter: b'z', n: 5_000_000, chunked: false }),
+        },
+    )])
+    .await;
+    let (url, args) = download_args(port, "/over", "/downloads/over.bin");
+    answer_held_reset();
+    let started = Instant::now();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_project_refusal(
+        &v,
+        "project storage quota of 2 MB exceeded: 1000000 bytes used, 5000000 bytes requested",
+    );
+    assert!(started.elapsed() < Duration::from_secs(8), "waited {:?}", started.elapsed());
+    assert_eq!(answer_held(&url), vec![0]);
+    wait_closed_early(&rec).await;
+    assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
+    project_untouched(&state, "/downloads/over.bin", None, 1_000_000).await;
+}
+
+// ── SPEC-0093/E2E-021 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_021_overwrite_over_the_project_side() {
+    let (app, token, state, _d) = served(true, None).await;
+    project_with(&state, 1_000_000, Some(500_000), TWO_MB).await;
+    let message =
+        "project storage quota of 2 MB exceeded: 1000000 bytes used, 1097153 bytes requested";
+    let (port, _rec) = stand_in(vec![
+        ("/chunked", Script::Letters { letter: b'z', n: 1_597_153, chunked: true }),
+        (
+            "/declared",
+            Script::Declared {
+                length: 1_597_153,
+                pause: Duration::from_secs(10),
+                then: Box::new(Script::Letters { letter: b'z', n: 1_597_153, chunked: false }),
+            },
+        ),
+    ])
+    .await;
+    let old = vec![b'o'; 500_000];
+
+    for route in ["/chunked", "/declared"] {
+        let (_url, args) = download_args(port, route, OLD_PATH);
+        let v = call_tool(&app, &token, "web.download", args).await;
+        assert_project_refusal(&v, message);
+        project_untouched(&state, OLD_PATH, Some(&old), 1_000_000).await;
+    }
+}
+
+// ── SPEC-0093/E2E-022 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_022_tie_between_the_two_sides() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    project_with(&state, 10_485_760, None, 62_914_560).await;
+    let (port, _rec) = stand_in(vec![(
+        "/tie",
+        Script::Letters { letter: b'z', n: SESSION_QUOTA + 1, chunked: true },
+    )])
+    .await;
+    let (_url, args) = download_args(port, "/tie", "/downloads/tie.bin");
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_project_refusal(
+        &v,
+        "project storage quota of 60 MB exceeded: 10485760 bytes used, 52428801 bytes requested",
+    );
+    project_untouched(&state, "/downloads/tie.bin", None, 10_485_760).await;
+}
+
+// ── SPEC-0093/E2E-023 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_023_session_partly_spent() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let client = state.stores.client("atlas").await.unwrap();
+    crate::core::fs_ops::write_bytes(
+        &client,
+        &state.safety,
+        MEMBER,
+        "atlas",
+        "/docs/spent.bin",
+        &vec![b's'; 50_000_000],
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    let (port, _rec) =
+        stand_in(vec![("/late", Script::Letters { letter: b'z', n: 3_000_000, chunked: true })])
+            .await;
+    let (url, args) = download_args(port, "/late", "/downloads/late.bin");
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    let held = answer_held(&url);
+    assert!(held.iter().all(|h| *h <= 3_477_376), "the answer held {held:?}");
+    assert!(held.iter().any(|h| *h > 2_428_800), "the refusal must count what it read: {held:?}");
+    assert!(!client.exists("/downloads/late.bin").await.unwrap());
+}

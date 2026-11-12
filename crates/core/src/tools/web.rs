@@ -114,7 +114,8 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::WebConfig) {
                     );
                     let (mount, client) = volume(&ctx, &fake_a).await?;
                     let path = norm(&ctx, &fake_a, "path")?;
-                    let limit = write_limit(&ctx.state.safety, &ctx.person, &mount);
+                    let limit =
+                        write_limit(&client, &ctx.state.safety, &ctx.person, &mount, &path).await?;
                     let (bytes, _content_type) =
                         fetch_raw(&url, timeout, limit.cap, |d| limit.refusal(d)).await?;
                     fs_ops::write_bytes(
@@ -158,7 +159,7 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::WebConfig) {
             let timeout = a.int_or("timeout_secs", 30).clamp(1, 120) as u64;
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            let limit = write_limit(&ctx.state.safety, &ctx.person, &mount);
+            let limit = write_limit(&client, &ctx.state.safety, &ctx.person, &mount, &path).await?;
             let (bytes, content_type) =
                 fetch_raw(&url, timeout, limit.cap, |d| limit.refusal(d)).await?;
             let mut result = fs_ops::write_bytes(
@@ -465,36 +466,77 @@ async fn fetch_raw(
     Ok((bytes, content_type))
 }
 
-/// What a download or a saved page may keep: the bytes the session may still write.
+/// What a download or a saved page may keep: the lower of the bytes the project
+/// can still take and the bytes the session may still write, a tie going to the
+/// project (the choice SPEC-0084 makes for archives).
 ///
 /// Computed after membership and the path check and before the request, so a
-/// flood is refused while it is read instead of after it was held whole. The
-/// project storage side joins it in the next story, the lower of the two winning.
+/// flood is refused while it is read instead of after it was held whole.
 pub(crate) struct WriteLimit {
     pub(crate) cap: u64,
     /// The configured session quota, for the message.
     quota: i64,
+    /// Set when the project side sets the cap.
+    project: Option<ProjectSide>,
 }
 
-pub(crate) fn write_limit(
+/// The figures of a project refusal, kept from the moment the limit was computed.
+struct ProjectSide {
+    limit: i64,
+    used: i64,
+    /// Size of the file the write replaces, 0 when the destination is free.
+    replaced: i64,
+}
+
+/// Time O(1) in the answer, two metadata reads; the answer is not touched.
+pub(crate) async fn write_limit(
+    client: &crate::storage::volume::VolumeClient,
     safety: &crate::safety::SafetyManager,
     person: &str,
     mount: &str,
-) -> WriteLimit {
-    WriteLimit {
-        cap: safety.session_remaining(person, mount).max(0) as u64,
-        quota: safety.config().write_quota_bytes,
+    path: &str,
+) -> crate::errors::Result<WriteLimit> {
+    let session = safety.session_remaining(person, mount).max(0) as u64;
+    let quota = safety.config().write_quota_bytes;
+    let Some(limit) = safety.project_limit(&client.project_id).await? else {
+        return Ok(WriteLimit { cap: session, quota, project: None });
+    };
+    let replaced = match client.meta.get(path).await? {
+        Some(node) if node.kind == "file" => node.size,
+        _ => 0,
+    };
+    let used = crate::quota::used_bytes(client).await?;
+    let remaining = (limit - used + replaced).max(0) as u64;
+    if remaining <= session {
+        Ok(WriteLimit {
+            cap: remaining,
+            quota,
+            project: Some(ProjectSide { limit, used, replaced }),
+        })
+    } else {
+        Ok(WriteLimit { cap: session, quota, project: None })
     }
 }
 
 impl WriteLimit {
-    /// Today's session refusal, word for word, whether the declared length or the
-    /// bytes read passed the limit.
-    pub(crate) fn refusal(&self, _declared: Option<u64>) -> ToolError {
-        ToolError::write_quota_exceeded(format!(
-            "session write quota of {} bytes exceeded",
-            self.quota
-        ))
+    /// The refusal of the side that set the cap. Session: today's message with
+    /// the configured quota. Project: today's message with net growth, the
+    /// declared length minus the replaced file, or one byte past what is left
+    /// when the limit was passed while reading.
+    pub(crate) fn refusal(&self, declared: Option<u64>) -> ToolError {
+        match &self.project {
+            None => ToolError::write_quota_exceeded(format!(
+                "session write quota of {} bytes exceeded",
+                self.quota
+            )),
+            Some(p) => {
+                let requested = match declared {
+                    Some(d) => (d as i64).saturating_sub(p.replaced),
+                    None => p.limit - p.used + 1,
+                };
+                ToolError::project_quota_exceeded(p.limit, p.used, requested)
+            }
+        }
     }
 }
 

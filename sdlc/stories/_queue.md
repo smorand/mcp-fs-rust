@@ -238,5 +238,5 @@
 | US-0236 | SPEC-0093 | cap search, news and suggestion answers | US-0235 | 2 | landed | story/US-0236-cap-search-news-and-suggestion-answers | story/US-0235-cap-a-fetched-page-at-16-mib |
 | US-0237 | SPEC-0093 | cap the library documentation answers | US-0236 | 2 | landed | story/US-0237-cap-the-library-documentation-answers | story/US-0236-cap-search-news-and-suggestion-answers |
 | US-0238 | SPEC-0093 | stop a download or a saved page at the session allowance | US-0237 | 2 | landed | story/US-0238-stop-a-download-or-a-saved-page-at-the-s | story/US-0237-cap-the-library-documentation-answers |
-| US-0239 | SPEC-0093 | stop a download at the project storage limit | US-0238 | 2 | todo | | |
+| US-0239 | SPEC-0093 | stop a download at the project storage limit | US-0238 | 2 | landed | story/US-0239-stop-a-download-at-the-project-storage-l | story/US-0238-stop-a-download-or-a-saved-page-at-the-s |
 | US-0240 | SPEC-0093 | web refusals in order, without trace, families off, and documentation | US-0239 | 2 | todo | | |
