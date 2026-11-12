@@ -37,6 +37,8 @@ pub struct SafetyManager {
     /// a growing write fail closed; a caller where no limit applies says so
     /// with [`SafetyManager::attach_no_limits`].
     limits: OnceLock<LimitsSource>,
+    /// Where documents decode, one ceiling per server (SPEC-0091 DEC-005).
+    decode_places: crate::docs::extract::DecodePlaces,
 }
 
 /// Where project limits come from, once a composition has decided.
@@ -48,7 +50,17 @@ enum LimitsSource {
 
 impl SafetyManager {
     pub fn new(config: SafetyConfig) -> Self {
-        Self { config, sessions: Mutex::new(HashMap::new()), limits: OnceLock::new() }
+        Self {
+            config,
+            sessions: Mutex::new(HashMap::new()),
+            limits: OnceLock::new(),
+            decode_places: crate::docs::extract::DecodePlaces::new(),
+        }
+    }
+
+    /// The places where documents decode.
+    pub(crate) fn decode_places(&self) -> &crate::docs::extract::DecodePlaces {
+        &self.decode_places
     }
 
     /// Read project storage limits from `admin` (SPEC-0020). A second call is

@@ -87,6 +87,8 @@ pub(crate) mod nesting_testkit;
 #[cfg(test)]
 mod office_bound_e2e;
 #[cfg(test)]
+pub(crate) mod offload_e2e;
+#[cfg(test)]
 mod pdf_bound_e2e;
 #[cfg(test)]
 pub(crate) mod pdf_testkit;

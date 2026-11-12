@@ -1739,6 +1739,7 @@ pub async fn extract_document(
     let prepared = crate::docs::extract::prepare_extraction(
         client,
         provider.as_ref(),
+        safety.decode_places(),
         norm,
         max_chars,
         preview_chars,

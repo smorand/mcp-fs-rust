@@ -136,21 +136,183 @@ impl ExtractResult {
     }
 }
 
+/// The places where documents decode: as many at once as the runtime has
+/// request processing threads, so peak memory of concurrent decodings is the
+/// ceiling the readers had when they ran on those threads (SPEC-0091 DEC-001).
+/// Owned by the `SafetyManager`, so each server has its own and parallel tests
+/// never share one (DEC-005).
+#[derive(Default)]
+pub struct DecodePlaces {
+    /// Built at the first acquire, on the runtime that serves the requests.
+    semaphore: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>,
+    #[cfg(test)]
+    probe: std::sync::Arc<std::sync::Mutex<PlacesProbe>>,
+}
+
+/// What the places saw, for the tests.
+#[cfg(test)]
+#[derive(Default)]
+struct PlacesProbe {
+    running: usize,
+    most: usize,
+    started: Vec<String>,
+    /// When each decoding began and, once it ended, when.
+    windows: Vec<(std::time::Instant, Option<std::time::Instant>)>,
+}
+
+/// A decoding in progress in the probe; ends it when dropped, panic included.
+#[cfg(test)]
+pub(crate) struct Running(std::sync::Arc<std::sync::Mutex<PlacesProbe>>, usize);
+
+#[cfg(test)]
+impl Running {
+    fn start(probe: std::sync::Arc<std::sync::Mutex<PlacesProbe>>, path: &str) -> Self {
+        let mut at = 0;
+        if let Ok(mut p) = probe.lock() {
+            p.running += 1;
+            p.most = p.most.max(p.running);
+            p.started.push(path.to_string());
+            p.windows.push((std::time::Instant::now(), None));
+            at = p.windows.len() - 1;
+        }
+        Self(probe, at)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(mut p) = self.0.lock() {
+            p.running -= 1;
+            p.windows[self.1].1 = Some(std::time::Instant::now());
+        }
+    }
+}
+
+impl DecodePlaces {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wait for a place; it is free again when the returned permit is dropped.
+    /// The semaphore is built here, on the runtime that serves the requests,
+    /// with one place per worker thread (at least one: a current thread test
+    /// runtime reports one).
+    pub(crate) async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let semaphore = self
+            .semaphore
+            .get_or_init(|| {
+                let workers = tokio::runtime::Handle::current().metrics().num_workers().max(1);
+                std::sync::Arc::new(tokio::sync::Semaphore::new(workers))
+            })
+            .clone();
+        semaphore.acquire_owned().await.map_err(|_| ToolError::internal("decoding places closed"))
+    }
+
+    /// The most decodings that ran at once.
+    #[cfg(test)]
+    pub(crate) fn most_at_once(&self) -> usize {
+        self.probe.lock().map_or(0, |p| p.most)
+    }
+
+    /// When each decoding began and ended (`None` while it runs), in order.
+    #[cfg(test)]
+    pub(crate) fn windows(&self) -> Vec<(std::time::Instant, Option<std::time::Instant>)> {
+        self.probe.lock().map(|p| p.windows.clone()).unwrap_or_default()
+    }
+
+    /// The paths whose decoding started, in order.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> Vec<String> {
+        self.probe.lock().map(|p| p.started.clone()).unwrap_or_default()
+    }
+}
+
+/// The test only figures a decoding thread measured, carried back to the thread
+/// that awaited the call because the readers write them to thread locals the
+/// SPEC-0088 and SPEC-0089 suites read there (SPEC-0091 DEC-004).
+#[derive(Default)]
+struct Figures {
+    #[cfg(test)]
+    office: Option<OfficeHeld>,
+    #[cfg(test)]
+    pdf: Option<PdfHeld>,
+}
+
+impl Figures {
+    /// Take both figures off this thread.
+    fn take() -> Self {
+        #[cfg(test)]
+        return Self {
+            office: LAST_OFFICE_HELD.with(std::cell::Cell::take),
+            pdf: LAST_PDF_HELD.with(std::cell::Cell::take),
+        };
+        #[cfg(not(test))]
+        Self::default()
+    }
+
+    /// Set both figures on this thread, for the code that moves them into the
+    /// per path maps with no `.await` between.
+    fn restore(self) {
+        #[cfg(test)]
+        {
+            LAST_OFFICE_HELD.with(|c| c.set(self.office));
+            LAST_PDF_HELD.with(|c| c.set(self.pdf));
+        }
+    }
+}
+
+/// One of the six built in readers: a synchronous decoding of the whole document.
+type Reader = fn(&[u8]) -> Result<ExtractResult>;
+
+/// The reader of an extension that needs one, `None` for every other suffix
+/// (images, fenced and text suffixes take no place and stay on the request side).
+fn builtin_reader(ext: &str) -> Option<Reader> {
+    Some(match ext {
+        ".pdf" => pdf,
+        ".docx" => docx,
+        ".pptx" | ".pptm" | ".potx" | ".ppsx" => pptx,
+        ".xlsx" | ".xlsm" => xlsx,
+        ".html" | ".htm" => |d| Ok(html(d)),
+        ".csv" => |d| Ok(csv(d)),
+        _ => return None,
+    })
+}
+
 /// The extraction engine. Borrows the OCR provider so the composition root owns
 /// it and a single instance serves every request.
 pub struct Extractor<'a> {
     ocr: &'a dyn OcrProvider,
+    places: Option<&'a DecodePlaces>,
 }
 
 impl<'a> Extractor<'a> {
+    /// An extractor with no ceiling on concurrent decodings (unit tests).
     pub fn new(ocr: &'a dyn OcrProvider) -> Self {
-        Self { ocr }
+        Self { ocr, places: None }
+    }
+
+    /// The production extractor: decodings wait for a place in `places`.
+    pub fn with_places(ocr: &'a dyn OcrProvider, places: &'a DecodePlaces) -> Self {
+        Self { ocr, places: Some(places) }
     }
 
     /// Extract `data` named `filename` to Markdown, capped at `max_chars`.
     pub async fn extract(
         &self,
         data: &[u8],
+        filename: &str,
+        max_chars: usize,
+        ocr_enabled: bool,
+    ) -> Result<ExtractResult> {
+        self.extract_owned(data.to_vec(), filename, max_chars, ocr_enabled).await
+    }
+
+    /// [`Extractor::extract`] for bytes the caller already owns, so a reader
+    /// that runs on the blocking pool takes them without a second copy.
+    pub async fn extract_owned(
+        &self,
+        data: Vec<u8>,
         filename: &str,
         max_chars: usize,
         ocr_enabled: bool,
@@ -162,23 +324,20 @@ impl<'a> Extractor<'a> {
             )));
         }
 
-        let outcome = match ext.as_str() {
-            ".pdf" => pdf(data),
-            ".docx" => docx(data),
-            ".pptx" | ".pptm" | ".potx" | ".ppsx" => pptx(data),
-            ".xlsx" | ".xlsm" => xlsx(data),
-            ".html" | ".htm" => Ok(html(data)),
-            ".csv" => Ok(csv(data)),
-            e if IMAGE_EXTS.contains(&e) => self.image(data, e, ocr_enabled).await,
-            e if FENCED_EXTS.contains(&e) => Ok(fenced(data, e)),
-            e if TEXT_EXTS.contains(&e) || e.is_empty() => {
-                Ok(ExtractResult::of("text", decode(data)))
-            }
-            e => Ok(ExtractResult::of("text", decode(data))
-                .with_note(format!("unknown extension {e}; decoded as text"))),
+        let outcome = match builtin_reader(&ext) {
+            Some(read) => self.read_apart(read, data, filename).await,
+            None => match ext.as_str() {
+                e if IMAGE_EXTS.contains(&e) => self.image(&data, e, ocr_enabled).await,
+                e if FENCED_EXTS.contains(&e) => Ok(fenced(&data, e)),
+                e if TEXT_EXTS.contains(&e) || e.is_empty() => {
+                    Ok(ExtractResult::of("text", decode(&data)))
+                }
+                e => Ok(ExtractResult::of("text", decode(&data))
+                    .with_note(format!("unknown extension {e}; decoded as text"))),
+            },
         };
-        // No await since the Office reader returned, so the slot still holds
-        // this call's figures (SPEC-0088 DEC-008).
+        // No await since the reader's figures were set on this thread, so the
+        // slots still hold this call's figures (SPEC-0088 DEC-008, SPEC-0091 DEC-004).
         #[cfg(test)]
         if let Some(held) = LAST_OFFICE_HELD.with(std::cell::Cell::take) {
             OFFICE_HELD.with(|m| m.borrow_mut().insert(filename.to_string(), held));
@@ -194,6 +353,54 @@ impl<'a> Extractor<'a> {
         result.text = text;
         result.truncated = truncated;
         Ok(result)
+    }
+
+    /// Run `read` over `data` on the blocking pool, so no request processing
+    /// thread is held while a document decodes (SPEC-0091 DEC-002).
+    ///
+    /// The place is taken here, before the task is spawned, and moves into the
+    /// closure: a request dropped while it waits never starts a decoding, and
+    /// one dropped after it started leaves the decoding its place until it ends
+    /// (DEC-003). Time: the reader's own, plus the wait for a place; space: the
+    /// document bytes, moved in, never copied again.
+    async fn read_apart(
+        &self,
+        read: Reader,
+        data: Vec<u8>,
+        #[cfg_attr(not(test), allow(unused_variables))] filename: &str,
+    ) -> Result<ExtractResult> {
+        let permit = match self.places {
+            Some(places) => Some(places.acquire().await?),
+            None => None,
+        };
+        #[cfg(test)]
+        let probe = self.places.map(|p| (p.probe.clone(), filename.to_string()));
+        let joined = tokio::task::spawn_blocking(move || {
+            // Dropped last: the place is free only once the figures are taken.
+            let _permit = permit;
+            #[cfg(test)]
+            let _run = probe.map(|(probe, path)| Running::start(probe, &path));
+            // A pooled thread keeps its thread locals between decodings, so a
+            // stale figure must not reach this one (DEC-004).
+            #[cfg(test)]
+            {
+                LAST_OFFICE_HELD.with(|c| c.set(None));
+                LAST_PDF_HELD.with(|c| c.set(None));
+            }
+            let outcome = read(&data);
+            let figures = Figures::take();
+            (outcome, figures)
+        })
+        .await;
+        match joined {
+            Ok((outcome, figures)) => {
+                figures.restore();
+                outcome
+            }
+            // Today's behaviour until a reader that stops has its own answer.
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => Err(ToolError::internal("decoding was cancelled")),
+        }
     }
 
     async fn image(&self, data: &[u8], ext: &str, ocr_enabled: bool) -> Result<ExtractResult> {
@@ -254,8 +461,20 @@ pub async fn extract_text(
     ocr_enabled: bool,
     refresh: bool,
 ) -> Result<Value> {
-    match prepare_extraction(client, ocr, path, max_chars, preview_chars, ocr_enabled, refresh)
-        .await?
+    // No production caller, so it keeps its seven arguments (the unit tests
+    // call it) and a place of its own: one call, no shared ceiling.
+    let places = DecodePlaces::new();
+    match prepare_extraction(
+        client,
+        ocr,
+        &places,
+        path,
+        max_chars,
+        preview_chars,
+        ocr_enabled,
+        refresh,
+    )
+    .await?
     {
         Prepared::Cached(payload) => Ok(payload),
         Prepared::Fresh(fresh) => {
@@ -327,9 +546,11 @@ impl FreshExtraction {
 }
 
 /// Answer from the up to date companion, or extract afresh without writing.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_extraction(
     client: &VolumeClient,
     ocr: &dyn OcrProvider,
+    places: &DecodePlaces,
     path: &str,
     max_chars: usize,
     preview_chars: usize,
@@ -374,8 +595,8 @@ pub async fn prepare_extraction(
     }
 
     let data = client.read_bytes(path).await?;
-    let extractor = Extractor::new(ocr);
-    let result = match extractor.extract(&data, path, max_chars, ocr_enabled).await {
+    let extractor = Extractor::with_places(ocr, places);
+    let result = match extractor.extract_owned(data, path, max_chars, ocr_enabled).await {
         Ok(r) => r,
         Err(e) if e.code == crate::errors::code::NOT_SUPPORTED => return Err(e),
         Err(e) => {
@@ -575,7 +796,7 @@ pub(crate) struct OfficeHeld {
 #[cfg(test)]
 thread_local! {
     /// Figures of the last Office reader that ran on this thread.
-    static LAST_OFFICE_HELD: std::cell::Cell<Option<OfficeHeld>> = const { std::cell::Cell::new(None) };
+    pub(crate) static LAST_OFFICE_HELD: std::cell::Cell<Option<OfficeHeld>> = const { std::cell::Cell::new(None) };
     /// Figures per file name given to `Extractor::extract`, so concurrent calls do not overwrite each other.
     pub(crate) static OFFICE_HELD: std::cell::RefCell<std::collections::HashMap<String, OfficeHeld>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
