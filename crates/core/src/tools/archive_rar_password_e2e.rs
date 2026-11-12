@@ -10,6 +10,8 @@ use serde_json::Value;
 
 const HP4: &[u8] = include_bytes!("../../tests/fixtures/rar/hp4.rar");
 const HP4LONG: &[u8] = include_bytes!("../../tests/fixtures/rar/hp4long.rar");
+const V4_SECRET: &[u8] = include_bytes!("../../tests/fixtures/rar/v4secret.rar");
+const HIDDEN: &[u8] = include_bytes!("../../tests/fixtures/rar/hidden.rar");
 const PASSWORD: &str = "s3cret-Ünï";
 const LONG: &str = "CorrectHorseBatteryStapleÜnï0123456789ab";
 const WRONG: &str =
@@ -311,4 +313,169 @@ async fn e2e_0090_020_three_hundred_wrong_passwords() {
     refused("hp4", HP4, Some("wrong0"), wrong_or_cut).await;
     refused("hp4", HP4, Some("wrong135"), cut).await;
     refused("hp4", HP4, Some("wrong299"), wrong_or_cut).await;
+}
+
+#[tokio::test]
+async fn e2e_0090_021_no_password_unchanged() {
+    refused("hp4", HP4, None, needed).await;
+    refused("hp4half", &HP4[..108], None, needed).await;
+}
+
+#[tokio::test]
+async fn e2e_0090_022_empty_password_unchanged() {
+    refused("hp4", HP4, Some(""), wrong).await;
+    refused("hp4half", &HP4[..108], Some(""), wrong).await;
+}
+
+#[tokio::test]
+async fn e2e_0090_023_readable_names_encrypted_data_unchang() {
+    refused("v4secret", V4_SECRET, Some("nope"), wrong).await;
+}
+
+#[tokio::test]
+async fn e2e_0090_024_version_5_unchanged() {
+    refused("hidden", HIDDEN, Some("nope"), wrong).await;
+}
+
+#[tokio::test]
+async fn e2e_0090_025_not_a_member_comes_first() {
+    const BOB: &str = "bob@example.com";
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    let e = match f.state.authorize(MOUNT, BOB).await {
+        Err(e) => e,
+        Ok(_) => crate::tools::archive::extract_archive(
+            &f.state,
+            MOUNT,
+            BOB,
+            "/uploads/hp4.rar",
+            None,
+            false,
+            Some("nope"),
+        )
+        .await
+        .expect_err("a non member must be refused"),
+    };
+    assert_eq!(e.code, code::FORBIDDEN);
+    assert_eq!(e.message, "'bob@example.com' is not a member of 'atlas'");
+    assert!(!exists(&f, "/uploads/hp4").await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0090_026_wrong_password_before_a_collision() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    seed(&f, "/uploads/hp4/a.txt", b"old").await;
+    let v = extract(&f, "/uploads/hp4.rar", None, false, Some("nope")).await;
+    wrong(&v);
+    assert_eq!(read(&f, "/uploads/hp4/a.txt").await.as_deref(), Some(&b"old"[..]));
+    assert!(!exists(&f, "/uploads/hp4/b.txt").await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0090_027_wrong_password_before_the_storage_lim() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    limit_remaining(&f, 5).await;
+    let allowance_before = allowance(&f);
+    let v = extract(&f, "/uploads/hp4.rar", None, false, Some("nope")).await;
+    wrong(&v);
+    assert_eq!(remaining_storage(&f).await, 5);
+    assert_eq!(allowance(&f), allowance_before);
+    assert!(!exists(&f, "/uploads/hp4").await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0090_028_wrong_password_with_a_new_destination() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    let v = extract(&f, "/uploads/hp4.rar", Some("/out"), false, Some("nope")).await;
+    wrong(&v);
+    assert!(!exists(&f, "/out").await);
+    assert!(!exists(&f, "/uploads/hp4").await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0090_029_a_refused_wrong_password_leaves_nothi() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let used_before = crate::quota::used_bytes(&c).await.unwrap();
+    let allowance_before = allowance(&f);
+    for _ in 0..2 {
+        let v = extract(&f, "/uploads/hp4.rar", None, false, Some("nope")).await;
+        wrong(&v);
+        assert!(!exists(&f, "/uploads/hp4").await);
+        assert_eq!(crate::quota::used_bytes(&c).await.unwrap(), used_before);
+        assert_eq!(allowance(&f), allowance_before);
+        assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+    }
+}
+
+/// The capture records on the thread that took the lock, so the whole body runs on that one
+/// thread (as SPEC-0088 E2E-035).
+#[test]
+fn e2e_0090_030_the_wrong_password_is_never_recorded() {
+    use crate::mcp::server::{ExtractArchiveArgs, McpServer};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    const GUESS: &str = "s3cret-Üni";
+    let _capture = crate::logging::capture::lock_for_test();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let f = fixture().await;
+        seed(&f, "/uploads/hp4.rar", HP4).await;
+        let server = McpServer::new(f.state.clone(), OWNER.to_string());
+        let args = ExtractArchiveArgs {
+            mount_id: MOUNT.into(),
+            path: "/uploads/hp4.rar".into(),
+            destination: None,
+            overwrite: false,
+            password: Some(GUESS.into()),
+        };
+        crate::logging::capture::clear();
+
+        let out = server.fs_extract_archive(Parameters(args)).await.unwrap();
+
+        assert_eq!(out.is_error, Some(true), "{out:?}");
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(text.contains(WRONG), "{text}");
+        assert!(!text.contains(GUESS), "{text}");
+        let events = crate::logging::capture::events();
+        assert!(
+            events.iter().any(|e| format!("{e:?}").contains("ERR_PASSWORD_REQUIRED")),
+            "{events:?}"
+        );
+        assert!(!format!("{events:?}").contains(GUESS), "{events:?}");
+        let log = f.state.safety.audit(OWNER, MOUNT);
+        assert!(!format!("{log:?}").contains(GUESS), "{log:?}");
+        assert!(!log.iter().any(|e| e.path == "/uploads/hp4.rar" && e.op == "extract_archive"));
+    });
+}
+
+#[tokio::test]
+async fn e2e_0090_031_overwrite_set_refused_nothing_replace() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    seed(&f, "/uploads/hp4/a.txt", b"old").await;
+    let v = extract(&f, "/uploads/hp4.rar", None, true, Some("nope")).await;
+    wrong(&v);
+    assert_eq!(read(&f, "/uploads/hp4/a.txt").await.as_deref(), Some(&b"old"[..]));
+    assert!(!exists(&f, "/uploads/hp4/b.txt").await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+}
+
+#[tokio::test]
+async fn e2e_0090_036_retry_with_the_right_password_after_a() {
+    let f = fixture().await;
+    seed(&f, "/uploads/hp4.rar", HP4).await;
+    wrong(&extract(&f, "/uploads/hp4.rar", None, false, Some("s3cret-Üni")).await);
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
+    extract(&f, "/uploads/hp4.rar", None, false, Some(PASSWORD)).await.unwrap();
+    assert_eq!(read(&f, "/uploads/hp4/a.txt").await.as_deref(), Some(&b"hello"[..]));
+    assert_eq!(read(&f, "/uploads/hp4/b.txt").await.as_deref(), Some(&b"goodbye"[..]));
+    assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 1);
 }
