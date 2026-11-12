@@ -6,6 +6,7 @@
 use crate::errors::ToolError;
 use crate::tools::registry_support::handler;
 use crate::tools::registry_support::{ToolRegistry, ToolSchema};
+use crate::tools::web::{ANSWER_LIMIT, host_of, over_answer_limit, read_answer, start_answer};
 use serde_json::Value;
 
 /// Register the two `context7.*` tools.
@@ -108,10 +109,14 @@ async fn resolve_library_id(
             }
         })?;
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| ToolError::internal(format!("parse context7 response: {e}")))?;
+    let bytes = read_answer(resp, &url, ANSWER_LIMIT, "parse context7 response", |_| {
+        over_answer_limit(&host_of(&url))
+    })
+    .await?;
+    // reqwest's own wording for a decode error, kept so the message does not change.
+    let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        ToolError::internal("parse context7 response: error decoding response body")
+    })?;
 
     let results = body.get("results").and_then(|r| r.as_array());
     match results {
@@ -146,17 +151,24 @@ async fn get_library_docs(
             }
         })?;
 
+    // A failure status is answered before the body is touched; the guard records that
+    // nothing was held. A success is recorded by `read_answer` itself.
     let status = resp.status();
     if status.as_u16() == 404 {
+        let _held = start_answer(&url);
         return Err(ToolError::internal(format!("library '{library_id}' not found")));
     }
     if !status.is_success() {
+        let _held = start_answer(&url);
         return Err(ToolError::internal(format!("context7 error: {status}")));
     }
 
-    let text =
-        resp.text().await.map_err(|e| ToolError::internal(format!("read docs response: {e}")))?;
-    Ok(Value::String(text))
+    let bytes = read_answer(resp, &url, ANSWER_LIMIT, "read docs response", |_| {
+        over_answer_limit(&host_of(&url))
+    })
+    .await?;
+    // `text()` without the charset feature decodes lossily as UTF-8.
+    Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// Percent-encode a string for use in a URL query parameter.

@@ -612,7 +612,7 @@ impl Drop for HeldRecord {
 }
 
 #[cfg(test)]
-fn start_answer(url: &str) -> HeldRecord {
+pub(crate) fn start_answer(url: &str) -> HeldRecord {
     let index = ANSWER_HELD.with(|h| {
         let mut h = h.borrow_mut();
         h.push(AnswerHeld { url: url.to_string(), held: 0 });
@@ -631,7 +631,7 @@ impl HeldRecord {
 }
 
 #[cfg(not(test))]
-fn start_answer(_url: &str) -> HeldRecord {
+pub(crate) fn start_answer(_url: &str) -> HeldRecord {
     HeldRecord
 }
 

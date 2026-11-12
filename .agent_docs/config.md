@@ -282,6 +282,20 @@ doc_service:
 
 Details in [`.agent_docs/git.md`](git.md).
 
+## `web` and `context7` (optional families, off by default)
+
+`web.enabled` and `context7.enabled` (with `context7.api_url`) switch the `web.*` and `context7.*`
+families on; while off, the tools are not offered and no remote request is made.
+
+- 2026-11-12 (SPEC-0093, US-0237): `context7.resolve_library_id` and `context7.get_library_docs`
+  read the service's answer through the capped reader. An answer that declares a length past
+  16 777 216 bytes is refused before its body is read, and one that passes it while being read is
+  abandoned (the connection is closed); both are `ERR_INVALID_ARGUMENT`
+  `response from host '<host>' exceeds the 16 MiB limit`. A failure status of the documentation
+  (404, 5xx) is still answered from the status alone, its body never read. At most the limit plus
+  1 048 576 bytes are held during a call. The `web.*` answers follow the same limit (US-0235,
+  US-0236); the write limit for downloads and saved pages arrives with US-0238.
+
 ## Derived paths
 
 Under the SQLite backend, only `infra.meta.dir`, `infra.blob.dir` and

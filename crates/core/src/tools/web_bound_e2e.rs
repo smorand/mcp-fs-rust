@@ -402,3 +402,202 @@ async fn e2e_0093_035_search_answer_declaring_a_length_over() {
     wait_closed_early(&rec).await;
     assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
 }
+
+// ── SPEC-0093/US-0237: library resolution and documentation ────────────────
+
+/// The served app with the documentation family pointed at a stand in site.
+async fn library_served(
+    routes: Vec<(&'static str, Script)>,
+) -> (axum::Router, String, std::sync::Arc<Record>, tempfile::TempDir) {
+    let (port, rec) = stand_in(routes).await;
+    let (app, token, _state, d) = served(false, Some(format!("http://127.0.0.1:{port}"))).await;
+    (app, token, rec, d)
+}
+
+/// Every held figure recorded, whatever the URL: the flood tests read one answer.
+fn all_held() -> Vec<u64> {
+    crate::tools::web::ANSWER_HELD.with(|h| h.borrow().iter().map(|r| r.held).collect())
+}
+
+fn assert_library_flood_held(rec: &Record) {
+    let held = all_held();
+    assert!(!held.is_empty(), "no answer was read");
+    assert!(held.iter().all(|h| *h <= 17_825_792), "the answer held {held:?}");
+    assert!(
+        held.iter().any(|h| *h > ANSWER_LIMIT),
+        "the refusal must count what it read: {held:?}"
+    );
+    let sent = rec.body_sent.load(Ordering::SeqCst);
+    assert!(sent < FLOOD_BYTES, "the stand in sent the whole flood: {sent}");
+}
+
+#[tokio::test]
+async fn e2e_0093_sec_008_library_resolution_flood() {
+    let _heavy = heavy().await;
+    let (app, token, rec, _d) =
+        library_served(vec![("/v1/search", Script::Flood { endless: false, encoding: None })])
+            .await;
+    answer_held_reset();
+
+    let v =
+        call_tool(&app, &token, "context7.resolve_library_id", json!({"library_name": "tokio"}))
+            .await;
+
+    assert_over_limit(&v);
+    wait_closed_early(&rec).await;
+    assert_library_flood_held(&rec);
+}
+
+#[tokio::test]
+async fn e2e_0093_sec_009_library_documentation_flood() {
+    let _heavy = heavy().await;
+    let (app, token, rec, _d) = library_served(vec![(
+        "/v1/tokio-rs/tokio",
+        Script::Flood { endless: false, encoding: None },
+    )])
+    .await;
+    answer_held_reset();
+
+    let v = call_tool(
+        &app,
+        &token,
+        "context7.get_library_docs",
+        json!({"library_id": "/tokio-rs/tokio"}),
+    )
+    .await;
+
+    assert_over_limit(&v);
+    wait_closed_early(&rec).await;
+    assert_library_flood_held(&rec);
+}
+
+// ── SPEC-0093/E2E-003 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_003_library_documentation_within_the_limi() {
+    let mut body = b"# Tokio docs\n".to_vec();
+    body.extend(std::iter::repeat_n(b't', 10_000));
+    let expected = String::from_utf8(body.clone()).unwrap();
+    let (app, token, _rec, _d) = library_served(vec![(
+        "/v1/tokio-rs/tokio",
+        Script::Fixed {
+            body,
+            content_type: Some("text/markdown".into()),
+            chunked: false,
+            encoding: None,
+        },
+    )])
+    .await;
+    answer_held_reset();
+
+    let v = call_tool(
+        &app,
+        &token,
+        "context7.get_library_docs",
+        json!({"library_id": "/tokio-rs/tokio"}),
+    )
+    .await;
+
+    let text = success_payload(&v);
+    assert_eq!(text.as_str().unwrap().len(), 10_013);
+    assert_eq!(text, Value::String(expected));
+    assert_eq!(all_held(), vec![10_013]);
+}
+
+// ── SPEC-0093/E2E-016 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_016_library_resolution_answer_over_the_li() {
+    let (app, token, _rec, _d) = library_served(vec![(
+        "/v1/search",
+        Script::Letters { letter: b'a', n: ANSWER_LIMIT + 1, chunked: true },
+    )])
+    .await;
+
+    let v =
+        call_tool(&app, &token, "context7.resolve_library_id", json!({"library_name": "tokio"}))
+            .await;
+
+    assert_over_limit(&v);
+}
+
+// ── SPEC-0093/E2E-032 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_032_documentation_failure_status_with_a_h() {
+    let (app, token, rec, _d) = library_served(vec![(
+        "/v1/tokio-rs/tokio",
+        Script::Status { code: 500, declared: FLOOD_BYTES },
+    )])
+    .await;
+    answer_held_reset();
+
+    let v = call_tool(
+        &app,
+        &token,
+        "context7.get_library_docs",
+        json!({"library_id": "/tokio-rs/tokio"}),
+    )
+    .await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_INTERNAL_ERROR"), "{text}");
+    assert!(text.contains("context7 error: 500 Internal Server Error"), "{text}");
+    assert_eq!(all_held(), vec![0]);
+    assert_eq!(rec.requests.load(Ordering::SeqCst), 1);
+}
+
+// ── SPEC-0093/E2E-036 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_036_documentation_answer_declaring_one_by() {
+    let (app, token, rec, _d) = library_served(vec![(
+        "/v1/tokio-rs/tokio",
+        Script::Declared {
+            length: ANSWER_LIMIT + 1,
+            pause: Duration::from_secs(10),
+            then: Box::new(Script::Letters { letter: b'b', n: ANSWER_LIMIT + 1, chunked: false }),
+        },
+    )])
+    .await;
+    answer_held_reset();
+    let started = Instant::now();
+
+    let v = call_tool(
+        &app,
+        &token,
+        "context7.get_library_docs",
+        json!({"library_id": "/tokio-rs/tokio"}),
+    )
+    .await;
+
+    assert_over_limit(&v);
+    assert!(started.elapsed() < Duration::from_secs(5), "the refusal waited for the body");
+    wait_closed_early(&rec).await;
+    assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
+    assert_eq!(all_held(), vec![0]);
+}
+
+// ── SPEC-0093/E2E-038 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_038_documentation_family_off() {
+    let (port, rec) = stand_in(vec![(
+        "/v1/tokio-rs/tokio",
+        Script::Letters { letter: b'a', n: 10, chunked: false },
+    )])
+    .await;
+    let (app, token, _state, _d) = served(true, None).await;
+    assert!(port > 0);
+
+    let v = call_tool(
+        &app,
+        &token,
+        "context7.get_library_docs",
+        json!({"library_id": "/tokio-rs/tokio"}),
+    )
+    .await;
+
+    crate::tools::tool_surface_e2e::assert_tool_not_found(&v);
+    assert_eq!(rec.requests.load(Ordering::SeqCst), 0);
+}

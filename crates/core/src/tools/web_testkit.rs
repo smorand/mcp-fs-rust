@@ -65,6 +65,11 @@ pub(crate) enum Script {
         per_second: u8,
         seconds: u32,
     },
+    /// A failure `code` declaring `declared` body bytes it never sends.
+    Status {
+        code: u16,
+        declared: u64,
+    },
 }
 
 /// A site on `127.0.0.1:0` answering `routes` by path prefix; returns its port.
@@ -178,6 +183,10 @@ async fn write_script(
                 _ => true,
             }
         }
+        Script::Status { code, declared } => {
+            let h = headers(false, *declared, None, &None);
+            w.write_all(&header_block(&format!("{code} {}", reason(*code)), &h)).await.is_ok()
+        }
         Script::Trickle { per_second, seconds } => {
             let h = headers(true, 0, None, &None);
             if w.write_all(&header_block("200 OK", &h)).await.is_err() {
@@ -192,6 +201,14 @@ async fn write_script(
             }
             w.write_all(b"0\r\n\r\n").await.is_ok()
         }
+    }
+}
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        500 => "Internal Server Error",
+        404 => "Not Found",
+        _ => "Status",
     }
 }
 
