@@ -41,6 +41,8 @@ pub(crate) mod archive_rar_crypt;
 mod archive_rar_cut_e2e;
 #[cfg(all(test, feature = "rar"))]
 pub(crate) mod archive_rar_fixtures;
+#[cfg(test)]
+mod archive_rar_password_e2e;
 pub(crate) mod archive_single;
 #[cfg(test)]
 mod archive_tar_bound_e2e;

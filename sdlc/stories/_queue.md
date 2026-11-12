@@ -230,7 +230,7 @@
 | US-0228 | SPEC-0091 | decode documents apart from the request threads, behind today's ceiling | US-0227 | 2 | landed | story/US-0228-decode-documents-apart-from-the-request | story/US-0227-nesting-refusals-through-the-http-door-a |
 | US-0229 | SPEC-0091 | a reader that stops and a requester who gives up | US-0228 | 2 | landed | story/US-0229-a-reader-that-stops-and-a-requester-who | story/US-0228-decode-documents-apart-from-the-request |
 | US-0230 | SPEC-0091 | extraction latency through the HTTP door and documentation | US-0229 | 2 | landed | story/US-0230-extraction-latency-through-the-http-door | story/US-0229-a-reader-that-stops-and-a-requester-who |
-| US-0231 | SPEC-0090 | judge a version 4 password on the first protected block | US-0230 | 2 | todo | | |
+| US-0231 | SPEC-0090 | judge a version 4 password on the first protected block | US-0230 | 2 | landed | story/US-0231-judge-a-version-4-password-on-the-first | story/US-0230-extraction-latency-through-the-http-door |
 | US-0232 | SPEC-0090 | cuts before the judgment, the right password and the accepted limit | US-0231 | 2 | todo | | |
 | US-0233 | SPEC-0090 | the wrong password first, nothing left, other answers unchanged | US-0232 | 2 | todo | | |
 | US-0234 | SPEC-0090 | wrong version 4 passwords through the HTTP door and documentation | US-0233 | 2 | todo | | |

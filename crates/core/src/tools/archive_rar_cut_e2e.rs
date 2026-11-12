@@ -537,13 +537,11 @@ async fn e2e_0087_026_version_4_encrypted_names_cut_inside() {
 
 #[cfg(feature = "rar")]
 #[tokio::test]
-async fn e2e_0087_027_version_4_encrypted_names_cut_wrong() {
-    // `nope` decrypts the first header to a size far past the end, which the walk reads
-    // as a shortfall. `w785` was found by search to decrypt it to a plausible size with a
-    // failing CRC16, the branch that must leave the answer to UnRAR (BL-0136).
+async fn e2e_0090_mod_001_version_4_encrypted_names_wrong_p() {
     for password in ["nope", "w785"] {
         for (stem, bytes) in [("hp4half", &HP4[..108]), ("hp4", HP4)] {
-            assert_refused_and_nothing_written(stem, bytes, Some(password), corrupt_any).await;
+            assert_refused_and_nothing_written(stem, bytes, Some(password), password_incorrect)
+                .await;
         }
     }
 }
