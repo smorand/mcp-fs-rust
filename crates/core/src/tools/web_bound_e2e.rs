@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 use crate::tools::archive_testkit::heavy;
 use crate::tools::tool_surface_e2e::{call_tool, success_payload};
 use crate::tools::web::{ANSWER_LIMIT, answer_held, answer_held_reset};
-use crate::tools::web_testkit::{FLOOD_BYTES, Record, Script, served, served_with_base, stand_in};
+use crate::tools::web_testkit::{
+    FLOOD_BYTES, MEMBER, Record, Script, nothing_left, served, served_with_base, stand_in,
+};
 
 fn refusal_text(v: &Value) -> String {
     assert!(v["error"].is_null(), "the tool is served, so it is dispatched: {v}");
@@ -600,4 +602,311 @@ async fn e2e_0093_038_documentation_family_off() {
 
     crate::tools::tool_surface_e2e::assert_tool_not_found(&v);
     assert_eq!(rec.requests.load(Ordering::SeqCst), 0);
+}
+
+// ── US-0238: a download or a saved page stops at the session allowance ──────
+
+const SESSION_QUOTA: u64 = 52_428_800;
+/// The session allowance plus the one piece a read may hold past it.
+const WRITE_HELD_BOUND: u64 = 53_477_376;
+const SESSION_REFUSAL: &str = "session write quota of 52428800 bytes exceeded";
+
+fn assert_session_refusal(v: &Value) {
+    let text = refusal_text(v);
+    assert!(text.contains("ERR_WRITE_QUOTA_EXCEEDED"), "{text}");
+    assert!(text.contains(SESSION_REFUSAL), "{text}");
+}
+
+fn download_args(port: u16, route: &str, path: &str) -> (String, Value) {
+    let url = format!("http://127.0.0.1:{port}{route}");
+    let args = json!({"url": url, "mount_id": "atlas", "path": path, "timeout_secs": 120});
+    (url, args)
+}
+
+fn save_args(port: u16, route: &str, path: &str) -> (String, Value) {
+    let (url, mut args) = fetch_args(port, route);
+    args["mount_id"] = json!("atlas");
+    args["save_path"] = json!(path);
+    (url, args)
+}
+
+/// A refusal while reading: bounded above, and it counted what it read.
+fn assert_write_held_refused(url: &str) {
+    let held = answer_held(url);
+    assert!(held.iter().all(|h| *h <= WRITE_HELD_BOUND), "the answer held {held:?}");
+    assert!(
+        held.iter().any(|h| *h > SESSION_QUOTA),
+        "the refusal must count what it read: {held:?}"
+    );
+}
+
+fn write_lines(state: &crate::state::AppState, path: &str) -> usize {
+    state
+        .safety
+        .audit(MEMBER, "atlas")
+        .into_iter()
+        .filter(|e| e.op == "write" && e.path == path)
+        .count()
+}
+
+// ── SPEC-0093/E2E-SEC-005 ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_sec_005_saved_page_flood() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, rec) =
+        stand_in(vec![("/flood", Script::Flood { endless: false, encoding: None })]).await;
+    let (url, args) = save_args(port, "/flood", "/pages/flood.html");
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.fetch", args).await;
+
+    assert_session_refusal(&v);
+    assert_write_held_refused(&url);
+    wait_closed_early(&rec).await;
+    let sent = rec.body_sent.load(Ordering::SeqCst);
+    assert!(sent < FLOOD_BYTES, "the stand in sent the whole flood: {sent}");
+    nothing_left(&state, "/pages", "/pages/flood.html", None).await;
+}
+
+// ── SPEC-0093/E2E-SEC-006 ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_sec_006_download_flood_originating_occurr() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, rec) =
+        stand_in(vec![("/flood", Script::Flood { endless: true, encoding: None })]).await;
+    let (url, args) = download_args(port, "/flood", "/downloads/flood.bin");
+    answer_held_reset();
+    let started = Instant::now();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    assert!(started.elapsed() < Duration::from_secs(30), "refused after {:?}", started.elapsed());
+    assert_write_held_refused(&url);
+    wait_closed_early(&rec).await;
+    nothing_left(&state, "/downloads", "/downloads/flood.bin", None).await;
+}
+
+// ── SPEC-0093/E2E-SEC-007 ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_sec_007_download_declaring_a_huge_length() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, rec) = stand_in(vec![(
+        "/flood",
+        Script::Declared {
+            length: FLOOD_BYTES,
+            pause: Duration::from_secs(10),
+            then: Box::new(Script::Letters { letter: b'a', n: FLOOD_BYTES, chunked: false }),
+        },
+    )])
+    .await;
+    let (url, args) = download_args(port, "/flood", "/downloads/flood.bin");
+    answer_held_reset();
+    let started = Instant::now();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    assert!(started.elapsed() < Duration::from_secs(8), "waited {:?}", started.elapsed());
+    assert_eq!(answer_held(&url), vec![0], "no body byte may be held");
+    wait_closed_early(&rec).await;
+    assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
+    nothing_left(&state, "/downloads", "/downloads/flood.bin", None).await;
+}
+
+// ── SPEC-0093/E2E-SEC-010 ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_sec_010_compressed_marked_download_flood() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, rec) =
+        stand_in(vec![("/flood", Script::Flood { endless: false, encoding: Some("gzip".into()) })])
+            .await;
+    let (url, args) = download_args(port, "/flood", "/downloads/flood.gz");
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    assert_write_held_refused(&url);
+    wait_closed_early(&rec).await;
+    nothing_left(&state, "/downloads", "/downloads/flood.gz", None).await;
+}
+
+// ── SPEC-0093/E2E-004 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_004_download_within_the_allowance() {
+    let (app, token, state, _d) = served(true, None).await;
+    let body = vec![b'p'; 1_000_000];
+    let (port, _rec) = stand_in(vec![(
+        "/report.pdf",
+        Script::Fixed {
+            body: body.clone(),
+            content_type: Some("application/pdf".into()),
+            chunked: false,
+            encoding: None,
+        },
+    )])
+    .await;
+    let (_url, args) = download_args(port, "/report.pdf", "/downloads/report.pdf");
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    let p = success_payload(&v);
+    assert_eq!(p["path"], "/downloads/report.pdf");
+    assert_eq!(p["bytes_written"], 1_000_000);
+    assert_eq!(p["overwritten"], false);
+    assert_eq!(p["content_type"], "application/pdf");
+    let client = state.stores.client("atlas").await.unwrap();
+    assert_eq!(client.read_bytes("/downloads/report.pdf").await.unwrap(), body);
+    assert_eq!(write_lines(&state, "/downloads/report.pdf"), 1, "one write line");
+    // The download was charged: 1 000 000 of the allowance is gone.
+    let too_big = vec![b'x'; 51_428_801];
+    let err = crate::core::fs_ops::write_bytes(
+        &client,
+        &state.safety,
+        MEMBER,
+        "atlas",
+        "/docs/after.bin",
+        &too_big,
+        true,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains(SESSION_REFUSAL), "{err}");
+}
+
+// ── SPEC-0093/E2E-005 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_005_page_saved_into_a_project_within_the() {
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, _rec) = stand_in(vec![(
+        "/page",
+        Script::Fixed {
+            body: b"<p>Saved</p>".to_vec(),
+            content_type: Some("text/html".into()),
+            chunked: true,
+            encoding: None,
+        },
+    )])
+    .await;
+    let (_url, args) = save_args(port, "/page", "/pages/saved.html");
+
+    let v = call_tool(&app, &token, "web.fetch", args).await;
+
+    let p = success_payload(&v);
+    assert_eq!(p["path"], "/pages/saved.html");
+    assert_eq!(p["bytes_written"], 12);
+    let client = state.stores.client("atlas").await.unwrap();
+    assert_eq!(client.read_bytes("/pages/saved.html").await.unwrap(), b"<p>Saved</p>");
+    assert_eq!(write_lines(&state, "/pages/saved.html"), 1, "one write line");
+}
+
+// ── SPEC-0093/E2E-008 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_008_download_of_exactly_the_session_side() {
+    let _heavy = heavy().await;
+    let (app, token, _state, _d) = served(true, None).await;
+    let (port, _rec) =
+        stand_in(vec![("/big", Script::Letters { letter: b'z', n: SESSION_QUOTA, chunked: true })])
+            .await;
+    let (url, args) = download_args(port, "/big", "/downloads/big.bin");
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_eq!(success_payload(&v)["bytes_written"], SESSION_QUOTA);
+    let held = answer_held(&url);
+    assert!(held.iter().all(|h| *h <= WRITE_HELD_BOUND), "{held:?}");
+    assert!(held.contains(&SESSION_QUOTA), "the whole answer was read: {held:?}");
+}
+
+// ── SPEC-0093/E2E-017 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_017_download_one_byte_over_the_session_si() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, _rec) = stand_in(vec![
+        ("/big", Script::Letters { letter: b'z', n: SESSION_QUOTA + 1, chunked: true }),
+        ("/one", Script::Letters { letter: b'z', n: 1, chunked: false }),
+    ])
+    .await;
+    let (url, args) = download_args(port, "/big", "/downloads/big.bin");
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    assert_write_held_refused(&url);
+    nothing_left(&state, "/downloads", "/downloads/big.bin", None).await;
+    // nothing_left spent the whole allowance: the limit is 0 now, and the message
+    // still names the configured quota, not the bytes left.
+    let (_url, args) = download_args(port, "/one", "/downloads/one.bin");
+    assert_session_refusal(&call_tool(&app, &token, "web.download", args).await);
+}
+
+// ── SPEC-0093/E2E-018 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_018_download_declaring_one_byte_over_the() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, rec) = stand_in(vec![(
+        "/big",
+        Script::Declared {
+            length: SESSION_QUOTA + 1,
+            pause: Duration::from_secs(10),
+            then: Box::new(Script::Letters { letter: b'z', n: SESSION_QUOTA + 1, chunked: false }),
+        },
+    )])
+    .await;
+    let (url, args) = download_args(port, "/big", "/downloads/big.bin");
+    answer_held_reset();
+    let started = Instant::now();
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    assert!(started.elapsed() < Duration::from_secs(8), "waited {:?}", started.elapsed());
+    assert_eq!(answer_held(&url), vec![0]);
+    wait_closed_early(&rec).await;
+    assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
+    nothing_left(&state, "/downloads", "/downloads/big.bin", None).await;
+}
+
+// ── SPEC-0093/E2E-037 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_037_compressed_download_saved_as_received() {
+    let (app, token, state, _d) = served(true, None).await;
+    let body: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    let (port, _rec) = stand_in(vec![(
+        "/packed",
+        Script::Fixed {
+            body: body.clone(),
+            content_type: None,
+            chunked: false,
+            encoding: Some("gzip".into()),
+        },
+    )])
+    .await;
+    let (_url, args) = download_args(port, "/packed", "/downloads/packed.gz");
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_eq!(success_payload(&v)["bytes_written"], 1_000_000);
+    let client = state.stores.client("atlas").await.unwrap();
+    assert_eq!(client.read_bytes("/downloads/packed.gz").await.unwrap(), body);
 }

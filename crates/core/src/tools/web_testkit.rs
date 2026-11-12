@@ -306,3 +306,46 @@ pub(crate) async fn served_with_base(
     }
     (app, token, state, d)
 }
+
+/// The member `tool_surface_e2e::setup` mints a token for.
+pub(crate) const MEMBER: &str = "mia@test.com";
+
+/// A refused write left nothing behind, read on three channels besides the answer:
+/// the folder listing has no `path` (or `path` still holds `before`), the session
+/// audit trail has no write line for `path`, and a 52 428 800 byte write of
+/// `/docs/fill.bin` still succeeds, which it cannot if the refused call charged
+/// the session allowance. The fill goes last because it spends the allowance.
+pub(crate) async fn nothing_left(
+    state: &AppState,
+    folder: &str,
+    path: &str,
+    before: Option<&[u8]>,
+) {
+    let client = state.stores.client("atlas").await.unwrap();
+    let name = path.rsplit('/').next().unwrap();
+    let listing = client.list_dir(folder).await.unwrap();
+    let present = listing.iter().any(|n| n.name == name);
+    match before {
+        None => assert!(!present, "{path} must not exist, folder holds {listing:?}"),
+        Some(bytes) => assert_eq!(client.read_bytes(path).await.unwrap(), bytes, "{path} changed"),
+    }
+    let written = state
+        .safety
+        .audit(MEMBER, "atlas")
+        .into_iter()
+        .any(|e| e.path == path && (e.op == "write" || e.op == "append"));
+    assert!(!written, "a write line was audited for {path}");
+    let fill = vec![b'f'; 52_428_800];
+    crate::core::fs_ops::write_bytes(
+        &client,
+        &state.safety,
+        MEMBER,
+        "atlas",
+        "/docs/fill.bin",
+        &fill,
+        true,
+        true,
+    )
+    .await
+    .expect("the allowance is untouched, so the whole of it can still be written");
+}

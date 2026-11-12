@@ -114,8 +114,9 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::WebConfig) {
                     );
                     let (mount, client) = volume(&ctx, &fake_a).await?;
                     let path = norm(&ctx, &fake_a, "path")?;
+                    let limit = write_limit(&ctx.state.safety, &ctx.person, &mount);
                     let (bytes, _content_type) =
-                        fetch_raw(&url, timeout, u64::MAX, unreachable_over).await?;
+                        fetch_raw(&url, timeout, limit.cap, |d| limit.refusal(d)).await?;
                     fs_ops::write_bytes(
                         &client,
                         &ctx.state.safety,
@@ -157,8 +158,9 @@ pub fn register(reg: &mut ToolRegistry, config: &crate::config::WebConfig) {
             let timeout = a.int_or("timeout_secs", 30).clamp(1, 120) as u64;
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
+            let limit = write_limit(&ctx.state.safety, &ctx.person, &mount);
             let (bytes, content_type) =
-                fetch_raw(&url, timeout, u64::MAX, unreachable_over).await?;
+                fetch_raw(&url, timeout, limit.cap, |d| limit.refusal(d)).await?;
             let mut result = fs_ops::write_bytes(
                 &client,
                 &ctx.state.safety,
@@ -463,9 +465,37 @@ async fn fetch_raw(
     Ok((bytes, content_type))
 }
 
-/// Save mode and download read the whole answer until the write limit story: no cap, no refusal.
-fn unreachable_over(_declared: Option<u64>) -> ToolError {
-    ToolError::internal("answer limit reached with no limit set")
+/// What a download or a saved page may keep: the bytes the session may still write.
+///
+/// Computed after membership and the path check and before the request, so a
+/// flood is refused while it is read instead of after it was held whole. The
+/// project storage side joins it in the next story, the lower of the two winning.
+pub(crate) struct WriteLimit {
+    pub(crate) cap: u64,
+    /// The configured session quota, for the message.
+    quota: i64,
+}
+
+pub(crate) fn write_limit(
+    safety: &crate::safety::SafetyManager,
+    person: &str,
+    mount: &str,
+) -> WriteLimit {
+    WriteLimit {
+        cap: safety.session_remaining(person, mount).max(0) as u64,
+        quota: safety.config().write_quota_bytes,
+    }
+}
+
+impl WriteLimit {
+    /// Today's session refusal, word for word, whether the declared length or the
+    /// bytes read passed the limit.
+    pub(crate) fn refusal(&self, _declared: Option<u64>) -> ToolError {
+        ToolError::write_quota_exceeded(format!(
+            "session write quota of {} bytes exceeded",
+            self.quota
+        ))
+    }
 }
 
 /// The lower case host of `url`, no port, read before sending so a redirect never changes it.

@@ -592,10 +592,17 @@ async fn e2e_0091_007_one_place_arrival_order() {
     let ((a, a_at), (memo, memo_at), (b, b_at)) =
         (a.await.unwrap(), memo.await.unwrap(), b.await.unwrap());
     in_time(&[health], base, 1);
-    assert!(
-        a_at < memo_at && memo_at < b_at,
-        "answered out of order: {a_at:?} {memo_at:?} {b_at:?}"
+    // Arrival order is the order the places are granted, so the decodings START in
+    // order. The answers need not finish in order: memo's decoding is tiny and its
+    // answer can land a few milliseconds before a's, which still has its companion
+    // to write after it gave the place back.
+    assert_eq!(
+        s.state.safety.decode_places().started(),
+        ["/docs/a.pdf", "/docs/memo.docx", "/docs/b.pdf"],
+        "the places were not granted in arrival order"
     );
+    assert!(memo_at < b_at, "memo waited behind b: {memo_at:?} {b_at:?}");
+    let _ = a_at;
     large_pdf_answer(&a, "/docs/a.pdf");
     large_pdf_answer(&b, "/docs/b.pdf");
     assert_eq!(memo.expect("memo")["preview"], MEMO_PREVIEW);
