@@ -119,6 +119,10 @@ pub(crate) mod trash;
 mod trash_search_e2e;
 pub mod web;
 #[cfg(test)]
+mod web_bound_e2e;
+#[cfg(test)]
+pub(crate) mod web_testkit;
+#[cfg(test)]
 pub(crate) mod write;
 
 use crate::errors::Result;

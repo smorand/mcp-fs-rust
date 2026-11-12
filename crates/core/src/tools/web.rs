@@ -102,7 +102,8 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
                     );
                     let (mount, client) = volume(&ctx, &fake_a).await?;
                     let path = norm(&ctx, &fake_a, "path")?;
-                    let (bytes, _content_type) = fetch_raw(&url, timeout).await?;
+                    let (bytes, _content_type) =
+                        fetch_raw(&url, timeout, u64::MAX, unreachable_over).await?;
                     fs_ops::write_bytes(
                         &client,
                         &ctx.state.safety,
@@ -144,7 +145,8 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
             let timeout = a.int_or("timeout_secs", 30).clamp(1, 120) as u64;
             let (mount, client) = volume(&ctx, &a).await?;
             let path = norm(&ctx, &a, "path")?;
-            let (bytes, content_type) = fetch_raw(&url, timeout).await?;
+            let (bytes, content_type) =
+                fetch_raw(&url, timeout, u64::MAX, unreachable_over).await?;
             let mut result = fs_ops::write_bytes(
                 &client,
                 &ctx.state.safety,
@@ -378,11 +380,19 @@ async fn web_news(
     Ok(Value::String(serde_json::to_string_pretty(&results).unwrap_or_default()))
 }
 
+/// The most of one remote answer handed back to the assistant (equal to the pull request tools').
+pub(crate) const ANSWER_LIMIT: u64 = 16_777_216;
+
 /// Fetch a URL and return the raw bytes plus the Content-Type header value.
 ///
 /// Used by both `web.fetch` (save mode) and `web.download`. The URL validation
 /// (http/https prefix) is the caller's responsibility.
-async fn fetch_raw(url: &str, timeout_secs: u64) -> crate::errors::Result<(Vec<u8>, String)> {
+async fn fetch_raw(
+    url: &str,
+    timeout_secs: u64,
+    cap: u64,
+    over: impl Fn(Option<u64>) -> ToolError,
+) -> crate::errors::Result<(Vec<u8>, String)> {
     let client = build_client(timeout_secs)?;
     let resp = client.get(url).send().await.map_err(|e| {
         if e.is_timeout() {
@@ -397,9 +407,62 @@ async fn fetch_raw(url: &str, timeout_secs: u64) -> crate::errors::Result<(Vec<u
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let bytes =
-        resp.bytes().await.map_err(|e| ToolError::internal(format!("read response: {e}")))?;
-    Ok((bytes.to_vec(), content_type))
+    let bytes = read_answer(resp, url, cap, "read response", over).await?;
+    Ok((bytes, content_type))
+}
+
+/// Save mode and download read the whole answer until the write limit story: no cap, no refusal.
+fn unreachable_over(_declared: Option<u64>) -> ToolError {
+    ToolError::internal("answer limit reached with no limit set")
+}
+
+/// The lower case host of `url`, no port, read before sending so a redirect never changes it.
+pub(crate) fn host_of(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_lowercase))
+        .unwrap_or_default()
+}
+
+/// The refusal of an answer past [`ANSWER_LIMIT`], worded as the pull request tools word theirs.
+pub(crate) fn over_answer_limit(host: &str) -> ToolError {
+    ToolError::invalid_argument(format!("response from host '{host}' exceeds the 16 MiB limit"))
+}
+
+/// Read a remote answer piece by piece, refusing once it passes `cap`.
+///
+/// A declared length past `cap` is refused before any body byte is read. While
+/// reading, the size is checked before each piece is appended, so at most `cap`
+/// bytes plus one piece are ever held. The response is dropped on refusal, which
+/// closes the connection without waiting for the site. No decompression is
+/// configured on the client, so the bytes counted are the bytes kept.
+///
+/// Time O(n) in the bytes read, space O(min(n, cap)) plus one piece.
+pub(crate) async fn read_answer(
+    mut resp: reqwest::Response,
+    url: &str,
+    cap: u64,
+    read_err: &str,
+    over: impl Fn(Option<u64>) -> ToolError,
+) -> crate::errors::Result<Vec<u8>> {
+    let held = start_answer(url);
+    if let Some(n) = resp.content_length()
+        && n > cap
+    {
+        return Err(over(Some(n)));
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(piece) =
+        resp.chunk().await.map_err(|e| ToolError::internal(format!("{read_err}: {e}")))?
+    {
+        let total = buf.len() as u64 + piece.len() as u64;
+        held.note(total);
+        if total > cap {
+            return Err(over(None));
+        }
+        buf.extend_from_slice(&piece);
+    }
+    Ok(buf)
 }
 
 async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value> {
@@ -407,7 +470,8 @@ async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value>
         return Err(ToolError::invalid_argument("url must start with http:// or https://"));
     }
 
-    let (bytes, content_type) = fetch_raw(url, timeout_secs).await?;
+    let (bytes, content_type) =
+        fetch_raw(url, timeout_secs, ANSWER_LIMIT, |_| over_answer_limit(&host_of(url))).await?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let text = if content_type.contains("text/html") { strip_html(&body) } else { body };
@@ -451,6 +515,83 @@ fn urlencoding(s: &str) -> String {
         }
     }
     out
+}
+
+/// What a test reads back of one answer read (DEC-003).
+#[cfg(test)]
+pub(crate) struct AnswerHeld {
+    pub(crate) url: String,
+    pub(crate) held: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANSWER_HELD: std::cell::RefCell<Vec<AnswerHeld>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test only record of the most a call held of one remote answer. It is pushed
+/// at once with 0 and written in `Drop`, so every return path leaves one record.
+#[cfg(test)]
+pub(crate) struct HeldRecord {
+    index: usize,
+    held: std::cell::Cell<u64>,
+}
+
+#[cfg(test)]
+impl HeldRecord {
+    fn note(&self, held: u64) {
+        self.held.set(self.held.get().max(held));
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeldRecord {
+    fn drop(&mut self) {
+        ANSWER_HELD.with(|h| {
+            if let Some(r) = h.borrow_mut().get_mut(self.index) {
+                r.held = self.held.get();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+fn start_answer(url: &str) -> HeldRecord {
+    let index = ANSWER_HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        h.push(AnswerHeld { url: url.to_string(), held: 0 });
+        h.len() - 1
+    });
+    HeldRecord { index, held: std::cell::Cell::new(0) }
+}
+
+/// Release build twin of the test hook: nothing recorded, nothing kept.
+#[cfg(not(test))]
+pub(crate) struct HeldRecord;
+
+#[cfg(not(test))]
+impl HeldRecord {
+    fn note(&self, _held: u64) {}
+}
+
+#[cfg(not(test))]
+fn start_answer(_url: &str) -> HeldRecord {
+    HeldRecord
+}
+
+#[cfg(test)]
+pub(crate) fn answer_held_reset() {
+    ANSWER_HELD.with(|h| h.borrow_mut().clear());
+}
+
+/// Every held figure recorded for `url`; panics when none, so a missing record never reads as 0.
+#[cfg(test)]
+pub(crate) fn answer_held(url: &str) -> Vec<u64> {
+    let v: Vec<u64> =
+        ANSWER_HELD.with(|h| h.borrow().iter().filter(|r| r.url == url).map(|r| r.held).collect());
+    assert!(!v.is_empty(), "no answer was read for {url}");
+    v
 }
 
 #[cfg(test)]

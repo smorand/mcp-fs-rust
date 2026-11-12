@@ -34,7 +34,7 @@ const OFF_BY_DEFAULT: [&str; 7] =
 
 /// A config wired to a throwaway state root and a fresh RS256 keypair, plus a
 /// token for Mia. Every flag stays at its default.
-fn setup(root: &Path) -> (ServerConfig, String) {
+pub(crate) fn setup(root: &Path) -> (ServerConfig, String) {
     let (key_path, pub_path) = keys::write_keypair(root.join("keys")).unwrap();
     let token =
         keys::mint_token_from_file(&key_path, MIA, keys::DEFAULT_ISSUER, keys::DEFAULT_CLAIM, 3600)
@@ -50,7 +50,7 @@ fn setup(root: &Path) -> (ServerConfig, String) {
 
 /// Build the app and create `atlas` with Mia as its owner, so every refusal
 /// below is the served surface's doing, never a membership check.
-async fn app_with_atlas(c: ServerConfig) -> (Router, Arc<AppState>) {
+pub(crate) async fn app_with_atlas(c: ServerConfig) -> (Router, Arc<AppState>) {
     let (router, state) = crate::app::build_with_state(c).await.unwrap();
     state.admin.create_project(PROJECT, MIA).await.unwrap();
     (router, state)
@@ -129,7 +129,7 @@ async fn list_names(app: &Router, token: &str) -> Vec<String> {
     list_tools(app, token).await.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
 }
 
-fn assert_tool_not_found(v: &Value) {
+pub(crate) fn assert_tool_not_found(v: &Value) {
     assert_eq!(v["error"]["code"], -32602, "expected JSON-RPC INVALID_PARAMS, got {v}");
     assert_eq!(v["error"]["message"], "tool not found", "got {v}");
 }
@@ -348,7 +348,7 @@ fn served_count(tools: &[Value]) -> usize {
     tools.iter().filter(|t| !t["name"].as_str().unwrap().starts_with("t.")).count()
 }
 
-async fn call_tool(app: &Router, token: &str, name: &str, arguments: Value) -> Value {
+pub(crate) async fn call_tool(app: &Router, token: &str, name: &str, arguments: Value) -> Value {
     send(
         app,
         token,
@@ -361,7 +361,7 @@ async fn call_tool(app: &Router, token: &str, name: &str, arguments: Value) -> V
 }
 
 /// The JSON a successful family call returned, decoded from its text content.
-fn success_payload(v: &Value) -> Value {
+pub(crate) fn success_payload(v: &Value) -> Value {
     assert!(v["error"].is_null(), "call must be dispatched: {v}");
     assert_ne!(v["result"]["isError"], Value::Bool(true), "call must succeed: {v}");
     let text = v["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{v}"));
