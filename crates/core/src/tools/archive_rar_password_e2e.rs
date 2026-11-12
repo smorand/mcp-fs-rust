@@ -46,13 +46,6 @@ fn corrupt_not_cut(v: &Result<Value>) {
     assert_ne!(e.message, CUT, "a later damage is not a cut");
 }
 
-fn wrong_or_cut(v: &Result<Value>) {
-    let e = v.as_ref().expect_err("the extraction must be refused");
-    let is_wrong = e.code == code::PASSWORD_REQUIRED && e.message == WRONG;
-    let is_cut = e.code == code::INVALID_ARGUMENT && e.message == CUT;
-    assert!(is_wrong || is_cut, "{e:?}");
-}
-
 fn needed(v: &Result<Value>) {
     let e = v.as_ref().expect_err("the extraction must be refused");
     assert_eq!(e.code, code::PASSWORD_REQUIRED, "{e:?}");
@@ -267,8 +260,9 @@ async fn e2e_0090_019_start_kind_and_size_boundaries() {
     }
 }
 
-/// 296 wrong passwords through the completeness check, the whole judgment, on scoped
-/// threads (one key derivation each), then four through the tool with nothing written.
+/// 300 wrong passwords through the completeness check, the whole judgment, on scoped
+/// threads (one key derivation each): at least 291 are WRONG and `wrong135` is CUT. Then
+/// two through the tool with nothing written.
 #[tokio::test]
 async fn e2e_0090_020_three_hundred_wrong_passwords() {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -279,7 +273,7 @@ async fn e2e_0090_020_three_hundred_wrong_passwords() {
                 let passwords = &passwords;
                 s.spawn(move || {
                     (0..300usize)
-                        .filter(|i| i % threads == t && ![0, 135, 299].contains(i))
+                        .filter(|i| i % threads == t)
                         .map(|i| {
                             let verdict = match crate::tools::archive_rar::ensure_rar_complete(
                                 HP4,
@@ -303,16 +297,14 @@ async fn e2e_0090_020_three_hundred_wrong_passwords() {
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
-    assert_eq!(verdicts.len(), 297);
+    assert_eq!(verdicts.len(), 300);
     let other: Vec<_> = verdicts.iter().filter(|(_, v)| *v == "other").collect();
     assert!(other.is_empty(), "neither wrong nor cut: {other:?}");
     let wrongs = verdicts.iter().filter(|(_, v)| *v == "wrong").count();
-    // 297 here plus wrong0, wrong135 and wrong299 through the tool: 291 of 300 at least.
-    assert!(wrongs + 2 >= 291, "only {wrongs} wrong of 297");
+    assert!(wrongs >= 291, "only {wrongs} wrong of 300");
+    assert!(verdicts.contains(&(135, "cut")), "wrong135 must read as a cut");
     refused("hp4", HP4, Some("nope"), wrong).await;
-    refused("hp4", HP4, Some("wrong0"), wrong_or_cut).await;
     refused("hp4", HP4, Some("wrong135"), cut).await;
-    refused("hp4", HP4, Some("wrong299"), wrong_or_cut).await;
 }
 
 #[tokio::test]
@@ -337,28 +329,36 @@ async fn e2e_0090_024_version_5_unchanged() {
     refused("hidden", HIDDEN, Some("nope"), wrong).await;
 }
 
+/// Drives the real MCP handler as a non member, on the encrypted names archive with a wrong
+/// password: the membership refusal must come before any read of the archive.
 #[tokio::test]
 async fn e2e_0090_025_not_a_member_comes_first() {
+    use crate::mcp::server::{ExtractArchiveArgs, McpServer};
+    use rmcp::handler::server::wrapper::Parameters;
+
     const BOB: &str = "bob@example.com";
     let f = fixture().await;
     seed(&f, "/uploads/hp4.rar", HP4).await;
-    let e = match f.state.authorize(MOUNT, BOB).await {
-        Err(e) => e,
-        Ok(_) => crate::tools::archive::extract_archive(
-            &f.state,
-            MOUNT,
-            BOB,
-            "/uploads/hp4.rar",
-            None,
-            false,
-            Some("nope"),
-        )
-        .await
-        .expect_err("a non member must be refused"),
+    let c = f.state.stores.client(MOUNT).await.unwrap();
+    let used_before = crate::quota::used_bytes(&c).await.unwrap();
+    let server = McpServer::new(f.state.clone(), BOB.to_string());
+    let args = ExtractArchiveArgs {
+        mount_id: MOUNT.into(),
+        path: "/uploads/hp4.rar".into(),
+        destination: None,
+        overwrite: false,
+        password: Some("nope".into()),
     };
-    assert_eq!(e.code, code::FORBIDDEN);
-    assert_eq!(e.message, "'bob@example.com' is not a member of 'atlas'");
+
+    let out = server.fs_extract_archive(Parameters(args)).await.unwrap();
+
+    assert_eq!(out.is_error, Some(true), "{out:?}");
+    let text = serde_json::to_string(&out).unwrap();
+    assert!(text.contains("ERR_FORBIDDEN"), "{text}");
+    assert!(text.contains("'bob@example.com' is not a member of 'atlas'"), "{text}");
+    assert!(!text.contains(WRONG), "the archive must not have been read: {text}");
     assert!(!exists(&f, "/uploads/hp4").await);
+    assert_eq!(crate::quota::used_bytes(&c).await.unwrap(), used_before);
     assert_eq!(extraction_audit_lines(&f, "/uploads/hp4.rar"), 0);
 }
 

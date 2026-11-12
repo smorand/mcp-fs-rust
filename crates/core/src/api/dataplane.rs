@@ -3804,6 +3804,65 @@ mod tests {
             assert_cut_refused("hid222", &hidden[..222], Some("s3cret-Ünï")).await;
         }
 
+        const WRONG: &str = "ERR_PASSWORD_REQUIRED: incorrect password for this archive; call again with the correct 'password' parameter";
+
+        /// Posts the extraction of `bytes` with `password` and returns status and body,
+        /// after checking that nothing was written.
+        async fn post_refused(
+            stem: &str,
+            bytes: &[u8],
+            password: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let h = Harness::new().await;
+            let c = h.state.stores.client(MOUNT).await.unwrap();
+            let path = format!("/uploads/{stem}.rar");
+            c.write_bytes_atomic(&path, bytes).await.unwrap();
+            let body = json!({ "path": path, "password": password });
+            let (s, v) = h.post(&u("extract-archive"), body).await;
+            assert!(!c.exists(&format!("/uploads/{stem}")).await.unwrap());
+            (s, v)
+        }
+
+        fn assert_wrong(s: StatusCode, v: &serde_json::Value) {
+            assert_eq!(s, StatusCode::PRECONDITION_REQUIRED, "{v}");
+            assert_eq!(v["error"], code::PASSWORD_REQUIRED, "{v}");
+            assert_eq!(v["detail"], WRONG, "{v}");
+        }
+
+        fn assert_cut(s: StatusCode, v: &serde_json::Value) {
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"], code::INVALID_ARGUMENT, "{v}");
+            assert!(v["detail"].as_str().unwrap_or_default().contains(TRUNCATED), "{v}");
+        }
+
+        /// SPEC-0090/E2E-032: a wrong password on a version 4 archive with encrypted names.
+        #[tokio::test]
+        async fn e2e_0090_032_http_api_wrong_password() {
+            let hp4 = include_bytes!("../../tests/fixtures/rar/hp4.rar");
+            let (s, v) = post_refused("hp4", hp4, "nope").await;
+            assert_wrong(s, &v);
+        }
+
+        /// SPEC-0090/E2E-033: right password, damaged first block (wrong) and a cut (cut).
+        #[tokio::test]
+        async fn e2e_0090_033_http_api_damaged_first_block_and_a_cu() {
+            let hp4 = include_bytes!("../../tests/fixtures/rar/hp4.rar");
+            let mut damaged = hp4.to_vec();
+            damaged[50] ^= 1;
+            let (s, v) = post_refused("hp4d", &damaged, "s3cret-Ünï").await;
+            assert_wrong(s, &v);
+            let (s, v) = post_refused("hp4half", &hp4[..108], "s3cret-Ünï").await;
+            assert_cut(s, &v);
+        }
+
+        /// SPEC-0090/E2E-034: cut one byte before the start of the first protected block.
+        #[tokio::test]
+        async fn e2e_0090_034_http_api_cut_before_the_start() {
+            let hp4 = include_bytes!("../../tests/fixtures/rar/hp4.rar");
+            let (s, v) = post_refused("hp4t", &hp4[..43], "nope").await;
+            assert_cut(s, &v);
+        }
+
         /// SPEC-0087/E2E-053: a version 4 archive with encrypted data, cut, right password.
         #[tokio::test]
         async fn e2e_0087_053_the_http_api_refuses_a_version_4_enc() {
@@ -4256,6 +4315,7 @@ mod tests {
     /// SPEC-0091/E2E-019: reads through the REST door every 100 ms from 50 ms
     /// after an extraction of the large PDF started are answered in time on one
     /// worker, and the extraction answers what the tool answers.
+    #[ignore = "timing sensitive: test.sh runs it serially with --ignored"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn e2e_0091_019_the_http_api_door_during_a_large_extr() {
         use crate::tools::archive_testkit::heavy;

@@ -228,8 +228,22 @@ them itself when `password` is the right one (`tools/archive_rar_crypt.rs`): RAR
 and AES 256 CBC, RAR 4 with its SHA-1 key schedule and AES 128 CBC; `aes`, `cbc`, `hmac` and `sha2` are
 optional dependencies behind the `rar` feature, and the code is safe Rust (no `unsafe`). The password
 questions keep their place before the truncation: a missing password, an empty one or a wrong one is
-answered as before, a cut archive with the right password is the corrupt refusal. A wrong password on RAR 4
-encrypted file names still reads as corrupt (BL-0136).
+answered as before, a cut archive with the right password is the corrupt refusal.
+
+(2026-11-12, SPEC-0090.) RAR 4 with encrypted file names and a non empty password: RAR 4 has no check value,
+so the password is judged on the first protected block, the one after the 20 byte leading part (marker, main
+header, 8 byte salt included). Fewer than the 24 bytes of the block start (salt plus first AES block): cut.
+A start that is not a possible block (kind 0x74 to 0x7b, declared size at least the kind's fixed part):
+wrong password (`ERR_PASSWORD_REQUIRED`, `incorrect password for this archive; call again with the correct
+'password' parameter`), even if the archive is also cut. A possible start but the archive ends before the
+declared block: cut. The whole block failing its integrity check (CRC16): wrong password; damage inside
+that very block with the right password reads the same, the lesser evil. Whole and passing: the walk goes
+on as before. This closes the gap that was BL-0136 (a wrong RAR 4 password read as corrupt). Accepted limit:
+a wrong password whose decoding looks like a possible block that runs past the end of the archive reads as a
+cut; measured at most 9 of 300 generated passwords, pinned by E2E-019 with `wrong135` and bounded by
+E2E-020 (291 or more of 300 are told wrong). Unchanged: no password (`password required`), an empty password,
+readable file names, RAR 5. The REST `extract-archive` route gives the same codes and messages (428 for a
+wrong password, 400 for a cut).
 
 (2026-11-05, SPEC-0081.) A bare gzip file (suffix `.gz` that is not `.tar.gz`, flow in
 `tools/archive_single.rs`) holds one file. Output name: the archive file name minus

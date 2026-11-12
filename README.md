@@ -299,7 +299,9 @@ wraps RARLAB's UnRAR source; that source is free of charge to use for reading RA
 licence forbids using it to build a RAR compatible archiver or to re create the RAR compression
 algorithm, which is why the feature is off by default. A truncated `.rar` (version 4 or 5, encrypted
 file names included once the password is right) is refused as corrupt, `unexpected end of archive`, and nothing is
-written. A bare gzip, bzip2 or xz file (not a
+written. A wrong non empty password on a version 4 archive with encrypted file names is told as such
+(`ERR_PASSWORD_REQUIRED`), judged on the first protected block; in rare cases (at most 9 in 300 generated
+passwords) a wrong password reads as a cut archive instead. A bare gzip, bzip2 or xz file (not a
 `.tar.gz`, `.tar.bz2` or `.tar.xz`) holds one file: it is decompressed next to the archive, or into
 `destination`, under the archive name minus `.gz`, `.bz2` or `.xz`; passwords are refused, several gzip
 members, bzip2 streams or xz streams are decoded as one stream, bytes after a bzip2 stream are

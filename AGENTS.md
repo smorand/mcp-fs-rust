@@ -159,7 +159,9 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   RAR 4 and RAR 5, as `archive is corrupt or not a valid rar file: unexpected end of archive` (SPEC-0087,
   complete means the end block was reached); `archive_rar_crypt.rs` decrypts the encrypted headers for that
   walk when the password is right (RAR 5 PBKDF2 HMAC SHA-256 plus AES 256 CBC, RAR 4 SHA-1 key schedule plus
-  AES 128 CBC), safe Rust only. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
+  AES 128 CBC), safe Rust only; a RAR 4 archive with encrypted names and a non empty password is judged
+  on its first protected block (SPEC-0090): a wrong password is `ERR_PASSWORD_REQUIRED`, a cut stays the
+  truncation refusal, with an accepted limit of a few wrong passwords reading as a cut. A compressed tar (`.tar.gz`, `.tar.bz2`, `.tar.xz`) is decoded
   under a bound (SPEC-0084): the lower of the project side (remaining storage plus the bytes stored under
   the destination) and the session write allowance, plus `TAR_FRAMING` (1 048 576 bytes); a plain `.tar`
   is unbounded. `archive_single.rs` holds `resolve_destination`, the one destination rule of every
