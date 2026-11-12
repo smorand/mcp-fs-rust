@@ -268,9 +268,13 @@ fn build_client(timeout_secs: u64) -> Result<reqwest::Client, ToolError> {
 /// Extract text between a delimiter and the next `<` (or end of string), stripping tags.
 fn extract_between(haystack: &str, after: &str) -> Option<String> {
     let start = haystack.find(after)? + after.len();
+    // The marker sits inside an opening tag (`class="result__snippet" href="...">`):
+    // skip the rest of that tag, or its closing quote and attributes leak into the text.
     let slice = &haystack[start..];
-    // Find end: the enclosing `</a>` or `</span>` — just go to the first `</`.
-    let end = slice.find("</").unwrap_or(slice.len());
+    let slice = &slice[slice.find('>')? + 1..];
+    // The text ends at the enclosing `</a>`; a nested `<b>` highlight must not cut it short.
+    // Without a `</a>`, fall back to the first closing tag.
+    let end = slice.find("</a>").or_else(|| slice.find("</")).unwrap_or(slice.len());
     let raw = &slice[..end];
     let text = strip_html(raw).trim().to_string();
     if text.is_empty() { None } else { Some(text) }
@@ -767,6 +771,31 @@ mod tests {
         assert_eq!(strip_html("&lt;tag&gt;"), "<tag>");
         assert_eq!(strip_html("&quot;quoted&quot;"), "\"quoted\"");
         assert_eq!(strip_html("&nbsp;space"), " space");
+    }
+
+    #[test]
+    fn extract_between_skips_the_rest_of_the_opening_tag() {
+        // A quoted class attribute used to leave its closing quote in the text.
+        assert_eq!(
+            extract_between(
+                r#"<a class="result__snippet" href="/x">A language</a>"#,
+                "result__snippet"
+            ),
+            Some("A language".to_string())
+        );
+        assert_eq!(
+            extract_between(
+                r#"<a class="result__snippet">A <b>bold</b> idea</a>"#,
+                "result__snippet"
+            ),
+            Some("A bold idea".to_string())
+        );
+        assert_eq!(
+            extract_between("<a class=result__snippet>Unquoted</a>", "result__snippet"),
+            Some("Unquoted".to_string())
+        );
+        // No closing `>` after the marker: nothing to extract.
+        assert_eq!(extract_between("class=\"result__snippet\"", "result__snippet"), None);
     }
 
     #[test]
