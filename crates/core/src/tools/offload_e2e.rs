@@ -28,7 +28,9 @@ use crate::keys;
 use crate::mcp::server::{ExtractTextArgs, ListDirArgs, ListTablesArgs, McpServer, ReadArgs};
 use crate::state::AppState;
 use crate::tools::archive_testkit::{RawPart, deflate_run, heavy, office_zip, raw_part, zip_raw};
-use crate::tools::pdf_testkit::{STREAM_LIMIT, content_bomb_pdf, large_content_pdf, report_pdf};
+use crate::tools::pdf_testkit::{
+    STREAM_LIMIT, content_bomb_pdf, large_content_pdf, page_pdf, plain, report_pdf,
+};
 
 const PROJECT: &str = "atlas";
 const MIA: &str = "mia@example.com";
@@ -767,6 +769,254 @@ async fn e2e_0091_016_every_format_answers_as_recorded() {
         assert_eq!(answer, want, "format {i}");
         assert_eq!(written.as_deref(), md, "format {i}");
     }
+}
+
+// A reader that stops, a requester who gives up (US-0229).
+
+const STOPPED: &str =
+    "could not extract /docs/report.pdf: the document reader stopped unexpectedly";
+
+/// A one page PDF reading `Revenue`.
+fn revenue_pdf() -> Vec<u8> {
+    page_pdf(plain("BT /F1 12 Tf 72 700 Td (Revenue) Tj ET"), "", vec![])
+}
+
+/// Nothing the extraction of `doc` for `person` could leave is there: no
+/// companion, no artifact, no audit line naming the document or its
+/// companion, and the whole session allowance is still free (a write of that
+/// size succeeds).
+async fn nothing_left(s: &Served, person: &str, doc: &str) {
+    let md = crate::docs::extract::companion_md_path(doc);
+    assert!(s.read(&md).await.is_none(), "{md} must not exist");
+    for listed in [
+        crate::tools::artifacts::list_tables(&s.state, PROJECT, doc, None).await,
+        crate::tools::artifacts::list_images(&s.state, PROJECT, doc, None).await,
+    ] {
+        let e = listed.expect_err("no artifact may be listed");
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            (crate::errors::code::NOT_FOUND, crate::docs::artifacts::NO_ARTIFACTS)
+        );
+    }
+    let log = s.state.safety.audit(person, PROJECT);
+    assert!(!log.iter().any(|e| e.path == doc || e.path == md), "{log:?}");
+    assert_eq!(s.state.safety.session_remaining(person, PROJECT), ALLOWANCE);
+    let client = s.state.stores.client(PROJECT).await.unwrap();
+    crate::core::fs_ops::write_bytes(
+        &client,
+        &s.state.safety,
+        person,
+        PROJECT,
+        "/docs/fill.bin",
+        &vec![b'w'; ALLOWANCE as usize],
+        true,
+        true,
+    )
+    .await
+    .expect("nothing was charged");
+}
+
+/// Wait until every decoding the places saw has ended.
+async fn all_decodings_ended(s: &Served) {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let windows = s.state.safety.decode_places().windows();
+        if !windows.is_empty() && windows.iter().all(|(_, end)| end.is_some()) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "a decoding never ended");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn e2e_0091_009_a_reader_stops_unexpectedly() {
+    let s = served().await;
+    s.seed("/docs/report.pdf", &revenue_pdf()).await;
+    s.state.safety.decode_places().inject_fault("/docs/report.pdf");
+
+    let v = extract(s.state.clone(), MIA, "/docs/report.pdf").await;
+
+    refusal(&v, "ERR_INTERNAL_ERROR", STOPPED);
+    nothing_left(&s, MIA, "/docs/report.pdf").await;
+}
+
+/// What the operator reads after an unexpected stop: one error line naming the
+/// code and the path, no audit line, and a health check answered healthy. The
+/// capture records on the thread that took the lock, so the whole body runs on
+/// that one thread.
+#[test]
+fn e2e_0091_010_what_the_operator_sees_after_an_unexp() {
+    let _capture = crate::logging::capture::lock_for_test();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let s = served().await;
+        s.seed("/docs/report.pdf", &revenue_pdf()).await;
+        s.state.safety.decode_places().inject_fault("/docs/report.pdf");
+        let base = baseline(&s, Probe::Health).await;
+        crate::logging::capture::clear();
+
+        let v = extract(s.state.clone(), MIA, "/docs/report.pdf").await;
+
+        refusal(&v, "ERR_INTERNAL_ERROR", STOPPED);
+        let events = crate::logging::capture::events();
+        let errors: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                let message = &e.fields["message"];
+                e.fields["level"] == "ERROR"
+                    && message.contains("ERR_INTERNAL_ERROR")
+                    && message.contains("/docs/report.pdf")
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{events:?}");
+        assert_eq!(events.iter().filter(|e| e.fields["level"] == "ERROR").count(), 1, "{events:?}");
+        let log = s.state.safety.audit(MIA, PROJECT);
+        assert!(!log.iter().any(|e| e.path.contains("report")), "{log:?}");
+        let health = probe_at(&s, Probe::Health, Instant::now()).await;
+        in_time(&[health], base, 1);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_0091_012_one_reader_stops_another_extraction_r() {
+    let _heavy = heavy().await;
+    let s = served().await;
+    s.seed("/docs/report.pdf", &revenue_pdf()).await;
+    s.seed("/docs/large.pdf", &large_pdf()).await;
+    s.seed("/docs/memo.docx", &memo_docx()).await;
+    s.state.safety.decode_places().inject_fault("/docs/report.pdf");
+
+    let t0 = Instant::now();
+    let noa = ask(&s, NOA, "/docs/large.pdf");
+    let (mia, took) = timed_ask(&s, MIA, "/docs/report.pdf", t0 + Duration::from_millis(50)).await;
+    refusal(&mia, "ERR_INTERNAL_ERROR", STOPPED);
+    let refused = Instant::now();
+    assert!(took < probe_bound(), "the refusal took {took:?}");
+    let ola = ask(&s, OLA, "/docs/memo.docx");
+    until(refused + Duration::from_millis(50)).await;
+
+    let (ola, ola_at) = ola.await.unwrap();
+    assert_eq!(ola.expect("memo")["preview"], MEMO_PREVIEW);
+    large_pdf_answer(&noa.await.unwrap().0, "/docs/large.pdf");
+    // Ola was answered while noa's decoding still ran: a place the stopped
+    // reader did not give back would have made memo wait for it.
+    let places = s.state.safety.decode_places();
+    let at = places.started().iter().position(|p| p == "/docs/large.pdf").unwrap();
+    let large_end = places.windows()[at].1.expect("noa's decoding ended");
+    assert!(ola_at < large_end, "ola waited {:?} for noa's decoding", ola_at - large_end);
+    assert_eq!(s.most_at_once(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn e2e_0091_013_mia_gives_up_mid_decoding() {
+    let _heavy = heavy().await;
+    let s = served().await;
+    s.seed("/docs/large.pdf", &large_pdf()).await;
+
+    let mia = ask(&s, MIA, "/docs/large.pdf");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    mia.abort();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    all_decodings_ended(&s).await;
+
+    assert!(mia.await.unwrap_err().is_cancelled());
+    assert_eq!(s.state.safety.decode_places().started(), ["/docs/large.pdf"]);
+    nothing_left(&s, MIA, "/docs/large.pdf").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn e2e_0091_014_an_abandoned_decoding_keeps_its_place() {
+    let _heavy = heavy().await;
+    let s = served().await;
+    s.seed("/docs/large.pdf", &large_pdf()).await;
+    s.seed("/docs/memo.docx", &memo_docx()).await;
+    let base = baseline(&s, Probe::Health).await;
+
+    let t0 = Instant::now();
+    let mia = ask(&s, MIA, "/docs/large.pdf");
+    until(t0 + Duration::from_secs(1)).await;
+    mia.abort();
+    let due = Instant::now() + Duration::from_millis(100);
+    let noa = timed_ask(&s, NOA, "/docs/memo.docx", due);
+    let health = probe_at(&s, Probe::Health, due);
+    let ((memo, took), health) = tokio::join!(noa, health);
+
+    let memo_at = due + took;
+    assert_eq!(memo.expect("memo")["preview"], MEMO_PREVIEW);
+    let (start, end) = s.state.safety.decode_places().windows()[0];
+    let end = end.expect("the large decoding ended");
+    // The story's "no earlier than 4 seconds" is a machine speed figure (this
+    // decoding takes about 3.3 s here); what matters is that the decoding was
+    // still running when noa asked, and noa waited for its end.
+    assert!(end > due && start < due, "the decoding was not running when noa asked");
+    assert!(memo_at >= end, "memo answered {:?} before the decoding ended", end - memo_at);
+    assert_eq!(s.most_at_once(), 1);
+    in_time(&[health], base, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn e2e_0091_015_asking_again_after_giving_up() {
+    let _heavy = heavy().await;
+    let s = served().await;
+    s.seed("/docs/large.pdf", &large_pdf()).await;
+    let mia = ask(&s, MIA, "/docs/large.pdf");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    mia.abort();
+    all_decodings_ended(&s).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let again = extract(s.state.clone(), MIA, "/docs/large.pdf").await;
+
+    large_pdf_answer(&again, "/docs/large.pdf");
+    assert_eq!(again.as_ref().unwrap()["cached"], json!(false), "{again:?}");
+    assert_eq!(s.read("/docs/large.md").await.unwrap(), recorded_large_companion().as_bytes());
+    assert_eq!(s.extraction_lines(MIA, "/docs/large.md"), 1);
+}
+
+#[tokio::test]
+async fn e2e_0091_026_the_same_document_after_the_fault_is() {
+    let recorded = served().await;
+    recorded.seed("/docs/report.pdf", &revenue_pdf()).await;
+    let want = extract(recorded.state.clone(), MIA, "/docs/report.pdf").await.expect("recorded");
+    let s = served().await;
+    s.seed("/docs/report.pdf", &revenue_pdf()).await;
+    let places = s.state.safety.decode_places();
+    places.inject_fault("/docs/report.pdf");
+    refusal(
+        &extract(s.state.clone(), MIA, "/docs/report.pdf").await,
+        "ERR_INTERNAL_ERROR",
+        STOPPED,
+    );
+    places.clear_faults();
+
+    let v = extract(s.state.clone(), MIA, "/docs/report.pdf").await.expect("after the fault");
+
+    assert_eq!(v, want);
+    assert!(v["preview"].as_str().unwrap().contains("Revenue"), "{v}");
+    assert!(s.read("/docs/report.md").await.is_some());
+    assert_eq!(s.extraction_lines(MIA, "/docs/report.md"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn e2e_0091_028_giving_up_while_waiting_for_a_place() {
+    let _heavy = heavy().await;
+    let s = served().await;
+    s.seed("/docs/large.pdf", &large_pdf()).await;
+    s.seed("/docs/c.pdf", &large_pdf()).await;
+
+    let t0 = Instant::now();
+    let noa = ask(&s, NOA, "/docs/large.pdf");
+    until(t0 + Duration::from_millis(50)).await;
+    let mia = ask(&s, MIA, "/docs/c.pdf");
+    until(t0 + Duration::from_millis(550)).await;
+    mia.abort();
+    large_pdf_answer(&done(noa).await, "/docs/large.pdf");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert!(mia.await.unwrap_err().is_cancelled());
+    assert_eq!(s.most_at_once(), 1);
+    assert_eq!(s.state.safety.decode_places().started(), ["/docs/large.pdf"]);
+    nothing_left(&s, MIA, "/docs/c.pdf").await;
 }
 
 // Recorded on the code before SPEC-0091 (US-0227's tree), DEC-009.

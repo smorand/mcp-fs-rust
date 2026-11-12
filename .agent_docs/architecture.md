@@ -452,3 +452,19 @@ reader then fails, contained, as `pdf parser failed on this document`; eight chi
 pin each stop. The code search scan (`docs/symbols.rs`) uses an explicit stack, so a deeply nested source
 is searched, never refused. Tests: `tools/nesting_e2e.rs` (filter `e2e_0092_`, `parity_`), builders in
 `tools/nesting_testkit.rs`; each case that could abort runs in a child process (`in_child`).
+
+## Document decoding apart from the request threads (SPEC-0091, 2026-11-12)
+
+The six readers (PDF, Word, PowerPoint, Excel, HTML, CSV) decode on the blocking pool, behind
+`DecodePlaces` (`docs/extract.rs`): one place per request processing thread, granted in arrival
+order, owned by the `SafetyManager` so each server has its own. The place is taken on the request
+side before the task is spawned and moves into it, so a request dropped while it waits never starts
+a decoding, and a request dropped mid decoding (a client that gives up) leaves the decoding its place
+until it ends; its result is dropped with the future, so no companion, artifact, audit line or charge
+follows, and asking again decodes afresh. A reader that panics (or a runtime that shuts down) frees its
+place as the task unwinds and is answered `ERR_INTERNAL_ERROR` `could not extract <path>: the document
+reader stopped unexpectedly` by `prepare_extraction`, with nothing written; the request side logs the one
+ERROR line (`log_tool_failure`), the decoding logs nothing. The Office readers are never wrapped in
+`catch_unwind` for this; the PDF reader's own `catch_unwind` still answers `pdf parser failed on this
+document`. Tests drive the stop with `DecodePlaces::inject_fault(path)` (test only, per server) in
+`tools/offload_e2e.rs` (filter `e2e_0091_`).

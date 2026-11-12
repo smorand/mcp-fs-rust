@@ -156,6 +156,8 @@ struct PlacesProbe {
     running: usize,
     most: usize,
     started: Vec<String>,
+    /// Paths whose decoding stops before the reader runs (DEC-007).
+    faults: std::collections::HashSet<String>,
     /// When each decoding began and, once it ended, when.
     windows: Vec<(std::time::Instant, Option<std::time::Instant>)>,
 }
@@ -221,6 +223,24 @@ impl DecodePlaces {
         self.probe.lock().map(|p| p.windows.clone()).unwrap_or_default()
     }
 
+    /// Make the decoding of `path` stop before its reader runs. Held per server:
+    /// the closure runs on a pooled thread, where a thread local set by the
+    /// test is invisible, and a per server set keeps parallel tests apart.
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&self, path: &str) {
+        if let Ok(mut p) = self.probe.lock() {
+            p.faults.insert(path.to_string());
+        }
+    }
+
+    /// Remove every injected fault.
+    #[cfg(test)]
+    pub(crate) fn clear_faults(&self) {
+        if let Ok(mut p) = self.probe.lock() {
+            p.faults.clear();
+        }
+    }
+
     /// The paths whose decoding started, in order.
     #[cfg(test)]
     pub(crate) fn started(&self) -> Vec<String> {
@@ -261,6 +281,9 @@ impl Figures {
         }
     }
 }
+
+/// Why a decoding gave no result: its reader stopped, or the runtime did.
+const READER_STOPPED: &str = "the document reader stopped unexpectedly";
 
 /// One of the six built in readers: a synchronous decoding of the whole document.
 type Reader = fn(&[u8]) -> Result<ExtractResult>;
@@ -375,6 +398,11 @@ impl<'a> Extractor<'a> {
         };
         #[cfg(test)]
         let probe = self.places.map(|p| (p.probe.clone(), filename.to_string()));
+        // Read on the request side: the closure only carries the boolean.
+        #[cfg(test)]
+        let fault = self
+            .places
+            .is_some_and(|p| p.probe.lock().is_ok_and(|probe| probe.faults.contains(filename)));
         let joined = tokio::task::spawn_blocking(move || {
             // Dropped last: the place is free only once the figures are taken.
             let _permit = permit;
@@ -387,6 +415,10 @@ impl<'a> Extractor<'a> {
                 LAST_OFFICE_HELD.with(|c| c.set(None));
                 LAST_PDF_HELD.with(|c| c.set(None));
             }
+            #[cfg(test)]
+            if fault {
+                panic!("test fault: the document reader stops");
+            }
             let outcome = read(&data);
             let figures = Figures::take();
             (outcome, figures)
@@ -397,9 +429,11 @@ impl<'a> Extractor<'a> {
                 figures.restore();
                 outcome
             }
-            // Today's behaviour until a reader that stops has its own answer.
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(_) => Err(ToolError::internal("decoding was cancelled")),
+            // A panic of the reader or a runtime shutdown: one answer, worded
+            // with the path by `prepare_extraction`. The place is already free
+            // (the closure's permit dropped as it unwound) and nothing was
+            // written. Never `catch_unwind` the Office readers for this.
+            Err(_) => Err(ToolError::internal(READER_STOPPED)),
         }
     }
 
@@ -599,6 +633,9 @@ pub async fn prepare_extraction(
     let result = match extractor.extract_owned(data, path, max_chars, ocr_enabled).await {
         Ok(r) => r,
         Err(e) if e.code == crate::errors::code::NOT_SUPPORTED => return Err(e),
+        Err(e) if e.code == crate::errors::code::INTERNAL_ERROR && e.message == READER_STOPPED => {
+            return Err(ToolError::internal(format!("could not extract {path}: {READER_STOPPED}")));
+        }
         Err(e) => {
             return Err(ToolError::invalid_argument(format!(
                 "could not extract {path}: {}",
