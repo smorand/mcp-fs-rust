@@ -235,7 +235,7 @@
 | US-0233 | SPEC-0090 | the wrong password first, nothing left, other answers unchanged | US-0232 | 2 | landed | story/US-0233-the-wrong-password-first-nothing-left-ot | story/US-0232-cuts-before-the-judgment-the-right-passw |
 | US-0234 | SPEC-0090 | wrong version 4 passwords through the HTTP door and documentation | US-0233 | 2 | landed | story/US-0234-wrong-version-4-passwords-through-the-ht | story/US-0233-the-wrong-password-first-nothing-left-ot |
 | US-0235 | SPEC-0093 | cap a fetched page at 16 MiB | US-0234 | 2 | landed | story/US-0235-cap-a-fetched-page-at-16-mib | story/US-0234-wrong-version-4-passwords-through-the-ht |
-| US-0236 | SPEC-0093 | cap search, news and suggestion answers | US-0235 | 2 | todo | | |
+| US-0236 | SPEC-0093 | cap search, news and suggestion answers | US-0235 | 2 | landed | story/US-0236-cap-search-news-and-suggestion-answers | story/US-0235-cap-a-fetched-page-at-16-mib |
 | US-0237 | SPEC-0093 | cap the library documentation answers | US-0236 | 2 | todo | | |
 | US-0238 | SPEC-0093 | stop a download or a saved page at the session allowance | US-0237 | 2 | todo | | |
 | US-0239 | SPEC-0093 | stop a download at the project storage limit | US-0238 | 2 | todo | | |

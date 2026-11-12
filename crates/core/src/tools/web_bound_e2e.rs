@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::tools::archive_testkit::heavy;
 use crate::tools::tool_surface_e2e::{call_tool, success_payload};
 use crate::tools::web::{ANSWER_LIMIT, answer_held, answer_held_reset};
-use crate::tools::web_testkit::{FLOOD_BYTES, Record, Script, served, stand_in};
+use crate::tools::web_testkit::{FLOOD_BYTES, Record, Script, served, served_with_base, stand_in};
 
 fn refusal_text(v: &Value) -> String {
     assert!(v["error"].is_null(), "the tool is served, so it is dispatched: {v}");
@@ -221,4 +221,184 @@ async fn e2e_0093_030_answer_trickling_until_the_time_limit() {
     assert!(text.contains("ERR_INTERNAL_ERROR"), "{text}");
     assert!(text.contains("read response: "), "{text}");
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
+// ── SPEC-0093/US-0236: search, news and suggestions ────────────────────────
+
+/// The served app with the three search hosts pointed at a stand in site.
+async fn search_served(
+    routes: Vec<(&'static str, Script)>,
+) -> (axum::Router, String, std::sync::Arc<Record>, tempfile::TempDir) {
+    let (port, rec) = stand_in(routes).await;
+    let (app, token, _state, d) =
+        served_with_base(true, None, Some(format!("http://127.0.0.1:{port}"))).await;
+    (app, token, rec, d)
+}
+
+/// The held figure of the one answer the call read: the refusal must be bounded
+/// above and must count what it read from below, and the site must not have
+/// sent the whole flood.
+fn assert_flood_held(rec: &Record) {
+    let urls: Vec<String> =
+        crate::tools::web::ANSWER_HELD.with(|h| h.borrow().iter().map(|r| r.url.clone()).collect());
+    assert_eq!(urls.len(), 1, "one answer was read: {urls:?}");
+    let held = answer_held(&urls[0]);
+    assert!(held.iter().all(|h| *h <= 17_825_792), "the answer held {held:?}");
+    assert!(
+        held.iter().any(|h| *h > ANSWER_LIMIT),
+        "the refusal must count what it read: {held:?}"
+    );
+    let sent = rec.body_sent.load(Ordering::SeqCst);
+    assert!(sent < FLOOD_BYTES, "the stand in sent the whole flood: {sent}");
+}
+
+#[tokio::test]
+async fn e2e_0093_sec_001_search_answer_flood() {
+    let _heavy = heavy().await;
+    let (app, token, rec, _d) =
+        search_served(vec![("/html/", Script::Flood { endless: false, encoding: None })]).await;
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.search", json!({"query": "rust"})).await;
+
+    assert_over_limit(&v);
+    wait_closed_early(&rec).await;
+    assert_flood_held(&rec);
+}
+
+#[tokio::test]
+async fn e2e_0093_sec_002_news_answer_flood() {
+    let _heavy = heavy().await;
+    let (app, token, rec, _d) = search_served(vec![(
+        "/news.js",
+        Script::Prefixed { prefix: b"{\"results\":[".to_vec(), letter: b'a', n: FLOOD_BYTES },
+    )])
+    .await;
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.news", json!({"query": "launch"})).await;
+
+    assert_over_limit(&v);
+    wait_closed_early(&rec).await;
+    assert_flood_held(&rec);
+}
+
+#[tokio::test]
+async fn e2e_0093_sec_003_suggestions_answer_flood() {
+    let _heavy = heavy().await;
+    let (app, token, rec, _d) =
+        search_served(vec![("/ac/", Script::Flood { endless: false, encoding: None })]).await;
+    answer_held_reset();
+
+    let v = call_tool(&app, &token, "web.suggestions", json!({"query": "ru"})).await;
+
+    assert_over_limit(&v);
+    wait_closed_early(&rec).await;
+    assert_flood_held(&rec);
+}
+
+// ── SPEC-0093/E2E-002 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_002_search_within_the_limit() {
+    let page = "<a class=\"result__a\" href=\"https://www.rust-lang.org/\">Rust</a>\
+<a class=result__snippet>A language</a>\
+<a class=\"result__a\" href=\"https://tokio.rs/\">Tokio</a>\
+<a class=result__snippet>A runtime</a>";
+    let (app, token, _rec, _d) = search_served(vec![(
+        "/html/",
+        Script::Fixed {
+            body: page.as_bytes().to_vec(),
+            content_type: Some("text/html".into()),
+            chunked: false,
+            encoding: None,
+        },
+    )])
+    .await;
+
+    let v =
+        call_tool(&app, &token, "web.search", json!({"query": "rust", "max_results": 10})).await;
+
+    let text = success_payload(&v);
+    let results: Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
+    assert_eq!(
+        results,
+        json!([
+            {"title": "Rust", "url": "https://www.rust-lang.org/", "snippet": "A language"},
+            {"title": "Tokio", "url": "https://tokio.rs/", "snippet": "A runtime"},
+        ])
+    );
+}
+
+// ── SPEC-0093/E2E-007 ───────────────────────────────────────────────────────
+
+fn padded_list(head: &str, total: u64) -> Vec<u8> {
+    let mut body = head.as_bytes().to_vec();
+    body.resize(total as usize, b' ');
+    body
+}
+
+#[tokio::test]
+async fn e2e_0093_007_news_answer_of_exactly_the_answer_lim() {
+    let head = r#"{"results":[{"title":"Launch","url":"https://x.test/","excerpt":"","date":""}]}"#;
+    let (app, token, _rec, _d) = search_served(vec![(
+        "/news.js",
+        Script::Fixed {
+            body: padded_list(head, ANSWER_LIMIT),
+            content_type: Some("application/json".into()),
+            chunked: true,
+            encoding: None,
+        },
+    )])
+    .await;
+
+    let v = call_tool(&app, &token, "web.news", json!({"query": "launch"})).await;
+
+    let text = success_payload(&v);
+    let items: Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    assert_eq!(items[0]["title"], "Launch");
+}
+
+// ── SPEC-0093/E2E-015 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_015_suggestions_answer_over_the_limit() {
+    let (app, token, _rec, _d) = search_served(vec![(
+        "/ac/",
+        Script::Fixed {
+            body: padded_list(r#"["ru",["rust","ruby"]]"#, ANSWER_LIMIT + 1),
+            content_type: Some("application/json".into()),
+            chunked: true,
+            encoding: None,
+        },
+    )])
+    .await;
+
+    let v = call_tool(&app, &token, "web.suggestions", json!({"query": "ru"})).await;
+
+    assert_over_limit(&v);
+}
+
+// ── SPEC-0093/E2E-035 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_035_search_answer_declaring_a_length_over() {
+    let (app, token, rec, _d) = search_served(vec![(
+        "/html/",
+        Script::Declared {
+            length: 20_000_000,
+            pause: Duration::from_secs(10),
+            then: Box::new(Script::Letters { letter: b'b', n: 20_000_000, chunked: false }),
+        },
+    )])
+    .await;
+    let started = Instant::now();
+
+    let v = call_tool(&app, &token, "web.search", json!({"query": "rust"})).await;
+
+    assert_over_limit(&v);
+    assert!(started.elapsed() < Duration::from_secs(5), "the refusal waited for the body");
+    wait_closed_early(&rec).await;
+    assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
 }

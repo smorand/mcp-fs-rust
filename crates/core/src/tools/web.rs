@@ -22,7 +22,7 @@ use crate::tools::{norm, volume};
 use serde_json::{Value, json};
 
 /// Register the four `web.*` tools.
-pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
+pub fn register(reg: &mut ToolRegistry, config: &crate::config::WebConfig) {
     reg.add(
         ToolSchema::new(
             "web.search",
@@ -34,12 +34,18 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         .read_only(true)
         .idempotent(true)
         .open_world(true),
-        handler(|_ctx, a| async move {
-            let query = a.str("query")?;
-            let max = cap_results(a.int_or("max_results", 0), 10);
-            let safe = a.str_or("safe_search", "moderate");
-            web_search(&query, max, &safe).await
-        }),
+        {
+            let config = config.clone();
+            handler(move |_ctx, a| {
+                let config = config.clone();
+                async move {
+                    let query = a.str("query")?;
+                    let max = cap_results(a.int_or("max_results", 0), 10);
+                    let safe = a.str_or("safe_search", "moderate");
+                    web_search(&endpoints(&config), &query, max, &safe).await
+                }
+            })
+        },
     );
 
     reg.add(
@@ -53,12 +59,18 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
             .read_only(true)
             .idempotent(true)
             .open_world(true),
-        handler(|_ctx, a| async move {
-            let query = a.str("query")?;
-            let max = cap_results(a.int_or("max_results", 0), 10);
-            let time_range = a.opt_str("time_range");
-            web_news(&query, max, time_range.as_deref()).await
-        }),
+        {
+            let config = config.clone();
+            handler(move |_ctx, a| {
+                let config = config.clone();
+                async move {
+                    let query = a.str("query")?;
+                    let max = cap_results(a.int_or("max_results", 0), 10);
+                    let time_range = a.opt_str("time_range");
+                    web_news(&endpoints(&config), &query, max, time_range.as_deref()).await
+                }
+            })
+        },
     );
 
     reg.add(
@@ -174,10 +186,16 @@ pub fn register(reg: &mut ToolRegistry, _config: &crate::config::WebConfig) {
         .read_only(true)
         .idempotent(true)
         .open_world(true),
-        handler(|_ctx, a| async move {
-            let query = a.str("query")?;
-            web_suggestions(&query).await
-        }),
+        {
+            let config = config.clone();
+            handler(move |_ctx, a| {
+                let config = config.clone();
+                async move {
+                    let query = a.str("query")?;
+                    web_suggestions(&endpoints(&config), &query).await
+                }
+            })
+        },
     );
 }
 
@@ -269,14 +287,39 @@ fn extract_href(haystack: &str) -> Option<String> {
     }
 }
 
+/// The three fixed service addresses; the test base replaces all three (DEC-007).
+struct Endpoints {
+    search: String,
+    news: String,
+    suggestions: String,
+}
+
+fn endpoints(config: &crate::config::WebConfig) -> Endpoints {
+    #[cfg(test)]
+    if let Some(base) = &config.test_base {
+        return Endpoints {
+            search: format!("{base}/html/"),
+            news: format!("{base}/news.js"),
+            suggestions: format!("{base}/ac/"),
+        };
+    }
+    let _ = config;
+    Endpoints {
+        search: "https://html.duckduckgo.com/html/".to_string(),
+        news: "https://duckduckgo.com/news.js".to_string(),
+        suggestions: "https://duckduckgo.com/ac/".to_string(),
+    }
+}
+
 async fn web_search(
+    ep: &Endpoints,
     query: &str,
     max_results: usize,
     safe_search: &str,
 ) -> crate::errors::Result<Value> {
     let encoded = urlencoding(query);
     let kp = safe_param(safe_search);
-    let url = format!("https://html.duckduckgo.com/html/?q={encoded}&kp={kp}&kl=us-en");
+    let url = format!("{}?q={encoded}&kp={kp}&kl=us-en", ep.search);
 
     let client = build_client(10)?;
     let resp = client.get(&url).send().await.map_err(|e| {
@@ -287,7 +330,11 @@ async fn web_search(
         }
     })?;
 
-    let html = resp.text().await.map_err(|e| ToolError::internal(format!("read response: {e}")))?;
+    let bytes = read_answer(resp, &url, ANSWER_LIMIT, "read response", |_| {
+        over_answer_limit(&host_of(&url))
+    })
+    .await?;
+    let html = String::from_utf8_lossy(&bytes);
 
     let mut results: Vec<Value> = Vec::new();
 
@@ -332,6 +379,7 @@ async fn web_search(
 }
 
 async fn web_news(
+    ep: &Endpoints,
     query: &str,
     max_results: usize,
     time_range: Option<&str>,
@@ -345,9 +393,9 @@ async fn web_news(
         _ => "",
     };
     let url = if df.is_empty() {
-        format!("https://duckduckgo.com/news.js?q={encoded}&o=json&noamp=1&kl=us-en")
+        format!("{}?q={encoded}&o=json&noamp=1&kl=us-en", ep.news)
     } else {
-        format!("https://duckduckgo.com/news.js?q={encoded}&o=json&noamp=1&kl=us-en&df={df}")
+        format!("{}?q={encoded}&o=json&noamp=1&kl=us-en&df={df}", ep.news)
     };
 
     let client = build_client(10)?;
@@ -359,8 +407,12 @@ async fn web_news(
         }
     })?;
 
-    let body: Value =
-        resp.json().await.map_err(|e| ToolError::internal(format!("parse news response: {e}")))?;
+    let bytes = read_answer(resp, &url, ANSWER_LIMIT, "parse news response", |_| {
+        over_answer_limit(&host_of(&url))
+    })
+    .await?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ToolError::internal("parse news response: error decoding response body"))?;
 
     let empty = vec![];
     let items = body["results"].as_array().unwrap_or(&empty);
@@ -480,9 +532,9 @@ async fn web_fetch(url: &str, timeout_secs: u64) -> crate::errors::Result<Value>
     Ok(Value::String(capped))
 }
 
-async fn web_suggestions(query: &str) -> crate::errors::Result<Value> {
+async fn web_suggestions(ep: &Endpoints, query: &str) -> crate::errors::Result<Value> {
     let encoded = urlencoding(query);
-    let url = format!("https://duckduckgo.com/ac/?q={encoded}&type=list");
+    let url = format!("{}?q={encoded}&type=list", ep.suggestions);
 
     let client = build_client(10)?;
     let resp = client.get(&url).send().await.map_err(|e| {
@@ -493,10 +545,13 @@ async fn web_suggestions(query: &str) -> crate::errors::Result<Value> {
         }
     })?;
 
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| ToolError::internal(format!("parse suggestions response: {e}")))?;
+    let bytes = read_answer(resp, &url, ANSWER_LIMIT, "parse suggestions response", |_| {
+        over_answer_limit(&host_of(&url))
+    })
+    .await?;
+    let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        ToolError::internal("parse suggestions response: error decoding response body")
+    })?;
 
     let suggestions = body.get(1).cloned().unwrap_or(Value::Array(vec![]));
     Ok(Value::String(serde_json::to_string_pretty(&suggestions).unwrap_or_default()))

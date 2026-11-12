@@ -618,13 +618,30 @@ fn d_web_request_timeout() -> u64 {
     10
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     pub enabled: bool,
     pub max_results: usize,
     pub request_timeout_secs: u64,
     pub safe_search: String,
+    /// Test only address standing in for the fixed search hosts (SPEC-0093 DEC-007).
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) test_base: Option<String>,
+}
+
+// Written by hand so the test only field never reaches the frozen `Debug` snapshots of the
+// configuration templates.
+impl std::fmt::Debug for WebConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebConfig")
+            .field("enabled", &self.enabled)
+            .field("max_results", &self.max_results)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("safe_search", &self.safe_search)
+            .finish()
+    }
 }
 
 impl Default for WebConfig {
@@ -634,6 +651,8 @@ impl Default for WebConfig {
             max_results: d_web_max_results(),
             request_timeout_secs: d_web_request_timeout(),
             safe_search: d_web_safe_search(),
+            #[cfg(test)]
+            test_base: None,
         }
     }
 }

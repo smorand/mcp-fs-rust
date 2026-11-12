@@ -48,6 +48,12 @@ pub(crate) enum Script {
         endless: bool,
         encoding: Option<String>,
     },
+    /// `prefix`, then `n` times `letter`, chunked.
+    Prefixed {
+        prefix: Vec<u8>,
+        letter: u8,
+        n: u64,
+    },
     /// Headers declaring `length`, a pause, then the body of `then` unframed.
     Declared {
         length: u64,
@@ -141,6 +147,14 @@ async fn write_script(
             }
             let n = if *endless { u64::MAX } else { FLOOD_BYTES };
             write_pieces(w, letter_pieces(b'a', n), true, rec).await
+        }
+        Script::Prefixed { prefix, letter, n } => {
+            let h = headers(true, 0, None, &None);
+            if w.write_all(&header_block("200 OK", &h)).await.is_err() {
+                return false;
+            }
+            let pieces = std::iter::once(prefix.clone()).chain(letter_pieces(*letter, *n));
+            write_pieces(w, pieces, true, rec).await
         }
         Script::Declared { length, pause, then } => {
             let h = headers(false, *length, None, &None);
@@ -251,9 +265,19 @@ pub(crate) async fn served(
     web: bool,
     context7_base: Option<String>,
 ) -> (Router, String, Arc<AppState>, TempDir) {
+    served_with_base(web, context7_base, None).await
+}
+
+/// [`served`] with the search, news and suggestion hosts pointed at `test_base`.
+pub(crate) async fn served_with_base(
+    web: bool,
+    context7_base: Option<String>,
+    test_base: Option<String>,
+) -> (Router, String, Arc<AppState>, TempDir) {
     let d = tempfile::tempdir().unwrap();
     let (mut c, token) = setup(d.path());
     c.web.enabled = web;
+    c.web.test_base = test_base;
     if let Some(base) = context7_base {
         c.context7.enabled = true;
         c.context7.api_url = base;
