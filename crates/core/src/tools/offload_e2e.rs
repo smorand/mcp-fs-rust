@@ -641,10 +641,12 @@ async fn e2e_0091_021_not_a_member_during_a_full_ceiling() {
     let s = served().await;
     seed_three_pdfs(&s).await;
     s.seed("/docs/memo.docx", &memo_docx()).await;
-    let t0 = Instant::now();
+    let places = s.state.safety.decode_places();
     let (a, b) = (ask(&s, MIA, "/docs/a.pdf"), ask(&s, NOA, "/docs/b.pdf"));
+    in_flight(places, &["/docs/a.pdf", "/docs/b.pdf"]).await;
 
-    let (eve, took) = timed_ask(&s, EVE, "/docs/memo.docx", t0 + Duration::from_millis(50)).await;
+    let (eve, took) = timed_ask(&s, EVE, "/docs/memo.docx", Instant::now()).await;
+    assert_eq!(places.running(), 2, "a decoding ended before eve was answered");
 
     assert!(took < probe_bound(), "the refusal took {took:?}");
     refusal(&eve, "ERR_FORBIDDEN", "'eve@example.com' is not a member of 'atlas'");
@@ -658,10 +660,12 @@ async fn e2e_0091_022_missing_path_during_a_full_ceiling() {
     let _heavy = heavy().await;
     let s = served().await;
     seed_three_pdfs(&s).await;
-    let t0 = Instant::now();
+    let places = s.state.safety.decode_places();
     let (a, b) = (ask(&s, MIA, "/docs/a.pdf"), ask(&s, NOA, "/docs/b.pdf"));
+    in_flight(places, &["/docs/a.pdf", "/docs/b.pdf"]).await;
 
-    let (none, took) = timed_ask(&s, OLA, "/docs/none.pdf", t0 + Duration::from_millis(50)).await;
+    let (none, took) = timed_ask(&s, OLA, "/docs/none.pdf", Instant::now()).await;
+    assert_eq!(places.running(), 2, "a decoding ended before ola was answered");
 
     assert!(took < probe_bound(), "the refusal took {took:?}");
     refusal(&none, "ERR_NOT_FOUND", "not a file: /docs/none.pdf");
@@ -816,6 +820,31 @@ async fn nothing_left(s: &Served, person: &str, doc: &str) {
     .expect("nothing was charged");
 }
 
+/// Wait until the decodings of `paths` (and only those) have started and are
+/// all still running: an event, so a fast machine cannot let a test act after
+/// a decoding it meant to interrupt has already ended.
+pub(crate) async fn in_flight(places: &crate::docs::extract::DecodePlaces, paths: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    let want = sorted(paths.iter().map(|p| p.to_string()).collect());
+    while sorted(places.started()) != want || places.running() != paths.len() {
+        assert!(Instant::now() < deadline, "never in flight: {:?}", places.started());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Wait until `n` calls have asked for a place, granted or waiting.
+async fn asked(s: &Served, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while s.state.safety.decode_places().asked() < n {
+        assert!(Instant::now() < deadline, "only {} asked", s.state.safety.decode_places().asked());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Wait until every decoding the places saw has ended.
 async fn all_decodings_ended(s: &Served) {
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -913,10 +942,11 @@ async fn e2e_0091_013_mia_gives_up_mid_decoding() {
     let s = served().await;
     s.seed("/docs/large.pdf", &large_pdf()).await;
 
+    let places = s.state.safety.decode_places();
     let mia = ask(&s, MIA, "/docs/large.pdf");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    in_flight(places, &["/docs/large.pdf"]).await;
     mia.abort();
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(places.running(), 1, "the decoding ended before mia gave up");
     all_decodings_ended(&s).await;
 
     assert!(mia.await.unwrap_err().is_cancelled());
@@ -932,10 +962,11 @@ async fn e2e_0091_014_an_abandoned_decoding_keeps_its_place() {
     s.seed("/docs/memo.docx", &memo_docx()).await;
     let base = baseline(&s, Probe::Health).await;
 
-    let t0 = Instant::now();
+    let places = s.state.safety.decode_places();
     let mia = ask(&s, MIA, "/docs/large.pdf");
-    until(t0 + Duration::from_secs(1)).await;
+    in_flight(places, &["/docs/large.pdf"]).await;
     mia.abort();
+    assert_eq!(places.running(), 1, "the decoding ended before mia gave up");
     let due = Instant::now() + Duration::from_millis(100);
     let noa = timed_ask(&s, NOA, "/docs/memo.docx", due);
     let health = probe_at(&s, Probe::Health, due);
@@ -959,11 +990,12 @@ async fn e2e_0091_015_asking_again_after_giving_up() {
     let _heavy = heavy().await;
     let s = served().await;
     s.seed("/docs/large.pdf", &large_pdf()).await;
+    let places = s.state.safety.decode_places();
     let mia = ask(&s, MIA, "/docs/large.pdf");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    in_flight(places, &["/docs/large.pdf"]).await;
     mia.abort();
+    assert_eq!(places.running(), 1, "the decoding ended before mia gave up");
     all_decodings_ended(&s).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let again = extract(s.state.clone(), MIA, "/docs/large.pdf").await;
 
@@ -1003,19 +1035,23 @@ async fn e2e_0091_028_giving_up_while_waiting_for_a_place() {
     let s = served().await;
     s.seed("/docs/large.pdf", &large_pdf()).await;
     s.seed("/docs/c.pdf", &large_pdf()).await;
+    s.seed("/docs/report.pdf", &revenue_pdf()).await;
+    let places = s.state.safety.decode_places();
 
-    let t0 = Instant::now();
     let noa = ask(&s, NOA, "/docs/large.pdf");
-    until(t0 + Duration::from_millis(50)).await;
+    in_flight(places, &["/docs/large.pdf"]).await;
     let mia = ask(&s, MIA, "/docs/c.pdf");
-    until(t0 + Duration::from_millis(550)).await;
+    asked(&s, 2).await;
     mia.abort();
+    assert_eq!(places.running(), 1, "noa's decoding ended before mia gave up");
     large_pdf_answer(&done(noa).await, "/docs/large.pdf");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Places are granted in arrival order: had mia's wait survived the abort,
+    // c.pdf would start before ola's report, so the order is the event.
+    extract(s.state.clone(), OLA, "/docs/report.pdf").await.expect("ola's report");
 
     assert!(mia.await.unwrap_err().is_cancelled());
     assert_eq!(s.most_at_once(), 1);
-    assert_eq!(s.state.safety.decode_places().started(), ["/docs/large.pdf"]);
+    assert_eq!(places.started(), ["/docs/large.pdf", "/docs/report.pdf"]);
     nothing_left(&s, MIA, "/docs/c.pdf").await;
 }
 

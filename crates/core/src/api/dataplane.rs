@@ -1611,6 +1611,7 @@ mod tests {
     use crate::keys;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     const OWNER: &str = "owner@test.com";
@@ -4178,6 +4179,242 @@ mod tests {
         let held = decoded_held("/docs/bomb.pdf");
         assert!(held <= BOMB_HELD, "held {held} decoded bytes");
         office_nothing_left(&h, "/docs/bomb.pdf", "/docs/bomb.md").await;
+    }
+
+    // SPEC-0091: the REST door during large extractions, a stop, a refusal, a closed socket.
+
+    const STOPPED_PDF: &str = "ERR_INTERNAL_ERROR: could not extract /docs/report.pdf: the document reader stopped unexpectedly";
+
+    /// Nothing an extraction of `doc` could leave is there, read with the
+    /// harness's client: no companion, no artifact, no audit line, and the whole
+    /// session allowance is still free (a write of that size succeeds).
+    async fn http_nothing_left(h: &Harness, doc: &str) {
+        let md = crate::docs::extract::companion_md_path(doc);
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        assert!(!c.exists(&md).await.unwrap(), "{md} must not exist");
+        for listed in [
+            crate::tools::artifacts::list_tables(&h.state, MOUNT, doc, None).await,
+            crate::tools::artifacts::list_images(&h.state, MOUNT, doc, None).await,
+        ] {
+            let e = listed.expect_err("no artifact may be listed");
+            assert_eq!(e.code, code::NOT_FOUND);
+        }
+        let log = h.state.safety.audit(OWNER, MOUNT);
+        assert!(!log.iter().any(|e| e.op == "extract_text"), "{log:?}");
+        assert_eq!(h.state.safety.session_remaining(OWNER, MOUNT), 52_428_800);
+        crate::core::fs_ops::write_bytes(
+            &c,
+            &h.state.safety,
+            OWNER,
+            MOUNT,
+            "/docs/fill.bin",
+            &vec![b'w'; 52_428_800],
+            true,
+            true,
+        )
+        .await
+        .expect("nothing was charged");
+    }
+
+    /// SPEC-0091/E2E-011: a reader that stops answers 500 through the REST door
+    /// with the tool's code and message, and leaves nothing.
+    #[tokio::test]
+    async fn e2e_0091_011_unexpected_stop_through_the_http_api() {
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/report.pdf", &crate::tools::pdf_testkit::report_pdf())
+            .await
+            .unwrap();
+        h.state.safety.decode_places().inject_fault("/docs/report.pdf");
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/report.pdf"})).await;
+
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(v["error"], code::INTERNAL_ERROR, "{v}");
+        assert_eq!(v["detail"], STOPPED_PDF, "{v}");
+        http_nothing_left(&h, "/docs/report.pdf").await;
+    }
+
+    /// One GET of the note, due at `due`, as noa's client would send it; the
+    /// answer time counted from `due`.
+    async fn http_probe(router: Router, token: String, due: std::time::Instant) -> Duration {
+        tokio::time::sleep_until(due.into()).await;
+        let req = Request::builder()
+            .uri(u("read?path=/notes/todo.txt"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let r = router.oneshot(req).await.unwrap();
+        let took = due.elapsed();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("buy milk"), "{body:?}");
+        took
+    }
+
+    /// SPEC-0091/E2E-019: reads through the REST door every 100 ms from 50 ms
+    /// after an extraction of the large PDF started are answered in time on one
+    /// worker, and the extraction answers what the tool answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn e2e_0091_019_the_http_api_door_during_a_large_extr() {
+        use crate::tools::archive_testkit::heavy;
+        use crate::tools::pdf_testkit::{STREAM_LIMIT, large_content_pdf};
+        use std::time::Instant;
+        let _heavy = heavy().await;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.makedirs("/notes", true).await.unwrap();
+        c.write_bytes_atomic("/notes/todo.txt", b"buy milk").await.unwrap();
+        c.write_bytes_atomic("/docs/large.pdf", &large_content_pdf(STREAM_LIMIT)).await.unwrap();
+        let (router, token) = (h.app(), h.owner_token.clone());
+        let base = http_probe(router.clone(), token.clone(), Instant::now()).await;
+
+        let (stop, mut rx) = tokio::sync::watch::channel(false);
+        let probes = {
+            let (router, token) = (router.clone(), token.clone());
+            tokio::spawn(async move {
+                let mut times = Vec::new();
+                let mut due = Instant::now() + Duration::from_millis(50);
+                while !*rx.borrow() {
+                    // Biased: a probe already due is sent and counted late even
+                    // when the stop signal is ready too.
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(due.into()) => {}
+                        _ = rx.changed() => break,
+                    }
+                    times.push((due, http_probe(router.clone(), token.clone(), due).await));
+                    due += Duration::from_millis(100);
+                }
+                times
+            })
+        };
+        let body = json!({"path": "/docs/large.pdf"});
+        let asked = {
+            let router = router.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri(u("extract-text"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap();
+                let r = router.oneshot(req).await.unwrap();
+                let status = r.status();
+                let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            })
+        };
+        let (s, v) = asked.await.unwrap();
+        stop.send(true).unwrap();
+        let times = probes.await.unwrap();
+
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["truncated"], json!(true), "{v}");
+        let preview = v["preview"].as_str().unwrap();
+        let text = preview.trim_start_matches("---\n*[Page 1]*\n\n");
+        assert!(!text.is_empty() && text.chars().all(|ch| ch == 'b'), "{preview}");
+        // 750 ms in a debug build (not optimized, shares the machine with the
+        // decoding thread), 250 ms in release; the waits this story removes
+        // are seconds long.
+        let bound = if cfg!(debug_assertions) {
+            Duration::from_millis(750)
+        } else {
+            Duration::from_millis(250)
+        };
+        assert!(times.len() >= 5, "only {} probes were answered: {times:?}", times.len());
+        for (_, t) in &times {
+            assert!(*t < base + bound, "a read took {t:?} (baseline {base:?}): {times:?}");
+        }
+        // The order, not the bound, tells a read served during the decoding from
+        // one that waited for it: inline decoding passes the bound on a fast machine.
+        let windows = h.state.safety.decode_places().windows();
+        assert_eq!(windows.len(), 1, "one decoding: {windows:?}");
+        let (start, end) = (windows[0].0, windows[0].1.expect("the decoding ended"));
+        let inside: Vec<_> = times.iter().filter(|(due, _)| *due >= start && *due < end).collect();
+        assert!(inside.len() >= 5, "only {} reads were due during the decoding", inside.len());
+        for (due, took) in inside {
+            assert!(*due + *took < end, "a read due during the decoding waited for its end");
+        }
+    }
+
+    /// SPEC-0091/E2E-020: a stream over the limit is refused through the REST
+    /// door as before the offload, with nothing left.
+    #[tokio::test]
+    async fn e2e_0091_020_a_refusal_through_the_http_api_as_rec() {
+        use crate::tools::archive_testkit::heavy;
+        use crate::tools::pdf_testkit::content_bomb_pdf;
+        let _heavy = heavy().await;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/bomb.pdf", &content_bomb_pdf()).await.unwrap();
+
+        let (s, v) = h.post(&u("extract-text"), json!({"path": "/docs/bomb.pdf"})).await;
+
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], code::INVALID_ARGUMENT, "{v}");
+        assert_eq!(
+            v["detail"],
+            "ERR_INVALID_ARGUMENT: could not extract /docs/bomb.pdf: a PDF stream decodes to more than 104857600 bytes"
+        );
+        http_nothing_left(&h, "/docs/bomb.pdf").await;
+    }
+
+    /// SPEC-0091/E2E-027: the client closes the connection 1 s after asking for
+    /// the large PDF's text while it decodes; hyper drops the handler, and once
+    /// the decoding ended nothing was written or charged. Served on a real loopback socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn e2e_0091_027_giving_up_through_the_http_api() {
+        use crate::tools::archive_testkit::heavy;
+        use crate::tools::pdf_testkit::{STREAM_LIMIT, large_content_pdf};
+        use tokio::io::AsyncWriteExt;
+        let _heavy = heavy().await;
+        let h = Harness::new().await;
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        c.makedirs("/docs", true).await.unwrap();
+        c.write_bytes_atomic("/docs/large.pdf", &large_content_pdf(STREAM_LIMIT)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, h.app()).into_future());
+        let body = json!({"path": "/docs/large.pdf"}).to_string();
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            u("extract-text"),
+            h.owner_token,
+            body.len()
+        );
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket.write_all(request.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+
+        // The handler got past membership and the path: the decoding is running
+        // when the client gives up, so a 401 or a 404 cannot pass.
+        let places = h.state.safety.decode_places();
+        crate::tools::offload_e2e::in_flight(places, &["/docs/large.pdf"]).await;
+        drop(socket);
+        assert_eq!(places.running(), 1, "the decoding ended before the client gave up");
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        while places.windows().iter().any(|(_, end)| end.is_none()) {
+            assert!(std::time::Instant::now() < deadline, "the decoding never ended");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // A handler that survived the closed socket writes the companion within
+        // milliseconds of the decoding's end; what must not happen has no event,
+        // so it is watched for a while.
+        let c = h.state.stores.client(MOUNT).await.unwrap();
+        for _ in 0..20 {
+            assert!(!c.exists("/docs/large.md").await.unwrap(), "the handler outlived the client");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        http_nothing_left(&h, "/docs/large.pdf").await;
+        server.abort();
     }
 
     /// SPEC-0089/E2E-039: an upload with the conversion flag keeps the document

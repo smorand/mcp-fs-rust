@@ -120,7 +120,11 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   `conformance.rs` (one suite, every engine), `mod.rs` (factories, `RelationalRegistry`
   pool cache, StoreManager).
 - `core/` : `fs_ops.rs` (every filesystem operation, the engine the tools call), `diff.rs`.
-- `docs/` : `extract.rs` (the Office readers go through `OfficeBudget`: part limit 104857600 decoded
+- `docs/` : `extract.rs` (the six built in readers decode on the blocking pool, behind `DecodePlaces`, owned
+  by `SafetyManager`: one place per runtime worker thread, granted in arrival order, taken on the request
+  side so a request dropped while waiting never starts; a reader that stops is answered `ERR_INTERNAL_ERROR`
+  `could not extract <path>: the document reader stopped unexpectedly`; the held figure hooks are carried
+  back to the caller thread, SPEC-0091; the Office readers go through `OfficeBudget`: part limit 104857600 decoded
   bytes, call limit 268435456 declared bytes, content limit 268435456 bytes, SPEC-0088),
   `docx.rs`, `symbols.rs` (tree-sitter + lexical fallback; the scan walks the syntax tree with an explicit
   stack, so a source of any nesting is searched, SPEC-0092),

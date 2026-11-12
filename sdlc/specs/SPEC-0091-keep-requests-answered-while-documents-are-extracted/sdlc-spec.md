@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: M
 > Depth evidence: 1 bounded context (document text extraction, its six built in readers), 6 functional requirements, observable change (latency of every other request while a document decodes, a ceiling on documents decoding at once, a defined answer when a reader stops unexpectedly), no persisted change, no change of any extraction answer. Override with --depth.
-> Status: designed
+> Status: implemented
 > Generated on: 2026-11-11
 > Project: existing
 > From backlog: BL-0146

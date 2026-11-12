@@ -155,6 +155,8 @@ pub struct DecodePlaces {
 struct PlacesProbe {
     running: usize,
     most: usize,
+    /// How many calls asked for a place, granted or not.
+    asked: usize,
     started: Vec<String>,
     /// Paths whose decoding stops before the reader runs (DEC-007).
     faults: std::collections::HashSet<String>,
@@ -208,6 +210,10 @@ impl DecodePlaces {
                 std::sync::Arc::new(tokio::sync::Semaphore::new(workers))
             })
             .clone();
+        #[cfg(test)]
+        if let Ok(mut p) = self.probe.lock() {
+            p.asked += 1;
+        }
         semaphore.acquire_owned().await.map_err(|_| ToolError::internal("decoding places closed"))
     }
 
@@ -215,6 +221,18 @@ impl DecodePlaces {
     #[cfg(test)]
     pub(crate) fn most_at_once(&self) -> usize {
         self.probe.lock().map_or(0, |p| p.most)
+    }
+
+    /// The decodings running now.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        self.probe.lock().map_or(0, |p| p.running)
+    }
+
+    /// How many calls asked for a place so far, granted or still waiting.
+    #[cfg(test)]
+    pub(crate) fn asked(&self) -> usize {
+        self.probe.lock().map_or(0, |p| p.asked)
     }
 
     /// When each decoding began and ended (`None` while it runs), in order.

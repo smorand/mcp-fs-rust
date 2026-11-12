@@ -358,7 +358,7 @@ logs one INFO line; both the assistant tool and the REST door log it. Both doors
 code and message. A damaged part that does not exceed its size is still read as absent (BL-0144).
 
 Known gaps, not fixed by this limit: a damaged part is read as absent (BL-0144),
-transient copies are not counted (BL-0145), the readers run on the async worker thread (BL-0146).
+transient copies are not counted (BL-0145).
 
 ## PDF text extraction limits
 
@@ -400,6 +400,24 @@ Known gaps: web fetch tools read the whole body
 (BL-0148), the page list is quadratic (BL-0149), a growing bundle file is read while it grows
 (BL-0150), parsed structures can be larger than their bytes (BL-0151), the converter's own
 children survive the kill (BL-0152), no total across cross reference streams (BL-0153).
+
+## Document extraction does not hold up other requests
+
+(2026-11-12, SPEC-0091.) The six built in readers of `fs.extract_text` (and `POST
+/api/fs/{mount_id}/extract-text`: Word, PowerPoint, Excel, PDF, HTML, CSV) decode on blocking threads,
+never on the threads that answer requests. Before this, a PDF at the stream limit made a trivial request
+wait 5.5 s on a server with one worker thread; now another request that decodes no document is delayed by
+at most 250 ms while documents decode. At most as many documents decode at once as the runtime has worker
+threads (a fair ceiling); an extraction over the ceiling waits for a place and the waiting ones start in
+arrival order. A request refused before decoding (not a member, a missing path) and a cached companion
+never wait for a place. The text, preview, character count, truncation, notes, companion, artifacts, audit
+line, charge and every refusal code and message are those of the inline readers, through the assistant
+tool and the REST door alike. A reader that stops answers `ERR_INTERNAL_ERROR` (HTTP 500) with `could not
+extract <path>: the document reader stopped unexpectedly`, leaves no companion, artifact, audit line or
+charge, and frees its place. A client that gives up (tool call cancelled, connection closed) leaves nothing
+either; its place comes back when its decoding ends, because the decoding itself is not interrupted, and
+asking again decodes afresh. Accepted limits: `Extractor::extract_text` builds its own places and only
+tests call it; the code search scan and the Markdown to Word rendering still run on the request thread.
 
 ## Document converter output limit
 

@@ -458,8 +458,19 @@ companion is answered without reading the document. A refusal writes no companio
 or audit line and logs one INFO line; `log_tool_failure` is wired at both doors (`mcp/server.rs`,
 `api/dataplane.rs`). The tool description is unchanged (`TOOL_CONTRACT.txt` does not name the limits).
 Known gaps: BL-0144 (a damaged
-part is read as absent), BL-0145 (uncounted transient copies), BL-0146 (readers run on the async
-worker thread).
+part is read as absent), BL-0145 (uncounted transient copies).
+
+(2026-11-12, SPEC-0091.) `fs.extract_text` leaves other requests alone: the six built in readers (docx,
+pptx, xlsx, pdf, html, csv) decode on blocking threads behind `DecodePlaces`, a fair ceiling equal to the
+number of runtime worker threads; waiting extractions start in arrival order; a request refused before
+decoding (membership, missing path) and a cached companion never wait. Another request is delayed by at
+most 250 ms while documents decode (with one worker a trivial request waited 5.5 s behind a PDF at the
+stream limit). A reader that stops (panic, runtime shutdown) answers `ERR_INTERNAL_ERROR` `could not
+extract <path>: the document reader stopped unexpectedly` (HTTP 500 with `error` and `detail` on the REST
+door), nothing left, place freed. An abandoned extraction leaves nothing; its place returns when the
+decoding ends (the decoding is not interrupted). Answers, refusals and figures are unchanged. No tool
+contract change. Accepted limits: `Extractor::extract_text` builds its own places (tests only); code
+search and Markdown to Word rendering still run on the request thread.
 
 (2026-11-11, SPEC-0089.) PDF limits of `fs.extract_text` (`docs/pdf_bound.rs`, none configurable).
 Measure, defuse, arm: every stream is measured before the reader decodes it (Flate, LZW through `weezl`
