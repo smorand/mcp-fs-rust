@@ -65,6 +65,10 @@ pub(crate) enum Script {
         per_second: u8,
         seconds: u32,
     },
+    /// A 302 to `location`, no body.
+    Redirect {
+        location: String,
+    },
     /// A failure `code` declaring `declared` body bytes it never sends.
     Status {
         code: u16,
@@ -183,6 +187,10 @@ async fn write_script(
                 _ => true,
             }
         }
+        Script::Redirect { location } => {
+            let h = vec![format!("Location: {location}"), "Content-Length: 0".to_string()];
+            w.write_all(&header_block("302 Found", &h)).await.is_ok()
+        }
         Script::Status { code, declared } => {
             let h = headers(false, *declared, None, &None);
             w.write_all(&header_block(&format!("{code} {}", reason(*code)), &h)).await.is_ok()
@@ -206,6 +214,7 @@ async fn write_script(
 
 fn reason(code: u16) -> &'static str {
     match code {
+        302 => "Found",
         500 => "Internal Server Error",
         404 => "Not Found",
         _ => "Status",

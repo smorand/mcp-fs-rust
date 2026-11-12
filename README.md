@@ -398,10 +398,31 @@ companion, artifact, charge or audit line. The REST door answers the same code a
 search (`fs.find_definition`, `fs.find_references`, `GET` routes alike) scans with explicit stacks and
 answers a source of any nesting; it is never refused for depth.
 
-Known gaps: web fetch tools read the whole body
-(BL-0148), the page list is quadratic (BL-0149), a growing bundle file is read while it grows
+Known gaps: the page list is quadratic (BL-0149), a growing bundle file is read while it grows
 (BL-0150), parsed structures can be larger than their bytes (BL-0151), the converter's own
 children survive the kill (BL-0152), no total across cross reference streams (BL-0153).
+
+## Remote answers of the optional web families are bounded
+
+(2026-11-12, SPEC-0093.) The `web` and `context7` families are off by default (`web.enabled`,
+`context7.enabled`); while off, their tools are not offered and no remote request is made. When on,
+every remote answer they hand back is read under a bound: `web.fetch` (page and saved page),
+`web.download`, `web.search`, `web.news`, `web.suggestions`, `context7.resolve_library_id` and
+`context7.get_library_docs`. An answer past 16 777 216 bytes is refused as `ERR_INVALID_ARGUMENT`
+`response from host '<host>' exceeds the 16 MiB limit`: a declared length past the limit is refused before
+any body byte is read, and a chunked answer is abandoned (connection closed) at the limit. No
+decompression is done by the server, so a compressed answer is counted as received. At most the limit
+plus 1 048 576 bytes are held during one call (reqwest delivers pieces up to 507 904 bytes). A download or a
+saved page into a project stops at the lower of the project side (remaining storage, the file replaced
+counted out) and the session write allowance, computed before the request, a tie going to the project;
+the refusal is today's storage message (`session write quota of 52428800 bytes exceeded`, or the project
+message with net growth). Order of refusals: argument checks, membership and path, then the request
+(transport failure, time limit, size), then the write checks on the whole answer (read before write,
+project, session). A refused call writes nothing, charges nothing and leaves no audit line, only the one
+log line of any refused call. Accepted limits: redirects and timeouts are as before, and which addresses
+a member may make the server fetch (CWE-918) is out of scope; the other remote readers (git clone and the
+rest of the class sweep of the spec) are not bounded here. Security note 2026-11-12: CWE-400 and CWE-770,
+an unbounded body read into memory, closed for these seven tools.
 
 ## Document extraction does not hold up other requests
 

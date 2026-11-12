@@ -69,6 +69,36 @@ async fn e2e_0093_sec_004_page_fetch_flood_originating_occu() {
     assert!(sent < FLOOD_BYTES, "the stand in sent the whole flood: {sent}");
 }
 
+// ── SPEC-0093/E2E-SEC-004 host rule ─────────────────────────────────────────
+
+/// The refusal names the host of the address the member gave (no port), even when the
+/// flood is served by another site after a redirect.
+#[tokio::test]
+async fn e2e_0093_sec_004_host_is_the_original_address_after_a_redirect() {
+    let _heavy = heavy().await;
+    let (app, token, _state, _d) = served(true, None).await;
+    let (port_b, rec_b) =
+        stand_in(vec![("/flood", Script::Flood { endless: false, encoding: None })]).await;
+    let (port_a, _rec_a) = stand_in(vec![(
+        "/go",
+        Script::Redirect { location: format!("http://127.0.0.1:{port_b}/flood") },
+    )])
+    .await;
+    let url = format!("http://localhost:{port_a}/go");
+
+    let v = call_tool(&app, &token, "web.fetch", json!({"url": url})).await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_INVALID_ARGUMENT"), "{text}");
+    assert!(
+        text.contains("response from host 'localhost' exceeds the 16 MiB limit"),
+        "the original host, no port: {text}"
+    );
+    assert!(!text.contains("127.0.0.1") && !text.contains(&port_a.to_string()), "{text}");
+    wait_closed_early(&rec_b).await;
+    assert!(rec_b.body_sent.load(Ordering::SeqCst) < FLOOD_BYTES);
+}
+
 // ── SPEC-0093/E2E-001 ───────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -720,6 +750,35 @@ async fn e2e_0093_sec_007_download_declaring_a_huge_length() {
     nothing_left(&state, "/downloads", "/downloads/flood.bin", None).await;
 }
 
+// ── SPEC-0093/E2E-SEC-007 on a saved page ───────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_sec_007_saved_page_declaring_a_huge_length() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, rec) = stand_in(vec![(
+        "/flood",
+        Script::Declared {
+            length: FLOOD_BYTES,
+            pause: Duration::from_secs(10),
+            then: Box::new(Script::Letters { letter: b'a', n: FLOOD_BYTES, chunked: false }),
+        },
+    )])
+    .await;
+    let (url, args) = save_args(port, "/flood", "/pages/flood.html");
+    answer_held_reset();
+    let started = Instant::now();
+
+    let v = call_tool(&app, &token, "web.fetch", args).await;
+
+    assert_session_refusal(&v);
+    assert!(started.elapsed() < Duration::from_secs(8), "waited {:?}", started.elapsed());
+    assert_eq!(answer_held(&url), vec![0], "no body byte may be held");
+    wait_closed_early(&rec).await;
+    assert_eq!(rec.body_sent.load(Ordering::SeqCst), 0);
+    nothing_left(&state, "/pages", "/pages/flood.html", None).await;
+}
+
 // ── SPEC-0093/E2E-SEC-010 ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1139,4 +1198,257 @@ async fn e2e_0093_023_session_partly_spent() {
     assert!(held.iter().all(|h| *h <= 3_477_376), "the answer held {held:?}");
     assert!(held.iter().any(|h| *h > 2_428_800), "the refusal must count what it read: {held:?}");
     assert!(!client.exists("/downloads/late.bin").await.unwrap());
+}
+
+// ── SPEC-0093/US-0240: order of refusals, no trace, families off ────────────
+
+/// A token for a person `setup` did not mint one for, signed with the fixture's key.
+fn token_for(dir: &std::path::Path, person: &str) -> String {
+    let key = dir.join("keys").join(crate::keys::PRIVATE_KEY_FILE);
+    crate::keys::mint_token_from_file(
+        &key,
+        person,
+        crate::keys::DEFAULT_ISSUER,
+        crate::keys::DEFAULT_CLAIM,
+        3600,
+    )
+    .unwrap()
+}
+
+fn small_site() -> Vec<(&'static str, Script)> {
+    let fixed = |body: &[u8]| Script::Fixed {
+        body: body.to_vec(),
+        content_type: None,
+        chunked: false,
+        encoding: None,
+    };
+    vec![("/new", fixed(b"new")), ("/x", fixed(b"x"))]
+}
+
+// ── SPEC-0093/E2E-012 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_012_web_family_off() {
+    let (port, rec) = stand_in(small_site()).await;
+    let (app, token, _state, _d) = served(false, None).await;
+    let (_url, args) = fetch_args(port, "/x");
+
+    let v = call_tool(&app, &token, "web.fetch", args).await;
+
+    crate::tools::tool_surface_e2e::assert_tool_not_found(&v);
+    assert_eq!(rec.requests.load(Ordering::SeqCst), 0);
+}
+
+// ── SPEC-0093/E2E-024 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_024_not_a_member() {
+    let (port, rec) = stand_in(small_site()).await;
+    let (app, _token, _state, d) = served(true, None).await;
+    let eve = token_for(d.path(), "eve@test.com");
+    let (_url, args) = download_args(port, "/x", "/downloads/x.bin");
+
+    let v = call_tool(&app, &eve, "web.download", args).await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_FORBIDDEN"), "{text}");
+    assert!(text.contains("'eve@test.com' is not a member of 'atlas'"), "{text}");
+    assert_eq!(rec.requests.load(Ordering::SeqCst), 0);
+}
+
+// ── SPEC-0093/E2E-025 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_025_download_address_that_is_not_a_web_ad() {
+    let (app, _token, _state, d) = served(true, None).await;
+    let eve = token_for(d.path(), "eve@test.com");
+    let args = json!({"url": "ftp://127.0.0.1/x", "mount_id": "atlas", "path": "/downloads/x.bin"});
+
+    let v = call_tool(&app, &eve, "web.download", args).await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_INVALID_ARGUMENT"), "{text}");
+    assert!(text.contains("url must start with http:// or https://"), "{text}");
+}
+
+// ── SPEC-0093/E2E-026 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_026_half_given_destination() {
+    let (port, rec) = stand_in(small_site()).await;
+    let (app, token, _state, _d) = served(true, None).await;
+    let (_url, mut args) = fetch_args(port, "/x");
+    args["mount_id"] = json!("atlas");
+
+    let v = call_tool(&app, &token, "web.fetch", args).await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_INVALID_ARGUMENT"), "{text}");
+    assert!(text.contains("mount_id and save_path must both be provided, or neither"), "{text}");
+    assert_eq!(rec.requests.load(Ordering::SeqCst), 0);
+}
+
+// ── SPEC-0093/E2E-027 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_027_unread_file_at_the_destination_answer() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let client = state.stores.client("atlas").await.unwrap();
+    client.write_bytes_atomic(OLD_PATH, b"old").await.unwrap();
+    let (port, _rec) =
+        stand_in(vec![("/big", Script::Letters { letter: b'z', n: 60_000_000, chunked: true })])
+            .await;
+    let (_url, args) = download_args(port, "/big", OLD_PATH);
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    assert_session_refusal(&v);
+    assert_eq!(client.read_bytes(OLD_PATH).await.unwrap(), b"old");
+}
+
+// ── SPEC-0093/E2E-028 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_028_unread_file_at_the_destination_answer() {
+    let (app, token, state, _d) = served(true, None).await;
+    let client = state.stores.client("atlas").await.unwrap();
+    client.write_bytes_atomic(OLD_PATH, b"old").await.unwrap();
+    let (port, _rec) = stand_in(small_site()).await;
+    let (_url, args) = download_args(port, "/new", OLD_PATH);
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_EDIT_WITHOUT_PRIOR_READ"), "{text}");
+    assert!(text.contains("edit '/downloads/old.bin' requires reading it first in this session"));
+    assert_eq!(client.read_bytes(OLD_PATH).await.unwrap(), b"old");
+}
+
+// ── SPEC-0093/E2E-029 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_029_site_unreachable() {
+    let (app, token, state, _d) = served(true, None).await;
+    // Bind then drop: the port is free, so the connection is refused.
+    let port =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+    let (_url, args) = download_args(port, "/x", "/downloads/x.bin");
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    let text = refusal_text(&v);
+    assert!(text.contains("ERR_INTERNAL_ERROR"), "{text}");
+    assert!(text.contains("fetch request failed: "), "{text}");
+    nothing_left(&state, "/downloads", "/downloads/x.bin", None).await;
+}
+
+// ── SPEC-0093/E2E-031 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_031_refused_download_repeated() {
+    let _heavy = heavy().await;
+    let (app, token, state, _d) = served(true, None).await;
+    let (port, _rec) = stand_in(vec![(
+        "/big",
+        Script::Letters { letter: b'z', n: SESSION_QUOTA + 1, chunked: true },
+    )])
+    .await;
+
+    for _ in 0..2 {
+        let (_url, args) = download_args(port, "/big", "/downloads/big.bin");
+        assert_session_refusal(&call_tool(&app, &token, "web.download", args).await);
+    }
+
+    nothing_left(&state, "/downloads", "/downloads/big.bin", None).await;
+}
+
+// ── SPEC-0093/E2E-033 ───────────────────────────────────────────────────────
+
+/// The capture records on the thread that took the lock, so the whole body runs
+/// on one current thread runtime.
+#[test]
+fn e2e_0093_033_what_a_refused_download_leaves() {
+    let _capture = crate::logging::capture::lock_for_test();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let _heavy = heavy().await;
+        let (app, token, state, _d) = served(true, None).await;
+        let client = state.stores.client("atlas").await.unwrap();
+        client.write_bytes_atomic("/downloads/keep.bin", b"keep").await.unwrap();
+        state.safety.record_read(MEMBER, "atlas", "/downloads/keep.bin");
+        let (port, _rec) = stand_in(vec![(
+            "/big",
+            Script::Letters { letter: b'z', n: SESSION_QUOTA + 1, chunked: true },
+        )])
+        .await;
+        let (_url, args) = download_args(port, "/big", "/downloads/keep.bin");
+        crate::logging::capture::clear();
+
+        let v = call_tool(&app, &token, "web.download", args).await;
+
+        assert_session_refusal(&v);
+        let events = crate::logging::capture::events();
+        let lines: Vec<_> = events
+            .iter()
+            .filter(|e| e.fields["message"].contains("ERR_WRITE_QUOTA_EXCEEDED"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{events:?}");
+        nothing_left(&state, "/downloads", "/downloads/keep.bin", Some(b"keep")).await;
+    });
+}
+
+// ── SPEC-0093/E2E-034 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_034_two_floods_and_a_normal_fetch_at_once() {
+    let _heavy = heavy().await;
+    let (app, mia, _state, d) = served(true, None).await;
+    let noa = token_for(d.path(), "noa@test.com");
+    let (port, rec) = stand_in(vec![
+        ("/flood", Script::Flood { endless: false, encoding: None }),
+        (
+            "/page",
+            Script::Fixed {
+                body: b"<p>Hello &amp; welcome</p>".to_vec(),
+                content_type: Some("text/html".into()),
+                chunked: false,
+                encoding: None,
+            },
+        ),
+    ])
+    .await;
+    let (flood_url, flood) = fetch_args(port, "/flood");
+    let (_url, page) = fetch_args(port, "/page");
+    answer_held_reset();
+
+    let (a, b, c) = tokio::join!(
+        call_tool(&app, &mia, "web.fetch", flood.clone()),
+        call_tool(&app, &noa, "web.fetch", flood),
+        call_tool(&app, &mia, "web.fetch", page),
+    );
+
+    assert_over_limit(&a);
+    assert_over_limit(&b);
+    assert_eq!(success_payload(&c), Value::String("Hello & welcome".into()));
+    let held = answer_held(&flood_url);
+    assert_eq!(held.len(), 2, "one record per flood call: {held:?}");
+    assert!(held.iter().all(|h| *h <= 17_825_792), "a flood call held {held:?}");
+    wait_closed_early(&rec).await;
+    assert!(rec.body_sent.load(Ordering::SeqCst) < 2 * FLOOD_BYTES);
+}
+
+// ── SPEC-0093/E2E-039 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_0093_039_download_while_the_web_family_is_off() {
+    let (port, rec) = stand_in(small_site()).await;
+    let (app, token, state, _d) = served(false, None).await;
+    let (_url, args) = download_args(port, "/new", "/downloads/new.bin");
+
+    let v = call_tool(&app, &token, "web.download", args).await;
+
+    crate::tools::tool_surface_e2e::assert_tool_not_found(&v);
+    assert_eq!(rec.requests.load(Ordering::SeqCst), 0);
+    let client = state.stores.client("atlas").await.unwrap();
+    assert!(client.list_dir("/downloads").await.unwrap().is_empty());
 }

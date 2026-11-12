@@ -294,7 +294,16 @@ families on; while off, the tools are not offered and no remote request is made.
   `response from host '<host>' exceeds the 16 MiB limit`. A failure status of the documentation
   (404, 5xx) is still answered from the status alone, its body never read. At most the limit plus
   1 048 576 bytes are held during a call. The `web.*` answers follow the same limit (US-0235,
-  US-0236); the write limit for downloads and saved pages arrives with US-0238.
+  US-0236).
+
+- 2026-11-12 (SPEC-0093, US-0238 to US-0240): a `web.download` and a `web.fetch` with `mount_id` and
+  `save_path` stop at the write limit, the lower of the project side (remaining storage, the replaced
+  file counted out) and the session side (`session_remaining`), computed after membership and the path
+  check and before the request; a tie goes to the project. The message is today's storage message
+  (net growth for the project). The whole answer then goes through `fs_ops::write_bytes`. Both families
+  are off by default; `web.test_base` exists only in test builds (`#[cfg(test)]`, `serde(skip)`), never in
+  a configuration file. Order of refusals: argument checks, membership and path, request and read, write
+  checks. Accepted: redirects and timeouts as before; address filtering (CWE-918) is out of scope.
 
 ## Derived paths
 

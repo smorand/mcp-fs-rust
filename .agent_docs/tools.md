@@ -690,6 +690,17 @@ family's own `ToolSchema::to_list_entry()`, so the served schema equals
 `mount_id` themselves, unchanged. They are outside the 116 tool golden
 contract. Tests: `tools/tool_surface_e2e.rs`.
 
+(2026-11-12, SPEC-0093) Remote answers of `web.*` and `context7.*` are read by `tools::web::read_answer`
+under `ANSWER_LIMIT` (16 777 216 bytes): a declared length past it is refused before any body byte, a
+chunked body is abandoned at the limit, nothing is decompressed (counted as received), and at most the
+limit plus 1 048 576 bytes are held. Refusal: `ERR_INVALID_ARGUMENT`
+`response from host '<host>' exceeds the 16 MiB limit`. `web.download` and `web.fetch` with a
+destination use `write_limit` instead: the lower of the project side and the session side, a tie to the
+project, refusing with today's storage messages. Order: argument checks (`url must start with http:// or
+https://`, `mount_id and save_path must both be provided, or neither`), membership and path, request and
+read, then the write checks on the whole answer (read before write, project, session). A refused call
+leaves no file, charge, audit line or companion, and logs one line. Tool descriptions are unchanged.
+
 ## Authorization model
 
 | Gate | Implementation | Applies to |

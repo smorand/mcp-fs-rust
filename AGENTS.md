@@ -100,6 +100,10 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   test-dispatch types for the five optional families' `#[cfg(test)]`-gated `register()` and the
   shared test harness, and `ToolRegistry`/`ToolSchema` back the five optional families'
   (`web`/`context7`/`sqlite`/`db`/`doc`) production `catalog()` read by `/api/swagger.json`.
+  `tools/web.rs` and `tools/context7.rs` read every remote answer through the capped `read_answer`
+  (16 MiB, `response from host '<host>' exceeds the 16 MiB limit`, limit plus 1 048 576 bytes held,
+  SPEC-0093); a download or saved page stops at `write_limit`, the lower of the project and session
+  sides. `WebConfig::test_base` is test only; the stand in is `tools/web_testkit.rs`.
 - `config.rs` : full `ServerConfig` + `${VAR}` expansion + `Dsn` (redacts in Debug and
   Display) + boot validation of every `infra.*` store.
 - `quota.rs` : project storage quota (SPEC-0020): `admit`/`admit_file`/`admit_paths`/

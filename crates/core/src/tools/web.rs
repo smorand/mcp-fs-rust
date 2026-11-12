@@ -727,6 +727,15 @@ mod tests {
     use crate::config::WebConfig;
     use crate::tools::registry_support::ToolRegistry;
 
+    /// SPEC-0093 host rule: the production endpoints carry plain host names, no port.
+    #[test]
+    fn e2e_0093_sec_004_production_endpoint_hosts() {
+        let e = endpoints(&WebConfig::default());
+        assert_eq!(host_of(&e.search), "html.duckduckgo.com");
+        assert_eq!(host_of(&e.news), "duckduckgo.com");
+        assert_eq!(host_of(&e.suggestions), "duckduckgo.com");
+    }
+
     fn reg() -> ToolRegistry {
         let mut r = ToolRegistry::new();
         register(&mut r, &WebConfig::default());
