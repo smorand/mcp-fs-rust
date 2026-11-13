@@ -428,7 +428,7 @@ Rules (2026-10-10, SPEC-0019):
 
 | Tool | Purpose | Parameters | Returns | Annotations | Auth |
 |---|---|---|---|---|---|
-| `fs.extract_text` | document to Markdown, stored as a companion `.md` | `path`, `max_chars:int=200000`, `preview_chars:int=4000`, `ocr:bool=true`, `refresh:bool=false` | `path`, `md_path`, `format`, `chars`, `cached`, `preview` | !D,!RO,I,OW | member |
+| `fs.extract_text` | document to Markdown, stored as a companion `.md` | `path`, `max_chars:int=200000`, `preview_chars:int=4000`, `ocr:bool=true`, `refresh:bool=false` | `path`, `md_path`, `format`, `chars`, `cached`, `preview` (+ `note` on a PDF, see SPEC-0094 below) | !D,!RO,I,OW | member |
 | `fs.write_docx` | render Markdown into a `.docx` | `path`, `markdown`, `title=null`, `overwrite:bool=false` | `path`, `bytes_written`, `overwritten` | D,!RO,!I,!OW | member |
 | `fs.documentize` | convert a stored document through the external `doc_service` | `path`, `overwrite:bool=false` | `path`, `md_path`, `bytes_written`, `overwritten` | !D,!RO,I,OW | member |
 
@@ -511,6 +511,22 @@ REST door answers the same code and message (`e2e_0092_002`, `015`). `fs.find_de
 Accepted test limits (2026-11-11, audit G3 and G5): E2E-SEC-012/032 cannot isolate a reintroduced second
 unbounded load of the title; the held figures are logical bytes and the real peak can reach about twice
 that; parsed operations of 100 MB of tiny operators are not counted (BL-0151); the e2e with one colour profile in 300 saved states proves the page still extracts, not that the reader's copies are empty stand ins (that needs an allocation counter, so only the structural unit test guards DEC-009).
+
+(2026-11-12, SPEC-0094.) A PDF answer of `fs.extract_text` (REST `extract-text` too, same engine) carries
+`note`. Fresh, it is `pdf: damaged or cut content on page 2; the text may be incomplete` (`pages 1, 3` in
+the plural), naming each page whose content, or the content of a form it draws, the strict parse
+(`Content::decode_strict`) refused; the lenient parse still gives the text, so the text is unchanged. A
+drawn XObject counts only when its dictionary has `/Subtype /Form` (image bytes are not content). At most
+20 page numbers are listed, then `and N more` (`pages 1, 2, ..., 20 and 5 more`). It is empty when no page
+is damaged, and a scan keeps its own message (`no extractable text layer (scanned PDF?); ...`). A cached
+PDF answer carries the note of the extraction that stored the copy, read from the nullable
+`doc_artifact_sets.note` column by `current_set_note(path, sha256 of the stored text)`, so the PDF is not
+read again; the note is present even when empty. A copy stored before SPEC-0094 has no note and answers an
+empty one until `refresh: true` reads the PDF again (a replaced PDF newer than its copy is read again
+without it). An empty text stores no copy, so it is always answered afresh. A document that is not a PDF
+never has a damage note, and its cached answer has no `note` key. Known limit (DEC-003): pages after a
+point where the reader stops are not examined and not listed. The DDL fingerprints of `storage::meta`
+moved with the additive column.
 
 (2026-11-11, SPEC-0089.) `fs.documentize` and the documented `fs.write_bytes` / upload: the converter's
 answer is capped by `doc_service.max_input_bytes` on every channel (cli stdout, web body, bundle files).

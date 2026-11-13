@@ -142,6 +142,9 @@ pub(crate) struct PdfText {
     pub(crate) pages: Vec<usize>,
     pub(crate) body: String,
     pub(crate) title: Option<String>,
+    /// The pages, from 1 and ascending, whose content or a drawn form's content
+    /// the strict parse refused, each once (SPEC-0094 DEC-002).
+    pub(crate) damaged: Vec<u32>,
 }
 
 /// The figures of one call. `page` is the decode count of the page being
@@ -204,6 +207,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<PdfText> {
 
     let page_ids: Vec<ObjectId> = doc.get_pages().into_values().collect();
     let mut pages = Vec::new();
+    let mut damaged = Vec::new();
     let mut sink =
         ContentSink { buf: Vec::new(), threshold: CONTENT_LIMIT + SINK_SLACK, tripped: false };
     for (index, page_id) in page_ids.into_iter().enumerate() {
@@ -211,6 +215,9 @@ pub(crate) fn extract(data: &[u8]) -> Result<PdfText> {
         budget.page_no = n;
         let walked = walk(&doc, page_id, &originals, budget)?;
         budget.hold(budget.page);
+        if walked.damaged {
+            damaged.push(n);
+        }
         // A tint transform pdf-extract would format from invalid UTF-8 keeps
         // doing so (DEC-009): its stand in holds the one invalid byte.
         for id in &walked.invalid {
@@ -255,7 +262,7 @@ pub(crate) fn extract(data: &[u8]) -> Result<PdfText> {
         .map_err(|_| ToolError::invalid_argument("pdf: the extracted text is not valid UTF-8"))?;
     body.drain(..body.len().min(2));
     let title = title(&doc);
-    Ok(PdfText { pages, body, title })
+    Ok(PdfText { pages, body, title, damaged })
 }
 
 /// `/Info /Title` of the loaded document: no second load (DEC-011). Absent or
@@ -1314,6 +1321,20 @@ fn measure(stream: &Stream, budget: &mut PdfBudget, scope: Scope) -> Result<u64>
     Ok(total)
 }
 
+/// The operations of `bytes` as the reader gets them. The strict grammar and
+/// the lenient one share a parser (`lopdf` `parser/mod.rs`), so a clean stream
+/// yields the same operations from either, in one parse. A stream the strict
+/// grammar refuses sets `damaged` and is parsed again leniently, which is what
+/// the walk always did (SPEC-0094 DEC-001).
+fn decode_flagging(bytes: &[u8], damaged: &mut bool) -> Option<Content> {
+    Content::decode_strict(bytes)
+        .or_else(|_| {
+            *damaged = true;
+            Content::decode(bytes)
+        })
+        .ok()
+}
+
 /// What the walk of one page found.
 #[derive(Default)]
 struct Walked {
@@ -1321,6 +1342,8 @@ struct Walked {
     armed: BTreeSet<ObjectId>,
     /// The stand ins of tint transforms whose original is not valid UTF-8.
     invalid: BTreeSet<ObjectId>,
+    /// Whether the content of the page or of a form it draws failed the strict parse.
+    damaged: bool,
 }
 
 /// The object `obj` leads to, with the id of the last reference followed.
@@ -1410,6 +1433,8 @@ struct PageWalk<'d> {
     doc: &'d Document,
     armed: BTreeSet<ObjectId>,
     sizes: HashMap<ObjectId, u64>,
+    /// Set when a content parse of this page needed the lenient fallback.
+    damaged: bool,
 }
 
 impl PageWalk<'_> {
@@ -1442,7 +1467,7 @@ impl PageWalk<'_> {
 impl PageWalk<'_> {
     /// The walk's result: the streams to arm and the stand ins to fill.
     fn into_walked(self, invalid: BTreeSet<ObjectId>) -> Walked {
-        Walked { armed: self.armed, invalid }
+        Walked { armed: self.armed, invalid, damaged: self.damaged }
     }
 
     /// Whether tint transform `id`, of `FunctionType` 4, decodes to bytes that
@@ -1485,7 +1510,7 @@ fn walk(
     budget: &mut PdfBudget,
 ) -> Result<Walked> {
     budget.page = 0;
-    let mut page = PageWalk { doc, armed: BTreeSet::new(), sizes: HashMap::new() };
+    let mut page = PageWalk { doc, armed: BTreeSet::new(), sizes: HashMap::new(), damaged: false };
     let mut invalid = BTreeSet::new();
     let Ok(page_dict) = doc.get_dictionary(page_id) else { return Ok(page.into_walked(invalid)) };
     let empty = Dictionary::new();
@@ -1511,7 +1536,9 @@ fn walk(
             content.push(b'\n');
         }
     }
-    let Ok(parsed) = Content::decode(&content) else { return Ok(page.into_walked(invalid)) };
+    let Some(parsed) = decode_flagging(&content, &mut page.damaged) else {
+        return Ok(page.into_walked(invalid));
+    };
     drop(content);
 
     let mut fonts: HashSet<Vec<u8>> = HashSet::new();
@@ -1601,7 +1628,18 @@ fn walk(
                 let inner = dict_at(doc, &xobject.dict, b"Resources").unwrap_or(resources);
                 budget.hold(size);
                 let bytes = reader_bytes(xobject, page.armed.contains(&id));
-                let Ok(parsed) = Content::decode(&bytes) else { break };
+                // The reader parses every drawn XObject as content, an image included,
+                // and an image's bytes are never a content grammar: only a form's refusal
+                // is damage, or every photo would flag its page.
+                let is_form = xobject
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .is_ok_and(|n| n == b"Form");
+                let mut hurt = false;
+                let parsed = decode_flagging(&bytes, &mut hurt);
+                page.damaged |= hurt && is_form;
+                let Some(parsed) = parsed else { break };
                 drop(bytes);
                 retained = retained.saturating_add(size);
                 budget.hold(retained);

@@ -240,3 +240,6 @@
 | US-0238 | SPEC-0093 | stop a download or a saved page at the session allowance | US-0237 | 2 | landed | story/US-0238-stop-a-download-or-a-saved-page-at-the-s | story/US-0237-cap-the-library-documentation-answers |
 | US-0239 | SPEC-0093 | stop a download at the project storage limit | US-0238 | 2 | landed | story/US-0239-stop-a-download-at-the-project-storage-l | story/US-0238-stop-a-download-or-a-saved-page-at-the-s |
 | US-0240 | SPEC-0093 | web refusals in order, without trace, families off, and documentation | US-0239 | 2 | landed | story/US-0240-web-refusals-in-order-without-trace-fami | story/US-0239-stop-a-download-at-the-project-storage-l |
+| US-0241 | SPEC-0094 | report cut pages in a fresh PDF extraction | main | 2 | landed |  |  |
+| US-0242 | SPEC-0094 | keep the damage note on the stored text copy | US-0241 | 1 | landed |  |  |
+| US-0243 | SPEC-0094 | other formats and replaced files stay as they are, and the documentation | US-0242 | 2 | landed |  |  |

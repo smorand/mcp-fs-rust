@@ -1763,7 +1763,8 @@ pub async fn extract_document(
                 &fresh.result.text,
                 &fresh.result.tables,
                 fresh.truncated_at(),
-            ),
+            )
+            .with_note(fresh.stored_note().map(str::to_string)),
         )),
         _ => None,
     };

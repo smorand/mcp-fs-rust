@@ -562,6 +562,13 @@ impl FreshExtraction {
         self.companion.as_deref().filter(|_| !self.result.text.trim().is_empty())
     }
 
+    /// The note kept with the artifact set (SPEC-0094 DEC-007): only a PDF
+    /// whose companion gets written, so the note is the damage note (or empty),
+    /// never the scanned message of an empty extraction, which stores no copy.
+    pub fn stored_note(&self) -> Option<&str> {
+        (self.result.fmt == "pdf" && self.md_path().is_some()).then_some(self.result.note.as_str())
+    }
+
     /// UTF-8 bytes of the companion that gets written.
     pub fn sibling_bytes(&self) -> i64 {
         self.md_path().map_or(0, |_| self.result.text.len() as i64)
@@ -636,14 +643,24 @@ pub async fn prepare_extraction(
             }
         }
         let cached = client.read_text(md).await?;
-        return Ok(Prepared::Cached(doc_payload(
-            path,
-            Some(md),
-            "md",
-            &cached,
-            preview_chars,
-            true,
-        )));
+        let mut payload = doc_payload(path, Some(md), "md", &cached, preview_chars, true);
+        // SPEC-0094 DEC-006: a PDF answered from its copy repeats the note of
+        // the extraction that stored it, looked up by the hash of the text just
+        // read, so the PDF itself is never read nor decoded on a hit. Other
+        // formats carry no note key on a cached answer.
+        if ext == ".pdf" {
+            let note = match client.trash.as_deref() {
+                Some(store) => {
+                    let sha = VolumeClient::sha256_hex(cached.as_bytes());
+                    store.current_set_note(path, &sha).await?.unwrap_or_default()
+                }
+                None => String::new(),
+            };
+            if let Value::Object(map) = &mut payload {
+                map.insert("note".into(), Value::String(note));
+            }
+        }
+        return Ok(Prepared::Cached(payload));
     }
 
     let data = client.read_bytes(path).await?;
@@ -788,6 +805,25 @@ const SEPARATOR: &str = " | ";
 
 // ── PDF ──────────────────────────────────────────────────────────────────────
 
+/// Most page numbers a damage note lists; the rest are counted (SPEC-0094 DEC-004).
+const DAMAGE_LIST_CAP: usize = 20;
+
+/// The note naming the PDF pages whose content is damaged or cut, `pages`
+/// ascending from 1; empty when none is.
+fn damage_note(pages: &[u32]) -> String {
+    if pages.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<String> = pages.iter().take(DAMAGE_LIST_CAP).map(u32::to_string).collect();
+    let more = pages.len().saturating_sub(DAMAGE_LIST_CAP);
+    let word = if pages.len() == 1 { "page" } else { "pages" };
+    let rest = if more > 0 { format!(" and {more} more") } else { String::new() };
+    format!(
+        "pdf: damaged or cut content on {word} {}{rest}; the text may be incomplete",
+        shown.join(", ")
+    )
+}
+
 fn pdf(data: &[u8]) -> Result<ExtractResult> {
     // pdf-extract panics on some malformed content streams, and a panic in a
     // request handler would take down the whole worker, so it is contained here.
@@ -802,10 +838,17 @@ fn pdf(data: &[u8]) -> Result<ExtractResult> {
     if let Some(title) = text.title.filter(|t| !t.is_empty()) {
         result = result.with_meta("title", json!(title));
     }
+    // `with_note` overwrites, so the final note is composed once: the damage
+    // note, then the scanned message when there is no text.
+    let mut note = damage_note(&text.damaged);
     if result.text.is_empty() {
-        result = result.with_note(
-            "no extractable text layer (scanned PDF?); enable a multimodal OCR provider",
-        );
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        note.push_str("no extractable text layer (scanned PDF?); enable a multimodal OCR provider");
+    }
+    if !note.is_empty() {
+        result = result.with_note(note);
     }
     Ok(result)
 }
@@ -1819,6 +1862,64 @@ pub(crate) mod tests {
         }
         async fn extract_text(&self, _image: &[u8], _mime: &str) -> Result<String> {
             Ok(self.0.to_string())
+        }
+    }
+
+    // ── damage_note ──────────────────────────────────────────────────────────
+
+    const TAIL: &str = "; the text may be incomplete";
+
+    #[test]
+    fn damage_note_of_no_page_is_empty() {
+        assert_eq!(damage_note(&[]), "");
+    }
+
+    #[test]
+    fn damage_note_of_one_page_is_singular() {
+        assert_eq!(
+            damage_note(&[2]),
+            "pdf: damaged or cut content on page 2; the text may be incomplete"
+        );
+    }
+
+    #[test]
+    fn damage_note_of_two_pages_is_plural() {
+        assert_eq!(
+            damage_note(&[1, 3]),
+            "pdf: damaged or cut content on pages 1, 3; the text may be incomplete"
+        );
+    }
+
+    #[test]
+    fn damage_note_of_twenty_pages_has_no_more() {
+        let pages: Vec<u32> = (1..=20).collect();
+        let list: Vec<String> = pages.iter().map(u32::to_string).collect();
+        let note = damage_note(&pages);
+        assert_eq!(note, format!("pdf: damaged or cut content on pages {}{TAIL}", list.join(", ")));
+        assert!(!note.contains("more"), "{note}");
+    }
+
+    #[test]
+    fn damage_note_of_twenty_one_pages_ends_with_one_more() {
+        let pages: Vec<u32> = (1..=21).collect();
+        let note = damage_note(&pages);
+        assert!(note.ends_with(&format!("19, 20 and 1 more{TAIL}")), "{note}");
+        assert!(!note.contains("21"), "{note}");
+    }
+
+    #[test]
+    fn damage_note_of_twenty_five_pages_ends_with_five_more() {
+        let pages: Vec<u32> = (1..=25).collect();
+        let note = damage_note(&pages);
+        assert!(note.starts_with("pdf: damaged or cut content on pages 1, 2, 3"), "{note}");
+        assert!(note.ends_with(&format!("19, 20 and 5 more{TAIL}")), "{note}");
+    }
+
+    #[test]
+    fn damage_note_always_ends_with_the_incomplete_text_sentence() {
+        for n in [1u32, 2, 20, 21, 25] {
+            let pages: Vec<u32> = (1..=n).collect();
+            assert!(damage_note(&pages).ends_with(TAIL), "{n}");
         }
     }
 

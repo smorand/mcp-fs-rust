@@ -52,6 +52,8 @@ pub(crate) struct PendingSet<'a> {
     /// `<id>: <reason>` per failed item, images by id then tables by id
     /// (FR-NEW-015).
     failures: Vec<String>,
+    /// The extraction's damage note, kept with the set (SPEC-0094 DEC-005).
+    note: Option<String>,
 }
 
 impl<'a> PendingSet<'a> {
@@ -76,7 +78,13 @@ impl<'a> PendingSet<'a> {
                 line_count: t.line_count,
             })
             .collect();
-        Self { text, images: Vec::new(), tables, failures: Vec::new() }
+        Self { text, images: Vec::new(), tables, failures: Vec::new(), note: None }
+    }
+
+    /// The same set carrying `note`, committed in the set's own transaction so
+    /// a cached answer can repeat it (SPEC-0094 DEC-005).
+    pub(crate) fn with_note(self, note: Option<String>) -> Self {
+        Self { note, ..self }
     }
 
     /// The set of an external conversion of `source` (FR-NEW-033): its
@@ -119,7 +127,7 @@ impl<'a> PendingSet<'a> {
                 }
             })
             .collect();
-        Self { text, images, tables, failures }
+        Self { text, images, tables, failures, note: None }
     }
 
     /// What this set adds to the session write quota beside the sibling
@@ -201,6 +209,7 @@ impl<'a> PendingSet<'a> {
             text_sha,
             text_len: self.text.len() as i64,
             report: self.report(),
+            note: self.note.clone(),
             images,
             tables,
         };

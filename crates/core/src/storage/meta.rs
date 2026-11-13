@@ -250,6 +250,7 @@ pub fn schema() -> SchemaSet {
                     Column::required("report", ColumnType::Text),
                     Column::new("superseded_at", ColumnType::BigInt),
                     Column::required("created_at", ColumnType::BigInt),
+                    Column::new("note", ColumnType::Text),
                 ],
                 vec!["volume_id", "set_id"],
             ),
@@ -314,6 +315,16 @@ pub fn schema() -> SchemaSet {
     .column_migration(ColumnMigration {
         table: "nodes",
         column: "rev",
+        ty: ColumnType::Text,
+        not_null: false,
+        default: "NULL",
+    })
+    // SPEC-0094 DEC-005: the damage note of the extraction that stored the
+    // set, so a cached answer repeats it without reading the PDF. Sets stored
+    // before the column existed keep NULL, read back as no note.
+    .column_migration(ColumnMigration {
+        table: "doc_artifact_sets",
+        column: "note",
         ty: ColumnType::Text,
         not_null: false,
         default: "NULL",
@@ -392,6 +403,8 @@ pub(crate) struct NewArtifactSet {
     pub text_sha: Option<String>,
     pub text_len: i64,
     pub report: String,
+    /// The note of the extraction that stored the set (SPEC-0094 DEC-005).
+    pub note: Option<String>,
     pub images: Vec<NewDocImage>,
     pub tables: Vec<NewDocTable>,
 }
@@ -891,8 +904,8 @@ impl RelationalMetaStore {
         tx.execute(
             &Query::new(
                 "INSERT INTO doc_artifact_sets (volume_id, set_id, path, node_rev, text_sha, \
-                 text_len, report, superseded_at, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 text_len, report, superseded_at, created_at, note) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )
             .bind(volume)
             .bind(&set.set_id)
@@ -902,7 +915,8 @@ impl RelationalMetaStore {
             .bind(set.text_len)
             .bind(&set.report)
             .bind(None::<i64>)
-            .bind(now),
+            .bind(now)
+            .bind(set.note.clone()),
         )
         .await?;
         let insert_table = format!(
@@ -1230,6 +1244,31 @@ impl RelationalMetaStore {
                 )
                 .bind(&self.volume_id)
                 .bind(set_id),
+            )
+            .await?;
+        Ok(row.map(|r| r.opt_text(0)).transpose()?.flatten())
+    }
+
+    /// The note stored with the current set of `path`, only when that set's
+    /// conversion text hashes to `text_sha` (SPEC-0094 DEC-006): the hash binds
+    /// the note to the very text a cached answer serves, so a companion written
+    /// by another path never inherits it.
+    pub(crate) async fn current_set_note(
+        &self,
+        path: &str,
+        text_sha: &str,
+    ) -> Result<Option<String>> {
+        let row = self
+            .db
+            .query_opt(
+                &Query::new(
+                    "SELECT s.note FROM doc_artifact_current c JOIN doc_artifact_sets s \
+                     ON s.volume_id = c.volume_id AND s.set_id = c.set_id \
+                     WHERE c.volume_id = ?1 AND c.path = ?2 AND s.text_sha = ?3",
+                )
+                .bind(&self.volume_id)
+                .bind(path)
+                .bind(text_sha),
             )
             .await?;
         Ok(row.map(|r| r.opt_text(0)).transpose()?.flatten())

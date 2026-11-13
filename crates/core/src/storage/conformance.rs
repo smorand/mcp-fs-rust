@@ -900,6 +900,7 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
         text_sha: Some("sha-text".into()),
         text_len: 42,
         report: "2 images, 2 tables".into(),
+        note: Some("n1".into()),
         images: vec![doc_image(3, Some(1)), doc_image(1, None)],
         tables: vec![doc_table(2, "Q2"), doc_table(1, "Q1 é | \"x\"")],
     };
@@ -907,6 +908,12 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
     let current = m.current_artifact_set("/b.xlsx").await?;
     assert_eq!(current.as_deref(), Some(set.set_id.as_str()), "{who}: pointer follows commit");
     assert_eq!(other.current_artifact_set("/b.xlsx").await?, None, "{who}: scoped by volume");
+    // SPEC-0094 DEC-005: the note is read back bound to the volume and the text hash.
+    let note = m.current_set_note("/b.xlsx", "sha-text").await?;
+    assert_eq!(note.as_deref(), Some("n1"), "{who}: the note round trips");
+    assert_eq!(m.current_set_note("/b.xlsx", "other").await?, None, "{who}: bound to the hash");
+    let scoped = other.current_set_note("/b.xlsx", "sha-text").await?;
+    assert_eq!(scoped, None, "{who}: the note is scoped by volume");
 
     let tables = m.list_artifact_tables(&set.set_id, 10, 0).await?;
     let seqs: Vec<i64> = tables.iter().map(|t| t.seq).collect();
@@ -976,6 +983,7 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
         text_sha: Some("sha-text-d1".into()),
         text_len: 5,
         report: "1 images, 0 tables".into(),
+        note: Some("n-d1".into()),
         images: vec![doc_image_with_sha(1, None, "sha-img-d1")],
         tables: Vec::new(),
     };
@@ -995,10 +1003,15 @@ async fn doc_artifacts_round_trip(engine: &Engine, tag: &str) -> Result<()> {
         text_sha: Some("sha-text-d2".into()),
         text_len: 5,
         report: "1 images, 0 tables".into(),
+        note: None,
         images: vec![doc_image_with_sha(1, None, "sha-img-d2")],
         tables: Vec::new(),
     };
     m.commit_artifact_set(&current_set).await?;
+    let d1 = m.current_set_note("/d.xlsx", "sha-text-d1").await?;
+    assert_eq!(d1, None, "{who}: a superseded set's note is not served");
+    let d2 = m.current_set_note("/d.xlsx", "sha-text-d2").await?;
+    assert_eq!(d2, None, "{who}: a set stored without a note has none");
 
     let sweep_now = now_unix() as i64;
     let (too_soon_sets, too_soon) = m.sweep_stale_artifact_sets(sweep_now, 600).await?;

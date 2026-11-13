@@ -448,19 +448,21 @@ mod tests {
     /// SPEC-0026/BT-020: the DDL of every production schema, on every engine, is
     /// byte identical to the one rendered before US-0029 (captured on 2026-10-14,
     /// before the PostgreSQL migrate change), so SQLite and PostgreSQL deployments
-    /// see no difference (BR-005).
+    /// see no difference (BR-005). One deliberate change since: SPEC-0094 added the
+    /// nullable `doc_artifact_sets.note` column (table and column migration), which
+    /// moved the two `storage::meta` fingerprints only.
     #[test]
     fn production_ddl_is_unchanged_on_every_engine() {
         let expected = [
             (
                 "storage::meta",
                 Dialect::Sqlite,
-                "4211e1149044ce4fc75dce370ead406eeb21a2431e8893b1d3587d8b213d97d8",
+                "8ea06b99c55c0a94e4bf645d3034f6c8b6535c6e578b646de44a8058d6a4b30b",
             ),
             (
                 "storage::meta",
                 Dialect::Postgres,
-                "6891bd41b0390995dc29ba63e43b869f47c2cb109141ae5fa1e0a8216f185d4a",
+                "8340b15aebab73becc4f57fe056e3ab1de3a883644888d6169a4be7f68d7375c",
             ),
             (
                 "storage::admin",

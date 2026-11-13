@@ -1997,6 +1997,7 @@ mod tests {
             text_sha: Some(format!("sha-text-{tag}")),
             text_len: 4,
             report: "1 images, 0 tables".into(),
+            note: None,
             images: vec![one_image(&image_sha)],
             tables: Vec::new(),
         };
@@ -2068,6 +2069,7 @@ mod tests {
             text_sha: Some("sha-text-v2".into()),
             text_len: 4,
             report: "1 images, 0 tables".into(),
+            note: None,
             images: vec![one_image(new_sha)],
             tables: Vec::new(),
         };

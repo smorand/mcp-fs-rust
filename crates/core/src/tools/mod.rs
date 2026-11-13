@@ -57,6 +57,8 @@ pub mod context7;
 pub(crate) mod contract_golden;
 #[cfg(test)]
 pub(crate) mod converter_bound_e2e;
+#[cfg(test)]
+mod damage_e2e;
 pub mod db;
 pub(crate) mod diff_files;
 #[cfg(test)]

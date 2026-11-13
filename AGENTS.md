@@ -63,6 +63,7 @@ cargo test -p mcp-fs-core --lib --features rar -- e2e_0080_  the `.rar` extracti
 cargo test -p mcp-fs-core --lib --features rar -- e2e_0087_ api::dataplane tool_contract   the truncated RAR tests (SPEC-0087)
 env -u MCPFS_TEST_PG_DSN cargo test -p mcp-fs-core --lib -- e2e_0089_ api::dataplane tool_contract --test-threads=1   the PDF and converter bound tests (SPEC-0089)
 env -u MCPFS_TEST_PG_DSN cargo test -p mcp-fs-core --lib -- e2e_0092_ api::dataplane tool_contract --test-threads=1   the nesting tests (SPEC-0092; the exploit cases re run the binary in a child process)
+env -u MCPFS_TEST_PG_DSN cargo test -p mcp-fs-core --lib -- e2e_0094_ --test-threads=1   the damaged PDF page tests (SPEC-0094; 21 tests in tools/damage_e2e.rs, E2E-009 waits 1100 ms of real time)
 MCPFS_REWRITE_TOOL_CONTRACT=1 cargo test -p mcp-fs-core --lib tool_contract_golden_is_current
                                       regenerate the frozen tool contract, then review the diff
 python3 scripts/doc_service_fake.py --port 8099   fake document service, for doc_service api mode
@@ -141,7 +142,11 @@ features on `mcp-fs-core`. The paths below are all under `crates/core/src/` unle
   decoded stream, 268435456 bytes for the object streams at load, per page and for the extracted text;
   LZW and ASCII85 chains, `weezl`; SPEC-0089; the same walk refuses forms nested more than 64 deep, a page
   tree climb past 256 page groups, and a character or code map nested more than 64 levels, as
-  `ERR_INVALID_ARGUMENT`, no trace on refusal, SPEC-0092), `artifacts/` (parse,
+  `ERR_INVALID_ARGUMENT`, no trace on refusal, SPEC-0092; the same walk also reads each page content strict
+  first (`decode_flagging`, lopdf `Content::decode_strict`, lenient fallback) and a drawn XObject only when
+  its dictionary has `/Subtype /Form`, and returns the pages whose content the strict parse refused, which
+  `extract.rs::damage_note` words as the `note` of `fs.extract_text`, at most 20 page numbers then `and N more`,
+  kept for a cached answer in the nullable `doc_artifact_sets.note` column, SPEC-0094), `artifacts/` (parse,
   capture and render of the images and tables a conversion keeps; meta rows, never `nodes`).
 - `tools/` : one module per family. Every family exposes typed `pub(crate)` async functions
   (the real logic, called directly by `mcp::server::McpServer`'s `#[tool]` methods and by the
