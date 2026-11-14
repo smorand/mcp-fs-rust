@@ -4,7 +4,7 @@
 > Nature: DEBT
 > Depth: S
 > Depth evidence: 1 debt item, 1 module (dependency graph and its gate), 0 public contract changed, 0 persisted change
-> Status: specified
+> Status: designed
 > Generated on: 2026-11-14
 > Behavior change: none
 > From backlog: BL-0059
@@ -133,3 +133,26 @@ None, Section 5 lists no dual maintained contract.
 | 1 | 0 | 0 | IMPLEMENTABLE |
 
 **Amendments applied:** none. Inline checklist (depth S) run on the file read back from disk, all 14 items PASS; security items 12 and 13: the class names a source and a sink and no file, two quoted searches, every hit disposed, safe verdicts cite their control; no kept occurrence needs an exploit test (the one site is the dependency removed by DR-002, proven by DT-002).
+
+## Design additions (2026-11-14)
+Validated by /sdlc-design: every DEC names its requirement, the migration order keeps the suite green only as one unit (steps 1 and 2 of Section 9), the perimeter claims were re read (`Cargo.toml:113-114`, `deny.toml:19-24`, `Cargo.lock:6537,7092`, `security_gate.rs:149,182,223`, `Makefile:46-48`), target tier 2 (default, no constitution or `.spec.json` setting).
+
+### File structure impact
+| Path | Action | Caused by | Story |
+|---|---|---|---|
+| `Cargo.toml` | modify, lines 113-114 | DR-001 | US-0244 |
+| `Cargo.lock` | regenerate with `cargo update -p utoipa-swagger-ui -p utoipa` | DR-001, DR-002 | US-0244 |
+| `deny.toml` | modify, remove lines 19-24 | DR-003 | US-0244 |
+| `.cargo/audit.toml` | modify, remove lines 9-12 | DR-003 | US-0244 |
+| `crates/mcp-fs/tests/security_gate.rs` | modify 3 tests, add DT-001 and DT-002 | DR-004 | US-0244 |
+Affected documentation: none (`README.md`, `AGENTS.md`, `.agent_docs/*` hold no zip 3.0.0 or BL-0059 reference, Section 2).
+
+### Test strategy
+| Test | Level | Driver | Location | Story |
+|---|---|---|---|---|
+| DT-001 | integration | direct read of `Cargo.lock` (`lock_packages`) | `crates/mcp-fs/tests/security_gate.rs` | US-0244 |
+| DT-002 | integration | direct read of the two config files | `crates/mcp-fs/tests/security_gate.rs` | US-0244 |
+| DT-003 | integration, existing unmodified | `cargo deny check` run | `security_gate.rs:126`, `:21` | US-0244 |
+
+### Additional decision
+- **DEC-003:** one story for the whole spec. **Obliged by:** DR-001 to DR-005. **Rationale:** after the bump alone, `lockfile_and_graph_carry_zip_9_only_for_normal_dependencies` and the id list test fail (Section 9 step 1), so no thinner cut leaves `make check` green. **Alternatives considered:** two stories (bump, then gate cleanup), rejected for that reason. **Source:** design. **Evidence:** `security_gate.rs:182-190` asserts two zip packages.
