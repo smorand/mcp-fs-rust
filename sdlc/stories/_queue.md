@@ -263,3 +263,13 @@
 | US-0261 | SPEC-0099 | the user configuration directory fsa with fallback | US-0259 | 2 | landed |  |  |
 | US-0262 | SPEC-0099 | test code and fixture spellings | US-0261 | 2 | landed |  |  |
 | US-0263 | SPEC-0099 | scripts, docs, repository URL and the guard tests | US-0262 | 2 | landed |  |  |
+| US-0264 | SPEC-0100 | an index update that is refused or fails keeps the old entries | main | 2 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0265 | SPEC-0100 | PostgreSQL and sqlite vec replace a file entries in one transaction | US-0264 | 2 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0266 | SPEC-0100 | job records and the fs.list_derived_jobs tool | main | 1 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0267 | SPEC-0100 | the settle delay setting | main | 2 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0268 | SPEC-0100 | a saved file is rebuilt once after it settles | US-0264, US-0265, US-0266, US-0267 | 1 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0269 | SPEC-0100 | a copy and a restore schedule their destination | US-0268 | 2 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0270 | SPEC-0100 | waiting rebuilds survive a restart | US-0268 | 2 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0271 | SPEC-0100 | delete and move follow the jobs | US-0268 | 1 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0272 | SPEC-0100 | index mode change and project removal cancel jobs | US-0268 | 2 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |
+| US-0273 | SPEC-0100 | fs.recalculate, docs and contract | US-0268, US-0271 | 1 | todo | feat/0174-derived-metadata-rebuilds-after-the-file-settles |  |

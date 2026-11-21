@@ -4,7 +4,7 @@
 > Nature: FEAT
 > Depth: L
 > Depth evidence: FEAT / depth L: 2 areas (search indexing, the new waiting and job mechanism) plus the tool surface, project lifecycle and server settings, 20 requirements, pending work now survives a restart
-> Status: draft
+> Status: designed
 > Generated on: 2026-11-20
 > Project: existing
 > From backlog: BL-0174
